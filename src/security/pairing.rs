@@ -190,11 +190,11 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
     let max_len = a.len().max(b.len());
     let mut byte_diff = 0u8;
     for i in 0..max_len {
-        let x = if i < a.len() { a[i] } else { 0 };
-        let y = if i < b.len() { b[i] } else { 0 };
+        let x = *a.get(i).unwrap_or(&0);
+        let y = *b.get(i).unwrap_or(&0);
         byte_diff |= x ^ y;
     }
-    len_diff == 0 && byte_diff == 0
+    (len_diff == 0) & (byte_diff == 0)
 }
 
 /// Check if a host string represents a non-localhost bind address.
