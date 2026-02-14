@@ -1,22 +1,36 @@
 // Encrypted secret store — defense-in-depth for API keys and tokens.
 //
-// Secrets are encrypted using a random key stored in `~/.zeroclaw/.secret_key`
-// with restrictive file permissions (0600). The config file stores only
-// hex-encoded ciphertext, never plaintext keys.
+// Secrets are encrypted using ChaCha20-Poly1305 AEAD with a random key stored
+// in `~/.zeroclaw/.secret_key` with restrictive file permissions (0600). The
+// config file stores only hex-encoded ciphertext, never plaintext keys.
+//
+// Each encryption generates a fresh random 12-byte nonce, prepended to the
+// ciphertext. The Poly1305 authentication tag prevents tampering.
 //
 // This prevents:
 //   - Plaintext exposure in config files
 //   - Casual `grep` or `git log` leaks
 //   - Accidental commit of raw API keys
+//   - Known-plaintext attacks (unlike the previous XOR cipher)
+//   - Ciphertext tampering (authenticated encryption)
 //
 // For sovereign users who prefer plaintext, `secrets.encrypt = false` disables this.
+//
+// Migration: values with the legacy `enc:` prefix (XOR cipher) are decrypted
+// using the old algorithm for backward compatibility. New encryptions always
+// produce `enc2:` (ChaCha20-Poly1305).
 
 use anyhow::{Context, Result};
+use chacha20poly1305::aead::{Aead, KeyInit, OsRng};
+use chacha20poly1305::{AeadCore, ChaCha20Poly1305, Key, Nonce};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Length of the random encryption key in bytes.
+/// Length of the random encryption key in bytes (256-bit, matches `ChaCha20`).
 const KEY_LEN: usize = 32;
+
+/// ChaCha20-Poly1305 nonce length in bytes.
+const NONCE_LEN: usize = 12;
 
 /// Manages encrypted storage of secrets (API keys, tokens, etc.)
 #[derive(Debug, Clone)]
@@ -36,37 +50,72 @@ impl SecretStore {
         }
     }
 
-    /// Encrypt a plaintext secret. Returns hex-encoded ciphertext prefixed with `enc:`.
+    /// Encrypt a plaintext secret. Returns hex-encoded ciphertext prefixed with `enc2:`.
+    /// Format: `enc2:<hex(nonce ‖ ciphertext ‖ tag)>` (12 + N + 16 bytes).
     /// If encryption is disabled, returns the plaintext as-is.
     pub fn encrypt(&self, plaintext: &str) -> Result<String> {
         if !self.enabled || plaintext.is_empty() {
             return Ok(plaintext.to_string());
         }
 
-        let key = self.load_or_create_key()?;
-        let ciphertext = xor_cipher(plaintext.as_bytes(), &key);
-        Ok(format!("enc:{}", hex_encode(&ciphertext)))
+        let key_bytes = self.load_or_create_key()?;
+        let key = Key::from_slice(&key_bytes);
+        let cipher = ChaCha20Poly1305::new(key);
+
+        let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let ciphertext = cipher
+            .encrypt(&nonce, plaintext.as_bytes())
+            .map_err(|e| anyhow::anyhow!("Encryption failed: {e}"))?;
+
+        // Prepend nonce to ciphertext for storage
+        let mut blob = Vec::with_capacity(NONCE_LEN + ciphertext.len());
+        blob.extend_from_slice(&nonce);
+        blob.extend_from_slice(&ciphertext);
+
+        Ok(format!("enc2:{}", hex_encode(&blob)))
     }
 
-    /// Decrypt a secret. If the value starts with `enc:`, it's decrypted.
-    /// Otherwise, it's returned as-is (backward-compatible with plaintext configs).
+    /// Decrypt a secret.
+    /// - `enc2:` prefix → ChaCha20-Poly1305 (current format)
+    /// - `enc:` prefix → legacy XOR cipher (backward compatibility for migration)
+    /// - No prefix → returned as-is (plaintext config)
     pub fn decrypt(&self, value: &str) -> Result<String> {
-        if !value.starts_with("enc:") {
-            return Ok(value.to_string());
-        }
+        if let Some(hex_str) = value.strip_prefix("enc2:") {
+            let blob =
+                hex_decode(hex_str).context("Failed to decode encrypted secret (corrupt hex)")?;
+            anyhow::ensure!(
+                blob.len() > NONCE_LEN,
+                "Encrypted value too short (missing nonce)"
+            );
 
-        let hex_str = &value[4..]; // strip "enc:" prefix
-        let ciphertext =
-            hex_decode(hex_str).context("Failed to decode encrypted secret (corrupt hex)")?;
-        let key = self.load_or_create_key()?;
-        let plaintext_bytes = xor_cipher(&ciphertext, &key);
-        String::from_utf8(plaintext_bytes)
-            .context("Decrypted secret is not valid UTF-8 — wrong key or corrupt data")
+            let (nonce_bytes, ciphertext) = blob.split_at(NONCE_LEN);
+            let nonce = Nonce::from_slice(nonce_bytes);
+            let key_bytes = self.load_or_create_key()?;
+            let key = Key::from_slice(&key_bytes);
+            let cipher = ChaCha20Poly1305::new(key);
+
+            let plaintext_bytes = cipher
+                .decrypt(nonce, ciphertext)
+                .map_err(|_| anyhow::anyhow!("Decryption failed — wrong key or tampered data"))?;
+
+            String::from_utf8(plaintext_bytes)
+                .context("Decrypted secret is not valid UTF-8 — corrupt data")
+        } else if let Some(hex_str) = value.strip_prefix("enc:") {
+            // Legacy XOR cipher — decrypt for backward compatibility
+            let ciphertext = hex_decode(hex_str)
+                .context("Failed to decode legacy encrypted secret (corrupt hex)")?;
+            let key = self.load_or_create_key()?;
+            let plaintext_bytes = xor_cipher(&ciphertext, &key);
+            String::from_utf8(plaintext_bytes)
+                .context("Decrypted legacy secret is not valid UTF-8 — wrong key or corrupt data")
+        } else {
+            Ok(value.to_string())
+        }
     }
 
-    /// Check if a value is already encrypted.
+    /// Check if a value is already encrypted (current or legacy format).
     pub fn is_encrypted(value: &str) -> bool {
-        value.starts_with("enc:")
+        value.starts_with("enc2:") || value.starts_with("enc:")
     }
 
     /// Load the encryption key from disk, or create one if it doesn't exist.
@@ -157,7 +206,7 @@ mod tests {
         let secret = "sk-my-secret-api-key-12345";
 
         let encrypted = store.encrypt(secret).unwrap();
-        assert!(encrypted.starts_with("enc:"), "Should have enc: prefix");
+        assert!(encrypted.starts_with("enc2:"), "Should have enc2: prefix");
         assert_ne!(encrypted, secret, "Should not be plaintext");
 
         let decrypted = store.decrypt(&encrypted).unwrap();
@@ -176,7 +225,7 @@ mod tests {
     fn decrypt_plaintext_passthrough() {
         let tmp = TempDir::new().unwrap();
         let store = SecretStore::new(tmp.path(), true);
-        // Values without "enc:" prefix are returned as-is (backward compat)
+        // Values without "enc:"/"enc2:" prefix are returned as-is (backward compat)
         let result = store.decrypt("sk-plaintext-key").unwrap();
         assert_eq!(result, "sk-plaintext-key");
     }
@@ -191,7 +240,8 @@ mod tests {
 
     #[test]
     fn is_encrypted_detects_prefix() {
-        assert!(SecretStore::is_encrypted("enc:aabbcc"));
+        assert!(SecretStore::is_encrypted("enc2:aabbcc"));
+        assert!(SecretStore::is_encrypted("enc:aabbcc")); // legacy
         assert!(!SecretStore::is_encrypted("sk-plaintext"));
         assert!(!SecretStore::is_encrypted(""));
     }
@@ -214,13 +264,20 @@ mod tests {
     }
 
     #[test]
-    fn same_key_used_across_calls() {
+    fn encrypting_same_value_produces_different_ciphertext() {
         let tmp = TempDir::new().unwrap();
         let store = SecretStore::new(tmp.path(), true);
 
         let e1 = store.encrypt("secret").unwrap();
         let e2 = store.encrypt("secret").unwrap();
-        assert_eq!(e1, e2, "Same key should produce same ciphertext");
+        assert_ne!(
+            e1, e2,
+            "AEAD with random nonce should produce different ciphertext each time"
+        );
+
+        // Both should still decrypt to the same value
+        assert_eq!(store.decrypt(&e1).unwrap(), "secret");
+        assert_eq!(store.decrypt(&e2).unwrap(), "secret");
     }
 
     #[test]
@@ -260,8 +317,69 @@ mod tests {
     fn corrupt_hex_returns_error() {
         let tmp = TempDir::new().unwrap();
         let store = SecretStore::new(tmp.path(), true);
-        let result = store.decrypt("enc:not-valid-hex!!");
+        let result = store.decrypt("enc2:not-valid-hex!!");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn tampered_ciphertext_detected() {
+        let tmp = TempDir::new().unwrap();
+        let store = SecretStore::new(tmp.path(), true);
+        let encrypted = store.encrypt("sensitive-data").unwrap();
+
+        // Flip a bit in the ciphertext (after the "enc2:" prefix)
+        let hex_str = &encrypted[5..];
+        let mut blob = hex_decode(hex_str).unwrap();
+        // Modify a byte in the ciphertext portion (after the 12-byte nonce)
+        if blob.len() > NONCE_LEN {
+            blob[NONCE_LEN] ^= 0xff;
+        }
+        let tampered = format!("enc2:{}", hex_encode(&blob));
+
+        let result = store.decrypt(&tampered);
+        assert!(result.is_err(), "Tampered ciphertext must be rejected");
+    }
+
+    #[test]
+    fn wrong_key_detected() {
+        let tmp1 = TempDir::new().unwrap();
+        let tmp2 = TempDir::new().unwrap();
+        let store1 = SecretStore::new(tmp1.path(), true);
+        let store2 = SecretStore::new(tmp2.path(), true);
+
+        let encrypted = store1.encrypt("secret-for-store1").unwrap();
+        let result = store2.decrypt(&encrypted);
+        assert!(result.is_err(), "Decrypting with a different key must fail");
+    }
+
+    #[test]
+    fn truncated_ciphertext_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let store = SecretStore::new(tmp.path(), true);
+        // Only a few bytes — shorter than nonce
+        let result = store.decrypt("enc2:aabbccdd");
+        assert!(result.is_err(), "Too-short ciphertext must be rejected");
+    }
+
+    // ── Legacy XOR backward compatibility ───────────────────────
+
+    #[test]
+    fn legacy_xor_decrypt_still_works() {
+        let tmp = TempDir::new().unwrap();
+        let store = SecretStore::new(tmp.path(), true);
+
+        // Trigger key creation via an encrypt call
+        let _ = store.encrypt("setup").unwrap();
+        let key = store.load_or_create_key().unwrap();
+
+        // Manually produce a legacy XOR-encrypted value
+        let plaintext = "sk-legacy-api-key";
+        let ciphertext = xor_cipher(plaintext.as_bytes(), &key);
+        let legacy_value = format!("enc:{}", hex_encode(&ciphertext));
+
+        // Store should still be able to decrypt legacy values
+        let decrypted = store.decrypt(&legacy_value).unwrap();
+        assert_eq!(decrypted, plaintext, "Legacy XOR values must still decrypt");
     }
 
     // ── Low-level helpers ───────────────────────────────────────
