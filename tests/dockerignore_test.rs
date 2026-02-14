@@ -9,7 +9,9 @@
 use std::fs;
 use std::path::Path;
 
-/// Paths that MUST be excluded from Docker build context (security/performance)
+/// Paths that MUST be excluded from Docker build context (security/performance).
+/// With a whitelist `.dockerignore` (`*` + `!allowed`), everything not explicitly
+/// re-included is excluded.
 const MUST_EXCLUDE: &[&str] = &[
     ".git",
     ".githooks",
@@ -24,13 +26,12 @@ const MUST_EXCLUDE: &[&str] = &[
     ".DS_Store",
     ".github",
     "deny.toml",
-    "LICENSE",
     ".env",
     ".tmp_*",
 ];
 
-/// Paths that MUST NOT be excluded (required for build)
-const MUST_INCLUDE: &[&str] = &["Cargo.toml", "Cargo.lock", "src/"];
+/// Paths that MUST NOT be excluded (required for build + legal)
+const MUST_INCLUDE: &[&str] = &["Cargo.toml", "Cargo.lock", "src/", "LICENSE"];
 
 /// Parse .dockerignore and return all non-comment, non-empty lines
 fn parse_dockerignore(content: &str) -> Vec<String> {
@@ -47,6 +48,11 @@ fn pattern_matches(pattern: &str, path: &str) -> bool {
     // Handle negation patterns
     if pattern.starts_with('!') {
         return false; // Negation re-includes, so it doesn't "exclude"
+    }
+
+    // Bare wildcard matches everything
+    if pattern == "*" {
+        return true;
     }
 
     // Handle glob patterns
@@ -84,10 +90,12 @@ fn pattern_matches(pattern: &str, path: &str) -> bool {
 fn is_excluded(patterns: &[String], path: &str) -> bool {
     let mut excluded = false;
     for pattern in patterns {
-        if pattern.starts_with('!') {
-            // Negation pattern - re-include
-            let negated = &pattern[1..];
-            if pattern_matches(negated, path) {
+        if let Some(negated) = pattern.strip_prefix('!') {
+            // Negation pattern - re-include if it matches
+            let neg = negated.trim_end_matches('/');
+            let p = path.trim_end_matches('/');
+            // Exact match or directory prefix match for negation
+            if p == neg || p.starts_with(&format!("{neg}/")) {
                 excluded = false;
             }
         } else if pattern_matches(pattern, path) {
@@ -297,18 +305,16 @@ fn dockerignore_has_valid_syntax() {
 
 #[test]
 fn dockerignore_pattern_matching_edge_cases() {
-    // Test the pattern matching logic itself
+    // Test the whitelist pattern matching logic
     let patterns = vec![
-        ".git".to_string(),
-        ".githooks".to_string(),
-        "target".to_string(),
-        "*.md".to_string(),
-        "*.db".to_string(),
-        ".tmp_*".to_string(),
-        ".env".to_string(),
+        "*".to_string(),
+        "!Cargo.toml".to_string(),
+        "!Cargo.lock".to_string(),
+        "!src/".to_string(),
+        "!LICENSE".to_string(),
     ];
 
-    // Should match
+    // Should be excluded (not in whitelist)
     assert!(is_excluded(&patterns, ".git"));
     assert!(is_excluded(&patterns, ".git/config"));
     assert!(is_excluded(&patterns, ".githooks"));
@@ -319,9 +325,10 @@ fn dockerignore_pattern_matching_edge_cases() {
     assert!(is_excluded(&patterns, ".tmp_todo_probe"));
     assert!(is_excluded(&patterns, ".env"));
 
-    // Should NOT match
+    // Should NOT be excluded (in whitelist)
     assert!(!is_excluded(&patterns, "src"));
     assert!(!is_excluded(&patterns, "src/main.rs"));
     assert!(!is_excluded(&patterns, "Cargo.toml"));
     assert!(!is_excluded(&patterns, "Cargo.lock"));
+    assert!(!is_excluded(&patterns, "LICENSE"));
 }
