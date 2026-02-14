@@ -23,7 +23,9 @@ use axum::{
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::timeout::TimeoutLayer;
 
 /// Maximum request body size (64KB) — prevents memory exhaustion
 pub const MAX_BODY_SIZE: usize = 65_536;
@@ -163,8 +165,6 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     };
 
     // Build router with middleware
-    // Note: Body limit layer prevents memory exhaustion from oversized requests
-    // Timeout is handled by tokio's TcpListener accept timeout and hyper's built-in timeouts
     let app = Router::new()
         .route("/health", get(handle_health))
         .route("/pair", post(handle_pair))
@@ -172,7 +172,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
         .with_state(state)
-        .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE));
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(REQUEST_TIMEOUT_SECS),
+        ));
 
     // Run the server
     axum::serve(listener, app).await?;

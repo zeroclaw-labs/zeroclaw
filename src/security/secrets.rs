@@ -241,7 +241,7 @@ fn hex_encode(data: &[u8]) -> String {
 
 /// Hex-decode a hex string to bytes.
 fn hex_decode(hex: &str) -> Result<Vec<u8>> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         anyhow::bail!("Hex string has odd length");
     }
     (0..hex.len())
