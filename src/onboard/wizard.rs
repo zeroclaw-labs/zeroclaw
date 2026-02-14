@@ -55,25 +55,28 @@ pub fn run_wizard() -> Result<Config> {
     );
     println!();
 
-    print_step(1, 7, "Workspace Setup");
+    print_step(1, 8, "Workspace Setup");
     let (workspace_dir, config_path) = setup_workspace()?;
 
-    print_step(2, 7, "AI Provider & API Key");
+    print_step(2, 8, "AI Provider & API Key");
     let (provider, api_key, model) = setup_provider()?;
 
-    print_step(3, 7, "Channels (How You Talk to ZeroClaw)");
+    print_step(3, 8, "Channels (How You Talk to ZeroClaw)");
     let channels_config = setup_channels()?;
 
-    print_step(4, 7, "Tunnel (Expose to Internet)");
+    print_step(4, 8, "Tunnel (Expose to Internet)");
     let tunnel_config = setup_tunnel()?;
 
-    print_step(5, 7, "Tool Mode & Security");
+    print_step(5, 8, "Tool Mode & Security");
     let (composio_config, secrets_config) = setup_tool_mode()?;
 
-    print_step(6, 7, "Project Context (Personalize Your Agent)");
+    print_step(6, 8, "Memory Configuration");
+    let memory_config = setup_memory()?;
+
+    print_step(7, 8, "Project Context (Personalize Your Agent)");
     let project_ctx = setup_project_context()?;
 
-    print_step(7, 7, "Workspace Files");
+    print_step(8, 8, "Workspace Files");
     scaffold_workspace(&workspace_dir, &project_ctx)?;
 
     // ── Build config ──
@@ -95,7 +98,7 @@ pub fn run_wizard() -> Result<Config> {
         reliability: crate::config::ReliabilityConfig::default(),
         heartbeat: HeartbeatConfig::default(),
         channels_config,
-        memory: MemoryConfig::default(), // SQLite + auto-save by default
+        memory: memory_config, // User-selected memory backend
         tunnel: tunnel_config,
         gateway: crate::config::GatewayConfig::default(),
         composio: composio_config,
@@ -110,9 +113,10 @@ pub fn run_wizard() -> Result<Config> {
         style("Supervised").green()
     );
     println!(
-        "  {} Memory: {} (auto-save: on)",
+        "  {} Memory: {} (auto-save: {})",
         style("✓").green().bold(),
-        style("sqlite").green()
+        style(&config.memory.backend).green(),
+        if config.memory.auto_save { "on" } else { "off" }
     );
 
     config.save()?;
@@ -210,10 +214,10 @@ pub fn run_channels_repair_wizard() -> Result<Config> {
 // ── Quick setup (zero prompts) ───────────────────────────────────
 
 /// Non-interactive setup: generates a sensible default config instantly.
-/// Use `zeroclaw onboard` or `zeroclaw onboard --api-key sk-... --provider openrouter`.
+/// Use `zeroclaw onboard` or `zeroclaw onboard --api-key sk-... --provider openrouter --memory sqlite`.
 /// Use `zeroclaw onboard --interactive` for the full wizard.
 #[allow(clippy::too_many_lines)]
-pub fn run_quick_setup(api_key: Option<&str>, provider: Option<&str>) -> Result<Config> {
+pub fn run_quick_setup(api_key: Option<&str>, provider: Option<&str>, memory_backend: Option<&str>) -> Result<Config> {
     println!("{}", style(BANNER).cyan().bold());
     println!(
         "  {}",
@@ -234,6 +238,24 @@ pub fn run_quick_setup(api_key: Option<&str>, provider: Option<&str>) -> Result<
 
     let provider_name = provider.unwrap_or("openrouter").to_string();
     let model = default_model_for_provider(&provider_name);
+    let memory_backend_name = memory_backend.unwrap_or("sqlite").to_string();
+
+    // Create memory config based on backend choice
+    let memory_config = MemoryConfig {
+        backend: memory_backend_name.clone(),
+        auto_save: memory_backend_name != "none",
+        hygiene_enabled: memory_backend_name == "sqlite",
+        archive_after_days: if memory_backend_name == "sqlite" { 7 } else { 0 },
+        purge_after_days: if memory_backend_name == "sqlite" { 30 } else { 0 },
+        conversation_retention_days: 30,
+        embedding_provider: "none".to_string(),
+        embedding_model: "text-embedding-3-small".to_string(),
+        embedding_dimensions: 1536,
+        vector_weight: 0.7,
+        keyword_weight: 0.3,
+        embedding_cache_size: if memory_backend_name == "sqlite" { 10000 } else { 0 },
+        chunk_max_tokens: 512,
+    };
 
     let config = Config {
         workspace_dir: workspace_dir.clone(),
@@ -248,7 +270,7 @@ pub fn run_quick_setup(api_key: Option<&str>, provider: Option<&str>) -> Result<
         reliability: crate::config::ReliabilityConfig::default(),
         heartbeat: HeartbeatConfig::default(),
         channels_config: ChannelsConfig::default(),
-        memory: MemoryConfig::default(),
+        memory: memory_config,
         tunnel: crate::config::TunnelConfig::default(),
         gateway: crate::config::GatewayConfig::default(),
         composio: ComposioConfig::default(),
@@ -300,9 +322,10 @@ pub fn run_quick_setup(api_key: Option<&str>, provider: Option<&str>) -> Result<
         style("Supervised (workspace-scoped)").green()
     );
     println!(
-        "  {} Memory:     {}",
+        "  {} Memory:     {} (auto-save: {})",
         style("✓").green().bold(),
-        style("sqlite (auto-save)").green()
+        style(&memory_backend_name).green(),
+        if memory_backend_name == "none" { "off" } else { "on" }
     );
     println!(
         "  {} Secrets:    {}",
@@ -929,6 +952,65 @@ fn setup_project_context() -> Result<ProjectContext> {
         timezone,
         agent_name,
         communication_style,
+    })
+}
+
+// ── Step 6: Memory Configuration ───────────────────────────────
+
+fn setup_memory() -> Result<MemoryConfig> {
+    print_bullet("Choose how ZeroClaw stores and searches memories.");
+    print_bullet("You can always change this later in config.toml.");
+    println!();
+
+    let options = vec![
+        "SQLite with Vector Search (recommended) — fast, hybrid search, embeddings",
+        "Markdown Files — simple, human-readable, no dependencies",
+        "None — disable persistent memory",
+    ];
+
+    let choice = Select::new()
+        .with_prompt("  Select memory backend")
+        .items(&options)
+        .default(0)
+        .interact()?;
+
+    let backend = match choice {
+        1 => "markdown", 
+        2 => "none",
+        _ => "sqlite", // 0 and any unexpected value defaults to sqlite
+    };
+
+    let auto_save = if backend == "none" {
+        false
+    } else {
+        let save = Confirm::new()
+            .with_prompt("  Auto-save conversations to memory?")
+            .default(true)
+            .interact()?;
+        save
+    };
+
+    println!(
+        "  {} Memory: {} (auto-save: {})",
+        style("✓").green().bold(),
+        style(backend).green(),
+        if auto_save { "on" } else { "off" }
+    );
+
+    Ok(MemoryConfig {
+        backend: backend.to_string(),
+        auto_save,
+        hygiene_enabled: backend == "sqlite", // Only enable hygiene for SQLite
+        archive_after_days: if backend == "sqlite" { 7 } else { 0 },
+        purge_after_days: if backend == "sqlite" { 30 } else { 0 },
+        conversation_retention_days: 30,
+        embedding_provider: "none".to_string(),
+        embedding_model: "text-embedding-3-small".to_string(),
+        embedding_dimensions: 1536,
+        vector_weight: 0.7,
+        keyword_weight: 0.3,
+        embedding_cache_size: if backend == "sqlite" { 10000 } else { 0 },
+        chunk_max_tokens: 512,
     })
 }
 

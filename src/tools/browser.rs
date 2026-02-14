@@ -207,6 +207,7 @@ impl BrowserTool {
     }
 
     /// Execute a browser action
+    #[allow(clippy::too_many_lines)]
     async fn execute_action(&self, action: BrowserAction) -> anyhow::Result<ToolResult> {
         match action {
             BrowserAction::Open { url } => {
@@ -342,6 +343,7 @@ impl BrowserTool {
         }
     }
 
+    #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
     fn to_result(&self, resp: AgentBrowserResponse) -> anyhow::Result<ToolResult> {
         if resp.success {
             let output = resp
@@ -506,13 +508,16 @@ impl Tool for BrowserTool {
             "snapshot" => BrowserAction::Snapshot {
                 interactive_only: args
                     .get("interactive_only")
-                    .and_then(|v| v.as_bool())
+                    .and_then(serde_json::Value::as_bool)
                     .unwrap_or(true), // Default to interactive for AI
                 compact: args
                     .get("compact")
-                    .and_then(|v| v.as_bool())
+                    .and_then(serde_json::Value::as_bool)
                     .unwrap_or(true),
-                depth: args.get("depth").and_then(|v| v.as_u64()).map(|d| d as u32),
+                depth: args
+                    .get("depth")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|d| u32::try_from(d).unwrap_or(u32::MAX)),
             },
             "click" => {
                 let selector = args
@@ -566,7 +571,7 @@ impl Tool for BrowserTool {
                 path: args.get("path").and_then(|v| v.as_str()).map(String::from),
                 full_page: args
                     .get("full_page")
-                    .and_then(|v| v.as_bool())
+                    .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
             },
             "wait" => BrowserAction::Wait {
@@ -574,7 +579,7 @@ impl Tool for BrowserTool {
                     .get("selector")
                     .and_then(|v| v.as_str())
                     .map(String::from),
-                ms: args.get("ms").and_then(|v| v.as_u64()),
+                ms: args.get("ms").and_then(serde_json::Value::as_u64),
                 text: args.get("text").and_then(|v| v.as_str()).map(String::from),
             },
             "press" => {
@@ -602,8 +607,8 @@ impl Tool for BrowserTool {
                     direction: direction.into(),
                     pixels: args
                         .get("pixels")
-                        .and_then(|v| v.as_u64())
-                        .map(|p| p as u32),
+                        .and_then(serde_json::Value::as_u64)
+                        .map(|p| u32::try_from(p).unwrap_or(u32::MAX)),
                 }
             }
             "is_visible" => {
