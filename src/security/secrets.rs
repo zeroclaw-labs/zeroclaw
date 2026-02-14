@@ -181,12 +181,21 @@ impl SecretStore {
             fs::write(&self.key_path, hex_encode(&key))
                 .context("Failed to write secret key file")?;
 
-            // Set restrictive permissions (Unix only)
+            // Set restrictive permissions
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 fs::set_permissions(&self.key_path, fs::Permissions::from_mode(0o600))
                     .context("Failed to set key file permissions")?;
+            }
+            #[cfg(windows)]
+            {
+                // On Windows, use icacls to restrict permissions to current user only
+                let _ = std::process::Command::new("icacls")
+                    .arg(&self.key_path)
+                    .args(["/inheritance:r", "/grant:r"])
+                    .arg(format!("{}:F", std::env::var("USERNAME").unwrap_or_default()))
+                    .output();
             }
 
             Ok(key)

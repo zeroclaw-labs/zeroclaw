@@ -221,6 +221,23 @@ pub fn init_skills_dir(workspace_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Recursively copy a directory (used as fallback when symlinks aren't available)
+#[cfg(any(windows, not(unix)))]
+fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dest_path = dest.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dest_path)?;
+        } else {
+            std::fs::copy(&src_path, &dest_path)?;
+        }
+    }
+    Ok(())
+}
+
 /// Handle the `skills` CLI command
 pub fn handle_command(command: super::SkillCommands, workspace_dir: &Path) -> Result<()> {
     match command {
@@ -303,10 +320,51 @@ pub fn handle_command(command: super::SkillCommands, workspace_dir: &Path) -> Re
                         dest.display()
                     );
                 }
-                #[cfg(not(unix))]
+                #[cfg(windows)]
                 {
-                    // On non-unix, copy the directory
-                    anyhow::bail!("Symlink not supported on this platform. Copy the skill directory manually.");
+                    // On Windows, try symlink first (requires admin or developer mode),
+                    // fall back to directory junction, then copy
+                    use std::os::windows::fs::symlink_dir;
+                    if symlink_dir(&src, &dest).is_ok() {
+                        println!(
+                            "  {} Skill linked: {}",
+                            console::style("✓").green().bold(),
+                            dest.display()
+                        );
+                    } else {
+                        // Try junction as fallback (works without admin)
+                        let junction_result = std::process::Command::new("cmd")
+                            .args(["/C", "mklink", "/J"])
+                            .arg(&dest)
+                            .arg(&src)
+                            .output();
+
+                        if junction_result.is_ok() && junction_result.unwrap().status.success() {
+                            println!(
+                                "  {} Skill linked (junction): {}",
+                                console::style("✓").green().bold(),
+                                dest.display()
+                            );
+                        } else {
+                            // Final fallback: copy the directory
+                            copy_dir_recursive(&src, &dest)?;
+                            println!(
+                                "  {} Skill copied: {}",
+                                console::style("✓").green().bold(),
+                                dest.display()
+                            );
+                        }
+                    }
+                }
+                #[cfg(not(any(unix, windows)))]
+                {
+                    // On other platforms, copy the directory
+                    copy_dir_recursive(&src, &dest)?;
+                    println!(
+                        "  {} Skill copied: {}",
+                        console::style("✓").green().bold(),
+                        dest.display()
+                    );
                 }
             }
 
