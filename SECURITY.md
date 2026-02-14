@@ -51,6 +51,11 @@ ZeroClaw implements defense-in-depth security:
 - Runaway cost from LLM API calls
 - Unauthorized shell command execution
 
+### API Error Handling
+- Provider error responses are scrubbed (known key patterns like `sk-*` replaced with `[REDACTED]`) and truncated to 200 characters before reaching logs or users
+- The gateway `/webhook` endpoint returns generic errors without internal details
+- **Contributors**: use the `api_error()` helper in `src/providers/mod.rs` when adding providers — never pass raw API response bodies to `bail!()`
+
 ## Security Testing
 
 All security mechanisms are covered by automated tests (129 tests):

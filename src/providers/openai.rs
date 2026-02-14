@@ -91,8 +91,7 @@ impl Provider for OpenAiProvider {
             .await?;
 
         if !response.status().is_success() {
-            let error = response.text().await?;
-            anyhow::bail!("OpenAI API error: {error}");
+            return Err(super::api_error("OpenAI", response).await);
         }
 
         let chat_response: ChatResponse = response.json().await?;

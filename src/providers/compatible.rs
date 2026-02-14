@@ -128,8 +128,7 @@ impl Provider for OpenAiCompatibleProvider {
         let response = req.send().await?;
 
         if !response.status().is_success() {
-            let error = response.text().await?;
-            anyhow::bail!("{} API error: {error}", self.name);
+            return Err(super::api_error(&self.name, response).await);
         }
 
         let chat_response: ChatResponse = response.json().await?;

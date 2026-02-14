@@ -302,7 +302,8 @@ async fn handle_webhook(
             (StatusCode::OK, Json(body))
         }
         Err(e) => {
-            let err = serde_json::json!({"error": format!("LLM error: {e}")});
+            tracing::error!("LLM request failed: {e}");
+            let err = serde_json::json!({"error": "LLM request failed"});
             (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
         }
     }

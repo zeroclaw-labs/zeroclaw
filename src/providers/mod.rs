@@ -11,6 +11,59 @@ pub use traits::Provider;
 use compatible::{AuthStyle, OpenAiCompatibleProvider};
 use reliable::ReliableProvider;
 
+/// Maximum length for API error messages to prevent credential leakage.
+const MAX_ERROR_LEN: usize = 200;
+
+/// Known secret prefixes to redact from error messages.
+const SECRET_PREFIXES: &[&str] = &["sk-", "xoxb-", "xoxp-"];
+
+/// Minimum token length (prefix + value) to redact — avoids false positives on short fragments.
+const MIN_SECRET_LEN: usize = 8;
+
+/// Replace tokens matching known API key patterns with `[REDACTED]`.
+fn scrub_secret_patterns(text: &str) -> String {
+    let mut result = text.to_string();
+    for prefix in SECRET_PREFIXES {
+        loop {
+            let Some(start) = result.find(prefix) else {
+                break;
+            };
+            let end = result[start..]
+                .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ',')
+                .map_or(result.len(), |i| start + i);
+            if end - start >= MIN_SECRET_LEN {
+                result.replace_range(start..end, "[REDACTED]");
+            } else {
+                break;
+            }
+        }
+    }
+    result
+}
+
+/// Truncate an API error body to a safe length and scrub potential credentials.
+pub(crate) fn sanitize_api_error(body: &str) -> String {
+    let scrubbed = scrub_secret_patterns(body.trim());
+    if scrubbed.len() <= MAX_ERROR_LEN {
+        scrubbed
+    } else {
+        let boundary = scrubbed.floor_char_boundary(MAX_ERROR_LEN);
+        format!("{}... (truncated)", &scrubbed[..boundary])
+    }
+}
+
+/// Build a sanitized `anyhow::Error` from a failed provider HTTP response.
+pub(crate) async fn api_error(name: &str, response: reqwest::Response) -> anyhow::Error {
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    anyhow::anyhow!(
+        "{} API error (HTTP {}): {}",
+        name,
+        status.as_u16(),
+        sanitize_api_error(&body)
+    )
+}
+
 /// Factory: create the right provider from config
 #[allow(clippy::too_many_lines)]
 pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<dyn Provider>> {
@@ -330,6 +383,98 @@ mod tests {
     #[test]
     fn factory_empty_name_errors() {
         assert!(create_provider("", None).is_err());
+    }
+
+    // ── sanitize_api_error ────────────────────────────────────
+
+    #[test]
+    fn sanitize_short_error_unchanged() {
+        let msg = "Invalid API key";
+        assert_eq!(sanitize_api_error(msg), msg);
+    }
+
+    #[test]
+    fn sanitize_long_error_truncated() {
+        let msg = "x".repeat(300);
+        let result = sanitize_api_error(&msg);
+        assert!(result.ends_with("... (truncated)"));
+        assert!(result.len() < 300);
+    }
+
+    #[test]
+    fn sanitize_empty_error() {
+        assert_eq!(sanitize_api_error(""), "");
+    }
+
+    #[test]
+    fn sanitize_whitespace_trimmed() {
+        assert_eq!(sanitize_api_error("  hello  "), "hello");
+    }
+
+    #[test]
+    fn sanitize_scrubs_openai_key() {
+        let msg = "error sk-proj-abc123xyz456 fail";
+        let result = sanitize_api_error(msg);
+        assert!(!result.contains("sk-proj-abc123xyz456"));
+        assert!(result.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn sanitize_scrubs_anthropic_key() {
+        let msg = "auth failed sk-ant-api03-secret123";
+        let result = sanitize_api_error(msg);
+        assert!(!result.contains("sk-ant-api03-secret123"));
+        assert!(result.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn sanitize_scrubs_slack_token() {
+        let msg = "token xoxb-1234-5678-abcdef invalid";
+        let result = sanitize_api_error(msg);
+        assert!(!result.contains("xoxb-1234-5678-abcdef"));
+        assert!(result.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn sanitize_scrubs_multiple_keys() {
+        let msg = "first sk-abc12345 then xoxp-def67890 also sk-ant-ghi12345";
+        let result = sanitize_api_error(msg);
+        assert!(!result.contains("sk-abc12345"));
+        assert!(!result.contains("xoxp-def67890"));
+        assert!(!result.contains("sk-ant-ghi12345"));
+        assert_eq!(result.matches("[REDACTED]").count(), 3);
+    }
+
+    #[test]
+    fn sanitize_preserves_short_prefix() {
+        let msg = "the sk- prefix is documented";
+        let result = sanitize_api_error(msg);
+        assert_eq!(result, msg);
+    }
+
+    #[test]
+    fn sanitize_scrubs_then_truncates() {
+        let msg = format!("error sk-proj-abc123xyz456 {}", "y".repeat(300));
+        let result = sanitize_api_error(&msg);
+        assert!(!result.contains("sk-proj-abc123xyz456"));
+        assert!(result.contains("[REDACTED]"));
+        assert!(result.ends_with("... (truncated)"));
+    }
+
+    #[test]
+    fn sanitize_key_at_end_of_string() {
+        let msg = "error: sk-proj-abc123xyz456";
+        let result = sanitize_api_error(msg);
+        assert!(!result.contains("sk-proj-abc123xyz456"));
+        assert!(result.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn sanitize_key_in_json() {
+        let msg = r#"{"key":"sk-abc123def456"}"#;
+        let result = sanitize_api_error(msg);
+        assert!(!result.contains("sk-abc123def456"));
+        assert!(result.contains("[REDACTED]"));
     }
 
     #[test]
