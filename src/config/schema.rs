@@ -68,7 +68,7 @@ pub struct IdentityConfig {
     /// Only used when format = "aieos"
     #[serde(default)]
     pub aieos_path: Option<String>,
-    /// Inline AIEOS JSON (alternative to aieos_path)
+    /// Inline AIEOS JSON (alternative to `aieos_path`)
     /// Only used when format = "aieos"
     #[serde(default)]
     pub aieos_inline: Option<String>,

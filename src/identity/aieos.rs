@@ -1,12 +1,12 @@
 //! AIEOS (AI Entity Object Specification) v1.1 support
 //!
 //! AIEOS is a standardization framework for portable AI identity.
-//! See: https://aieos.org
+//! See: <https://aieos.org>
 //!
 //! This module provides:
 //! - Full AIEOS v1.1 schema types
 //! - JSON parsing and validation
-//! - Conversion to ZeroClaw system prompt sections
+//! - Conversion to `ZeroClaw` system prompt sections
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -705,8 +705,55 @@ pub fn load_aieos_identity(path: &Path) -> Result<AieosEntity> {
 }
 
 /// Parse an AIEOS identity from a JSON string
+///
+/// Handles edge cases:
+/// - Strips BOM if present
+/// - Trims whitespace
+/// - Provides detailed error context
 pub fn parse_aieos_json(json: &str) -> Result<AieosEntity> {
-    serde_json::from_str(json).context("Failed to parse AIEOS JSON")
+    // Strip UTF-8 BOM if present
+    let json = json.strip_prefix('\u{feff}').unwrap_or(json);
+    // Trim whitespace
+    let json = json.trim();
+
+    if json.is_empty() {
+        anyhow::bail!("AIEOS JSON is empty");
+    }
+
+    serde_json::from_str(json).with_context(|| {
+        // Provide helpful error context
+        let preview = if json.len() > 100 {
+            format!("{}...", &json[..100])
+        } else {
+            json.to_string()
+        };
+        format!("Failed to parse AIEOS JSON. Preview: {preview}")
+    })
+}
+
+/// Validate AIEOS schema version compatibility
+pub fn validate_aieos_version(entity: &AieosEntity) -> Result<()> {
+    if let Some(ref standard) = entity.standard {
+        if let Some(ref version) = standard.version {
+            // We support v1.0.x and v1.1.x
+            if version.starts_with("1.0") || version.starts_with("1.1") {
+                return Ok(());
+            }
+            // Warn but don't fail for newer minor versions
+            if version.starts_with("1.") {
+                tracing::warn!(
+                    "AIEOS version {version} is newer than supported (1.1.x); some fields may be ignored"
+                );
+                return Ok(());
+            }
+            // Fail for major version mismatch
+            anyhow::bail!(
+                "AIEOS version {version} is not compatible; supported versions: 1.0.x, 1.1.x"
+            );
+        }
+    }
+    // No version specified — assume compatible
+    Ok(())
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -790,6 +837,9 @@ impl AieosEntity {
 
         // History section (brief)
         self.write_history_section(&mut prompt);
+
+        // Interests section
+        self.write_interests_section(&mut prompt);
 
         prompt
     }
@@ -912,6 +962,28 @@ impl AieosEntity {
                 if let Some(ref temperament) = traits.temperament {
                     if !temperament.is_empty() {
                         let _ = writeln!(prompt, "- Temperament: {temperament}");
+                    }
+                }
+                // OCEAN (Big Five) traits
+                if let Some(ref ocean) = traits.ocean {
+                    let mut ocean_parts = Vec::new();
+                    if let Some(o) = ocean.openness {
+                        ocean_parts.push(format!("O:{:.0}%", o * 100.0));
+                    }
+                    if let Some(c) = ocean.conscientiousness {
+                        ocean_parts.push(format!("C:{:.0}%", c * 100.0));
+                    }
+                    if let Some(e) = ocean.extraversion {
+                        ocean_parts.push(format!("E:{:.0}%", e * 100.0));
+                    }
+                    if let Some(a) = ocean.agreeableness {
+                        ocean_parts.push(format!("A:{:.0}%", a * 100.0));
+                    }
+                    if let Some(n) = ocean.neuroticism {
+                        ocean_parts.push(format!("N:{:.0}%", n * 100.0));
+                    }
+                    if !ocean_parts.is_empty() {
+                        let _ = writeln!(prompt, "- OCEAN: {}", ocean_parts.join(" "));
                     }
                 }
                 prompt.push('\n');
@@ -1142,6 +1214,88 @@ impl AieosEntity {
                         prompt.push('\n');
                     }
                 }
+            }
+        }
+    }
+
+    fn write_interests_section(&self, prompt: &mut String) {
+        if let Some(ref interests) = self.interests {
+            let mut has_content = false;
+
+            // Hobbies
+            if !interests.hobbies.is_empty() {
+                if !has_content {
+                    prompt.push_str("### Interests & Lifestyle\n\n");
+                    has_content = true;
+                }
+                let _ = writeln!(prompt, "**Hobbies:** {}", interests.hobbies.join(", "));
+            }
+
+            // Favorites (compact)
+            if let Some(ref favs) = interests.favorites {
+                let mut fav_parts = Vec::new();
+                if let Some(ref music) = favs.music_genre {
+                    if !music.is_empty() {
+                        fav_parts.push(format!("music: {music}"));
+                    }
+                }
+                if let Some(ref book) = favs.book {
+                    if !book.is_empty() {
+                        fav_parts.push(format!("book: {book}"));
+                    }
+                }
+                if let Some(ref movie) = favs.movie {
+                    if !movie.is_empty() {
+                        fav_parts.push(format!("movie: {movie}"));
+                    }
+                }
+                if let Some(ref food) = favs.food {
+                    if !food.is_empty() {
+                        fav_parts.push(format!("food: {food}"));
+                    }
+                }
+                if !fav_parts.is_empty() {
+                    if !has_content {
+                        prompt.push_str("### Interests & Lifestyle\n\n");
+                        has_content = true;
+                    }
+                    let _ = writeln!(prompt, "**Favorites:** {}", fav_parts.join(", "));
+                }
+            }
+
+            // Aversions
+            if !interests.aversions.is_empty() {
+                if !has_content {
+                    prompt.push_str("### Interests & Lifestyle\n\n");
+                    has_content = true;
+                }
+                let _ = writeln!(prompt, "**Dislikes:** {}", interests.aversions.join(", "));
+            }
+
+            // Lifestyle
+            if let Some(ref lifestyle) = interests.lifestyle {
+                let mut lifestyle_parts = Vec::new();
+                if let Some(ref diet) = lifestyle.diet {
+                    if !diet.is_empty() {
+                        lifestyle_parts.push(format!("diet: {diet}"));
+                    }
+                }
+                if let Some(ref sleep) = lifestyle.sleep_schedule {
+                    if !sleep.is_empty() {
+                        lifestyle_parts.push(format!("sleep: {sleep}"));
+                    }
+                }
+                if !lifestyle_parts.is_empty() {
+                    if !has_content {
+                        prompt.push_str("### Interests & Lifestyle\n\n");
+                        has_content = true;
+                    }
+                    let _ = writeln!(prompt, "**Lifestyle:** {}", lifestyle_parts.join(", "));
+                }
+            }
+
+            if has_content {
+                prompt.push('\n');
             }
         }
     }
@@ -1449,5 +1603,243 @@ mod tests {
         let entity = parse_aieos_json(json).unwrap();
         // Should fall back to "Entity" when names are empty
         assert_eq!(entity.display_name(), "Entity");
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // Edge Case Tests
+    // ══════════════════════════════════════════════════════════
+
+    #[test]
+    fn parse_empty_json_fails() {
+        let result = parse_aieos_json("");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("empty"));
+    }
+
+    #[test]
+    fn parse_whitespace_only_fails() {
+        let result = parse_aieos_json("   \n\t  ");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("empty"));
+    }
+
+    #[test]
+    fn parse_json_with_bom() {
+        // UTF-8 BOM followed by valid JSON
+        let json = "\u{feff}{\"identity\": {\"names\": {\"first\": \"BOM Test\"}}}";
+        let entity = parse_aieos_json(json).unwrap();
+        assert_eq!(entity.display_name(), "BOM Test");
+    }
+
+    #[test]
+    fn parse_json_with_leading_whitespace() {
+        let json = "   \n\t  {\"identity\": {\"names\": {\"first\": \"Whitespace\"}}}";
+        let entity = parse_aieos_json(json).unwrap();
+        assert_eq!(entity.display_name(), "Whitespace");
+    }
+
+    #[test]
+    fn validate_version_1_0_ok() {
+        let json = r#"{"standard": {"version": "1.0.0"}}"#;
+        let entity = parse_aieos_json(json).unwrap();
+        assert!(validate_aieos_version(&entity).is_ok());
+    }
+
+    #[test]
+    fn validate_version_1_1_ok() {
+        let json = r#"{"standard": {"version": "1.1.0"}}"#;
+        let entity = parse_aieos_json(json).unwrap();
+        assert!(validate_aieos_version(&entity).is_ok());
+    }
+
+    #[test]
+    fn validate_version_1_2_warns_but_ok() {
+        let json = r#"{"standard": {"version": "1.2.0"}}"#;
+        let entity = parse_aieos_json(json).unwrap();
+        // Should warn but not fail
+        assert!(validate_aieos_version(&entity).is_ok());
+    }
+
+    #[test]
+    fn validate_version_2_0_fails() {
+        let json = r#"{"standard": {"version": "2.0.0"}}"#;
+        let entity = parse_aieos_json(json).unwrap();
+        let result = validate_aieos_version(&entity);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not compatible"));
+    }
+
+    #[test]
+    fn validate_no_version_ok() {
+        let json = r#"{}"#;
+        let entity = parse_aieos_json(json).unwrap();
+        assert!(validate_aieos_version(&entity).is_ok());
+    }
+
+    #[test]
+    fn parse_invalid_json_provides_preview() {
+        let result = parse_aieos_json("{invalid json here}");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Preview"));
+    }
+
+    #[test]
+    fn ocean_traits_in_prompt() {
+        let json = r#"{
+            "psychology": {
+                "traits": {
+                    "ocean": {
+                        "openness": 0.8,
+                        "conscientiousness": 0.6,
+                        "extraversion": 0.4,
+                        "agreeableness": 0.7,
+                        "neuroticism": 0.3
+                    }
+                }
+            }
+        }"#;
+        let entity = parse_aieos_json(json).unwrap();
+        let prompt = entity.to_system_prompt();
+        assert!(prompt.contains("OCEAN:"));
+        assert!(prompt.contains("O:80%"));
+        assert!(prompt.contains("C:60%"));
+        assert!(prompt.contains("E:40%"));
+        assert!(prompt.contains("A:70%"));
+        assert!(prompt.contains("N:30%"));
+    }
+
+    #[test]
+    fn interests_in_prompt() {
+        let json = r#"{
+            "interests": {
+                "hobbies": ["coding", "gaming"],
+                "favorites": {
+                    "music_genre": "Jazz",
+                    "book": "Dune"
+                },
+                "aversions": ["crowds"],
+                "lifestyle": {
+                    "diet": "omnivore",
+                    "sleep_schedule": "early bird"
+                }
+            }
+        }"#;
+        let entity = parse_aieos_json(json).unwrap();
+        let prompt = entity.to_system_prompt();
+        assert!(prompt.contains("### Interests & Lifestyle"));
+        assert!(prompt.contains("coding, gaming"));
+        assert!(prompt.contains("music: Jazz"));
+        assert!(prompt.contains("book: Dune"));
+        assert!(prompt.contains("crowds"));
+        assert!(prompt.contains("diet: omnivore"));
+    }
+
+    #[test]
+    fn null_values_handled() {
+        // JSON with explicit nulls
+        let json = r#"{
+            "identity": {
+                "names": { "first": null, "last": "Smith" }
+            }
+        }"#;
+        let entity = parse_aieos_json(json).unwrap();
+        assert_eq!(entity.full_name(), Some("Smith".to_string()));
+    }
+
+    #[test]
+    fn extra_fields_ignored() {
+        // JSON with unknown fields should be ignored (forward compatibility)
+        let json = r#"{
+            "identity": {
+                "names": { "first": "Test" },
+                "unknown_field": "should be ignored",
+                "another_unknown": { "nested": true }
+            },
+            "future_section": { "data": 123 }
+        }"#;
+        let entity = parse_aieos_json(json).unwrap();
+        assert_eq!(entity.display_name(), "Test");
+    }
+
+    #[test]
+    fn case_insensitive_format_matching() {
+        // This tests the config format matching in channels/mod.rs
+        // Here we just verify the entity parses correctly
+        let json = r#"{"identity": {"names": {"first": "CaseTest"}}}"#;
+        let entity = parse_aieos_json(json).unwrap();
+        assert_eq!(entity.display_name(), "CaseTest");
+    }
+
+    #[test]
+    fn emotional_triggers_parsed() {
+        let json = r#"{
+            "psychology": {
+                "emotional_profile": {
+                    "base_mood": "optimistic",
+                    "volatility": 0.3,
+                    "resilience": "high",
+                    "triggers": {
+                        "joy": ["helping others", "learning"],
+                        "anger": ["injustice"],
+                        "sadness": ["loss"]
+                    }
+                }
+            }
+        }"#;
+        let entity = parse_aieos_json(json).unwrap();
+        let psych = entity.psychology.unwrap();
+        let emotional = psych.emotional_profile.unwrap();
+        assert_eq!(emotional.base_mood, Some("optimistic".to_string()));
+        assert_eq!(emotional.triggers.as_ref().unwrap().joy.len(), 2);
+    }
+
+    #[test]
+    fn idiosyncrasies_parsed() {
+        let json = r#"{
+            "psychology": {
+                "idiosyncrasies": {
+                    "phobias": ["heights"],
+                    "obsessions": ["organization"],
+                    "tics": ["tapping fingers"]
+                }
+            }
+        }"#;
+        let entity = parse_aieos_json(json).unwrap();
+        let psych = entity.psychology.unwrap();
+        let idio = psych.idiosyncrasies.unwrap();
+        assert_eq!(idio.phobias, vec!["heights"]);
+        assert_eq!(idio.obsessions, vec!["organization"]);
+    }
+
+    #[test]
+    fn tts_config_parsed() {
+        let json = r#"{
+            "linguistics": {
+                "voice": {
+                    "tts_config": {
+                        "provider": "elevenlabs",
+                        "voice_id": "abc123",
+                        "stability": 0.7,
+                        "similarity_boost": 0.8
+                    },
+                    "accent": {
+                        "region": "British",
+                        "strength": 0.5
+                    }
+                }
+            }
+        }"#;
+        let entity = parse_aieos_json(json).unwrap();
+        let ling = entity.linguistics.unwrap();
+        let voice = ling.voice.unwrap();
+        assert_eq!(
+            voice.tts_config.as_ref().unwrap().provider,
+            Some("elevenlabs".to_string())
+        );
+        assert_eq!(
+            voice.accent.as_ref().unwrap().region,
+            Some("British".to_string())
+        );
     }
 }

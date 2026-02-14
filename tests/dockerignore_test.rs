@@ -12,6 +12,7 @@ use std::path::Path;
 /// Paths that MUST be excluded from Docker build context (security/performance)
 const MUST_EXCLUDE: &[&str] = &[
     ".git",
+    ".githooks",
     "target",
     "docs",
     "examples",
@@ -22,10 +23,10 @@ const MUST_EXCLUDE: &[&str] = &[
     "*.db-journal",
     ".DS_Store",
     ".github",
-    ".githooks",
     "deny.toml",
     "LICENSE",
     ".env",
+    ".tmp_*",
 ];
 
 /// Paths that MUST NOT be excluded (required for build)
@@ -299,20 +300,24 @@ fn dockerignore_pattern_matching_edge_cases() {
     // Test the pattern matching logic itself
     let patterns = vec![
         ".git".to_string(),
+        ".githooks".to_string(),
         "target".to_string(),
         "*.md".to_string(),
         "*.db".to_string(),
         ".tmp_*".to_string(),
+        ".env".to_string(),
     ];
 
     // Should match
     assert!(is_excluded(&patterns, ".git"));
     assert!(is_excluded(&patterns, ".git/config"));
+    assert!(is_excluded(&patterns, ".githooks"));
     assert!(is_excluded(&patterns, "target"));
     assert!(is_excluded(&patterns, "target/debug/build"));
     assert!(is_excluded(&patterns, "README.md"));
     assert!(is_excluded(&patterns, "brain.db"));
     assert!(is_excluded(&patterns, ".tmp_todo_probe"));
+    assert!(is_excluded(&patterns, ".env"));
 
     // Should NOT match
     assert!(!is_excluded(&patterns, "src"));

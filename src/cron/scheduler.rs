@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::cron::{due_jobs, reschedule_after_run, CronJob};
+use crate::security::SecurityPolicy;
 use anyhow::Result;
 use chrono::Utc;
 use tokio::process::Command;
@@ -10,6 +11,7 @@ const MIN_POLL_SECONDS: u64 = 5;
 pub async fn run(config: Config) -> Result<()> {
     let poll_secs = config.reliability.scheduler_poll_secs.max(MIN_POLL_SECONDS);
     let mut interval = time::interval(Duration::from_secs(poll_secs));
+    let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
     crate::health::mark_component_ok("scheduler");
 
@@ -27,7 +29,7 @@ pub async fn run(config: Config) -> Result<()> {
 
         for job in jobs {
             crate::health::mark_component_ok("scheduler");
-            let (success, output) = execute_job_with_retry(&config, &job).await;
+            let (success, output) = execute_job_with_retry(&config, &security, &job).await;
 
             if !success {
                 crate::health::mark_component_error("scheduler", format!("job {} failed", job.id));
@@ -41,17 +43,26 @@ pub async fn run(config: Config) -> Result<()> {
     }
 }
 
-async fn execute_job_with_retry(config: &Config, job: &CronJob) -> (bool, String) {
+async fn execute_job_with_retry(
+    config: &Config,
+    security: &SecurityPolicy,
+    job: &CronJob,
+) -> (bool, String) {
     let mut last_output = String::new();
     let retries = config.reliability.scheduler_retries;
     let mut backoff_ms = config.reliability.provider_backoff_ms.max(200);
 
     for attempt in 0..=retries {
-        let (success, output) = run_job_command(config, job).await;
+        let (success, output) = run_job_command(config, security, job).await;
         last_output = output;
 
         if success {
             return (true, last_output);
+        }
+
+        if last_output.starts_with("blocked by security policy:") {
+            // Deterministic policy violations are not retryable.
+            return (false, last_output);
         }
 
         if attempt < retries {
@@ -64,7 +75,86 @@ async fn execute_job_with_retry(config: &Config, job: &CronJob) -> (bool, String
     (false, last_output)
 }
 
-async fn run_job_command(config: &Config, job: &CronJob) -> (bool, String) {
+fn is_env_assignment(word: &str) -> bool {
+    word.contains('=')
+        && word
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+}
+
+fn strip_wrapping_quotes(token: &str) -> &str {
+    token.trim_matches(|c| c == '"' || c == '\'')
+}
+
+fn forbidden_path_argument(security: &SecurityPolicy, command: &str) -> Option<String> {
+    let mut normalized = command.to_string();
+    for sep in ["&&", "||"] {
+        normalized = normalized.replace(sep, "\x00");
+    }
+    for sep in ['\n', ';', '|'] {
+        normalized = normalized.replace(sep, "\x00");
+    }
+
+    for segment in normalized.split('\x00') {
+        let tokens: Vec<&str> = segment.split_whitespace().collect();
+        if tokens.is_empty() {
+            continue;
+        }
+
+        // Skip leading env assignments and executable token.
+        let mut idx = 0;
+        while idx < tokens.len() && is_env_assignment(tokens[idx]) {
+            idx += 1;
+        }
+        if idx >= tokens.len() {
+            continue;
+        }
+        idx += 1;
+
+        for token in &tokens[idx..] {
+            let candidate = strip_wrapping_quotes(token);
+            if candidate.is_empty() || candidate.starts_with('-') || candidate.contains("://") {
+                continue;
+            }
+
+            let looks_like_path = candidate.starts_with('/')
+                || candidate.starts_with("./")
+                || candidate.starts_with("../")
+                || candidate.starts_with("~/")
+                || candidate.contains('/');
+
+            if looks_like_path && !security.is_path_allowed(candidate) {
+                return Some(candidate.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+async fn run_job_command(
+    config: &Config,
+    security: &SecurityPolicy,
+    job: &CronJob,
+) -> (bool, String) {
+    if !security.is_command_allowed(&job.command) {
+        return (
+            false,
+            format!(
+                "blocked by security policy: command not allowed: {}",
+                job.command
+            ),
+        );
+    }
+
+    if let Some(path) = forbidden_path_argument(security, &job.command) {
+        return (
+            false,
+            format!("blocked by security policy: forbidden path argument: {path}"),
+        );
+    }
+
     let output = Command::new("sh")
         .arg("-lc")
         .arg(&job.command)
@@ -92,6 +182,7 @@ async fn run_job_command(config: &Config, job: &CronJob) -> (bool, String) {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::security::SecurityPolicy;
     use tempfile::TempDir;
 
     fn test_config(tmp: &TempDir) -> Config {
@@ -118,8 +209,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
         let job = test_job("echo scheduler-ok");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) = run_job_command(&config, &job).await;
+        let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(success);
         assert!(output.contains("scheduler-ok"));
         assert!(output.contains("status=exit status: 0"));
@@ -129,12 +221,42 @@ mod tests {
     async fn run_job_command_failure() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
-        let job = test_job("echo scheduler-fail 1>&2; exit 7");
+        let job = test_job("ls definitely_missing_file_for_scheduler_test");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) = run_job_command(&config, &job).await;
+        let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
-        assert!(output.contains("scheduler-fail"));
-        assert!(output.contains("status=exit status: 7"));
+        assert!(output.contains("definitely_missing_file_for_scheduler_test"));
+        assert!(output.contains("status=exit status:"));
+    }
+
+    #[tokio::test]
+    async fn run_job_command_blocks_disallowed_command() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.autonomy.allowed_commands = vec!["echo".into()];
+        let job = test_job("curl https://evil.example");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(!success);
+        assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("command not allowed"));
+    }
+
+    #[tokio::test]
+    async fn run_job_command_blocks_forbidden_path_argument() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.autonomy.allowed_commands = vec!["cat".into()];
+        let job = test_job("cat /etc/passwd");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(!success);
+        assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("forbidden path argument"));
+        assert!(output.contains("/etc/passwd"));
     }
 
     #[tokio::test]
@@ -143,12 +265,17 @@ mod tests {
         let mut config = test_config(&tmp);
         config.reliability.scheduler_retries = 1;
         config.reliability.provider_backoff_ms = 1;
+        config.autonomy.allowed_commands = vec!["sh".into()];
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let job = test_job(
-            "if [ -f retry-ok.flag ]; then echo recovered; exit 0; else touch retry-ok.flag; echo first-fail 1>&2; exit 1; fi",
-        );
+        std::fs::write(
+            config.workspace_dir.join("retry-once.sh"),
+            "#!/bin/sh\nif [ -f retry-ok.flag ]; then\n  echo recovered\n  exit 0\nfi\ntouch retry-ok.flag\nexit 1\n",
+        )
+        .unwrap();
+        let job = test_job("sh ./retry-once.sh");
 
-        let (success, output) = execute_job_with_retry(&config, &job).await;
+        let (success, output) = execute_job_with_retry(&config, &security, &job).await;
         assert!(success);
         assert!(output.contains("recovered"));
     }
@@ -159,11 +286,12 @@ mod tests {
         let mut config = test_config(&tmp);
         config.reliability.scheduler_retries = 1;
         config.reliability.provider_backoff_ms = 1;
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let job = test_job("echo still-bad 1>&2; exit 1");
+        let job = test_job("ls always_missing_for_retry_test");
 
-        let (success, output) = execute_job_with_retry(&config, &job).await;
+        let (success, output) = execute_job_with_retry(&config, &security, &job).await;
         assert!(!success);
-        assert!(output.contains("still-bad"));
+        assert!(output.contains("always_missing_for_retry_test"));
     }
 }
