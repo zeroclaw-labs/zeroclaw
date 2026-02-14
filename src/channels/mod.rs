@@ -4,6 +4,7 @@ pub mod imessage;
 pub mod matrix;
 pub mod slack;
 pub mod telegram;
+pub mod whatsapp;
 pub mod traits;
 
 pub use cli::CliChannel;
@@ -12,6 +13,7 @@ pub use imessage::IMessageChannel;
 pub use matrix::MatrixChannel;
 pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
+pub use whatsapp::WhatsAppChannel;
 pub use traits::Channel;
 
 use crate::config::Config;
