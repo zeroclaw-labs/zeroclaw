@@ -7,7 +7,6 @@ pub mod slack;
 pub mod telegram;
 pub mod whatsapp;
 pub mod traits;
-pub mod whatsapp;
 
 pub use cli::CliChannel;
 pub use discord::DiscordChannel;
@@ -15,10 +14,8 @@ pub use imessage::IMessageChannel;
 pub use matrix::MatrixChannel;
 pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
-#[allow(unused_imports)]
 pub use whatsapp::WhatsAppChannel;
 pub use traits::Channel;
-pub use whatsapp::WhatsAppChannel;
 
 use crate::config::Config;
 use crate::memory::{self, Memory};
