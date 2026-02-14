@@ -15,7 +15,7 @@ use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use anyhow::Result;
 use axum::{
     body::Bytes,
-    extract::{Query, State},
+    extract::{Query, State, WebSocketUpgrade, ws},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json},
     routing::{get, post},
@@ -184,6 +184,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/webhook", post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
+        .route("/events", get(handle_events_ws))
         .with_state(state)
         .merge(registry_api)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE));
@@ -427,6 +428,54 @@ async fn handle_whatsapp_message(State(state): State<AppState>, body: Bytes) -> 
 
     // Acknowledge the webhook
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
+/// GET /events — WebSocket endpoint for real-time agent event streaming.
+///
+/// Clients connect via WebSocket and receive JSON-serialized `AgentEvent` messages
+/// for all tool executions, assistant text, thinking, and lifecycle events.
+/// This powers the dashboard's real-time agent activity display.
+async fn handle_events_ws(
+    ws: WebSocketUpgrade,
+    State(_state): State<AppState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(handle_events_socket)
+}
+
+async fn handle_events_socket(mut socket: ws::WebSocket) {
+    let bus = crate::events::event_bus();
+
+    // Use a tokio channel to bridge the sync event bus callback to the async WebSocket
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    let listener_id = bus.subscribe(move |evt| {
+        if let Ok(json) = serde_json::to_string(evt) {
+            let _ = tx.send(json);
+        }
+    });
+
+    tracing::info!("Dashboard WebSocket connected (events stream)");
+
+    // Stream events to the client until they disconnect
+    loop {
+        tokio::select! {
+            Some(json) = rx.recv() => {
+                if socket.send(ws::Message::Text(json.into())).await.is_err() {
+                    break; // Client disconnected
+                }
+            }
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(ws::Message::Close(_))) | None => break,
+                    Some(Err(_)) => break,
+                    _ => {} // Ignore other messages (ping/pong handled by axum)
+                }
+            }
+        }
+    }
+
+    bus.unsubscribe(listener_id);
+    tracing::info!("Dashboard WebSocket disconnected");
 }
 
 #[cfg(test)]

@@ -13,12 +13,15 @@
 
 pub mod aria;
 pub mod config;
+pub mod events;
 pub mod heartbeat;
 pub mod memory;
 pub mod observability;
 pub mod pipeline;
+pub mod prompt;
 pub mod providers;
 pub mod quilt;
 pub mod runtime;
 pub mod security;
+pub mod session;
 pub mod team;
