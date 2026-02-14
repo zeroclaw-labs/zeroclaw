@@ -302,7 +302,8 @@ async fn handle_webhook(
             (StatusCode::OK, Json(body))
         }
         Err(e) => {
-            let err = serde_json::json!({"error": format!("LLM error: {e}")});
+            tracing::error!("LLM error: {e:#}");
+            let err = serde_json::json!({"error": "Internal error processing your request"});
             (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
         }
     }
@@ -405,8 +406,10 @@ async fn handle_whatsapp_message(State(state): State<AppState>, body: Bytes) -> 
                 }
             }
             Err(e) => {
-                tracing::error!("LLM error for WhatsApp message: {e}");
-                let _ = wa.send(&format!("⚠️ Error: {e}"), &msg.sender).await;
+                tracing::error!("LLM error for WhatsApp message: {e:#}");
+                let _ = wa
+                    .send("Sorry, I couldn't process your message right now.", &msg.sender)
+                    .await;
             }
         }
     }
