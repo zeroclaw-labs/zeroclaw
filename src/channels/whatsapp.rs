@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use super::traits::{Channel, ChannelMessage};
 
@@ -150,8 +150,14 @@ impl WhatsAppChannel {
     pub fn is_sender_allowed(&self, phone: &str) -> bool {
         if self.config.allowed_numbers.is_empty() { return false; }
         if self.config.allowed_numbers.iter().any(|a| a == "*") { return true; }
+        // Normalize phone numbers for comparison (strip + and leading zeros)
+        fn normalize(p: &str) -> String {
+            p.trim_start_matches('+').trim_start_matches('0').to_string()
+        }
+        let phone_norm = normalize(phone);
         self.config.allowed_numbers.iter().any(|a| {
-            a.eq_ignore_ascii_case(phone) || phone.ends_with(a) || a.ends_with(phone)
+            let a_norm = normalize(a);
+            a_norm == phone_norm || phone_norm.ends_with(&a_norm) || a_norm.ends_with(&phone_norm)
         })
     }
 
@@ -190,7 +196,10 @@ impl Channel for WhatsAppChannel {
     async fn listen(&self, _tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
         info!("WhatsApp webhook path: {}", self.config.webhook_path);
         // Webhooks handled by gateway HTTP server — process_webhook() called externally
-        Ok(())
+        // Keep task alive to prevent channel bus from closing
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        }
     }
 
     async fn health_check(&self) -> bool {
@@ -198,7 +207,7 @@ impl Channel for WhatsAppChannel {
         self.client.get(&url)
             .header("Authorization", format!("Bearer {}", self.config.access_token))
             .send().await
-            .map(|r| r.status().is_success() || r.status().as_u16() == 404)
+            .map(|r| r.status().is_success())
             .unwrap_or(false)
     }
 }

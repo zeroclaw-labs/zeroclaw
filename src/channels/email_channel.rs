@@ -2,19 +2,76 @@ use async_trait::async_trait;
 use anyhow::{anyhow, Result};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
-use mail_parser::{Message as ParsedMessage, MimeHeaders};
+use mail_parser::{MessageParser, MimeHeaders};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader, Write as IoWrite};
+use std::io::Write as IoWrite;
 use std::net::TcpStream;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
-// Email config — add to config.rs
 use super::traits::{Channel, ChannelMessage};
+
+/// Email channel configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmailConfig {
+    /// IMAP server hostname
+    pub imap_host: String,
+    /// IMAP server port (default: 993 for TLS)
+    #[serde(default = "default_imap_port")]
+    pub imap_port: u16,
+    /// IMAP folder to poll (default: INBOX)
+    #[serde(default = "default_imap_folder")]
+    pub imap_folder: String,
+    /// SMTP server hostname
+    pub smtp_host: String,
+    /// SMTP server port (default: 587 for STARTTLS)
+    #[serde(default = "default_smtp_port")]
+    pub smtp_port: u16,
+    /// Use TLS for SMTP (default: true)
+    #[serde(default = "default_true")]
+    pub smtp_tls: bool,
+    /// Email username for authentication
+    pub username: String,
+    /// Email password for authentication
+    pub password: String,
+    /// From address for outgoing emails
+    pub from_address: String,
+    /// Poll interval in seconds (default: 60)
+    #[serde(default = "default_poll_interval")]
+    pub poll_interval_secs: u64,
+    /// Allowed sender addresses/domains (empty = deny all, ["*"] = allow all)
+    #[serde(default)]
+    pub allowed_senders: Vec<String>,
+}
+
+fn default_imap_port() -> u16 { 993 }
+fn default_smtp_port() -> u16 { 587 }
+fn default_imap_folder() -> String { "INBOX".into() }
+fn default_poll_interval() -> u64 { 60 }
+fn default_true() -> bool { true }
+
+impl Default for EmailConfig {
+    fn default() -> Self {
+        Self {
+            imap_host: String::new(),
+            imap_port: default_imap_port(),
+            imap_folder: default_imap_folder(),
+            smtp_host: String::new(),
+            smtp_port: default_smtp_port(),
+            smtp_tls: true,
+            username: String::new(),
+            password: String::new(),
+            from_address: String::new(),
+            poll_interval_secs: default_poll_interval(),
+            allowed_senders: Vec::new(),
+        }
+    }
+}
 
 /// Email channel — IMAP polling for inbound, SMTP for outbound
 pub struct EmailChannel {
@@ -38,11 +95,18 @@ impl EmailChannel {
         if self.config.allowed_senders.iter().any(|a| a == "*") {
             return true; // Wildcard = allow all
         }
+        let email_lower = email.to_lowercase();
         self.config.allowed_senders.iter().any(|allowed| {
-            allowed.eq_ignore_ascii_case(email)
-                || email.to_lowercase().ends_with(&format!("@{}", allowed.to_lowercase()))
-                || (allowed.starts_with('@')
-                    && email.to_lowercase().ends_with(&allowed.to_lowercase()))
+            if allowed.starts_with('@') {
+                // Domain match with @ prefix: "@example.com"
+                email_lower.ends_with(&allowed.to_lowercase())
+            } else if allowed.contains('@') {
+                // Full email address match
+                allowed.eq_ignore_ascii_case(email)
+            } else {
+                // Domain match without @ prefix: "example.com"
+                email_lower.ends_with(&format!("@{}", allowed.to_lowercase()))
+            }
         })
     }
 
@@ -63,18 +127,11 @@ impl EmailChannel {
 
     /// Extract the sender address from a parsed email
     fn extract_sender(parsed: &mail_parser::Message) -> String {
-        match parsed.from() {
-            mail_parser::HeaderValue::Address(addr) => {
-                addr.address.as_ref().map(|a| a.to_string()).unwrap_or_else(|| "unknown".into())
-            }
-            mail_parser::HeaderValue::AddressList(addrs) => {
-                addrs.first()
-                    .and_then(|a| a.address.as_ref())
-                    .map(|a| a.to_string())
-                    .unwrap_or_else(|| "unknown".into())
-            }
-            _ => "unknown".into(),
-        }
+        parsed.from()
+            .and_then(|addr| addr.first())
+            .and_then(|a| a.address())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "unknown".into())
     }
 
     /// Extract readable text from a parsed email
@@ -124,7 +181,7 @@ impl EmailChannel {
             rustls::ClientConnection::new(tls_config, server_name)?;
         let mut tls = rustls::StreamOwned::new(conn, tcp);
 
-        let mut read_line = |tls: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>| -> Result<String> {
+        let read_line = |tls: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>| -> Result<String> {
             let mut buf = Vec::new();
             loop {
                 let mut byte = [0u8; 1];
@@ -141,7 +198,7 @@ impl EmailChannel {
             }
         };
 
-        let mut send_cmd = |tls: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+        let send_cmd = |tls: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
                             tag: &str,
                             cmd: &str|
          -> Result<Vec<String>> {
@@ -189,10 +246,13 @@ impl EmailChannel {
         }
 
         let mut results = Vec::new();
+        let mut tag_counter = 4_u32; // Start after A1, A2, A3
 
         for uid in &uids {
-            // Fetch RFC822
-            let fetch_resp = send_cmd(&mut tls, "A4", &format!("FETCH {} RFC822", uid))?;
+            // Fetch RFC822 with unique tag
+            let fetch_tag = format!("A{}", tag_counter);
+            tag_counter += 1;
+            let fetch_resp = send_cmd(&mut tls, &fetch_tag, &format!("FETCH {} RFC822", uid))?;
             // Reconstruct the raw email from the response (skip first and last lines)
             let raw: String = fetch_resp
                 .iter()
@@ -201,7 +261,7 @@ impl EmailChannel {
                 .cloned()
                 .collect();
 
-            if let Some(parsed) = ParsedMessage::parse(raw.as_bytes()) {
+            if let Some(parsed) = MessageParser::default().parse(raw.as_bytes()) {
                 let sender = Self::extract_sender(&parsed);
                 let subject = parsed.subject().unwrap_or("(no subject)").to_string();
                 let body = Self::extract_text(&parsed);
@@ -213,7 +273,6 @@ impl EmailChannel {
                 let ts = parsed
                     .date()
                     .map(|d| {
-                        // DateTime year/month/day/hour/minute/second
                         let naive = chrono::NaiveDate::from_ymd_opt(
                             d.year as i32, d.month as u32, d.day as u32
                         ).and_then(|date| date.and_hms_opt(d.hour as u32, d.minute as u32, d.second as u32));
@@ -222,19 +281,22 @@ impl EmailChannel {
                     .unwrap_or_else(|| {
                         SystemTime::now()
                             .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs()
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0)
                     });
 
                 results.push((msg_id, sender, content, ts));
             }
 
-            // Mark as seen
-            let _ = send_cmd(&mut tls, "A5", &format!("STORE {} +FLAGS (\\Seen)", uid));
+            // Mark as seen with unique tag
+            let store_tag = format!("A{}", tag_counter);
+            tag_counter += 1;
+            let _ = send_cmd(&mut tls, &store_tag, &format!("STORE {} +FLAGS (\\Seen)", uid));
         }
 
-        // Logout
-        let _ = send_cmd(&mut tls, "A6", "LOGOUT");
+        // Logout with unique tag
+        let logout_tag = format!("A{}", tag_counter);
+        let _ = send_cmd(&mut tls, &logout_tag, "LOGOUT");
 
         Ok(results)
     }
