@@ -169,9 +169,9 @@ enum Commands {
 
 #[derive(Subcommand, Debug)]
 enum MigrateCommands {
-    /// Import memory from an OpenClaw workspace into this ZeroClaw workspace
+    /// Import memory from an `OpenClaw` workspace into this `ZeroClaw` workspace
     Openclaw {
-        /// Optional path to OpenClaw workspace (defaults to ~/.openclaw/workspace)
+        /// Optional path to `OpenClaw` workspace (defaults to ~/.openclaw/workspace)
         #[arg(long)]
         source: Option<std::path::PathBuf>,
 
@@ -387,9 +387,9 @@ async fn main() -> Result<()> {
             Ok(())
         }
 
-        Commands::Cron { cron_command } => cron::handle_command(cron_command, config),
+        Commands::Cron { cron_command } => cron::handle_command(cron_command, &config),
 
-        Commands::Service { service_command } => service::handle_command(service_command, &config),
+        Commands::Service { service_command } => service::handle_command(&service_command, &config),
 
         Commands::Doctor => doctor::run(&config),
 

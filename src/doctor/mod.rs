@@ -52,25 +52,21 @@ pub fn run(config: &Config) -> Result<()> {
             let scheduler_ok = scheduler
                 .get("status")
                 .and_then(serde_json::Value::as_str)
-                .map(|s| s == "ok")
-                .unwrap_or(false);
+                .is_some_and(|s| s == "ok");
 
             let scheduler_last_ok = scheduler
                 .get("last_ok")
                 .and_then(serde_json::Value::as_str)
                 .and_then(parse_rfc3339)
-                .map(|dt| Utc::now().signed_duration_since(dt).num_seconds())
-                .unwrap_or(i64::MAX);
+                .map_or(i64::MAX, |dt| {
+                    Utc::now().signed_duration_since(dt).num_seconds()
+                });
 
             if scheduler_ok && scheduler_last_ok <= SCHEDULER_STALE_SECONDS {
-                println!(
-                    "  ✅ scheduler healthy (last ok {}s ago)",
-                    scheduler_last_ok
-                );
+                println!("  ✅ scheduler healthy (last ok {scheduler_last_ok}s ago)");
             } else {
                 println!(
-                    "  ❌ scheduler unhealthy/stale (status_ok={}, age={}s)",
-                    scheduler_ok, scheduler_last_ok
+                    "  ❌ scheduler unhealthy/stale (status_ok={scheduler_ok}, age={scheduler_last_ok}s)"
                 );
             }
         } else {
@@ -86,14 +82,14 @@ pub fn run(config: &Config) -> Result<()> {
             let status_ok = component
                 .get("status")
                 .and_then(serde_json::Value::as_str)
-                .map(|s| s == "ok")
-                .unwrap_or(false);
+                .is_some_and(|s| s == "ok");
             let age = component
                 .get("last_ok")
                 .and_then(serde_json::Value::as_str)
                 .and_then(parse_rfc3339)
-                .map(|dt| Utc::now().signed_duration_since(dt).num_seconds())
-                .unwrap_or(i64::MAX);
+                .map_or(i64::MAX, |dt| {
+                    Utc::now().signed_duration_since(dt).num_seconds()
+                });
 
             if status_ok && age <= CHANNEL_STALE_SECONDS {
                 println!("  ✅ {name} fresh (last ok {age}s ago)");
@@ -107,10 +103,7 @@ pub fn run(config: &Config) -> Result<()> {
     if channel_count == 0 {
         println!("  ℹ️ no channel components tracked in state yet");
     } else {
-        println!(
-            "  Channel summary: {} total, {} stale",
-            channel_count, stale_channels
-        );
+        println!("  Channel summary: {channel_count} total, {stale_channels} stale");
     }
 
     Ok(())

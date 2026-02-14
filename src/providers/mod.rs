@@ -24,17 +24,29 @@ const MIN_SECRET_LEN: usize = 8;
 fn scrub_secret_patterns(text: &str) -> String {
     let mut result = text.to_string();
     for prefix in SECRET_PREFIXES {
+        let mut search_from = 0;
         loop {
-            let Some(start) = result.find(prefix) else {
+            let Some(rel) = result[search_from..].find(prefix) else {
                 break;
             };
+            let start = search_from + rel;
             let end = result[start..]
-                .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ',')
+                .find(|c: char| {
+                    c.is_whitespace()
+                        || c == '"'
+                        || c == '\''
+                        || c == ','
+                        || c == '}'
+                        || c == ')'
+                        || c == ']'
+                        || c == ';'
+                })
                 .map_or(result.len(), |i| start + i);
             if end - start >= MIN_SECRET_LEN {
                 result.replace_range(start..end, "[REDACTED]");
+                search_from = start + "[REDACTED]".len();
             } else {
-                break;
+                search_from = end;
             }
         }
     }
@@ -450,6 +462,22 @@ mod tests {
         let msg = "the sk- prefix is documented";
         let result = sanitize_api_error(msg);
         assert_eq!(result, msg);
+    }
+
+    #[test]
+    fn sanitize_short_prefix_then_real_key() {
+        let msg = "error with sk- prefix and key sk-1234567890";
+        let result = sanitize_api_error(msg);
+        assert!(!result.contains("sk-1234567890"));
+        assert!(result.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn sanitize_sk_proj_comment_then_real_key() {
+        let msg = "use sk-proj- prefix then sk-proj-abc123xyz456";
+        let result = sanitize_api_error(msg);
+        assert!(!result.contains("sk-proj-abc123xyz456"));
+        assert!(result.contains("[REDACTED]"));
     }
 
     #[test]

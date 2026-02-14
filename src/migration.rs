@@ -220,7 +220,7 @@ fn read_openclaw_markdown_entries(source_workspace: &Path) -> Result<Vec<SourceE
         all.extend(parse_markdown_file(
             &core_path,
             &content,
-            MemoryCategory::Core,
+            &MemoryCategory::Core,
             "openclaw_core",
         ));
     }
@@ -241,7 +241,7 @@ fn read_openclaw_markdown_entries(source_workspace: &Path) -> Result<Vec<SourceE
             all.extend(parse_markdown_file(
                 &path,
                 &content,
-                MemoryCategory::Daily,
+                &MemoryCategory::Daily,
                 stem,
             ));
         }
@@ -253,7 +253,7 @@ fn read_openclaw_markdown_entries(source_workspace: &Path) -> Result<Vec<SourceE
 fn parse_markdown_file(
     _path: &Path,
     content: &str,
-    default_category: MemoryCategory,
+    default_category: &MemoryCategory,
     stem: &str,
 ) -> Vec<SourceEntry> {
     let mut entries = Vec::new();
@@ -306,10 +306,9 @@ fn parse_structured_memory_line(line: &str) -> Option<(&str, &str)> {
 
 fn parse_category(raw: &str) -> MemoryCategory {
     match raw.trim().to_ascii_lowercase().as_str() {
-        "core" => MemoryCategory::Core,
         "daily" => MemoryCategory::Daily,
         "conversation" => MemoryCategory::Conversation,
-        "" => MemoryCategory::Core,
+        "core" | "" => MemoryCategory::Core,
         other => MemoryCategory::Custom(other.to_string()),
     }
 }
@@ -350,7 +349,7 @@ fn pick_optional_column_expr(columns: &[String], candidates: &[&str]) -> Option<
     candidates
         .iter()
         .find(|candidate| columns.iter().any(|c| c == *candidate))
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
 }
 
 fn pick_column_expr(columns: &[String], candidates: &[&str], fallback: &str) -> String {
@@ -459,7 +458,7 @@ mod tests {
         let entries = parse_markdown_file(
             Path::new("/tmp/MEMORY.md"),
             "- plain note",
-            MemoryCategory::Core,
+            &MemoryCategory::Core,
             "core",
         );
         assert_eq!(entries.len(), 1);

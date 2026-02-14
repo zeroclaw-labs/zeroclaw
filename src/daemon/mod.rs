@@ -90,7 +90,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     println!("   Ctrl+C to stop");
 
     tokio::signal::ctrl_c().await?;
-    crate::health::mark_component_error("daemon", "shutdown requested");
+    crate::health::mark_component_error("daemon", &"shutdown requested");
 
     for handle in &handles {
         handle.abort();
@@ -151,11 +151,11 @@ where
             crate::health::mark_component_ok(name);
             match run_component().await {
                 Ok(()) => {
-                    crate::health::mark_component_error(name, "component exited unexpectedly");
+                    crate::health::mark_component_error(name, &"component exited unexpectedly");
                     tracing::warn!("Daemon component '{name}' exited unexpectedly");
                 }
                 Err(e) => {
-                    crate::health::mark_component_error(name, e.to_string());
+                    crate::health::mark_component_error(name, &e.to_string());
                     tracing::error!("Daemon component '{name}' failed: {e}");
                 }
             }
@@ -192,7 +192,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             let temp = config.default_temperature;
             if let Err(e) = crate::agent::run(config.clone(), Some(prompt), None, None, temp).await
             {
-                crate::health::mark_component_error("heartbeat", e.to_string());
+                crate::health::mark_component_error("heartbeat", &e.to_string());
                 tracing::warn!("Heartbeat task failed: {e}");
             } else {
                 crate::health::mark_component_ok("heartbeat");

@@ -21,7 +21,7 @@ pub async fn run(config: Config) -> Result<()> {
         let jobs = match due_jobs(&config, Utc::now()) {
             Ok(jobs) => jobs,
             Err(e) => {
-                crate::health::mark_component_error("scheduler", e.to_string());
+                crate::health::mark_component_error("scheduler", &e.to_string());
                 tracing::warn!("Scheduler query failed: {e}");
                 continue;
             }
@@ -32,11 +32,11 @@ pub async fn run(config: Config) -> Result<()> {
             let (success, output) = execute_job_with_retry(&config, &security, &job).await;
 
             if !success {
-                crate::health::mark_component_error("scheduler", format!("job {} failed", job.id));
+                crate::health::mark_component_error("scheduler", &format!("job {} failed", job.id));
             }
 
             if let Err(e) = reschedule_after_run(&config, &job, success, &output) {
-                crate::health::mark_component_error("scheduler", e.to_string());
+                crate::health::mark_component_error("scheduler", &e.to_string());
                 tracing::warn!("Failed to persist scheduler run result: {e}");
             }
         }
@@ -66,7 +66,7 @@ async fn execute_job_with_retry(
         }
 
         if attempt < retries {
-            let jitter_ms = (Utc::now().timestamp_subsec_millis() % 250) as u64;
+            let jitter_ms = u64::from(Utc::now().timestamp_subsec_millis() % 250);
             time::sleep(Duration::from_millis(backoff_ms + jitter_ms)).await;
             backoff_ms = (backoff_ms.saturating_mul(2)).min(30_000);
         }
