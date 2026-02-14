@@ -4,7 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-const SERVICE_LABEL: &str = "com.zeroclaw.daemon";
+const SERVICE_LABEL: &str = "com.afw.daemon";
 
 pub fn handle_command(command: super::ServiceCommands, config: &Config) -> Result<()> {
     match command {
@@ -35,7 +35,7 @@ fn start(config: &Config) -> Result<()> {
         Ok(())
     } else if cfg!(target_os = "linux") {
         run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
-        run_checked(Command::new("systemctl").args(["--user", "start", "zeroclaw.service"]))?;
+        run_checked(Command::new("systemctl").args(["--user", "start", "afw.service"]))?;
         println!("✅ Service started");
         Ok(())
     } else {
@@ -57,7 +57,7 @@ fn stop(config: &Config) -> Result<()> {
         println!("✅ Service stopped");
         Ok(())
     } else if cfg!(target_os = "linux") {
-        let _ = run_checked(Command::new("systemctl").args(["--user", "stop", "zeroclaw.service"]));
+        let _ = run_checked(Command::new("systemctl").args(["--user", "stop", "afw.service"]));
         println!("✅ Service stopped");
         Ok(())
     } else {
@@ -86,7 +86,7 @@ fn status(config: &Config) -> Result<()> {
         let out = run_capture(Command::new("systemctl").args([
             "--user",
             "is-active",
-            "zeroclaw.service",
+            "afw.service",
         ]))
         .unwrap_or_else(|_| "unknown".into());
         println!("Service state: {}", out.trim());
@@ -172,7 +172,7 @@ fn install_macos(config: &Config) -> Result<()> {
 
     fs::write(&file, plist)?;
     println!("✅ Installed launchd service: {}", file.display());
-    println!("   Start with: zeroclaw service start");
+    println!("   Start with: afw service start");
     Ok(())
 }
 
@@ -184,15 +184,15 @@ fn install_linux(config: &Config) -> Result<()> {
 
     let exe = std::env::current_exe().context("Failed to resolve current executable")?;
     let unit = format!(
-        "[Unit]\nDescription=ZeroClaw daemon\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={} daemon\nRestart=always\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=Aria daemon\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={} daemon\nRestart=always\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n",
         exe.display()
     );
 
     fs::write(&file, unit)?;
     let _ = run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]));
-    let _ = run_checked(Command::new("systemctl").args(["--user", "enable", "zeroclaw.service"]));
+    let _ = run_checked(Command::new("systemctl").args(["--user", "enable", "afw.service"]));
     println!("✅ Installed systemd user service: {}", file.display());
-    println!("   Start with: zeroclaw service start");
+    println!("   Start with: afw service start");
     Ok(())
 }
 
@@ -215,7 +215,7 @@ fn linux_service_file(config: &Config) -> Result<PathBuf> {
         .join(".config")
         .join("systemd")
         .join("user")
-        .join("zeroclaw.service"))
+        .join("afw.service"))
 }
 
 fn run_checked(command: &mut Command) -> Result<()> {
@@ -279,6 +279,6 @@ mod tests {
     fn linux_service_file_has_expected_suffix() {
         let file = linux_service_file(&Config::default()).unwrap();
         let path = file.to_string_lossy();
-        assert!(path.ends_with(".config/systemd/user/zeroclaw.service"));
+        assert!(path.ends_with(".config/systemd/user/afw.service"));
     }
 }

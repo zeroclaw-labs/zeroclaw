@@ -79,7 +79,7 @@ fn show_integration_info(config: &Config, name: &str) -> Result<()> {
 
     let Some(entry) = entries.iter().find(|e| e.name.to_lowercase() == name_lower) else {
         anyhow::bail!(
-            "Unknown integration: {name}. Check README for supported integrations or run `zeroclaw onboard --interactive` to configure channels/providers."
+            "Unknown integration: {name}. Check README for supported integrations or run `afw onboard --interactive` to configure channels/providers."
         );
     };
 
@@ -107,26 +107,26 @@ fn show_integration_info(config: &Config, name: &str) -> Result<()> {
             println!("  Setup:");
             println!("    1. Message @BotFather on Telegram");
             println!("    2. Create a bot and copy the token");
-            println!("    3. Run: zeroclaw onboard");
-            println!("    4. Start: zeroclaw channel start");
+            println!("    3. Run: afw onboard");
+            println!("    4. Start: afw channel start");
         }
         "Discord" => {
             println!("  Setup:");
             println!("    1. Go to https://discord.com/developers/applications");
             println!("    2. Create app → Bot → Copy token");
             println!("    3. Enable MESSAGE CONTENT intent");
-            println!("    4. Run: zeroclaw onboard");
+            println!("    4. Run: afw onboard");
         }
         "Slack" => {
             println!("  Setup:");
             println!("    1. Go to https://api.slack.com/apps");
             println!("    2. Create app → Bot Token Scopes → Install");
-            println!("    3. Run: zeroclaw onboard");
+            println!("    3. Run: afw onboard");
         }
         "OpenRouter" => {
             println!("  Setup:");
             println!("    1. Get API key at https://openrouter.ai/keys");
-            println!("    2. Run: zeroclaw onboard");
+            println!("    2. Run: afw onboard");
             println!("    Access 200+ models with one key.");
         }
         "Ollama" => {
@@ -147,23 +147,23 @@ fn show_integration_info(config: &Config, name: &str) -> Result<()> {
         }
         "Browser" => {
             println!("  Built-in:");
-            println!("    ZeroClaw can control Chrome/Chromium for web tasks.");
+            println!("    Aria can control Chrome/Chromium for web tasks.");
             println!("    Uses headless browser automation.");
         }
         "Cron" => {
             println!("  Built-in:");
-            println!("    Schedule tasks in ~/.zeroclaw/workspace/cron/");
-            println!("    Run: zeroclaw cron list");
+            println!("    Schedule tasks in ~/.afw/workspace/cron/");
+            println!("    Run: afw cron list");
         }
         "Webhooks" => {
             println!("  Built-in:");
             println!("    HTTP endpoint for external triggers.");
-            println!("    Run: zeroclaw gateway");
+            println!("    Run: afw gateway");
         }
         _ => {
             if status == IntegrationStatus::ComingSoon {
                 println!("  This integration is planned. Stay tuned!");
-                println!("  Track progress: https://github.com/theonlyhennygod/zeroclaw");
+                println!("  Track progress: https://github.com/theonlyhennygod/afw");
             }
         }
     }

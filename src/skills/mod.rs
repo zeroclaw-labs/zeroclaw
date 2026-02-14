@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// A skill is a user-defined or community-built capability.
-/// Skills live in `~/.zeroclaw/workspace/skills/<name>/SKILL.md`
+/// Skills live in `~/.afw/workspace/skills/<name>/SKILL.md`
 /// and can include tool definitions, prompts, and automation scripts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Skill {
@@ -191,7 +191,7 @@ pub fn init_skills_dir(workspace_dir: &Path) -> Result<()> {
     if !readme.exists() {
         std::fs::write(
             &readme,
-            "# ZeroClaw Skills\n\n\
+            "# Aria Skills\n\n\
              Each subdirectory is a skill. Create a `SKILL.toml` or `SKILL.md` file inside.\n\n\
              ## SKILL.toml format\n\n\
              ```toml\n\
@@ -212,8 +212,8 @@ pub fn init_skills_dir(workspace_dir: &Path) -> Result<()> {
              The agent will read it and follow the instructions.\n\n\
              ## Installing community skills\n\n\
              ```bash\n\
-             zeroclaw skills install <github-url>\n\
-             zeroclaw skills list\n\
+             afw skills install <github-url>\n\
+             afw skills list\n\
              ```\n",
         )?;
     }
@@ -246,10 +246,10 @@ pub fn handle_command(command: super::SkillCommands, workspace_dir: &Path) -> Re
             if skills.is_empty() {
                 println!("No skills installed.");
                 println!();
-                println!("  Create one: mkdir -p ~/.zeroclaw/workspace/skills/my-skill");
-                println!("              echo '# My Skill' > ~/.zeroclaw/workspace/skills/my-skill/SKILL.md");
+                println!("  Create one: mkdir -p ~/.afw/workspace/skills/my-skill");
+                println!("              echo '# My Skill' > ~/.afw/workspace/skills/my-skill/SKILL.md");
                 println!();
-                println!("  Or install: zeroclaw skills install <github-url>");
+                println!("  Or install: afw skills install <github-url>");
             } else {
                 println!("Installed skills ({}):", skills.len());
                 println!();
@@ -297,7 +297,7 @@ pub fn handle_command(command: super::SkillCommands, workspace_dir: &Path) -> Re
                         "  {} Skill installed successfully!",
                         console::style("✓").green().bold()
                     );
-                    println!("  Restart `zeroclaw channel start` to activate.");
+                    println!("  Restart `afw channel start` to activate.");
                 } else {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     anyhow::bail!("Git clone failed: {stderr}");
@@ -666,9 +666,9 @@ description = "Bare minimum"
 
     #[test]
     fn skills_dir_path() {
-        let base = std::path::Path::new("/home/user/.zeroclaw");
+        let base = std::path::Path::new("/home/user/.afw");
         let dir = skills_dir(base);
-        assert_eq!(dir, PathBuf::from("/home/user/.zeroclaw/skills"));
+        assert_eq!(dir, PathBuf::from("/home/user/.afw/skills"));
     }
 
     #[test]

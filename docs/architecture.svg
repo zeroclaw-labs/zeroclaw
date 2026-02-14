@@ -27,7 +27,7 @@
   <rect width="1100" height="950" rx="12" fill="url(#bgGrad)"/>
 
   <!-- Title -->
-  <text x="550" y="38" text-anchor="middle" fill="#e6edf3" font-size="22" font-weight="700">ZeroClaw Architecture</text>
+  <text x="550" y="38" text-anchor="middle" fill="#e6edf3" font-size="22" font-weight="700">Aria Architecture</text>
   <text x="550" y="58" text-anchor="middle" fill="#7d8590" font-size="12">Zero overhead. Zero compromise. 100% Rust. 100% Agnostic. 8 pluggable traits.</text>
 
   <!-- ═══════════ LEFT: Chat Apps ═══════════ -->
@@ -260,13 +260,13 @@
 
   <!-- ═══════════ BOTTOM: Setup Wizard ═══════════ -->
   <rect x="20" y="760" width="1060" height="170" rx="10" fill="#1c2333" stroke="#f472b6" stroke-width="1.5" filter="url(#shadow)"/>
-  <text x="550" y="785" text-anchor="middle" fill="#f9a8d4" font-size="14" font-weight="700">Setup Wizard  --  zeroclaw onboard (quick default | --interactive for full wizard)</text>
+  <text x="550" y="785" text-anchor="middle" fill="#f9a8d4" font-size="14" font-weight="700">Setup Wizard  --  afw onboard (quick default | --interactive for full wizard)</text>
   <text x="550" y="802" text-anchor="middle" fill="#7d8590" font-size="10">7 steps, under 60 seconds | Live connection testing | Secure defaults</text>
 
   <!-- Wizard steps: 7 -->
   <rect x="30" y="815" width="130" height="38" rx="8" fill="#2d1f3d" stroke="#c084fc" stroke-width="1"/>
   <text x="95" y="831" text-anchor="middle" fill="#e9d5ff" font-size="8" font-weight="600">1. Workspace</text>
-  <text x="95" y="845" text-anchor="middle" fill="#a78bfa" font-size="7">~/.zeroclaw/</text>
+  <text x="95" y="845" text-anchor="middle" fill="#a78bfa" font-size="7">~/.afw/</text>
 
   <rect x="170" y="815" width="130" height="38" rx="8" fill="#2d1f3d" stroke="#c084fc" stroke-width="1"/>
   <text x="235" y="831" text-anchor="middle" fill="#e9d5ff" font-size="8" font-weight="600">2. AI Provider</text>
@@ -305,7 +305,7 @@
 
   <!-- Ready badge -->
   <rect x="380" y="888" width="340" height="28" rx="14" fill="#166534" stroke="#4ade80" stroke-width="1"/>
-  <text x="550" y="907" text-anchor="middle" fill="#4ade80" font-size="12" font-weight="600">Ready -- zeroclaw agent</text>
+  <text x="550" y="907" text-anchor="middle" fill="#4ade80" font-size="12" font-weight="600">Ready -- afw agent</text>
 
   <!-- Footer stats -->
   <text x="550" y="942" text-anchor="middle" fill="#7d8590" font-size="10">~3.4MB binary  |  &lt;10ms startup  |  1,050 tests  |  22+ providers  |  8 traits  |  18,900+ lines of Rust  |  0 clippy warnings</text>

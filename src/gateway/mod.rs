@@ -120,7 +120,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         }
     }
 
-    println!("🦀 ZeroClaw Gateway listening on http://{display_addr}");
+    println!("🦀 Aria Gateway listening on http://{display_addr}");
     if let Some(ref url) = tunnel_url {
         println!("  🌐 Public URL: {url}");
     }
@@ -162,6 +162,19 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         whatsapp: whatsapp_channel,
     };
 
+    // ── Aria Registry API ──────────────────────────────────────
+    let aria_db_path = config
+        .workspace_dir
+        .join("aria.db");
+    let aria_registries = crate::aria::initialize_aria_registries(&aria_db_path)
+        .unwrap_or_else(|e| {
+            tracing::warn!("Failed to initialize Aria registries: {e}");
+            // Create a fallback in-memory DB
+            let db = crate::aria::db::AriaDb::open_in_memory().expect("fallback in-memory DB");
+            std::sync::Arc::new(crate::aria::AriaRegistries::new(db))
+        });
+    let registry_api = crate::api::registry_router(aria_registries.db.clone());
+
     // Build router with middleware
     // Note: Body limit layer prevents memory exhaustion from oversized requests
     // Timeout is handled by tokio's TcpListener accept timeout and hyper's built-in timeouts
@@ -172,6 +185,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
         .with_state(state)
+        .merge(registry_api)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE));
 
     // Run the server

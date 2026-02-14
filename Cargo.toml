@@ -1,10 +1,10 @@
 [package]
-name = "zeroclaw"
+name = "afw"
 version = "0.1.0"
 edition = "2021"
 authors = ["theonlyhennygod"]
 license = "MIT"
-description = "Zero overhead. Zero compromise. 100% Rust. The fastest, smallest AI assistant."
+description = "Aria Firmware — zero overhead, zero compromise, 100% Rust. The fastest, smallest AI assistant."
 repository = "https://github.com/theonlyhennygod/zeroclaw"
 readme = "README.md"
 keywords = ["ai", "agent", "cli", "assistant", "chatbot"]

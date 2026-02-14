@@ -139,8 +139,8 @@ impl Channel for DiscordChannel {
                 "intents": 33281, // GUILDS | GUILD_MESSAGES | MESSAGE_CONTENT | DIRECT_MESSAGES
                 "properties": {
                     "os": "linux",
-                    "browser": "zeroclaw",
-                    "device": "zeroclaw"
+                    "browser": "afw",
+                    "device": "afw"
                 }
             }
         });

@@ -13,6 +13,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "afw"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "chacha20poly1305",
+ "chrono",
+ "clap",
+ "console",
+ "cron",
+ "dialoguer",
+ "directories",
+ "futures-util",
+ "hostname",
+ "http-body-util",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "shellexpand",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-test",
+ "tokio-tungstenite",
+ "toml",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2468,41 +2503,6 @@ dependencies = [
  "quote",
  "syn",
  "synstructure",
-]
-
-[[package]]
-name = "zeroclaw"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "chacha20poly1305",
- "chrono",
- "clap",
- "console",
- "cron",
- "dialoguer",
- "directories",
- "futures-util",
- "hostname",
- "http-body-util",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "shellexpand",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-test",
- "tokio-tungstenite",
- "toml",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]
