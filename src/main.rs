@@ -169,9 +169,9 @@ enum Commands {
 
 #[derive(Subcommand, Debug)]
 enum MigrateCommands {
-    /// Import memory from an OpenClaw workspace into this ZeroClaw workspace
+    /// Import memory from an `OpenClaw` workspace into this `ZeroClaw` workspace
     Openclaw {
-        /// Optional path to OpenClaw workspace (defaults to ~/.openclaw/workspace)
+        /// Optional path to `OpenClaw` workspace (defaults to ~/.openclaw/workspace)
         #[arg(long)]
         source: Option<std::path::PathBuf>,
 

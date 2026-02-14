@@ -95,7 +95,7 @@ struct GeminiCliSettings {
 
 impl GeminiProvider {
     /// Create a new Gemini provider.
-    /// 
+    ///
     /// Authentication priority:
     /// 1. Explicit API key passed in
     /// 2. `GEMINI_API_KEY` environment variable

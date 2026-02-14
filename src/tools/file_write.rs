@@ -69,15 +69,12 @@ impl Tool for FileWriteTool {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        let parent = match full_path.parent() {
-            Some(p) => p,
-            None => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some("Invalid path: missing parent directory".into()),
-                });
-            }
+        let Some(parent) = full_path.parent() else {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Invalid path: missing parent directory".into()),
+            });
         };
 
         // Resolve parent before writing to block symlink escapes.
@@ -103,15 +100,12 @@ impl Tool for FileWriteTool {
             });
         }
 
-        let file_name = match full_path.file_name() {
-            Some(name) => name,
-            None => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some("Invalid path: missing file name".into()),
-                });
-            }
+        let Some(file_name) = full_path.file_name() else {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Invalid path: missing file name".into()),
+            });
         };
 
         let resolved_target = resolved_parent.join(file_name);

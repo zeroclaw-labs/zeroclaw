@@ -6,6 +6,7 @@ use std::process::Command;
 
 const SERVICE_LABEL: &str = "com.zeroclaw.daemon";
 
+#[allow(clippy::needless_pass_by_value)]
 pub fn handle_command(command: super::ServiceCommands, config: &Config) -> Result<()> {
     match command {
         super::ServiceCommands::Install => install(config),

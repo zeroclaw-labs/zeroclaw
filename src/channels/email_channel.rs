@@ -8,8 +8,8 @@
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::unnecessary_map_or)]
 
-use async_trait::async_trait;
 use anyhow::{anyhow, Result};
+use async_trait::async_trait;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
 use mail_parser::{MessageParser, MimeHeaders};
@@ -59,11 +59,21 @@ pub struct EmailConfig {
     pub allowed_senders: Vec<String>,
 }
 
-fn default_imap_port() -> u16 { 993 }
-fn default_smtp_port() -> u16 { 587 }
-fn default_imap_folder() -> String { "INBOX".into() }
-fn default_poll_interval() -> u64 { 60 }
-fn default_true() -> bool { true }
+fn default_imap_port() -> u16 {
+    993
+}
+fn default_smtp_port() -> u16 {
+    587
+}
+fn default_imap_folder() -> String {
+    "INBOX".into()
+}
+fn default_poll_interval() -> u64 {
+    60
+}
+fn default_true() -> bool {
+    true
+}
 
 impl Default for EmailConfig {
     fn default() -> Self {
@@ -137,7 +147,8 @@ impl EmailChannel {
 
     /// Extract the sender address from a parsed email
     fn extract_sender(parsed: &mail_parser::Message) -> String {
-        parsed.from()
+        parsed
+            .from()
             .and_then(|addr| addr.first())
             .and_then(|a| a.address())
             .map(|s| s.to_string())
@@ -185,32 +196,31 @@ impl EmailChannel {
                 .with_root_certificates(root_store)
                 .with_no_client_auth(),
         );
-        let server_name: ServerName<'_> =
-            ServerName::try_from(config.imap_host.clone())?;
-        let conn =
-            rustls::ClientConnection::new(tls_config, server_name)?;
+        let server_name: ServerName<'_> = ServerName::try_from(config.imap_host.clone())?;
+        let conn = rustls::ClientConnection::new(tls_config, server_name)?;
         let mut tls = rustls::StreamOwned::new(conn, tcp);
 
-        let read_line = |tls: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>| -> Result<String> {
-            let mut buf = Vec::new();
-            loop {
-                let mut byte = [0u8; 1];
-                match std::io::Read::read(tls, &mut byte) {
-                    Ok(0) => return Err(anyhow!("IMAP connection closed")),
-                    Ok(_) => {
-                        buf.push(byte[0]);
-                        if buf.ends_with(b"\r\n") {
-                            return Ok(String::from_utf8_lossy(&buf).to_string());
+        let read_line =
+            |tls: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>| -> Result<String> {
+                let mut buf = Vec::new();
+                loop {
+                    let mut byte = [0u8; 1];
+                    match std::io::Read::read(tls, &mut byte) {
+                        Ok(0) => return Err(anyhow!("IMAP connection closed")),
+                        Ok(_) => {
+                            buf.push(byte[0]);
+                            if buf.ends_with(b"\r\n") {
+                                return Ok(String::from_utf8_lossy(&buf).to_string());
+                            }
                         }
+                        Err(e) => return Err(e.into()),
                     }
-                    Err(e) => return Err(e.into()),
                 }
-            }
-        };
+            };
 
         let send_cmd = |tls: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
-                            tag: &str,
-                            cmd: &str|
+                        tag: &str,
+                        cmd: &str|
          -> Result<Vec<String>> {
             let full = format!("{} {}\r\n", tag, cmd);
             IoWrite::write_all(tls, full.as_bytes())?;
@@ -241,7 +251,11 @@ impl EmailChannel {
         }
 
         // Select folder
-        let _select = send_cmd(&mut tls, "A2", &format!("SELECT \"{}\"", config.imap_folder))?;
+        let _select = send_cmd(
+            &mut tls,
+            "A2",
+            &format!("SELECT \"{}\"", config.imap_folder),
+        )?;
 
         // Search unseen
         let search_resp = send_cmd(&mut tls, "A3", "SEARCH UNSEEN")?;
@@ -285,8 +299,17 @@ impl EmailChannel {
                     .date()
                     .map(|d| {
                         let naive = chrono::NaiveDate::from_ymd_opt(
-                            d.year as i32, u32::from(d.month), u32::from(d.day)
-                        ).and_then(|date| date.and_hms_opt(u32::from(d.hour), u32::from(d.minute), u32::from(d.second)));
+                            d.year as i32,
+                            u32::from(d.month),
+                            u32::from(d.day),
+                        )
+                        .and_then(|date| {
+                            date.and_hms_opt(
+                                u32::from(d.hour),
+                                u32::from(d.minute),
+                                u32::from(d.second),
+                            )
+                        });
                         naive.map_or(0, |n| n.and_utc().timestamp() as u64)
                     })
                     .unwrap_or_else(|| {
@@ -302,7 +325,11 @@ impl EmailChannel {
             // Mark as seen with unique tag
             let store_tag = format!("A{tag_counter}");
             tag_counter += 1;
-            let _ = send_cmd(&mut tls, &store_tag, &format!("STORE {uid} +FLAGS (\\Seen)"));
+            let _ = send_cmd(
+                &mut tls,
+                &store_tag,
+                &format!("STORE {uid} +FLAGS (\\Seen)"),
+            );
         }
 
         // Logout with unique tag

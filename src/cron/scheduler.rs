@@ -66,7 +66,7 @@ async fn execute_job_with_retry(
         }
 
         if attempt < retries {
-            let jitter_ms = (Utc::now().timestamp_subsec_millis() % 250) as u64;
+            let jitter_ms = u64::from(Utc::now().timestamp_subsec_millis() % 250);
             time::sleep(Duration::from_millis(backoff_ms + jitter_ms)).await;
             backoff_ms = (backoff_ms.saturating_mul(2)).min(30_000);
         }

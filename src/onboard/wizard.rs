@@ -451,7 +451,10 @@ fn setup_provider() -> Result<(String, String, String)> {
             ("mistral", "Mistral — Large & Codestral"),
             ("xai", "xAI — Grok 3 & 4"),
             ("perplexity", "Perplexity — search-augmented AI"),
-            ("gemini", "Google Gemini — Gemini 2.0 Flash & Pro (supports CLI auth)"),
+            (
+                "gemini",
+                "Google Gemini — Gemini 2.0 Flash & Pro (supports CLI auth)",
+            ),
         ],
         1 => vec![
             ("groq", "Groq — ultra-fast LPU inference"),
@@ -534,7 +537,10 @@ fn setup_provider() -> Result<(String, String, String)> {
     let api_key = if provider_name == "ollama" {
         print_bullet("Ollama runs locally — no API key needed!");
         String::new()
-    } else if provider_name == "gemini" || provider_name == "google" || provider_name == "google-gemini" {
+    } else if provider_name == "gemini"
+        || provider_name == "google"
+        || provider_name == "google-gemini"
+    {
         // Special handling for Gemini: check for CLI auth first
         if crate::providers::gemini::GeminiProvider::has_cli_credentials() {
             print_bullet(&format!(
@@ -741,7 +747,10 @@ fn setup_provider() -> Result<(String, String, String)> {
         ],
         "gemini" | "google" | "google-gemini" => vec![
             ("gemini-2.0-flash", "Gemini 2.0 Flash (fast, recommended)"),
-            ("gemini-2.0-flash-lite", "Gemini 2.0 Flash Lite (fastest, cheapest)"),
+            (
+                "gemini-2.0-flash-lite",
+                "Gemini 2.0 Flash Lite (fastest, cheapest)",
+            ),
             ("gemini-1.5-pro", "Gemini 1.5 Pro (best quality)"),
             ("gemini-1.5-flash", "Gemini 1.5 Flash (balanced)"),
         ],

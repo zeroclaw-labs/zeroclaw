@@ -5,8 +5,8 @@ pub mod imessage;
 pub mod matrix;
 pub mod slack;
 pub mod telegram;
-pub mod whatsapp;
 pub mod traits;
+pub mod whatsapp;
 
 pub use cli::CliChannel;
 pub use discord::DiscordChannel;
@@ -14,8 +14,8 @@ pub use imessage::IMessageChannel;
 pub use matrix::MatrixChannel;
 pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
-pub use whatsapp::WhatsAppChannel;
 pub use traits::Channel;
+pub use whatsapp::WhatsAppChannel;
 
 use crate::config::Config;
 use crate::memory::{self, Memory};
@@ -189,7 +189,7 @@ pub fn build_system_prompt(
     }
 }
 
-/// Inject OpenClaw (markdown) identity files into the prompt
+/// Inject `OpenClaw` (markdown) identity files into the prompt
 fn inject_openclaw_identity(prompt: &mut String, workspace_dir: &std::path::Path) {
     #[allow(unused_imports)]
     use std::fmt::Write;
