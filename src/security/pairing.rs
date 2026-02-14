@@ -145,17 +145,28 @@ impl PairingGuard {
     }
 }
 
-/// Generate a 6-digit numeric pairing code.
+/// Generate a 6-digit numeric pairing code using cryptographically secure randomness.
 fn generate_code() -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    use std::time::SystemTime;
+    // UUID v4 uses getrandom (backed by /dev/urandom on Linux, BCryptGenRandom
+    // on Windows) — a CSPRNG. We extract 4 bytes from it for a uniform random
+    // number in [0, 1_000_000).
+    //
+    // Rejection sampling eliminates modulo bias: values above the largest
+    // multiple of 1_000_000 that fits in u32 are discarded and re-drawn.
+    // The rejection probability is ~0.02%, so this loop almost always exits
+    // on the first iteration.
+    const UPPER_BOUND: u32 = 1_000_000;
+    const REJECT_THRESHOLD: u32 = (u32::MAX / UPPER_BOUND) * UPPER_BOUND;
 
-    let mut hasher = DefaultHasher::new();
-    SystemTime::now().hash(&mut hasher);
-    std::process::id().hash(&mut hasher);
-    let raw = hasher.finish();
-    format!("{:06}", raw % 1_000_000)
+    loop {
+        let uuid = uuid::Uuid::new_v4();
+        let bytes = uuid.as_bytes();
+        let raw = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+
+        if raw < REJECT_THRESHOLD {
+            return format!("{:06}", raw % UPPER_BOUND);
+        }
+    }
 }
 
 /// Generate a cryptographically-adequate bearer token (hex-encoded).
@@ -312,6 +323,19 @@ mod tests {
         let code = generate_code();
         assert_eq!(code.len(), 6);
         assert!(code.chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn generate_code_is_not_deterministic() {
+        // Two codes should differ with overwhelming probability. We try
+        // multiple pairs so a single 1-in-10^6 collision doesn't cause
+        // a flaky CI failure. All 10 pairs colliding is ~1-in-10^60.
+        for _ in 0..10 {
+            if generate_code() != generate_code() {
+                return; // Pass: found a non-matching pair.
+            }
+        }
+        panic!("Generated 10 pairs of codes and all were collisions — CSPRNG failure");
     }
 
     #[test]
