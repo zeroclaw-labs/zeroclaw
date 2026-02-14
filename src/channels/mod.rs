@@ -14,6 +14,8 @@ pub use imessage::IMessageChannel;
 pub use matrix::MatrixChannel;
 pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
+#[allow(unused_imports)]
+pub use whatsapp::WhatsAppChannel;
 pub use traits::Channel;
 
 use crate::config::Config;

@@ -1,5 +1,6 @@
 pub mod anthropic;
 pub mod compatible;
+pub mod gemini;
 pub mod ollama;
 pub mod openai;
 pub mod openrouter;
@@ -20,6 +21,9 @@ pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<
         "ollama" => Ok(Box::new(ollama::OllamaProvider::new(
             api_key.filter(|k| !k.is_empty()),
         ))),
+        "gemini" | "google" | "google-gemini" => {
+            Ok(Box::new(gemini::GeminiProvider::new(api_key)))
+        }
 
         // ── OpenAI-compatible providers ──────────────────────
         "venice" => Ok(Box::new(OpenAiCompatibleProvider::new(
@@ -135,6 +139,15 @@ mod tests {
     #[test]
     fn factory_ollama() {
         assert!(create_provider("ollama", None).is_ok());
+    }
+
+    #[test]
+    fn factory_gemini() {
+        assert!(create_provider("gemini", Some("test-key")).is_ok());
+        assert!(create_provider("google", Some("test-key")).is_ok());
+        assert!(create_provider("google-gemini", Some("test-key")).is_ok());
+        // Should also work without key (will try CLI auth)
+        assert!(create_provider("gemini", None).is_ok());
     }
 
     // ── OpenAI-compatible providers ──────────────────────────
@@ -301,6 +314,7 @@ mod tests {
             "anthropic",
             "openai",
             "ollama",
+            "gemini",
             "venice",
             "vercel",
             "cloudflare",

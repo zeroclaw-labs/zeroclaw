@@ -293,6 +293,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "ollama" => "llama3.2".into(),
         "groq" => "llama-3.3-70b-versatile".into(),
         "deepseek" => "deepseek-chat".into(),
+        "gemini" | "google" | "google-gemini" => "gemini-2.0-flash".into(),
         _ => "anthropic/claude-sonnet-4-20250514".into(),
     }
 }
@@ -361,7 +362,7 @@ fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
 fn setup_provider() -> Result<(String, String, String)> {
     // ── Tier selection ──
     let tiers = vec![
-        "⭐ Recommended (OpenRouter, Venice, Anthropic, OpenAI)",
+        "⭐ Recommended (OpenRouter, Venice, Anthropic, OpenAI, Gemini)",
         "⚡ Fast inference (Groq, Fireworks, Together AI)",
         "🌐 Gateway / proxy (Vercel AI, Cloudflare AI, Amazon Bedrock)",
         "🔬 Specialized (Moonshot/Kimi, GLM/Zhipu, MiniMax, Qianfan, Z.AI, Synthetic, OpenCode Zen, Cohere)",
@@ -388,6 +389,7 @@ fn setup_provider() -> Result<(String, String, String)> {
             ("mistral", "Mistral — Large & Codestral"),
             ("xai", "xAI — Grok 3 & 4"),
             ("perplexity", "Perplexity — search-augmented AI"),
+            ("gemini", "Google Gemini — Gemini 2.0 Flash & Pro (supports CLI auth)"),
         ],
         1 => vec![
             ("groq", "Groq — ultra-fast LPU inference"),
@@ -470,6 +472,50 @@ fn setup_provider() -> Result<(String, String, String)> {
     let api_key = if provider_name == "ollama" {
         print_bullet("Ollama runs locally — no API key needed!");
         String::new()
+    } else if provider_name == "gemini" || provider_name == "google" || provider_name == "google-gemini" {
+        // Special handling for Gemini: check for CLI auth first
+        if crate::providers::gemini::GeminiProvider::has_cli_credentials() {
+            print_bullet(&format!(
+                "{} Gemini CLI credentials detected! You can skip the API key.",
+                style("✓").green().bold()
+            ));
+            print_bullet("ZeroClaw will reuse your existing Gemini CLI authentication.");
+            println!();
+
+            let use_cli: bool = dialoguer::Confirm::new()
+                .with_prompt("  Use existing Gemini CLI authentication?")
+                .default(true)
+                .interact()?;
+
+            if use_cli {
+                println!(
+                    "  {} Using Gemini CLI OAuth tokens",
+                    style("✓").green().bold()
+                );
+                String::new() // Empty key = will use CLI tokens
+            } else {
+                print_bullet("Get your API key at: https://aistudio.google.com/app/apikey");
+                Input::new()
+                    .with_prompt("  Paste your Gemini API key")
+                    .allow_empty(true)
+                    .interact_text()?
+            }
+        } else if std::env::var("GEMINI_API_KEY").is_ok() {
+            print_bullet(&format!(
+                "{} GEMINI_API_KEY environment variable detected!",
+                style("✓").green().bold()
+            ));
+            String::new()
+        } else {
+            print_bullet("Get your API key at: https://aistudio.google.com/app/apikey");
+            print_bullet("Or run `gemini` CLI to authenticate (tokens will be reused).");
+            println!();
+
+            Input::new()
+                .with_prompt("  Paste your Gemini API key (or press Enter to skip)")
+                .allow_empty(true)
+                .interact_text()?
+        }
     } else {
         let key_url = match provider_name {
             "openrouter" => "https://openrouter.ai/keys",
@@ -489,6 +535,7 @@ fn setup_provider() -> Result<(String, String, String)> {
             "vercel" => "https://vercel.com/account/tokens",
             "cloudflare" => "https://dash.cloudflare.com/profile/api-tokens",
             "bedrock" => "https://console.aws.amazon.com/iam",
+            "gemini" | "google" | "google-gemini" => "https://aistudio.google.com/app/apikey",
             _ => "",
         };
 
@@ -630,6 +677,12 @@ fn setup_provider() -> Result<(String, String, String)> {
             ("codellama", "Code Llama"),
             ("phi3", "Phi-3 (small, fast)"),
         ],
+        "gemini" | "google" | "google-gemini" => vec![
+            ("gemini-2.0-flash", "Gemini 2.0 Flash (fast, recommended)"),
+            ("gemini-2.0-flash-lite", "Gemini 2.0 Flash Lite (fastest, cheapest)"),
+            ("gemini-1.5-pro", "Gemini 1.5 Pro (best quality)"),
+            ("gemini-1.5-flash", "Gemini 1.5 Flash (balanced)"),
+        ],
         _ => vec![("default", "Default model")],
     };
 
@@ -678,6 +731,7 @@ fn provider_env_var(name: &str) -> &'static str {
         "vercel" | "vercel-ai" => "VERCEL_API_KEY",
         "cloudflare" | "cloudflare-ai" => "CLOUDFLARE_API_KEY",
         "bedrock" | "aws-bedrock" => "AWS_ACCESS_KEY_ID",
+        "gemini" | "google" | "google-gemini" => "GEMINI_API_KEY",
         _ => "API_KEY",
     }
 }

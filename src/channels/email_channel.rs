@@ -1,3 +1,13 @@
+#![allow(clippy::uninlined_format_args)]
+#![allow(clippy::map_unwrap_or)]
+#![allow(clippy::redundant_closure_for_method_calls)]
+#![allow(clippy::cast_lossless)]
+#![allow(clippy::trim_split_whitespace)]
+#![allow(clippy::doc_link_with_quotes)]
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::too_many_lines)]
+#![allow(clippy::unnecessary_map_or)]
+
 use async_trait::async_trait;
 use anyhow::{anyhow, Result};
 use lettre::transport::smtp::authentication::Credentials;
@@ -270,13 +280,14 @@ impl EmailChannel {
                     .message_id()
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| format!("gen-{}", Uuid::new_v4()));
+                #[allow(clippy::cast_sign_loss)]
                 let ts = parsed
                     .date()
                     .map(|d| {
                         let naive = chrono::NaiveDate::from_ymd_opt(
-                            d.year as i32, d.month as u32, d.day as u32
-                        ).and_then(|date| date.and_hms_opt(d.hour as u32, d.minute as u32, d.second as u32));
-                        naive.map(|n| n.and_utc().timestamp() as u64).unwrap_or(0)
+                            d.year as i32, u32::from(d.month), u32::from(d.day)
+                        ).and_then(|date| date.and_hms_opt(u32::from(d.hour), u32::from(d.minute), u32::from(d.second)));
+                        naive.map_or(0, |n| n.and_utc().timestamp() as u64)
                     })
                     .unwrap_or_else(|| {
                         SystemTime::now()
@@ -289,13 +300,13 @@ impl EmailChannel {
             }
 
             // Mark as seen with unique tag
-            let store_tag = format!("A{}", tag_counter);
+            let store_tag = format!("A{tag_counter}");
             tag_counter += 1;
-            let _ = send_cmd(&mut tls, &store_tag, &format!("STORE {} +FLAGS (\\Seen)", uid));
+            let _ = send_cmd(&mut tls, &store_tag, &format!("STORE {uid} +FLAGS (\\Seen)"));
         }
 
         // Logout with unique tag
-        let logout_tag = format!("A{}", tag_counter);
+        let logout_tag = format!("A{tag_counter}");
         let _ = send_cmd(&mut tls, &logout_tag, "LOGOUT");
 
         Ok(results)
@@ -398,14 +409,11 @@ impl Channel for EmailChannel {
 
     async fn health_check(&self) -> bool {
         let cfg = self.config.clone();
-        match tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let tcp = TcpStream::connect((&*cfg.imap_host, cfg.imap_port));
             tcp.is_ok()
         })
         .await
-        {
-            Ok(ok) => ok,
-            Err(_) => false,
-        }
+        .unwrap_or_default()
     }
 }

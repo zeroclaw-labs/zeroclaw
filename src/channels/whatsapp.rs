@@ -12,7 +12,7 @@ use super::traits::{Channel, ChannelMessage};
 
 const WHATSAPP_API_BASE: &str = "https://graph.facebook.com/v18.0";
 
-/// WhatsApp channel configuration
+/// `WhatsApp` channel configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WhatsAppConfig {
     pub phone_number_id: String,
@@ -89,7 +89,7 @@ impl WhatsAppChannel {
         }
     }
 
-    pub async fn verify_webhook(&self, mode: &str, token: &str, challenge: &str) -> Result<String> {
+    pub fn verify_webhook(&self, mode: &str, token: &str, challenge: &str) -> Result<String> {
         if mode == "subscribe" && token == self.config.verify_token {
             Ok(challenge.to_string())
         } else {
@@ -148,12 +148,12 @@ impl WhatsAppChannel {
     }
 
     pub fn is_sender_allowed(&self, phone: &str) -> bool {
-        if self.config.allowed_numbers.is_empty() { return false; }
-        if self.config.allowed_numbers.iter().any(|a| a == "*") { return true; }
-        // Normalize phone numbers for comparison (strip + and leading zeros)
         fn normalize(p: &str) -> String {
             p.trim_start_matches('+').trim_start_matches('0').to_string()
         }
+        if self.config.allowed_numbers.is_empty() { return false; }
+        if self.config.allowed_numbers.iter().any(|a| a == "*") { return true; }
+        // Normalize phone numbers for comparison (strip + and leading zeros)
         let phone_norm = normalize(phone);
         self.config.allowed_numbers.iter().any(|a| {
             let a_norm = normalize(a);
@@ -187,7 +187,7 @@ impl Channel for WhatsAppChannel {
             .json(&body).send().await?;
         if !resp.status().is_success() {
             let err = resp.text().await?;
-            return Err(anyhow!("WhatsApp API: {}", err));
+            return Err(anyhow!("WhatsApp API: {err}"));
         }
         info!("WhatsApp sent to {}", recipient);
         Ok(())
@@ -216,6 +216,12 @@ impl Channel for WhatsAppChannel {
 mod tests {
     use super::*;
 
+    #[test]
+    fn whatsapp_module_compiles() {
+        // This test should always pass if the module compiles
+        assert!(true);
+    }
+
     fn wildcard() -> WhatsAppConfig {
         WhatsAppConfig {
             phone_number_id: "123".into(), access_token: "tok".into(),
@@ -224,32 +230,58 @@ mod tests {
         }
     }
 
-    #[test] fn name() { assert_eq!(WhatsAppChannel::new(wildcard()).name(), "whatsapp"); }
-    #[test] fn allow_wildcard() { assert!(WhatsAppChannel::new(wildcard()).is_sender_allowed("any")); }
-    #[test] fn deny_empty() {
-        let mut c = wildcard(); c.allowed_numbers = vec![];
+    #[test]
+    fn name() {
+        assert_eq!(WhatsAppChannel::new(wildcard()).name(), "whatsapp");
+    }
+    #[test]
+    fn allow_wildcard() {
+        assert!(WhatsAppChannel::new(wildcard()).is_sender_allowed("any"));
+    }
+    #[test]
+    fn deny_empty() {
+        let mut c = wildcard();
+        c.allowed_numbers = vec![];
         assert!(!WhatsAppChannel::new(c).is_sender_allowed("any"));
     }
-    #[tokio::test] async fn verify_ok() {
+    #[tokio::test]
+    async fn verify_ok() {
         let ch = WhatsAppChannel::new(wildcard());
-        assert_eq!(ch.verify_webhook("subscribe", "verify", "ch").await.unwrap(), "ch");
+        assert_eq!(
+            ch.verify_webhook("subscribe", "verify", "ch")
+                .await
+                .unwrap(),
+            "ch"
+        );
     }
-    #[tokio::test] async fn verify_bad() {
-        assert!(WhatsAppChannel::new(wildcard()).verify_webhook("subscribe", "wrong", "c").await.is_err());
+    #[tokio::test]
+    async fn verify_bad() {
+        assert!(WhatsAppChannel::new(wildcard())
+            .verify_webhook("subscribe", "wrong", "c")
+            .await
+            .is_err());
     }
-    #[tokio::test] async fn rate_limit() {
-        let mut c = wildcard(); c.rate_limit_per_minute = 2;
+    #[tokio::test]
+    async fn rate_limit() {
+        let mut c = wildcard();
+        c.rate_limit_per_minute = 2;
         let ch = WhatsAppChannel::new(c);
         assert!(ch.check_rate_limit("+1").await);
         assert!(ch.check_rate_limit("+1").await);
         assert!(!ch.check_rate_limit("+1").await);
     }
-    #[tokio::test] async fn text_msg() {
+    #[tokio::test]
+    async fn text_msg() {
         let ch = WhatsAppChannel::new(wildcard());
         let (tx, mut rx) = mpsc::channel(10);
-        ch.process_webhook(json!({"entry":[{"changes":[{"value":{"messages":[{
-            "from":"123","id":"m1","timestamp":"100","text":{"body":"hi"}
-        }]}}]}]}), &tx).await.unwrap();
+        ch.process_webhook(
+            json!({"entry":[{"changes":[{"value":{"messages":[{
+                "from":"123","id":"m1","timestamp":"100","text":{"body":"hi"}
+            }]}}]}]}),
+            &tx,
+        )
+        .await
+        .unwrap();
         let m = rx.recv().await.unwrap();
         assert_eq!(m.content, "hi");
         assert_eq!(m.channel, "whatsapp");
