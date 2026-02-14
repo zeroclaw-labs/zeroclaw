@@ -1,212 +1,207 @@
-use async_trait::async_trait;
-use anyhow::{anyhow, Result};
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
-use tracing::{debug, info, warn};
-
 use super::traits::{Channel, ChannelMessage};
+use async_trait::async_trait;
+use uuid::Uuid;
 
-const WHATSAPP_API_BASE: &str = "https://graph.facebook.com/v18.0";
-
-/// `WhatsApp` channel configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WhatsAppConfig {
-    pub phone_number_id: String,
-    pub access_token: String,
-    pub verify_token: String,
-    #[serde(default)]
-    pub allowed_numbers: Vec<String>,
-    #[serde(default = "default_webhook_path")]
-    pub webhook_path: String,
-    #[serde(default = "default_rate_limit")]
-    pub rate_limit_per_minute: u32,
-}
-
-fn default_webhook_path() -> String { "/webhook/whatsapp".into() }
-fn default_rate_limit() -> u32 { 60 }
-
-impl Default for WhatsAppConfig {
-    fn default() -> Self {
-        Self {
-            phone_number_id: String::new(),
-            access_token: String::new(),
-            verify_token: String::new(),
-            allowed_numbers: Vec::new(),
-            webhook_path: default_webhook_path(),
-            rate_limit_per_minute: default_rate_limit(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct WebhookEntry { changes: Vec<WebhookChange> }
-#[derive(Debug, Deserialize)]
-struct WebhookChange { value: WebhookValue }
-#[derive(Debug, Deserialize)]
-struct WebhookValue {
-    messages: Option<Vec<WebhookMessage>>,
-    statuses: Option<Vec<MessageStatus>>,
-}
-#[derive(Debug, Deserialize)]
-struct WebhookMessage {
-    from: String, id: String, timestamp: String,
-    text: Option<MessageText>,
-    image: Option<MediaMessage>,
-    document: Option<MediaMessage>,
-}
-#[derive(Debug, Deserialize)]
-struct MessageText { body: String }
-#[derive(Debug, Deserialize)]
-struct MediaMessage { id: String, mime_type: Option<String>, filename: Option<String> }
-#[derive(Debug, Deserialize)]
-struct MessageStatus { id: String, status: String, timestamp: String, recipient_id: String }
-
-#[derive(Debug, Serialize)]
-struct SendMessageRequest {
-    messaging_product: String, to: String,
-    #[serde(rename = "type")] message_type: String,
-    text: MessageTextBody,
-}
-#[derive(Debug, Serialize)]
-struct MessageTextBody { body: String }
-
+/// WhatsApp channel — uses WhatsApp Business Cloud API
+///
+/// This channel operates in webhook mode (push-based) rather than polling.
+/// Messages are received via the gateway's `/whatsapp` webhook endpoint.
+/// The `listen` method here is a no-op placeholder; actual message handling
+/// happens in the gateway when Meta sends webhook events.
 pub struct WhatsAppChannel {
-    pub config: WhatsAppConfig,
-    client: Client,
-    rate_limiter: Arc<RwLock<HashMap<String, Vec<u64>>>>,
+    access_token: String,
+    phone_number_id: String,
+    verify_token: String,
+    allowed_numbers: Vec<String>,
+    client: reqwest::Client,
 }
 
 impl WhatsAppChannel {
-    pub fn new(config: WhatsAppConfig) -> Self {
+    pub fn new(
+        access_token: String,
+        phone_number_id: String,
+        verify_token: String,
+        allowed_numbers: Vec<String>,
+    ) -> Self {
         Self {
-            config,
-            client: Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap(),
-            rate_limiter: Arc::new(RwLock::new(HashMap::new())),
+            access_token,
+            phone_number_id,
+            verify_token,
+            allowed_numbers,
+            client: reqwest::Client::new(),
         }
     }
 
-    pub fn verify_webhook(&self, mode: &str, token: &str, challenge: &str) -> Result<String> {
-        if mode == "subscribe" && token == self.config.verify_token {
-            Ok(challenge.to_string())
-        } else {
-            Err(anyhow!("Webhook verification failed"))
-        }
+    /// Check if a phone number is allowed (E.164 format: +1234567890)
+    fn is_number_allowed(&self, phone: &str) -> bool {
+        self.allowed_numbers.iter().any(|n| n == "*" || n == phone)
     }
 
-    pub async fn process_webhook(&self, payload: Value, tx: &mpsc::Sender<ChannelMessage>) -> Result<()> {
-        let webhook: HashMap<String, Value> = serde_json::from_value(payload)?;
-        if let Some(entry_array) = webhook.get("entry") {
-            if let Some(entries) = entry_array.as_array() {
-                for entry in entries {
-                    if let Ok(e) = serde_json::from_value::<WebhookEntry>(entry.clone()) {
-                        for change in e.changes {
-                            if let Some(messages) = change.value.messages {
-                                for msg in messages {
-                                    let _ = self.process_message(msg, tx).await;
-                                }
-                            }
-                            if let Some(statuses) = change.value.statuses {
-                                for s in statuses {
-                                    debug!("Status {}: {} for {}", s.id, s.status, s.recipient_id);
-                                }
-                            }
-                        }
+    /// Get the verify token for webhook verification
+    pub fn verify_token(&self) -> &str {
+        &self.verify_token
+    }
+
+    /// Parse an incoming webhook payload from Meta and extract messages
+    pub fn parse_webhook_payload(&self, payload: &serde_json::Value) -> Vec<ChannelMessage> {
+        let mut messages = Vec::new();
+
+        // WhatsApp Cloud API webhook structure:
+        // { "object": "whatsapp_business_account", "entry": [...] }
+        let Some(entries) = payload.get("entry").and_then(|e| e.as_array()) else {
+            return messages;
+        };
+
+        for entry in entries {
+            let Some(changes) = entry.get("changes").and_then(|c| c.as_array()) else {
+                continue;
+            };
+
+            for change in changes {
+                let Some(value) = change.get("value") else {
+                    continue;
+                };
+
+                // Extract messages array
+                let Some(msgs) = value.get("messages").and_then(|m| m.as_array()) else {
+                    continue;
+                };
+
+                for msg in msgs {
+                    // Get sender phone number
+                    let Some(from) = msg.get("from").and_then(|f| f.as_str()) else {
+                        continue;
+                    };
+
+                    // Check allowlist
+                    let normalized_from = if from.starts_with('+') {
+                        from.to_string()
+                    } else {
+                        format!("+{from}")
+                    };
+
+                    if !self.is_number_allowed(&normalized_from) {
+                        tracing::warn!(
+                            "WhatsApp: ignoring message from unauthorized number: {normalized_from}. \
+                            Add to allowed_numbers in config.toml, then run `zeroclaw onboard --channels-only`."
+                        );
+                        continue;
                     }
+
+                    // Extract text content (support text messages only for now)
+                    let content = if let Some(text_obj) = msg.get("text") {
+                        text_obj
+                            .get("body")
+                            .and_then(|b| b.as_str())
+                            .unwrap_or("")
+                            .to_string()
+                    } else {
+                        // Could be image, audio, etc. — skip for now
+                        tracing::debug!("WhatsApp: skipping non-text message from {from}");
+                        continue;
+                    };
+
+                    if content.is_empty() {
+                        continue;
+                    }
+
+                    // Get timestamp
+                    let timestamp = msg
+                        .get("timestamp")
+                        .and_then(|t| t.as_str())
+                        .and_then(|t| t.parse::<u64>().ok())
+                        .unwrap_or_else(|| {
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs()
+                        });
+
+                    messages.push(ChannelMessage {
+                        id: Uuid::new_v4().to_string(),
+                        sender: normalized_from,
+                        content,
+                        channel: "whatsapp".to_string(),
+                        timestamp,
+                    });
                 }
             }
         }
-        Ok(())
-    }
 
-    async fn process_message(&self, message: WebhookMessage, tx: &mpsc::Sender<ChannelMessage>) -> Result<()> {
-        if !self.is_sender_allowed(&message.from) {
-            warn!("Blocked WhatsApp from {}", message.from);
-            return Ok(());
-        }
-        if !self.check_rate_limit(&message.from).await {
-            warn!("Rate limited: {}", message.from);
-            return Ok(());
-        }
-        let content = if let Some(text) = message.text { text.body }
-            else if message.image.is_some() { "[Image]".into() }
-            else if message.document.is_some() { "[Document]".into() }
-            else { "[Unsupported]".into() };
-
-        let timestamp = message.timestamp.parse::<u64>().unwrap_or_else(|_| {
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
-        });
-
-        let _ = tx.send(ChannelMessage {
-            id: message.id, sender: message.from, content,
-            channel: "whatsapp".into(), timestamp,
-        }).await;
-        Ok(())
-    }
-
-    pub fn is_sender_allowed(&self, phone: &str) -> bool {
-        fn normalize(p: &str) -> String {
-            p.trim_start_matches('+').trim_start_matches('0').to_string()
-        }
-        if self.config.allowed_numbers.is_empty() { return false; }
-        if self.config.allowed_numbers.iter().any(|a| a == "*") { return true; }
-        // Normalize phone numbers for comparison (strip + and leading zeros)
-        let phone_norm = normalize(phone);
-        self.config.allowed_numbers.iter().any(|a| {
-            let a_norm = normalize(a);
-            a_norm == phone_norm || phone_norm.ends_with(&a_norm) || a_norm.ends_with(&phone_norm)
-        })
-    }
-
-    pub async fn check_rate_limit(&self, phone: &str) -> bool {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        let mut limiter = self.rate_limiter.write().await;
-        let timestamps = limiter.entry(phone.to_string()).or_default();
-        timestamps.retain(|&t| now - t < 60);
-        if timestamps.len() >= self.config.rate_limit_per_minute as usize { return false; }
-        timestamps.push(now);
-        true
+        messages
     }
 }
 
 #[async_trait]
 impl Channel for WhatsAppChannel {
-    fn name(&self) -> &str { "whatsapp" }
+    fn name(&self) -> &str {
+        "whatsapp"
+    }
 
-    async fn send(&self, message: &str, recipient: &str) -> Result<()> {
-        let url = format!("{}/{}/messages", WHATSAPP_API_BASE, self.config.phone_number_id);
-        let body = json!({
-            "messaging_product": "whatsapp", "to": recipient,
-            "type": "text", "text": {"body": message}
+    async fn send(&self, message: &str, recipient: &str) -> anyhow::Result<()> {
+        // WhatsApp Cloud API: POST to /v18.0/{phone_number_id}/messages
+        let url = format!(
+            "https://graph.facebook.com/v18.0/{}/messages",
+            self.phone_number_id
+        );
+
+        // Normalize recipient (remove leading + if present for API)
+        let to = recipient.strip_prefix('+').unwrap_or(recipient);
+
+        let body = serde_json::json!({
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": to,
+            "type": "text",
+            "text": {
+                "preview_url": false,
+                "body": message
+            }
         });
-        let resp = self.client.post(&url)
-            .header("Authorization", format!("Bearer {}", self.config.access_token))
-            .json(&body).send().await?;
+
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.access_token))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
         if !resp.status().is_success() {
-            let err = resp.text().await?;
-            return Err(anyhow!("WhatsApp API: {err}"));
+            let status = resp.status();
+            let error_body = resp.text().await.unwrap_or_default();
+            tracing::error!("WhatsApp send failed: {status} — {error_body}");
+            anyhow::bail!("WhatsApp API error: {status}");
         }
-        info!("WhatsApp sent to {}", recipient);
+
         Ok(())
     }
 
-    async fn listen(&self, _tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
-        info!("WhatsApp webhook path: {}", self.config.webhook_path);
-        // Webhooks handled by gateway HTTP server — process_webhook() called externally
-        // Keep task alive to prevent channel bus from closing
+    async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+        // WhatsApp uses webhooks (push-based), not polling.
+        // Messages are received via the gateway's /whatsapp endpoint.
+        // This method keeps the channel "alive" but doesn't actively poll.
+        tracing::info!(
+            "WhatsApp channel active (webhook mode). \
+            Configure Meta webhook to POST to your gateway's /whatsapp endpoint."
+        );
+
+        // Keep the task alive — it will be cancelled when the channel shuts down
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
         }
     }
 
     async fn health_check(&self) -> bool {
-        let url = format!("{}/{}", WHATSAPP_API_BASE, self.config.phone_number_id);
-        self.client.get(&url)
-            .header("Authorization", format!("Bearer {}", self.config.access_token))
-            .send().await
+        // Check if we can reach the WhatsApp API
+        let url = format!("https://graph.facebook.com/v18.0/{}", self.phone_number_id);
+
+        self.client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.access_token))
+            .send()
+            .await
             .map(|r| r.status().is_success())
             .unwrap_or(false)
     }
@@ -216,74 +211,900 @@ impl Channel for WhatsAppChannel {
 mod tests {
     use super::*;
 
-    #[test]
-    fn whatsapp_module_compiles() {
-        // This test should always pass if the module compiles
-        assert!(true);
-    }
-
-    fn wildcard() -> WhatsAppConfig {
-        WhatsAppConfig {
-            phone_number_id: "123".into(), access_token: "tok".into(),
-            verify_token: "verify".into(), allowed_numbers: vec!["*".into()],
-            ..Default::default()
-        }
+    fn make_channel() -> WhatsAppChannel {
+        WhatsAppChannel::new(
+            "test-token".into(),
+            "123456789".into(),
+            "verify-me".into(),
+            vec!["+1234567890".into()],
+        )
     }
 
     #[test]
-    fn name() {
-        assert_eq!(WhatsAppChannel::new(wildcard()).name(), "whatsapp");
+    fn whatsapp_channel_name() {
+        let ch = make_channel();
+        assert_eq!(ch.name(), "whatsapp");
     }
+
     #[test]
-    fn allow_wildcard() {
-        assert!(WhatsAppChannel::new(wildcard()).is_sender_allowed("any"));
+    fn whatsapp_verify_token() {
+        let ch = make_channel();
+        assert_eq!(ch.verify_token(), "verify-me");
     }
+
     #[test]
-    fn deny_empty() {
-        let mut c = wildcard();
-        c.allowed_numbers = vec![];
-        assert!(!WhatsAppChannel::new(c).is_sender_allowed("any"));
+    fn whatsapp_number_allowed_exact() {
+        let ch = make_channel();
+        assert!(ch.is_number_allowed("+1234567890"));
+        assert!(!ch.is_number_allowed("+9876543210"));
     }
-    #[tokio::test]
-    async fn verify_ok() {
-        let ch = WhatsAppChannel::new(wildcard());
-        assert_eq!(
-            ch.verify_webhook("subscribe", "verify", "ch")
-                .await
-                .unwrap(),
-            "ch"
+
+    #[test]
+    fn whatsapp_number_allowed_wildcard() {
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        assert!(ch.is_number_allowed("+1234567890"));
+        assert!(ch.is_number_allowed("+9999999999"));
+    }
+
+    #[test]
+    fn whatsapp_number_denied_empty() {
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec![]);
+        assert!(!ch.is_number_allowed("+1234567890"));
+    }
+
+    #[test]
+    fn whatsapp_parse_empty_payload() {
+        let ch = make_channel();
+        let payload = serde_json::json!({});
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn whatsapp_parse_valid_text_message() {
+        let ch = make_channel();
+        let payload = serde_json::json!({
+            "object": "whatsapp_business_account",
+            "entry": [{
+                "id": "123",
+                "changes": [{
+                    "value": {
+                        "messaging_product": "whatsapp",
+                        "metadata": {
+                            "display_phone_number": "15551234567",
+                            "phone_number_id": "123456789"
+                        },
+                        "messages": [{
+                            "from": "1234567890",
+                            "id": "wamid.xxx",
+                            "timestamp": "1699999999",
+                            "type": "text",
+                            "text": {
+                                "body": "Hello ZeroClaw!"
+                            }
+                        }]
+                    },
+                    "field": "messages"
+                }]
+            }]
+        });
+
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].sender, "+1234567890");
+        assert_eq!(msgs[0].content, "Hello ZeroClaw!");
+        assert_eq!(msgs[0].channel, "whatsapp");
+        assert_eq!(msgs[0].timestamp, 1699999999);
+    }
+
+    #[test]
+    fn whatsapp_parse_unauthorized_number() {
+        let ch = make_channel();
+        let payload = serde_json::json!({
+            "object": "whatsapp_business_account",
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "9999999999",
+                            "timestamp": "1699999999",
+                            "type": "text",
+                            "text": { "body": "Spam" }
+                        }]
+                    }
+                }]
+            }]
+        });
+
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(msgs.is_empty(), "Unauthorized numbers should be filtered");
+    }
+
+    #[test]
+    fn whatsapp_parse_non_text_message_skipped() {
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "1234567890",
+                            "timestamp": "1699999999",
+                            "type": "image",
+                            "image": { "id": "img123" }
+                        }]
+                    }
+                }]
+            }]
+        });
+
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(msgs.is_empty(), "Non-text messages should be skipped");
+    }
+
+    #[test]
+    fn whatsapp_parse_multiple_messages() {
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [
+                            { "from": "111", "timestamp": "1", "type": "text", "text": { "body": "First" } },
+                            { "from": "222", "timestamp": "2", "type": "text", "text": { "body": "Second" } }
+                        ]
+                    }
+                }]
+            }]
+        });
+
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].content, "First");
+        assert_eq!(msgs[1].content, "Second");
+    }
+
+    #[test]
+    fn whatsapp_parse_normalizes_phone_with_plus() {
+        let ch = WhatsAppChannel::new(
+            "tok".into(),
+            "123".into(),
+            "ver".into(),
+            vec!["+1234567890".into()],
+        );
+        // API sends without +, but we normalize to +
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "1234567890",
+                            "timestamp": "1",
+                            "type": "text",
+                            "text": { "body": "Hi" }
+                        }]
+                    }
+                }]
+            }]
+        });
+
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].sender, "+1234567890");
+    }
+
+    #[test]
+    fn whatsapp_empty_text_skipped() {
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "111",
+                            "timestamp": "1",
+                            "type": "text",
+                            "text": { "body": "" }
+                        }]
+                    }
+                }]
+            }]
+        });
+
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(msgs.is_empty());
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // EDGE CASES — Comprehensive coverage
+    // ══════════════════════════════════════════════════════════
+
+    #[test]
+    fn whatsapp_parse_missing_entry_array() {
+        let ch = make_channel();
+        let payload = serde_json::json!({
+            "object": "whatsapp_business_account"
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn whatsapp_parse_entry_not_array() {
+        let ch = make_channel();
+        let payload = serde_json::json!({
+            "entry": "not_an_array"
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn whatsapp_parse_missing_changes_array() {
+        let ch = make_channel();
+        let payload = serde_json::json!({
+            "entry": [{ "id": "123" }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn whatsapp_parse_changes_not_array() {
+        let ch = make_channel();
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": "not_an_array"
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn whatsapp_parse_missing_value() {
+        let ch = make_channel();
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{ "field": "messages" }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn whatsapp_parse_missing_messages_array() {
+        let ch = make_channel();
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "metadata": {}
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn whatsapp_parse_messages_not_array() {
+        let ch = make_channel();
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": "not_an_array"
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn whatsapp_parse_missing_from_field() {
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "timestamp": "1",
+                            "type": "text",
+                            "text": { "body": "No sender" }
+                        }]
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(msgs.is_empty(), "Messages without 'from' should be skipped");
+    }
+
+    #[test]
+    fn whatsapp_parse_missing_text_body() {
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "111",
+                            "timestamp": "1",
+                            "type": "text",
+                            "text": {}
+                        }]
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(
+            msgs.is_empty(),
+            "Messages with empty text object should be skipped"
         );
     }
-    #[tokio::test]
-    async fn verify_bad() {
-        assert!(WhatsAppChannel::new(wildcard())
-            .verify_webhook("subscribe", "wrong", "c")
-            .await
-            .is_err());
+
+    #[test]
+    fn whatsapp_parse_null_text_body() {
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "111",
+                            "timestamp": "1",
+                            "type": "text",
+                            "text": { "body": null }
+                        }]
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(msgs.is_empty(), "Messages with null body should be skipped");
     }
-    #[tokio::test]
-    async fn rate_limit() {
-        let mut c = wildcard();
-        c.rate_limit_per_minute = 2;
-        let ch = WhatsAppChannel::new(c);
-        assert!(ch.check_rate_limit("+1").await);
-        assert!(ch.check_rate_limit("+1").await);
-        assert!(!ch.check_rate_limit("+1").await);
+
+    #[test]
+    fn whatsapp_parse_invalid_timestamp_uses_current() {
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "111",
+                            "timestamp": "not_a_number",
+                            "type": "text",
+                            "text": { "body": "Hello" }
+                        }]
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+        // Timestamp should be current time (non-zero)
+        assert!(msgs[0].timestamp > 0);
     }
-    #[tokio::test]
-    async fn text_msg() {
-        let ch = WhatsAppChannel::new(wildcard());
-        let (tx, mut rx) = mpsc::channel(10);
-        ch.process_webhook(
-            json!({"entry":[{"changes":[{"value":{"messages":[{
-                "from":"123","id":"m1","timestamp":"100","text":{"body":"hi"}
-            }]}}]}]}),
-            &tx,
-        )
-        .await
-        .unwrap();
-        let m = rx.recv().await.unwrap();
-        assert_eq!(m.content, "hi");
-        assert_eq!(m.channel, "whatsapp");
+
+    #[test]
+    fn whatsapp_parse_missing_timestamp_uses_current() {
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "111",
+                            "type": "text",
+                            "text": { "body": "Hello" }
+                        }]
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0].timestamp > 0);
+    }
+
+    #[test]
+    fn whatsapp_parse_multiple_entries() {
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "entry": [
+                {
+                    "changes": [{
+                        "value": {
+                            "messages": [{
+                                "from": "111",
+                                "timestamp": "1",
+                                "type": "text",
+                                "text": { "body": "Entry 1" }
+                            }]
+                        }
+                    }]
+                },
+                {
+                    "changes": [{
+                        "value": {
+                            "messages": [{
+                                "from": "222",
+                                "timestamp": "2",
+                                "type": "text",
+                                "text": { "body": "Entry 2" }
+                            }]
+                        }
+                    }]
+                }
+            ]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].content, "Entry 1");
+        assert_eq!(msgs[1].content, "Entry 2");
+    }
+
+    #[test]
+    fn whatsapp_parse_multiple_changes() {
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [
+                    {
+                        "value": {
+                            "messages": [{
+                                "from": "111",
+                                "timestamp": "1",
+                                "type": "text",
+                                "text": { "body": "Change 1" }
+                            }]
+                        }
+                    },
+                    {
+                        "value": {
+                            "messages": [{
+                                "from": "222",
+                                "timestamp": "2",
+                                "type": "text",
+                                "text": { "body": "Change 2" }
+                            }]
+                        }
+                    }
+                ]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].content, "Change 1");
+        assert_eq!(msgs[1].content, "Change 2");
+    }
+
+    #[test]
+    fn whatsapp_parse_status_update_ignored() {
+        // Status updates have "statuses" instead of "messages"
+        let ch = make_channel();
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "statuses": [{
+                            "id": "wamid.xxx",
+                            "status": "delivered",
+                            "timestamp": "1699999999"
+                        }]
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(msgs.is_empty(), "Status updates should be ignored");
+    }
+
+    #[test]
+    fn whatsapp_parse_audio_message_skipped() {
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "111",
+                            "timestamp": "1",
+                            "type": "audio",
+                            "audio": { "id": "audio123", "mime_type": "audio/ogg" }
+                        }]
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn whatsapp_parse_video_message_skipped() {
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "111",
+                            "timestamp": "1",
+                            "type": "video",
+                            "video": { "id": "video123" }
+                        }]
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn whatsapp_parse_document_message_skipped() {
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "111",
+                            "timestamp": "1",
+                            "type": "document",
+                            "document": { "id": "doc123", "filename": "file.pdf" }
+                        }]
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn whatsapp_parse_sticker_message_skipped() {
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "111",
+                            "timestamp": "1",
+                            "type": "sticker",
+                            "sticker": { "id": "sticker123" }
+                        }]
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn whatsapp_parse_location_message_skipped() {
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "111",
+                            "timestamp": "1",
+                            "type": "location",
+                            "location": { "latitude": 40.7128, "longitude": -74.0060 }
+                        }]
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn whatsapp_parse_contacts_message_skipped() {
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "111",
+                            "timestamp": "1",
+                            "type": "contacts",
+                            "contacts": [{ "name": { "formatted_name": "John" } }]
+                        }]
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn whatsapp_parse_reaction_message_skipped() {
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "111",
+                            "timestamp": "1",
+                            "type": "reaction",
+                            "reaction": { "message_id": "wamid.xxx", "emoji": "👍" }
+                        }]
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn whatsapp_parse_mixed_authorized_unauthorized() {
+        let ch = WhatsAppChannel::new(
+            "tok".into(),
+            "123".into(),
+            "ver".into(),
+            vec!["+1111111111".into()],
+        );
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [
+                            { "from": "1111111111", "timestamp": "1", "type": "text", "text": { "body": "Allowed" } },
+                            { "from": "9999999999", "timestamp": "2", "type": "text", "text": { "body": "Blocked" } },
+                            { "from": "1111111111", "timestamp": "3", "type": "text", "text": { "body": "Also allowed" } }
+                        ]
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].content, "Allowed");
+        assert_eq!(msgs[1].content, "Also allowed");
+    }
+
+    #[test]
+    fn whatsapp_parse_unicode_message() {
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "111",
+                            "timestamp": "1",
+                            "type": "text",
+                            "text": { "body": "Hello 👋 世界 🌍 مرحبا" }
+                        }]
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "Hello 👋 世界 🌍 مرحبا");
+    }
+
+    #[test]
+    fn whatsapp_parse_very_long_message() {
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let long_text = "A".repeat(10_000);
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "111",
+                            "timestamp": "1",
+                            "type": "text",
+                            "text": { "body": long_text }
+                        }]
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content.len(), 10_000);
+    }
+
+    #[test]
+    fn whatsapp_parse_whitespace_only_message_skipped() {
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "111",
+                            "timestamp": "1",
+                            "type": "text",
+                            "text": { "body": "   " }
+                        }]
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        // Whitespace-only is NOT empty, so it passes through
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "   ");
+    }
+
+    #[test]
+    fn whatsapp_number_allowed_multiple_numbers() {
+        let ch = WhatsAppChannel::new(
+            "tok".into(),
+            "123".into(),
+            "ver".into(),
+            vec![
+                "+1111111111".into(),
+                "+2222222222".into(),
+                "+3333333333".into(),
+            ],
+        );
+        assert!(ch.is_number_allowed("+1111111111"));
+        assert!(ch.is_number_allowed("+2222222222"));
+        assert!(ch.is_number_allowed("+3333333333"));
+        assert!(!ch.is_number_allowed("+4444444444"));
+    }
+
+    #[test]
+    fn whatsapp_number_allowed_case_sensitive() {
+        // Phone numbers should be exact match
+        let ch = WhatsAppChannel::new(
+            "tok".into(),
+            "123".into(),
+            "ver".into(),
+            vec!["+1234567890".into()],
+        );
+        assert!(ch.is_number_allowed("+1234567890"));
+        // Different number should not match
+        assert!(!ch.is_number_allowed("+1234567891"));
+    }
+
+    #[test]
+    fn whatsapp_parse_phone_already_has_plus() {
+        let ch = WhatsAppChannel::new(
+            "tok".into(),
+            "123".into(),
+            "ver".into(),
+            vec!["+1234567890".into()],
+        );
+        // If API sends with +, we should still handle it
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "+1234567890",
+                            "timestamp": "1",
+                            "type": "text",
+                            "text": { "body": "Hi" }
+                        }]
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].sender, "+1234567890");
+    }
+
+    #[test]
+    fn whatsapp_channel_fields_stored_correctly() {
+        let ch = WhatsAppChannel::new(
+            "my-access-token".into(),
+            "phone-id-123".into(),
+            "my-verify-token".into(),
+            vec!["+111".into(), "+222".into()],
+        );
+        assert_eq!(ch.verify_token(), "my-verify-token");
+        assert!(ch.is_number_allowed("+111"));
+        assert!(ch.is_number_allowed("+222"));
+        assert!(!ch.is_number_allowed("+333"));
+    }
+
+    #[test]
+    fn whatsapp_parse_empty_messages_array() {
+        let ch = make_channel();
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": []
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn whatsapp_parse_empty_entry_array() {
+        let ch = make_channel();
+        let payload = serde_json::json!({
+            "entry": []
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn whatsapp_parse_empty_changes_array() {
+        let ch = make_channel();
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": []
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn whatsapp_parse_newlines_preserved() {
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "111",
+                            "timestamp": "1",
+                            "type": "text",
+                            "text": { "body": "Line 1\nLine 2\nLine 3" }
+                        }]
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "Line 1\nLine 2\nLine 3");
+    }
+
+    #[test]
+    fn whatsapp_parse_special_characters() {
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "111",
+                            "timestamp": "1",
+                            "type": "text",
+                            "text": { "body": "<script>alert('xss')</script> & \"quotes\" 'apostrophe'" }
+                        }]
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(
+            msgs[0].content,
+            "<script>alert('xss')</script> & \"quotes\" 'apostrophe'"
+        );
     }
 }

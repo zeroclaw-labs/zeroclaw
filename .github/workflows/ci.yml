@@ -63,3 +63,40 @@ jobs:
         with:
           name: zeroclaw-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/zeroclaw*
+
+  docker:
+    name: Docker Security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t zeroclaw:test .
+
+      - name: Verify non-root user (UID != 0)
+        run: |
+          USER_ID=$(docker inspect --format='{{.Config.User}}' zeroclaw:test)
+          echo "Container user: $USER_ID"
+          if [ "$USER_ID" = "0" ] || [ "$USER_ID" = "root" ] || [ -z "$USER_ID" ]; then
+            echo "❌ FAIL: Container runs as root (UID 0)"
+            exit 1
+          fi
+          echo "✅ PASS: Container runs as non-root user ($USER_ID)"
+
+      - name: Verify distroless nonroot base image
+        run: |
+          BASE_IMAGE=$(grep -E '^FROM.*runtime|^FROM gcr.io/distroless' Dockerfile | tail -1)
+          echo "Base image line: $BASE_IMAGE"
+          if ! echo "$BASE_IMAGE" | grep -q ':nonroot'; then
+            echo "❌ FAIL: Runtime stage does not use :nonroot variant"
+            exit 1
+          fi
+          echo "✅ PASS: Using distroless :nonroot variant"
+
+      - name: Verify USER directive exists
+        run: |
+          if ! grep -qE '^USER\s+[0-9]+' Dockerfile; then
+            echo "❌ FAIL: No explicit USER directive with numeric UID"
+            exit 1
+          fi
+          echo "✅ PASS: Explicit USER directive found"

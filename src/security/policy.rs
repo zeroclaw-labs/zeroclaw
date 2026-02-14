@@ -258,8 +258,14 @@ impl SecurityPolicy {
     /// Validate that a resolved path is still inside the workspace.
     /// Call this AFTER joining `workspace_dir` + relative path and canonicalizing.
     pub fn is_resolved_path_allowed(&self, resolved: &Path) -> bool {
-        // Must be under workspace_dir (prevents symlink escapes)
-        resolved.starts_with(&self.workspace_dir)
+        // Must be under workspace_dir (prevents symlink escapes).
+        // Prefer canonical workspace root so `/a/../b` style config paths don't
+        // cause false positives or negatives.
+        let workspace_root = self
+            .workspace_dir
+            .canonicalize()
+            .unwrap_or_else(|_| self.workspace_dir.clone());
+        resolved.starts_with(workspace_root)
     }
 
     /// Check if autonomy level permits any action at all

@@ -55,7 +55,30 @@ impl Tool for FileReadTool {
 
         let full_path = self.security.workspace_dir.join(path);
 
-        match tokio::fs::read_to_string(&full_path).await {
+        // Resolve path before reading to block symlink escapes.
+        let resolved_path = match tokio::fs::canonicalize(&full_path).await {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to resolve file path: {e}")),
+                });
+            }
+        };
+
+        if !self.security.is_resolved_path_allowed(&resolved_path) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Resolved path escapes workspace: {}",
+                    resolved_path.display()
+                )),
+            });
+        }
+
+        match tokio::fs::read_to_string(&resolved_path).await {
             Ok(contents) => Ok(ToolResult {
                 success: true,
                 output: contents,
@@ -127,7 +150,7 @@ mod tests {
         let tool = FileReadTool::new(test_security(dir.clone()));
         let result = tool.execute(json!({"path": "nope.txt"})).await.unwrap();
         assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("Failed to read"));
+        assert!(result.error.as_ref().unwrap().contains("Failed to resolve"));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
@@ -199,5 +222,37 @@ mod tests {
         assert_eq!(result.output, "deep content");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_read_blocks_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join("zeroclaw_test_file_read_symlink_escape");
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+
+        tokio::fs::write(outside.join("secret.txt"), "outside workspace")
+            .await
+            .unwrap();
+
+        symlink(outside.join("secret.txt"), workspace.join("escape.txt")).unwrap();
+
+        let tool = FileReadTool::new(test_security(workspace.clone()));
+        let result = tool.execute(json!({"path": "escape.txt"})).await.unwrap();
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("escapes workspace"));
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 }

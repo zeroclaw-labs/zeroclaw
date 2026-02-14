@@ -69,7 +69,54 @@ impl Tool for FileWriteTool {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        match tokio::fs::write(&full_path, content).await {
+        let parent = match full_path.parent() {
+            Some(p) => p,
+            None => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some("Invalid path: missing parent directory".into()),
+                });
+            }
+        };
+
+        // Resolve parent before writing to block symlink escapes.
+        let resolved_parent = match tokio::fs::canonicalize(parent).await {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to resolve file path: {e}")),
+                });
+            }
+        };
+
+        if !self.security.is_resolved_path_allowed(&resolved_parent) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Resolved path escapes workspace: {}",
+                    resolved_parent.display()
+                )),
+            });
+        }
+
+        let file_name = match full_path.file_name() {
+            Some(name) => name,
+            None => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some("Invalid path: missing file name".into()),
+                });
+            }
+        };
+
+        let resolved_target = resolved_parent.join(file_name);
+
+        match tokio::fs::write(&resolved_target, content).await {
             Ok(()) => Ok(ToolResult {
                 success: true,
                 output: format!("Written {} bytes to {path}", content.len()),
@@ -238,5 +285,37 @@ mod tests {
         assert!(result.output.contains("0 bytes"));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_write_blocks_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join("zeroclaw_test_file_write_symlink_escape");
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+
+        symlink(&outside, workspace.join("escape_dir")).unwrap();
+
+        let tool = FileWriteTool::new(test_security(workspace.clone()));
+        let result = tool
+            .execute(json!({"path": "escape_dir/hijack.txt", "content": "bad"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("escapes workspace"));
+        assert!(!outside.join("hijack.txt").exists());
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 }

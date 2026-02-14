@@ -15,7 +15,7 @@ categories = ["command-line-utilities", "api-bindings"]
 clap = { version = "4.5", features = ["derive"] }
 
 # Async runtime - feature-optimized for size
-tokio = { version = "1.42", default-features = false, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync", "process", "io-std", "fs"] }
+tokio = { version = "1.42", default-features = false, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync", "process", "io-std", "fs", "signal"] }
 
 # HTTP client - minimal features
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
@@ -49,6 +49,7 @@ async-trait = "0.1"
 # Memory / persistence
 rusqlite = { version = "0.32", features = ["bundled"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+cron = "0.12"
 
 # Interactive CLI prompts
 dialoguer = { version = "0.11", features = ["fuzzy-select"] }
@@ -63,6 +64,12 @@ mail-parser = "0.11.2"
 rustls-pki-types = "1.14.0"
 tokio-rustls = "0.26.4"
 webpki-roots = "1.0.6"
+
+# HTTP server (gateway) — replaces raw TCP for proper HTTP/1.1 compliance
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio", "query"] }
+tower = { version = "0.5", default-features = false }
+tower-http = { version = "0.6", default-features = false, features = ["limit", "timeout"] }
+http-body-util = "0.1"
 
 [profile.release]
 opt-level = "z"      # Optimize for size

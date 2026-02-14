@@ -8,7 +8,7 @@
     dead_code
 )]
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
@@ -17,15 +17,20 @@ mod agent;
 mod channels;
 mod config;
 mod cron;
+mod daemon;
+mod doctor;
 mod gateway;
+mod health;
 mod heartbeat;
 mod integrations;
 mod memory;
+mod migration;
 mod observability;
 mod onboard;
 mod providers;
 mod runtime;
 mod security;
+mod service;
 mod skills;
 mod tools;
 mod tunnel;
@@ -44,12 +49,30 @@ struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+enum ServiceCommands {
+    /// Install daemon service unit for auto-start and restart
+    Install,
+    /// Start daemon service
+    Start,
+    /// Stop daemon service
+    Stop,
+    /// Check daemon service status
+    Status,
+    /// Uninstall daemon service unit
+    Uninstall,
+}
+
+#[derive(Subcommand, Debug)]
 enum Commands {
     /// Initialize your workspace and configuration
     Onboard {
         /// Run the full interactive wizard (default is quick setup)
         #[arg(long)]
         interactive: bool,
+
+        /// Reconfigure channels only (fast repair flow)
+        #[arg(long)]
+        channels_only: bool,
 
         /// API key (used in quick mode, ignored with --interactive)
         #[arg(long)]
@@ -71,7 +94,7 @@ enum Commands {
         provider: Option<String>,
 
         /// Model to use
-        #[arg(short, long)]
+        #[arg(long)]
         model: Option<String>,
 
         /// Temperature (0.0 - 2.0)
@@ -86,9 +109,29 @@ enum Commands {
         port: u16,
 
         /// Host to bind to
-        #[arg(short, long, default_value = "127.0.0.1")]
+        #[arg(long, default_value = "127.0.0.1")]
         host: String,
     },
+
+    /// Start long-running autonomous runtime (gateway + channels + heartbeat + scheduler)
+    Daemon {
+        /// Port to listen on (use 0 for random available port)
+        #[arg(short, long, default_value = "8080")]
+        port: u16,
+
+        /// Host to bind to
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+    },
+
+    /// Manage OS service lifecycle (launchd/systemd user service)
+    Service {
+        #[command(subcommand)]
+        service_command: ServiceCommands,
+    },
+
+    /// Run diagnostics for daemon/scheduler/channel freshness
+    Doctor,
 
     /// Show system status (full details)
     Status,
@@ -115,6 +158,26 @@ enum Commands {
     Skills {
         #[command(subcommand)]
         skill_command: SkillCommands,
+    },
+
+    /// Migrate data from other agent runtimes
+    Migrate {
+        #[command(subcommand)]
+        migrate_command: MigrateCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum MigrateCommands {
+    /// Import memory from an OpenClaw workspace into this ZeroClaw workspace
+    Openclaw {
+        /// Optional path to OpenClaw workspace (defaults to ~/.openclaw/workspace)
+        #[arg(long)]
+        source: Option<std::path::PathBuf>,
+
+        /// Validate and preview migration without writing any data
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -198,11 +261,21 @@ async fn main() -> Result<()> {
     // Onboard runs quick setup by default, or the interactive wizard with --interactive
     if let Commands::Onboard {
         interactive,
+        channels_only,
         api_key,
         provider,
     } = &cli.command
     {
-        let config = if *interactive {
+        if *interactive && *channels_only {
+            bail!("Use either --interactive or --channels-only, not both");
+        }
+        if *channels_only && (api_key.is_some() || provider.is_some()) {
+            bail!("--channels-only does not accept --api-key or --provider");
+        }
+
+        let config = if *channels_only {
+            onboard::run_channels_repair_wizard()?
+        } else if *interactive {
             onboard::run_wizard()?
         } else {
             onboard::run_quick_setup(api_key.as_deref(), provider.as_deref())?
@@ -234,6 +307,15 @@ async fn main() -> Result<()> {
                 info!("🚀 Starting ZeroClaw Gateway on {host}:{port}");
             }
             gateway::run_gateway(&host, port, config).await
+        }
+
+        Commands::Daemon { port, host } => {
+            if port == 0 {
+                info!("🧠 Starting ZeroClaw Daemon on {host} (random port)");
+            } else {
+                info!("🧠 Starting ZeroClaw Daemon on {host}:{port}");
+            }
+            daemon::run(config, host, port).await
         }
 
         Commands::Status => {
@@ -307,6 +389,10 @@ async fn main() -> Result<()> {
 
         Commands::Cron { cron_command } => cron::handle_command(cron_command, config),
 
+        Commands::Service { service_command } => service::handle_command(service_command, &config),
+
+        Commands::Doctor => doctor::run(&config),
+
         Commands::Channel { channel_command } => match channel_command {
             ChannelCommands::Start => channels::start_channels(config).await,
             ChannelCommands::Doctor => channels::doctor_channels(config).await,
@@ -320,5 +406,20 @@ async fn main() -> Result<()> {
         Commands::Skills { skill_command } => {
             skills::handle_command(skill_command, &config.workspace_dir)
         }
+
+        Commands::Migrate { migrate_command } => {
+            migration::handle_command(migrate_command, &config).await
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_definition_has_no_flag_conflicts() {
+        Cli::command().debug_assert();
     }
 }

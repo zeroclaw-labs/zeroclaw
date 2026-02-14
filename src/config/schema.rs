@@ -26,6 +26,9 @@ pub struct Config {
     pub runtime: RuntimeConfig,
 
     #[serde(default)]
+    pub reliability: ReliabilityConfig,
+
+    #[serde(default)]
     pub heartbeat: HeartbeatConfig,
 
     #[serde(default)]
@@ -48,6 +51,38 @@ pub struct Config {
 
     #[serde(default)]
     pub browser: BrowserConfig,
+
+    #[serde(default)]
+    pub identity: IdentityConfig,
+}
+
+// ── Identity (AIEOS / OpenClaw format) ──────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityConfig {
+    /// Identity format: "openclaw" (default) or "aieos"
+    #[serde(default = "default_identity_format")]
+    pub format: String,
+    /// Path to AIEOS JSON file (relative to workspace)
+    #[serde(default)]
+    pub aieos_path: Option<String>,
+    /// Inline AIEOS JSON (alternative to file path)
+    #[serde(default)]
+    pub aieos_inline: Option<String>,
+}
+
+fn default_identity_format() -> String {
+    "openclaw".into()
+}
+
+impl Default for IdentityConfig {
+    fn default() -> Self {
+        Self {
+            format: default_identity_format(),
+            aieos_path: None,
+            aieos_inline: None,
+        }
+    }
 }
 
 // ── Gateway security ─────────────────────────────────────────────
@@ -143,6 +178,18 @@ pub struct MemoryConfig {
     pub backend: String,
     /// Auto-save conversation context to memory
     pub auto_save: bool,
+    /// Run memory/session hygiene (archiving + retention cleanup)
+    #[serde(default = "default_hygiene_enabled")]
+    pub hygiene_enabled: bool,
+    /// Archive daily/session files older than this many days
+    #[serde(default = "default_archive_after_days")]
+    pub archive_after_days: u32,
+    /// Purge archived files older than this many days
+    #[serde(default = "default_purge_after_days")]
+    pub purge_after_days: u32,
+    /// For sqlite backend: prune conversation rows older than this many days
+    #[serde(default = "default_conversation_retention_days")]
+    pub conversation_retention_days: u32,
     /// Embedding provider: "none" | "openai" | "custom:URL"
     #[serde(default = "default_embedding_provider")]
     pub embedding_provider: String,
@@ -169,6 +216,18 @@ pub struct MemoryConfig {
 fn default_embedding_provider() -> String {
     "none".into()
 }
+fn default_hygiene_enabled() -> bool {
+    true
+}
+fn default_archive_after_days() -> u32 {
+    7
+}
+fn default_purge_after_days() -> u32 {
+    30
+}
+fn default_conversation_retention_days() -> u32 {
+    30
+}
 fn default_embedding_model() -> String {
     "text-embedding-3-small".into()
 }
@@ -193,6 +252,10 @@ impl Default for MemoryConfig {
         Self {
             backend: "sqlite".into(),
             auto_save: true,
+            hygiene_enabled: default_hygiene_enabled(),
+            archive_after_days: default_archive_after_days(),
+            purge_after_days: default_purge_after_days(),
+            conversation_retention_days: default_conversation_retention_days(),
             embedding_provider: default_embedding_provider(),
             embedding_model: default_embedding_model(),
             embedding_dimensions: default_embedding_dims(),
@@ -281,7 +344,9 @@ impl Default for AutonomyConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeConfig {
-    /// "native" | "docker" | "cloudflare"
+    /// Runtime kind (currently supported: "native").
+    ///
+    /// Reserved values (not implemented yet): "docker", "cloudflare".
     pub kind: String,
 }
 
@@ -289,6 +354,71 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             kind: "native".into(),
+        }
+    }
+}
+
+// ── Reliability / supervision ────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReliabilityConfig {
+    /// Retries per provider before failing over.
+    #[serde(default = "default_provider_retries")]
+    pub provider_retries: u32,
+    /// Base backoff (ms) for provider retry delay.
+    #[serde(default = "default_provider_backoff_ms")]
+    pub provider_backoff_ms: u64,
+    /// Fallback provider chain (e.g. `["anthropic", "openai"]`).
+    #[serde(default)]
+    pub fallback_providers: Vec<String>,
+    /// Initial backoff for channel/daemon restarts.
+    #[serde(default = "default_channel_backoff_secs")]
+    pub channel_initial_backoff_secs: u64,
+    /// Max backoff for channel/daemon restarts.
+    #[serde(default = "default_channel_backoff_max_secs")]
+    pub channel_max_backoff_secs: u64,
+    /// Scheduler polling cadence in seconds.
+    #[serde(default = "default_scheduler_poll_secs")]
+    pub scheduler_poll_secs: u64,
+    /// Max retries for cron job execution attempts.
+    #[serde(default = "default_scheduler_retries")]
+    pub scheduler_retries: u32,
+}
+
+fn default_provider_retries() -> u32 {
+    2
+}
+
+fn default_provider_backoff_ms() -> u64 {
+    500
+}
+
+fn default_channel_backoff_secs() -> u64 {
+    2
+}
+
+fn default_channel_backoff_max_secs() -> u64 {
+    60
+}
+
+fn default_scheduler_poll_secs() -> u64 {
+    15
+}
+
+fn default_scheduler_retries() -> u32 {
+    2
+}
+
+impl Default for ReliabilityConfig {
+    fn default() -> Self {
+        Self {
+            provider_retries: default_provider_retries(),
+            provider_backoff_ms: default_provider_backoff_ms(),
+            fallback_providers: Vec::new(),
+            channel_initial_backoff_secs: default_channel_backoff_secs(),
+            channel_max_backoff_secs: default_channel_backoff_max_secs(),
+            scheduler_poll_secs: default_scheduler_poll_secs(),
+            scheduler_retries: default_scheduler_retries(),
         }
     }
 }
@@ -387,6 +517,7 @@ pub struct ChannelsConfig {
     pub webhook: Option<WebhookConfig>,
     pub imessage: Option<IMessageConfig>,
     pub matrix: Option<MatrixConfig>,
+    pub whatsapp: Option<WhatsAppConfig>,
 }
 
 impl Default for ChannelsConfig {
@@ -399,6 +530,7 @@ impl Default for ChannelsConfig {
             webhook: None,
             imessage: None,
             matrix: None,
+            whatsapp: None,
         }
     }
 }
@@ -445,6 +577,19 @@ pub struct MatrixConfig {
     pub allowed_users: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WhatsAppConfig {
+    /// Access token from Meta Business Suite
+    pub access_token: String,
+    /// Phone number ID from Meta Business API
+    pub phone_number_id: String,
+    /// Webhook verify token (you define this, Meta sends it back for verification)
+    pub verify_token: String,
+    /// Allowed phone numbers (E.164 format: +1234567890) or "*" for all
+    #[serde(default)]
+    pub allowed_numbers: Vec<String>,
+}
+
 // ── Config impl ──────────────────────────────────────────────────
 
 impl Default for Config {
@@ -463,6 +608,7 @@ impl Default for Config {
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
             runtime: RuntimeConfig::default(),
+            reliability: ReliabilityConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
@@ -471,6 +617,7 @@ impl Default for Config {
             composio: ComposioConfig::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
+            identity: IdentityConfig::default(),
         }
     }
 }
@@ -559,6 +706,17 @@ mod tests {
     }
 
     #[test]
+    fn memory_config_default_hygiene_settings() {
+        let m = MemoryConfig::default();
+        assert_eq!(m.backend, "sqlite");
+        assert!(m.auto_save);
+        assert!(m.hygiene_enabled);
+        assert_eq!(m.archive_after_days, 7);
+        assert_eq!(m.purge_after_days, 30);
+        assert_eq!(m.conversation_retention_days, 30);
+    }
+
+    #[test]
     fn channels_config_default() {
         let c = ChannelsConfig::default();
         assert!(c.cli);
@@ -591,6 +749,7 @@ mod tests {
             runtime: RuntimeConfig {
                 kind: "docker".into(),
             },
+            reliability: ReliabilityConfig::default(),
             heartbeat: HeartbeatConfig {
                 enabled: true,
                 interval_minutes: 15,
@@ -606,6 +765,7 @@ mod tests {
                 webhook: None,
                 imessage: None,
                 matrix: None,
+                whatsapp: None,
             },
             memory: MemoryConfig::default(),
             tunnel: TunnelConfig::default(),
@@ -613,6 +773,7 @@ mod tests {
             composio: ComposioConfig::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
+            identity: IdentityConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -650,6 +811,10 @@ default_temperature = 0.7
         assert_eq!(parsed.runtime.kind, "native");
         assert!(!parsed.heartbeat.enabled);
         assert!(parsed.channels_config.cli);
+        assert!(parsed.memory.hygiene_enabled);
+        assert_eq!(parsed.memory.archive_after_days, 7);
+        assert_eq!(parsed.memory.purge_after_days, 30);
+        assert_eq!(parsed.memory.conversation_retention_days, 30);
     }
 
     #[test]
@@ -669,6 +834,7 @@ default_temperature = 0.7
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
             runtime: RuntimeConfig::default(),
+            reliability: ReliabilityConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
@@ -677,6 +843,7 @@ default_temperature = 0.7
             composio: ComposioConfig::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
+            identity: IdentityConfig::default(),
         };
 
         config.save().unwrap();
@@ -810,6 +977,7 @@ default_temperature = 0.7
                 room_id: "!r:m".into(),
                 allowed_users: vec!["@u:m".into()],
             }),
+            whatsapp: None,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -892,6 +1060,89 @@ channel_id = "C123"
         let parsed: WebhookConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.secret.is_none());
         assert_eq!(parsed.port, 8080);
+    }
+
+    // ── WhatsApp config ──────────────────────────────────────
+
+    #[test]
+    fn whatsapp_config_serde() {
+        let wc = WhatsAppConfig {
+            access_token: "EAABx...".into(),
+            phone_number_id: "123456789".into(),
+            verify_token: "my-verify-token".into(),
+            allowed_numbers: vec!["+1234567890".into(), "+9876543210".into()],
+        };
+        let json = serde_json::to_string(&wc).unwrap();
+        let parsed: WhatsAppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.access_token, "EAABx...");
+        assert_eq!(parsed.phone_number_id, "123456789");
+        assert_eq!(parsed.verify_token, "my-verify-token");
+        assert_eq!(parsed.allowed_numbers.len(), 2);
+    }
+
+    #[test]
+    fn whatsapp_config_toml_roundtrip() {
+        let wc = WhatsAppConfig {
+            access_token: "tok".into(),
+            phone_number_id: "12345".into(),
+            verify_token: "verify".into(),
+            allowed_numbers: vec!["+1".into()],
+        };
+        let toml_str = toml::to_string(&wc).unwrap();
+        let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.phone_number_id, "12345");
+        assert_eq!(parsed.allowed_numbers, vec!["+1"]);
+    }
+
+    #[test]
+    fn whatsapp_config_deserializes_without_allowed_numbers() {
+        let json = r#"{"access_token":"tok","phone_number_id":"123","verify_token":"ver"}"#;
+        let parsed: WhatsAppConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.allowed_numbers.is_empty());
+    }
+
+    #[test]
+    fn whatsapp_config_wildcard_allowed() {
+        let wc = WhatsAppConfig {
+            access_token: "tok".into(),
+            phone_number_id: "123".into(),
+            verify_token: "ver".into(),
+            allowed_numbers: vec!["*".into()],
+        };
+        let toml_str = toml::to_string(&wc).unwrap();
+        let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.allowed_numbers, vec!["*"]);
+    }
+
+    #[test]
+    fn channels_config_with_whatsapp() {
+        let c = ChannelsConfig {
+            cli: true,
+            telegram: None,
+            discord: None,
+            slack: None,
+            webhook: None,
+            imessage: None,
+            matrix: None,
+            whatsapp: Some(WhatsAppConfig {
+                access_token: "tok".into(),
+                phone_number_id: "123".into(),
+                verify_token: "ver".into(),
+                allowed_numbers: vec!["+1".into()],
+            }),
+        };
+        let toml_str = toml::to_string_pretty(&c).unwrap();
+        let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
+        assert!(parsed.whatsapp.is_some());
+        let wa = parsed.whatsapp.unwrap();
+        assert_eq!(wa.phone_number_id, "123");
+        assert_eq!(wa.allowed_numbers, vec!["+1"]);
+    }
+
+    #[test]
+    fn channels_config_default_has_no_whatsapp() {
+        let c = ChannelsConfig::default();
+        assert!(c.whatsapp.is_none());
     }
 
     // ══════════════════════════════════════════════════════════

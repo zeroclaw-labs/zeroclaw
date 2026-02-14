@@ -1,5 +1,6 @@
 pub mod chunker;
 pub mod embeddings;
+pub mod hygiene;
 pub mod markdown;
 pub mod sqlite;
 pub mod traits;
@@ -21,6 +22,11 @@ pub fn create_memory(
     workspace_dir: &Path,
     api_key: Option<&str>,
 ) -> anyhow::Result<Box<dyn Memory>> {
+    // Best-effort memory hygiene/retention pass (throttled by state file).
+    if let Err(e) = hygiene::run_if_due(config, workspace_dir) {
+        tracing::warn!("memory hygiene skipped: {e}");
+    }
+
     match config.backend.as_str() {
         "sqlite" => {
             let embedder: Arc<dyn embeddings::EmbeddingProvider> =

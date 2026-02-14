@@ -61,16 +61,17 @@ impl HeartbeatEngine {
 
     /// Single heartbeat tick — read HEARTBEAT.md and return task count
     async fn tick(&self) -> Result<usize> {
+        Ok(self.collect_tasks().await?.len())
+    }
+
+    /// Read HEARTBEAT.md and return all parsed tasks.
+    pub async fn collect_tasks(&self) -> Result<Vec<String>> {
         let heartbeat_path = self.workspace_dir.join("HEARTBEAT.md");
-
         if !heartbeat_path.exists() {
-            return Ok(0);
+            return Ok(Vec::new());
         }
-
         let content = tokio::fs::read_to_string(&heartbeat_path).await?;
-        let tasks = Self::parse_tasks(&content);
-
-        Ok(tasks.len())
+        Ok(Self::parse_tasks(&content))
     }
 
     /// Parse tasks from HEARTBEAT.md (lines starting with `- `)

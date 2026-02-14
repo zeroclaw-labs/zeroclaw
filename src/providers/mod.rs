@@ -4,11 +4,13 @@ pub mod gemini;
 pub mod ollama;
 pub mod openai;
 pub mod openrouter;
+pub mod reliable;
 pub mod traits;
 
 pub use traits::Provider;
 
 use compatible::{AuthStyle, OpenAiCompatibleProvider};
+use reliable::ReliableProvider;
 
 /// Factory: create the right provider from config
 #[allow(clippy::too_many_lines)]
@@ -112,6 +114,42 @@ pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<
              Tip: Use \"custom:https://your-api.com\" for any OpenAI-compatible endpoint."
         ),
     }
+}
+
+/// Create provider chain with retry and fallback behavior.
+pub fn create_resilient_provider(
+    primary_name: &str,
+    api_key: Option<&str>,
+    reliability: &crate::config::ReliabilityConfig,
+) -> anyhow::Result<Box<dyn Provider>> {
+    let mut providers: Vec<(String, Box<dyn Provider>)> = Vec::new();
+
+    providers.push((
+        primary_name.to_string(),
+        create_provider(primary_name, api_key)?,
+    ));
+
+    for fallback in &reliability.fallback_providers {
+        if fallback == primary_name || providers.iter().any(|(name, _)| name == fallback) {
+            continue;
+        }
+
+        match create_provider(fallback, api_key) {
+            Ok(provider) => providers.push((fallback.clone(), provider)),
+            Err(e) => {
+                tracing::warn!(
+                    fallback_provider = fallback,
+                    "Ignoring invalid fallback provider: {e}"
+                );
+            }
+        }
+    }
+
+    Ok(Box::new(ReliableProvider::new(
+        providers,
+        reliability.provider_retries,
+        reliability.provider_backoff_ms,
+    )))
 }
 
 #[cfg(test)]
@@ -305,6 +343,34 @@ mod tests {
     #[test]
     fn factory_empty_name_errors() {
         assert!(create_provider("", None).is_err());
+    }
+
+    #[test]
+    fn resilient_provider_ignores_duplicate_and_invalid_fallbacks() {
+        let reliability = crate::config::ReliabilityConfig {
+            provider_retries: 1,
+            provider_backoff_ms: 100,
+            fallback_providers: vec![
+                "openrouter".into(),
+                "nonexistent-provider".into(),
+                "openai".into(),
+                "openai".into(),
+            ],
+            channel_initial_backoff_secs: 2,
+            channel_max_backoff_secs: 60,
+            scheduler_poll_secs: 15,
+            scheduler_retries: 2,
+        };
+
+        let provider = create_resilient_provider("openrouter", Some("sk-test"), &reliability);
+        assert!(provider.is_ok());
+    }
+
+    #[test]
+    fn resilient_provider_errors_for_invalid_primary() {
+        let reliability = crate::config::ReliabilityConfig::default();
+        let provider = create_resilient_provider("totally-invalid", Some("sk-test"), &reliability);
+        assert!(provider.is_err());
     }
 
     #[test]

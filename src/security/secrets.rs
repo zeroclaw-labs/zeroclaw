@@ -79,43 +79,92 @@ impl SecretStore {
     /// - `enc2:` prefix → ChaCha20-Poly1305 (current format)
     /// - `enc:` prefix → legacy XOR cipher (backward compatibility for migration)
     /// - No prefix → returned as-is (plaintext config)
+    ///
+    /// **Warning**: Legacy `enc:` values are insecure. Use `decrypt_and_migrate` to
+    /// automatically upgrade them to the secure `enc2:` format.
     pub fn decrypt(&self, value: &str) -> Result<String> {
         if let Some(hex_str) = value.strip_prefix("enc2:") {
-            let blob =
-                hex_decode(hex_str).context("Failed to decode encrypted secret (corrupt hex)")?;
-            anyhow::ensure!(
-                blob.len() > NONCE_LEN,
-                "Encrypted value too short (missing nonce)"
-            );
-
-            let (nonce_bytes, ciphertext) = blob.split_at(NONCE_LEN);
-            let nonce = Nonce::from_slice(nonce_bytes);
-            let key_bytes = self.load_or_create_key()?;
-            let key = Key::from_slice(&key_bytes);
-            let cipher = ChaCha20Poly1305::new(key);
-
-            let plaintext_bytes = cipher
-                .decrypt(nonce, ciphertext)
-                .map_err(|_| anyhow::anyhow!("Decryption failed — wrong key or tampered data"))?;
-
-            String::from_utf8(plaintext_bytes)
-                .context("Decrypted secret is not valid UTF-8 — corrupt data")
+            self.decrypt_chacha20(hex_str)
         } else if let Some(hex_str) = value.strip_prefix("enc:") {
-            // Legacy XOR cipher — decrypt for backward compatibility
-            let ciphertext = hex_decode(hex_str)
-                .context("Failed to decode legacy encrypted secret (corrupt hex)")?;
-            let key = self.load_or_create_key()?;
-            let plaintext_bytes = xor_cipher(&ciphertext, &key);
-            String::from_utf8(plaintext_bytes)
-                .context("Decrypted legacy secret is not valid UTF-8 — wrong key or corrupt data")
+            self.decrypt_legacy_xor(hex_str)
         } else {
             Ok(value.to_string())
         }
     }
 
+    /// Decrypt a secret and return a migrated `enc2:` value if the input used legacy `enc:` format.
+    ///
+    /// Returns `(plaintext, Some(new_enc2_value))` if migration occurred, or
+    /// `(plaintext, None)` if no migration was needed.
+    ///
+    /// This allows callers to persist the upgraded value back to config.
+    pub fn decrypt_and_migrate(&self, value: &str) -> Result<(String, Option<String>)> {
+        if let Some(hex_str) = value.strip_prefix("enc2:") {
+            // Already using secure format — no migration needed
+            let plaintext = self.decrypt_chacha20(hex_str)?;
+            Ok((plaintext, None))
+        } else if let Some(hex_str) = value.strip_prefix("enc:") {
+            // Legacy XOR cipher — decrypt and re-encrypt with ChaCha20-Poly1305
+            tracing::warn!(
+                "Decrypting legacy XOR-encrypted secret (enc: prefix). \
+                 This format is insecure and will be removed in a future release. \
+                 The secret will be automatically migrated to enc2: (ChaCha20-Poly1305)."
+            );
+            let plaintext = self.decrypt_legacy_xor(hex_str)?;
+            let migrated = self.encrypt(&plaintext)?;
+            Ok((plaintext, Some(migrated)))
+        } else {
+            // Plaintext — no migration needed
+            Ok((value.to_string(), None))
+        }
+    }
+
+    /// Check if a value uses the legacy `enc:` format that should be migrated.
+    pub fn needs_migration(value: &str) -> bool {
+        value.starts_with("enc:")
+    }
+
+    /// Decrypt using ChaCha20-Poly1305 (current secure format).
+    fn decrypt_chacha20(&self, hex_str: &str) -> Result<String> {
+        let blob =
+            hex_decode(hex_str).context("Failed to decode encrypted secret (corrupt hex)")?;
+        anyhow::ensure!(
+            blob.len() > NONCE_LEN,
+            "Encrypted value too short (missing nonce)"
+        );
+
+        let (nonce_bytes, ciphertext) = blob.split_at(NONCE_LEN);
+        let nonce = Nonce::from_slice(nonce_bytes);
+        let key_bytes = self.load_or_create_key()?;
+        let key = Key::from_slice(&key_bytes);
+        let cipher = ChaCha20Poly1305::new(key);
+
+        let plaintext_bytes = cipher
+            .decrypt(nonce, ciphertext)
+            .map_err(|_| anyhow::anyhow!("Decryption failed — wrong key or tampered data"))?;
+
+        String::from_utf8(plaintext_bytes)
+            .context("Decrypted secret is not valid UTF-8 — corrupt data")
+    }
+
+    /// Decrypt using legacy XOR cipher (insecure, for backward compatibility only).
+    fn decrypt_legacy_xor(&self, hex_str: &str) -> Result<String> {
+        let ciphertext = hex_decode(hex_str)
+            .context("Failed to decode legacy encrypted secret (corrupt hex)")?;
+        let key = self.load_or_create_key()?;
+        let plaintext_bytes = xor_cipher(&ciphertext, &key);
+        String::from_utf8(plaintext_bytes)
+            .context("Decrypted legacy secret is not valid UTF-8 — wrong key or corrupt data")
+    }
+
     /// Check if a value is already encrypted (current or legacy format).
     pub fn is_encrypted(value: &str) -> bool {
         value.starts_with("enc2:") || value.starts_with("enc:")
+    }
+
+    /// Check if a value uses the secure `enc2:` format.
+    pub fn is_secure_encrypted(value: &str) -> bool {
+        value.starts_with("enc2:")
     }
 
     /// Load the encryption key from disk, or create one if it doesn't exist.
@@ -132,12 +181,21 @@ impl SecretStore {
             fs::write(&self.key_path, hex_encode(&key))
                 .context("Failed to write secret key file")?;
 
-            // Set restrictive permissions (Unix only)
+            // Set restrictive permissions
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 fs::set_permissions(&self.key_path, fs::Permissions::from_mode(0o600))
                     .context("Failed to set key file permissions")?;
+            }
+            #[cfg(windows)]
+            {
+                // On Windows, use icacls to restrict permissions to current user only
+                let _ = std::process::Command::new("icacls")
+                    .arg(&self.key_path)
+                    .args(["/inheritance:r", "/grant:r"])
+                    .arg(format!("{}:F", std::env::var("USERNAME").unwrap_or_default()))
+                    .output();
             }
 
             Ok(key)
@@ -380,6 +438,258 @@ mod tests {
         // Store should still be able to decrypt legacy values
         let decrypted = store.decrypt(&legacy_value).unwrap();
         assert_eq!(decrypted, plaintext, "Legacy XOR values must still decrypt");
+    }
+
+    // ── Migration tests ─────────────────────────────────────────
+
+    #[test]
+    fn needs_migration_detects_legacy_prefix() {
+        assert!(SecretStore::needs_migration("enc:aabbcc"));
+        assert!(!SecretStore::needs_migration("enc2:aabbcc"));
+        assert!(!SecretStore::needs_migration("sk-plaintext"));
+        assert!(!SecretStore::needs_migration(""));
+    }
+
+    #[test]
+    fn is_secure_encrypted_detects_enc2_only() {
+        assert!(SecretStore::is_secure_encrypted("enc2:aabbcc"));
+        assert!(!SecretStore::is_secure_encrypted("enc:aabbcc"));
+        assert!(!SecretStore::is_secure_encrypted("sk-plaintext"));
+        assert!(!SecretStore::is_secure_encrypted(""));
+    }
+
+    #[test]
+    fn decrypt_and_migrate_returns_none_for_enc2() {
+        let tmp = TempDir::new().unwrap();
+        let store = SecretStore::new(tmp.path(), true);
+
+        let encrypted = store.encrypt("my-secret").unwrap();
+        assert!(encrypted.starts_with("enc2:"));
+
+        let (plaintext, migrated) = store.decrypt_and_migrate(&encrypted).unwrap();
+        assert_eq!(plaintext, "my-secret");
+        assert!(
+            migrated.is_none(),
+            "enc2: values should not trigger migration"
+        );
+    }
+
+    #[test]
+    fn decrypt_and_migrate_returns_none_for_plaintext() {
+        let tmp = TempDir::new().unwrap();
+        let store = SecretStore::new(tmp.path(), true);
+
+        let (plaintext, migrated) = store.decrypt_and_migrate("sk-plaintext-key").unwrap();
+        assert_eq!(plaintext, "sk-plaintext-key");
+        assert!(
+            migrated.is_none(),
+            "Plaintext values should not trigger migration"
+        );
+    }
+
+    #[test]
+    fn decrypt_and_migrate_upgrades_legacy_xor() {
+        let tmp = TempDir::new().unwrap();
+        let store = SecretStore::new(tmp.path(), true);
+
+        // Create key first
+        let _ = store.encrypt("setup").unwrap();
+        let key = store.load_or_create_key().unwrap();
+
+        // Manually create a legacy XOR-encrypted value
+        let plaintext = "sk-legacy-secret-to-migrate";
+        let ciphertext = xor_cipher(plaintext.as_bytes(), &key);
+        let legacy_value = format!("enc:{}", hex_encode(&ciphertext));
+
+        // Verify it needs migration
+        assert!(SecretStore::needs_migration(&legacy_value));
+
+        // Decrypt and migrate
+        let (decrypted, migrated) = store.decrypt_and_migrate(&legacy_value).unwrap();
+        assert_eq!(decrypted, plaintext, "Plaintext must match original");
+        assert!(migrated.is_some(), "Legacy value should trigger migration");
+
+        let new_value = migrated.unwrap();
+        assert!(
+            new_value.starts_with("enc2:"),
+            "Migrated value must use enc2: prefix"
+        );
+        assert!(
+            !SecretStore::needs_migration(&new_value),
+            "Migrated value should not need migration"
+        );
+
+        // Verify the migrated value decrypts correctly
+        let (decrypted2, migrated2) = store.decrypt_and_migrate(&new_value).unwrap();
+        assert_eq!(
+            decrypted2, plaintext,
+            "Migrated value must decrypt to same plaintext"
+        );
+        assert!(
+            migrated2.is_none(),
+            "Migrated value should not trigger another migration"
+        );
+    }
+
+    #[test]
+    fn decrypt_and_migrate_handles_unicode() {
+        let tmp = TempDir::new().unwrap();
+        let store = SecretStore::new(tmp.path(), true);
+
+        let _ = store.encrypt("setup").unwrap();
+        let key = store.load_or_create_key().unwrap();
+
+        let plaintext = "sk-日本語-émojis-🦀-тест";
+        let ciphertext = xor_cipher(plaintext.as_bytes(), &key);
+        let legacy_value = format!("enc:{}", hex_encode(&ciphertext));
+
+        let (decrypted, migrated) = store.decrypt_and_migrate(&legacy_value).unwrap();
+        assert_eq!(decrypted, plaintext);
+        assert!(migrated.is_some());
+
+        // Verify migrated value works
+        let new_value = migrated.unwrap();
+        let (decrypted2, _) = store.decrypt_and_migrate(&new_value).unwrap();
+        assert_eq!(decrypted2, plaintext);
+    }
+
+    #[test]
+    fn decrypt_and_migrate_handles_empty_secret() {
+        let tmp = TempDir::new().unwrap();
+        let store = SecretStore::new(tmp.path(), true);
+
+        let _ = store.encrypt("setup").unwrap();
+        let key = store.load_or_create_key().unwrap();
+
+        // Empty plaintext XOR-encrypted
+        let plaintext = "";
+        let ciphertext = xor_cipher(plaintext.as_bytes(), &key);
+        let legacy_value = format!("enc:{}", hex_encode(&ciphertext));
+
+        let (decrypted, migrated) = store.decrypt_and_migrate(&legacy_value).unwrap();
+        assert_eq!(decrypted, plaintext);
+        // Empty string encryption returns empty string (not enc2:)
+        assert!(migrated.is_some());
+        assert_eq!(migrated.unwrap(), "");
+    }
+
+    #[test]
+    fn decrypt_and_migrate_handles_long_secret() {
+        let tmp = TempDir::new().unwrap();
+        let store = SecretStore::new(tmp.path(), true);
+
+        let _ = store.encrypt("setup").unwrap();
+        let key = store.load_or_create_key().unwrap();
+
+        let plaintext = "a".repeat(10_000);
+        let ciphertext = xor_cipher(plaintext.as_bytes(), &key);
+        let legacy_value = format!("enc:{}", hex_encode(&ciphertext));
+
+        let (decrypted, migrated) = store.decrypt_and_migrate(&legacy_value).unwrap();
+        assert_eq!(decrypted, plaintext);
+        assert!(migrated.is_some());
+
+        let new_value = migrated.unwrap();
+        let (decrypted2, _) = store.decrypt_and_migrate(&new_value).unwrap();
+        assert_eq!(decrypted2, plaintext);
+    }
+
+    #[test]
+    fn decrypt_and_migrate_fails_on_corrupt_legacy_hex() {
+        let tmp = TempDir::new().unwrap();
+        let store = SecretStore::new(tmp.path(), true);
+        let _ = store.encrypt("setup").unwrap();
+
+        let result = store.decrypt_and_migrate("enc:not-valid-hex!!");
+        assert!(result.is_err(), "Corrupt hex should fail");
+    }
+
+    #[test]
+    fn decrypt_and_migrate_wrong_key_produces_garbage_or_fails() {
+        let tmp1 = TempDir::new().unwrap();
+        let tmp2 = TempDir::new().unwrap();
+        let store1 = SecretStore::new(tmp1.path(), true);
+        let store2 = SecretStore::new(tmp2.path(), true);
+
+        // Create keys for both stores
+        let _ = store1.encrypt("setup").unwrap();
+        let _ = store2.encrypt("setup").unwrap();
+        let key1 = store1.load_or_create_key().unwrap();
+
+        // Encrypt with store1's key
+        let plaintext = "secret-for-store1";
+        let ciphertext = xor_cipher(plaintext.as_bytes(), &key1);
+        let legacy_value = format!("enc:{}", hex_encode(&ciphertext));
+
+        // Decrypt with store2 — XOR will produce garbage bytes
+        // This may fail with UTF-8 error or succeed with garbage plaintext
+        match store2.decrypt_and_migrate(&legacy_value) {
+            Ok((decrypted, _)) => {
+                // If it succeeds, the plaintext should be garbage (not the original)
+                assert_ne!(
+                    decrypted, plaintext,
+                    "Wrong key should produce garbage plaintext"
+                );
+            }
+            Err(e) => {
+                // Expected: UTF-8 decoding failure from garbage bytes
+                assert!(
+                    e.to_string().contains("UTF-8"),
+                    "Error should be UTF-8 related: {e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn migration_produces_different_ciphertext_each_time() {
+        let tmp = TempDir::new().unwrap();
+        let store = SecretStore::new(tmp.path(), true);
+
+        let _ = store.encrypt("setup").unwrap();
+        let key = store.load_or_create_key().unwrap();
+
+        let plaintext = "sk-same-secret";
+        let ciphertext = xor_cipher(plaintext.as_bytes(), &key);
+        let legacy_value = format!("enc:{}", hex_encode(&ciphertext));
+
+        let (_, migrated1) = store.decrypt_and_migrate(&legacy_value).unwrap();
+        let (_, migrated2) = store.decrypt_and_migrate(&legacy_value).unwrap();
+
+        assert!(migrated1.is_some());
+        assert!(migrated2.is_some());
+        assert_ne!(
+            migrated1.unwrap(),
+            migrated2.unwrap(),
+            "Each migration should produce different ciphertext (random nonce)"
+        );
+    }
+
+    #[test]
+    fn migrated_value_is_tamper_resistant() {
+        let tmp = TempDir::new().unwrap();
+        let store = SecretStore::new(tmp.path(), true);
+
+        let _ = store.encrypt("setup").unwrap();
+        let key = store.load_or_create_key().unwrap();
+
+        let plaintext = "sk-sensitive-data";
+        let ciphertext = xor_cipher(plaintext.as_bytes(), &key);
+        let legacy_value = format!("enc:{}", hex_encode(&ciphertext));
+
+        let (_, migrated) = store.decrypt_and_migrate(&legacy_value).unwrap();
+        let new_value = migrated.unwrap();
+
+        // Tamper with the migrated value
+        let hex_str = &new_value[5..];
+        let mut blob = hex_decode(hex_str).unwrap();
+        if blob.len() > NONCE_LEN {
+            blob[NONCE_LEN] ^= 0xff;
+        }
+        let tampered = format!("enc2:{}", hex_encode(&blob));
+
+        let result = store.decrypt_and_migrate(&tampered);
+        assert!(result.is_err(), "Tampered migrated value must be rejected");
     }
 
     // ── Low-level helpers ───────────────────────────────────────
