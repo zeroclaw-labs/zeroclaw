@@ -195,13 +195,7 @@ fn generate_token() -> String {
 
 /// SHA-256 hash a bearer token for storage. Returns lowercase hex.
 fn hash_token(token: &str) -> String {
-    let digest = Sha256::digest(token.as_bytes());
-    let mut hex = String::with_capacity(64);
-    for b in digest {
-        use std::fmt::Write;
-        let _ = write!(hex, "{b:02x}");
-    }
-    hex
+    format!("{:x}", Sha256::digest(token.as_bytes()))
 }
 
 /// Check if a stored value looks like a SHA-256 hash (64 hex chars)
