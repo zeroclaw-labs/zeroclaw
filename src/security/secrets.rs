@@ -191,14 +191,26 @@ impl SecretStore {
             #[cfg(windows)]
             {
                 // On Windows, use icacls to restrict permissions to current user only
-                let _ = std::process::Command::new("icacls")
+                match std::process::Command::new("icacls")
                     .arg(&self.key_path)
                     .args(["/inheritance:r", "/grant:r"])
                     .arg(format!(
                         "{}:F",
                         std::env::var("USERNAME").unwrap_or_default()
                     ))
-                    .output();
+                    .output()
+                {
+                    Ok(o) if !o.status.success() => {
+                        tracing::warn!(
+                            "Failed to set key file permissions via icacls (exit code {:?})",
+                            o.status.code()
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("Could not set key file permissions: {e}");
+                    }
+                    _ => {}
+                }
             }
 
             Ok(key)
@@ -241,7 +253,7 @@ fn hex_encode(data: &[u8]) -> String {
 
 /// Hex-decode a hex string to bytes.
 fn hex_decode(hex: &str) -> Result<Vec<u8>> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         anyhow::bail!("Hex string has odd length");
     }
     (0..hex.len())
