@@ -199,59 +199,60 @@ end tell"#
     }
 }
 
-/// Get the current max ROWID from the messages table
+/// Get the current max ROWID from the messages table.
+///
+/// Uses `rusqlite` with read-only access instead of spawning the `sqlite3` CLI,
+/// which avoids subprocess security bypass and environment variable leakage.
 async fn get_max_rowid(db_path: &std::path::Path) -> anyhow::Result<i64> {
-    let output = tokio::process::Command::new("sqlite3")
-        .arg(db_path)
-        .arg("SELECT MAX(ROWID) FROM message WHERE is_from_me = 0;")
-        .output()
-        .await?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let rowid = stdout.trim().parse::<i64>().unwrap_or(0);
-    Ok(rowid)
+    let path = db_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let conn = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let rowid: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(ROWID), 0) FROM message WHERE is_from_me = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        Ok(rowid)
+    })
+    .await?
 }
 
-/// Fetch messages newer than `since_rowid`
+/// Fetch messages newer than `since_rowid`.
+///
+/// Uses `rusqlite` with parameterized queries instead of spawning the `sqlite3`
+/// CLI, eliminating the SQL interpolation pattern and subprocess security bypass.
 async fn fetch_new_messages(
     db_path: &std::path::Path,
     since_rowid: i64,
 ) -> anyhow::Result<Vec<(i64, String, String)>> {
-    let query = format!(
-        "SELECT m.ROWID, h.id, m.text \
-         FROM message m \
-         JOIN handle h ON m.handle_id = h.ROWID \
-         WHERE m.ROWID > {since_rowid} \
-         AND m.is_from_me = 0 \
-         AND m.text IS NOT NULL \
-         ORDER BY m.ROWID ASC \
-         LIMIT 20;"
-    );
-
-    let output = tokio::process::Command::new("sqlite3")
-        .arg("-separator")
-        .arg("|")
-        .arg(db_path)
-        .arg(&query)
-        .output()
-        .await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("sqlite3 query failed: {stderr}");
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut results = Vec::new();
-
-    for line in stdout.lines() {
-        let parts: Vec<&str> = line.splitn(3, '|').collect();
-        if parts.len() == 3 {
-            if let Ok(rowid) = parts[0].parse::<i64>() {
-                results.push((rowid, parts[1].to_string(), parts[2].to_string()));
-            }
-        }
-    }
+    let path = db_path.to_path_buf();
+    let results = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT m.ROWID, h.id, m.text \
+             FROM message m \
+             JOIN handle h ON m.handle_id = h.ROWID \
+             WHERE m.ROWID > ?1 \
+             AND m.is_from_me = 0 \
+             AND m.text IS NOT NULL \
+             ORDER BY m.ROWID ASC \
+             LIMIT 20",
+        )?;
+        let rows = stmt.query_map([since_rowid], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    })
+    .await??;
 
     Ok(results)
 }
