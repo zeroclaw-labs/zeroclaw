@@ -40,6 +40,9 @@ thiserror = "2.0"
 # UUID generation
 uuid = { version = "1.11", default-features = false, features = ["v4", "std"] }
 
+# Authenticated encryption (AEAD) for secret store
+chacha20poly1305 = "0.10"
+
 # Async traits
 async-trait = "0.1"
 
