@@ -773,6 +773,11 @@ mod tests {
             "byte[6] matched UUID v4 version nibble {version_match}/100 times — \
              likely still using UUID-based key generation"
         );
+        assert!(
+            variant_match < 50,
+            "byte[8] matched UUID v4 variant bits {variant_match}/100 times — \
+             likely still using UUID-based key generation"
+        );
     }
 
     #[cfg(unix)]
