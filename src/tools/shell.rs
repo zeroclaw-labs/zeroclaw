@@ -9,6 +9,9 @@ use std::time::Duration;
 const SHELL_TIMEOUT_SECS: u64 = 60;
 /// Maximum output size in bytes (1MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
+/// Environment variables safe to pass to shell commands.
+/// Only functional variables are included — never API keys or secrets.
+const SAFE_ENV_VARS: &[&str] = &["PATH", "HOME", "TERM", "LANG", "USER", "SHELL", "TMPDIR"];
 
 /// Shell command execution tool with sandboxing
 pub struct ShellTool {
@@ -59,14 +62,24 @@ impl Tool for ShellTool {
             });
         }
 
-        // Execute with timeout to prevent hanging commands
+        // Execute with timeout to prevent hanging commands.
+        // Clear the environment to prevent leaking API keys and other secrets
+        // (CWE-200), then re-add only safe, functional variables.
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(command)
+            .current_dir(&self.security.workspace_dir)
+            .env_clear();
+
+        for var in SAFE_ENV_VARS {
+            if let Ok(val) = std::env::var(var) {
+                cmd.env(var, val);
+            }
+        }
+
         let result = tokio::time::timeout(
             Duration::from_secs(SHELL_TIMEOUT_SECS),
-            tokio::process::Command::new("sh")
-                .arg("-c")
-                .arg(command)
-                .current_dir(&self.security.workspace_dir)
-                .output(),
+            cmd.output(),
         )
         .await;
 
@@ -198,5 +211,55 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
+    }
+
+    fn test_security_with_env_cmd() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["env".into(), "echo".into()],
+            ..SecurityPolicy::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn shell_does_not_leak_api_key() {
+        // Set a fake API key in the process environment
+        unsafe {
+            std::env::set_var("API_KEY", "sk-test-secret-12345");
+            std::env::set_var("ZEROCLAW_API_KEY", "sk-test-secret-67890");
+        }
+
+        let tool = ShellTool::new(test_security_with_env_cmd());
+        let result = tool.execute(json!({"command": "env"})).await.unwrap();
+        assert!(result.success);
+        assert!(
+            !result.output.contains("sk-test-secret-12345"),
+            "API_KEY leaked to shell command output"
+        );
+        assert!(
+            !result.output.contains("sk-test-secret-67890"),
+            "ZEROCLAW_API_KEY leaked to shell command output"
+        );
+
+        // Clean up
+        unsafe {
+            std::env::remove_var("API_KEY");
+            std::env::remove_var("ZEROCLAW_API_KEY");
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_preserves_path_and_home() {
+        let tool = ShellTool::new(test_security_with_env_cmd());
+        let result = tool
+            .execute(json!({"command": "echo $HOME"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(
+            !result.output.trim().is_empty(),
+            "HOME should be available in shell"
+        );
     }
 }
