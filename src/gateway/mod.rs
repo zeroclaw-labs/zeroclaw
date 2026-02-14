@@ -160,6 +160,12 @@ pub async fn run_gateway(
 
     crate::health::mark_component_ok("gateway");
 
+    let state = AppState {
+        provider,
+        model,
+        temperature,
+        mem,
+        auto_save: config.memory.auto_save,
         webhook_secret,
         pairing,
         whatsapp: whatsapp_channel,
