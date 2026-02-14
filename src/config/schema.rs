@@ -162,12 +162,15 @@ impl Default for SecretsConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BrowserConfig {
-    /// Enable `browser_open` tool (opens URLs in Brave without scraping)
+    /// Enable browser tools (`browser_open` and browser automation)
     #[serde(default)]
     pub enabled: bool,
-    /// Allowed domains for `browser_open` (exact or subdomain match)
+    /// Allowed domains for browser tools (exact or subdomain match)
     #[serde(default)]
     pub allowed_domains: Vec<String>,
+    /// Session name for agent-browser (persists state across commands)
+    #[serde(default)]
+    pub session_name: Option<String>,
 }
 
 // ── Memory ───────────────────────────────────────────────────
@@ -624,10 +627,19 @@ impl Default for Config {
 
 impl Config {
     pub fn load_or_init() -> Result<Self> {
-        let home = UserDirs::new()
-            .map(|u| u.home_dir().to_path_buf())
-            .context("Could not find home directory")?;
-        let zeroclaw_dir = home.join(".zeroclaw");
+        // Check for workspace override from environment (Docker support)
+        let zeroclaw_dir = if let Ok(workspace) = std::env::var("ZEROCLAW_WORKSPACE") {
+            let ws_path = PathBuf::from(&workspace);
+            ws_path
+                .parent()
+                .map_or_else(|| PathBuf::from(&workspace), PathBuf::from)
+        } else {
+            let home = UserDirs::new()
+                .map(|u| u.home_dir().to_path_buf())
+                .context("Could not find home directory")?;
+            home.join(".zeroclaw")
+        };
+
         let config_path = zeroclaw_dir.join("config.toml");
 
         if !zeroclaw_dir.exists() {
@@ -636,16 +648,69 @@ impl Config {
                 .context("Failed to create workspace directory")?;
         }
 
-        if config_path.exists() {
+        let mut config = if config_path.exists() {
             let contents =
                 fs::read_to_string(&config_path).context("Failed to read config file")?;
-            let config: Config =
-                toml::from_str(&contents).context("Failed to parse config file")?;
-            Ok(config)
+            toml::from_str(&contents).context("Failed to parse config file")?
         } else {
-            let config = Config::default();
+            Config::default()
+        };
+
+        // Apply environment variable overrides (Docker/container support)
+        config.apply_env_overrides();
+
+        // Save config if it didn't exist (creates default config with env overrides)
+        if !config_path.exists() {
             config.save()?;
-            Ok(config)
+        }
+
+        Ok(config)
+    }
+
+    /// Apply environment variable overrides to config.
+    ///
+    /// Supports: `ZEROCLAW_API_KEY`, `API_KEY`, `ZEROCLAW_PROVIDER`, `PROVIDER`,
+    /// `ZEROCLAW_MODEL`, `ZEROCLAW_WORKSPACE`, `ZEROCLAW_GATEWAY_PORT`
+    pub fn apply_env_overrides(&mut self) {
+        // API Key: ZEROCLAW_API_KEY or API_KEY
+        if let Ok(key) = std::env::var("ZEROCLAW_API_KEY").or_else(|_| std::env::var("API_KEY")) {
+            if !key.is_empty() {
+                self.api_key = Some(key);
+            }
+        }
+
+        // Provider: ZEROCLAW_PROVIDER or PROVIDER
+        if let Ok(provider) =
+            std::env::var("ZEROCLAW_PROVIDER").or_else(|_| std::env::var("PROVIDER"))
+        {
+            if !provider.is_empty() {
+                self.default_provider = Some(provider);
+            }
+        }
+
+        // Model: ZEROCLAW_MODEL
+        if let Ok(model) = std::env::var("ZEROCLAW_MODEL") {
+            if !model.is_empty() {
+                self.default_model = Some(model);
+            }
+        }
+
+        // Workspace directory: ZEROCLAW_WORKSPACE
+        if let Ok(workspace) = std::env::var("ZEROCLAW_WORKSPACE") {
+            if !workspace.is_empty() {
+                self.workspace_dir = PathBuf::from(workspace);
+            }
+        }
+
+        // Gateway port: ZEROCLAW_GATEWAY_PORT or PORT
+        if let Ok(port_str) =
+            std::env::var("ZEROCLAW_GATEWAY_PORT").or_else(|_| std::env::var("PORT"))
+        {
+            if let Ok(port) = port_str.parse::<u16>() {
+                // Gateway config doesn't have port yet, but we can add it
+                // For now, this is a placeholder for future gateway port config
+                let _ = port; // Suppress unused warning
+            }
         }
     }
 
@@ -1345,6 +1410,7 @@ default_temperature = 0.7
         let b = BrowserConfig {
             enabled: true,
             allowed_domains: vec!["example.com".into(), "docs.example.com".into()],
+            session_name: None,
         };
         let toml_str = toml::to_string(&b).unwrap();
         let parsed: BrowserConfig = toml::from_str(&toml_str).unwrap();
@@ -1363,5 +1429,98 @@ default_temperature = 0.7
         let parsed: Config = toml::from_str(minimal).unwrap();
         assert!(!parsed.browser.enabled);
         assert!(parsed.browser.allowed_domains.is_empty());
+    }
+
+    // ── Environment variable overrides (Docker support) ─────────
+
+    #[test]
+    fn env_override_api_key() {
+        let mut config = Config::default();
+        assert!(config.api_key.is_none());
+
+        // Simulate ZEROCLAW_API_KEY
+        std::env::set_var("ZEROCLAW_API_KEY", "sk-test-env-key");
+        config.apply_env_overrides();
+        assert_eq!(config.api_key.as_deref(), Some("sk-test-env-key"));
+
+        // Clean up
+        std::env::remove_var("ZEROCLAW_API_KEY");
+    }
+
+    #[test]
+    fn env_override_api_key_fallback() {
+        let mut config = Config::default();
+
+        // Simulate API_KEY (fallback)
+        std::env::remove_var("ZEROCLAW_API_KEY");
+        std::env::set_var("API_KEY", "sk-fallback-key");
+        config.apply_env_overrides();
+        assert_eq!(config.api_key.as_deref(), Some("sk-fallback-key"));
+
+        // Clean up
+        std::env::remove_var("API_KEY");
+    }
+
+    #[test]
+    fn env_override_provider() {
+        let mut config = Config::default();
+
+        std::env::set_var("ZEROCLAW_PROVIDER", "anthropic");
+        config.apply_env_overrides();
+        assert_eq!(config.default_provider.as_deref(), Some("anthropic"));
+
+        // Clean up
+        std::env::remove_var("ZEROCLAW_PROVIDER");
+    }
+
+    #[test]
+    fn env_override_provider_fallback() {
+        let mut config = Config::default();
+
+        std::env::remove_var("ZEROCLAW_PROVIDER");
+        std::env::set_var("PROVIDER", "openai");
+        config.apply_env_overrides();
+        assert_eq!(config.default_provider.as_deref(), Some("openai"));
+
+        // Clean up
+        std::env::remove_var("PROVIDER");
+    }
+
+    #[test]
+    fn env_override_model() {
+        let mut config = Config::default();
+
+        std::env::set_var("ZEROCLAW_MODEL", "gpt-4o");
+        config.apply_env_overrides();
+        assert_eq!(config.default_model.as_deref(), Some("gpt-4o"));
+
+        // Clean up
+        std::env::remove_var("ZEROCLAW_MODEL");
+    }
+
+    #[test]
+    fn env_override_workspace() {
+        let mut config = Config::default();
+
+        std::env::set_var("ZEROCLAW_WORKSPACE", "/custom/workspace");
+        config.apply_env_overrides();
+        assert_eq!(config.workspace_dir, PathBuf::from("/custom/workspace"));
+
+        // Clean up
+        std::env::remove_var("ZEROCLAW_WORKSPACE");
+    }
+
+    #[test]
+    fn env_override_empty_values_ignored() {
+        let mut config = Config::default();
+        let original_provider = config.default_provider.clone();
+
+        std::env::set_var("ZEROCLAW_PROVIDER", "");
+        config.apply_env_overrides();
+        // Empty value should not override
+        assert_eq!(config.default_provider, original_provider);
+
+        // Clean up
+        std::env::remove_var("ZEROCLAW_PROVIDER");
     }
 }

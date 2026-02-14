@@ -1,3 +1,4 @@
+pub mod browser;
 pub mod browser_open;
 pub mod composio;
 pub mod file_read;
@@ -8,6 +9,7 @@ pub mod memory_store;
 pub mod shell;
 pub mod traits;
 
+pub use browser::BrowserTool;
 pub use browser_open::BrowserOpenTool;
 pub use composio::ComposioTool;
 pub use file_read::FileReadTool;
@@ -50,9 +52,16 @@ pub fn all_tools(
     ];
 
     if browser_config.enabled {
+        // Add legacy browser_open tool for simple URL opening
         tools.push(Box::new(BrowserOpenTool::new(
             security.clone(),
             browser_config.allowed_domains.clone(),
+        )));
+        // Add full browser automation tool (agent-browser)
+        tools.push(Box::new(BrowserTool::new(
+            security.clone(),
+            browser_config.allowed_domains.clone(),
+            browser_config.session_name.clone(),
         )));
     }
 
@@ -92,6 +101,7 @@ mod tests {
         let browser = BrowserConfig {
             enabled: false,
             allowed_domains: vec!["example.com".into()],
+            session_name: None,
         };
 
         let tools = all_tools(&security, mem, None, &browser);
@@ -113,6 +123,7 @@ mod tests {
         let browser = BrowserConfig {
             enabled: true,
             allowed_domains: vec!["example.com".into()],
+            session_name: None,
         };
 
         let tools = all_tools(&security, mem, None, &browser);
