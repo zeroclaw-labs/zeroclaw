@@ -1,0 +1,75 @@
+# CodeRabbit configuration for ZeroClaw
+# Documentation: https://docs.coderabbit.ai/reference/configuration
+
+language: en-US
+early_access: false
+
+# Enable tone control for reviews
+reviews:
+  # Request changes workflow
+  request_changes_workflow: false
+  
+  # High level summary of the PR
+  high_level_summary: true
+  
+  # Generate sequence diagrams
+  sequence_diagrams: true
+  
+  # Auto-review configuration
+  auto_review:
+    enabled: true
+    # Only review PRs targeting these branches
+    base_branches:
+      - main
+      - develop
+    # Skip reviews for draft PRs or WIP
+    drafts: false
+    # Enable base branch analysis
+    base_branch_analysis: true
+  
+  # Poem configuration
+  poem:
+    enabled: false
+  
+  # Reviewer suggestions
+  reviewer:
+    # Suggest reviewers based on blame data
+    enabled: true
+    # Automatically assign suggested reviewers
+    auto_assign: false
+  
+  # Enable finishing touches
+  finishing_touches:
+    # Generate docstrings
+    docstrings:
+      enabled: true
+    # Generate unit tests
+    unit_tests:
+      enabled: true
+
+# Tools configuration
+tools:
+  # Rust-specific tools
+  cargo:
+    enabled: true
+  
+# Chat configuration
+chat:
+  auto_reply: true
+
+# Path filters - ignore generated files
+path_filters:
+  - "!**/target/**"
+  - "!**/node_modules/**"
+  - "!**/.cargo/**"
+  - "!**/Cargo.lock"
+
+# Review instructions specific to Rust and this project
+review_instructions:
+  - "Focus on Rust best practices and idiomatic code"
+  - "Check for security vulnerabilities in encryption/crypto code"
+  - "Ensure proper error handling with Result types"
+  - "Verify memory safety and avoid unnecessary clones"
+  - "Check for proper use of lifetimes and borrowing"
+  - "Ensure tests cover critical security paths"
+  - "Review configuration migration code carefully"
