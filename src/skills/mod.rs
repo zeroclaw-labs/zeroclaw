@@ -295,18 +295,19 @@ pub fn handle_command(command: super::SkillCommands, workspace_dir: &Path) -> Re
                 let dest = skills_path.join(name);
 
                 #[cfg(unix)]
-                std::os::unix::fs::symlink(&src, &dest)?;
+                {
+                    std::os::unix::fs::symlink(&src, &dest)?;
+                    println!(
+                        "  {} Skill linked: {}",
+                        console::style("✓").green().bold(),
+                        dest.display()
+                    );
+                }
                 #[cfg(not(unix))]
                 {
                     // On non-unix, copy the directory
                     anyhow::bail!("Symlink not supported on this platform. Copy the skill directory manually.");
                 }
-
-                println!(
-                    "  {} Skill linked: {}",
-                    console::style("✓").green().bold(),
-                    dest.display()
-                );
             }
 
             Ok(())
