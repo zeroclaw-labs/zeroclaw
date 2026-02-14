@@ -25,6 +25,13 @@ impl TelegramChannel {
     fn is_user_allowed(&self, username: &str) -> bool {
         self.allowed_users.iter().any(|u| u == "*" || u == username)
     }
+
+    fn is_any_user_allowed<'a, I>(&self, identities: I) -> bool
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        identities.into_iter().any(|id| self.is_user_allowed(id))
+    }
 }
 
 #[async_trait]
@@ -95,15 +102,28 @@ impl Channel for TelegramChannel {
                         continue;
                     };
 
-                    let username = message
+                    let username_opt = message
                         .get("from")
                         .and_then(|f| f.get("username"))
-                        .and_then(|u| u.as_str())
-                        .unwrap_or("unknown");
+                        .and_then(|u| u.as_str());
+                    let username = username_opt.unwrap_or("unknown");
 
-                    if !self.is_user_allowed(username) {
+                    let user_id = message
+                        .get("from")
+                        .and_then(|f| f.get("id"))
+                        .and_then(serde_json::Value::as_i64);
+                    let user_id_str = user_id.map(|id| id.to_string());
+
+                    let mut identities = vec![username];
+                    if let Some(ref id) = user_id_str {
+                        identities.push(id.as_str());
+                    }
+
+                    if !self.is_any_user_allowed(identities.iter().copied()) {
                         tracing::warn!(
-                            "Telegram: ignoring message from unauthorized user: {username}"
+                            "Telegram: ignoring message from unauthorized user: username={username}, user_id={}. \
+Allowlist Telegram @username or numeric user ID, then run `zeroclaw onboard --channels-only`.",
+                            user_id_str.as_deref().unwrap_or("unknown")
                         );
                         continue;
                     }
@@ -210,5 +230,17 @@ mod tests {
         assert!(ch.is_user_allowed("alice"));
         assert!(ch.is_user_allowed("bob"));
         assert!(ch.is_user_allowed("anyone"));
+    }
+
+    #[test]
+    fn telegram_user_allowed_by_numeric_id_identity() {
+        let ch = TelegramChannel::new("t".into(), vec!["123456789".into()]);
+        assert!(ch.is_any_user_allowed(["unknown", "123456789"]));
+    }
+
+    #[test]
+    fn telegram_user_denied_when_none_of_identities_match() {
+        let ch = TelegramChannel::new("t".into(), vec!["alice".into(), "987654321".into()]);
+        assert!(!ch.is_any_user_allowed(["unknown", "123456789"]));
     }
 }

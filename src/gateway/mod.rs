@@ -26,9 +26,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let actual_port = listener.local_addr()?.port();
     let addr = format!("{host}:{actual_port}");
 
-    let provider: Arc<dyn Provider> = Arc::from(providers::create_provider(
+    let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider(
         config.default_provider.as_deref().unwrap_or("openrouter"),
         config.api_key.as_deref(),
+        &config.reliability,
     )?);
     let model = config
         .default_model
@@ -96,6 +97,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         println!("  🔒 Webhook secret: ENABLED");
     }
     println!("  Press Ctrl+C to stop.\n");
+
+    crate::health::mark_component_ok("gateway");
 
     loop {
         let (mut stream, peer) = listener.accept().await?;
@@ -175,6 +178,7 @@ async fn handle_request(
             let body = serde_json::json!({
                 "status": "ok",
                 "paired": pairing.is_paired(),
+                "runtime": crate::health::snapshot_json(),
             });
             let _ = send_json(stream, 200, &body).await;
         }

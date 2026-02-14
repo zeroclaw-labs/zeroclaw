@@ -91,6 +91,7 @@ pub fn run_wizard() -> Result<Config> {
         observability: ObservabilityConfig::default(),
         autonomy: AutonomyConfig::default(),
         runtime: RuntimeConfig::default(),
+        reliability: crate::config::ReliabilityConfig::default(),
         heartbeat: HeartbeatConfig::default(),
         channels_config,
         memory: MemoryConfig::default(), // SQLite + auto-save by default
@@ -118,6 +119,61 @@ pub fn run_wizard() -> Result<Config> {
     print_summary(&config);
 
     // ── Offer to launch channels immediately ─────────────────────
+    let has_channels = config.channels_config.telegram.is_some()
+        || config.channels_config.discord.is_some()
+        || config.channels_config.slack.is_some()
+        || config.channels_config.imessage.is_some()
+        || config.channels_config.matrix.is_some();
+
+    if has_channels && config.api_key.is_some() {
+        let launch: bool = Confirm::new()
+            .with_prompt(format!(
+                "  {} Launch channels now? (connected channels → AI → reply)",
+                style("🚀").cyan()
+            ))
+            .default(true)
+            .interact()?;
+
+        if launch {
+            println!();
+            println!(
+                "  {} {}",
+                style("⚡").cyan(),
+                style("Starting channel server...").white().bold()
+            );
+            println!();
+            // Signal to main.rs to call start_channels after wizard returns
+            std::env::set_var("ZEROCLAW_AUTOSTART_CHANNELS", "1");
+        }
+    }
+
+    Ok(config)
+}
+
+/// Interactive repair flow: rerun channel setup only without redoing full onboarding.
+pub fn run_channels_repair_wizard() -> Result<Config> {
+    println!("{}", style(BANNER).cyan().bold());
+    println!(
+        "  {}",
+        style("Channels Repair — update channel tokens and allowlists only")
+            .white()
+            .bold()
+    );
+    println!();
+
+    let mut config = Config::load_or_init()?;
+
+    print_step(1, 1, "Channels (How You Talk to ZeroClaw)");
+    config.channels_config = setup_channels()?;
+    config.save()?;
+
+    println!();
+    println!(
+        "  {} Channel config saved: {}",
+        style("✓").green().bold(),
+        style(config.config_path.display()).green()
+    );
+
     let has_channels = config.channels_config.telegram.is_some()
         || config.channels_config.discord.is_some()
         || config.channels_config.slack.is_some()
@@ -187,6 +243,7 @@ pub fn run_quick_setup(api_key: Option<&str>, provider: Option<&str>) -> Result<
         observability: ObservabilityConfig::default(),
         autonomy: AutonomyConfig::default(),
         runtime: RuntimeConfig::default(),
+        reliability: crate::config::ReliabilityConfig::default(),
         heartbeat: HeartbeatConfig::default(),
         channels_config: ChannelsConfig::default(),
         memory: MemoryConfig::default(),
@@ -204,7 +261,9 @@ pub fn run_quick_setup(api_key: Option<&str>, provider: Option<&str>) -> Result<
         user_name: std::env::var("USER").unwrap_or_else(|_| "User".into()),
         timezone: "UTC".into(),
         agent_name: "ZeroClaw".into(),
-        communication_style: "Direct and concise".into(),
+        communication_style:
+            "Be warm, natural, and clear. Use occasional relevant emojis (1-2 max) and avoid robotic phrasing."
+                .into(),
     };
     scaffold_workspace(&workspace_dir, &default_ctx)?;
 
@@ -824,24 +883,33 @@ fn setup_project_context() -> Result<ProjectContext> {
 
     let style_options = vec![
         "Direct & concise — skip pleasantries, get to the point",
-        "Friendly & casual — warm but efficient",
+        "Friendly & casual — warm, human, and helpful",
+        "Professional & polished — calm, confident, and clear",
+        "Expressive & playful — more personality + natural emojis",
         "Technical & detailed — thorough explanations, code-first",
         "Balanced — adapt to the situation",
+        "Custom — write your own style guide",
     ];
 
     let style_idx = Select::new()
         .with_prompt("  Communication style")
         .items(&style_options)
-        .default(0)
+        .default(1)
         .interact()?;
 
     let communication_style = match style_idx {
         0 => "Be direct and concise. Skip pleasantries. Get to the point.".to_string(),
-        1 => "Be friendly and casual. Warm but efficient.".to_string(),
-        2 => "Be technical and detailed. Thorough explanations, code-first.".to_string(),
-        _ => {
-            "Adapt to the situation. Be concise when needed, thorough when it matters.".to_string()
-        }
+        1 => "Be friendly, human, and conversational. Show warmth and empathy while staying efficient. Use natural contractions.".to_string(),
+        2 => "Be professional and polished. Stay calm, structured, and respectful. Use occasional tone-setting emojis only when appropriate.".to_string(),
+        3 => "Be expressive and playful when appropriate. Use relevant emojis naturally (0-2 max), and keep serious topics emoji-light.".to_string(),
+        4 => "Be technical and detailed. Thorough explanations, code-first.".to_string(),
+        5 => "Adapt to the situation. Default to warm and clear communication; be concise when needed, thorough when it matters.".to_string(),
+        _ => Input::new()
+            .with_prompt("  Custom communication style")
+            .default(
+                "Be warm, natural, and clear. Use occasional relevant emojis (1-2 max) and avoid robotic phrasing.".into(),
+            )
+            .interact_text()?,
     };
 
     println!(
@@ -987,16 +1055,37 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     }
                 }
 
+                print_bullet(
+                    "Allowlist your own Telegram identity first (recommended for secure + fast setup).",
+                );
+                print_bullet(
+                    "Use your @username without '@' (example: argenis), or your numeric Telegram user ID.",
+                );
+                print_bullet("Use '*' only for temporary open testing.");
+
                 let users_str: String = Input::new()
-                    .with_prompt("  Allowed usernames (comma-separated, or * for all)")
-                    .default("*".into())
+                    .with_prompt(
+                        "  Allowed Telegram identities (comma-separated: username without '@' and/or numeric user ID, '*' for all)",
+                    )
+                    .allow_empty(true)
                     .interact_text()?;
 
                 let allowed_users = if users_str.trim() == "*" {
                     vec!["*".into()]
                 } else {
-                    users_str.split(',').map(|s| s.trim().to_string()).collect()
+                    users_str
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
                 };
+
+                if allowed_users.is_empty() {
+                    println!(
+                        "  {} No users allowlisted — Telegram inbound messages will be denied until you add your username/user ID or '*'.",
+                        style("⚠").yellow().bold()
+                    );
+                }
 
                 config.telegram = Some(TelegramConfig {
                     bot_token: token,
@@ -1057,9 +1146,15 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     .allow_empty(true)
                     .interact_text()?;
 
+                print_bullet("Allowlist your own Discord user ID first (recommended).");
+                print_bullet(
+                    "Get it in Discord: Settings -> Advanced -> Developer Mode (ON), then right-click your profile -> Copy User ID.",
+                );
+                print_bullet("Use '*' only for temporary open testing.");
+
                 let allowed_users_str: String = Input::new()
                     .with_prompt(
-                        "  Allowed Discord user IDs (comma-separated, '*' for all, Enter to deny all)",
+                        "  Allowed Discord user IDs (comma-separated, recommended: your own ID, '*' for all)",
                     )
                     .allow_empty(true)
                     .interact_text()?;
@@ -1160,9 +1255,15 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     .allow_empty(true)
                     .interact_text()?;
 
+                print_bullet("Allowlist your own Slack member ID first (recommended).");
+                print_bullet(
+                    "Member IDs usually start with 'U' (open your Slack profile -> More -> Copy member ID).",
+                );
+                print_bullet("Use '*' only for temporary open testing.");
+
                 let allowed_users_str: String = Input::new()
                     .with_prompt(
-                        "  Allowed Slack user IDs (comma-separated, '*' for all, Enter to deny all)",
+                        "  Allowed Slack user IDs (comma-separated, recommended: your own member ID, '*' for all)",
                     )
                     .allow_empty(true)
                     .interact_text()?;
@@ -1564,7 +1665,7 @@ fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> 
         &ctx.timezone
     };
     let comm_style = if ctx.communication_style.is_empty() {
-        "Adapt to the situation. Be concise when needed, thorough when it matters."
+        "Be warm, natural, and clear. Use occasional relevant emojis (1-2 max) and avoid robotic phrasing."
     } else {
         &ctx.communication_style
     };
@@ -1613,6 +1714,14 @@ fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> 
          ## Tools & Skills\n\n\
          Skills are listed in the system prompt. Use `read` on a skill's SKILL.md for details.\n\
          Keep local notes (SSH hosts, device names, etc.) in `TOOLS.md`.\n\n\
+         ## Crash Recovery\n\n\
+         - If a run stops unexpectedly, recover context before acting.\n\
+         - Check `MEMORY.md` + latest `memory/*.md` notes to avoid duplicate work.\n\
+         - Resume from the last confirmed step, not from scratch.\n\n\
+         ## Sub-task Scoping\n\n\
+         - Break complex work into focused sub-tasks with clear success criteria.\n\
+         - Keep sub-tasks small, verify each output, then merge results.\n\
+         - Prefer one clear objective per sub-task over broad \"do everything\" asks.\n\n\
          ## Make It Yours\n\n\
          This is a starting point. Add your own conventions, style, and rules.\n"
     );
@@ -1650,6 +1759,11 @@ fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> 
          - Always introduce yourself as {agent} if asked\n\n\
          ## Communication\n\n\
          {comm_style}\n\n\
+         - Sound like a real person, not a support script.\n\
+         - Mirror the user's energy: calm when serious, upbeat when casual.\n\
+         - Use emojis naturally (0-2 max when they help tone, not every sentence).\n\
+         - Match emoji density to the user. Formal user => minimal/no emojis.\n\
+         - Prefer specific, grounded phrasing over generic filler.\n\n\
          ## Boundaries\n\n\
          - Private things stay private. Period.\n\
          - When in doubt, ask before acting externally.\n\
@@ -1690,11 +1804,23 @@ fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> 
          - Anything environment-specific\n\n\
          ## Built-in Tools\n\n\
          - **shell** — Execute terminal commands\n\
+           - Use when: running local checks, build/test commands, or diagnostics.\n\
+           - Don't use when: a safer dedicated tool exists, or command is destructive without approval.\n\
          - **file_read** — Read file contents\n\
+           - Use when: inspecting project files, configs, or logs.\n\
+           - Don't use when: you only need a quick string search (prefer targeted search first).\n\
          - **file_write** — Write file contents\n\
+           - Use when: applying focused edits, scaffolding files, or updating docs/code.\n\
+           - Don't use when: unsure about side effects or when the file should remain user-owned.\n\
          - **memory_store** — Save to memory\n\
+           - Use when: preserving durable preferences, decisions, or key context.\n\
+           - Don't use when: info is transient, noisy, or sensitive without explicit need.\n\
          - **memory_recall** — Search memory\n\
-         - **memory_forget** — Delete a memory entry\n\n\
+           - Use when: you need prior decisions, user preferences, or historical context.\n\
+           - Don't use when: the answer is already in current files/conversation.\n\
+         - **memory_forget** — Delete a memory entry\n\
+           - Use when: memory is incorrect, stale, or explicitly requested to be removed.\n\
+           - Don't use when: uncertain about impact; verify before deleting.\n\n\
          ---\n\
          *Add whatever helps you do your job. This is your cheat sheet.*\n";
 
@@ -2188,7 +2314,7 @@ mod tests {
 
         let soul = fs::read_to_string(tmp.path().join("SOUL.md")).unwrap();
         assert!(
-            soul.contains("Adapt to the situation"),
+            soul.contains("Be warm, natural, and clear."),
             "should default communication style"
         );
     }
@@ -2329,6 +2455,31 @@ mod tests {
                 "TOOLS.md should list built-in tool: {tool}"
             );
         }
+        assert!(
+            tools.contains("Use when:"),
+            "TOOLS.md should include 'Use when' guidance"
+        );
+        assert!(
+            tools.contains("Don't use when:"),
+            "TOOLS.md should include 'Don't use when' guidance"
+        );
+    }
+
+    #[test]
+    fn soul_md_includes_emoji_awareness_guidance() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = ProjectContext::default();
+        scaffold_workspace(tmp.path(), &ctx).unwrap();
+
+        let soul = fs::read_to_string(tmp.path().join("SOUL.md")).unwrap();
+        assert!(
+            soul.contains("Use emojis naturally (0-2 max"),
+            "SOUL.md should include emoji usage guidance"
+        );
+        assert!(
+            soul.contains("Match emoji density to the user"),
+            "SOUL.md should include emoji-awareness guidance"
+        );
     }
 
     // ── scaffold_workspace: special characters in names ─────────
@@ -2360,7 +2511,9 @@ mod tests {
             user_name: "Argenis".into(),
             timezone: "US/Eastern".into(),
             agent_name: "Claw".into(),
-            communication_style: "Be friendly and casual. Warm but efficient.".into(),
+            communication_style:
+                "Be friendly, human, and conversational. Show warmth and empathy while staying efficient. Use natural contractions."
+                    .into(),
         };
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
@@ -2370,12 +2523,12 @@ mod tests {
 
         let soul = fs::read_to_string(tmp.path().join("SOUL.md")).unwrap();
         assert!(soul.contains("You are **Claw**"));
-        assert!(soul.contains("Be friendly and casual"));
+        assert!(soul.contains("Be friendly, human, and conversational"));
 
         let user_md = fs::read_to_string(tmp.path().join("USER.md")).unwrap();
         assert!(user_md.contains("**Name:** Argenis"));
         assert!(user_md.contains("**Timezone:** US/Eastern"));
-        assert!(user_md.contains("Be friendly and casual"));
+        assert!(user_md.contains("Be friendly, human, and conversational"));
 
         let agents = fs::read_to_string(tmp.path().join("AGENTS.md")).unwrap();
         assert!(agents.contains("Claw Personal Assistant"));
