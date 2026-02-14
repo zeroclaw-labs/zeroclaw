@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+#
+# pre-push hook — runs fmt, clippy, and tests before every push.
+# Install:  git config core.hooksPath .githooks
+# Skip:     git push --no-verify
+
+set -euo pipefail
+
+echo "==> pre-push: checking formatting..."
+cargo fmt -- --check || {
+    echo "FAIL: cargo fmt -- --check found unformatted code."
+    echo "Run 'cargo fmt' and try again."
+    exit 1
+}
+
+echo "==> pre-push: running clippy..."
+cargo clippy -- -D warnings || {
+    echo "FAIL: clippy reported warnings."
+    exit 1
+}
+
+echo "==> pre-push: running tests..."
+cargo test || {
+    echo "FAIL: some tests did not pass."
+    exit 1
+}
+
+echo "==> pre-push: all checks passed."

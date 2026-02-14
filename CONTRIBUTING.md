@@ -9,18 +9,33 @@ Thanks for your interest in contributing to ZeroClaw! This guide will help you g
 git clone https://github.com/theonlyhennygod/zeroclaw.git
 cd zeroclaw
 
+# Enable the pre-push hook (runs fmt, clippy, tests before every push)
+git config core.hooksPath .githooks
+
 # Build
 cargo build
 
-# Run tests (180 tests, all must pass)
+# Run tests (all must pass)
 cargo test
 
 # Format & lint (must pass before PR)
 cargo fmt && cargo clippy -- -D warnings
 
-# Release build (~3.1MB)
+# Release build (~3.4MB)
 cargo build --release
 ```
+
+### Pre-push hook
+
+The repo includes a pre-push hook in `.githooks/` that enforces `cargo fmt --check`, `cargo clippy -- -D warnings`, and `cargo test` before every push. Enable it with `git config core.hooksPath .githooks`.
+
+To skip it during rapid iteration:
+
+```bash
+git push --no-verify
+```
+
+> **Note:** CI runs the same checks, so skipped hooks will be caught on the PR.
 
 ## Architecture: Trait-Based Pluggability
 
