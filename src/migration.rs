@@ -250,6 +250,7 @@ fn read_openclaw_markdown_entries(source_workspace: &Path) -> Result<Vec<SourceE
     Ok(all)
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn parse_markdown_file(
     _path: &Path,
     content: &str,
@@ -306,10 +307,9 @@ fn parse_structured_memory_line(line: &str) -> Option<(&str, &str)> {
 
 fn parse_category(raw: &str) -> MemoryCategory {
     match raw.trim().to_ascii_lowercase().as_str() {
-        "core" => MemoryCategory::Core,
+        "core" | "" => MemoryCategory::Core,
         "daily" => MemoryCategory::Daily,
         "conversation" => MemoryCategory::Conversation,
-        "" => MemoryCategory::Core,
         other => MemoryCategory::Custom(other.to_string()),
     }
 }
@@ -350,7 +350,7 @@ fn pick_optional_column_expr(columns: &[String], candidates: &[&str]) -> Option<
     candidates
         .iter()
         .find(|candidate| columns.iter().any(|c| c == *candidate))
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
 }
 
 fn pick_column_expr(columns: &[String], candidates: &[&str], fallback: &str) -> String {

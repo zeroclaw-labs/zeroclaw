@@ -188,7 +188,7 @@ pub fn build_system_prompt(
     }
 }
 
-/// Inject OpenClaw (markdown) identity files into the prompt
+/// Inject `OpenClaw` (markdown) identity files into the prompt
 fn inject_openclaw_identity(prompt: &mut String, workspace_dir: &std::path::Path) {
     #[allow(unused_imports)]
     use std::fmt::Write;

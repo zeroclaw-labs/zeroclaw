@@ -6,7 +6,7 @@ use std::process::Command;
 
 const SERVICE_LABEL: &str = "com.zeroclaw.daemon";
 
-pub fn handle_command(command: super::ServiceCommands, config: &Config) -> Result<()> {
+pub fn handle_command(command: &super::ServiceCommands, config: &Config) -> Result<()> {
     match command {
         super::ServiceCommands::Install => install(config),
         super::ServiceCommands::Start => start(config),

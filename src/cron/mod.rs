@@ -18,10 +18,11 @@ pub struct CronJob {
     pub last_status: Option<String>,
 }
 
-pub fn handle_command(command: super::CronCommands, config: Config) -> Result<()> {
+#[allow(clippy::needless_pass_by_value)]
+pub fn handle_command(command: super::CronCommands, config: &Config) -> Result<()> {
     match command {
         super::CronCommands::List => {
-            let jobs = list_jobs(&config)?;
+            let jobs = list_jobs(config)?;
             if jobs.is_empty() {
                 println!("No scheduled tasks yet.");
                 println!("\nUsage:");
@@ -33,8 +34,7 @@ pub fn handle_command(command: super::CronCommands, config: Config) -> Result<()
             for job in jobs {
                 let last_run = job
                     .last_run
-                    .map(|d| d.to_rfc3339())
-                    .unwrap_or_else(|| "never".into());
+                    .map_or_else(|| "never".into(), |d| d.to_rfc3339());
                 let last_status = job.last_status.unwrap_or_else(|| "n/a".into());
                 println!(
                     "- {} | {} | next={} | last={} ({})\n    cmd: {}",
@@ -52,14 +52,14 @@ pub fn handle_command(command: super::CronCommands, config: Config) -> Result<()
             expression,
             command,
         } => {
-            let job = add_job(&config, &expression, &command)?;
+            let job = add_job(config, &expression, &command)?;
             println!("✅ Added cron job {}", job.id);
             println!("  Expr: {}", job.expression);
             println!("  Next: {}", job.next_run.to_rfc3339());
             println!("  Cmd : {}", job.command);
             Ok(())
         }
-        super::CronCommands::Remove { id } => remove_job(&config, &id),
+        super::CronCommands::Remove { id } => remove_job(config, &id),
     }
 }
 

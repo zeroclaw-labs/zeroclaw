@@ -67,6 +67,7 @@ pub fn mark_component_ok(component: &str) {
     });
 }
 
+#[allow(clippy::needless_pass_by_value)]
 pub fn mark_component_error(component: &str, error: impl ToString) {
     let err = error.to_string();
     upsert_component(component, move |entry| {
