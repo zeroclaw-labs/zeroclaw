@@ -11,7 +11,9 @@ const SHELL_TIMEOUT_SECS: u64 = 60;
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
 /// Environment variables safe to pass to shell commands.
 /// Only functional variables are included — never API keys or secrets.
-const SAFE_ENV_VARS: &[&str] = &["PATH", "HOME", "TERM", "LANG", "USER", "SHELL", "TMPDIR"];
+const SAFE_ENV_VARS: &[&str] = &[
+    "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
+];
 
 /// Shell command execution tool with sandboxing
 pub struct ShellTool {
@@ -222,13 +224,24 @@ mod tests {
         })
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn shell_does_not_leak_api_key() {
-        // Set a fake API key in the process environment
+        // Panic-safe cleanup guard for env vars
+        struct CleanupGuard;
+        impl Drop for CleanupGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    std::env::remove_var("API_KEY");
+                    std::env::remove_var("ZEROCLAW_API_KEY");
+                }
+            }
+        }
+
         unsafe {
             std::env::set_var("API_KEY", "sk-test-secret-12345");
             std::env::set_var("ZEROCLAW_API_KEY", "sk-test-secret-67890");
         }
+        let _guard = CleanupGuard;
 
         let tool = ShellTool::new(test_security_with_env_cmd());
         let result = tool.execute(json!({"command": "env"})).await.unwrap();
@@ -241,12 +254,6 @@ mod tests {
             !result.output.contains("sk-test-secret-67890"),
             "ZEROCLAW_API_KEY leaked to shell command output"
         );
-
-        // Clean up
-        unsafe {
-            std::env::remove_var("API_KEY");
-            std::env::remove_var("ZEROCLAW_API_KEY");
-        }
     }
 
     #[tokio::test]
@@ -260,6 +267,16 @@ mod tests {
         assert!(
             !result.output.trim().is_empty(),
             "HOME should be available in shell"
+        );
+
+        let result = tool
+            .execute(json!({"command": "echo $PATH"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(
+            !result.output.trim().is_empty(),
+            "PATH should be available in shell"
         );
     }
 }
