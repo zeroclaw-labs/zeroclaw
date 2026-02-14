@@ -14,4 +14,10 @@ pub trait Provider: Send + Sync {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String>;
+
+    /// Warm up the HTTP connection pool (TLS handshake, DNS, HTTP/2 setup).
+    /// Default implementation is a no-op; providers with HTTP clients should override.
+    async fn warmup(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }

@@ -426,6 +426,13 @@ pub async fn start_channels(config: Config) -> Result<()> {
         config.api_key.as_deref(),
         &config.reliability,
     )?);
+
+    // Warm up the provider connection pool (TLS handshake, DNS, HTTP/2 setup)
+    // so the first real message doesn't hit a cold-start timeout.
+    if let Err(e) = provider.warmup().await {
+        tracing::warn!("Provider warmup failed (non-fatal): {e}");
+    }
+
     let model = config
         .default_model
         .clone()
