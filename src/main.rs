@@ -36,7 +36,6 @@ mod skills;
 mod tools;
 mod tunnel;
 
-
 use config::Config;
 
 /// `ZeroClaw` - Zero overhead. Zero compromise. 100% Rust.

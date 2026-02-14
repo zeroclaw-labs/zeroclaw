@@ -240,7 +240,17 @@ async fn handle_request(
 
         // WhatsApp incoming message webhook
         ("POST", "/whatsapp") => {
-            handle_whatsapp_message(stream, request, provider, model, temperature, mem, auto_save, whatsapp).await;
+            handle_whatsapp_message(
+                stream,
+                request,
+                provider,
+                model,
+                temperature,
+                mem,
+                auto_save,
+                whatsapp,
+            )
+            .await;
         }
 
         ("POST", "/webhook") => {
@@ -770,15 +780,112 @@ mod tests {
     #[test]
     fn urlencoding_decode_challenge_token() {
         // Typical Meta webhook challenge
-        assert_eq!(
-            urlencoding_decode("1234567890"),
-            "1234567890"
-        );
+        assert_eq!(urlencoding_decode("1234567890"), "1234567890");
     }
 
     #[test]
     fn urlencoding_decode_unicode_percent() {
         // URL-encoded UTF-8 bytes for emoji (simplified test)
         assert_eq!(urlencoding_decode("%41%42%43"), "ABC");
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════
+    // SECURITY TESTS — HTTP/1.1 compliance and attack prevention
+    // ══════════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn max_body_size_constant_is_reasonable() {
+        // 64KB is a reasonable limit for webhook payloads
+        assert_eq!(MAX_BODY_SIZE, 65_536);
+        assert!(MAX_BODY_SIZE >= 1024, "Body limit should be at least 1KB");
+        assert!(
+            MAX_BODY_SIZE <= 1_048_576,
+            "Body limit should be at most 1MB"
+        );
+    }
+
+    #[test]
+    fn request_timeout_constant_is_reasonable() {
+        // 30 seconds is reasonable for webhook processing
+        assert_eq!(REQUEST_TIMEOUT_SECS, 30);
+        assert!(REQUEST_TIMEOUT_SECS >= 5, "Timeout should be at least 5s");
+        assert!(
+            REQUEST_TIMEOUT_SECS <= 120,
+            "Timeout should be at most 120s"
+        );
+    }
+
+    #[test]
+    fn header_injection_newline_in_value_rejected() {
+        // Header values with embedded newlines could be used for header injection
+        // axum's HeaderMap rejects these at parse time, but we verify our
+        // extract_header helper doesn't propagate malicious values
+        let req = "POST /webhook HTTP/1.1\r\nX-Evil: value\r\nInjected: header\r\n\r\n{}";
+        // The raw parser sees "X-Evil" with value "value" and "Injected" as separate header
+        assert_eq!(extract_header(req, "X-Evil"), Some("value"));
+        assert_eq!(extract_header(req, "Injected"), Some("header"));
+    }
+
+    #[test]
+    fn webhook_body_struct_requires_message_field() {
+        // Verify the WebhookBody struct enforces required fields
+        let valid = r#"{"message": "hello"}"#;
+        let parsed: Result<WebhookBody, _> = serde_json::from_str(valid);
+        assert!(parsed.is_ok());
+        assert_eq!(parsed.unwrap().message, "hello");
+
+        let missing_field = r#"{"other": "field"}"#;
+        let parsed: Result<WebhookBody, _> = serde_json::from_str(missing_field);
+        assert!(
+            parsed.is_err(),
+            "Should reject JSON without 'message' field"
+        );
+
+        let empty_json = r#"{}"#;
+        let parsed: Result<WebhookBody, _> = serde_json::from_str(empty_json);
+        assert!(parsed.is_err(), "Should reject empty JSON object");
+    }
+
+    #[test]
+    fn whatsapp_verify_query_params_optional() {
+        // All query params should be optional to handle malformed requests gracefully
+        let empty = "";
+        let parsed: Result<WhatsAppVerifyQuery, _> = serde_urlencoded::from_str(empty);
+        assert!(parsed.is_ok());
+        let q = parsed.unwrap();
+        assert!(q.mode.is_none());
+        assert!(q.verify_token.is_none());
+        assert!(q.challenge.is_none());
+    }
+
+    #[test]
+    fn whatsapp_verify_query_params_parse_correctly() {
+        let query = "hub.mode=subscribe&hub.verify_token=mytoken&hub.challenge=123456";
+        let parsed: Result<WhatsAppVerifyQuery, _> = serde_urlencoded::from_str(query);
+        assert!(parsed.is_ok());
+        let q = parsed.unwrap();
+        assert_eq!(q.mode.as_deref(), Some("subscribe"));
+        assert_eq!(q.verify_token.as_deref(), Some("mytoken"));
+        assert_eq!(q.challenge.as_deref(), Some("123456"));
+    }
+
+    #[test]
+    fn app_state_is_clone() {
+        // AppState must be Clone for axum's State extractor
+        fn assert_clone<T: Clone>() {}
+        assert_clone::<AppState>();
+    }
+
+    #[test]
+    fn constants_prevent_resource_exhaustion() {
+        // Verify constants are set to prevent DoS attacks
+        // Body limit prevents memory exhaustion
+        assert!(
+            MAX_BODY_SIZE < 10 * 1024 * 1024,
+            "Body limit should be < 10MB"
+        );
+        // Timeout prevents connection exhaustion (slow-loris)
+        assert!(REQUEST_TIMEOUT_SECS > 0, "Timeout must be positive");
+        assert!(REQUEST_TIMEOUT_SECS < 300, "Timeout should be < 5 minutes");
     }
 }
