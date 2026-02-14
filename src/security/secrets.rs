@@ -86,6 +86,10 @@ impl SecretStore {
         if let Some(hex_str) = value.strip_prefix("enc2:") {
             self.decrypt_chacha20(hex_str)
         } else if let Some(hex_str) = value.strip_prefix("enc:") {
+            tracing::warn!(
+                "Decrypting legacy XOR-encrypted secret (enc: prefix). \
+                 This format is insecure and will be removed in a future release."
+            );
             self.decrypt_legacy_xor(hex_str)
         } else {
             Ok(value.to_string())
@@ -103,14 +107,9 @@ impl SecretStore {
             // Already using secure format — no migration needed
             let plaintext = self.decrypt_chacha20(hex_str)?;
             Ok((plaintext, None))
-        } else if let Some(hex_str) = value.strip_prefix("enc:") {
-            // Legacy XOR cipher — decrypt and re-encrypt with ChaCha20-Poly1305
-            tracing::warn!(
-                "Decrypting legacy XOR-encrypted secret (enc: prefix). \
-                 This format is insecure and will be removed in a future release. \
-                 The secret will be automatically migrated to enc2: (ChaCha20-Poly1305)."
-            );
-            let plaintext = self.decrypt_legacy_xor(hex_str)?;
+        } else if value.starts_with("enc:") {
+            // Legacy XOR cipher — decrypt (which logs the warning) and re-encrypt
+            let plaintext = self.decrypt(value)?;
             let migrated = self.encrypt(&plaintext)?;
             Ok((plaintext, Some(migrated)))
         } else {
@@ -170,12 +169,8 @@ impl SecretStore {
     /// Migrate a legacy `enc:` value to `enc2:` (ChaCha20-Poly1305).
     /// Returns `Some(enc2:...)` if migration occurred, `None` if no migration needed.
     pub fn migrate_legacy_value(&self, value: &str) -> Result<Option<String>> {
-        if !value.starts_with("enc:") {
-            return Ok(None);
-        }
-        let plaintext = self.decrypt(value)?;
-        let migrated = self.encrypt(&plaintext)?;
-        Ok(Some(migrated))
+        let (_, migrated) = self.decrypt_and_migrate(value)?;
+        Ok(migrated)
     }
 
     /// Load the encryption key from disk, or create one if it doesn't exist.
@@ -263,6 +258,20 @@ fn hex_decode(hex: &str) -> Result<Vec<u8>> {
                 .map_err(|e| anyhow::anyhow!("Invalid hex at position {i}: {e}"))
         })
         .collect()
+}
+
+/// Test helpers for creating legacy `enc:` values without duplicating XOR/hex logic.
+#[cfg(test)]
+pub(crate) mod test_helpers {
+    use super::*;
+
+    /// Create a legacy `enc:`-prefixed value by XOR-encrypting `plaintext` with the
+    /// store's key. The store must already have a key on disk (call `encrypt("setup")` first).
+    pub fn create_legacy_enc_value(store: &SecretStore, plaintext: &str) -> String {
+        let key = store.load_or_create_key().unwrap();
+        let ciphertext = xor_cipher(plaintext.as_bytes(), &key);
+        format!("enc:{}", hex_encode(&ciphertext))
+    }
 }
 
 #[cfg(test)]
@@ -440,15 +449,10 @@ mod tests {
     fn legacy_xor_decrypt_still_works() {
         let tmp = TempDir::new().unwrap();
         let store = SecretStore::new(tmp.path(), true);
-
-        // Trigger key creation via an encrypt call
         let _ = store.encrypt("setup").unwrap();
-        let key = store.load_or_create_key().unwrap();
 
-        // Manually produce a legacy XOR-encrypted value
         let plaintext = "sk-legacy-api-key";
-        let ciphertext = xor_cipher(plaintext.as_bytes(), &key);
-        let legacy_value = format!("enc:{}", hex_encode(&ciphertext));
+        let legacy_value = test_helpers::create_legacy_enc_value(&store, plaintext);
 
         // Store should still be able to decrypt legacy values
         let decrypted = store.decrypt(&legacy_value).unwrap();
@@ -506,15 +510,10 @@ mod tests {
     fn decrypt_and_migrate_upgrades_legacy_xor() {
         let tmp = TempDir::new().unwrap();
         let store = SecretStore::new(tmp.path(), true);
-
-        // Create key first
         let _ = store.encrypt("setup").unwrap();
-        let key = store.load_or_create_key().unwrap();
 
-        // Manually create a legacy XOR-encrypted value
         let plaintext = "sk-legacy-secret-to-migrate";
-        let ciphertext = xor_cipher(plaintext.as_bytes(), &key);
-        let legacy_value = format!("enc:{}", hex_encode(&ciphertext));
+        let legacy_value = test_helpers::create_legacy_enc_value(&store, plaintext);
 
         // Verify it needs migration
         assert!(SecretStore::needs_migration(&legacy_value));
@@ -550,13 +549,10 @@ mod tests {
     fn decrypt_and_migrate_handles_unicode() {
         let tmp = TempDir::new().unwrap();
         let store = SecretStore::new(tmp.path(), true);
-
         let _ = store.encrypt("setup").unwrap();
-        let key = store.load_or_create_key().unwrap();
 
         let plaintext = "sk-日本語-émojis-🦀-тест";
-        let ciphertext = xor_cipher(plaintext.as_bytes(), &key);
-        let legacy_value = format!("enc:{}", hex_encode(&ciphertext));
+        let legacy_value = test_helpers::create_legacy_enc_value(&store, plaintext);
 
         let (decrypted, migrated) = store.decrypt_and_migrate(&legacy_value).unwrap();
         assert_eq!(decrypted, plaintext);
@@ -572,14 +568,10 @@ mod tests {
     fn decrypt_and_migrate_handles_empty_secret() {
         let tmp = TempDir::new().unwrap();
         let store = SecretStore::new(tmp.path(), true);
-
         let _ = store.encrypt("setup").unwrap();
-        let key = store.load_or_create_key().unwrap();
 
-        // Empty plaintext XOR-encrypted
         let plaintext = "";
-        let ciphertext = xor_cipher(plaintext.as_bytes(), &key);
-        let legacy_value = format!("enc:{}", hex_encode(&ciphertext));
+        let legacy_value = test_helpers::create_legacy_enc_value(&store, plaintext);
 
         let (decrypted, migrated) = store.decrypt_and_migrate(&legacy_value).unwrap();
         assert_eq!(decrypted, plaintext);
@@ -592,13 +584,10 @@ mod tests {
     fn decrypt_and_migrate_handles_long_secret() {
         let tmp = TempDir::new().unwrap();
         let store = SecretStore::new(tmp.path(), true);
-
         let _ = store.encrypt("setup").unwrap();
-        let key = store.load_or_create_key().unwrap();
 
         let plaintext = "a".repeat(10_000);
-        let ciphertext = xor_cipher(plaintext.as_bytes(), &key);
-        let legacy_value = format!("enc:{}", hex_encode(&ciphertext));
+        let legacy_value = test_helpers::create_legacy_enc_value(&store, &plaintext);
 
         let (decrypted, migrated) = store.decrypt_and_migrate(&legacy_value).unwrap();
         assert_eq!(decrypted, plaintext);
@@ -629,12 +618,9 @@ mod tests {
         // Create keys for both stores
         let _ = store1.encrypt("setup").unwrap();
         let _ = store2.encrypt("setup").unwrap();
-        let key1 = store1.load_or_create_key().unwrap();
 
-        // Encrypt with store1's key
         let plaintext = "secret-for-store1";
-        let ciphertext = xor_cipher(plaintext.as_bytes(), &key1);
-        let legacy_value = format!("enc:{}", hex_encode(&ciphertext));
+        let legacy_value = test_helpers::create_legacy_enc_value(&store1, plaintext);
 
         // Decrypt with store2 — XOR will produce garbage bytes
         // This may fail with UTF-8 error or succeed with garbage plaintext
@@ -660,13 +646,10 @@ mod tests {
     fn migration_produces_different_ciphertext_each_time() {
         let tmp = TempDir::new().unwrap();
         let store = SecretStore::new(tmp.path(), true);
-
         let _ = store.encrypt("setup").unwrap();
-        let key = store.load_or_create_key().unwrap();
 
         let plaintext = "sk-same-secret";
-        let ciphertext = xor_cipher(plaintext.as_bytes(), &key);
-        let legacy_value = format!("enc:{}", hex_encode(&ciphertext));
+        let legacy_value = test_helpers::create_legacy_enc_value(&store, plaintext);
 
         let (_, migrated1) = store.decrypt_and_migrate(&legacy_value).unwrap();
         let (_, migrated2) = store.decrypt_and_migrate(&legacy_value).unwrap();
@@ -684,13 +667,10 @@ mod tests {
     fn migrated_value_is_tamper_resistant() {
         let tmp = TempDir::new().unwrap();
         let store = SecretStore::new(tmp.path(), true);
-
         let _ = store.encrypt("setup").unwrap();
-        let key = store.load_or_create_key().unwrap();
 
         let plaintext = "sk-sensitive-data";
-        let ciphertext = xor_cipher(plaintext.as_bytes(), &key);
-        let legacy_value = format!("enc:{}", hex_encode(&ciphertext));
+        let legacy_value = test_helpers::create_legacy_enc_value(&store, plaintext);
 
         let (_, migrated) = store.decrypt_and_migrate(&legacy_value).unwrap();
         let new_value = migrated.unwrap();
@@ -711,13 +691,10 @@ mod tests {
     fn migrate_legacy_value_converts_enc_to_enc2() {
         let tmp = TempDir::new().unwrap();
         let store = SecretStore::new(tmp.path(), true);
-
         let _ = store.encrypt("setup").unwrap();
-        let key = store.load_or_create_key().unwrap();
 
         let plaintext = "sk-migrate-me";
-        let ciphertext = xor_cipher(plaintext.as_bytes(), &key);
-        let legacy_value = format!("enc:{}", hex_encode(&ciphertext));
+        let legacy_value = test_helpers::create_legacy_enc_value(&store, plaintext);
 
         let result = store.migrate_legacy_value(&legacy_value).unwrap();
         assert!(result.is_some(), "Should return migrated value");

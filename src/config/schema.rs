@@ -673,6 +673,8 @@ impl Config {
             .config_path
             .parent()
             .context("Could not determine parent directory of config file")?;
+        // Always enable encryption for migration — legacy enc: values must be
+        // upgraded to enc2: even when the user has disabled encryption for new values.
         let store = SecretStore::new(zeroclaw_dir, true);
 
         let mut migrated = 0usize;
@@ -1569,28 +1571,15 @@ default_temperature = 0.7
 
     #[test]
     fn migrate_legacy_secrets_converts_enc_to_enc2() {
-        use crate::security::secrets::SecretStore;
+        use crate::security::secrets::{test_helpers, SecretStore};
         use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
         let store = SecretStore::new(tmp.path(), true);
-
-        // Create key and produce a legacy enc: value
         let _ = store.encrypt("setup").unwrap();
-        let key_hex = std::fs::read_to_string(tmp.path().join(".secret_key")).unwrap();
-        let key: Vec<u8> = (0..key_hex.trim().len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&key_hex.trim()[i..i + 2], 16).unwrap())
-            .collect();
+
         let plaintext = "sk-legacy-token";
-        let ciphertext: Vec<u8> = plaintext
-            .as_bytes()
-            .iter()
-            .enumerate()
-            .map(|(i, &b)| b ^ key[i % key.len()])
-            .collect();
-        let ct_hex: String = ciphertext.iter().map(|b| format!("{b:02x}")).collect();
-        let legacy_value = format!("enc:{ct_hex}");
+        let legacy_value = test_helpers::create_legacy_enc_value(&store, plaintext);
 
         // Build a config with the legacy value in api_key
         let config_path = tmp.path().join("config.toml");
