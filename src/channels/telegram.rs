@@ -122,7 +122,7 @@ impl Channel for TelegramChannel {
                     if !self.is_any_user_allowed(identities.iter().copied()) {
                         tracing::warn!(
                             "Telegram: ignoring message from unauthorized user: username={username}, user_id={}. \
-Allowlist Telegram @username or numeric user ID, then run `zeroclaw onboard --channels-only`.",
+Allowlist Telegram @username or numeric user ID, then run `afw onboard --channels-only`.",
                             user_id_str.as_deref().unwrap_or("unknown")
                         );
                         continue;

@@ -15,7 +15,7 @@ use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use anyhow::Result;
 use axum::{
     body::Bytes,
-    extract::{Query, State},
+    extract::{Query, State, WebSocketUpgrade, ws},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json},
     routing::{get, post},
@@ -120,7 +120,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         }
     }
 
-    println!("🦀 ZeroClaw Gateway listening on http://{display_addr}");
+    println!("🦀 Aria Gateway listening on http://{display_addr}");
     if let Some(ref url) = tunnel_url {
         println!("  🌐 Public URL: {url}");
     }
@@ -162,6 +162,19 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         whatsapp: whatsapp_channel,
     };
 
+    // ── Aria Registry API ──────────────────────────────────────
+    let aria_db_path = config
+        .workspace_dir
+        .join("aria.db");
+    let aria_registries = crate::aria::initialize_aria_registries(&aria_db_path)
+        .unwrap_or_else(|e| {
+            tracing::warn!("Failed to initialize Aria registries: {e}");
+            // Create a fallback in-memory DB
+            let db = crate::aria::db::AriaDb::open_in_memory().expect("fallback in-memory DB");
+            std::sync::Arc::new(crate::aria::AriaRegistries::new(db))
+        });
+    let registry_api = crate::api::registry_router(aria_registries.db.clone());
+
     // Build router with middleware
     // Note: Body limit layer prevents memory exhaustion from oversized requests
     // Timeout is handled by tokio's TcpListener accept timeout and hyper's built-in timeouts
@@ -171,7 +184,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/webhook", post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
+        .route("/events", get(handle_events_ws))
         .with_state(state)
+        .merge(registry_api)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE));
 
     // Run the server
@@ -413,6 +428,70 @@ async fn handle_whatsapp_message(State(state): State<AppState>, body: Bytes) -> 
 
     // Acknowledge the webhook
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
+/// GET /events — WebSocket endpoint for real-time agent event streaming.
+///
+/// Clients connect via WebSocket and receive JSON-serialized `AgentEvent` messages
+/// for all tool executions, assistant text, thinking, and lifecycle events.
+/// This powers the dashboard's real-time agent activity display.
+async fn handle_events_ws(
+    ws: WebSocketUpgrade,
+    State(_state): State<AppState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(handle_events_socket)
+}
+
+async fn handle_events_socket(mut socket: ws::WebSocket) {
+    let bus = crate::events::event_bus();
+
+    // Bounded channel prevents unbounded memory growth if the WebSocket can't
+    // keep up. Events beyond the buffer are dropped with a warning.
+    const EVENT_BUFFER: usize = 512;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(EVENT_BUFFER);
+    let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let dropped_inner = dropped.clone();
+
+    let listener_id = bus.subscribe(move |evt| {
+        if let Ok(json) = serde_json::to_string(evt) {
+            if tx.try_send(json).is_err() {
+                let n = dropped_inner.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n % 100 == 0 {
+                    tracing::warn!(
+                        dropped = n + 1,
+                        "Event stream backpressure: dropping events (WebSocket too slow)"
+                    );
+                }
+            }
+        }
+    });
+
+    tracing::info!("Dashboard WebSocket connected (events stream)");
+
+    // Stream events to the client until they disconnect
+    loop {
+        tokio::select! {
+            Some(json) = rx.recv() => {
+                if socket.send(ws::Message::Text(json.into())).await.is_err() {
+                    break; // Client disconnected
+                }
+            }
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(ws::Message::Close(_))) | None => break,
+                    Some(Err(_)) => break,
+                    _ => {} // Ignore other messages (ping/pong handled by axum)
+                }
+            }
+        }
+    }
+
+    bus.unsubscribe(listener_id);
+    let total_dropped = dropped.load(std::sync::atomic::Ordering::Relaxed);
+    if total_dropped > 0 {
+        tracing::warn!(total_dropped, "WebSocket session dropped events due to backpressure");
+    }
+    tracing::info!("Dashboard WebSocket disconnected");
 }
 
 #[cfg(test)]

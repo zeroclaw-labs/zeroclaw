@@ -1,6 +1,6 @@
-# Contributing to ZeroClaw
+# Contributing to Aria
 
-Thanks for your interest in contributing to ZeroClaw! This guide will help you get started.
+Thanks for your interest in contributing to Aria! This guide will help you get started.
 
 ## Development Setup
 
@@ -39,7 +39,7 @@ git push --no-verify
 
 ## Architecture: Trait-Based Pluggability
 
-ZeroClaw's architecture is built on **traits** — every subsystem is swappable. This means contributing a new integration is as simple as implementing a trait and registering it in the factory function.
+Aria's architecture is built on **traits** — every subsystem is swappable. This means contributing a new integration is as simple as implementing a trait and registering it in the factory function.
 
 ```
 src/

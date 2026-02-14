@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="zeroclaw.png" alt="ZeroClaw" width="200" />
+  <img src="afw.png" alt="Aria" width="200" />
 </p>
 
-<h1 align="center">ZeroClaw 🦀</h1>
+<h1 align="center">Aria 🦀</h1>
 
 <p align="center">
   <strong>Zero overhead. Zero compromise. 100% Rust. 100% Agnostic.</strong>
@@ -18,20 +18,20 @@ Fast, small, and fully autonomous AI assistant infrastructure — deploy anywher
 ~3.4MB binary · <10ms startup · 1,017 tests · 22+ providers · 8 traits · Pluggable everything
 ```
 
-### Why teams pick ZeroClaw
+### Why teams pick Aria
 
 - **Lean by default:** small Rust binary, fast startup, low memory footprint.
 - **Secure by design:** pairing, strict sandboxing, explicit allowlists, workspace scoping.
 - **Fully swappable:** core systems are traits (providers, channels, tools, memory, tunnels).
 - **No lock-in:** OpenAI-compatible provider support + pluggable custom endpoints.
 
-## Benchmark Snapshot (ZeroClaw vs OpenClaw)
+## Benchmark Snapshot (Aria vs OpenClaw)
 
 Local machine quick benchmark (macOS arm64, Feb 2026), same host, 3 runs each.
 
-| Metric | ZeroClaw (Rust release binary) | OpenClaw (Node + built `dist`) |
+| Metric | Aria (Rust release binary) | OpenClaw (Node + built `dist`) |
 |---|---:|---:|
-| Build output size | `target/release/zeroclaw`: **3.4 MB** | `dist/`: **28 MB** |
+| Build output size | `target/release/afw`: **3.4 MB** | `dist/`: **28 MB** |
 | `--help` startup (cold/warm) | **0.38s / ~0.00s** | **3.31s / ~1.11s** |
 | `status` command runtime (best of 3) | **~0.00s** | **5.98s** |
 | `--help` max RSS observed | **~7.3 MB** | **~394 MB** |
@@ -39,14 +39,14 @@ Local machine quick benchmark (macOS arm64, Feb 2026), same host, 3 runs each.
 
 > Notes: measured with `/usr/bin/time -l`; first run includes cold-start effects. OpenClaw results were measured after `pnpm install` + `pnpm build`.
 
-Reproduce ZeroClaw numbers locally:
+Reproduce Aria numbers locally:
 
 ```bash
 cargo build --release
-ls -lh target/release/zeroclaw
+ls -lh target/release/afw
 
-/usr/bin/time -l target/release/zeroclaw --help
-/usr/bin/time -l target/release/zeroclaw status
+/usr/bin/time -l target/release/afw --help
+/usr/bin/time -l target/release/afw status
 ```
 
 ## Quick Start
@@ -58,46 +58,46 @@ cargo build --release
 cargo install --path . --force
 
 # Quick setup (no prompts)
-zeroclaw onboard --api-key sk-... --provider openrouter
+afw onboard --api-key sk-... --provider openrouter
 
 # Or interactive wizard
-zeroclaw onboard --interactive
+afw onboard --interactive
 
 # Or quickly repair channels/allowlists only
-zeroclaw onboard --channels-only
+afw onboard --channels-only
 
 # Chat
-zeroclaw agent -m "Hello, ZeroClaw!"
+afw agent -m "Hello, Aria!"
 
 # Interactive mode
-zeroclaw agent
+afw agent
 
 # Start the gateway (webhook server)
-zeroclaw gateway                # default: 127.0.0.1:8080
-zeroclaw gateway --port 0       # random port (security hardened)
+afw gateway                # default: 127.0.0.1:8080
+afw gateway --port 0       # random port (security hardened)
 
 # Start full autonomous runtime
-zeroclaw daemon
+afw daemon
 
 # Check status
-zeroclaw status
+afw status
 
 # Run system diagnostics
-zeroclaw doctor
+afw doctor
 
 # Check channel health
-zeroclaw channel doctor
+afw channel doctor
 
 # Get integration setup details
-zeroclaw integrations info Telegram
+afw integrations info Telegram
 
 # Manage background service
-zeroclaw service install
-zeroclaw service status
+afw service install
+afw service status
 
 # Migrate memory from OpenClaw (safe preview first)
-zeroclaw migrate openclaw --dry-run
-zeroclaw migrate openclaw
+afw migrate openclaw --dry-run
+afw migrate openclaw
 ```
 
 > **Dev fallback (no global install):** prefix commands with `cargo run --release --` (example: `cargo run --release -- status`).
@@ -107,7 +107,7 @@ zeroclaw migrate openclaw
 Every subsystem is a **trait** — swap implementations with a config change, zero code changes.
 
 <p align="center">
-  <img src="docs/architecture.svg" alt="ZeroClaw Architecture" width="900" />
+  <img src="docs/architecture.svg" alt="Aria Architecture" width="900" />
 </p>
 
 | Subsystem | Trait | Ships with | Extend |
@@ -130,7 +130,7 @@ Every subsystem is a **trait** — swap implementations with a config change, ze
 - ✅ Supported today: `runtime.kind = "native"`
 - 🚧 Planned, not implemented yet: Docker / WASM / edge runtimes
 
-When an unsupported `runtime.kind` is configured, ZeroClaw now exits with a clear error instead of silently falling back to native.
+When an unsupported `runtime.kind` is configured, Aria now exits with a clear error instead of silently falling back to native.
 
 ### Memory System (Full-Stack Search Engine)
 
@@ -159,7 +159,7 @@ keyword_weight = 0.3
 
 ## Security
 
-ZeroClaw enforces security at **every layer** — not just the sandbox. It passes all items from the community security checklist.
+Aria enforces security at **every layer** — not just the sandbox. It passes all items from the community security checklist.
 
 ### Security Checklist
 
@@ -170,7 +170,7 @@ ZeroClaw enforces security at **every layer** — not just the sandbox. It passe
 | 3 | **Filesystem scoped (no /)** | ✅ | `workspace_only = true` by default. 14 system dirs + 4 sensitive dotfiles blocked. Null byte injection blocked. Symlink escape detection via canonicalization + resolved-path workspace checks in file read/write tools. |
 | 4 | **Access via tunnel only** | ✅ | Gateway refuses public bind without active tunnel. Supports Tailscale, Cloudflare, ngrok, or any custom tunnel. |
 
-> **Run your own nmap:** `nmap -p 1-65535 <your-host>` — ZeroClaw binds to localhost only, so nothing is exposed unless you explicitly configure a tunnel.
+> **Run your own nmap:** `nmap -p 1-65535 <your-host>` — Aria binds to localhost only, so nothing is exposed unless you explicitly configure a tunnel.
 
 ### Channel allowlists (Telegram / Discord / Slack)
 
@@ -199,7 +199,7 @@ If you hit authorization warnings in logs (for example: `ignoring message from u
 rerun channel setup only:
 
 ```bash
-zeroclaw onboard --channels-only
+afw onboard --channels-only
 ```
 
 ### WhatsApp Business Cloud API Setup
@@ -216,7 +216,7 @@ WhatsApp uses Meta's Cloud API with webhooks (push-based, not polling):
    - **Phone Number ID:** From WhatsApp → API Setup → Phone number ID
    - **Verify Token:** You define this (any random string) — Meta will send it back during webhook verification
 
-3. **Configure ZeroClaw:**
+3. **Configure Aria:**
    ```toml
    [channels_config.whatsapp]
    access_token = "EAABx..."
@@ -227,7 +227,7 @@ WhatsApp uses Meta's Cloud API with webhooks (push-based, not polling):
 
 4. **Start the gateway with a tunnel:**
    ```bash
-   zeroclaw gateway --port 8080
+   afw gateway --port 8080
    ```
    WhatsApp requires HTTPS, so use a tunnel (ngrok, Cloudflare, Tailscale Funnel).
 
@@ -237,11 +237,11 @@ WhatsApp uses Meta's Cloud API with webhooks (push-based, not polling):
    - **Verify Token:** Same as your `verify_token` in config
    - Subscribe to `messages` field
 
-6. **Test:** Send a message to your WhatsApp Business number — ZeroClaw will respond via the LLM.
+6. **Test:** Send a message to your WhatsApp Business number — Aria will respond via the LLM.
 
 ## Configuration
 
-Config: `~/.zeroclaw/config.toml` (created by `onboard`)
+Config: `~/.afw/config.toml` (created by `onboard`)
 
 ```toml
 api_key = "sk-..."
@@ -294,7 +294,7 @@ format = "openclaw"             # "openclaw" (default, markdown files) or "aieos
 
 ## Identity System (AIEOS Support)
 
-ZeroClaw supports **identity-agnostic** AI personas through two formats:
+Aria supports **identity-agnostic** AI personas through two formats:
 
 ### OpenClaw (Default)
 
@@ -306,7 +306,7 @@ Traditional markdown files in your workspace:
 
 ### AIEOS (AI Entity Object Specification)
 
-[AIEOS](https://aieos.org) is a standardization framework for portable AI identity. ZeroClaw supports AIEOS v1.1 JSON payloads, allowing you to:
+[AIEOS](https://aieos.org) is a standardization framework for portable AI identity. Aria supports AIEOS v1.1 JSON payloads, allowing you to:
 
 - **Import identities** from the AIEOS ecosystem
 - **Export identities** to other AIEOS-compatible systems
@@ -428,8 +428,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Implement a trait, submit a PR:
 - New `Tool` → `src/tools/`
 - New `Memory` → `src/memory/`
 - New `Tunnel` → `src/tunnel/`
-- New `Skill` → `~/.zeroclaw/workspace/skills/<name>/`
+- New `Skill` → `~/.afw/workspace/skills/<name>/`
 
 ---
 
-**ZeroClaw** — Zero overhead. Zero compromise. Deploy anywhere. Swap anything. 🦀
+**Aria** — Zero overhead. Zero compromise. Deploy anywhere. Swap anything. 🦀

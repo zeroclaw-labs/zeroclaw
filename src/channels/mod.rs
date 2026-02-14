@@ -23,7 +23,7 @@ use anyhow::Result;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Maximum characters per injected workspace file (matches `OpenClaw` default).
+/// Maximum characters per injected workspace file.
 const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 
 const DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS: u64 = 2;
@@ -68,186 +68,23 @@ fn spawn_supervised_listener(
 
 /// Load workspace identity files and build a system prompt.
 ///
-/// Follows the `OpenClaw` framework structure:
-/// 1. Tooling — tool list + descriptions
-/// 2. Safety — guardrail reminder
-/// 3. Skills — compact list with paths (loaded on-demand)
-/// 4. Workspace — working directory
-/// 5. Bootstrap files — AGENTS, SOUL, TOOLS, IDENTITY, USER, HEARTBEAT, BOOTSTRAP, MEMORY
-/// 6. Date & Time — timezone for cache stability
-/// 7. Runtime — host, OS, model
-///
-/// Daily memory files (`memory/*.md`) are NOT injected — they are accessed
-/// on-demand via `memory_recall` / `memory_search` tools.
+/// Delegates to [`crate::prompt::build_system_prompt`] — the canonical prompt
+/// construction module. This wrapper exists for backward compatibility with
+/// existing call sites.
 pub fn build_system_prompt(
     workspace_dir: &std::path::Path,
     model_name: &str,
     tools: &[(&str, &str)],
     skills: &[crate::skills::Skill],
 ) -> String {
-    use std::fmt::Write;
-    let mut prompt = String::with_capacity(8192);
-
-    // ── 1. Tooling ──────────────────────────────────────────────
-    if !tools.is_empty() {
-        prompt.push_str("## Tools\n\n");
-        prompt.push_str("You have access to the following tools:\n\n");
-        for (name, desc) in tools {
-            let _ = writeln!(prompt, "- **{name}**: {desc}");
-        }
-        prompt.push('\n');
-    }
-
-    // ── 2. Safety ───────────────────────────────────────────────
-    prompt.push_str("## Safety\n\n");
-    prompt.push_str(
-        "- Do not exfiltrate private data.\n\
-         - Do not run destructive commands without asking.\n\
-         - Do not bypass oversight or approval mechanisms.\n\
-         - Prefer `trash` over `rm` (recoverable beats gone forever).\n\
-         - When in doubt, ask before acting externally.\n\n",
-    );
-
-    // ── 3. Skills (compact list — load on-demand) ───────────────
-    if !skills.is_empty() {
-        prompt.push_str("## Available Skills\n\n");
-        prompt.push_str(
-            "Skills are loaded on demand. Use `read` on the skill path to get full instructions.\n\n",
-        );
-        prompt.push_str("<available_skills>\n");
-        for skill in skills {
-            let _ = writeln!(prompt, "  <skill>");
-            let _ = writeln!(prompt, "    <name>{}</name>", skill.name);
-            let _ = writeln!(
-                prompt,
-                "    <description>{}</description>",
-                skill.description
-            );
-            let location = workspace_dir
-                .join("skills")
-                .join(&skill.name)
-                .join("SKILL.md");
-            let _ = writeln!(prompt, "    <location>{}</location>", location.display());
-            let _ = writeln!(prompt, "  </skill>");
-        }
-        prompt.push_str("</available_skills>\n\n");
-    }
-
-    // ── 4. Workspace ────────────────────────────────────────────
-    let _ = writeln!(
-        prompt,
-        "## Workspace\n\nWorking directory: `{}`\n",
-        workspace_dir.display()
-    );
-
-    // ── 5. Bootstrap files (injected into context) ──────────────
-    prompt.push_str("## Project Context\n\n");
-    prompt
-        .push_str("The following workspace files define your identity, behavior, and context.\n\n");
-
-    let bootstrap_files = [
-        "AGENTS.md",
-        "SOUL.md",
-        "TOOLS.md",
-        "IDENTITY.md",
-        "USER.md",
-        "HEARTBEAT.md",
-    ];
-
-    for filename in &bootstrap_files {
-        inject_workspace_file(&mut prompt, workspace_dir, filename);
-    }
-
-    // BOOTSTRAP.md — only if it exists (first-run ritual)
-    let bootstrap_path = workspace_dir.join("BOOTSTRAP.md");
-    if bootstrap_path.exists() {
-        inject_workspace_file(&mut prompt, workspace_dir, "BOOTSTRAP.md");
-    }
-
-    // MEMORY.md — curated long-term memory (main session only)
-    inject_workspace_file(&mut prompt, workspace_dir, "MEMORY.md");
-
-    // ── 6. Date & Time ──────────────────────────────────────────
-    let now = chrono::Local::now();
-    let tz = now.format("%Z").to_string();
-    let _ = writeln!(prompt, "## Current Date & Time\n\nTimezone: {tz}\n");
-
-    // ── 7. Runtime ──────────────────────────────────────────────
-    let host =
-        hostname::get().map_or_else(|_| "unknown".into(), |h| h.to_string_lossy().to_string());
-    let _ = writeln!(
-        prompt,
-        "## Runtime\n\nHost: {host} | OS: {} | Model: {model_name}\n",
-        std::env::consts::OS,
-    );
-
-    if prompt.is_empty() {
-        "You are ZeroClaw, a fast and efficient AI assistant built in Rust. Be helpful, concise, and direct.".to_string()
-    } else {
-        prompt
-    }
-}
-
-/// Inject OpenClaw (markdown) identity files into the prompt
-fn inject_openclaw_identity(prompt: &mut String, workspace_dir: &std::path::Path) {
-    #[allow(unused_imports)]
-    use std::fmt::Write;
-
-    prompt.push_str("## Project Context\n\n");
-    prompt
-        .push_str("The following workspace files define your identity, behavior, and context.\n\n");
-
-    let bootstrap_files = [
-        "AGENTS.md",
-        "SOUL.md",
-        "TOOLS.md",
-        "IDENTITY.md",
-        "USER.md",
-        "HEARTBEAT.md",
-    ];
-
-    for filename in &bootstrap_files {
-        inject_workspace_file(prompt, workspace_dir, filename);
-    }
-
-    // BOOTSTRAP.md — only if it exists (first-run ritual)
-    let bootstrap_path = workspace_dir.join("BOOTSTRAP.md");
-    if bootstrap_path.exists() {
-        inject_workspace_file(prompt, workspace_dir, "BOOTSTRAP.md");
-    }
-
-    // MEMORY.md — curated long-term memory (main session only)
-    inject_workspace_file(prompt, workspace_dir, "MEMORY.md");
-}
-
-/// Inject a single workspace file into the prompt with truncation and missing-file markers.
-fn inject_workspace_file(prompt: &mut String, workspace_dir: &std::path::Path, filename: &str) {
-    use std::fmt::Write;
-
-    let path = workspace_dir.join(filename);
-    match std::fs::read_to_string(&path) {
-        Ok(content) => {
-            let trimmed = content.trim();
-            if trimmed.is_empty() {
-                return;
-            }
-            let _ = writeln!(prompt, "### {filename}\n");
-            if trimmed.len() > BOOTSTRAP_MAX_CHARS {
-                prompt.push_str(&trimmed[..BOOTSTRAP_MAX_CHARS]);
-                let _ = writeln!(
-                    prompt,
-                    "\n\n[... truncated at {BOOTSTRAP_MAX_CHARS} chars — use `read` for full file]\n"
-                );
-            } else {
-                prompt.push_str(trimmed);
-                prompt.push_str("\n\n");
-            }
-        }
-        Err(_) => {
-            // Missing-file marker (matches OpenClaw behavior)
-            let _ = writeln!(prompt, "### {filename}\n\n[File not found: {filename}]\n");
-        }
-    }
+    let descriptors: Vec<crate::prompt::SkillDescriptor> = skills
+        .iter()
+        .map(|s| crate::prompt::SkillDescriptor {
+            name: s.name.clone(),
+            description: s.description.clone(),
+        })
+        .collect();
+    crate::prompt::build_system_prompt(workspace_dir, model_name, tools, &descriptors)
 }
 
 pub fn handle_command(command: super::ChannelCommands, config: &Config) -> Result<()> {
@@ -274,9 +111,9 @@ pub fn handle_command(command: super::ChannelCommands, config: &Config) -> Resul
             ] {
                 println!("  {} {name}", if configured { "✅" } else { "❌" });
             }
-            println!("\nTo start channels: zeroclaw channel start");
-            println!("To check health:    zeroclaw channel doctor");
-            println!("To configure:      zeroclaw onboard");
+            println!("\nTo start channels: afw channel start");
+            println!("To check health:    afw channel doctor");
+            println!("To configure:      afw onboard");
             Ok(())
         }
         super::ChannelCommands::Add {
@@ -284,11 +121,11 @@ pub fn handle_command(command: super::ChannelCommands, config: &Config) -> Resul
             config: _,
         } => {
             anyhow::bail!(
-                "Channel type '{channel_type}' — use `zeroclaw onboard` to configure channels"
+                "Channel type '{channel_type}' — use `afw onboard` to configure channels"
             );
         }
         super::ChannelCommands::Remove { name } => {
-            anyhow::bail!("Remove channel '{name}' — edit ~/.zeroclaw/config.toml directly");
+            anyhow::bail!("Remove channel '{name}' — edit ~/.afw/config.toml directly");
         }
     }
 }
@@ -378,11 +215,11 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     }
 
     if channels.is_empty() {
-        println!("No real-time channels configured. Run `zeroclaw onboard` first.");
+        println!("No real-time channels configured. Run `afw onboard` first.");
         return Ok(());
     }
 
-    println!("🩺 ZeroClaw Channel Doctor");
+    println!("🩺 Aria Channel Doctor");
     println!();
 
     let mut healthy = 0_u32;
@@ -410,7 +247,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     }
 
     if config.channels_config.webhook.is_some() {
-        println!("  ℹ️  Webhook   check via `zeroclaw gateway` then GET /health");
+        println!("  ℹ️  Webhook   check via `afw gateway` then GET /health");
     }
 
     println!();
@@ -538,11 +375,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
 
     if channels.is_empty() {
-        println!("No channels configured. Run `zeroclaw onboard` to set up channels.");
+        println!("No channels configured. Run `afw onboard` to set up channels.");
         return Ok(());
     }
 
-    println!("🦀 ZeroClaw Channel Server");
+    println!("🦀 Aria Channel Server");
     println!("  🤖 Model:    {model}");
     println!(
         "  🧠 Memory:   {} (auto-save: {})",
@@ -666,7 +503,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         // Create minimal workspace files
         std::fs::write(tmp.path().join("SOUL.md"), "# Soul\nBe helpful.").unwrap();
-        std::fs::write(tmp.path().join("IDENTITY.md"), "# Identity\nName: ZeroClaw").unwrap();
+        std::fs::write(tmp.path().join("IDENTITY.md"), "# Identity\nName: Aria").unwrap();
         std::fs::write(tmp.path().join("USER.md"), "# User\nName: Test User").unwrap();
         std::fs::write(
             tmp.path().join("AGENTS.md"),
@@ -737,7 +574,7 @@ mod tests {
         assert!(prompt.contains("Be helpful"), "missing SOUL content");
         assert!(prompt.contains("### IDENTITY.md"), "missing IDENTITY.md");
         assert!(
-            prompt.contains("Name: ZeroClaw"),
+            prompt.contains("Name: Aria"),
             "missing IDENTITY content"
         );
         assert!(prompt.contains("### USER.md"), "missing USER.md");

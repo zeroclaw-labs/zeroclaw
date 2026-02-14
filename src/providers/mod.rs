@@ -106,7 +106,7 @@ pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<
         }
 
         _ => anyhow::bail!(
-            "Unknown provider: {name}. Check README for supported providers or run `zeroclaw onboard --interactive` to reconfigure.\n\
+            "Unknown provider: {name}. Check README for supported providers or run `afw onboard --interactive` to reconfigure.\n\
              Tip: Use \"custom:https://your-api.com\" for any OpenAI-compatible endpoint."
         ),
     }

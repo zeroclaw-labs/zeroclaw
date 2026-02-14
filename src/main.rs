@@ -14,35 +14,45 @@ use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 mod agent;
+mod api;
+mod aria;
 mod channels;
 mod config;
 mod cron;
 mod daemon;
 mod doctor;
+mod events;
+mod feed;
 mod gateway;
 mod health;
 mod heartbeat;
+mod injection;
 mod integrations;
 mod memory;
 mod migration;
 mod observability;
 mod onboard;
+mod pipeline;
+mod prompt;
 mod providers;
+mod quilt;
 mod runtime;
 mod security;
 mod service;
+mod session;
 mod skills;
+mod team;
 mod tools;
 mod tunnel;
 
 use config::Config;
 
-/// `ZeroClaw` - Zero overhead. Zero compromise. 100% Rust.
+/// `Aria` — Aria Firmware (afw). Zero overhead. Zero compromise. 100% Rust.
 #[derive(Parser, Debug)]
-#[command(name = "zeroclaw")]
+#[command(name = "afw")]
 #[command(author = "theonlyhennygod")]
 #[command(version = "0.1.0")]
-#[command(about = "The fastest, smallest AI assistant.", long_about = None)]
+#[command(about = "Aria Firmware — the fastest, smallest AI assistant.", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -169,7 +179,7 @@ enum Commands {
 
 #[derive(Subcommand, Debug)]
 enum MigrateCommands {
-    /// Import memory from an OpenClaw workspace into this ZeroClaw workspace
+    /// Import memory from an OpenClaw workspace into this Aria workspace
     Openclaw {
         /// Optional path to OpenClaw workspace (defaults to ~/.openclaw/workspace)
         #[arg(long)]
@@ -281,7 +291,7 @@ async fn main() -> Result<()> {
             onboard::run_quick_setup(api_key.as_deref(), provider.as_deref())?
         };
         // Auto-start channels if user said yes during wizard
-        if std::env::var("ZEROCLAW_AUTOSTART_CHANNELS").as_deref() == Ok("1") {
+        if std::env::var("AFW_AUTOSTART_CHANNELS").as_deref() == Ok("1") {
             channels::start_channels(config).await?;
         }
         return Ok(());
@@ -302,24 +312,24 @@ async fn main() -> Result<()> {
 
         Commands::Gateway { port, host } => {
             if port == 0 {
-                info!("🚀 Starting ZeroClaw Gateway on {host} (random port)");
+                info!("🚀 Starting Aria Gateway on {host} (random port)");
             } else {
-                info!("🚀 Starting ZeroClaw Gateway on {host}:{port}");
+                info!("🚀 Starting Aria Gateway on {host}:{port}");
             }
             gateway::run_gateway(&host, port, config).await
         }
 
         Commands::Daemon { port, host } => {
             if port == 0 {
-                info!("🧠 Starting ZeroClaw Daemon on {host} (random port)");
+                info!("🧠 Starting Aria Daemon on {host} (random port)");
             } else {
-                info!("🧠 Starting ZeroClaw Daemon on {host}:{port}");
+                info!("🧠 Starting Aria Daemon on {host}:{port}");
             }
             daemon::run(config, host, port).await
         }
 
         Commands::Status => {
-            println!("🦀 ZeroClaw Status");
+            println!("🦀 Aria Firmware Status");
             println!();
             println!("Version:     {}", env!("CARGO_PKG_VERSION"));
             println!("Workspace:   {}", config.workspace_dir.display());

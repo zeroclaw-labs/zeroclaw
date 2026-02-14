@@ -61,8 +61,8 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: zeroclaw-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/zeroclaw*
+          name: afw-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/afw*
 
   docker:
     name: Docker Security
@@ -71,11 +71,11 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build Docker image
-        run: docker build -t zeroclaw:test .
+        run: docker build -t afw:test .
 
       - name: Verify non-root user (UID != 0)
         run: |
-          USER_ID=$(docker inspect --format='{{.Config.User}}' zeroclaw:test)
+          USER_ID=$(docker inspect --format='{{.Config.User}}' afw:test)
           echo "Container user: $USER_ID"
           if [ "$USER_ID" = "0" ] || [ "$USER_ID" = "root" ] || [ -z "$USER_ID" ]; then
             echo "❌ FAIL: Container runs as root (UID 0)"

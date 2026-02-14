@@ -25,7 +25,7 @@ pub fn handle_command(command: super::CronCommands, config: Config) -> Result<()
             if jobs.is_empty() {
                 println!("No scheduled tasks yet.");
                 println!("\nUsage:");
-                println!("  zeroclaw cron add '0 9 * * *' 'agent -m \"Good morning!\"'");
+                println!("  afw cron add '0 9 * * *' 'agent -m \"Good morning!\"'");
                 return Ok(());
             }
 

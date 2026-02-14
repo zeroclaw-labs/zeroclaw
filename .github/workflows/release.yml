@@ -19,16 +19,16 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact: zeroclaw
+            artifact: afw
           - os: macos-latest
             target: x86_64-apple-darwin
-            artifact: zeroclaw
+            artifact: afw
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact: zeroclaw
+            artifact: afw
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact: zeroclaw.exe
+            artifact: afw.exe
 
     steps:
       - uses: actions/checkout@v4
@@ -55,19 +55,19 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../zeroclaw-${{ matrix.target }}.tar.gz ${{ matrix.artifact }}
+          tar czf ../../../afw-${{ matrix.target }}.tar.gz ${{ matrix.artifact }}
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         run: |
           cd target/${{ matrix.target }}/release
-          7z a ../../../zeroclaw-${{ matrix.target }}.zip ${{ matrix.artifact }}
+          7z a ../../../afw-${{ matrix.target }}.zip ${{ matrix.artifact }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: zeroclaw-${{ matrix.target }}
-          path: zeroclaw-${{ matrix.target }}.*
+          name: afw-${{ matrix.target }}
+          path: afw-${{ matrix.target }}.*
 
   publish:
     name: Publish Release
