@@ -351,7 +351,7 @@ async fn handle_whatsapp_verify(
     (StatusCode::FORBIDDEN, "Forbidden".to_string())
 }
 
-/// Verify the `X-Hub-Signature-256` header from Meta's WhatsApp webhook.
+/// Verify the `X-Hub-Signature-256` header from Meta's `WhatsApp` webhook.
 fn verify_whatsapp_signature(app_secret: &str, body: &[u8], signature_header: &str) -> bool {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
@@ -363,6 +363,9 @@ fn verify_whatsapp_signature(app_secret: &str, body: &[u8], signature_header: &s
         return false;
     };
     let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(app_secret.as_bytes()) else {
+        tracing::error!(
+            "Failed to create HMAC for WhatsApp signature verification — app_secret may be invalid"
+        );
         return false;
     };
     mac.update(body);
@@ -371,7 +374,7 @@ fn verify_whatsapp_signature(app_secret: &str, body: &[u8], signature_header: &s
 
 /// Simple hex decode for signature verification.
 fn hex_decode_bytes(hex: &str) -> Result<Vec<u8>, ()> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Err(());
     }
     (0..hex.len())
@@ -397,10 +400,13 @@ async fn handle_whatsapp_message(
     if let Some(ref app_secret) = state.whatsapp_app_secret {
         let sig = headers
             .get("X-Hub-Signature-256")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if !verify_whatsapp_signature(app_secret, &body, sig) {
-            tracing::warn!("WhatsApp webhook signature verification failed");
+            .and_then(|v| v.to_str().ok());
+
+        if !sig.is_some_and(|s| verify_whatsapp_signature(app_secret, &body, s)) {
+            tracing::warn!(
+                "WhatsApp webhook signature verification failed (header: {})",
+                sig.map_or("missing", |_| "invalid")
+            );
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({"error": "Invalid signature"})),
