@@ -1024,17 +1024,17 @@ fn anthropic_models_for_onboarding(credential: Option<&str>) -> Vec<(String, Str
     dynamic.sort_by(|a, b| a.0.cmp(&b.0));
     dynamic.dedup_by(|a, b| a.0 == b.0);
 
-    dynamic.push((
-        "__custom__".to_string(),
-        "Custom model id (type manually)".to_string(),
-    ));
-
     defaults.retain(|(id, _)| id != "__custom__");
     for (id, label) in defaults {
         if !dynamic.iter().any(|(existing, _)| existing == &id) {
             dynamic.push((id, format!("{label} (fallback)")));
         }
     }
+
+    dynamic.push((
+        "__custom__".to_string(),
+        "Custom model id (type manually)".to_string(),
+    ));
 
     dynamic
 }
@@ -3094,7 +3094,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_anthropic_models_live_skips_inside_async_runtime() {
+    async fn fetch_anthropic_models_live_returns_none_for_invalid_credential() {
         let result = fetch_anthropic_models_live("sk-ant-oat01-test");
         assert!(result.is_none());
     }
