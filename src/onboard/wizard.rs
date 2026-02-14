@@ -217,7 +217,11 @@ pub fn run_channels_repair_wizard() -> Result<Config> {
 /// Use `zeroclaw onboard` or `zeroclaw onboard --api-key sk-... --provider openrouter --memory sqlite`.
 /// Use `zeroclaw onboard --interactive` for the full wizard.
 #[allow(clippy::too_many_lines)]
-pub fn run_quick_setup(api_key: Option<&str>, provider: Option<&str>, memory_backend: Option<&str>) -> Result<Config> {
+pub fn run_quick_setup(
+    api_key: Option<&str>,
+    provider: Option<&str>,
+    memory_backend: Option<&str>,
+) -> Result<Config> {
     println!("{}", style(BANNER).cyan().bold());
     println!(
         "  {}",
@@ -245,15 +249,27 @@ pub fn run_quick_setup(api_key: Option<&str>, provider: Option<&str>, memory_bac
         backend: memory_backend_name.clone(),
         auto_save: memory_backend_name != "none",
         hygiene_enabled: memory_backend_name == "sqlite",
-        archive_after_days: if memory_backend_name == "sqlite" { 7 } else { 0 },
-        purge_after_days: if memory_backend_name == "sqlite" { 30 } else { 0 },
+        archive_after_days: if memory_backend_name == "sqlite" {
+            7
+        } else {
+            0
+        },
+        purge_after_days: if memory_backend_name == "sqlite" {
+            30
+        } else {
+            0
+        },
         conversation_retention_days: 30,
         embedding_provider: "none".to_string(),
         embedding_model: "text-embedding-3-small".to_string(),
         embedding_dimensions: 1536,
         vector_weight: 0.7,
         keyword_weight: 0.3,
-        embedding_cache_size: if memory_backend_name == "sqlite" { 10000 } else { 0 },
+        embedding_cache_size: if memory_backend_name == "sqlite" {
+            10000
+        } else {
+            0
+        },
         chunk_max_tokens: 512,
     };
 
@@ -325,7 +341,11 @@ pub fn run_quick_setup(api_key: Option<&str>, provider: Option<&str>, memory_bac
         "  {} Memory:     {} (auto-save: {})",
         style("✓").green().bold(),
         style(&memory_backend_name).green(),
-        if memory_backend_name == "none" { "off" } else { "on" }
+        if memory_backend_name == "none" {
+            "off"
+        } else {
+            "on"
+        }
     );
     println!(
         "  {} Secrets:    {}",
@@ -356,7 +376,13 @@ pub fn run_quick_setup(api_key: Option<&str>, provider: Option<&str>, memory_bac
     println!();
     println!("  {}", style("Next steps:").white().bold());
     if api_key.is_none() {
-        println!("    1. Set your API key:  export OPENROUTER_API_KEY=\"sk-...\"");
+        if provider_name == "anthropic" {
+            println!("    1. Set auth token:    export ANTHROPIC_OAUTH_TOKEN=\"sk-ant-oat01-...\"");
+            println!("       or API key:        export ANTHROPIC_API_KEY=\"sk-ant-...\"");
+        } else {
+            let env_var = provider_env_var(&provider_name);
+            println!("    1. Set your API key:  export {env_var}=\"sk-...\"");
+        }
         println!("    2. Or edit:           ~/.zeroclaw/config.toml");
         println!("    3. Chat:              zeroclaw agent -m \"Hello!\"");
         println!("    4. Gateway:           zeroclaw gateway");
@@ -467,7 +493,10 @@ fn setup_provider() -> Result<(String, String, String)> {
                 "OpenRouter — 200+ models, 1 API key (recommended)",
             ),
             ("venice", "Venice AI — privacy-first (Llama, Opus)"),
-            ("anthropic", "Anthropic — Claude Sonnet & Opus (direct)"),
+            (
+                "anthropic",
+                "Anthropic — Claude Sonnet & Opus (API key or setup-token)",
+            ),
             ("openai", "OpenAI — GPT-4o, o1, GPT-5 (direct)"),
             ("deepseek", "DeepSeek — V3 & R1 (affordable)"),
             ("mistral", "Mistral — Large & Codestral"),
@@ -555,10 +584,72 @@ fn setup_provider() -> Result<(String, String, String)> {
     let api_key = if provider_name == "ollama" {
         print_bullet("Ollama runs locally — no API key needed!");
         String::new()
+    } else if provider_name == "anthropic" {
+        println!();
+        print_bullet("Choose how to authenticate Anthropic.");
+        let auth_options = vec![
+            "Claude setup-token (Pro/Max) — generated via `claude setup-token`",
+            "Anthropic API key (Console) — usage-based billing",
+        ];
+        let auth_idx = Select::new()
+            .with_prompt("  Anthropic auth method")
+            .items(&auth_options)
+            .default(0)
+            .interact()?;
+
+        if auth_idx == 0 {
+            println!();
+            print_bullet("Run `claude setup-token` in your terminal.");
+            print_bullet("Paste the generated token below (starts with sk-ant-oat01-).");
+            println!();
+
+            let token: String = Input::new()
+                .with_prompt("  Paste Anthropic setup-token (or Enter to skip)")
+                .allow_empty(true)
+                .interact_text()?;
+            let token = normalize_anthropic_setup_token_input(&token);
+
+            if token.is_empty() {
+                print_bullet(&format!(
+                    "Skipped. Set {} later.",
+                    style("ANTHROPIC_OAUTH_TOKEN").yellow()
+                ));
+                String::new()
+            } else if let Some(err) = validate_anthropic_setup_token(&token) {
+                anyhow::bail!("Invalid Anthropic setup-token: {err}");
+            } else {
+                token
+            }
+        } else {
+            println!();
+            print_bullet(&format!(
+                "Get your API key at: {}",
+                style("https://console.anthropic.com/settings/keys")
+                    .cyan()
+                    .underlined()
+            ));
+            print_bullet("You can also set it later via env var or config file.");
+            println!();
+
+            let key: String = Input::new()
+                .with_prompt("  Paste your API key (or press Enter to skip)")
+                .allow_empty(true)
+                .interact_text()?;
+            let key = normalize_pasted_secret(&key);
+
+            if key.is_empty() {
+                print_bullet(&format!(
+                    "Skipped. Set {} or {} later.",
+                    style("ANTHROPIC_API_KEY").yellow(),
+                    style("ANTHROPIC_OAUTH_TOKEN").yellow()
+                ));
+            }
+
+            key
+        }
     } else {
         let key_url = match provider_name {
             "openrouter" => "https://openrouter.ai/keys",
-            "anthropic" => "https://console.anthropic.com/settings/keys",
             "openai" => "https://platform.openai.com/api-keys",
             "venice" => "https://venice.ai/settings/api",
             "groq" => "https://console.groq.com/keys",
@@ -591,6 +682,7 @@ fn setup_provider() -> Result<(String, String, String)> {
             .with_prompt("  Paste your API key (or press Enter to skip)")
             .allow_empty(true)
             .interact_text()?;
+        let key = normalize_pasted_secret(&key);
 
         if key.is_empty() {
             let env_var = provider_env_var(provider_name);
@@ -604,6 +696,39 @@ fn setup_provider() -> Result<(String, String, String)> {
     };
 
     // ── Model selection ──
+    if provider_name == "anthropic" {
+        let models = anthropic_models_for_onboarding(if api_key.is_empty() {
+            None
+        } else {
+            Some(&api_key)
+        });
+
+        let model_labels: Vec<&str> = models.iter().map(|(_, label)| label.as_str()).collect();
+
+        let model_idx = Select::new()
+            .with_prompt("  Select your default model")
+            .items(&model_labels)
+            .default(0)
+            .interact()?;
+
+        let mut model = models[model_idx].0.clone();
+        if model == "__custom__" {
+            model = Input::new()
+                .with_prompt("  Enter Anthropic model id (e.g. claude-opus-4-6)")
+                .default("claude-opus-4-6".into())
+                .interact_text()?;
+        }
+
+        println!(
+            "  {} Provider: {} | Model: {}",
+            style("✓").green().bold(),
+            style(provider_name).green(),
+            style(&model).green()
+        );
+
+        return Ok((provider_name.to_string(), api_key, model));
+    }
+
     let models: Vec<(&str, &str)> = match provider_name {
         "openrouter" => vec![
             (
@@ -625,17 +750,6 @@ fn setup_provider() -> Result<(String, String, String)> {
                 "Llama 3.3 70B (open source)",
             ),
             ("deepseek/deepseek-chat", "DeepSeek Chat (affordable)"),
-        ],
-        "anthropic" => vec![
-            (
-                "claude-sonnet-4-20250514",
-                "Claude Sonnet 4 (balanced, recommended)",
-            ),
-            ("claude-3-5-sonnet-20241022", "Claude 3.5 Sonnet (fast)"),
-            (
-                "claude-3-5-haiku-20241022",
-                "Claude 3.5 Haiku (fastest, cheapest)",
-            ),
         ],
         "openai" => vec![
             ("gpt-4o", "GPT-4o (flagship)"),
@@ -765,6 +879,178 @@ fn provider_env_var(name: &str) -> &'static str {
         "bedrock" | "aws-bedrock" => "AWS_ACCESS_KEY_ID",
         _ => "API_KEY",
     }
+}
+
+const ANTHROPIC_SETUP_TOKEN_PREFIX: &str = "sk-ant-oat01-";
+const ANTHROPIC_SETUP_TOKEN_MIN_LENGTH: usize = 80;
+
+fn validate_anthropic_setup_token(raw: &str) -> Option<&'static str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Some("token is required");
+    }
+    if !trimmed.starts_with(ANTHROPIC_SETUP_TOKEN_PREFIX) {
+        return Some("expected token starting with sk-ant-oat01-");
+    }
+    if trimmed.len() < ANTHROPIC_SETUP_TOKEN_MIN_LENGTH {
+        return Some("token looks too short; paste the full setup-token");
+    }
+    None
+}
+
+fn normalize_pasted_secret(raw: &str) -> String {
+    raw.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+fn normalize_anthropic_setup_token_input(raw: &str) -> String {
+    let compact = normalize_pasted_secret(raw);
+    if let Some(idx) = compact.find(ANTHROPIC_SETUP_TOKEN_PREFIX) {
+        return compact[idx..].to_string();
+    }
+    compact
+}
+
+fn run_in_blocking_thread<T, F>(f: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Option<T> + Send + 'static,
+{
+    std::thread::spawn(f).join().ok().flatten()
+}
+
+fn default_anthropic_models() -> Vec<(String, String)> {
+    vec![
+        (
+            "claude-sonnet-4-20250514".to_string(),
+            "Claude Sonnet 4 (balanced, recommended)".to_string(),
+        ),
+        (
+            "claude-opus-4-6".to_string(),
+            "Claude Opus 4.6 (strongest reasoning)".to_string(),
+        ),
+        (
+            "claude-opus-4-5".to_string(),
+            "Claude Opus 4.5 (premium, stable)".to_string(),
+        ),
+        (
+            "claude-sonnet-4-5".to_string(),
+            "Claude Sonnet 4.5 (high performance)".to_string(),
+        ),
+        (
+            "claude-3-7-sonnet-latest".to_string(),
+            "Claude 3.7 Sonnet (latest 3.x Sonnet)".to_string(),
+        ),
+        (
+            "claude-3-5-sonnet-20241022".to_string(),
+            "Claude 3.5 Sonnet (fast, reliable)".to_string(),
+        ),
+        (
+            "claude-3-5-haiku-20241022".to_string(),
+            "Claude 3.5 Haiku (fastest, cheapest)".to_string(),
+        ),
+        (
+            "__custom__".to_string(),
+            "Custom model id (type manually)".to_string(),
+        ),
+    ]
+}
+
+fn parse_anthropic_models_payload(payload: &serde_json::Value) -> Vec<String> {
+    let mut ids: Vec<String> = payload
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("id").and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .filter(|id| id.starts_with("claude") && !id.is_empty())
+        .map(ToString::to_string)
+        .collect();
+
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+fn fetch_anthropic_models_live(credential: &str) -> Option<Vec<String>> {
+    // reqwest::blocking creates its own runtime and panics if dropped inside an async runtime.
+    // The onboarding wizard is launched from an async main, so safely skip live fetch there.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return None;
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(4))
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .build()
+        .ok()?;
+
+    let mut req = client
+        .get("https://api.anthropic.com/v1/models")
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json");
+
+    if credential.starts_with(ANTHROPIC_SETUP_TOKEN_PREFIX) {
+        req = req.header("Authorization", format!("Bearer {credential}"));
+    } else {
+        req = req.header("x-api-key", credential);
+    }
+
+    let resp = req.send().ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let payload: serde_json::Value = resp.json().ok()?;
+    let ids = parse_anthropic_models_payload(&payload);
+    if ids.is_empty() {
+        None
+    } else {
+        Some(ids)
+    }
+}
+
+fn anthropic_models_for_onboarding(credential: Option<&str>) -> Vec<(String, String)> {
+    let mut defaults = default_anthropic_models();
+    let Some(credential) = credential.map(str::trim).filter(|c| !c.is_empty()) else {
+        return defaults;
+    };
+
+    let Some(dynamic_ids) = fetch_anthropic_models_live(credential) else {
+        return defaults;
+    };
+
+    let mut dynamic: Vec<(String, String)> = dynamic_ids
+        .into_iter()
+        .map(|id| {
+            let label = if id.contains("opus") {
+                format!("{id} (live)")
+            } else if id.contains("sonnet") {
+                format!("{id} (live)")
+            } else if id.contains("haiku") {
+                format!("{id} (live)")
+            } else {
+                id.clone()
+            };
+            (id, label)
+        })
+        .collect();
+
+    dynamic.sort_by(|a, b| a.0.cmp(&b.0));
+    dynamic.dedup_by(|a, b| a.0 == b.0);
+
+    dynamic.push((
+        "__custom__".to_string(),
+        "Custom model id (type manually)".to_string(),
+    ));
+
+    defaults.retain(|(id, _)| id != "__custom__");
+    for (id, label) in defaults {
+        if !dynamic.iter().any(|(existing, _)| existing == &id) {
+            dynamic.push((id, format!("{label} (fallback)")));
+        }
+    }
+
+    dynamic
 }
 
 // ── Step 5: Tool Mode & Security ────────────────────────────────
@@ -975,7 +1261,7 @@ fn setup_memory() -> Result<MemoryConfig> {
         .interact()?;
 
     let backend = match choice {
-        1 => "markdown", 
+        1 => "markdown",
         2 => "none",
         _ => "sqlite", // 0 and any unexpected value defaults to sqlite
     };
@@ -1125,16 +1411,24 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                 // Test connection
                 print!("  {} Testing connection... ", style("⏳").dim());
-                let client = reqwest::blocking::Client::new();
                 let url = format!("https://api.telegram.org/bot{token}/getMe");
-                match client.get(&url).send() {
-                    Ok(resp) if resp.status().is_success() => {
-                        let data: serde_json::Value = resp.json().unwrap_or_default();
-                        let bot_name = data
-                            .get("result")
+                let bot_name = run_in_blocking_thread(move || {
+                    let client = reqwest::blocking::Client::new();
+                    let resp = client.get(&url).send().ok()?;
+                    if !resp.status().is_success() {
+                        return None;
+                    }
+                    let data: serde_json::Value = resp.json().ok()?;
+                    Some(
+                        data.get("result")
                             .and_then(|r| r.get("username"))
                             .and_then(serde_json::Value::as_str)
-                            .unwrap_or("unknown");
+                            .unwrap_or("unknown")
+                            .to_string(),
+                    )
+                });
+                match bot_name {
+                    Some(bot_name) => {
                         println!(
                             "\r  {} Connected as @{bot_name}        ",
                             style("✅").green().bold()
@@ -1209,18 +1503,27 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                 // Test connection
                 print!("  {} Testing connection... ", style("⏳").dim());
-                let client = reqwest::blocking::Client::new();
-                match client
-                    .get("https://discord.com/api/v10/users/@me")
-                    .header("Authorization", format!("Bot {token}"))
-                    .send()
-                {
-                    Ok(resp) if resp.status().is_success() => {
-                        let data: serde_json::Value = resp.json().unwrap_or_default();
-                        let bot_name = data
-                            .get("username")
+                let token_check = token.clone();
+                let bot_name = run_in_blocking_thread(move || {
+                    let client = reqwest::blocking::Client::new();
+                    let resp = client
+                        .get("https://discord.com/api/v10/users/@me")
+                        .header("Authorization", format!("Bot {token_check}"))
+                        .send()
+                        .ok()?;
+                    if !resp.status().is_success() {
+                        return None;
+                    }
+                    let data: serde_json::Value = resp.json().ok()?;
+                    Some(
+                        data.get("username")
                             .and_then(serde_json::Value::as_str)
-                            .unwrap_or("unknown");
+                            .unwrap_or("unknown")
+                            .to_string(),
+                    )
+                });
+                match bot_name {
+                    Some(bot_name) => {
                         println!(
                             "\r  {} Connected as {bot_name}        ",
                             style("✅").green().bold()
@@ -1300,37 +1603,46 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                 // Test connection
                 print!("  {} Testing connection... ", style("⏳").dim());
-                let client = reqwest::blocking::Client::new();
-                match client
-                    .get("https://slack.com/api/auth.test")
-                    .bearer_auth(&token)
-                    .send()
-                {
-                    Ok(resp) if resp.status().is_success() => {
-                        let data: serde_json::Value = resp.json().unwrap_or_default();
-                        let ok = data
-                            .get("ok")
-                            .and_then(serde_json::Value::as_bool)
-                            .unwrap_or(false);
-                        let team = data
-                            .get("team")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("unknown");
-                        if ok {
-                            println!(
-                                "\r  {} Connected to workspace: {team}        ",
-                                style("✅").green().bold()
-                            );
-                        } else {
-                            let err = data
-                                .get("error")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or("unknown error");
-                            println!("\r  {} Slack error: {err}", style("❌").red().bold());
-                            continue;
-                        }
+                let token_check = token.clone();
+                let slack_check = run_in_blocking_thread(move || {
+                    let client = reqwest::blocking::Client::new();
+                    let resp = client
+                        .get("https://slack.com/api/auth.test")
+                        .bearer_auth(&token_check)
+                        .send()
+                        .ok()?;
+                    if !resp.status().is_success() {
+                        return Some((false, "request failed".to_string(), String::new()));
                     }
-                    _ => {
+                    let data: serde_json::Value = resp.json().ok()?;
+                    let ok = data
+                        .get("ok")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    let team = data
+                        .get("team")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let err = data
+                        .get("error")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown error")
+                        .to_string();
+                    Some((ok, err, team))
+                });
+                match slack_check {
+                    Some((true, _, team)) => {
+                        println!(
+                            "\r  {} Connected to workspace: {team}        ",
+                            style("✅").green().bold()
+                        );
+                    }
+                    Some((false, err, _)) => {
+                        println!("\r  {} Slack error: {err}", style("❌").red().bold());
+                        continue;
+                    }
+                    None => {
                         println!(
                             "\r  {} Connection failed — check your token",
                             style("❌").red().bold()
@@ -1470,18 +1782,28 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 // Test connection
                 let hs = homeserver.trim_end_matches('/');
                 print!("  {} Testing connection... ", style("⏳").dim());
-                let client = reqwest::blocking::Client::new();
-                match client
-                    .get(format!("{hs}/_matrix/client/v3/account/whoami"))
-                    .header("Authorization", format!("Bearer {access_token}"))
-                    .send()
-                {
-                    Ok(resp) if resp.status().is_success() => {
-                        let data: serde_json::Value = resp.json().unwrap_or_default();
-                        let user_id = data
-                            .get("user_id")
+                let hs_owned = hs.to_string();
+                let access_token_check = access_token.clone();
+                let user_id = run_in_blocking_thread(move || {
+                    let client = reqwest::blocking::Client::new();
+                    let resp = client
+                        .get(format!("{hs_owned}/_matrix/client/v3/account/whoami"))
+                        .header("Authorization", format!("Bearer {access_token_check}"))
+                        .send()
+                        .ok()?;
+                    if !resp.status().is_success() {
+                        return None;
+                    }
+                    let data: serde_json::Value = resp.json().ok()?;
+                    Some(
+                        data.get("user_id")
                             .and_then(serde_json::Value::as_str)
-                            .unwrap_or("unknown");
+                            .unwrap_or("unknown")
+                            .to_string(),
+                    )
+                });
+                match user_id {
+                    Some(user_id) => {
                         println!(
                             "\r  {} Connected as {user_id}        ",
                             style("✅").green().bold()
@@ -1557,17 +1879,22 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                 // Test connection
                 print!("  {} Testing connection... ", style("⏳").dim());
-                let client = reqwest::blocking::Client::new();
                 let url = format!(
                     "https://graph.facebook.com/v18.0/{}",
                     phone_number_id.trim()
                 );
-                match client
-                    .get(&url)
-                    .header("Authorization", format!("Bearer {}", access_token.trim()))
-                    .send()
-                {
-                    Ok(resp) if resp.status().is_success() => {
+                let access_token_check = access_token.trim().to_string();
+                let connected = run_in_blocking_thread(move || {
+                    let client = reqwest::blocking::Client::new();
+                    let resp = client
+                        .get(&url)
+                        .header("Authorization", format!("Bearer {access_token_check}"))
+                        .send()
+                        .ok()?;
+                    Some(resp.status().is_success())
+                });
+                match connected {
+                    Some(true) => {
                         println!(
                             "\r  {} Connected to WhatsApp API        ",
                             style("✅").green().bold()
@@ -2740,5 +3067,61 @@ mod tests {
     #[test]
     fn provider_env_var_unknown_falls_back() {
         assert_eq!(provider_env_var("some-new-provider"), "API_KEY");
+    }
+
+    #[test]
+    fn anthropic_setup_token_validation_accepts_valid_token() {
+        let token = format!("{}{}", ANTHROPIC_SETUP_TOKEN_PREFIX, "a".repeat(80));
+        assert_eq!(validate_anthropic_setup_token(&token), None);
+    }
+
+    #[test]
+    fn anthropic_setup_token_validation_rejects_bad_prefix() {
+        let token = "sk-ant-invalid-token";
+        assert_eq!(
+            validate_anthropic_setup_token(token),
+            Some("expected token starting with sk-ant-oat01-")
+        );
+    }
+
+    #[test]
+    fn normalize_pasted_secret_removes_whitespace_and_linebreaks() {
+        let raw = " sk-ant-oat01-abc\n  def\r\n ghi\t";
+        let normalized = normalize_pasted_secret(raw);
+        assert_eq!(normalized, "sk-ant-oat01-abcdefghi");
+    }
+
+    #[test]
+    fn normalize_anthropic_setup_token_input_trims_leading_noise() {
+        let raw = "sssk-ant-oat01-abc\n123";
+        let normalized = normalize_anthropic_setup_token_input(raw);
+        assert_eq!(normalized, "sk-ant-oat01-abc123");
+    }
+
+    #[test]
+    fn parse_anthropic_models_payload_extracts_claude_model_ids() {
+        let payload = serde_json::json!({
+            "data": [
+                {"id": "claude-opus-4-6"},
+                {"id": "claude-sonnet-4-5"},
+                {"id": "non-claude-model"},
+                {"id": "claude-opus-4-6"}
+            ]
+        });
+
+        let ids = parse_anthropic_models_payload(&payload);
+        assert_eq!(ids, vec!["claude-opus-4-6", "claude-sonnet-4-5"]);
+    }
+
+    #[test]
+    fn default_anthropic_models_include_opus_4_6() {
+        let models = default_anthropic_models();
+        assert!(models.iter().any(|(id, _)| id == "claude-opus-4-6"));
+    }
+
+    #[tokio::test]
+    async fn fetch_anthropic_models_live_skips_inside_async_runtime() {
+        let result = fetch_anthropic_models_live("sk-ant-oat01-test");
+        assert!(result.is_none());
     }
 }
