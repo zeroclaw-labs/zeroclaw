@@ -2397,8 +2397,8 @@ mod tests {
 
         let identity = fs::read_to_string(tmp.path().join("IDENTITY.md")).unwrap();
         assert!(
-            identity.contains("**Name:** ZeroClaw"),
-            "should default agent name to ZeroClaw"
+            identity.contains("**Name:** Aria"),
+            "should default agent name to Aria"
         );
 
         let user_md = fs::read_to_string(tmp.path().join("USER.md")).unwrap();
@@ -2588,7 +2588,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext {
             user_name: "José María".into(),
-            agent_name: "ZeroClaw-v2".into(),
+            agent_name: "Aria-v2".into(),
             timezone: "Europe/Madrid".into(),
             communication_style: "Be direct.".into(),
         };
@@ -2598,7 +2598,7 @@ mod tests {
         assert!(user_md.contains("José María"));
 
         let soul = fs::read_to_string(tmp.path().join("SOUL.md")).unwrap();
-        assert!(soul.contains("ZeroClaw-v2"));
+        assert!(soul.contains("Aria-v2"));
     }
 
     // ── scaffold_workspace: full personalization round-trip ─────
