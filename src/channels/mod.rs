@@ -5,6 +5,7 @@ pub mod matrix;
 pub mod slack;
 pub mod telegram;
 pub mod traits;
+pub mod whatsapp;
 
 pub use cli::CliChannel;
 pub use discord::DiscordChannel;
@@ -13,6 +14,7 @@ pub use matrix::MatrixChannel;
 pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
 pub use traits::Channel;
+pub use whatsapp::WhatsAppChannel;
 
 use crate::config::Config;
 use crate::memory::{self, Memory};
@@ -236,6 +238,7 @@ pub fn handle_command(command: super::ChannelCommands, config: &Config) -> Resul
                 ("Webhook", config.channels_config.webhook.is_some()),
                 ("iMessage", config.channels_config.imessage.is_some()),
                 ("Matrix", config.channels_config.matrix.is_some()),
+                ("WhatsApp", config.channels_config.whatsapp.is_some()),
             ] {
                 println!("  {} {name}", if configured { "✅" } else { "❌" });
             }
@@ -326,6 +329,18 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 mx.access_token.clone(),
                 mx.room_id.clone(),
                 mx.allowed_users.clone(),
+            )),
+        ));
+    }
+
+    if let Some(ref wa) = config.channels_config.whatsapp {
+        channels.push((
+            "WhatsApp",
+            Arc::new(WhatsAppChannel::new(
+                wa.access_token.clone(),
+                wa.phone_number_id.clone(),
+                wa.verify_token.clone(),
+                wa.allowed_numbers.clone(),
             )),
         ));
     }
@@ -478,6 +493,15 @@ pub async fn start_channels(config: Config) -> Result<()> {
             mx.access_token.clone(),
             mx.room_id.clone(),
             mx.allowed_users.clone(),
+        )));
+    }
+
+    if let Some(ref wa) = config.channels_config.whatsapp {
+        channels.push(Arc::new(WhatsAppChannel::new(
+            wa.access_token.clone(),
+            wa.phone_number_id.clone(),
+            wa.verify_token.clone(),
+            wa.allowed_numbers.clone(),
         )));
     }
 

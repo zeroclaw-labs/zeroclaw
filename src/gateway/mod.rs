@@ -1,3 +1,4 @@
+use crate::channels::{Channel, WhatsAppChannel};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::providers::{self, Provider};
@@ -50,6 +51,17 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .and_then(|w| w.secret.as_deref())
         .map(Arc::from);
 
+    // WhatsApp channel (if configured)
+    let whatsapp_channel: Option<Arc<WhatsAppChannel>> =
+        config.channels_config.whatsapp.as_ref().map(|wa| {
+            Arc::new(WhatsAppChannel::new(
+                wa.access_token.clone(),
+                wa.phone_number_id.clone(),
+                wa.verify_token.clone(),
+                wa.allowed_numbers.clone(),
+            ))
+        });
+
     // ── Pairing guard ──────────────────────────────────────
     let pairing = Arc::new(PairingGuard::new(
         config.gateway.require_pairing,
@@ -78,9 +90,13 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     if let Some(ref url) = tunnel_url {
         println!("  🌐 Public URL: {url}");
     }
-    println!("  POST /pair     — pair a new client (X-Pairing-Code header)");
-    println!("  POST /webhook  — {{\"message\": \"your prompt\"}}");
-    println!("  GET  /health   — health check");
+    println!("  POST /pair      — pair a new client (X-Pairing-Code header)");
+    println!("  POST /webhook   — {{\"message\": \"your prompt\"}}");
+    if whatsapp_channel.is_some() {
+        println!("  GET  /whatsapp  — Meta webhook verification");
+        println!("  POST /whatsapp  — WhatsApp message webhook");
+    }
+    println!("  GET  /health    — health check");
     if let Some(code) = pairing.pairing_code() {
         println!();
         println!("  � PAIRING REQUIRED — use this one-time code:");
@@ -108,6 +124,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         let auto_save = config.memory.auto_save;
         let secret = webhook_secret.clone();
         let pairing = pairing.clone();
+        let whatsapp = whatsapp_channel.clone();
 
         tokio::spawn(async move {
             // Read with 30s timeout to prevent slow-loris attacks
@@ -136,6 +153,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                     auto_save,
                     secret.as_ref(),
                     &pairing,
+                    whatsapp.as_ref(),
                 )
                 .await;
             } else {
@@ -171,6 +189,7 @@ async fn handle_request(
     auto_save: bool,
     webhook_secret: Option<&Arc<str>>,
     pairing: &PairingGuard,
+    whatsapp: Option<&Arc<WhatsAppChannel>>,
 ) {
     match (method, path) {
         // Health check — always public (no secrets leaked)
@@ -212,6 +231,16 @@ async fn handle_request(
                     let _ = send_json(stream, 429, &err).await;
                 }
             }
+        }
+
+        // WhatsApp webhook verification (Meta sends GET to verify)
+        ("GET", "/whatsapp") => {
+            handle_whatsapp_verify(stream, request, whatsapp).await;
+        }
+
+        // WhatsApp incoming message webhook
+        ("POST", "/whatsapp") => {
+            handle_whatsapp_message(stream, request, provider, model, temperature, mem, auto_save, whatsapp).await;
         }
 
         ("POST", "/webhook") => {
@@ -309,6 +338,172 @@ async fn handle_webhook(
             let _ = send_json(stream, 500, &err).await;
         }
     }
+}
+
+/// Handle webhook verification (GET /whatsapp)
+/// Meta sends: `GET /whatsapp?hub.mode=subscribe&hub.verify_token=<token>&hub.challenge=<challenge>`
+async fn handle_whatsapp_verify(
+    stream: &mut tokio::net::TcpStream,
+    request: &str,
+    whatsapp: Option<&Arc<WhatsAppChannel>>,
+) {
+    let Some(wa) = whatsapp else {
+        let err = serde_json::json!({"error": "WhatsApp not configured"});
+        let _ = send_json(stream, 404, &err).await;
+        return;
+    };
+
+    // Parse query string from the request line
+    // GET /whatsapp?hub.mode=subscribe&hub.verify_token=xxx&hub.challenge=yyy HTTP/1.1
+    let first_line = request.lines().next().unwrap_or("");
+    let query = first_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|path| path.split('?').nth(1))
+        .unwrap_or("");
+
+    let mut mode = None;
+    let mut token = None;
+    let mut challenge = None;
+
+    for pair in query.split('&') {
+        if let Some((key, value)) = pair.split_once('=') {
+            match key {
+                "hub.mode" => mode = Some(value),
+                "hub.verify_token" => token = Some(value),
+                "hub.challenge" => challenge = Some(value),
+                _ => {}
+            }
+        }
+    }
+
+    // Verify the token matches
+    if mode == Some("subscribe") && token == Some(wa.verify_token()) {
+        if let Some(ch) = challenge {
+            // URL-decode the challenge (basic: replace %XX)
+            let decoded = urlencoding_decode(ch);
+            tracing::info!("WhatsApp webhook verified successfully");
+            let _ = send_response(stream, 200, &decoded).await;
+        } else {
+            let _ = send_response(stream, 400, "Missing hub.challenge").await;
+        }
+    } else {
+        tracing::warn!("WhatsApp webhook verification failed — token mismatch");
+        let _ = send_response(stream, 403, "Forbidden").await;
+    }
+}
+
+/// Simple URL decoding (handles %XX sequences)
+fn urlencoding_decode(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let hex: String = chars.by_ref().take(2).collect();
+            // Require exactly 2 hex digits for valid percent encoding
+            if hex.len() == 2 {
+                if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                    result.push(byte as char);
+                } else {
+                    result.push('%');
+                    result.push_str(&hex);
+                }
+            } else {
+                // Incomplete percent encoding - preserve as-is
+                result.push('%');
+                result.push_str(&hex);
+            }
+        } else if c == '+' {
+            result.push(' ');
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
+}
+
+/// Handle incoming message webhook (POST /whatsapp)
+#[allow(clippy::too_many_arguments)]
+async fn handle_whatsapp_message(
+    stream: &mut tokio::net::TcpStream,
+    request: &str,
+    provider: &Arc<dyn Provider>,
+    model: &str,
+    temperature: f64,
+    mem: &Arc<dyn Memory>,
+    auto_save: bool,
+    whatsapp: Option<&Arc<WhatsAppChannel>>,
+) {
+    let Some(wa) = whatsapp else {
+        let err = serde_json::json!({"error": "WhatsApp not configured"});
+        let _ = send_json(stream, 404, &err).await;
+        return;
+    };
+
+    // Extract JSON body
+    let body_str = request
+        .split("\r\n\r\n")
+        .nth(1)
+        .or_else(|| request.split("\n\n").nth(1))
+        .unwrap_or("");
+
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(body_str) else {
+        let err = serde_json::json!({"error": "Invalid JSON payload"});
+        let _ = send_json(stream, 400, &err).await;
+        return;
+    };
+
+    // Parse messages from the webhook payload
+    let messages = wa.parse_webhook_payload(&payload);
+
+    if messages.is_empty() {
+        // Acknowledge the webhook even if no messages (could be status updates)
+        let _ = send_response(stream, 200, "OK").await;
+        return;
+    }
+
+    // Process each message
+    for msg in &messages {
+        tracing::info!(
+            "WhatsApp message from {}: {}",
+            msg.sender,
+            if msg.content.len() > 50 {
+                format!("{}...", &msg.content[..50])
+            } else {
+                msg.content.clone()
+            }
+        );
+
+        // Auto-save to memory
+        if auto_save {
+            let _ = mem
+                .store(
+                    &format!("whatsapp_{}", msg.sender),
+                    &msg.content,
+                    MemoryCategory::Conversation,
+                )
+                .await;
+        }
+
+        // Call the LLM
+        match provider.chat(&msg.content, model, temperature).await {
+            Ok(response) => {
+                // Send reply via WhatsApp
+                if let Err(e) = wa.send(&response, &msg.sender).await {
+                    tracing::error!("Failed to send WhatsApp reply: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::error!("LLM error for WhatsApp message: {e}");
+                let _ = wa.send(&format!("⚠️ Error: {e}"), &msg.sender).await;
+            }
+        }
+    }
+
+    // Acknowledge the webhook
+    let _ = send_response(stream, 200, "OK").await;
 }
 
 async fn send_response(
@@ -524,5 +719,66 @@ mod tests {
     #[test]
     fn extract_header_newline_only_request() {
         assert_eq!(extract_header("\r\n\r\n", "X-Webhook-Secret"), None);
+    }
+
+    // ── URL decoding tests ────────────────────────────────────
+
+    #[test]
+    fn urlencoding_decode_plain_text() {
+        assert_eq!(urlencoding_decode("hello"), "hello");
+    }
+
+    #[test]
+    fn urlencoding_decode_spaces() {
+        assert_eq!(urlencoding_decode("hello+world"), "hello world");
+        assert_eq!(urlencoding_decode("hello%20world"), "hello world");
+    }
+
+    #[test]
+    fn urlencoding_decode_special_chars() {
+        assert_eq!(urlencoding_decode("%21%40%23"), "!@#");
+        assert_eq!(urlencoding_decode("%3F%3D%26"), "?=&");
+    }
+
+    #[test]
+    fn urlencoding_decode_mixed() {
+        assert_eq!(urlencoding_decode("hello%20world%21"), "hello world!");
+        assert_eq!(urlencoding_decode("a+b%2Bc"), "a b+c");
+    }
+
+    #[test]
+    fn urlencoding_decode_empty() {
+        assert_eq!(urlencoding_decode(""), "");
+    }
+
+    #[test]
+    fn urlencoding_decode_invalid_hex() {
+        // Invalid hex should be preserved
+        assert_eq!(urlencoding_decode("%ZZ"), "%ZZ");
+        assert_eq!(urlencoding_decode("%G1"), "%G1");
+    }
+
+    #[test]
+    fn urlencoding_decode_incomplete_percent() {
+        // Incomplete percent encoding at end - function takes available chars
+        // "%2" -> takes "2" as hex, fails to parse, outputs "%2"
+        assert_eq!(urlencoding_decode("test%2"), "test%2");
+        // "%" alone -> takes "" as hex, fails to parse, outputs "%"
+        assert_eq!(urlencoding_decode("test%"), "test%");
+    }
+
+    #[test]
+    fn urlencoding_decode_challenge_token() {
+        // Typical Meta webhook challenge
+        assert_eq!(
+            urlencoding_decode("1234567890"),
+            "1234567890"
+        );
+    }
+
+    #[test]
+    fn urlencoding_decode_unicode_percent() {
+        // URL-encoded UTF-8 bytes for emoji (simplified test)
+        assert_eq!(urlencoding_decode("%41%42%43"), "ABC");
     }
 }

@@ -3,6 +3,7 @@ use crate::config::{
     HeartbeatConfig, IMessageConfig, MatrixConfig, MemoryConfig, ObservabilityConfig,
     RuntimeConfig, SecretsConfig, SlackConfig, TelegramConfig, WebhookConfig,
 };
+use crate::config::schema::WhatsAppConfig;
 use anyhow::{Context, Result};
 use console::style;
 use dialoguer::{Confirm, Input, Select};
@@ -945,6 +946,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
         webhook: None,
         imessage: None,
         matrix: None,
+        whatsapp: None,
     };
 
     loop {
@@ -990,6 +992,14 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 }
             ),
             format!(
+                "WhatsApp   {}",
+                if config.whatsapp.is_some() {
+                    "✅ connected"
+                } else {
+                    "— Business Cloud API"
+                }
+            ),
+            format!(
                 "Webhook    {}",
                 if config.webhook.is_some() {
                     "✅ configured"
@@ -1003,7 +1013,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
         let choice = Select::new()
             .with_prompt("  Connect a channel (or Done to continue)")
             .items(&options)
-            .default(6)
+            .default(7)
             .interact()?;
 
         match choice {
@@ -1425,6 +1435,91 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 });
             }
             5 => {
+                // ── WhatsApp ──
+                println!();
+                println!(
+                    "  {} {}",
+                    style("WhatsApp Setup").white().bold(),
+                    style("— Business Cloud API").dim()
+                );
+                print_bullet("1. Go to developers.facebook.com and create a WhatsApp app");
+                print_bullet("2. Add the WhatsApp product and get your phone number ID");
+                print_bullet("3. Generate a temporary access token (System User)");
+                print_bullet("4. Configure webhook URL to: https://your-domain/whatsapp");
+                println!();
+
+                let access_token: String = Input::new()
+                    .with_prompt("  Access token (from Meta Developers)")
+                    .interact_text()?;
+
+                if access_token.trim().is_empty() {
+                    println!("  {} Skipped", style("→").dim());
+                    continue;
+                }
+
+                let phone_number_id: String = Input::new()
+                    .with_prompt("  Phone number ID (from WhatsApp app settings)")
+                    .interact_text()?;
+
+                if phone_number_id.trim().is_empty() {
+                    println!("  {} Skipped — phone number ID required", style("→").dim());
+                    continue;
+                }
+
+                let verify_token: String = Input::new()
+                    .with_prompt("  Webhook verify token (create your own)")
+                    .default("zeroclaw-whatsapp-verify".into())
+                    .interact_text()?;
+
+                // Test connection
+                print!("  {} Testing connection... ", style("⏳").dim());
+                let client = reqwest::blocking::Client::new();
+                let url = format!(
+                    "https://graph.facebook.com/v18.0/{}",
+                    phone_number_id.trim()
+                );
+                match client
+                    .get(&url)
+                    .header("Authorization", format!("Bearer {}", access_token.trim()))
+                    .send()
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        println!(
+                            "\r  {} Connected to WhatsApp API        ",
+                            style("✅").green().bold()
+                        );
+                    }
+                    _ => {
+                        println!(
+                            "\r  {} Connection failed — check access token and phone number ID",
+                            style("❌").red().bold()
+                        );
+                        continue;
+                    }
+                }
+
+                let users_str: String = Input::new()
+                    .with_prompt("  Allowed phone numbers (comma-separated +1234567890, or * for all)")
+                    .default("*".into())
+                    .interact_text()?;
+
+                let allowed_numbers = if users_str.trim() == "*" {
+                    vec!["*".into()]
+                } else {
+                    users_str
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .collect()
+                };
+
+                config.whatsapp = Some(WhatsAppConfig {
+                    access_token: access_token.trim().to_string(),
+                    phone_number_id: phone_number_id.trim().to_string(),
+                    verify_token: verify_token.trim().to_string(),
+                    allowed_numbers,
+                });
+            }
+            6 => {
                 // ── Webhook ──
                 println!();
                 println!(
@@ -1478,6 +1573,9 @@ fn setup_channels() -> Result<ChannelsConfig> {
     }
     if config.matrix.is_some() {
         active.push("Matrix");
+    }
+    if config.whatsapp.is_some() {
+        active.push("WhatsApp");
     }
     if config.webhook.is_some() {
         active.push("Webhook");

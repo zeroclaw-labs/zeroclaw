@@ -485,6 +485,7 @@ pub struct ChannelsConfig {
     pub webhook: Option<WebhookConfig>,
     pub imessage: Option<IMessageConfig>,
     pub matrix: Option<MatrixConfig>,
+    pub whatsapp: Option<WhatsAppConfig>,
 }
 
 impl Default for ChannelsConfig {
@@ -497,6 +498,7 @@ impl Default for ChannelsConfig {
             webhook: None,
             imessage: None,
             matrix: None,
+            whatsapp: None,
         }
     }
 }
@@ -541,6 +543,19 @@ pub struct MatrixConfig {
     pub access_token: String,
     pub room_id: String,
     pub allowed_users: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WhatsAppConfig {
+    /// Access token from Meta Business Suite
+    pub access_token: String,
+    /// Phone number ID from Meta Business API
+    pub phone_number_id: String,
+    /// Webhook verify token (you define this, Meta sends it back for verification)
+    pub verify_token: String,
+    /// Allowed phone numbers (E.164 format: +1234567890) or "*" for all
+    #[serde(default)]
+    pub allowed_numbers: Vec<String>,
 }
 
 // ── Config impl ──────────────────────────────────────────────────
@@ -717,6 +732,7 @@ mod tests {
                 webhook: None,
                 imessage: None,
                 matrix: None,
+                whatsapp: None,
             },
             memory: MemoryConfig::default(),
             tunnel: TunnelConfig::default(),
@@ -926,6 +942,7 @@ default_temperature = 0.7
                 room_id: "!r:m".into(),
                 allowed_users: vec!["@u:m".into()],
             }),
+            whatsapp: None,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -1008,6 +1025,89 @@ channel_id = "C123"
         let parsed: WebhookConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.secret.is_none());
         assert_eq!(parsed.port, 8080);
+    }
+
+    // ── WhatsApp config ──────────────────────────────────────
+
+    #[test]
+    fn whatsapp_config_serde() {
+        let wc = WhatsAppConfig {
+            access_token: "EAABx...".into(),
+            phone_number_id: "123456789".into(),
+            verify_token: "my-verify-token".into(),
+            allowed_numbers: vec!["+1234567890".into(), "+9876543210".into()],
+        };
+        let json = serde_json::to_string(&wc).unwrap();
+        let parsed: WhatsAppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.access_token, "EAABx...");
+        assert_eq!(parsed.phone_number_id, "123456789");
+        assert_eq!(parsed.verify_token, "my-verify-token");
+        assert_eq!(parsed.allowed_numbers.len(), 2);
+    }
+
+    #[test]
+    fn whatsapp_config_toml_roundtrip() {
+        let wc = WhatsAppConfig {
+            access_token: "tok".into(),
+            phone_number_id: "12345".into(),
+            verify_token: "verify".into(),
+            allowed_numbers: vec!["+1".into()],
+        };
+        let toml_str = toml::to_string(&wc).unwrap();
+        let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.phone_number_id, "12345");
+        assert_eq!(parsed.allowed_numbers, vec!["+1"]);
+    }
+
+    #[test]
+    fn whatsapp_config_deserializes_without_allowed_numbers() {
+        let json = r#"{"access_token":"tok","phone_number_id":"123","verify_token":"ver"}"#;
+        let parsed: WhatsAppConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.allowed_numbers.is_empty());
+    }
+
+    #[test]
+    fn whatsapp_config_wildcard_allowed() {
+        let wc = WhatsAppConfig {
+            access_token: "tok".into(),
+            phone_number_id: "123".into(),
+            verify_token: "ver".into(),
+            allowed_numbers: vec!["*".into()],
+        };
+        let toml_str = toml::to_string(&wc).unwrap();
+        let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.allowed_numbers, vec!["*"]);
+    }
+
+    #[test]
+    fn channels_config_with_whatsapp() {
+        let c = ChannelsConfig {
+            cli: true,
+            telegram: None,
+            discord: None,
+            slack: None,
+            webhook: None,
+            imessage: None,
+            matrix: None,
+            whatsapp: Some(WhatsAppConfig {
+                access_token: "tok".into(),
+                phone_number_id: "123".into(),
+                verify_token: "ver".into(),
+                allowed_numbers: vec!["+1".into()],
+            }),
+        };
+        let toml_str = toml::to_string_pretty(&c).unwrap();
+        let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
+        assert!(parsed.whatsapp.is_some());
+        let wa = parsed.whatsapp.unwrap();
+        assert_eq!(wa.phone_number_id, "123");
+        assert_eq!(wa.allowed_numbers, vec!["+1"]);
+    }
+
+    #[test]
+    fn channels_config_default_has_no_whatsapp() {
+        let c = ChannelsConfig::default();
+        assert!(c.whatsapp.is_none());
     }
 
     // ══════════════════════════════════════════════════════════
