@@ -36,7 +36,7 @@ pub struct SkillDescriptor {
     pub description: String,
 }
 
-/// Maximum characters to inject from a single workspace file (matches OpenClaw default).
+/// Maximum characters to inject from a single workspace file.
 const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 
 /// Default fallback prompt when nothing else produces output.

@@ -56,11 +56,11 @@ pub struct Config {
     pub identity: IdentityConfig,
 }
 
-// ── Identity (AIEOS / OpenClaw format) ──────────────────────────
+// ── Identity (Aria markdown / AIEOS JSON format) ────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IdentityConfig {
-    /// Identity format: "openclaw" (default) or "aieos"
+    /// Identity format: "aria" (default, markdown workspace files) or "aieos" (JSON)
     #[serde(default = "default_identity_format")]
     pub format: String,
     /// Path to AIEOS JSON file (relative to workspace)
@@ -72,7 +72,7 @@ pub struct IdentityConfig {
 }
 
 fn default_identity_format() -> String {
-    "openclaw".into()
+    "aria".into()
 }
 
 impl Default for IdentityConfig {

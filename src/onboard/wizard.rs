@@ -1974,7 +1974,10 @@ fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> 
     ];
 
     // Create subdirectories
-    let subdirs = ["sessions", "memory", "state", "cron", "skills"];
+    let subdirs = [
+        "sessions", "memory", "state", "cron", "skills",
+        "hooks", "plugins", "tools", "agents", "teams", "pipelines", "feeds",
+    ];
     for dir in &subdirs {
         fs::create_dir_all(workspace_dir.join(dir))?;
     }

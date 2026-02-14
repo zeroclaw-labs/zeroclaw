@@ -445,12 +445,24 @@ async fn handle_events_ws(
 async fn handle_events_socket(mut socket: ws::WebSocket) {
     let bus = crate::events::event_bus();
 
-    // Use a tokio channel to bridge the sync event bus callback to the async WebSocket
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    // Bounded channel prevents unbounded memory growth if the WebSocket can't
+    // keep up. Events beyond the buffer are dropped with a warning.
+    const EVENT_BUFFER: usize = 512;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(EVENT_BUFFER);
+    let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let dropped_inner = dropped.clone();
 
     let listener_id = bus.subscribe(move |evt| {
         if let Ok(json) = serde_json::to_string(evt) {
-            let _ = tx.send(json);
+            if tx.try_send(json).is_err() {
+                let n = dropped_inner.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n % 100 == 0 {
+                    tracing::warn!(
+                        dropped = n + 1,
+                        "Event stream backpressure: dropping events (WebSocket too slow)"
+                    );
+                }
+            }
         }
     });
 
@@ -475,6 +487,10 @@ async fn handle_events_socket(mut socket: ws::WebSocket) {
     }
 
     bus.unsubscribe(listener_id);
+    let total_dropped = dropped.load(std::sync::atomic::Ordering::Relaxed);
+    if total_dropped > 0 {
+        tracing::warn!(total_dropped, "WebSocket session dropped events due to backpressure");
+    }
     tracing::info!("Dashboard WebSocket disconnected");
 }
 

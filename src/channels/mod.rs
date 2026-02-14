@@ -23,7 +23,7 @@ use anyhow::Result;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Maximum characters per injected workspace file (matches `OpenClaw` default).
+/// Maximum characters per injected workspace file.
 const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 
 const DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS: u64 = 2;

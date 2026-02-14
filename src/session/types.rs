@@ -57,6 +57,10 @@ pub struct SessionHeader {
 /// A single agent message persisted as one JSONL line.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AgentMessage {
+    /// Unique message ID for idempotent appends. When present, duplicate
+    /// messages with the same `message_id` can be detected and skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
     pub role: Role,
     pub content: Vec<ContentBlock>,
     #[serde(default)]
@@ -110,6 +114,7 @@ mod tests {
     #[test]
     fn agent_message_with_content_blocks() {
         let msg = AgentMessage {
+            message_id: None,
             role: Role::Assistant,
             content: vec![
                 ContentBlock::Text {

@@ -6,8 +6,11 @@
 use crate::aria::db::AriaDb;
 use crate::feed::executor::FeedExecutor;
 use anyhow::{Context, Result};
+use chrono::Utc;
+use cron::Schedule;
 use rusqlite::params;
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
@@ -320,57 +323,84 @@ impl FeedScheduler {
     }
 }
 
-/// Parse a cron-like schedule expression into an interval in seconds.
+/// Parse a cron schedule expression into an interval in seconds by computing
+/// the gap between the next two fire times using the `cron` crate.
 ///
-/// Supported patterns:
-/// - `*/N * * * *` -> every N minutes
-/// - `M * * * *` -> every hour (3600s)
-/// - `M H * * *` -> every day (86400s)
-/// - Fallback: every hour (3600s)
+/// Falls back to 86400 (daily) if the expression cannot be parsed, and logs a
+/// warning so the degradation is visible rather than silent.
 pub fn parse_schedule_to_interval(schedule: &str) -> u64 {
-    let parts: Vec<&str> = schedule.trim().split_whitespace().collect();
+    const FALLBACK_SECS: u64 = 86400;
 
-    if parts.len() < 5 {
-        return 3600; // Default: every hour
-    }
-
-    let minute_field = parts[0];
-    let hour_field = parts[1];
-    let day_field = parts[2];
-    let month_field = parts[3];
-    let weekday_field = parts[4];
-
-    // Check for */N pattern in minute field
-    if let Some(stripped) = minute_field.strip_prefix("*/") {
-        if let Ok(n) = stripped.parse::<u64>() {
-            if n > 0 && hour_field == "*" && day_field == "*" && month_field == "*" && weekday_field == "*" {
-                return n * 60;
+    // Normalize 5-field crontab expressions to 7-field (seconds + year) form
+    // that the `cron` crate expects.  6/7-field expressions are passed through.
+    let normalized = {
+        let trimmed = schedule.trim();
+        let field_count = trimmed.split_whitespace().count();
+        match field_count {
+            5 => format!("0 {trimmed}"),
+            6 | 7 => trimmed.to_string(),
+            _ => {
+                tracing::warn!(
+                    schedule = schedule,
+                    fallback_secs = FALLBACK_SECS,
+                    "Invalid cron expression (bad field count), falling back to daily interval"
+                );
+                return FALLBACK_SECS;
             }
         }
+    };
+
+    let cron_schedule = match Schedule::from_str(&normalized) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                schedule = schedule,
+                error = %e,
+                fallback_secs = FALLBACK_SECS,
+                "Failed to parse cron expression, falling back to daily interval"
+            );
+            return FALLBACK_SECS;
+        }
+    };
+
+    let now = Utc::now();
+    let mut upcoming = cron_schedule.after(&now);
+
+    let first = match upcoming.next() {
+        Some(t) => t,
+        None => {
+            tracing::warn!(
+                schedule = schedule,
+                fallback_secs = FALLBACK_SECS,
+                "Cron expression has no future fire time, falling back to daily interval"
+            );
+            return FALLBACK_SECS;
+        }
+    };
+
+    let second = match upcoming.next() {
+        Some(t) => t,
+        None => {
+            tracing::warn!(
+                schedule = schedule,
+                fallback_secs = FALLBACK_SECS,
+                "Cron expression has only one future fire time, falling back to daily interval"
+            );
+            return FALLBACK_SECS;
+        }
+    };
+
+    let interval = (second - first).num_seconds().unsigned_abs();
+    if interval == 0 {
+        tracing::warn!(
+            schedule = schedule,
+            fallback_secs = FALLBACK_SECS,
+            "Cron expression produced zero-second interval, falling back to daily interval"
+        );
+        return FALLBACK_SECS;
     }
 
-    // Specific minute, wildcard hour -> every hour
-    if minute_field.parse::<u64>().is_ok()
-        && hour_field == "*"
-        && day_field == "*"
-        && month_field == "*"
-        && weekday_field == "*"
-    {
-        return 3600;
-    }
-
-    // Specific minute + specific hour, wildcard day -> every day
-    if minute_field.parse::<u64>().is_ok()
-        && hour_field.parse::<u64>().is_ok()
-        && day_field == "*"
-        && month_field == "*"
-        && weekday_field == "*"
-    {
-        return 86400;
-    }
-
-    // Default fallback: every hour
-    3600
+    interval
 }
 
 #[cfg(test)]
@@ -424,18 +454,28 @@ mod tests {
     }
 
     #[test]
-    fn parse_fallback_for_complex_expressions() {
-        // Specific day of week -> fallback to hourly
-        assert_eq!(parse_schedule_to_interval("0 9 * * 1"), 3600);
-        // Specific month -> fallback to hourly
-        assert_eq!(parse_schedule_to_interval("0 0 1 1 *"), 3600);
+    fn parse_weekly_expression() {
+        // "0 9 * * 1" = every Monday at 09:00 -> ~604800s (7 days)
+        assert_eq!(parse_schedule_to_interval("0 9 * * 1"), 604800);
+    }
+
+    #[test]
+    fn parse_yearly_expression() {
+        // "0 0 1 1 *" = midnight on January 1st -> ~31536000s (365 days)
+        let interval = parse_schedule_to_interval("0 0 1 1 *");
+        // Could be 365 or 366 days depending on leap years
+        assert!(
+            interval == 365 * 86400 || interval == 366 * 86400,
+            "Expected yearly interval (~31536000 or ~31622400), got {interval}"
+        );
     }
 
     #[test]
     fn parse_fallback_for_invalid_input() {
-        assert_eq!(parse_schedule_to_interval("invalid"), 3600);
-        assert_eq!(parse_schedule_to_interval(""), 3600);
-        assert_eq!(parse_schedule_to_interval("* *"), 3600);
+        // Invalid inputs now fall back to daily (86400) instead of hourly (3600)
+        assert_eq!(parse_schedule_to_interval("invalid"), 86400);
+        assert_eq!(parse_schedule_to_interval(""), 86400);
+        assert_eq!(parse_schedule_to_interval("* *"), 86400);
     }
 
     // ── Scheduler lifecycle tests ──────────────────────────────

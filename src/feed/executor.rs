@@ -1,11 +1,13 @@
 //! Feed executor — runs feed handlers and manages feed item persistence.
 //!
-//! Currently provides a stub execution path that builds SDK context.
-//! When Quilt integration lands, this will create/reuse tenant-scoped
-//! containers and execute handler code in a sandboxed environment.
+//! Supports two execution modes:
+//! - **URL feeds**: When `handler_code` is an HTTP(S) URL, the executor fetches
+//!   the content and returns it as a single `FeedItem` with card_type `Text`.
+//! - **Code handlers**: Requires the Quilt container runtime (not yet available).
+//!   Returns an error indicating that code-based handlers are not yet supported.
 
 use crate::aria::db::AriaDb;
-use crate::aria::types::{FeedItem, FeedResult};
+use crate::aria::types::{FeedCardType, FeedItem, FeedResult};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rusqlite::params;
@@ -21,14 +23,120 @@ impl FeedExecutor {
         Self { db }
     }
 
+    /// Returns `true` if `handler_code` looks like an HTTP(S) URL.
+    fn is_url_feed(handler_code: &str) -> bool {
+        let trimmed = handler_code.trim();
+        trimmed.starts_with("http://") || trimmed.starts_with("https://")
+    }
+
+    /// Derive a human-readable title from a URL.
+    ///
+    /// Strips the scheme and uses the host + path as the title.
+    /// Falls back to the full URL if parsing fails.
+    fn title_from_url(url: &str) -> String {
+        // Try to extract host + path for a concise title
+        if let Some(rest) = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")) {
+            let trimmed = rest.trim_end_matches('/');
+            if trimmed.is_empty() {
+                return url.to_string();
+            }
+            format!("Feed: {trimmed}")
+        } else {
+            format!("Feed: {url}")
+        }
+    }
+
+    /// Execute a URL-based feed by fetching the content via HTTP.
+    ///
+    /// Returns a `FeedResult` containing a single `FeedItem` with the
+    /// fetched body as text content.
+    async fn execute_url_feed(
+        feed_id: &str,
+        url: &str,
+        run_id: &str,
+    ) -> Result<FeedResult> {
+        let url = url.trim();
+
+        tracing::info!(
+            feed_id = feed_id,
+            url = url,
+            run_id = run_id,
+            "Fetching URL feed"
+        );
+
+        let response = reqwest::get(url)
+            .await
+            .with_context(|| format!("Failed to fetch URL feed: {url}"))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Ok(FeedResult {
+                success: false,
+                items: Vec::new(),
+                summary: None,
+                metadata: None,
+                error: Some(format!(
+                    "HTTP {status} fetching feed URL: {url}"
+                )),
+            });
+        }
+
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("text/plain")
+            .to_string();
+
+        let body_text = response
+            .text()
+            .await
+            .with_context(|| format!("Failed to read response body from: {url}"))?;
+
+        let title = Self::title_from_url(url);
+
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            "content_type".to_string(),
+            serde_json::json!(content_type),
+        );
+        metadata.insert(
+            "source_url".to_string(),
+            serde_json::json!(url),
+        );
+        metadata.insert(
+            "fetched_at".to_string(),
+            serde_json::json!(Utc::now().to_rfc3339()),
+        );
+
+        let item = FeedItem {
+            card_type: FeedCardType::Text,
+            title,
+            body: Some(body_text),
+            source: Some(url.to_string()),
+            url: Some(url.to_string()),
+            metadata: Some(metadata),
+            timestamp: Some(Utc::now().timestamp()),
+        };
+
+        Ok(FeedResult {
+            success: true,
+            items: vec![item],
+            summary: Some(format!(
+                "Fetched URL feed for {feed_id} (run_id={run_id})"
+            )),
+            metadata: None,
+            error: None,
+        })
+    }
+
     /// Execute a feed's handler and return the result.
     ///
-    /// Currently builds SDK context with access to registries.
-    /// When Quilt integration lands, this will:
-    /// 1. Create/reuse tenant-scoped container
-    /// 2. Inject handler code + SDK runtime
-    /// 3. Execute handler(context)
-    /// 4. Return typed FeedResult
+    /// Two execution modes are supported:
+    /// - **URL feeds** (`handler_code` starts with `http://` or `https://`):
+    ///   Fetches the URL content and returns it as a single `FeedItem`.
+    /// - **Code handlers**: Requires the Quilt container runtime. Currently
+    ///   returns an error since Quilt is not yet available.
     pub async fn execute(
         &self,
         feed_id: &str,
@@ -43,8 +151,7 @@ impl FeedExecutor {
             "Executing feed handler"
         );
 
-        // TODO: When Quilt lands, replace this stub with container execution.
-        // For now, return a placeholder result indicating the handler was invoked.
+        // Empty handler code is always an error.
         if handler_code.is_empty() {
             return Ok(FeedResult {
                 success: false,
@@ -55,16 +162,22 @@ impl FeedExecutor {
             });
         }
 
-        // Stub: acknowledge handler code exists but cannot execute natively yet
+        // URL feeds: fetch the content directly via HTTP.
+        if Self::is_url_feed(handler_code) {
+            return Self::execute_url_feed(feed_id, handler_code, run_id).await;
+        }
+
+        // Non-URL handler code requires Quilt container runtime (not yet available).
         Ok(FeedResult {
-            success: true,
+            success: false,
             items: Vec::new(),
-            summary: Some(format!(
-                "Feed {feed_id} executed (stub, run_id={run_id}). Handler code length: {} bytes.",
-                handler_code.len()
-            )),
+            summary: None,
             metadata: None,
-            error: None,
+            error: Some(
+                "Handler execution requires Quilt container runtime (not yet available). \
+                 Use a URL as handler_code for basic HTTP feeds."
+                    .to_string(),
+            ),
         })
     }
 
@@ -215,15 +328,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_returns_stub_result_for_valid_handler() {
+    async fn execute_returns_quilt_error_for_code_handler() {
         let (_db, executor) = setup();
         let result = executor
             .execute("feed-1", "tenant-1", "console.log('hello')", "run-1")
             .await
             .unwrap();
-        assert!(result.success);
-        assert!(result.summary.is_some());
-        assert!(result.items.is_empty()); // Stub returns no items
+        assert!(!result.success);
+        assert!(result.items.is_empty());
+        let error = result.error.as_deref().unwrap();
+        assert!(
+            error.contains("Quilt container runtime"),
+            "Expected Quilt error message, got: {error}"
+        );
+        assert!(
+            error.contains("not yet available"),
+            "Expected 'not yet available' in error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn is_url_feed_detects_http_urls() {
+        assert!(FeedExecutor::is_url_feed("https://example.com/feed.json"));
+        assert!(FeedExecutor::is_url_feed("http://example.com/rss"));
+        assert!(FeedExecutor::is_url_feed("  https://example.com/feed  "));
+        assert!(!FeedExecutor::is_url_feed("console.log('hello')"));
+        assert!(!FeedExecutor::is_url_feed(""));
+        assert!(!FeedExecutor::is_url_feed("ftp://example.com/file"));
+        assert!(!FeedExecutor::is_url_feed("httpx://not-a-url"));
+    }
+
+    #[test]
+    fn title_from_url_extracts_host_and_path() {
+        assert_eq!(
+            FeedExecutor::title_from_url("https://example.com/feed.json"),
+            "Feed: example.com/feed.json"
+        );
+        assert_eq!(
+            FeedExecutor::title_from_url("http://api.example.com/v1/data"),
+            "Feed: api.example.com/v1/data"
+        );
+        assert_eq!(
+            FeedExecutor::title_from_url("https://example.com/"),
+            "Feed: example.com"
+        );
     }
 
     #[test]

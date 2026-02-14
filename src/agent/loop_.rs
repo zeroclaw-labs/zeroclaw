@@ -83,7 +83,7 @@ pub async fn run(
         model: model_name.to_string(),
     });
 
-    // ── Build system prompt from workspace MD files (OpenClaw framework) ──
+    // ── Build system prompt from workspace MD files (Aria framework) ──
     let skills = crate::skills::load_skills(&config.workspace_dir);
     let mut tool_descs: Vec<(&str, &str)> = vec![
         (

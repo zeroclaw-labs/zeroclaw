@@ -124,6 +124,7 @@ pub fn repair_tool_use(messages: &[AgentMessage]) -> (Vec<AgentMessage>, ToolRep
         report.missing_results = missing;
 
         result_messages.push(AgentMessage {
+            message_id: None,
             role: Role::User,
             content: synthetic_blocks,
             timestamp: None,
@@ -222,6 +223,7 @@ mod tests {
 
     fn user_msg(text: &str) -> AgentMessage {
         AgentMessage {
+            message_id: None,
             role: Role::User,
             content: vec![ContentBlock::Text { text: text.into() }],
             timestamp: None,
@@ -233,6 +235,7 @@ mod tests {
 
     fn assistant_msg(text: &str) -> AgentMessage {
         AgentMessage {
+            message_id: None,
             role: Role::Assistant,
             content: vec![ContentBlock::Text { text: text.into() }],
             timestamp: None,
@@ -244,6 +247,7 @@ mod tests {
 
     fn assistant_with_tool(text: &str, tool_id: &str, tool_name: &str) -> AgentMessage {
         AgentMessage {
+            message_id: None,
             role: Role::Assistant,
             content: vec![
                 ContentBlock::Text { text: text.into() },
@@ -262,6 +266,7 @@ mod tests {
 
     fn tool_result_msg(tool_use_id: &str, content: &str) -> AgentMessage {
         AgentMessage {
+            message_id: None,
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
                 tool_use_id: tool_use_id.into(),
@@ -424,6 +429,7 @@ mod tests {
             user_msg("hello"),
             assistant_with_tool("searching", "tu-1", "search"),
             AgentMessage {
+                message_id: None,
                 role: Role::Tool,
                 content: vec![ContentBlock::ToolResult {
                     tool_use_id: "tu-1".into(),
@@ -446,6 +452,7 @@ mod tests {
     #[test]
     fn usage_merging_on_role_collapse() {
         let msg1 = AgentMessage {
+            message_id: None,
             role: Role::User,
             content: vec![ContentBlock::Text { text: "a".into() }],
             timestamp: None,
@@ -459,6 +466,7 @@ mod tests {
             metadata: None,
         };
         let msg2 = AgentMessage {
+            message_id: None,
             role: Role::User,
             content: vec![ContentBlock::Text { text: "b".into() }],
             timestamp: None,
@@ -491,6 +499,7 @@ mod tests {
     fn system_messages_pass_through() {
         let messages = vec![
             AgentMessage {
+                message_id: None,
                 role: Role::System,
                 content: vec![ContentBlock::Text { text: "system prompt".into() }],
                 timestamp: None,

@@ -389,7 +389,10 @@ impl SessionStore {
         Ok(())
     }
 
-    /// Serialize the cache to `sessions.json`.
+    /// Serialize the cache to `sessions.json` atomically.
+    ///
+    /// Writes to a temporary file then renames, so a crash mid-write
+    /// never corrupts the index.
     fn persist(&self) -> Result<()> {
         let index_path = self.index_path();
 
@@ -406,8 +409,12 @@ impl SessionStore {
         let data = serde_json::to_string_pretty(&entries)
             .context("serializing sessions index")?;
 
-        fs::write(&index_path, data)
-            .with_context(|| format!("writing {}", index_path.display()))?;
+        // Atomic write: temp file → rename
+        let tmp_path = index_path.with_extension("json.tmp");
+        fs::write(&tmp_path, &data)
+            .with_context(|| format!("writing temp file {}", tmp_path.display()))?;
+        fs::rename(&tmp_path, &index_path)
+            .with_context(|| format!("renaming {} to {}", tmp_path.display(), index_path.display()))?;
 
         Ok(())
     }
@@ -439,6 +446,7 @@ mod tests {
     /// Helper: create a test agent message.
     fn test_message(index: usize) -> AgentMessage {
         AgentMessage {
+            message_id: None,
             role: if index % 2 == 0 { Role::User } else { Role::Assistant },
             content: vec![ContentBlock::Text {
                 text: format!("Message {index}"),

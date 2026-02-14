@@ -227,7 +227,15 @@ impl AgentEventBus {
     }
 
     /// Emit a lifecycle event.
+    ///
+    /// When `SessionEnd` or `TurnEnd` is emitted, the run's sequence counter
+    /// is automatically cleaned up to prevent unbounded memory growth.
     pub fn emit_lifecycle(&self, run_id: &str, session_key: Option<&str>, data: LifecycleEventData) {
+        let is_terminal = matches!(
+            data.phase,
+            LifecyclePhase::SessionEnd | LifecyclePhase::TurnEnd
+        );
+
         self.emit(AgentEvent {
             run_id: run_id.to_string(),
             seq: 0,
@@ -237,6 +245,15 @@ impl AgentEventBus {
             session_key: session_key.map(String::from),
             tenant_id: None,
         });
+
+        if is_terminal {
+            self.clear_run(run_id);
+        }
+    }
+
+    /// Number of tracked run IDs (for diagnostics / leak detection).
+    pub fn run_count(&self) -> usize {
+        self.seq_by_run.lock().unwrap().len()
     }
 
     /// Emit an error event.
