@@ -1,3 +1,4 @@
+use crate::security::secrets::SecretStore;
 use crate::security::AutonomyLevel;
 use anyhow::{Context, Result};
 use directories::UserDirs;
@@ -639,8 +640,14 @@ impl Config {
         if config_path.exists() {
             let contents =
                 fs::read_to_string(&config_path).context("Failed to read config file")?;
-            let config: Config =
+            let mut config: Config =
                 toml::from_str(&contents).context("Failed to parse config file")?;
+
+            // Auto-migrate any legacy XOR-encrypted secrets (enc: → enc2:)
+            if let Err(e) = config.migrate_legacy_secrets() {
+                tracing::warn!("Failed to migrate legacy secrets: {e}");
+            }
+
             Ok(config)
         } else {
             let config = Config::default();
@@ -654,6 +661,104 @@ impl Config {
         fs::write(&self.config_path, toml_str).context("Failed to write config file")?;
         Ok(())
     }
+
+    /// Scan all secret-holding fields for legacy `enc:` values and re-encrypt
+    /// them with ChaCha20-Poly1305 (`enc2:`). Persists the config if any
+    /// migrations occurred. Returns the number of migrated fields.
+    ///
+    /// **IMPORTANT:** When adding a new secret field to the config, you MUST
+    /// add a corresponding migration call here to ensure it gets migrated.
+    pub fn migrate_legacy_secrets(&mut self) -> Result<usize> {
+        let zeroclaw_dir = self
+            .config_path
+            .parent()
+            .context("Could not determine parent directory of config file")?;
+        let store = SecretStore::new(zeroclaw_dir, true);
+
+        let mut migrated = 0usize;
+
+        // Helper: attempt migration, log and continue on failure.
+        macro_rules! try_migrate {
+            ($expr:expr, $label:expr) => {
+                match $expr {
+                    Ok(n) => migrated += n,
+                    Err(e) => tracing::warn!(field = $label, "Failed to migrate legacy secret: {e}"),
+                }
+            };
+        }
+
+        // Top-level API key
+        try_migrate!(migrate_opt_field(&store, &mut self.api_key), "api_key");
+
+        // Composio API key
+        try_migrate!(migrate_opt_field(&store, &mut self.composio.api_key), "composio.api_key");
+
+        // Gateway paired tokens
+        for (i, token) in self.gateway.paired_tokens.iter_mut().enumerate() {
+            try_migrate!(migrate_string_field(&store, token), &format!("gateway.paired_tokens[{i}]"));
+        }
+
+        // Channel tokens
+        if let Some(ref mut tg) = self.channels_config.telegram {
+            try_migrate!(migrate_string_field(&store, &mut tg.bot_token), "telegram.bot_token");
+        }
+        if let Some(ref mut dc) = self.channels_config.discord {
+            try_migrate!(migrate_string_field(&store, &mut dc.bot_token), "discord.bot_token");
+        }
+        if let Some(ref mut sl) = self.channels_config.slack {
+            try_migrate!(migrate_string_field(&store, &mut sl.bot_token), "slack.bot_token");
+            try_migrate!(migrate_opt_field(&store, &mut sl.app_token), "slack.app_token");
+        }
+        if let Some(ref mut wh) = self.channels_config.webhook {
+            try_migrate!(migrate_opt_field(&store, &mut wh.secret), "webhook.secret");
+        }
+        if let Some(ref mut mx) = self.channels_config.matrix {
+            try_migrate!(migrate_string_field(&store, &mut mx.access_token), "matrix.access_token");
+        }
+        if let Some(ref mut wa) = self.channels_config.whatsapp {
+            try_migrate!(migrate_string_field(&store, &mut wa.access_token), "whatsapp.access_token");
+            try_migrate!(migrate_string_field(&store, &mut wa.verify_token), "whatsapp.verify_token");
+        }
+
+        // Tunnel tokens
+        if let Some(ref mut cf) = self.tunnel.cloudflare {
+            try_migrate!(migrate_string_field(&store, &mut cf.token), "cloudflare.token");
+        }
+        if let Some(ref mut ng) = self.tunnel.ngrok {
+            try_migrate!(migrate_string_field(&store, &mut ng.auth_token), "ngrok.auth_token");
+        }
+
+        if migrated > 0 {
+            tracing::info!(
+                count = migrated,
+                "Migrated legacy XOR-encrypted secrets to ChaCha20-Poly1305"
+            );
+            self.save()?;
+        }
+
+        Ok(migrated)
+    }
+}
+
+/// Migrate a `String` field from legacy `enc:` to `enc2:`. Returns 1 if migrated, 0 otherwise.
+fn migrate_string_field(store: &SecretStore, field: &mut String) -> Result<usize> {
+    if let Some(new_val) = store.migrate_legacy_value(field)? {
+        *field = new_val;
+        Ok(1)
+    } else {
+        Ok(0)
+    }
+}
+
+/// Migrate an `Option<String>` field from legacy `enc:` to `enc2:`. Returns 1 if migrated, 0 otherwise.
+fn migrate_opt_field(store: &SecretStore, field: &mut Option<String>) -> Result<usize> {
+    if let Some(val) = field.as_ref() {
+        if let Some(new_val) = store.migrate_legacy_value(val)? {
+            *field = Some(new_val);
+            return Ok(1);
+        }
+    }
+    Ok(0)
 }
 
 #[cfg(test)]
@@ -1363,5 +1468,137 @@ default_temperature = 0.7
         let parsed: Config = toml::from_str(minimal).unwrap();
         assert!(!parsed.browser.enabled);
         assert!(parsed.browser.allowed_domains.is_empty());
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // IDENTITY CONFIG TESTS (AIEOS support)
+    // ══════════════════════════════════════════════════════════
+
+    #[test]
+    fn identity_config_default_is_openclaw() {
+        let i = IdentityConfig::default();
+        assert_eq!(i.format, "openclaw");
+        assert!(i.aieos_path.is_none());
+        assert!(i.aieos_inline.is_none());
+    }
+
+    #[test]
+    fn identity_config_serde_roundtrip() {
+        let i = IdentityConfig {
+            format: "aieos".into(),
+            aieos_path: Some("identity.json".into()),
+            aieos_inline: None,
+        };
+        let toml_str = toml::to_string(&i).unwrap();
+        let parsed: IdentityConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.format, "aieos");
+        assert_eq!(parsed.aieos_path.as_deref(), Some("identity.json"));
+        assert!(parsed.aieos_inline.is_none());
+    }
+
+    #[test]
+    fn identity_config_with_inline_json() {
+        let i = IdentityConfig {
+            format: "aieos".into(),
+            aieos_path: None,
+            aieos_inline: Some(r#"{"identity":{"names":{"first":"Test"}}}"#.into()),
+        };
+        let toml_str = toml::to_string(&i).unwrap();
+        let parsed: IdentityConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.format, "aieos");
+        assert!(parsed.aieos_inline.is_some());
+        assert!(parsed.aieos_inline.unwrap().contains("Test"));
+    }
+
+    #[test]
+    fn identity_config_backward_compat_missing_section() {
+        let minimal = r#"
+workspace_dir = "/tmp/ws"
+config_path = "/tmp/config.toml"
+default_temperature = 0.7
+"#;
+        let parsed: Config = toml::from_str(minimal).unwrap();
+        assert_eq!(parsed.identity.format, "openclaw");
+        assert!(parsed.identity.aieos_path.is_none());
+        assert!(parsed.identity.aieos_inline.is_none());
+    }
+
+    #[test]
+    fn config_default_has_identity() {
+        let c = Config::default();
+        assert_eq!(c.identity.format, "openclaw");
+        assert!(c.identity.aieos_path.is_none());
+    }
+
+    // ── Legacy secret migration ──────────────────────────────────
+
+    #[test]
+    fn migrate_legacy_secrets_converts_enc_to_enc2() {
+        use crate::security::secrets::SecretStore;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let store = SecretStore::new(tmp.path(), true);
+
+        // Create key and produce a legacy enc: value
+        let _ = store.encrypt("setup").unwrap();
+        let key_hex = std::fs::read_to_string(tmp.path().join(".secret_key")).unwrap();
+        let key: Vec<u8> = (0..key_hex.trim().len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&key_hex.trim()[i..i + 2], 16).unwrap())
+            .collect();
+        let plaintext = "sk-legacy-token";
+        let ciphertext: Vec<u8> = plaintext
+            .as_bytes()
+            .iter()
+            .enumerate()
+            .map(|(i, &b)| b ^ key[i % key.len()])
+            .collect();
+        let ct_hex: String = ciphertext.iter().map(|b| format!("{b:02x}")).collect();
+        let legacy_value = format!("enc:{ct_hex}");
+
+        // Build a config with the legacy value in api_key
+        let config_path = tmp.path().join("config.toml");
+        let mut config = Config {
+            config_path: config_path.clone(),
+            api_key: Some(legacy_value),
+            ..Config::default()
+        };
+
+        let migrated = config.migrate_legacy_secrets().unwrap();
+        assert_eq!(migrated, 1, "Should migrate exactly one field");
+
+        let api_key = config.api_key.as_ref().unwrap();
+        assert!(
+            api_key.starts_with("enc2:"),
+            "api_key should now use enc2: prefix"
+        );
+
+        // Verify the migrated value still decrypts to the original
+        let decrypted = store.decrypt(api_key).unwrap();
+        assert_eq!(decrypted, plaintext);
+
+        // Verify config was persisted
+        assert!(
+            config_path.exists(),
+            "Config should be saved after migration"
+        );
+    }
+
+    #[test]
+    fn migrate_legacy_secrets_skips_when_no_legacy() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let mut config = Config {
+            config_path,
+            api_key: Some("sk-plaintext".into()),
+            ..Config::default()
+        };
+
+        let migrated = config.migrate_legacy_secrets().unwrap();
+        assert_eq!(migrated, 0, "No legacy values means no migration");
+        assert_eq!(config.api_key.as_deref(), Some("sk-plaintext"));
     }
 }

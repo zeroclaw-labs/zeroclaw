@@ -167,6 +167,17 @@ impl SecretStore {
         value.starts_with("enc2:")
     }
 
+    /// Migrate a legacy `enc:` value to `enc2:` (ChaCha20-Poly1305).
+    /// Returns `Some(enc2:...)` if migration occurred, `None` if no migration needed.
+    pub fn migrate_legacy_value(&self, value: &str) -> Result<Option<String>> {
+        if !value.starts_with("enc:") {
+            return Ok(None);
+        }
+        let plaintext = self.decrypt(value)?;
+        let migrated = self.encrypt(&plaintext)?;
+        Ok(Some(migrated))
+    }
+
     /// Load the encryption key from disk, or create one if it doesn't exist.
     fn load_or_create_key(&self) -> Result<Vec<u8>> {
         if self.key_path.exists() {
@@ -238,7 +249,7 @@ fn hex_encode(data: &[u8]) -> String {
 
 /// Hex-decode a hex string to bytes.
 fn hex_decode(hex: &str) -> Result<Vec<u8>> {
-    if !hex.len().is_multiple_of(2) {
+    if hex.len() % 2 != 0 {
         anyhow::bail!("Hex string has odd length");
     }
     (0..hex.len())
@@ -419,7 +430,7 @@ mod tests {
         assert!(result.is_err(), "Too-short ciphertext must be rejected");
     }
 
-    // ── Legacy XOR backward compatibility ───────────────────────
+    // ── Legacy XOR backward compatibility & migration ──────────
 
     #[test]
     fn legacy_xor_decrypt_still_works() {
@@ -690,6 +701,51 @@ mod tests {
 
         let result = store.decrypt_and_migrate(&tampered);
         assert!(result.is_err(), "Tampered migrated value must be rejected");
+    }
+
+    #[test]
+    fn migrate_legacy_value_converts_enc_to_enc2() {
+        let tmp = TempDir::new().unwrap();
+        let store = SecretStore::new(tmp.path(), true);
+
+        let _ = store.encrypt("setup").unwrap();
+        let key = store.load_or_create_key().unwrap();
+
+        let plaintext = "sk-migrate-me";
+        let ciphertext = xor_cipher(plaintext.as_bytes(), &key);
+        let legacy_value = format!("enc:{}", hex_encode(&ciphertext));
+
+        let result = store.migrate_legacy_value(&legacy_value).unwrap();
+        assert!(result.is_some(), "Should return migrated value");
+
+        let migrated = result.unwrap();
+        assert!(
+            migrated.starts_with("enc2:"),
+            "Migrated value must use enc2: prefix"
+        );
+
+        // Verify the migrated value decrypts to the original plaintext
+        let decrypted = store.decrypt(&migrated).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn migrate_legacy_value_skips_enc2() {
+        let tmp = TempDir::new().unwrap();
+        let store = SecretStore::new(tmp.path(), true);
+        let enc2_value = store.encrypt("already-secure").unwrap();
+
+        let result = store.migrate_legacy_value(&enc2_value).unwrap();
+        assert!(result.is_none(), "enc2: values need no migration");
+    }
+
+    #[test]
+    fn migrate_legacy_value_skips_plaintext() {
+        let tmp = TempDir::new().unwrap();
+        let store = SecretStore::new(tmp.path(), true);
+
+        let result = store.migrate_legacy_value("sk-plaintext-key").unwrap();
+        assert!(result.is_none(), "Plaintext values need no migration");
     }
 
     // ── Low-level helpers ───────────────────────────────────────
