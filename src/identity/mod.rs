@@ -6,4 +6,4 @@
 
 pub mod aieos;
 
-pub use aieos::{AieosEntity, AieosIdentity, load_aieos_identity};
+pub use aieos::{AieosEntity, AieosIdentity};

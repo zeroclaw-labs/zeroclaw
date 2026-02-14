@@ -1056,11 +1056,7 @@ impl AieosEntity {
                     }
                 }
                 if let Some(slang) = style.slang_usage {
-                    let _ = writeln!(
-                        prompt,
-                        "- **Slang:** {}",
-                        if slang { "yes" } else { "no" }
-                    );
+                    let _ = writeln!(prompt, "- **Slang:** {}", if slang { "yes" } else { "no" });
                 }
                 if !style.style_descriptors.is_empty() {
                     let _ = writeln!(

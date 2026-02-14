@@ -240,17 +240,7 @@ async fn handle_request(
 
         // WhatsApp incoming message webhook
         ("POST", "/whatsapp") => {
-            handle_whatsapp_message(
-                stream,
-                request,
-                provider,
-                model,
-                temperature,
-                mem,
-                auto_save,
-                whatsapp,
-            )
-            .await;
+            handle_whatsapp_message(stream, request, provider, model, temperature, mem, auto_save, whatsapp).await;
         }
 
         ("POST", "/webhook") => {
@@ -780,7 +770,10 @@ mod tests {
     #[test]
     fn urlencoding_decode_challenge_token() {
         // Typical Meta webhook challenge
-        assert_eq!(urlencoding_decode("1234567890"), "1234567890");
+        assert_eq!(
+            urlencoding_decode("1234567890"),
+            "1234567890"
+        );
     }
 
     #[test]

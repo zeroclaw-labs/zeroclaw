@@ -631,3 +631,6 @@ description = "Bare minimum"
         assert_eq!(skills[0].name, "from-toml"); // TOML takes priority
     }
 }
+
+#[cfg(test)]
+mod symlink_tests;

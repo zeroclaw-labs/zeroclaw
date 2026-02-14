@@ -22,6 +22,7 @@ mod doctor;
 mod gateway;
 mod health;
 mod heartbeat;
+mod identity;
 mod integrations;
 mod memory;
 mod migration;
@@ -34,6 +35,7 @@ mod service;
 mod skills;
 mod tools;
 mod tunnel;
+
 
 use config::Config;
 

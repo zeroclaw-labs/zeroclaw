@@ -266,7 +266,9 @@ pub fn build_system_prompt_with_identity(
             prompt.push_str(&aieos_entity.to_system_prompt());
         } else {
             // Fallback to OpenClaw if AIEOS loading fails
-            tracing::warn!("AIEOS identity configured but failed to load; falling back to OpenClaw");
+            tracing::warn!(
+                "AIEOS identity configured but failed to load; falling back to OpenClaw"
+            );
             inject_openclaw_identity(&mut prompt, workspace_dir);
         }
     } else {
@@ -305,7 +307,10 @@ fn load_aieos_from_config(
         if !inline_json.is_empty() {
             match parse_aieos_json(inline_json) {
                 Ok(entity) => {
-                    tracing::info!("Loaded AIEOS identity from inline JSON: {}", entity.display_name());
+                    tracing::info!(
+                        "Loaded AIEOS identity from inline JSON: {}",
+                        entity.display_name()
+                    );
                     return Some(entity);
                 }
                 Err(e) => {
@@ -350,10 +355,12 @@ fn load_aieos_from_config(
 
 /// Inject OpenClaw (markdown) identity files into the prompt
 fn inject_openclaw_identity(prompt: &mut String, workspace_dir: &std::path::Path) {
+    #[allow(unused_imports)]
     use std::fmt::Write;
 
     prompt.push_str("## Project Context\n\n");
-    prompt.push_str("The following workspace files define your identity, behavior, and context.\n\n");
+    prompt
+        .push_str("The following workspace files define your identity, behavior, and context.\n\n");
 
     let bootstrap_files = [
         "AGENTS.md",

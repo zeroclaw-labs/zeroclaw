@@ -101,6 +101,7 @@ pub fn run_wizard() -> Result<Config> {
         composio: composio_config,
         secrets: secrets_config,
         browser: BrowserConfig::default(),
+        identity: crate::config::IdentityConfig::default(),
     };
 
     println!(
@@ -253,6 +254,7 @@ pub fn run_quick_setup(api_key: Option<&str>, provider: Option<&str>) -> Result<
         composio: ComposioConfig::default(),
         secrets: SecretsConfig::default(),
         browser: BrowserConfig::default(),
+        identity: crate::config::IdentityConfig::default(),
     };
 
     config.save()?;

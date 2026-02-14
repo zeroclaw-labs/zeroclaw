@@ -29,6 +29,60 @@ impl IMessageChannel {
     }
 }
 
+/// Escape a string for safe interpolation into `AppleScript`.
+///
+/// This prevents injection attacks by escaping:
+/// - Backslashes (`\` → `\\`)
+/// - Double quotes (`"` → `\"`)
+fn escape_applescript(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Validate that a target looks like a valid phone number or email address.
+///
+/// This is a defense-in-depth measure to reject obviously malicious targets
+/// before they reach `AppleScript` interpolation.
+///
+/// Valid patterns:
+/// - Phone: starts with `+` followed by digits (with optional spaces/dashes)
+/// - Email: contains `@` with alphanumeric chars on both sides
+fn is_valid_imessage_target(target: &str) -> bool {
+    let target = target.trim();
+    if target.is_empty() {
+        return false;
+    }
+
+    // Phone number: +1234567890 or +1 234-567-8900
+    if target.starts_with('+') {
+        let digits_only: String = target.chars().filter(char::is_ascii_digit).collect();
+        // Must have at least 7 digits (shortest valid phone numbers)
+        return digits_only.len() >= 7 && digits_only.len() <= 15;
+    }
+
+    // Email: simple validation (contains @ with chars on both sides)
+    if let Some(at_pos) = target.find('@') {
+        let local = &target[..at_pos];
+        let domain = &target[at_pos + 1..];
+
+        // Local part: non-empty, alphanumeric + common email chars
+        let local_valid = !local.is_empty()
+            && local
+                .chars()
+                .all(|c| c.is_alphanumeric() || "._+-".contains(c));
+
+        // Domain: non-empty, contains a dot, alphanumeric + dots/hyphens
+        let domain_valid = !domain.is_empty()
+            && domain.contains('.')
+            && domain
+                .chars()
+                .all(|c| c.is_alphanumeric() || ".-".contains(c));
+
+        return local_valid && domain_valid;
+    }
+
+    false
+}
+
 #[async_trait]
 impl Channel for IMessageChannel {
     fn name(&self) -> &str {
@@ -36,11 +90,22 @@ impl Channel for IMessageChannel {
     }
 
     async fn send(&self, message: &str, target: &str) -> anyhow::Result<()> {
-        let escaped_msg = message.replace('\\', "\\\\").replace('"', "\\\"");
+        // Defense-in-depth: validate target format before any interpolation
+        if !is_valid_imessage_target(target) {
+            anyhow::bail!(
+                "Invalid iMessage target: must be a phone number (+1234567890) or email (user@example.com)"
+            );
+        }
+
+        // SECURITY: Escape both message AND target to prevent AppleScript injection
+        // See: CWE-78 (OS Command Injection)
+        let escaped_msg = escape_applescript(message);
+        let escaped_target = escape_applescript(target);
+
         let script = format!(
             r#"tell application "Messages"
     set targetService to 1st account whose service type = iMessage
-    set targetBuddy to participant "{target}" of targetService
+    set targetBuddy to participant "{escaped_target}" of targetService
     send "{escaped_msg}" to targetBuddy
 end tell"#
         );
@@ -261,5 +326,205 @@ mod tests {
         let ch = IMessageChannel::new(vec!["  spaced  ".into()]);
         assert!(ch.is_contact_allowed("  spaced  "));
         assert!(!ch.is_contact_allowed("spaced"));
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // AppleScript Escaping Tests (CWE-78 Prevention)
+    // ══════════════════════════════════════════════════════════
+
+    #[test]
+    fn escape_applescript_double_quotes() {
+        assert_eq!(escape_applescript(r#"hello "world""#), r#"hello \"world\""#);
+    }
+
+    #[test]
+    fn escape_applescript_backslashes() {
+        assert_eq!(escape_applescript(r"path\to\file"), r"path\\to\\file");
+    }
+
+    #[test]
+    fn escape_applescript_mixed() {
+        assert_eq!(
+            escape_applescript(r#"say "hello\" world"#),
+            r#"say \"hello\\\" world"#
+        );
+    }
+
+    #[test]
+    fn escape_applescript_injection_attempt() {
+        // This is the exact attack vector from the security report
+        let malicious = r#"" & do shell script "id" & ""#;
+        let escaped = escape_applescript(malicious);
+        // After escaping, the quotes should be escaped and not break out
+        assert_eq!(escaped, r#"\" & do shell script \"id\" & \""#);
+        // Verify all quotes are now escaped (preceded by backslash)
+        // The escaped string should not have any unescaped quotes (quote not preceded by backslash)
+        let chars: Vec<char> = escaped.chars().collect();
+        for (i, &c) in chars.iter().enumerate() {
+            if c == '"' {
+                // Every quote must be preceded by a backslash
+                assert!(
+                    i > 0 && chars[i - 1] == '\\',
+                    "Found unescaped quote at position {i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn escape_applescript_empty_string() {
+        assert_eq!(escape_applescript(""), "");
+    }
+
+    #[test]
+    fn escape_applescript_no_special_chars() {
+        assert_eq!(escape_applescript("hello world"), "hello world");
+    }
+
+    #[test]
+    fn escape_applescript_unicode() {
+        assert_eq!(escape_applescript("hello 🦀 world"), "hello 🦀 world");
+    }
+
+    #[test]
+    fn escape_applescript_newlines_preserved() {
+        assert_eq!(escape_applescript("line1\nline2"), "line1\nline2");
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // Target Validation Tests
+    // ══════════════════════════════════════════════════════════
+
+    #[test]
+    fn valid_phone_number_simple() {
+        assert!(is_valid_imessage_target("+1234567890"));
+    }
+
+    #[test]
+    fn valid_phone_number_with_country_code() {
+        assert!(is_valid_imessage_target("+14155551234"));
+    }
+
+    #[test]
+    fn valid_phone_number_with_spaces() {
+        assert!(is_valid_imessage_target("+1 415 555 1234"));
+    }
+
+    #[test]
+    fn valid_phone_number_with_dashes() {
+        assert!(is_valid_imessage_target("+1-415-555-1234"));
+    }
+
+    #[test]
+    fn valid_phone_number_international() {
+        assert!(is_valid_imessage_target("+447911123456")); // UK
+        assert!(is_valid_imessage_target("+81312345678")); // Japan
+    }
+
+    #[test]
+    fn valid_email_simple() {
+        assert!(is_valid_imessage_target("user@example.com"));
+    }
+
+    #[test]
+    fn valid_email_with_subdomain() {
+        assert!(is_valid_imessage_target("user@mail.example.com"));
+    }
+
+    #[test]
+    fn valid_email_with_plus() {
+        assert!(is_valid_imessage_target("user+tag@example.com"));
+    }
+
+    #[test]
+    fn valid_email_with_dots() {
+        assert!(is_valid_imessage_target("first.last@example.com"));
+    }
+
+    #[test]
+    fn valid_email_icloud() {
+        assert!(is_valid_imessage_target("user@icloud.com"));
+        assert!(is_valid_imessage_target("user@me.com"));
+    }
+
+    #[test]
+    fn invalid_target_empty() {
+        assert!(!is_valid_imessage_target(""));
+        assert!(!is_valid_imessage_target("   "));
+    }
+
+    #[test]
+    fn invalid_target_no_plus_prefix() {
+        // Phone numbers must start with +
+        assert!(!is_valid_imessage_target("1234567890"));
+    }
+
+    #[test]
+    fn invalid_target_too_short_phone() {
+        // Less than 7 digits
+        assert!(!is_valid_imessage_target("+123456"));
+    }
+
+    #[test]
+    fn invalid_target_too_long_phone() {
+        // More than 15 digits
+        assert!(!is_valid_imessage_target("+1234567890123456"));
+    }
+
+    #[test]
+    fn invalid_target_email_no_at() {
+        assert!(!is_valid_imessage_target("userexample.com"));
+    }
+
+    #[test]
+    fn invalid_target_email_no_domain() {
+        assert!(!is_valid_imessage_target("user@"));
+    }
+
+    #[test]
+    fn invalid_target_email_no_local() {
+        assert!(!is_valid_imessage_target("@example.com"));
+    }
+
+    #[test]
+    fn invalid_target_email_no_dot_in_domain() {
+        assert!(!is_valid_imessage_target("user@localhost"));
+    }
+
+    #[test]
+    fn invalid_target_injection_attempt() {
+        // The exact attack vector from the security report
+        assert!(!is_valid_imessage_target(r#"" & do shell script "id" & ""#));
+    }
+
+    #[test]
+    fn invalid_target_applescript_injection() {
+        // Various injection attempts
+        assert!(!is_valid_imessage_target(r#"test" & quit"#));
+        assert!(!is_valid_imessage_target(r#"test\ndo shell script"#));
+        assert!(!is_valid_imessage_target("test\"; malicious code; \""));
+    }
+
+    #[test]
+    fn invalid_target_special_chars() {
+        assert!(!is_valid_imessage_target("user<script>@example.com"));
+        assert!(!is_valid_imessage_target("user@example.com; rm -rf /"));
+    }
+
+    #[test]
+    fn invalid_target_null_byte() {
+        assert!(!is_valid_imessage_target("user\0@example.com"));
+    }
+
+    #[test]
+    fn invalid_target_newline() {
+        assert!(!is_valid_imessage_target("user\n@example.com"));
+    }
+
+    #[test]
+    fn target_with_leading_trailing_whitespace_trimmed() {
+        // Should trim and validate
+        assert!(is_valid_imessage_target("  +1234567890  "));
+        assert!(is_valid_imessage_target("  user@example.com  "));
     }
 }
