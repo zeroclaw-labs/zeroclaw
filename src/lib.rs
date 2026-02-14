@@ -13,6 +13,7 @@
 
 pub mod config;
 pub mod heartbeat;
+pub mod identity;
 pub mod memory;
 pub mod observability;
 pub mod providers;

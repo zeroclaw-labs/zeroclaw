@@ -1,9 +1,9 @@
+use crate::config::schema::WhatsAppConfig;
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
     HeartbeatConfig, IMessageConfig, MatrixConfig, MemoryConfig, ObservabilityConfig,
     RuntimeConfig, SecretsConfig, SlackConfig, TelegramConfig, WebhookConfig,
 };
-use crate::config::schema::WhatsAppConfig;
 use anyhow::{Context, Result};
 use console::style;
 use dialoguer::{Confirm, Input, Select};
@@ -1499,17 +1499,16 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 }
 
                 let users_str: String = Input::new()
-                    .with_prompt("  Allowed phone numbers (comma-separated +1234567890, or * for all)")
+                    .with_prompt(
+                        "  Allowed phone numbers (comma-separated +1234567890, or * for all)",
+                    )
                     .default("*".into())
                     .interact_text()?;
 
                 let allowed_numbers = if users_str.trim() == "*" {
                     vec!["*".into()]
                 } else {
-                    users_str
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .collect()
+                    users_str.split(',').map(|s| s.trim().to_string()).collect()
                 };
 
                 config.whatsapp = Some(WhatsAppConfig {

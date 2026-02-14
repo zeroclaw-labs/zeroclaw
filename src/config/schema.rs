@@ -51,6 +51,41 @@ pub struct Config {
 
     #[serde(default)]
     pub browser: BrowserConfig,
+
+    #[serde(default)]
+    pub identity: IdentityConfig,
+}
+
+// ── Identity (AIEOS support) ─────────────────────────────────────
+
+/// Identity configuration — supports multiple identity formats
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityConfig {
+    /// Identity format: "openclaw" (default, markdown files) or "aieos" (JSON)
+    #[serde(default = "default_identity_format")]
+    pub format: String,
+    /// Path to AIEOS JSON file (relative to workspace or absolute)
+    /// Only used when format = "aieos"
+    #[serde(default)]
+    pub aieos_path: Option<String>,
+    /// Inline AIEOS JSON (alternative to aieos_path)
+    /// Only used when format = "aieos"
+    #[serde(default)]
+    pub aieos_inline: Option<String>,
+}
+
+fn default_identity_format() -> String {
+    "openclaw".into()
+}
+
+impl Default for IdentityConfig {
+    fn default() -> Self {
+        Self {
+            format: default_identity_format(),
+            aieos_path: None,
+            aieos_inline: None,
+        }
+    }
 }
 
 // ── Gateway security ─────────────────────────────────────────────
@@ -585,6 +620,7 @@ impl Default for Config {
             composio: ComposioConfig::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
+            identity: IdentityConfig::default(),
         }
     }
 }
@@ -740,6 +776,7 @@ mod tests {
             composio: ComposioConfig::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
+            identity: IdentityConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -809,6 +846,7 @@ default_temperature = 0.7
             composio: ComposioConfig::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
+            identity: IdentityConfig::default(),
         };
 
         config.save().unwrap();
@@ -1328,5 +1366,65 @@ default_temperature = 0.7
         let parsed: Config = toml::from_str(minimal).unwrap();
         assert!(!parsed.browser.enabled);
         assert!(parsed.browser.allowed_domains.is_empty());
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // IDENTITY CONFIG TESTS (AIEOS support)
+    // ══════════════════════════════════════════════════════════
+
+    #[test]
+    fn identity_config_default_is_openclaw() {
+        let i = IdentityConfig::default();
+        assert_eq!(i.format, "openclaw");
+        assert!(i.aieos_path.is_none());
+        assert!(i.aieos_inline.is_none());
+    }
+
+    #[test]
+    fn identity_config_serde_roundtrip() {
+        let i = IdentityConfig {
+            format: "aieos".into(),
+            aieos_path: Some("identity.json".into()),
+            aieos_inline: None,
+        };
+        let toml_str = toml::to_string(&i).unwrap();
+        let parsed: IdentityConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.format, "aieos");
+        assert_eq!(parsed.aieos_path.as_deref(), Some("identity.json"));
+        assert!(parsed.aieos_inline.is_none());
+    }
+
+    #[test]
+    fn identity_config_with_inline_json() {
+        let i = IdentityConfig {
+            format: "aieos".into(),
+            aieos_path: None,
+            aieos_inline: Some(r#"{"identity":{"names":{"first":"Test"}}}"#.into()),
+        };
+        let toml_str = toml::to_string(&i).unwrap();
+        let parsed: IdentityConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.format, "aieos");
+        assert!(parsed.aieos_inline.is_some());
+        assert!(parsed.aieos_inline.unwrap().contains("Test"));
+    }
+
+    #[test]
+    fn identity_config_backward_compat_missing_section() {
+        let minimal = r#"
+workspace_dir = "/tmp/ws"
+config_path = "/tmp/config.toml"
+default_temperature = 0.7
+"#;
+        let parsed: Config = toml::from_str(minimal).unwrap();
+        assert_eq!(parsed.identity.format, "openclaw");
+        assert!(parsed.identity.aieos_path.is_none());
+        assert!(parsed.identity.aieos_inline.is_none());
+    }
+
+    #[test]
+    fn config_default_has_identity() {
+        let c = Config::default();
+        assert_eq!(c.identity.format, "openclaw");
+        assert!(c.identity.aieos_path.is_none());
     }
 }
