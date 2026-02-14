@@ -191,25 +191,32 @@ impl SecretStore {
             #[cfg(windows)]
             {
                 // On Windows, use icacls to restrict permissions to current user only
-                match std::process::Command::new("icacls")
-                    .arg(&self.key_path)
-                    .args(["/inheritance:r", "/grant:r"])
-                    .arg(format!(
-                        "{}:F",
-                        std::env::var("USERNAME").unwrap_or_default()
-                    ))
-                    .output()
-                {
-                    Ok(o) if !o.status.success() => {
-                        tracing::warn!(
-                            "Failed to set key file permissions via icacls (exit code {:?})",
-                            o.status.code()
-                        );
+                let username = std::env::var("USERNAME").unwrap_or_default();
+                if username.is_empty() {
+                    tracing::warn!(
+                        "USERNAME environment variable is empty; \
+                         cannot restrict key file permissions via icacls"
+                    );
+                } else {
+                    match std::process::Command::new("icacls")
+                        .arg(&self.key_path)
+                        .args(["/inheritance:r", "/grant:r"])
+                        .arg(format!("{username}:F"))
+                        .output()
+                    {
+                        Ok(o) if !o.status.success() => {
+                            tracing::warn!(
+                                "Failed to set key file permissions via icacls (exit code {:?})",
+                                o.status.code()
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("Could not set key file permissions: {e}");
+                        }
+                        _ => {
+                            tracing::debug!("Key file permissions restricted via icacls");
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!("Could not set key file permissions: {e}");
-                    }
-                    _ => {}
                 }
             }
 
