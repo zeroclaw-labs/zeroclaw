@@ -36,8 +36,12 @@ impl IMessageChannel {
 /// This prevents injection attacks by escaping:
 /// - Backslashes (`\` → `\\`)
 /// - Double quotes (`"` → `\"`)
+/// - Newlines (`\n` → `\\n`, `\r` → `\\r`) to prevent code injection via line breaks
 fn escape_applescript(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 /// Validate that a target looks like a valid phone number or email address.
@@ -386,8 +390,10 @@ mod tests {
     }
 
     #[test]
-    fn escape_applescript_newlines_preserved() {
-        assert_eq!(escape_applescript("line1\nline2"), "line1\nline2");
+    fn escape_applescript_newlines_escaped() {
+        assert_eq!(escape_applescript("line1\nline2"), "line1\\nline2");
+        assert_eq!(escape_applescript("line1\rline2"), "line1\\rline2");
+        assert_eq!(escape_applescript("line1\r\nline2"), "line1\\r\\nline2");
     }
 
     // ══════════════════════════════════════════════════════════
