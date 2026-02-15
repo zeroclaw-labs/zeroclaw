@@ -255,6 +255,13 @@ enum IntegrationCommands {
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
+    // Install default crypto provider for Rustls TLS.
+    // This prevents the error: "could not automatically determine the process-level CryptoProvider"
+    // when both aws-lc-rs and ring features are available (or neither is explicitly selected).
+    if let Err(e) = rustls::crypto::ring::default_provider().install_default() {
+        eprintln!("Warning: Failed to install default crypto provider: {e:?}");
+    }
+
     let cli = Cli::parse();
 
     // Initialize logging

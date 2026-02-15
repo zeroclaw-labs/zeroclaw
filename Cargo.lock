@@ -2957,6 +2957,7 @@ dependencies = [
  "mail-parser",
  "reqwest",
  "rusqlite",
+ "rustls",
  "rustls-pki-types",
  "serde",
  "serde_json",

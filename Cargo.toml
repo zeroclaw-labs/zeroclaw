@@ -66,6 +66,7 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 hostname = "0.4.2"
 lettre = { version = "0.11.19", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }
 mail-parser = "0.11.2"
+rustls = "0.23"
 rustls-pki-types = "1.14.0"
 tokio-rustls = "0.26.4"
 webpki-roots = "1.0.6"
