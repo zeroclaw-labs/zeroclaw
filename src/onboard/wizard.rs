@@ -217,7 +217,11 @@ pub fn run_channels_repair_wizard() -> Result<Config> {
 /// Use `zeroclaw onboard` or `zeroclaw onboard --api-key sk-... --provider openrouter --memory sqlite`.
 /// Use `zeroclaw onboard --interactive` for the full wizard.
 #[allow(clippy::too_many_lines)]
-pub fn run_quick_setup(api_key: Option<&str>, provider: Option<&str>, memory_backend: Option<&str>) -> Result<Config> {
+pub fn run_quick_setup(
+    api_key: Option<&str>,
+    provider: Option<&str>,
+    memory_backend: Option<&str>,
+) -> Result<Config> {
     println!("{}", style(BANNER).cyan().bold());
     println!(
         "  {}",
@@ -245,15 +249,27 @@ pub fn run_quick_setup(api_key: Option<&str>, provider: Option<&str>, memory_bac
         backend: memory_backend_name.clone(),
         auto_save: memory_backend_name != "none",
         hygiene_enabled: memory_backend_name == "sqlite",
-        archive_after_days: if memory_backend_name == "sqlite" { 7 } else { 0 },
-        purge_after_days: if memory_backend_name == "sqlite" { 30 } else { 0 },
+        archive_after_days: if memory_backend_name == "sqlite" {
+            7
+        } else {
+            0
+        },
+        purge_after_days: if memory_backend_name == "sqlite" {
+            30
+        } else {
+            0
+        },
         conversation_retention_days: 30,
         embedding_provider: "none".to_string(),
         embedding_model: "text-embedding-3-small".to_string(),
         embedding_dimensions: 1536,
         vector_weight: 0.7,
         keyword_weight: 0.3,
-        embedding_cache_size: if memory_backend_name == "sqlite" { 10000 } else { 0 },
+        embedding_cache_size: if memory_backend_name == "sqlite" {
+            10000
+        } else {
+            0
+        },
         chunk_max_tokens: 512,
     };
 
@@ -325,7 +341,11 @@ pub fn run_quick_setup(api_key: Option<&str>, provider: Option<&str>, memory_bac
         "  {} Memory:     {} (auto-save: {})",
         style("✓").green().bold(),
         style(&memory_backend_name).green(),
-        if memory_backend_name == "none" { "off" } else { "on" }
+        if memory_backend_name == "none" {
+            "off"
+        } else {
+            "on"
+        }
     );
     println!(
         "  {} Secrets:    {}",
@@ -975,7 +995,7 @@ fn setup_memory() -> Result<MemoryConfig> {
         .interact()?;
 
     let backend = match choice {
-        1 => "markdown", 
+        1 => "markdown",
         2 => "none",
         _ => "sqlite", // 0 and any unexpected value defaults to sqlite
     };

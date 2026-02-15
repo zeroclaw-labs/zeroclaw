@@ -89,6 +89,12 @@ impl Default for IdentityConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewayConfig {
+    /// Gateway port (default: 3000)
+    #[serde(default = "default_gateway_port")]
+    pub port: u16,
+    /// Gateway host/bind address (default: 127.0.0.1)
+    #[serde(default = "default_gateway_host")]
+    pub host: String,
     /// Require pairing before accepting requests (default: true)
     #[serde(default = "default_true")]
     pub require_pairing: bool,
@@ -100,6 +106,14 @@ pub struct GatewayConfig {
     pub paired_tokens: Vec<String>,
 }
 
+fn default_gateway_port() -> u16 {
+    3000
+}
+
+fn default_gateway_host() -> String {
+    "127.0.0.1".into()
+}
+
 fn default_true() -> bool {
     true
 }
@@ -107,6 +121,8 @@ fn default_true() -> bool {
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
+            port: default_gateway_port(),
+            host: default_gateway_host(),
             require_pairing: true,
             allow_public_bind: false,
             paired_tokens: Vec::new(),
@@ -669,8 +685,14 @@ impl Config {
 
     /// Apply environment variable overrides to config.
     ///
-    /// Supports: `ZEROCLAW_API_KEY`, `API_KEY`, `ZEROCLAW_PROVIDER`, `PROVIDER`,
-    /// `ZEROCLAW_MODEL`, `ZEROCLAW_WORKSPACE`, `ZEROCLAW_GATEWAY_PORT`
+    /// Supports:
+    /// - `ZEROCLAW_API_KEY` or `API_KEY` - LLM provider API key
+    /// - `ZEROCLAW_PROVIDER` or `PROVIDER` - Provider name (openrouter, openai, anthropic, ollama)
+    /// - `ZEROCLAW_MODEL` - Model name/ID
+    /// - `ZEROCLAW_WORKSPACE` - Workspace directory path
+    /// - `ZEROCLAW_GATEWAY_PORT` or `PORT` - Gateway server port
+    /// - `ZEROCLAW_GATEWAY_HOST` or `HOST` - Gateway bind address
+    /// - `ZEROCLAW_TEMPERATURE` - Default temperature (0.0-2.0)
     pub fn apply_env_overrides(&mut self) {
         // API Key: ZEROCLAW_API_KEY or API_KEY
         if let Ok(key) = std::env::var("ZEROCLAW_API_KEY").or_else(|_| std::env::var("API_KEY")) {
@@ -695,6 +717,15 @@ impl Config {
             }
         }
 
+        // Temperature: ZEROCLAW_TEMPERATURE
+        if let Ok(temp_str) = std::env::var("ZEROCLAW_TEMPERATURE") {
+            if let Ok(temp) = temp_str.parse::<f64>() {
+                if (0.0..=2.0).contains(&temp) {
+                    self.default_temperature = temp;
+                }
+            }
+        }
+
         // Workspace directory: ZEROCLAW_WORKSPACE
         if let Ok(workspace) = std::env::var("ZEROCLAW_WORKSPACE") {
             if !workspace.is_empty() {
@@ -707,9 +738,15 @@ impl Config {
             std::env::var("ZEROCLAW_GATEWAY_PORT").or_else(|_| std::env::var("PORT"))
         {
             if let Ok(port) = port_str.parse::<u16>() {
-                // Gateway config doesn't have port yet, but we can add it
-                // For now, this is a placeholder for future gateway port config
-                let _ = port; // Suppress unused warning
+                self.gateway.port = port;
+            }
+        }
+
+        // Gateway host: ZEROCLAW_GATEWAY_HOST or HOST
+        if let Ok(host) = std::env::var("ZEROCLAW_GATEWAY_HOST").or_else(|_| std::env::var("HOST"))
+        {
+            if !host.is_empty() {
+                self.gateway.host = host;
             }
         }
     }
@@ -1256,6 +1293,8 @@ channel_id = "C123"
     #[test]
     fn checklist_gateway_serde_roundtrip() {
         let g = GatewayConfig {
+            port: 3000,
+            host: "127.0.0.1".into(),
             require_pairing: true,
             allow_public_bind: false,
             paired_tokens: vec!["zc_test_token".into()],
@@ -1522,5 +1561,103 @@ default_temperature = 0.7
 
         // Clean up
         std::env::remove_var("ZEROCLAW_PROVIDER");
+    }
+
+    #[test]
+    fn env_override_gateway_port() {
+        let mut config = Config::default();
+        assert_eq!(config.gateway.port, 3000);
+
+        std::env::set_var("ZEROCLAW_GATEWAY_PORT", "8080");
+        config.apply_env_overrides();
+        assert_eq!(config.gateway.port, 8080);
+
+        std::env::remove_var("ZEROCLAW_GATEWAY_PORT");
+    }
+
+    #[test]
+    fn env_override_port_fallback() {
+        std::env::remove_var("ZEROCLAW_GATEWAY_PORT");
+        let mut config = Config::default();
+
+        std::env::set_var("PORT", "9000");
+        config.apply_env_overrides();
+        assert_eq!(config.gateway.port, 9000);
+
+        std::env::remove_var("PORT");
+    }
+
+    #[test]
+    fn env_override_gateway_host() {
+        let mut config = Config::default();
+        assert_eq!(config.gateway.host, "127.0.0.1");
+
+        std::env::set_var("ZEROCLAW_GATEWAY_HOST", "0.0.0.0");
+        config.apply_env_overrides();
+        assert_eq!(config.gateway.host, "0.0.0.0");
+
+        std::env::remove_var("ZEROCLAW_GATEWAY_HOST");
+    }
+
+    #[test]
+    fn env_override_host_fallback() {
+        std::env::remove_var("ZEROCLAW_GATEWAY_HOST");
+        let mut config = Config::default();
+
+        std::env::set_var("HOST", "0.0.0.0");
+        config.apply_env_overrides();
+        assert_eq!(config.gateway.host, "0.0.0.0");
+
+        std::env::remove_var("HOST");
+    }
+
+    #[test]
+    fn env_override_temperature() {
+        std::env::remove_var("ZEROCLAW_TEMPERATURE");
+        let mut config = Config::default();
+
+        std::env::set_var("ZEROCLAW_TEMPERATURE", "0.5");
+        config.apply_env_overrides();
+        assert!((config.default_temperature - 0.5).abs() < f64::EPSILON);
+
+        std::env::remove_var("ZEROCLAW_TEMPERATURE");
+    }
+
+    #[test]
+    fn env_override_temperature_out_of_range_ignored() {
+        std::env::remove_var("ZEROCLAW_TEMPERATURE");
+        let mut config = Config::default();
+        let original_temp = config.default_temperature;
+
+        std::env::set_var("ZEROCLAW_TEMPERATURE", "3.0");
+        config.apply_env_overrides();
+        assert!(
+            (config.default_temperature - original_temp).abs() < f64::EPSILON,
+            "Temperature 3.0 should be ignored (out of range)"
+        );
+
+        std::env::remove_var("ZEROCLAW_TEMPERATURE");
+    }
+
+    #[test]
+    fn env_override_invalid_port_ignored() {
+        let mut config = Config::default();
+        let original_port = config.gateway.port;
+
+        std::env::set_var("PORT", "not_a_number");
+        config.apply_env_overrides();
+        assert_eq!(config.gateway.port, original_port);
+
+        std::env::remove_var("PORT");
+    }
+
+    #[test]
+    fn gateway_config_default_values() {
+        let g = GatewayConfig::default();
+        assert_eq!(g.port, 3000);
+        assert_eq!(g.host, "127.0.0.1");
+        assert!(g.require_pairing);
+        assert!(!g.allow_public_bind);
+        assert!(g.paired_tokens.is_empty());
     }
 }
