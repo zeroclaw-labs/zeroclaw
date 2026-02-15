@@ -6,6 +6,7 @@ use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 pub struct AnthropicProvider {
     credential: Option<String>,
@@ -613,5 +614,11 @@ mod tests {
             let json = serde_json::to_string(&req).unwrap();
             assert!(json.contains(&format!("{temp}")));
         }
+    }
+
+    #[test]
+    fn detects_auth_from_jwt_shape() {
+        let kind = detect_auth_kind("a.b.c", None);
+        assert_eq!(kind, AnthropicAuthKind::Authorization);
     }
 }

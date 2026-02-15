@@ -164,6 +164,7 @@ zeroclaw daemon
 
 # Check status
 zeroclaw status
+zeroclaw auth status
 
 # Run system diagnostics
 zeroclaw doctor
@@ -187,6 +188,51 @@ zeroclaw migrate openclaw
 ```
 
 > **Dev fallback (no global install):** prefix commands with `cargo run --release --` (example: `cargo run --release -- status`).
+
+## Subscription Auth (OpenAI Codex / Claude Code)
+
+ZeroClaw now supports subscription-native auth profiles (multi-account, encrypted at rest).
+
+- Store file: `~/.zeroclaw/auth-profiles.json`
+- Encryption key: `~/.zeroclaw/.secret_key`
+- Profile id format: `<provider>:<profile_name>` (example: `openai-codex:work`)
+
+OpenAI Codex OAuth (ChatGPT subscription):
+
+```bash
+# Recommended on servers/headless
+zeroclaw auth login --provider openai-codex --device-code
+
+# Browser/callback flow with paste fallback
+zeroclaw auth login --provider openai-codex --profile default
+zeroclaw auth paste-redirect --provider openai-codex --profile default
+
+# Check / refresh / switch profile
+zeroclaw auth status
+zeroclaw auth refresh --provider openai-codex --profile default
+zeroclaw auth use --provider openai-codex --profile work
+```
+
+Claude Code / Anthropic setup-token:
+
+```bash
+# Paste subscription/setup token (Authorization header mode)
+zeroclaw auth paste-token --provider anthropic --profile default --auth-kind authorization
+
+# Alias command
+zeroclaw auth setup-token --provider anthropic --profile default
+```
+
+Run the agent with subscription auth:
+
+```bash
+zeroclaw agent --provider openai-codex -m "hello"
+zeroclaw agent --provider openai-codex --auth-profile openai-codex:work -m "hello"
+
+# Anthropic supports both API key and auth token env vars:
+# ANTHROPIC_AUTH_TOKEN, ANTHROPIC_OAUTH_TOKEN, ANTHROPIC_API_KEY
+zeroclaw agent --provider anthropic -m "hello"
+```
 
 ## Architecture
 

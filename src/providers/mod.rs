@@ -4,6 +4,7 @@ pub mod copilot;
 pub mod gemini;
 pub mod ollama;
 pub mod openai;
+pub mod openai_codex;
 pub mod openrouter;
 pub mod reliable;
 pub mod router;
@@ -17,6 +18,7 @@ pub use traits::{
 
 use compatible::{AuthStyle, OpenAiCompatibleProvider};
 use reliable::ReliableProvider;
+use std::path::PathBuf;
 
 const MAX_API_ERROR_CHARS: usize = 200;
 const MINIMAX_INTL_BASE_URL: &str = "https://api.minimax.io/v1";
@@ -175,6 +177,23 @@ fn zai_base_url(name: &str) -> Option<&'static str> {
         Some(ZAI_GLOBAL_BASE_URL)
     } else {
         None
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderRuntimeOptions {
+    pub auth_profile_override: Option<String>,
+    pub zeroclaw_dir: Option<PathBuf>,
+    pub secrets_encrypt: bool,
+}
+
+impl Default for ProviderRuntimeOptions {
+    fn default() -> Self {
+        Self {
+            auth_profile_override: None,
+            zeroclaw_dir: None,
+            secrets_encrypt: true,
+        }
     }
 }
 
@@ -538,6 +557,21 @@ pub fn create_resilient_provider(
     api_key: Option<&str>,
     api_url: Option<&str>,
     reliability: &crate::config::ReliabilityConfig,
+) -> anyhow::Result<Box<dyn Provider>> {
+    create_resilient_provider_with_options(
+        primary_name,
+        api_key,
+        reliability,
+        &ProviderRuntimeOptions::default(),
+    )
+}
+
+/// Create provider chain with retry/fallback behavior and auth runtime options.
+pub fn create_resilient_provider_with_options(
+    primary_name: &str,
+    api_key: Option<&str>,
+    reliability: &crate::config::ReliabilityConfig,
+    options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
     let mut providers: Vec<(String, Box<dyn Provider>)> = Vec::new();
 
@@ -941,6 +975,12 @@ mod tests {
     #[test]
     fn factory_openai() {
         assert!(create_provider("openai", Some("provider-test-credential")).is_ok());
+    }
+
+    #[test]
+    fn factory_openai_codex() {
+        let options = ProviderRuntimeOptions::default();
+        assert!(create_provider_with_options("openai-codex", None, &options).is_ok());
     }
 
     #[test]
