@@ -144,7 +144,7 @@ impl Clone for Backpressure {
 
 /// 背压许可 - 持有期间表示可以执行
 pub struct BackpressurePermit {
-    _permit: Option<SemaphorePermit>,
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
     acquired_at: Instant,
 }
 

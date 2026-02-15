@@ -13,7 +13,7 @@ use std::sync::{Arc, RwLock};
 use url::Url;
 
 /// Threat level classification
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ThreatLevel {
     Safe,
     Suspicious,
@@ -109,7 +109,7 @@ impl Default for PhishingGuardConfig {
             Regex::new(r#"system\s*\("#).unwrap(),
             Regex::new(r#"subprocess\.call"#).unwrap(),
             Regex::new(r#"os\.system"#).unwrap(),
-            Regex::new(r#`rm\s+-rf\s+/`"#).unwrap(),
+            Regex::new(r"rm\s+-rf\s+/").unwrap(),
             Regex::new(r#"curl\s+.*\|\s*sh"#).unwrap(),
             Regex::new(r#"wget\s+.*\|\s*bash"#).unwrap(),
         ];

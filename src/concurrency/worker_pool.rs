@@ -123,7 +123,7 @@ struct QueuedTask {
     priority: TaskPriority,
     created_at: Instant,
     tx: TaskSender,
-    exec: Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = Box<dyn Send + Sync>> + Send>> + Send>,
+    exec: Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = Box<dyn std::any::Any + Send + Sync>> + Send>> + Send>,
     timeout: Option<Duration>,
 }
 
@@ -150,7 +150,7 @@ impl Ord for QueuedTask {
     }
 }
 
-type TaskSender = oneshot::Sender<TaskResult<Box<dyn Send + Sync>>>;
+type TaskSender = oneshot::Sender<TaskResult<Box<dyn std::any::Any + Send + Sync>>>;
 
 /// Worker Pool 统计信息
 #[derive(Debug, Clone, Default)]
@@ -229,7 +229,8 @@ impl WorkerPool {
 
     /// 使用配置创建
     pub fn with_config(config: WorkerPoolConfig) -> Self {
-        let (tx, mut rx) = mpsc::channel::<QueuedTask>(config.queue_size);
+        let (tx, rx) = mpsc::channel::<QueuedTask>(config.queue_size);
+        let rx = Arc::new(tokio::sync::Mutex::new(rx));
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
         let stats = Arc::new(WorkerPoolStatsInner {
             active_workers: AtomicUsize::new(0),
@@ -245,6 +246,7 @@ impl WorkerPool {
         for worker_id in 0..config.worker_count {
             let mut shutdown_rx = shutdown_tx.subscribe();
             let stats = Arc::clone(&stats);
+            let rx = Arc::clone(&rx);
             
             let handle = tokio::spawn(async move {
                 loop {
@@ -258,7 +260,7 @@ impl WorkerPool {
                         }
                         
                         // 处理任务
-                        Some(task) = rx.recv() => {
+                        Some(task) = async { rx.lock().await.recv().await } => {
                             stats.active_workers.fetch_add(1, Ordering::SeqCst);
                             let start = Instant::now();
                             
@@ -326,7 +328,7 @@ impl WorkerPool {
             exec: Box::new(move || {
                 Box::pin(async move {
                     let result: T = task.future.await;
-                    Box::new(result) as Box<dyn Send + Sync>
+                    Box::new(result) as Box<dyn std::any::Any + Send + Sync>
                 })
             }),
             timeout: task.timeout.or(Some(self.config.default_timeout)),
@@ -359,25 +361,35 @@ impl WorkerPool {
     }
 
     /// 尝试提交任务（非阻塞）
-    pub fn try_submit<F, T>(&self, task: Task<F, T>) -> Result<oneshot::Receiver<TaskResult<Box<dyn Send + Sync>>>, Task<F, T>>
+    pub fn try_submit<F, T>(&self, mut task: Task<F, T>) -> Result<oneshot::Receiver<TaskResult<Box<dyn std::any::Any + Send + Sync>>>, Task<F, T>>
     where
         F: Future<Output = T> + Send + 'static,
         T: Send + Sync + 'static,
     {
         let (tx, rx) = oneshot::channel();
         
+        let timeout = task.timeout.or(Some(self.config.default_timeout));
+        // Extract all fields from task to avoid partial move
+        let task_id = task.id;
+        let task_priority = task.priority;
+        let task_created_at = task.created_at;
+        // Use Option::take pattern to extract the future
+        let task_future = std::mem::replace(&mut task.future, Box::pin(async move {
+            panic!("Placeholder future should never be executed")
+        }));
+        
         let queued_task = QueuedTask {
-            id: task.id,
-            priority: task.priority,
-            created_at: task.created_at,
+            id: task_id,
+            priority: task_priority,
+            created_at: task_created_at,
             tx,
             exec: Box::new(move || {
                 Box::pin(async move {
-                    let result: T = task.future.await;
-                    Box::new(result) as Box<dyn Send + Sync>
+                    let result: T = task_future.await;
+                    Box::new(result) as Box<dyn std::any::Any + Send + Sync>
                 })
             }),
-            timeout: task.timeout.or(Some(self.config.default_timeout)),
+            timeout,
         };
 
         match self.tx.try_send(queued_task) {
@@ -439,9 +451,12 @@ impl WorkerPool {
 
 impl Drop for WorkerPool {
     fn drop(&mut self) {
+        // Signal shutdown - workers will exit when they receive the signal
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
+        // Note: We can't await the workers here since drop is synchronous
+        // Workers will be aborted when the runtime drops them
     }
 }
 

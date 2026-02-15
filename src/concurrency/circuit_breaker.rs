@@ -6,6 +6,7 @@
 //! - 可配置的恢复策略
 //! - 半开状态的探测机制
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -533,7 +534,7 @@ where
             }
             Poll::Ready(Err(e)) => {
                 self.breaker.record_failure();
-                Poll::Ready(Err(CircuitError::Inner(e)))
+                Poll::Ready(Err(CircuitError::Inner(std::sync::Arc::new(e))))
             }
             Poll::Pending => Poll::Pending,
         }
@@ -546,7 +547,7 @@ pub enum CircuitError {
     /// 熔断器开启，请求被拒绝
     Open,
     /// 内部错误
-    Inner(anyhow::Error),
+    Inner(std::sync::Arc<anyhow::Error>),
     /// 超时
     Timeout,
 }

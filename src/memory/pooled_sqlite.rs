@@ -40,7 +40,7 @@ struct EmbeddingBatch {
 
 struct BatchEntry {
     content: String,
-    senders: Vec<tokio::sync::oneshot::Sender<anyhow::Result<Vec<f32>>>,
+    senders: Vec<tokio::sync::oneshot::Sender<anyhow::Result<Vec<f32>>>>,
 }
 
 /// Metrics for performance monitoring
@@ -101,17 +101,14 @@ impl PooledSqliteMemory {
         drop(conn);
 
         // Configure connection pool
-        let pool_config = PoolConfig::new(
-            std::thread::available_parallelism()
-                .map(|n| n.get() * 2)
-                .unwrap_or(4)
-                .max(4) as usize
-        );
+        let max_connections = std::thread::available_parallelism()
+            .map(|n| n.get() * 2)
+            .unwrap_or(4)
+            .max(4) as usize;
 
-        let config = Config::new(db_path.to_str().unwrap())
-            .pool_config(pool_config);
-
-        let pool = config.create_pool(Runtime::Tokio1)?;
+        let pool = Config::new(db_path.to_str().unwrap())
+            .create_pool(Runtime::Tokio1)?;
+        pool.resize(max_connections);
 
         // Test pool connectivity
         let _conn = pool.get().await?;
@@ -220,22 +217,25 @@ impl PooledSqliteMemory {
         // Check cache first (fast path)
         {
             let conn = self.pool.get().await?;
+            let hash_clone = hash.clone();
+            let now_clone = now.clone();
             let cached: Option<Vec<u8>> = conn
                 .interact(move |conn| {
                     let mut stmt = conn
                         .prepare("SELECT embedding FROM embedding_cache WHERE content_hash = ?1")?;
-                    let result: Option<Vec<u8>> = stmt.query_row(params![hash], |row| row.get(0)).ok();
+                    let result: Option<Vec<u8>> = stmt.query_row(params![hash_clone], |row| row.get(0)).ok();
                     
                     // Update accessed_at for LRU
                     if result.is_some() {
                         conn.execute(
                             "UPDATE embedding_cache SET accessed_at = ?1 WHERE content_hash = ?2",
-                            params![now, hash],
+                            params![now_clone, hash_clone],
                         )?;
                     }
                     Ok::<_, anyhow::Error>(result)
                 })
-                .await?;
+                .await
+                .map_err(|e| anyhow::anyhow!("Database interaction failed: {}", e))??;
 
             if let Some(bytes) = cached {
                 return Ok(Some(vector::bytes_to_vec(&bytes)));
@@ -308,23 +308,26 @@ impl PooledSqliteMemory {
 
         // Cache results and notify waiters
         let now = Local::now().to_rfc3339();
+        let cache_max = self.cache_max;
+        
         for ((hash, entry), embedding) in batch_to_process.into_iter().zip(embeddings.into_iter()) {
             // Cache the embedding
             let bytes = vector::vec_to_bytes(&embedding);
             let hash_clone = hash.clone();
             let bytes_clone = bytes.clone();
+            let now_clone = now.clone();
             
             let conn = self.pool.get().await?;
             conn.interact(move |conn| {
                 conn.execute(
                     "INSERT OR REPLACE INTO embedding_cache (content_hash, embedding, created_at, accessed_at)
                      VALUES (?1, ?2, ?3, ?4)",
-                    params![hash_clone, bytes_clone, now, now],
+                    params![hash_clone, bytes_clone, now_clone.clone(), now_clone],
                 )?;
                 
                 // LRU eviction
                 #[allow(clippy::cast_possible_wrap)]
-                let max = self.cache_max as i64;
+                let max = cache_max as i64;
                 conn.execute(
                     "DELETE FROM embedding_cache WHERE content_hash IN (
                         SELECT content_hash FROM embedding_cache
@@ -334,7 +337,8 @@ impl PooledSqliteMemory {
                     params![max],
                 )?;
                 Ok::<_, anyhow::Error>(())
-            }).await?;
+            }).await
+            .map_err(|e| anyhow::anyhow!("Database interaction failed: {}", e))??;
 
             // Notify all waiters for this content
             for sender in entry.senders {
@@ -372,7 +376,8 @@ impl PooledSqliteMemory {
                 params![max],
             )?;
             Ok::<_, anyhow::Error>(())
-        }).await?;
+        }).await
+        .map_err(|e| anyhow::anyhow!("Database interaction failed: {}", e))??;
 
         Ok(())
     }
@@ -381,7 +386,7 @@ impl PooledSqliteMemory {
     async fn fts5_search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<(String, f32)>> {
         let fts_query: String = query
             .split_whitespace()
-            .map(|w| format!("\"{}\"", w.replace('"', """)))
+            .map(|w| format!("\"{}\"", w.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(" OR ");
 
@@ -417,7 +422,8 @@ impl PooledSqliteMemory {
                 }
                 Ok::<_, anyhow::Error>(results)
             })
-            .await?;
+            .await
+            .map_err(|e| anyhow::anyhow!("Database interaction failed: {}", e))??;
 
         Ok(results)
     }
@@ -456,7 +462,8 @@ impl PooledSqliteMemory {
                 scored.truncate(limit);
                 Ok::<_, anyhow::Error>(scored)
             })
-            .await?;
+            .await
+            .map_err(|e| anyhow::anyhow!("Database interaction failed: {}", e))??;
 
         Ok(results)
     }
@@ -488,7 +495,8 @@ impl PooledSqliteMemory {
         let conn = self.pool.get().await?;
         conn.interact(|conn| {
             conn.execute_batch("INSERT INTO memories_fts(memories_fts) VALUES('rebuild');")
-        }).await??;
+        }).await
+        .map_err(|e| anyhow::anyhow!("Database interaction failed: {}", e))??;
 
         // Step 2: Re-embed all memories that lack embeddings
         if self.embedder.dimensions() == 0 {
@@ -503,8 +511,9 @@ impl PooledSqliteMemory {
                 let rows = stmt.query_map([], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 })?;
-                rows.filter_map(std::result::Result::ok).collect::<Vec<_>>()
-            }).await?
+                Ok::<_, anyhow::Error>(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
+            }).await
+            .map_err(|e| anyhow::anyhow!("Database interaction failed: {}", e))??
         };
 
         let mut count = 0;
@@ -518,7 +527,8 @@ impl PooledSqliteMemory {
                         "UPDATE memories SET embedding = ?1 WHERE id = ?2",
                         params![bytes, id],
                     )
-                }).await??;
+                }).await
+                .map_err(|e| anyhow::anyhow!("Database interaction failed: {}", e))??;
                 count += 1;
             }
         }
@@ -563,7 +573,8 @@ impl Memory for PooledSqliteMemory {
                     updated_at = excluded.updated_at",
                 params![id, key, content, cat, embedding_bytes, now, now],
             )
-        }).await??;
+        }).await
+        .map_err(|e| anyhow::anyhow!("Database interaction failed: {}", e))??;
 
         Ok(())
     }
@@ -615,8 +626,9 @@ impl Memory for PooledSqliteMemory {
         let mut results = Vec::new();
         for scored in &merged {
             let id = scored.id.clone();
+            let final_score = scored.final_score;
             let conn = self.pool.get().await?;
-            if let Ok(entry) = conn.interact(move |conn| {
+            match conn.interact(move |conn| {
                 let mut stmt = conn.prepare(
                     "SELECT id, key, content, category, created_at FROM memories WHERE id = ?1",
                 )?;
@@ -628,11 +640,12 @@ impl Memory for PooledSqliteMemory {
                         category: Self::str_to_category(&row.get::<_, String>(3)?),
                         timestamp: row.get(4)?,
                         session_id: None,
-                        score: Some(f64::from(scored.final_score)),
+                        score: Some(f64::from(final_score)),
                     })
                 })
-            }).await? {
-                results.push(entry);
+            }).await {
+                Ok(Ok(entry)) => results.push(entry),
+                _ => {}
             }
         }
 
@@ -688,7 +701,8 @@ impl Memory for PooledSqliteMemory {
                         results.push(row?);
                     }
                     Ok::<_, anyhow::Error>(results)
-                }).await?;
+                }).await
+                .map_err(|e| anyhow::anyhow!("Database interaction failed: {}", e))??;
                 
                 results = fallback_results;
             }
@@ -723,7 +737,8 @@ impl Memory for PooledSqliteMemory {
                 Some(Ok(entry)) => Ok::<_, anyhow::Error>(Some(entry)),
                 _ => Ok(None),
             }
-        }).await?;
+        }).await
+        .map_err(|e| anyhow::anyhow!("Database interaction failed: {}", e))??;
 
         Ok(entry)
     }
@@ -768,7 +783,8 @@ impl Memory for PooledSqliteMemory {
             }
 
             Ok::<_, anyhow::Error>(results)
-        }).await?;
+        }).await
+        .map_err(|e| anyhow::anyhow!("Database interaction failed: {}", e))??;
 
         Ok(results)
     }
@@ -779,7 +795,8 @@ impl Memory for PooledSqliteMemory {
         
         let affected = conn.interact(move |conn| {
             conn.execute("DELETE FROM memories WHERE key = ?1", params![key])
-        }).await??;
+        }).await
+        .map_err(|e| anyhow::anyhow!("Database interaction failed: {}", e))??;
         
         Ok(affected > 0)
     }
@@ -790,16 +807,23 @@ impl Memory for PooledSqliteMemory {
         let count = conn.interact(|conn| {
             let count: i64 = conn.query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))?;
             Ok::<_, anyhow::Error>(count)
-        }).await?;
+        }).await
+        .map_err(|e| anyhow::anyhow!("Database interaction failed: {}", e))??;
 
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         Ok(count as usize)
     }
 
     async fn health_check(&self) -> bool {
-        self.pool.get().await
-            .map(|c| c.interact(|conn| conn.execute_batch("SELECT 1")).await.ok().map(|r| r.ok()).is_some())
-            .unwrap_or(false)
+        match self.pool.get().await {
+            Ok(conn) => {
+                match conn.interact(|conn| conn.execute_batch("SELECT 1")).await {
+                    Ok(Ok(())) => true,
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
     }
 }
 

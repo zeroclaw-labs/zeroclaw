@@ -12,10 +12,10 @@ pub mod deduplicator;
 pub mod circuit_breaker;
 pub mod channel_integration;
 
-pub use worker_pool::{WorkerPool, Task, TaskResult, TaskPriority};
-pub use backpressure::{Backpressure, RateLimiter, AdaptiveLimiter};
-pub use deduplicator::{Deduplicator, DedupKey, DedupStrategy};
-pub use circuit_breaker::{CircuitBreaker, CircuitState, CircuitConfig};
+pub use worker_pool::{WorkerPool, Task, TaskResult, TaskPriority, WorkerPoolStats};
+pub use backpressure::{Backpressure, BackpressureStats, RateLimiter, AdaptiveLimiter};
+pub use deduplicator::{Deduplicator, DedupKey, DedupStrategy, DedupStats};
+pub use circuit_breaker::{CircuitBreaker, CircuitBreakerGroup, CircuitBreakerStats, CircuitState, CircuitConfig};
 
 use std::time::Duration;
 
