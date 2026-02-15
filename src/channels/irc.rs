@@ -150,6 +150,22 @@ fn encode_sasl_plain(nick: &str, password: &str) -> String {
 fn split_message(message: &str, max_bytes: usize) -> Vec<String> {
     let mut chunks = Vec::new();
 
+    // Guard against max_bytes == 0 to prevent infinite loop
+    if max_bytes == 0 {
+        let full: String = message
+            .lines()
+            .map(|l| l.trim_end_matches('\r'))
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if full.is_empty() {
+            chunks.push(String::new());
+        } else {
+            chunks.push(full);
+        }
+        return chunks;
+    }
+
     for line in message.split('\n') {
         let line = line.trim_end_matches('\r');
         if line.is_empty() {
