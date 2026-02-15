@@ -793,20 +793,14 @@ mod tests {
     #[test]
     fn extract_host_handles_ipv6() {
         // IPv6 with brackets (required for URLs with ports)
-        assert_eq!(
-            extract_host("https://[::1]/path").unwrap(),
-            "[::1]"
-        );
+        assert_eq!(extract_host("https://[::1]/path").unwrap(), "[::1]");
         // IPv6 with brackets and port
         assert_eq!(
             extract_host("https://[2001:db8::1]:8080/path").unwrap(),
             "[2001:db8::1]"
         );
         // IPv6 with brackets, trailing slash
-        assert_eq!(
-            extract_host("https://[fe80::1]/").unwrap(),
-            "[fe80::1]"
-        );
+        assert_eq!(extract_host("https://[fe80::1]/").unwrap(), "[fe80::1]");
     }
 
     #[test]

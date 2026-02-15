@@ -33,6 +33,9 @@ shellexpand = "3.1"
 tracing = { version = "0.1", default-features = false }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi"] }
 
+# Observability - Prometheus metrics
+prometheus = { version = "0.13", default-features = false }
+
 # Error handling
 anyhow = "1.0"
 thiserror = "2.0"

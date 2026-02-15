@@ -37,7 +37,7 @@ pub enum ObserverMetric {
 }
 
 /// Core observability trait — implement for any backend
-pub trait Observer: Send + Sync {
+pub trait Observer: Send + Sync + 'static {
     /// Record a discrete event
     fn record_event(&self, event: &ObserverEvent);
 
@@ -49,4 +49,12 @@ pub trait Observer: Send + Sync {
 
     /// Human-readable name of this observer
     fn name(&self) -> &str;
+
+    /// Downcast to `Any` for backend-specific operations
+    fn as_any(&self) -> &dyn std::any::Any
+    where
+        Self: Sized,
+    {
+        self
+    }
 }

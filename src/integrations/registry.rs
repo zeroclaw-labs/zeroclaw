@@ -55,9 +55,15 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
         },
         IntegrationEntry {
             name: "WhatsApp",
-            description: "QR pairing via web bridge",
+            description: "Meta Cloud API via webhook",
             category: IntegrationCategory::Chat,
-            status_fn: |_| IntegrationStatus::ComingSoon,
+            status_fn: |c| {
+                if c.channels_config.whatsapp.is_some() {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
         },
         IntegrationEntry {
             name: "Signal",
@@ -614,9 +620,15 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
         },
         IntegrationEntry {
             name: "Email",
-            description: "Send & read emails",
+            description: "IMAP/SMTP email channel",
             category: IntegrationCategory::Social,
-            status_fn: |_| IntegrationStatus::ComingSoon,
+            status_fn: |c| {
+                if c.channels_config.email.is_some() {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
         },
         // ── Platforms ───────────────────────────────────────────
         IntegrationEntry {
@@ -798,13 +810,35 @@ mod tests {
     fn coming_soon_integrations_stay_coming_soon() {
         let config = Config::default();
         let entries = all_integrations();
-        for name in ["WhatsApp", "Signal", "Nostr", "Spotify", "Home Assistant"] {
+        for name in ["Signal", "Nostr", "Spotify", "Home Assistant"] {
             let entry = entries.iter().find(|e| e.name == name).unwrap();
             assert!(
                 matches!((entry.status_fn)(&config), IntegrationStatus::ComingSoon),
                 "{name} should be ComingSoon"
             );
         }
+    }
+
+    #[test]
+    fn whatsapp_available_when_not_configured() {
+        let config = Config::default();
+        let entries = all_integrations();
+        let wa = entries.iter().find(|e| e.name == "WhatsApp").unwrap();
+        assert!(matches!(
+            (wa.status_fn)(&config),
+            IntegrationStatus::Available
+        ));
+    }
+
+    #[test]
+    fn email_available_when_not_configured() {
+        let config = Config::default();
+        let entries = all_integrations();
+        let email = entries.iter().find(|e| e.name == "Email").unwrap();
+        assert!(matches!(
+            (email.status_fn)(&config),
+            IntegrationStatus::Available
+        ));
     }
 
     #[test]

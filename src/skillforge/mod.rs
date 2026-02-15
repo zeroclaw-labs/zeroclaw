@@ -78,10 +78,7 @@ impl std::fmt::Debug for SkillForgeConfig {
             .field("sources", &self.sources)
             .field("scan_interval_hours", &self.scan_interval_hours)
             .field("min_score", &self.min_score)
-            .field(
-                "github_token",
-                &self.github_token.as_ref().map(|_| "***"),
-            )
+            .field("github_token", &self.github_token.as_ref().map(|_| "***"))
             .field("output_dir", &self.output_dir)
             .finish()
     }
@@ -155,7 +152,10 @@ impl SkillForge {
                     }
                 }
                 ScoutSource::ClawHub | ScoutSource::HuggingFace => {
-                    info!(source = src.as_str(), "Source not yet implemented — skipping");
+                    info!(
+                        source = src.as_str(),
+                        "Source not yet implemented — skipping"
+                    );
                 }
             }
         }
