@@ -9,7 +9,11 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// Workspace directory - computed from home, not serialized
+    #[serde(skip)]
     pub workspace_dir: PathBuf,
+    /// Path to config.toml - computed from home, not serialized
+    #[serde(skip)]
     pub config_path: PathBuf,
     pub api_key: Option<String>,
     pub default_provider: Option<String>,
@@ -694,11 +698,16 @@ impl Config {
         if config_path.exists() {
             let contents =
                 fs::read_to_string(&config_path).context("Failed to read config file")?;
-            let config: Config =
+            let mut config: Config =
                 toml::from_str(&contents).context("Failed to parse config file")?;
+            // Set computed paths that are skipped during serialization
+            config.config_path = config_path.clone();
+            config.workspace_dir = zeroclaw_dir.join("workspace");
             Ok(config)
         } else {
-            let config = Config::default();
+            let mut config = Config::default();
+            config.config_path = config_path.clone();
+            config.workspace_dir = zeroclaw_dir.join("workspace");
             config.save()?;
             Ok(config)
         }
