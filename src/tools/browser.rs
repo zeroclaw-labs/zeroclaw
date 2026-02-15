@@ -365,6 +365,7 @@ impl BrowserTool {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 #[async_trait]
 impl Tool for BrowserTool {
     fn name(&self) -> &str {
