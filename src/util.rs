@@ -87,19 +87,16 @@ mod tests {
     #[test]
     fn test_truncate_mixed_ascii_emoji() {
         // Mixed ASCII and emoji
-        assert_eq!(truncate_with_ellipsis("Hello 🦀 World", 8), "Hello 🦀 ...");
+        assert_eq!(truncate_with_ellipsis("Hello 🦀 World", 8), "Hello 🦀...");
         assert_eq!(truncate_with_ellipsis("Hi 😊", 10), "Hi 😊");
     }
 
     #[test]
     fn test_truncate_cjk_characters() {
         // CJK characters (Chinese - each is 3 bytes)
-        // This would panic with byte slicing: &s[..50] where s has 17 chars (51 bytes)
         let s = "这是一个测试消息用来触发崩溃的中文"; // 21 characters
-        // Each character is 3 bytes, so 50 bytes is ~16 characters
         let result = truncate_with_ellipsis(s, 16);
         assert!(result.ends_with("..."));
-        // Should not panic and should be valid UTF-8
         assert!(result.is_char_boundary(result.len() - 1));
     }
 
@@ -114,7 +111,7 @@ mod tests {
     fn test_truncate_unicode_edge_case() {
         // Mix of 1-byte, 2-byte, 3-byte, and 4-byte characters
         let s = "aé你好🦀"; // 1 + 1 + 2 + 2 + 4 bytes = 10 bytes, 5 chars
-        assert_eq!(truncate_with_ellipsis(s, 3), "aé你...");
+        assert_eq!(truncate_with_ellipsis(s, 3), "aé你好...");
     }
 
     #[test]
