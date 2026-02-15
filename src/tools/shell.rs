@@ -9,6 +9,11 @@ use std::time::Duration;
 const SHELL_TIMEOUT_SECS: u64 = 60;
 /// Maximum output size in bytes (1MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
+/// Environment variables safe to pass to shell commands.
+/// Only functional variables are included — never API keys or secrets.
+const SAFE_ENV_VARS: &[&str] = &[
+    "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
+];
 
 /// Shell command execution tool with sandboxing
 pub struct ShellTool {
@@ -59,14 +64,24 @@ impl Tool for ShellTool {
             });
         }
 
-        // Execute with timeout to prevent hanging commands
+        // Execute with timeout to prevent hanging commands.
+        // Clear the environment to prevent leaking API keys and other secrets
+        // (CWE-200), then re-add only safe, functional variables.
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(command)
+            .current_dir(&self.security.workspace_dir)
+            .env_clear();
+
+        for var in SAFE_ENV_VARS {
+            if let Ok(val) = std::env::var(var) {
+                cmd.env(var, val);
+            }
+        }
+
         let result = tokio::time::timeout(
             Duration::from_secs(SHELL_TIMEOUT_SECS),
-            tokio::process::Command::new("sh")
-                .arg("-c")
-                .arg(command)
-                .current_dir(&self.security.workspace_dir)
-                .output(),
+            cmd.output(),
         )
         .await;
 
@@ -77,11 +92,11 @@ impl Tool for ShellTool {
 
                 // Truncate output to prevent OOM
                 if stdout.len() > MAX_OUTPUT_BYTES {
-                    stdout.truncate(MAX_OUTPUT_BYTES);
+                    stdout.truncate(stdout.floor_char_boundary(MAX_OUTPUT_BYTES));
                     stdout.push_str("\n... [output truncated at 1MB]");
                 }
                 if stderr.len() > MAX_OUTPUT_BYTES {
-                    stderr.truncate(MAX_OUTPUT_BYTES);
+                    stderr.truncate(stderr.floor_char_boundary(MAX_OUTPUT_BYTES));
                     stderr.push_str("\n... [stderr truncated at 1MB]");
                 }
 
@@ -198,5 +213,81 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
+    }
+
+    fn test_security_with_env_cmd() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["env".into(), "echo".into()],
+            ..SecurityPolicy::default()
+        })
+    }
+
+    /// RAII guard that restores an environment variable to its original state on drop,
+    /// ensuring cleanup even if the test panics.
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(val) => std::env::set_var(self.key, val),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shell_does_not_leak_api_key() {
+        let _g1 = EnvGuard::set("API_KEY", "sk-test-secret-12345");
+        let _g2 = EnvGuard::set("ZEROCLAW_API_KEY", "sk-test-secret-67890");
+
+        let tool = ShellTool::new(test_security_with_env_cmd());
+        let result = tool.execute(json!({"command": "env"})).await.unwrap();
+        assert!(result.success);
+        assert!(
+            !result.output.contains("sk-test-secret-12345"),
+            "API_KEY leaked to shell command output"
+        );
+        assert!(
+            !result.output.contains("sk-test-secret-67890"),
+            "ZEROCLAW_API_KEY leaked to shell command output"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_preserves_path_and_home() {
+        let tool = ShellTool::new(test_security_with_env_cmd());
+
+        let result = tool
+            .execute(json!({"command": "echo $HOME"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(
+            !result.output.trim().is_empty(),
+            "HOME should be available in shell"
+        );
+
+        let result = tool
+            .execute(json!({"command": "echo $PATH"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(
+            !result.output.trim().is_empty(),
+            "PATH should be available in shell"
+        );
     }
 }
