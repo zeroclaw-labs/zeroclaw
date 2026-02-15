@@ -117,6 +117,12 @@ pub async fn run(
             "Open approved HTTPS URLs in Brave Browser (allowlist-only, no scraping)",
         ));
     }
+    if config.mcp.enabled && !config.mcp.servers.is_empty() {
+        tool_descs.push((
+            "mcp",
+            "Connect to MCP servers and use their tools. Use action='list_servers' to see configured servers, action='list_tools' to discover a server's tools, or action='call' to invoke a specific tool.",
+        ));
+    }
     let system_prompt = crate::channels::build_system_prompt(
         &config.workspace_dir,
         model_name,
