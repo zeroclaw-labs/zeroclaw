@@ -536,17 +536,23 @@ impl Channel for IrcChannel {
 
                     // Determine reply target: if sent to a channel, reply to channel;
                     // if DM (target == our nick), reply to sender
-                    let reply_to = if target.starts_with('#') || target.starts_with('&') {
+                    let is_channel = target.starts_with('#') || target.starts_with('&');
+                    let reply_to = if is_channel {
                         target.to_string()
                     } else {
                         sender_nick.to_string()
+                    };
+                    let content = if is_channel {
+                        format!("{IRC_STYLE_PREFIX}<{sender_nick}> {text}")
+                    } else {
+                        format!("{IRC_STYLE_PREFIX}{text}")
                     };
 
                     let seq = MSG_SEQ.fetch_add(1, Ordering::Relaxed);
                     let channel_msg = ChannelMessage {
                         id: format!("irc_{}_{seq}", chrono::Utc::now().timestamp_millis()),
                         sender: reply_to,
-                        content: format!("{IRC_STYLE_PREFIX}{text}"),
+                        content,
                         channel: "irc".to_string(),
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)

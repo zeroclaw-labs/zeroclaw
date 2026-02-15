@@ -1741,20 +1741,20 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     },
                     channels,
                     allowed_users,
-                    server_password: if server_password.is_empty() {
+                    server_password: if server_password.trim().is_empty() {
                         None
                     } else {
-                        Some(server_password)
+                        Some(server_password.trim().to_string())
                     },
-                    nickserv_password: if nickserv_password.is_empty() {
+                    nickserv_password: if nickserv_password.trim().is_empty() {
                         None
                     } else {
-                        Some(nickserv_password)
+                        Some(nickserv_password.trim().to_string())
                     },
-                    sasl_password: if sasl_password.is_empty() {
+                    sasl_password: if sasl_password.trim().is_empty() {
                         None
                     } else {
-                        Some(sasl_password)
+                        Some(sasl_password.trim().to_string())
                     },
                     verify_tls: Some(true),
                 });
