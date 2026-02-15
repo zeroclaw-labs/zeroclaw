@@ -96,20 +96,17 @@ pub fn build_authorize_url(pkce: &PkceState) -> String {
 
     let mut encoded: Vec<String> = Vec::with_capacity(params.len());
     for (k, v) in params {
-        encoded.push(format!(
-            "{}={}",
-            url_encode(k),
-            url_encode(v)
-        ));
+        encoded.push(format!("{}={}", url_encode(k), url_encode(v)));
     }
 
-    format!(
-        "{OPENAI_OAUTH_AUTHORIZE_URL}?{}",
-        encoded.join("&")
-    )
+    format!("{OPENAI_OAUTH_AUTHORIZE_URL}?{}", encoded.join("&"))
 }
 
-pub async fn exchange_code_for_tokens(client: &Client, code: &str, pkce: &PkceState) -> Result<TokenSet> {
+pub async fn exchange_code_for_tokens(
+    client: &Client,
+    code: &str,
+    pkce: &PkceState,
+) -> Result<TokenSet> {
     let form = [
         ("grant_type", "authorization_code"),
         ("code", code),
@@ -180,7 +177,10 @@ pub async fn start_device_code_flow(client: &Client) -> Result<DeviceCodeStart> 
     })
 }
 
-pub async fn poll_device_code_tokens(client: &Client, device: &DeviceCodeStart) -> Result<TokenSet> {
+pub async fn poll_device_code_tokens(
+    client: &Client,
+    device: &DeviceCodeStart,
+) -> Result<TokenSet> {
     let started = Instant::now();
     let mut interval_secs = device.interval.max(1);
 
@@ -269,7 +269,8 @@ pub async fn receive_loopback_code(expected_state: &str, timeout: Duration) -> R
 
     let code = parse_code_from_redirect(path, Some(expected_state))?;
 
-    let body = "<html><body><h2>ZeroClaw login complete</h2><p>You can close this tab.</p></body></html>";
+    let body =
+        "<html><body><h2>ZeroClaw login complete</h2><p>You can close this tab.</p></body></html>";
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
@@ -282,12 +283,8 @@ pub async fn receive_loopback_code(expected_state: &str, timeout: Duration) -> R
 
 pub fn parse_code_from_redirect(input: &str, expected_state: Option<&str>) -> Result<String> {
     let trimmed = input.trim();
-
-    if !trimmed.contains("code=") {
-        if trimmed.is_empty() {
-            anyhow::bail!("No OAuth code provided");
-        }
-        return Ok(trimmed.to_string());
+    if trimmed.is_empty() {
+        anyhow::bail!("No OAuth code provided");
     }
 
     let query = if let Some((_, right)) = trimmed.split_once('?') {
@@ -297,6 +294,10 @@ pub fn parse_code_from_redirect(input: &str, expected_state: Option<&str>) -> Re
     };
 
     let params = parse_query_params(query);
+    let is_callback_payload = trimmed.contains('?')
+        || params.contains_key("code")
+        || params.contains_key("state")
+        || params.contains_key("error");
 
     if let Some(err) = params.get("error") {
         let desc = params
@@ -307,18 +308,24 @@ pub fn parse_code_from_redirect(input: &str, expected_state: Option<&str>) -> Re
     }
 
     if let Some(expected_state) = expected_state {
-        let got = params
-            .get("state")
-            .ok_or_else(|| anyhow::anyhow!("Missing OAuth state in callback"))?;
-        if got != expected_state {
-            anyhow::bail!("OAuth state mismatch");
+        if let Some(got) = params.get("state") {
+            if got != expected_state {
+                anyhow::bail!("OAuth state mismatch");
+            }
+        } else if is_callback_payload {
+            anyhow::bail!("Missing OAuth state in callback");
         }
     }
 
-    params
-        .get("code")
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("Missing OAuth code in callback"))
+    if let Some(code) = params.get("code").cloned() {
+        return Ok(code);
+    }
+
+    if !is_callback_payload {
+        return Ok(trimmed.to_string());
+    }
+
+    anyhow::bail!("Missing OAuth code in callback")
 }
 
 pub fn extract_account_id_from_jwt(token: &str) -> Option<String> {
@@ -476,6 +483,18 @@ mod tests {
     fn parse_redirect_rejects_state_mismatch() {
         let err = parse_code_from_redirect("/auth/callback?code=x&state=a", Some("b")).unwrap_err();
         assert!(err.to_string().contains("state mismatch"));
+    }
+
+    #[test]
+    fn parse_redirect_rejects_error_without_code() {
+        let err = parse_code_from_redirect(
+            "/auth/callback?error=access_denied&error_description=user+cancelled",
+            Some("xyz"),
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("OpenAI OAuth error: access_denied"));
     }
 
     #[test]
