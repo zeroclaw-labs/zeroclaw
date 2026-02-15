@@ -14,6 +14,15 @@ use reliable::ReliableProvider;
 
 const MAX_API_ERROR_CHARS: usize = 200;
 
+fn custom_provider_uses_raw_endpoints(base_url: &str) -> bool {
+    let Ok(parsed_url) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+
+    let path = parsed_url.path().trim_end_matches('/');
+    !path.is_empty() && path != "/v1"
+}
+
 fn is_secret_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':')
 }
@@ -182,12 +191,18 @@ pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<
             if base_url.is_empty() {
                 anyhow::bail!("Custom provider requires a URL. Format: custom:https://your-api.com");
             }
-            Ok(Box::new(OpenAiCompatibleProvider::new(
+            let mut provider = OpenAiCompatibleProvider::new(
                 "Custom",
                 base_url,
                 api_key,
                 AuthStyle::Bearer,
-            )))
+            );
+
+            if custom_provider_uses_raw_endpoints(base_url) {
+                provider = provider.with_api_prefix("");
+            }
+
+            Ok(Box::new(provider))
         }
 
         _ => anyhow::bail!(
@@ -415,6 +430,32 @@ mod tests {
     fn factory_custom_no_key() {
         let p = create_provider("custom:https://my-llm.example.com", None);
         assert!(p.is_ok());
+    }
+
+    #[test]
+    fn custom_url_path_detection_defaults_to_v1_for_root() {
+        assert!(!custom_provider_uses_raw_endpoints(
+            "https://api.example.com"
+        ));
+    }
+
+    #[test]
+    fn custom_url_path_detection_keeps_v1_when_already_present() {
+        assert!(!custom_provider_uses_raw_endpoints(
+            "https://api.example.com/v1"
+        ));
+    }
+
+    #[test]
+    fn custom_url_path_detection_uses_raw_for_versioned_paths() {
+        assert!(custom_provider_uses_raw_endpoints(
+            "https://api.example.com/api/coding/v3"
+        ));
+    }
+
+    #[test]
+    fn custom_url_path_detection_handles_invalid_url() {
+        assert!(!custom_provider_uses_raw_endpoints("not-a-url"));
     }
 
     #[test]

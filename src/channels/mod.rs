@@ -193,6 +193,13 @@ pub fn build_system_prompt(
 }
 
 /// Inject a single workspace file into the prompt with truncation and missing-file markers.
+fn truncate_at_char_limit(input: &str, max_chars: usize) -> Option<&str> {
+    input
+        .char_indices()
+        .nth(max_chars)
+        .map(|(byte_idx, _)| &input[..byte_idx])
+}
+
 fn inject_workspace_file(prompt: &mut String, workspace_dir: &std::path::Path, filename: &str) {
     use std::fmt::Write;
 
@@ -204,8 +211,8 @@ fn inject_workspace_file(prompt: &mut String, workspace_dir: &std::path::Path, f
                 return;
             }
             let _ = writeln!(prompt, "### {filename}\n");
-            if trimmed.len() > BOOTSTRAP_MAX_CHARS {
-                prompt.push_str(&trimmed[..BOOTSTRAP_MAX_CHARS]);
+            if let Some(truncated) = truncate_at_char_limit(trimmed, BOOTSTRAP_MAX_CHARS) {
+                prompt.push_str(truncated);
                 let _ = writeln!(
                     prompt,
                     "\n\n[... truncated at {BOOTSTRAP_MAX_CHARS} chars — use `read` for full file]\n"
@@ -590,10 +597,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             .await
         {
             Ok(response) => {
-                println!(
-                    "  🤖 Reply: {}",
-                    truncate_with_ellipsis(&response, 80)
-                );
+                println!("  🤖 Reply: {}", truncate_with_ellipsis(&response, 80));
                 // Find the channel that sent this message and reply
                 for ch in &channels {
                     if ch.name() == msg.channel {
@@ -828,6 +832,21 @@ mod tests {
             !prompt.contains(&big_content),
             "full content should not appear"
         );
+    }
+
+    #[test]
+    fn prompt_truncation_is_utf8_safe_for_multibyte_content() {
+        let ws = make_workspace();
+        let big_content = "你".repeat(BOOTSTRAP_MAX_CHARS + 1000);
+        std::fs::write(ws.path().join("AGENTS.md"), &big_content).unwrap();
+
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[]);
+
+        assert!(
+            prompt.contains("truncated at"),
+            "multibyte content should still be truncated safely"
+        );
+        assert!(prompt.contains('你'));
     }
 
     #[test]

@@ -4,6 +4,8 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 
+const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
+
 /// Read file contents with path sandboxing
 pub struct FileReadTool {
     security: Arc<SecurityPolicy>,
@@ -44,6 +46,14 @@ impl Tool for FileReadTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'path' parameter"))?;
 
+        if !self.security.record_action() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Action blocked: rate limit exceeded".into()),
+            });
+        }
+
         // Security check: validate path is within workspace
         if !self.security.is_path_allowed(path) {
             return Ok(ToolResult {
@@ -79,15 +89,14 @@ impl Tool for FileReadTool {
         }
 
         // Check file size AFTER canonicalization to prevent TOCTOU symlink bypass
-        const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
         match tokio::fs::metadata(&resolved_path).await {
             Ok(meta) => {
-                if meta.len() > MAX_FILE_SIZE {
+                if meta.len() > MAX_FILE_SIZE_BYTES {
                     return Ok(ToolResult {
                         success: false,
                         output: String::new(),
                         error: Some(format!(
-                            "File too large: {} bytes (limit: {MAX_FILE_SIZE} bytes)",
+                            "File too large: {} bytes (limit: {MAX_FILE_SIZE_BYTES} bytes)",
                             meta.len()
                         )),
                     });
@@ -126,6 +135,18 @@ mod tests {
         Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: workspace,
+            ..SecurityPolicy::default()
+        })
+    }
+
+    fn test_security_with_limit(
+        workspace: std::path::PathBuf,
+        max_actions_per_hour: u32,
+    ) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace,
+            max_actions_per_hour,
             ..SecurityPolicy::default()
         })
     }
@@ -202,6 +223,24 @@ mod tests {
         let result = tool.execute(json!({"path": "/etc/passwd"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("not allowed"));
+    }
+
+    #[tokio::test]
+    async fn file_read_blocks_rate_limited() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_rate_limit");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("test.txt"), "hello")
+            .await
+            .unwrap();
+
+        let tool = FileReadTool::new(test_security_with_limit(dir.clone(), 0));
+        let result = tool.execute(json!({"path": "test.txt"})).await.unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("rate limit"));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]

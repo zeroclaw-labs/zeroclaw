@@ -191,8 +191,12 @@ impl EmailChannel {
         // TLS
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let crypto_provider = rustls::crypto::CryptoProvider::get_default()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
         let tls_config = Arc::new(
-            TlsConfig::builder()
+            TlsConfig::builder_with_provider(crypto_provider)
+                .with_protocol_versions(rustls::DEFAULT_VERSIONS)?
                 .with_root_certificates(root_store)
                 .with_no_client_auth(),
         );

@@ -53,6 +53,22 @@ impl Tool for FileWriteTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'content' parameter"))?;
 
+        if !self.security.can_act() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Write not allowed by security policy: autonomy is read-only".into()),
+            });
+        }
+
+        if !self.security.record_action() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Write not allowed by security policy: rate limit exceeded".into()),
+            });
+        }
+
         // Security check: validate path is within workspace
         if !self.security.is_path_allowed(path) {
             return Ok(ToolResult {
@@ -146,6 +162,26 @@ mod tests {
         Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: workspace,
+            ..SecurityPolicy::default()
+        })
+    }
+
+    fn test_readonly_security(workspace: std::path::PathBuf) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            workspace_dir: workspace,
+            ..SecurityPolicy::default()
+        })
+    }
+
+    fn test_security_with_limit(
+        workspace: std::path::PathBuf,
+        max_actions_per_hour: u32,
+    ) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace,
+            max_actions_per_hour,
             ..SecurityPolicy::default()
         })
     }
@@ -260,6 +296,42 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("not allowed"));
+    }
+
+    #[tokio::test]
+    async fn file_write_blocks_readonly() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_readonly");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let tool = FileWriteTool::new(test_readonly_security(dir.clone()));
+        let result = tool
+            .execute(json!({"path": "out.txt", "content": "blocked"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("read-only"));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_write_blocks_rate_limited() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_rate_limit");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let tool = FileWriteTool::new(test_security_with_limit(dir.clone(), 0));
+        let result = tool
+            .execute(json!({"path": "out.txt", "content": "blocked"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("rate limit"));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]

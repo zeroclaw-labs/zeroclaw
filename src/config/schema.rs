@@ -732,6 +732,13 @@ impl Config {
 
     pub fn save(&self) -> Result<()> {
         let toml_str = toml::to_string_pretty(self).context("Failed to serialize config")?;
+
+        if let Some(parent) = self.config_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).context("Failed to create config directory")?;
+            }
+        }
+
         fs::write(&self.config_path, toml_str).context("Failed to write config file")?;
         Ok(())
     }
@@ -935,6 +942,24 @@ default_temperature = 0.7
         assert_eq!(loaded.api_key.as_deref(), Some("sk-roundtrip"));
         assert_eq!(loaded.default_model.as_deref(), Some("test-model"));
         assert!((loaded.default_temperature - 0.9).abs() < f64::EPSILON);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_save_creates_missing_parent_dirs() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_config_nested");
+        let _ = fs::remove_dir_all(&dir);
+
+        let config_path = dir.join("nested/a/b/config.toml");
+        let config = Config {
+            workspace_dir: dir.join("workspace"),
+            config_path: config_path.clone(),
+            ..Config::default()
+        };
+
+        config.save().unwrap();
+        assert!(config_path.exists());
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1599,7 +1624,7 @@ default_temperature = 0.7
     fn env_override_temperature_out_of_range_ignored() {
         // Clean up any leftover env vars from other tests
         std::env::remove_var("ZEROCLAW_TEMPERATURE");
-        
+
         let mut config = Config::default();
         let original_temp = config.default_temperature;
 

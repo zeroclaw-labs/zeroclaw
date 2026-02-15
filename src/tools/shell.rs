@@ -55,6 +55,22 @@ impl Tool for ShellTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'command' parameter"))?;
 
+        if !self.security.can_act() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Command not allowed by security policy: autonomy is read-only".into()),
+            });
+        }
+
+        if !self.security.record_action() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Command not allowed by security policy: rate limit exceeded".into()),
+            });
+        }
+
         // Security check: validate command against allowlist
         if !self.security.is_command_allowed(command) {
             return Ok(ToolResult {
@@ -185,6 +201,31 @@ mod tests {
         let result = tool.execute(json!({"command": "ls"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("not allowed"));
+    }
+
+    #[tokio::test]
+    async fn shell_blocks_rate_limited() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["echo".into()],
+            max_actions_per_hour: 1,
+            ..SecurityPolicy::default()
+        });
+        let tool = ShellTool::new(security);
+
+        let first = tool
+            .execute(json!({"command": "echo first"}))
+            .await
+            .unwrap();
+        assert!(first.success);
+
+        let second = tool
+            .execute(json!({"command": "echo second"}))
+            .await
+            .unwrap();
+        assert!(!second.success);
+        assert!(second.error.as_deref().unwrap_or("").contains("rate limit"));
     }
 
     #[tokio::test]

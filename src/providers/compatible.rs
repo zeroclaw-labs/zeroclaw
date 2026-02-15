@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 pub struct OpenAiCompatibleProvider {
     pub(crate) name: String,
     pub(crate) base_url: String,
+    pub(crate) api_prefix: String,
     pub(crate) api_key: Option<String>,
     pub(crate) auth_header: AuthStyle,
     client: Client,
@@ -31,9 +32,17 @@ pub enum AuthStyle {
 
 impl OpenAiCompatibleProvider {
     pub fn new(name: &str, base_url: &str, api_key: Option<&str>, auth_style: AuthStyle) -> Self {
+        let base_url = base_url.trim_end_matches('/').to_string();
+        let api_prefix = if base_url.ends_with("/v1") {
+            String::new()
+        } else {
+            "/v1".to_string()
+        };
+
         Self {
             name: name.to_string(),
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url,
+            api_prefix,
             api_key: api_key.map(ToString::to_string),
             auth_header: auth_style,
             client: Client::builder()
@@ -41,6 +50,30 @@ impl OpenAiCompatibleProvider {
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
+        }
+    }
+
+    /// Override API prefix for endpoint construction.
+    ///
+    /// Examples:
+    /// - `"/v1"` -> `https://host/v1/chat/completions`
+    /// - `""`    -> `https://host/chat/completions`
+    pub fn with_api_prefix(mut self, api_prefix: &str) -> Self {
+        let trimmed = api_prefix.trim_matches('/');
+        self.api_prefix = if trimmed.is_empty() {
+            String::new()
+        } else {
+            format!("/{trimmed}")
+        };
+        self
+    }
+
+    fn endpoint_url(&self, endpoint: &str) -> String {
+        let endpoint = endpoint.trim_start_matches('/');
+        if self.api_prefix.is_empty() {
+            format!("{}/{}", self.base_url, endpoint)
+        } else {
+            format!("{}{}/{}", self.base_url, self.api_prefix, endpoint)
         }
     }
 }
@@ -121,7 +154,7 @@ fn first_nonempty(text: Option<&str>) -> Option<String> {
     })
 }
 
-fn extract_responses_text(response: ResponsesResponse) -> Option<String> {
+fn extract_responses_text(response: &ResponsesResponse) -> Option<String> {
     if let Some(text) = first_nonempty(response.output_text.as_deref()) {
         return Some(text);
     }
@@ -177,7 +210,7 @@ impl OpenAiCompatibleProvider {
             stream: Some(false),
         };
 
-        let url = format!("{}/v1/responses", self.base_url);
+        let url = self.endpoint_url("responses");
 
         let response = self
             .apply_auth_header(self.client.post(&url).json(&request), api_key)
@@ -191,7 +224,7 @@ impl OpenAiCompatibleProvider {
 
         let responses: ResponsesResponse = response.json().await?;
 
-        extract_responses_text(responses)
+        extract_responses_text(&responses)
             .ok_or_else(|| anyhow::anyhow!("No response from {} Responses API", self.name))
     }
 }
@@ -232,7 +265,7 @@ impl Provider for OpenAiCompatibleProvider {
             temperature,
         };
 
-        let url = format!("{}/v1/chat/completions", self.base_url);
+        let url = self.endpoint_url("chat/completions");
 
         let response = self
             .apply_auth_header(self.client.post(&url).json(&request), api_key)
@@ -295,6 +328,43 @@ mod tests {
     fn strips_trailing_slash() {
         let p = make_provider("test", "https://example.com/", None);
         assert_eq!(p.base_url, "https://example.com");
+    }
+
+    #[test]
+    fn default_prefix_uses_v1_for_root_urls() {
+        let p = make_provider("test", "https://example.com", None);
+        assert_eq!(
+            p.endpoint_url("chat/completions"),
+            "https://example.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn default_prefix_skips_duplicate_v1() {
+        let p = make_provider("test", "https://example.com/v1", None);
+        assert_eq!(
+            p.endpoint_url("chat/completions"),
+            "https://example.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn custom_prefix_supports_non_v1_paths() {
+        let p =
+            make_provider("test", "https://api.vendor.com", None).with_api_prefix("/api/coding/v3");
+        assert_eq!(
+            p.endpoint_url("chat/completions"),
+            "https://api.vendor.com/api/coding/v3/chat/completions"
+        );
+    }
+
+    #[test]
+    fn empty_prefix_builds_raw_endpoints() {
+        let p = make_provider("test", "https://api.vendor.com/api/v3", None).with_api_prefix("");
+        assert_eq!(
+            p.endpoint_url("responses"),
+            "https://api.vendor.com/api/v3/responses"
+        );
     }
 
     #[tokio::test]
@@ -396,7 +466,7 @@ mod tests {
         let json = r#"{"output_text":"Hello from top-level","output":[]}"#;
         let response: ResponsesResponse = serde_json::from_str(json).unwrap();
         assert_eq!(
-            extract_responses_text(response).as_deref(),
+            extract_responses_text(&response).as_deref(),
             Some("Hello from top-level")
         );
     }
@@ -407,7 +477,7 @@ mod tests {
             r#"{"output":[{"content":[{"type":"output_text","text":"Hello from nested"}]}]}"#;
         let response: ResponsesResponse = serde_json::from_str(json).unwrap();
         assert_eq!(
-            extract_responses_text(response).as_deref(),
+            extract_responses_text(&response).as_deref(),
             Some("Hello from nested")
         );
     }
@@ -417,7 +487,7 @@ mod tests {
         let json = r#"{"output":[{"content":[{"type":"message","text":"Fallback text"}]}]}"#;
         let response: ResponsesResponse = serde_json::from_str(json).unwrap();
         assert_eq!(
-            extract_responses_text(response).as_deref(),
+            extract_responses_text(&response).as_deref(),
             Some("Fallback text")
         );
     }

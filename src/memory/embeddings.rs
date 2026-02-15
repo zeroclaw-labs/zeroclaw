@@ -45,6 +45,7 @@ impl EmbeddingProvider for NoopEmbedding {
 pub struct OpenAiEmbedding {
     client: reqwest::Client,
     base_url: String,
+    api_prefix: String,
     api_key: String,
     model: String,
     dims: usize,
@@ -52,12 +53,39 @@ pub struct OpenAiEmbedding {
 
 impl OpenAiEmbedding {
     pub fn new(base_url: &str, api_key: &str, model: &str, dims: usize) -> Self {
+        let base_url = base_url.trim_end_matches('/').to_string();
+        let api_prefix = if base_url.ends_with("/v1") {
+            String::new()
+        } else {
+            "/v1".to_string()
+        };
+
         Self {
             client: reqwest::Client::new(),
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url,
+            api_prefix,
             api_key: api_key.to_string(),
             model: model.to_string(),
             dims,
+        }
+    }
+
+    fn with_api_prefix(mut self, api_prefix: &str) -> Self {
+        let trimmed = api_prefix.trim_matches('/');
+        self.api_prefix = if trimmed.is_empty() {
+            String::new()
+        } else {
+            format!("/{trimmed}")
+        };
+        self
+    }
+
+    fn endpoint_url(&self, endpoint: &str) -> String {
+        let endpoint = endpoint.trim_start_matches('/');
+        if self.api_prefix.is_empty() {
+            format!("{}/{}", self.base_url, endpoint)
+        } else {
+            format!("{}{}/{}", self.base_url, self.api_prefix, endpoint)
         }
     }
 }
@@ -84,7 +112,7 @@ impl EmbeddingProvider for OpenAiEmbedding {
 
         let resp = self
             .client
-            .post(format!("{}/v1/embeddings", self.base_url))
+            .post(self.endpoint_url("embeddings"))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
             .json(&body)
@@ -125,6 +153,15 @@ impl EmbeddingProvider for OpenAiEmbedding {
 
 // ── Factory ──────────────────────────────────────────────────
 
+fn custom_embedding_uses_raw_endpoints(base_url: &str) -> bool {
+    let Ok(parsed_url) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+
+    let path = parsed_url.path().trim_end_matches('/');
+    !path.is_empty() && path != "/v1"
+}
+
 pub fn create_embedding_provider(
     provider: &str,
     api_key: Option<&str>,
@@ -144,7 +181,11 @@ pub fn create_embedding_provider(
         name if name.starts_with("custom:") => {
             let base_url = name.strip_prefix("custom:").unwrap_or("");
             let key = api_key.unwrap_or("");
-            Box::new(OpenAiEmbedding::new(base_url, key, model, dims))
+            let mut provider = OpenAiEmbedding::new(base_url, key, model, dims);
+            if custom_embedding_uses_raw_endpoints(base_url) {
+                provider = provider.with_api_prefix("");
+            }
+            Box::new(provider)
         }
         _ => Box::new(NoopEmbedding),
     }
@@ -248,5 +289,43 @@ mod tests {
     fn openai_dimensions_custom() {
         let p = OpenAiEmbedding::new("http://localhost", "k", "m", 384);
         assert_eq!(p.dimensions(), 384);
+    }
+
+    #[test]
+    fn openai_default_endpoint_uses_v1() {
+        let p = OpenAiEmbedding::new("https://api.example.com", "k", "m", 384);
+        assert_eq!(
+            p.endpoint_url("embeddings"),
+            "https://api.example.com/v1/embeddings"
+        );
+    }
+
+    #[test]
+    fn openai_existing_v1_endpoint_does_not_duplicate_prefix() {
+        let p = OpenAiEmbedding::new("https://api.example.com/v1", "k", "m", 384);
+        assert_eq!(
+            p.endpoint_url("embeddings"),
+            "https://api.example.com/v1/embeddings"
+        );
+    }
+
+    #[test]
+    fn openai_supports_custom_non_v1_prefix() {
+        let p = OpenAiEmbedding::new("https://api.example.com", "k", "m", 384)
+            .with_api_prefix("/api/coding/v3");
+        assert_eq!(
+            p.endpoint_url("embeddings"),
+            "https://api.example.com/api/coding/v3/embeddings"
+        );
+    }
+
+    #[test]
+    fn custom_embedding_path_detection_uses_raw_endpoints() {
+        assert!(custom_embedding_uses_raw_endpoints(
+            "https://api.example.com/api/coding/v3"
+        ));
+        assert!(!custom_embedding_uses_raw_endpoints(
+            "https://api.example.com"
+        ));
     }
 }

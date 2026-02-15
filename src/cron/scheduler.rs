@@ -138,6 +138,20 @@ async fn run_job_command(
     security: &SecurityPolicy,
     job: &CronJob,
 ) -> (bool, String) {
+    if !security.can_act() {
+        return (
+            false,
+            "blocked by security policy: autonomy is read-only".to_string(),
+        );
+    }
+
+    if !security.record_action() {
+        return (
+            false,
+            "blocked by security policy: rate limit exceeded".to_string(),
+        );
+    }
+
     if !security.is_command_allowed(&job.command) {
         return (
             false,
@@ -182,7 +196,7 @@ async fn run_job_command(
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::security::SecurityPolicy;
+    use crate::security::{AutonomyLevel, SecurityPolicy};
     use tempfile::TempDir;
 
     fn test_config(tmp: &TempDir) -> Config {
@@ -244,6 +258,36 @@ mod tests {
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("command not allowed"));
+    }
+
+    #[tokio::test]
+    async fn run_job_command_blocks_readonly_autonomy() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.autonomy.level = AutonomyLevel::ReadOnly;
+        config.autonomy.allowed_commands = vec!["echo".into()];
+        let job = test_job("echo should-not-run");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(!success);
+        assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("read-only"));
+    }
+
+    #[tokio::test]
+    async fn run_job_command_blocks_rate_limited() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.autonomy.allowed_commands = vec!["echo".into()];
+        config.autonomy.max_actions_per_hour = 0;
+        let job = test_job("echo should-not-run");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(!success);
+        assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("rate limit"));
     }
 
     #[tokio::test]
