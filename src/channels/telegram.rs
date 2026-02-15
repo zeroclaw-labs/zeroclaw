@@ -500,6 +500,17 @@ Allowlist Telegram @username or numeric user ID, then run `zeroclaw onboard --ch
                         .map(|id| id.to_string())
                         .unwrap_or_default();
 
+                    // Send "typing" indicator immediately when we receive a message
+                    let typing_body = serde_json::json!({
+                        "chat_id": &chat_id,
+                        "action": "typing"
+                    });
+                    let _ = self.client
+                        .post(self.api_url("sendChatAction"))
+                        .json(&typing_body)
+                        .send()
+                        .await; // Ignore errors for typing indicator
+
                     let msg = ChannelMessage {
                         id: Uuid::new_v4().to_string(),
                         sender: chat_id,
