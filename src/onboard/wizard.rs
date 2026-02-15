@@ -96,6 +96,7 @@ pub fn run_wizard() -> Result<Config> {
         autonomy: AutonomyConfig::default(),
         runtime: RuntimeConfig::default(),
         reliability: crate::config::ReliabilityConfig::default(),
+        model_routes: Vec::new(),
         heartbeat: HeartbeatConfig::default(),
         channels_config,
         memory: memory_config, // User-selected memory backend
@@ -286,6 +287,7 @@ pub fn run_quick_setup(
         autonomy: AutonomyConfig::default(),
         runtime: RuntimeConfig::default(),
         reliability: crate::config::ReliabilityConfig::default(),
+        model_routes: Vec::new(),
         heartbeat: HeartbeatConfig::default(),
         channels_config: ChannelsConfig::default(),
         memory: memory_config,

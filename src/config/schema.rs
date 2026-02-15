@@ -32,6 +32,10 @@ pub struct Config {
     #[serde(default)]
     pub reliability: ReliabilityConfig,
 
+    /// Model routing rules — route `hint:<name>` to specific provider+model combos.
+    #[serde(default)]
+    pub model_routes: Vec<ModelRouteConfig>,
+
     #[serde(default)]
     pub heartbeat: HeartbeatConfig,
 
@@ -446,6 +450,36 @@ impl Default for ReliabilityConfig {
     }
 }
 
+// ── Model routing ────────────────────────────────────────────────
+
+/// Route a task hint to a specific provider + model.
+///
+/// ```toml
+/// [[model_routes]]
+/// hint = "reasoning"
+/// provider = "openrouter"
+/// model = "anthropic/claude-opus-4-20250514"
+///
+/// [[model_routes]]
+/// hint = "fast"
+/// provider = "groq"
+/// model = "llama-3.3-70b-versatile"
+/// ```
+///
+/// Usage: pass `hint:reasoning` as the model parameter to route the request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelRouteConfig {
+    /// Task hint name (e.g. "reasoning", "fast", "code", "summarize")
+    pub hint: String,
+    /// Provider to route to (must match a known provider name)
+    pub provider: String,
+    /// Model to use with that provider
+    pub model: String,
+    /// Optional API key override for this route's provider
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
 // ── Heartbeat ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -670,6 +704,7 @@ impl Default for Config {
             autonomy: AutonomyConfig::default(),
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
+            model_routes: Vec::new(),
             heartbeat: HeartbeatConfig::default(),
             channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
@@ -875,6 +910,7 @@ mod tests {
                 kind: "docker".into(),
             },
             reliability: ReliabilityConfig::default(),
+            model_routes: Vec::new(),
             heartbeat: HeartbeatConfig {
                 enabled: true,
                 interval_minutes: 15,
@@ -962,6 +998,7 @@ default_temperature = 0.7
             autonomy: AutonomyConfig::default(),
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
+            model_routes: Vec::new(),
             heartbeat: HeartbeatConfig::default(),
             channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),

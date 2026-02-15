@@ -73,10 +73,12 @@ pub async fn run(
         .or(config.default_model.as_deref())
         .unwrap_or("anthropic/claude-sonnet-4-20250514");
 
-    let provider: Box<dyn Provider> = providers::create_resilient_provider(
+    let provider: Box<dyn Provider> = providers::create_routed_provider(
         provider_name,
         config.api_key.as_deref(),
         &config.reliability,
+        &config.model_routes,
+        model_name,
     )?;
 
     observer.record_event(&ObserverEvent::AgentStart {

@@ -5,6 +5,7 @@ pub mod ollama;
 pub mod openai;
 pub mod openrouter;
 pub mod reliable;
+pub mod router;
 pub mod traits;
 
 pub use traits::Provider;
@@ -153,7 +154,7 @@ fn resolve_api_key(name: &str, api_key: Option<&str>) -> Option<String> {
 /// Factory: create the right provider from config
 #[allow(clippy::too_many_lines)]
 pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<dyn Provider>> {
-    let resolved_key = resolve_api_key(name, api_key);
+    let _resolved_key = resolve_api_key(name, api_key);
     match name {
         // ── Primary providers (custom implementations) ───────
         "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(api_key))),
@@ -313,6 +314,71 @@ pub fn create_resilient_provider(
         providers,
         reliability.provider_retries,
         reliability.provider_backoff_ms,
+    )))
+}
+
+/// Create a RouterProvider if model routes are configured, otherwise return a
+/// standard resilient provider. The router wraps individual providers per route,
+/// each with its own retry/fallback chain.
+pub fn create_routed_provider(
+    primary_name: &str,
+    api_key: Option<&str>,
+    reliability: &crate::config::ReliabilityConfig,
+    model_routes: &[crate::config::ModelRouteConfig],
+    default_model: &str,
+) -> anyhow::Result<Box<dyn Provider>> {
+    if model_routes.is_empty() {
+        return create_resilient_provider(primary_name, api_key, reliability);
+    }
+
+    // Collect unique provider names needed
+    let mut needed: Vec<String> = vec![primary_name.to_string()];
+    for route in model_routes {
+        if !needed.iter().any(|n| n == &route.provider) {
+            needed.push(route.provider.clone());
+        }
+    }
+
+    // Create each provider (with its own resilience wrapper)
+    let mut providers: Vec<(String, Box<dyn Provider>)> = Vec::new();
+    for name in &needed {
+        let key = model_routes
+            .iter()
+            .find(|r| &r.provider == name)
+            .and_then(|r| r.api_key.as_deref())
+            .or(api_key);
+        match create_resilient_provider(name, key, reliability) {
+            Ok(provider) => providers.push((name.clone(), provider)),
+            Err(e) => {
+                if name == primary_name {
+                    return Err(e);
+                }
+                tracing::warn!(
+                    provider = name.as_str(),
+                    "Ignoring routed provider that failed to create: {e}"
+                );
+            }
+        }
+    }
+
+    // Build route table
+    let routes: Vec<(String, router::Route)> = model_routes
+        .iter()
+        .map(|r| {
+            (
+                r.hint.clone(),
+                router::Route {
+                    provider_name: r.provider.clone(),
+                    model: r.model.clone(),
+                },
+            )
+        })
+        .collect();
+
+    Ok(Box::new(router::RouterProvider::new(
+        providers,
+        routes,
+        default_model.to_string(),
     )))
 }
 
