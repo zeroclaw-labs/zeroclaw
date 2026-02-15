@@ -34,7 +34,11 @@
 /// ```
 pub fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     match s.char_indices().nth(max_chars) {
-        Some((idx, _)) => format!("{}...", &s[..idx]),
+        Some((idx, _)) => {
+            let truncated = &s[..idx];
+            // Trim trailing whitespace for cleaner output
+            format!("{}...", truncated.trim_end())
+        }
         None => s.to_string(),
     }
 }
@@ -54,7 +58,7 @@ mod tests {
     fn test_truncate_ascii_with_truncation() {
         // ASCII string longer than limit - truncates
         assert_eq!(truncate_with_ellipsis("hello world", 5), "hello...");
-        assert_eq!(truncate_with_ellipsis("This is a long message", 10), "This is a ...");
+        assert_eq!(truncate_with_ellipsis("This is a long message", 10), "This is a...");
     }
 
     #[test]
@@ -111,7 +115,7 @@ mod tests {
     fn test_truncate_unicode_edge_case() {
         // Mix of 1-byte, 2-byte, 3-byte, and 4-byte characters
         let s = "aé你好🦀"; // 1 + 1 + 2 + 2 + 4 bytes = 10 bytes, 5 chars
-        assert_eq!(truncate_with_ellipsis(s, 3), "aé你好...");
+        assert_eq!(truncate_with_ellipsis(s, 3), "aé你...");
     }
 
     #[test]
