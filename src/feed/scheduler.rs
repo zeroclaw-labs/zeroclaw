@@ -200,6 +200,7 @@ impl FeedScheduler {
                                     "feedId": feed_id_owned.as_str(),
                                     "feedName": feed_id_owned.as_str(),
                                     "inserted": result.items.len(),
+                                    "tenantId": tenant_id_owned.as_str(),
                                 }),
                             );
                         } else {
@@ -209,6 +210,7 @@ impl FeedScheduler {
                                     "feedId": feed_id_owned.as_str(),
                                     "feedName": feed_id_owned.as_str(),
                                     "error": result.error.clone().unwrap_or_else(|| "feed execution failed".to_string()),
+                                    "tenantId": tenant_id_owned.as_str(),
                                 }),
                             );
                         }
@@ -221,6 +223,7 @@ impl FeedScheduler {
                                         "feedId": feed_id_owned.as_str(),
                                         "title": item.title,
                                         "cardType": format!("{:?}", item.card_type),
+                                        "tenantId": tenant_id_owned.as_str(),
                                     }),
                                 );
                             }
@@ -258,6 +261,7 @@ impl FeedScheduler {
                                 "feedId": feed_id_owned.as_str(),
                                 "feedName": feed_id_owned.as_str(),
                                 "error": e.to_string(),
+                                "tenantId": tenant_id_owned.as_str(),
                             }),
                         );
                         tracing::warn!(

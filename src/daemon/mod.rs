@@ -1,8 +1,10 @@
 use crate::config::Config;
+use crate::status_events;
 use anyhow::Result;
 use chrono::Utc;
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 
@@ -16,6 +18,8 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         .max(initial_backoff);
 
     crate::health::mark_component_ok("daemon");
+
+    wire_cron_bridge_hooks(&config)?;
 
     if config.heartbeat.enabled {
         let _ =
@@ -84,9 +88,22 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         ));
     }
 
+    {
+        let feed_cfg = config.clone();
+        handles.push(spawn_component_supervisor(
+            "feed-scheduler",
+            initial_backoff,
+            max_backoff,
+            move || {
+                let cfg = feed_cfg.clone();
+                async move { run_feed_scheduler_worker(cfg).await }
+            },
+        ));
+    }
+
     println!("🧠 Aria daemon started");
     println!("   Gateway:  http://{host}:{port}");
-    println!("   Components: gateway, channels, heartbeat, scheduler");
+    println!("   Components: gateway, channels, heartbeat, scheduler, feed-scheduler");
     println!("   Ctrl+C to stop");
 
     tokio::signal::ctrl_c().await?;
@@ -181,6 +198,13 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
 
     loop {
         interval.tick().await;
+        status_events::emit(
+            "heartbeat.tick",
+            serde_json::json!({
+                "tenantId": "dev-tenant",
+                "intervalMinutes": interval_mins,
+            }),
+        );
 
         let tasks = engine.collect_tasks().await?;
         if tasks.is_empty() {
@@ -194,8 +218,98 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             {
                 crate::health::mark_component_error("heartbeat", e.to_string());
                 tracing::warn!("Heartbeat task failed: {e}");
+                status_events::emit(
+                    "heartbeat.task.failed",
+                    serde_json::json!({
+                        "tenantId": "dev-tenant",
+                        "task": task,
+                        "error": e.to_string(),
+                    }),
+                );
             } else {
                 crate::health::mark_component_ok("heartbeat");
+                status_events::emit(
+                    "heartbeat.task.completed",
+                    serde_json::json!({
+                        "tenantId": "dev-tenant",
+                        "task": task,
+                    }),
+                );
+            }
+        }
+    }
+}
+
+fn wire_cron_bridge_hooks(config: &Config) -> Result<()> {
+    let aria_db = crate::aria::db::AriaDb::open(&config.workspace_dir.join("aria.db"))?;
+    let add_cfg = config.clone();
+    let remove_cfg = config.clone();
+
+    let add_job: crate::aria::cron_bridge::AddJobFn = Arc::new(move |expr, command| {
+        let job = crate::cron::add_job(&add_cfg, expr, command)?;
+        Ok(crate::aria::cron_bridge::CronJobHandle { id: job.id })
+    });
+    let remove_job: crate::aria::cron_bridge::RemoveJobFn = Arc::new(move |job_id| {
+        crate::cron::remove_job(&remove_cfg, job_id)
+    });
+
+    let bridge = Arc::new(crate::aria::cron_bridge::CronBridge::new(
+        aria_db, add_job, remove_job,
+    ));
+    bridge.sync_all()?;
+
+    let on_uploaded = bridge.clone();
+    let on_deleted = bridge.clone();
+    crate::aria::hooks::set_cron_hooks(crate::aria::hooks::CronHooks {
+        on_cron_uploaded: Some(Box::new(move |cron_id| {
+            if let Err(e) = on_uploaded.sync_cron(cron_id) {
+                tracing::warn!("Failed to sync cron '{cron_id}' after upload: {e}");
+            }
+        })),
+        on_cron_deleted: Some(Box::new(move |cron_id| {
+            if let Err(e) = on_deleted.remove_cron(cron_id) {
+                tracing::warn!("Failed to remove cron '{cron_id}' after delete: {e}");
+            }
+        })),
+    });
+
+    Ok(())
+}
+
+async fn run_feed_scheduler_worker(config: Config) -> Result<()> {
+    let db = crate::aria::db::AriaDb::open(&config.workspace_dir.join("aria.db"))?;
+    let scheduler = crate::feed::scheduler::FeedScheduler::new(
+        db.clone(),
+        crate::feed::executor::FeedExecutor::new(db),
+    );
+    scheduler.start().await?;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(String, bool)>();
+    crate::aria::hooks::set_feed_hooks(crate::aria::hooks::FeedHooks {
+        on_feed_uploaded: Some(Box::new({
+            let tx = tx.clone();
+            move |feed_id| {
+                let _ = tx.send((feed_id.to_string(), true));
+            }
+        })),
+        on_feed_deleted: Some(Box::new(move |feed_id| {
+            let _ = tx.send((feed_id.to_string(), false));
+        })),
+    });
+
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+    loop {
+        tokio::select! {
+            maybe_evt = rx.recv() => {
+                if let Some((feed_id, uploaded)) = maybe_evt {
+                    if uploaded {
+                        scheduler.sync_feed(&feed_id).await?;
+                    } else {
+                        scheduler.remove_feed(&feed_id);
+                    }
+                }
+            }
+            _ = heartbeat.tick() => {
+                crate::health::mark_component_ok("feed-scheduler");
             }
         }
     }

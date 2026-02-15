@@ -38,6 +38,9 @@ pub struct CronJobHandle {
     pub id: String,
 }
 
+/// Internal command marker for Aria cron-function jobs stored in `cron_jobs`.
+pub const ARIA_CRON_COMMAND_PREFIX: &str = "__ARIA_CRON__:";
+
 /// Callback type for adding a cron job to the runtime system.
 /// Takes (cron_expression, command) and returns the created job handle.
 pub type AddJobFn = Arc<dyn Fn(&str, &str) -> Result<CronJobHandle> + Send + Sync>;
@@ -312,40 +315,7 @@ pub fn schedule_to_cron_expression(kind: &str, data: &str) -> Result<String> {
 ///
 /// The command encodes the payload as an afw agent invocation.
 fn build_cron_command(entry: &AriaCronFunctionEntry) -> String {
-    match entry.payload_kind.as_str() {
-        "systemEvent" => {
-            let text = serde_json::from_str::<serde_json::Value>(&entry.payload_data)
-                .ok()
-                .and_then(|v| v["text"].as_str().map(String::from))
-                .unwrap_or_else(|| entry.payload_data.clone());
-            format!(
-                "afw agent -m \"[cron:{}] {}\"",
-                entry.name,
-                text.replace('"', "\\\"")
-            )
-        }
-        "agentTurn" => {
-            let payload = serde_json::from_str::<serde_json::Value>(&entry.payload_data)
-                .unwrap_or_default();
-            let message = payload["message"]
-                .as_str()
-                .unwrap_or("cron trigger");
-            let mut cmd = format!(
-                "afw agent -m \"{}\"",
-                message.replace('"', "\\\"")
-            );
-            if let Some(model) = payload["model"].as_str() {
-                cmd.push_str(&format!(" --model {model}"));
-            }
-            cmd
-        }
-        _ => {
-            format!(
-                "afw agent -m \"[cron:{}] trigger\"",
-                entry.name
-            )
-        }
-    }
+    format!("{ARIA_CRON_COMMAND_PREFIX}{}", entry.id)
 }
 
 #[cfg(test)]
@@ -488,9 +458,7 @@ mod tests {
         };
 
         let cmd = build_cron_command(&entry);
-        assert!(cmd.contains("afw agent -m"));
-        assert!(cmd.contains("Good morning!"));
-        assert!(cmd.contains("[cron:morning-check]"));
+        assert_eq!(cmd, format!("{ARIA_CRON_COMMAND_PREFIX}{}", entry.id));
     }
 
     #[test]
@@ -516,8 +484,7 @@ mod tests {
         };
 
         let cmd = build_cron_command(&entry);
-        assert!(cmd.contains("afw agent -m"));
-        assert!(cmd.contains("Generate daily report"));
+        assert_eq!(cmd, format!("{ARIA_CRON_COMMAND_PREFIX}{}", entry.id));
         assert!(cmd.contains("--model claude-3"));
     }
 

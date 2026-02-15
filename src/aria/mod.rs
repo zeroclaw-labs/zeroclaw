@@ -18,9 +18,7 @@ pub mod task_registry;
 pub mod team_registry;
 pub mod tool_registry;
 
-// cron_bridge depends on crate::cron which references binary-only modules (CronCommands, health).
-// It is available in the binary crate but not in the library crate.
-// pub mod cron_bridge;
+pub mod cron_bridge;
 pub mod hooks;
 
 use db::AriaDb;

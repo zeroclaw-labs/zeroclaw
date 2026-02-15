@@ -173,7 +173,7 @@ impl AriaCronFunctionRegistry {
                     "UPDATE aria_cron_functions SET description=?1, schedule_kind=?2,
                      schedule_data=?3, session_target=?4, wake_mode=?5, payload_kind=?6,
                      payload_data=?7, isolation=?8, enabled=?9, delete_after_run=?10,
-                     updated_at=?11 WHERE id=?12",
+                     status='active', cron_job_id=NULL, updated_at=?11 WHERE id=?12",
                     params![
                         description,
                         schedule_kind,
@@ -202,6 +202,8 @@ impl AriaCronFunctionRegistry {
                 isolation: isolation.map(String::from),
                 enabled,
                 delete_after_run,
+                status: "active".to_string(),
+                cron_job_id: None,
                 updated_at: now,
                 ..entry
             };

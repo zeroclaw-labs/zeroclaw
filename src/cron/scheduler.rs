@@ -2,12 +2,23 @@ use crate::config::Config;
 use crate::cron::{due_jobs, reschedule_after_run, CronJob};
 use crate::security::SecurityPolicy;
 use crate::status_events;
+use crate::{agent, aria};
 use anyhow::Result;
 use chrono::Utc;
+use rusqlite::params;
+use serde_json::Value;
 use tokio::process::Command;
 use tokio::time::{self, Duration};
 
 const MIN_POLL_SECONDS: u64 = 5;
+
+#[derive(Debug, Clone)]
+struct JobRunOutcome {
+    success: bool,
+    output: String,
+    tenant_id: Option<String>,
+    remove_after_run: bool,
+}
 
 pub async fn run(config: Config) -> Result<()> {
     let poll_secs = config.reliability.scheduler_poll_secs.max(MIN_POLL_SECONDS);
@@ -30,13 +41,15 @@ pub async fn run(config: Config) -> Result<()> {
 
         for job in jobs {
             crate::health::mark_component_ok("scheduler");
-            let (success, output) = execute_job_with_retry(&config, &security, &job).await;
-            if success {
+            let outcome = execute_job_with_retry(&config, &security, &job).await;
+            let tenant = outcome.tenant_id.clone();
+            if outcome.success {
                 status_events::emit(
                     "cron.completed",
                     serde_json::json!({
                         "jobId": job.id,
-                        "summary": output.lines().next().unwrap_or("ok"),
+                        "summary": outcome.output.lines().next().unwrap_or("ok"),
+                        "tenantId": tenant,
                     }),
                 );
             } else {
@@ -44,16 +57,22 @@ pub async fn run(config: Config) -> Result<()> {
                     "cron.failed",
                     serde_json::json!({
                         "jobId": job.id,
-                        "error": output,
+                        "error": outcome.output,
+                        "tenantId": tenant,
                     }),
                 );
             }
 
-            if !success {
+            if !outcome.success {
                 crate::health::mark_component_error("scheduler", format!("job {} failed", job.id));
             }
 
-            if let Err(e) = reschedule_after_run(&config, &job, success, &output) {
+            if outcome.remove_after_run {
+                if let Err(e) = crate::cron::remove_job(&config, &job.id) {
+                    crate::health::mark_component_error("scheduler", e.to_string());
+                    tracing::warn!("Failed to remove one-shot cron job {}: {e}", job.id);
+                }
+            } else if let Err(e) = reschedule_after_run(&config, &job, outcome.success, &outcome.output) {
                 crate::health::mark_component_error("scheduler", e.to_string());
                 tracing::warn!("Failed to persist scheduler run result: {e}");
             }
@@ -65,22 +84,27 @@ async fn execute_job_with_retry(
     config: &Config,
     security: &SecurityPolicy,
     job: &CronJob,
-) -> (bool, String) {
-    let mut last_output = String::new();
+) -> JobRunOutcome {
+    let mut last = JobRunOutcome {
+        success: false,
+        output: String::new(),
+        tenant_id: None,
+        remove_after_run: false,
+    };
     let retries = config.reliability.scheduler_retries;
     let mut backoff_ms = config.reliability.provider_backoff_ms.max(200);
 
     for attempt in 0..=retries {
-        let (success, output) = run_job_command(config, security, job).await;
-        last_output = output;
+        let outcome = run_job_command(config, security, job).await;
+        last = outcome.clone();
 
-        if success {
-            return (true, last_output);
+        if outcome.success || outcome.remove_after_run {
+            return outcome;
         }
 
-        if last_output.starts_with("blocked by security policy:") {
+        if outcome.output.starts_with("blocked by security policy:") {
             // Deterministic policy violations are not retryable.
-            return (false, last_output);
+            return outcome;
         }
 
         if attempt < retries {
@@ -90,7 +114,7 @@ async fn execute_job_with_retry(
         }
     }
 
-    (false, last_output)
+    last
 }
 
 fn is_env_assignment(word: &str) -> bool {
@@ -155,22 +179,33 @@ async fn run_job_command(
     config: &Config,
     security: &SecurityPolicy,
     job: &CronJob,
-) -> (bool, String) {
+) -> JobRunOutcome {
+    if let Some(cron_func_id) = job
+        .command
+        .strip_prefix(aria::cron_bridge::ARIA_CRON_COMMAND_PREFIX)
+    {
+        return run_aria_cron_function(config, cron_func_id.trim()).await;
+    }
+
     if !security.is_command_allowed(&job.command) {
-        return (
-            false,
-            format!(
+        return JobRunOutcome {
+            success: false,
+            output: format!(
                 "blocked by security policy: command not allowed: {}",
                 job.command
             ),
-        );
+            tenant_id: None,
+            remove_after_run: false,
+        };
     }
 
     if let Some(path) = forbidden_path_argument(security, &job.command) {
-        return (
-            false,
-            format!("blocked by security policy: forbidden path argument: {path}"),
-        );
+        return JobRunOutcome {
+            success: false,
+            output: format!("blocked by security policy: forbidden path argument: {path}"),
+            tenant_id: None,
+            remove_after_run: false,
+        };
     }
 
     let output = Command::new("sh")
@@ -190,9 +225,181 @@ async fn run_job_command(
                 stdout.trim(),
                 stderr.trim()
             );
-            (output.status.success(), combined)
+            JobRunOutcome {
+                success: output.status.success(),
+                output: combined,
+                tenant_id: None,
+                remove_after_run: false,
+            }
         }
-        Err(e) => (false, format!("spawn error: {e}")),
+        Err(e) => JobRunOutcome {
+            success: false,
+            output: format!("spawn error: {e}"),
+            tenant_id: None,
+            remove_after_run: false,
+        },
+    }
+}
+
+fn payload_message(payload_kind: &str, payload_data: &str, name: &str) -> (String, Option<String>) {
+    let parsed: Value = serde_json::from_str(payload_data).unwrap_or_else(|_| Value::Null);
+    match payload_kind {
+        "systemEvent" => {
+            let text = parsed
+                .get("text")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| payload_data.to_string());
+            (format!("[Cron:{name}] {text}"), None)
+        }
+        "agentTurn" => {
+            let text = parsed
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("cron trigger")
+                .to_string();
+            let model = parsed.get("model").and_then(Value::as_str).map(str::to_owned);
+            (text, model)
+        }
+        _ => (format!("[Cron:{name}] trigger"), None),
+    }
+}
+
+fn append_heartbeat_task(workspace_dir: &std::path::Path, task: &str) -> Result<()> {
+    let heartbeat_path = workspace_dir.join("HEARTBEAT.md");
+    if !heartbeat_path.exists() {
+        std::fs::write(
+            &heartbeat_path,
+            "# Periodic Tasks\n\n# Add tasks below (one per line, starting with `- `)\n",
+        )?;
+    }
+    let mut content = std::fs::read_to_string(&heartbeat_path).unwrap_or_default();
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str("- ");
+    content.push_str(task);
+    content.push('\n');
+    std::fs::write(&heartbeat_path, content)?;
+    Ok(())
+}
+
+fn consume_delete_after_run(config: &Config, cron_func_id: &str) -> Result<()> {
+    let db = aria::db::AriaDb::open(&config.workspace_dir.join("aria.db"))?;
+    let now = Utc::now().to_rfc3339();
+    db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE aria_cron_functions
+             SET enabled = 0, status = 'consumed', cron_job_id = NULL, updated_at = ?1
+             WHERE id = ?2",
+            params![now, cron_func_id],
+        )?;
+        Ok(())
+    })
+}
+
+async fn run_aria_cron_function(config: &Config, cron_func_id: &str) -> JobRunOutcome {
+    let db_path = config.workspace_dir.join("aria.db");
+    let db = match aria::db::AriaDb::open(&db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            return JobRunOutcome {
+                success: false,
+                output: format!("failed to open aria db: {e}"),
+                tenant_id: None,
+                remove_after_run: false,
+            }
+        }
+    };
+
+    let row = db.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT tenant_id, name, payload_kind, payload_data, wake_mode, enabled, status, delete_after_run
+             FROM aria_cron_functions WHERE id = ?1",
+        )?;
+        let found = stmt.query_row(params![cron_func_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, i64>(5)? != 0,
+                r.get::<_, String>(6)?,
+                r.get::<_, i64>(7)? != 0,
+            ))
+        });
+        match found {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    });
+
+    let Some((tenant_id, name, payload_kind, payload_data, wake_mode, enabled, status, delete_after_run)) =
+        row.unwrap_or(None)
+    else {
+        return JobRunOutcome {
+            success: true,
+            output: format!("cron function {cron_func_id} not found, removing orphaned job"),
+            tenant_id: None,
+            remove_after_run: true,
+        };
+    };
+
+    if !enabled || status != "active" {
+        return JobRunOutcome {
+            success: true,
+            output: format!("cron function {name} is disabled/inactive, removing job"),
+            tenant_id: Some(tenant_id),
+            remove_after_run: true,
+        };
+    }
+
+    let (message, model) = payload_message(&payload_kind, &payload_data, &name);
+
+    if wake_mode == "next-heartbeat" {
+        let summary = format!("[Cron:{name}] {message}");
+        match append_heartbeat_task(&config.workspace_dir, &summary) {
+            Ok(()) => {
+                if delete_after_run {
+                    let _ = consume_delete_after_run(config, cron_func_id);
+                }
+                JobRunOutcome {
+                    success: true,
+                    output: "queued for next heartbeat".to_string(),
+                    tenant_id: Some(tenant_id),
+                    remove_after_run: delete_after_run,
+                }
+            }
+            Err(e) => JobRunOutcome {
+                success: false,
+                output: format!("failed to queue heartbeat task: {e}"),
+                tenant_id: Some(tenant_id),
+                remove_after_run: false,
+            },
+        }
+    } else {
+        let temp = config.default_temperature;
+        match agent::run(config.clone(), Some(message), None, model, temp).await {
+            Ok(_) => {
+                if delete_after_run {
+                    let _ = consume_delete_after_run(config, cron_func_id);
+                }
+                JobRunOutcome {
+                    success: true,
+                    output: "ran immediately".to_string(),
+                    tenant_id: Some(tenant_id),
+                    remove_after_run: delete_after_run,
+                }
+            }
+            Err(e) => JobRunOutcome {
+                success: false,
+                output: format!("agent execution failed: {e}"),
+                tenant_id: Some(tenant_id),
+                remove_after_run: false,
+            },
+        }
     }
 }
 
@@ -229,10 +436,10 @@ mod tests {
         let job = test_job("echo scheduler-ok");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) = run_job_command(&config, &security, &job).await;
-        assert!(success);
-        assert!(output.contains("scheduler-ok"));
-        assert!(output.contains("status=exit status: 0"));
+        let outcome = run_job_command(&config, &security, &job).await;
+        assert!(outcome.success);
+        assert!(outcome.output.contains("scheduler-ok"));
+        assert!(outcome.output.contains("status=exit status: 0"));
     }
 
     #[tokio::test]
@@ -242,10 +449,12 @@ mod tests {
         let job = test_job("ls definitely_missing_file_for_scheduler_test");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) = run_job_command(&config, &security, &job).await;
-        assert!(!success);
-        assert!(output.contains("definitely_missing_file_for_scheduler_test"));
-        assert!(output.contains("status=exit status:"));
+        let outcome = run_job_command(&config, &security, &job).await;
+        assert!(!outcome.success);
+        assert!(outcome
+            .output
+            .contains("definitely_missing_file_for_scheduler_test"));
+        assert!(outcome.output.contains("status=exit status:"));
     }
 
     #[tokio::test]
@@ -256,9 +465,9 @@ mod tests {
         let job = test_job("curl https://evil.example");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) = run_job_command(&config, &security, &job).await;
-        assert!(!success);
-        assert!(output.contains("blocked by security policy"));
+        let outcome = run_job_command(&config, &security, &job).await;
+        assert!(!outcome.success);
+        assert!(outcome.output.contains("blocked by security policy"));
         assert!(output.contains("command not allowed"));
     }
 

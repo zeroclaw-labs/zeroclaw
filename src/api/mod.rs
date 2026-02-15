@@ -101,9 +101,15 @@ fn extract_route_context(
         ));
     }
 
-    // Extract tenant_id from token. Format: "tenant_id:secret" or just use as tenant_id
-    let tenant_id = if let Some((tid, _)) = token.split_once(':') {
-        tid.to_string()
+    // Normalize tenant identity to match gateway token resolution.
+    let tenant_id = if token.starts_with("zc_") {
+        "dev-tenant".to_string()
+    } else if let Some((tid, _)) = token.split_once(':') {
+        if tid == "tenant" {
+            "dev-tenant".to_string()
+        } else {
+            tid.to_string()
+        }
     } else {
         token.to_string()
     };
@@ -1259,6 +1265,17 @@ async fn crons_delete(
     };
 
     let result = state.db.with_conn(|conn| {
+        let exists: Option<String> = conn
+            .query_row(
+                "SELECT id FROM aria_cron_functions WHERE id = ?1 AND tenant_id = ?2",
+                rusqlite::params![id, ctx.tenant_id],
+                |row| row.get(0),
+            )
+            .ok();
+        if exists.is_none() {
+            anyhow::bail!("Cron function not found");
+        }
+        crate::aria::hooks::notify_cron_deleted(&id);
         let changed = conn.execute(
             "DELETE FROM aria_cron_functions WHERE id = ?1 AND tenant_id = ?2",
             rusqlite::params![id, ctx.tenant_id],
@@ -1266,7 +1283,6 @@ async fn crons_delete(
         if changed == 0 {
             anyhow::bail!("Cron function not found");
         }
-        crate::aria::hooks::notify_cron_deleted(&id);
         Ok(())
     });
 
@@ -1883,7 +1899,9 @@ async fn bulk_upload(
                                 display: display.as_deref(),
                                 sandbox_config: sandbox.as_deref(),
                             })
-                            .map(|_| ())
+                            .map(|entry| {
+                                crate::aria::hooks::notify_feed_uploaded(&entry.id);
+                            })
                     }
                     Err(e) => Err(anyhow::anyhow!("Invalid feed payload: {e}")),
                 }
@@ -1913,7 +1931,9 @@ async fn bulk_upload(
                                 v.enabled.unwrap_or(true),
                                 v.delete_after_run.unwrap_or(false),
                             )
-                            .map(|_| ())
+                            .map(|entry| {
+                                crate::aria::hooks::notify_cron_uploaded(&entry.id);
+                            })
                     }
                     Err(e) => Err(anyhow::anyhow!("Invalid cron payload: {e}")),
                 }
