@@ -56,6 +56,8 @@ fn spawn_supervised_listener(
                 Ok(()) => {
                     tracing::warn!("Channel {} exited unexpectedly; restarting", ch.name());
                     crate::health::mark_component_error(&component, "listener exited unexpectedly");
+                    // Clean exit — reset backoff since the listener ran successfully
+                    backoff = initial_backoff_secs.max(1);
                 }
                 Err(e) => {
                     tracing::error!("Channel {} error: {e}; restarting", ch.name());
@@ -65,6 +67,7 @@ fn spawn_supervised_listener(
 
             crate::health::bump_component_restart(&component);
             tokio::time::sleep(Duration::from_secs(backoff)).await;
+            // Double backoff AFTER sleeping so first error uses initial_backoff
             backoff = backoff.saturating_mul(2).min(max_backoff);
         }
     })
