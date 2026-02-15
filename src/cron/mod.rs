@@ -281,9 +281,11 @@ mod tests {
     use tempfile::TempDir;
 
     fn test_config(tmp: &TempDir) -> Config {
-        let mut config = Config::default();
-        config.workspace_dir = tmp.path().join("workspace");
-        config.config_path = tmp.path().join("config.toml");
+        let config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         config
     }

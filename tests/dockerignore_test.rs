@@ -84,9 +84,8 @@ fn pattern_matches(pattern: &str, path: &str) -> bool {
 fn is_excluded(patterns: &[String], path: &str) -> bool {
     let mut excluded = false;
     for pattern in patterns {
-        if pattern.starts_with('!') {
+        if let Some(negated) = pattern.strip_prefix('!') {
             // Negation pattern - re-include
-            let negated = &pattern[1..];
             if pattern_matches(negated, path) {
                 excluded = false;
             }

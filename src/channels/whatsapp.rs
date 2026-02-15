@@ -294,7 +294,7 @@ mod tests {
         assert_eq!(msgs[0].sender, "+1234567890");
         assert_eq!(msgs[0].content, "Hello ZeroClaw!");
         assert_eq!(msgs[0].channel, "whatsapp");
-        assert_eq!(msgs[0].timestamp, 1699999999);
+        assert_eq!(msgs[0].timestamp, 1_699_999_999);
     }
 
     #[test]

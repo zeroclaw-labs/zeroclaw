@@ -272,7 +272,7 @@ fn build_windows_icacls_grant_arg(username: &str) -> Option<String> {
 /// Hex-decode a hex string to bytes.
 #[allow(clippy::manual_is_multiple_of)]
 fn hex_decode(hex: &str) -> Result<Vec<u8>> {
-    if hex.len() % 2 != 0 {
+    if (hex.len() & 1) != 0 {
         anyhow::bail!("Hex string has odd length");
     }
     (0..hex.len())
