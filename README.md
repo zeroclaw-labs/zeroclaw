@@ -5,7 +5,8 @@
 <h1 align="center">ZeroClaw 🦀</h1>
 
 <p align="center">
-  <strong>Zero overhead. Zero compromise. 100% Rust. 100% Agnostic.</strong>
+  <strong>Zero overhead. Zero compromise. 100% Rust. 100% Agnostic.</strong><br>
+  ⚡️ <strong>Runs on $10 hardware with <10MB RAM: That's 99% less memory than OpenClaw and 98% cheaper than a Mac mini!</strong>
 </p>
 
 <p align="center">
@@ -17,6 +18,13 @@ Fast, small, and fully autonomous AI assistant infrastructure — deploy anywher
 ```
 ~3.4MB binary · <10ms startup · 1,017 tests · 22+ providers · 8 traits · Pluggable everything
 ```
+
+### ✨ Features
+
+- 🏎️ **Ultra-Lightweight:** <10MB Memory footprint — 99% smaller than OpenClaw core.
+- 💰 **Minimal Cost:** Efficient enough to run on $10 Hardware — 98% cheaper than a Mac mini.
+- ⚡ **Lightning Fast:** 400X Faster startup time, boot in <10ms (under 1s even on 0.6GHz cores).
+- 🌍 **True Portability:** Single self-contained binary across ARM, x86, and RISC-V.
 
 ### Why teams pick ZeroClaw
 
@@ -38,6 +46,10 @@ Local machine quick benchmark (macOS arm64, Feb 2026), same host, 3 runs each.
 | `status` max RSS observed | **~7.8 MB** | **~1.52 GB** |
 
 > Notes: measured with `/usr/bin/time -l`; first run includes cold-start effects. OpenClaw results were measured after `pnpm install` + `pnpm build`.
+
+<p align="center">
+  <img src="zero-claw.jpeg" alt="ZeroClaw vs OpenClaw Comparison" width="800" />
+</p>
 
 Reproduce ZeroClaw numbers locally:
 
