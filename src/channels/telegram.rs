@@ -376,11 +376,21 @@ impl Channel for TelegramChannel {
             "parse_mode": "Markdown"
         });
 
-        self.client
+        let resp = self
+            .client
             .post(self.api_url("sendMessage"))
             .json(&body)
             .send()
             .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+            anyhow::bail!("Telegram sendMessage failed ({status}): {err}");
+        }
 
         Ok(())
     }

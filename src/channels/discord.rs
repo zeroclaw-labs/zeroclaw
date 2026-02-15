@@ -87,12 +87,22 @@ impl Channel for DiscordChannel {
         let url = format!("https://discord.com/api/v10/channels/{channel_id}/messages");
         let body = json!({ "content": message });
 
-        self.client
+        let resp = self
+            .client
             .post(&url)
             .header("Authorization", format!("Bot {}", self.bot_token))
             .json(&body)
             .send()
             .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+            anyhow::bail!("Discord send message failed ({status}): {err}");
+        }
 
         Ok(())
     }
