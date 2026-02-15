@@ -251,9 +251,22 @@ pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<
             )))
         }
 
+        // ── Anthropic-compatible custom endpoints ───────────
+        // Format: "anthropic-custom:https://your-api.com"
+        name if name.starts_with("anthropic-custom:") => {
+            let base_url = name.strip_prefix("anthropic-custom:").unwrap_or("");
+            if base_url.is_empty() {
+                anyhow::bail!("Anthropic-custom provider requires a URL. Format: anthropic-custom:https://your-api.com");
+            }
+            Ok(Box::new(anthropic::AnthropicProvider::with_base_url(
+                api_key, Some(base_url),
+            )))
+        }
+
         _ => anyhow::bail!(
             "Unknown provider: {name}. Check README for supported providers or run `zeroclaw onboard --interactive` to reconfigure.\n\
-             Tip: Use \"custom:https://your-api.com\" for any OpenAI-compatible endpoint."
+             Tip: Use \"custom:https://your-api.com\" for OpenAI-compatible endpoints.\n\
+             Tip: Use \"anthropic-custom:https://your-api.com\" for Anthropic-compatible endpoints."
         ),
     }
 }
@@ -486,6 +499,37 @@ mod tests {
                 "Expected 'requires a URL', got: {e}"
             ),
             Ok(_) => panic!("Expected error for empty custom URL"),
+        }
+    }
+
+    // ── Anthropic-compatible custom endpoints ─────────────────
+
+    #[test]
+    fn factory_anthropic_custom_url() {
+        let p = create_provider("anthropic-custom:https://api.example.com", Some("key"));
+        assert!(p.is_ok());
+    }
+
+    #[test]
+    fn factory_anthropic_custom_trailing_slash() {
+        let p = create_provider("anthropic-custom:https://api.example.com/", Some("key"));
+        assert!(p.is_ok());
+    }
+
+    #[test]
+    fn factory_anthropic_custom_no_key() {
+        let p = create_provider("anthropic-custom:https://api.example.com", None);
+        assert!(p.is_ok());
+    }
+
+    #[test]
+    fn factory_anthropic_custom_empty_url_errors() {
+        match create_provider("anthropic-custom:", None) {
+            Err(e) => assert!(
+                e.to_string().contains("requires a URL"),
+                "Expected 'requires a URL', got: {e}"
+            ),
+            Ok(_) => panic!("Expected error for empty anthropic-custom URL"),
         }
     }
 

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 pub struct AnthropicProvider {
     credential: Option<String>,
+    base_url: String,
     client: Client,
 }
 
@@ -36,11 +37,20 @@ struct ContentBlock {
 
 impl AnthropicProvider {
     pub fn new(api_key: Option<&str>) -> Self {
+        Self::with_base_url(api_key, None)
+    }
+
+    pub fn with_base_url(api_key: Option<&str>, base_url: Option<&str>) -> Self {
+        let base_url = base_url
+            .map(|u| u.trim_end_matches('/'))
+            .unwrap_or("https://api.anthropic.com")
+            .to_string();
         Self {
             credential: api_key
                 .map(str::trim)
                 .filter(|k| !k.is_empty())
                 .map(ToString::to_string),
+            base_url,
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
                 .connect_timeout(std::time::Duration::from_secs(10))
@@ -82,7 +92,7 @@ impl Provider for AnthropicProvider {
 
         let mut request = self
             .client
-            .post("https://api.anthropic.com/v1/messages")
+            .post(format!("{}/v1/messages", self.base_url))
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
             .json(&request);
@@ -119,12 +129,14 @@ mod tests {
         let p = AnthropicProvider::new(Some("sk-ant-test123"));
         assert!(p.credential.is_some());
         assert_eq!(p.credential.as_deref(), Some("sk-ant-test123"));
+        assert_eq!(p.base_url, "https://api.anthropic.com");
     }
 
     #[test]
     fn creates_without_key() {
         let p = AnthropicProvider::new(None);
         assert!(p.credential.is_none());
+        assert_eq!(p.base_url, "https://api.anthropic.com");
     }
 
     #[test]
@@ -138,6 +150,25 @@ mod tests {
         let p = AnthropicProvider::new(Some("  sk-ant-test123  "));
         assert!(p.credential.is_some());
         assert_eq!(p.credential.as_deref(), Some("sk-ant-test123"));
+    }
+
+    #[test]
+    fn creates_with_custom_base_url() {
+        let p = AnthropicProvider::with_base_url(Some("sk-ant-test"), Some("https://api.example.com"));
+        assert_eq!(p.base_url, "https://api.example.com");
+        assert_eq!(p.credential.as_deref(), Some("sk-ant-test"));
+    }
+
+    #[test]
+    fn custom_base_url_trims_trailing_slash() {
+        let p = AnthropicProvider::with_base_url(None, Some("https://api.example.com/"));
+        assert_eq!(p.base_url, "https://api.example.com");
+    }
+
+    #[test]
+    fn default_base_url_when_none_provided() {
+        let p = AnthropicProvider::with_base_url(None, None);
+        assert_eq!(p.base_url, "https://api.anthropic.com");
     }
 
     #[tokio::test]
