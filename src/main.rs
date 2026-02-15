@@ -19,6 +19,7 @@ mod aria;
 mod channels;
 mod config;
 mod cron;
+mod dashboard;
 mod daemon;
 mod doctor;
 mod events;

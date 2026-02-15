@@ -15,14 +15,15 @@ use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use anyhow::Result;
 use axum::{
     body::Bytes,
-    extract::{ws, Query, State, WebSocketUpgrade},
+    extract::{ws, Multipart, Path, Query, State, WebSocketUpgrade},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json},
-    routing::{get, post},
+    routing::{delete, get, patch, post, put},
     Router,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 
 /// Maximum request body size (64KB) — prevents memory exhaustion
@@ -37,6 +38,7 @@ pub struct AppState {
     pub model: String,
     pub temperature: f64,
     pub mem: Arc<dyn Memory>,
+    pub registry_db: crate::aria::db::AriaDb,
     pub auto_save: bool,
     pub webhook_secret: Option<Arc<str>>,
     pub pairing: Arc<PairingGuard>,
@@ -150,19 +152,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     crate::health::mark_component_ok("gateway");
 
-    // Build shared state
-    let state = AppState {
-        provider,
-        model,
-        temperature,
-        mem,
-        auto_save: config.memory.auto_save,
-        webhook_secret,
-        pairing,
-        whatsapp: whatsapp_channel,
-    };
-
-    // ── Aria Registry API ──────────────────────────────────────
+    // ── Aria Registry API + Dashboard Schema ───────────────────
     let aria_db_path = config.workspace_dir.join("aria.db");
     let aria_registries =
         crate::aria::initialize_aria_registries(&aria_db_path).unwrap_or_else(|e| {
@@ -171,7 +161,28 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             let db = crate::aria::db::AriaDb::open_in_memory().expect("fallback in-memory DB");
             std::sync::Arc::new(crate::aria::AriaRegistries::new(db))
         });
+    crate::dashboard::ensure_schema(&aria_registries.db)?;
+    if let Ok(src) = std::env::var("AFW_IMPORT_CLOUD_DB") {
+        let imported =
+            crate::dashboard::import_from_cloud_db(&aria_registries.db, std::path::Path::new(&src))?;
+        if imported > 0 {
+            tracing::info!(imported_tables = imported, source = %src, "Imported dashboard tables from cloud DB");
+        }
+    }
     let registry_api = crate::api::registry_router(aria_registries.db.clone());
+
+    // Build shared state
+    let state = AppState {
+        provider,
+        model,
+        temperature,
+        mem,
+        registry_db: aria_registries.db.clone(),
+        auto_save: config.memory.auto_save,
+        webhook_secret,
+        pairing,
+        whatsapp: whatsapp_channel,
+    };
 
     // Build router with middleware
     // Note: Body limit layer prevents memory exhaustion from oversized requests
@@ -180,11 +191,81 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/health", get(handle_health))
         .route("/pair", post(handle_pair))
         .route("/webhook", post(handle_webhook))
+        // Dashboard parity routes (cloud-compatible)
+        .route("/api/messages", post(api_send_message))
+        .route("/api/messages", get(api_list_messages))
+        .route("/api/chats", post(api_create_chat))
+        .route("/api/chats", get(api_list_chats))
+        .route("/api/chats/:chat_id/messages", get(api_get_chat_messages))
+        .route("/api/chats/:chat_id", delete(api_delete_chat))
+        .route("/api/chats/:chat_id/duplicate", post(api_duplicate_chat))
+        .route("/api/conversations", get(api_list_conversations))
+        .route("/api/approvals", get(api_list_approvals))
+        .route("/api/approvals", post(api_respond_approval))
+        .route("/api/sessions", get(api_list_sessions))
+        .route("/api/sessions/:key", patch(api_patch_session))
+        .route("/api/sessions/:key/reset", post(api_reset_session))
+        .route("/api/sessions/:key", delete(api_delete_session))
+        .route("/api/events", get(api_list_events))
+        .route("/api/nodes", get(api_list_nodes))
+        .route("/api/metrics", get(api_get_metrics))
+        .route("/api/status", get(api_get_status))
+        .route("/api/channels", get(api_list_channels))
+        .route("/api/channels/:id", patch(api_patch_channel))
+        .route("/api/channels/:id", delete(api_delete_channel))
+        .route("/api/cron", get(api_list_cron))
+        .route("/api/cron/:id", patch(api_patch_cron))
+        .route("/api/cron/:id", delete(api_delete_cron))
+        .route("/api/cron/:id/run", post(api_run_cron))
+        .route("/api/skills", get(api_list_skills))
+        .route("/api/skills/:id", patch(api_patch_skill))
+        .route("/api/config", get(api_get_config))
+        .route("/api/config", put(api_put_config))
+        .route("/api/tools", get(api_list_tools))
+        .route("/api/agents", get(api_list_agents))
+        .route("/api/teams", get(api_list_teams))
+        .route("/api/teams/:id", get(api_get_team))
+        .route("/api/pipelines", get(api_list_pipelines))
+        .route("/api/pipelines/:id", get(api_get_pipeline))
+        .route("/api/kv", get(api_list_kv))
+        .route("/api/kv/:key", get(api_get_kv))
+        .route("/api/containers", get(api_list_containers))
+        .route("/api/logs", get(api_list_logs))
+        .route("/api/api-keys", get(api_list_api_keys))
+        .route("/api/api-keys", post(api_create_api_key))
+        .route("/api/api-keys/:id", delete(api_revoke_api_key))
+        .route("/api/v1/auth/magic-number", post(api_create_magic_number))
+        .route("/api/v1/auth/magic-numbers", get(api_list_magic_numbers))
+        .route("/api/v1/auth/magic-number/:id", delete(api_revoke_magic_number))
+        .route("/api/billing", get(api_get_billing))
+        .route("/api/billing/usage", get(api_get_billing_usage))
+        .route("/api/billing/invoices", get(api_get_billing_invoices))
+        .route("/api/billing/payment-methods", get(api_get_billing_methods))
+        .route("/api/feeds", get(api_list_feeds))
+        .route("/api/feeds/:id", get(api_get_feed))
+        .route("/api/feeds/:id/items", get(api_list_feed_items))
+        .route("/api/feeds/:id", patch(api_patch_feed))
+        .route("/api/feed/files", get(api_list_feed_files))
+        .route("/api/feed/files", post(api_upload_feed_file))
+        .route("/api/feed/files/:file_id/content", get(api_get_feed_file_content))
+        .route("/api/feed/files/:file_id", delete(api_delete_feed_file))
+        .route("/api/tool-calls", get(api_list_tool_calls))
+        .route("/api/tool-calls/stats", get(api_tool_calls_stats))
+        .route("/api/tool-calls/:id", get(api_get_tool_call))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
         .route("/events", get(handle_events_ws))
+        .route("/ws/chat", get(handle_events_ws))
+        .route("/ws/status", get(handle_events_ws))
+        .route("/ws/logs", get(handle_events_ws))
         .with_state(state)
         .merge(registry_api)
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any),
+        )
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE));
 
     // Run the server
@@ -319,6 +400,1617 @@ async fn handle_webhook(
             (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
         }
     }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// DASHBOARD API (Cloud route parity)
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn api_ok<T: serde::Serialize>(data: T) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "success": true,
+            "data": data
+        })),
+    )
+}
+
+fn api_err(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        status,
+        Json(serde_json::json!({
+            "success": false,
+            "error": {
+                "code": format!("HTTP_{}", status.as_u16()),
+                "message": message.into()
+            }
+        })),
+    )
+}
+
+fn api_tenant(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    let auth = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let token = auth.strip_prefix("Bearer ").unwrap_or("");
+    if state.pairing.require_pairing() && !state.pairing.is_authenticated(token) {
+        return Err(api_err(
+            StatusCode::UNAUTHORIZED,
+            "Missing or invalid Authorization header. Use: Bearer <token>",
+        ));
+    }
+    if token.is_empty() {
+        return Ok("dev-tenant".to_string());
+    }
+    Ok(token
+        .split_once(':')
+        .map(|(t, _)| t.to_string())
+        .unwrap_or_else(|| token.to_string()))
+}
+
+fn iso_from_millis(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339())
+}
+
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+#[derive(serde::Deserialize)]
+struct ApiCreateChatBody {
+    title: Option<String>,
+    session_id: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct ApiSendMessageBody {
+    content: Option<String>,
+    message: Option<String>,
+    #[serde(rename = "sessionId")]
+    session_id: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct ApiApprovalBody {
+    action: Option<String>,
+    #[serde(rename = "requestId")]
+    request_id: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct ApiUpdateStatusBody {
+    status: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct ApiPatchChannelBody {
+    status: Option<String>,
+    name: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct ApiPatchSkillBody {
+    enabled: Option<bool>,
+}
+
+#[derive(serde::Deserialize)]
+struct ApiUpdateConfigBody {
+    gateway: Option<serde_json::Value>,
+    auth: Option<serde_json::Value>,
+    limits: Option<serde_json::Value>,
+}
+
+#[derive(serde::Deserialize)]
+struct ApiUpdateFeedBody {
+    status: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct ApiCreateKeyBody {
+    name: Option<String>,
+    scopes: Option<Vec<String>>,
+}
+
+#[derive(serde::Deserialize)]
+struct ListQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+async fn api_create_chat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ApiCreateChatBody>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let chat_id = uuid::Uuid::new_v4().to_string();
+    let now = now_ms();
+    let title = body.title.unwrap_or_else(|| "New Chat".to_string());
+    let session_id = body.session_id.unwrap_or_else(|| chat_id.clone());
+    let res = state.registry_db.with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO chats (id, tenant_id, title, preview, session_id, message_count, created_at, updated_at)
+             VALUES (?1, ?2, ?3, '', ?4, 0, ?5, ?5)",
+            rusqlite::params![chat_id, tenant, title, session_id, now],
+        )?;
+        Ok(())
+    });
+    if let Err(e) = res {
+        return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    }
+    api_ok(serde_json::json!({
+        "id": session_id,
+        "title": title,
+        "preview": "",
+        "messageCount": 0,
+        "createdAt": iso_from_millis(now),
+        "updatedAt": iso_from_millis(now),
+    }))
+}
+
+async fn api_send_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ApiSendMessageBody>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let content = body
+        .content
+        .or(body.message)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if content.is_empty() {
+        return api_err(StatusCode::BAD_REQUEST, "content is required");
+    }
+    let session_id = body
+        .session_id
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let now = now_ms();
+
+    // Ensure chat row exists
+    let _ = state.registry_db.with_conn(|conn| {
+        let exists: Option<String> = conn
+            .query_row(
+                "SELECT id FROM chats WHERE tenant_id=?1 AND session_id=?2 LIMIT 1",
+                rusqlite::params![tenant, session_id],
+                |row| row.get(0),
+            )
+            .ok();
+        if exists.is_none() {
+            let title = content.chars().take(64).collect::<String>();
+            conn.execute(
+                "INSERT INTO chats (id, tenant_id, title, preview, session_id, message_count, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, '', ?4, 0, ?5, ?5)",
+                rusqlite::params![uuid::Uuid::new_v4().to_string(), tenant, title, session_id, now],
+            )?;
+        }
+        Ok(())
+    });
+
+    let user_msg_id = uuid::Uuid::new_v4().to_string();
+    let _ = state.registry_db.with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO messages (id, tenant_id, chat_id, role, content, created_at)
+             VALUES (?1, ?2, ?3, 'user', ?4, ?5)",
+            rusqlite::params![user_msg_id, tenant, session_id, content, now],
+        )?;
+        Ok(())
+    });
+
+    let assistant_text = match state
+        .provider
+        .chat(&content, &state.model, state.temperature)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => format!("LLM error: {e}"),
+    };
+    let assistant_id = uuid::Uuid::new_v4().to_string();
+    let _ = state.registry_db.with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO messages (id, tenant_id, chat_id, role, content, created_at)
+             VALUES (?1, ?2, ?3, 'assistant', ?4, ?5)",
+            rusqlite::params![assistant_id, tenant, session_id, assistant_text, now_ms()],
+        )?;
+        conn.execute(
+            "UPDATE chats
+             SET preview=?1, message_count=(SELECT COUNT(*) FROM messages WHERE chat_id=?2 AND tenant_id=?3), updated_at=?4
+             WHERE session_id=?2 AND tenant_id=?3",
+            rusqlite::params![assistant_text.chars().take(140).collect::<String>(), session_id, tenant, now_ms()],
+        )?;
+        Ok(())
+    });
+
+    api_ok(serde_json::json!({
+        "id": assistant_id,
+        "role": "assistant",
+        "content": assistant_text,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    }))
+}
+
+async fn api_list_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ListQuery>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let limit = q.limit.unwrap_or(500) as i64;
+    let offset = q.offset.unwrap_or(0) as i64;
+    let res = state.registry_db.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, role, content, created_at FROM messages
+             WHERE tenant_id=?1 ORDER BY created_at ASC LIMIT ?2 OFFSET ?3",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![tenant, limit, offset], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "role": row.get::<_, String>(1)?,
+                "content": row.get::<_, String>(2)?,
+                "timestamp": iso_from_millis(row.get::<_, i64>(3)?),
+            }))
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
+    });
+    match res {
+        Ok(items) => api_ok(items),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn api_list_chats(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let res = state.registry_db.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT session_id, title, preview, message_count, created_at, updated_at
+             FROM chats WHERE tenant_id=?1 ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![tenant], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "title": row.get::<_, String>(1)?,
+                "preview": row.get::<_, String>(2)?,
+                "messageCount": row.get::<_, i64>(3)?,
+                "createdAt": iso_from_millis(row.get::<_, i64>(4)?),
+                "updatedAt": iso_from_millis(row.get::<_, i64>(5)?),
+            }))
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
+    });
+    match res {
+        Ok(items) => api_ok(items),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn api_get_chat_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(chat_id): Path<String>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let res = state.registry_db.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, role, content, created_at FROM messages
+             WHERE tenant_id=?1 AND chat_id=?2 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![tenant, chat_id], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "role": row.get::<_, String>(1)?,
+                "content": row.get::<_, String>(2)?,
+                "timestamp": iso_from_millis(row.get::<_, i64>(3)?),
+            }))
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
+    });
+    match res {
+        Ok(items) => api_ok(items),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn api_delete_chat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(chat_id): Path<String>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let res = state.registry_db.with_conn(|conn| {
+        conn.execute(
+            "DELETE FROM messages WHERE tenant_id=?1 AND chat_id=?2",
+            rusqlite::params![tenant, chat_id],
+        )?;
+        conn.execute(
+            "DELETE FROM chats WHERE tenant_id=?1 AND session_id=?2",
+            rusqlite::params![tenant, chat_id],
+        )?;
+        Ok(())
+    });
+    match res {
+        Ok(()) => api_ok(serde_json::json!({"id": chat_id, "deleted": true})),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn api_duplicate_chat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(chat_id): Path<String>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let new_chat_id = uuid::Uuid::new_v4().to_string();
+    let now = now_ms();
+    let res = state.registry_db.with_conn(|conn| {
+        let (title, preview): (String, String) = conn.query_row(
+            "SELECT title, preview FROM chats WHERE tenant_id=?1 AND session_id=?2",
+            rusqlite::params![tenant, chat_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        conn.execute(
+            "INSERT INTO chats (id, tenant_id, title, preview, session_id, message_count, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?6)",
+            rusqlite::params![
+                uuid::Uuid::new_v4().to_string(),
+                tenant,
+                format!("{title} (copy)"),
+                preview,
+                new_chat_id,
+                now
+            ],
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT role, content, created_at FROM messages WHERE tenant_id=?1 AND chat_id=?2 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![tenant, chat_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut count = 0_i64;
+        for row in rows.flatten() {
+            conn.execute(
+                "INSERT INTO messages (id, tenant_id, chat_id, role, content, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(),
+                    tenant,
+                    new_chat_id,
+                    row.0,
+                    row.1,
+                    row.2
+                ],
+            )?;
+            count += 1;
+        }
+        conn.execute(
+            "UPDATE chats SET message_count=?1, updated_at=?2 WHERE tenant_id=?3 AND session_id=?4",
+            rusqlite::params![count, now, tenant, new_chat_id],
+        )?;
+        Ok(())
+    });
+    match res {
+        Ok(()) => api_ok(serde_json::json!({
+            "id": new_chat_id,
+            "title": "Chat copy",
+            "preview": "",
+            "messageCount": 0,
+            "createdAt": iso_from_millis(now),
+            "updatedAt": iso_from_millis(now),
+        })),
+        Err(_) => api_err(StatusCode::NOT_FOUND, "Chat not found"),
+    }
+}
+
+async fn api_list_conversations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let res = state.registry_db.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT session_id, title, created_at, updated_at FROM chats WHERE tenant_id=?1 ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![tenant], |row| {
+            let sid: String = row.get(0)?;
+            Ok(serde_json::json!({
+                "id": sid.clone(),
+                "title": row.get::<_, String>(1)?,
+                "messages": [],
+                "createdAt": iso_from_millis(row.get::<_, i64>(2)?),
+                "updatedAt": iso_from_millis(row.get::<_, i64>(3)?),
+                "sessionId": sid,
+            }))
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
+    });
+    match res {
+        Ok(items) => api_ok(items),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn api_list_approvals(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let res = state.registry_db.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, command, metadata_json, countdown, status, created_at, expires_at
+             FROM approvals WHERE tenant_id=?1 AND status='pending' ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![tenant], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "command": row.get::<_, String>(1)?,
+                "metadata": serde_json::from_str::<serde_json::Value>(&row.get::<_, Option<String>>(2)?.unwrap_or_else(|| "{}".to_string())).unwrap_or(serde_json::json!({})),
+                "countdown": row.get::<_, i64>(3)?,
+                "status": row.get::<_, String>(4)?,
+                "createdAt": iso_from_millis(row.get::<_, i64>(5)?),
+                "expiresAt": row.get::<_, Option<i64>>(6)?.map(iso_from_millis),
+            }))
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
+    });
+    match res {
+        Ok(items) => api_ok(items),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn api_respond_approval(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ApiApprovalBody>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let id = body.request_id.unwrap_or_default();
+    let action = body.action.unwrap_or_else(|| "deny".to_string());
+    if id.is_empty() {
+        return api_err(StatusCode::BAD_REQUEST, "requestId is required");
+    }
+    let status = if action == "deny" { "denied" } else { "approved" };
+    let _ = state.registry_db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE approvals SET status=?1 WHERE tenant_id=?2 AND id=?3",
+            rusqlite::params![status, tenant, id],
+        )?;
+        Ok(())
+    });
+    api_ok(serde_json::json!({"id": id, "status": status}))
+}
+
+async fn api_list_sessions(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let res = state.registry_db.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, name, status, last_activity, run_count, created_at, user_id
+             FROM sessions WHERE tenant_id=?1 ORDER BY last_activity DESC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![tenant], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "name": row.get::<_, String>(1)?,
+                "status": row.get::<_, String>(2)?,
+                "lastActivity": row.get::<_, Option<i64>>(3)?.map(iso_from_millis),
+                "runCount": row.get::<_, i64>(4)?,
+                "createdAt": iso_from_millis(row.get::<_, i64>(5)?),
+                "userId": row.get::<_, Option<String>>(6)?,
+            }))
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
+    });
+    match res {
+        Ok(items) => api_ok(items),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn api_patch_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(key): Path<String>,
+    Json(body): Json<ApiUpdateStatusBody>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let status = body.status.unwrap_or_else(|| "active".to_string());
+    let res = state.registry_db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE sessions SET status=?1, last_activity=?2 WHERE tenant_id=?3 AND id=?4",
+            rusqlite::params![status, now_ms(), tenant, key],
+        )?;
+        Ok(())
+    });
+    match res { Ok(()) => api_ok(serde_json::json!({"id": key, "status": status})), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+}
+
+async fn api_reset_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(key): Path<String>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let res = state.registry_db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE sessions SET run_count=0, last_activity=?1 WHERE tenant_id=?2 AND id=?3",
+            rusqlite::params![now_ms(), tenant, key],
+        )?;
+        Ok(())
+    });
+    match res { Ok(()) => api_ok(serde_json::json!({"reset": true})), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+}
+
+async fn api_delete_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(key): Path<String>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let res = state.registry_db.with_conn(|conn| {
+        conn.execute(
+            "DELETE FROM sessions WHERE tenant_id=?1 AND id=?2",
+            rusqlite::params![tenant, key],
+        )?;
+        Ok(())
+    });
+    match res { Ok(()) => api_ok(serde_json::json!({"deleted": true})), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+}
+
+async fn api_list_events(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let res = state.registry_db.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, type, title, description, source, timestamp FROM events
+             WHERE tenant_id=?1 ORDER BY timestamp DESC LIMIT 200",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![tenant], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "type": row.get::<_, String>(1)?,
+                "title": row.get::<_, String>(2)?,
+                "description": row.get::<_, Option<String>>(3)?,
+                "source": row.get::<_, Option<String>>(4)?,
+                "timestamp": iso_from_millis(row.get::<_, i64>(5)?),
+            }))
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
+    });
+    match res {
+        Ok(items) => api_ok(items),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn api_list_nodes(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let res = state.registry_db.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, name, type, status, load, memory_usage, cpu_usage, last_heartbeat
+             FROM nodes WHERE tenant_id=?1 ORDER BY name ASC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![tenant], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "name": row.get::<_, String>(1)?,
+                "type": row.get::<_, String>(2)?,
+                "status": row.get::<_, String>(3)?,
+                "load": row.get::<_, i64>(4)?,
+                "memoryUsage": row.get::<_, i64>(5)?,
+                "cpuUsage": row.get::<_, i64>(6)?,
+                "lastHeartbeat": row.get::<_, Option<i64>>(7)?.map(iso_from_millis),
+            }))
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
+    });
+    match res {
+        Ok(items) => api_ok(items),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn api_get_metrics(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let res = state.registry_db.with_conn(|conn| {
+        let active_sessions: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE tenant_id=?1 AND status='active'",
+            rusqlite::params![tenant],
+            |row| row.get(0),
+        )?;
+        let alerts: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE tenant_id=?1 AND type IN ('error','warning')",
+            rusqlite::params![tenant],
+            |row| row.get(0),
+        )?;
+        Ok(serde_json::json!({
+            "cpuUsage": 0,
+            "memoryUsage": 0,
+            "activeSessions": active_sessions,
+            "alerts": alerts,
+        }))
+    });
+    match res {
+        Ok(data) => api_ok(data),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn api_get_status(State(_state): State<AppState>, _headers: HeaderMap) -> impl IntoResponse {
+    let runtime = crate::health::snapshot_json();
+    let uptime = runtime
+        .get("uptime_seconds")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    api_ok(serde_json::json!({
+        "isConnected": true,
+        "uptime": format!("{uptime}s"),
+        "activeSessions": 0,
+        "alerts": 0
+    }))
+}
+
+async fn api_list_channels(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let res = state.registry_db.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id,name,type,status,requests_per_min,endpoint,created_at,updated_at
+             FROM channels WHERE tenant_id=?1 ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![tenant], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "name": row.get::<_, String>(1)?,
+                "type": row.get::<_, String>(2)?,
+                "status": row.get::<_, String>(3)?,
+                "requestsPerMin": row.get::<_, i64>(4)?,
+                "endpoint": row.get::<_, Option<String>>(5)?,
+                "createdAt": iso_from_millis(row.get::<_, i64>(6)?),
+                "updatedAt": iso_from_millis(row.get::<_, i64>(7)?),
+            }))
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
+    });
+    match res { Ok(v) => api_ok(v), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+}
+
+async fn api_patch_channel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<ApiPatchChannelBody>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let status = body.status.unwrap_or_else(|| "active".to_string());
+    let name = body.name.unwrap_or_else(|| id.clone());
+    let now = now_ms();
+    let res = state.registry_db.with_conn(|conn| {
+        let updated = conn.execute(
+            "UPDATE channels SET name=?1, status=?2, updated_at=?3 WHERE tenant_id=?4 AND id=?5",
+            rusqlite::params![name, status, now, tenant, id],
+        )?;
+        if updated == 0 {
+            conn.execute(
+                "INSERT INTO channels (id, tenant_id, name, type, status, requests_per_min, endpoint, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'custom', ?4, 0, NULL, ?5, ?5)",
+                rusqlite::params![id, tenant, name, status, now],
+            )?;
+        }
+        Ok(())
+    });
+    match res { Ok(()) => api_ok(serde_json::json!({ "id": id, "name": name, "status": status })), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+}
+
+async fn api_delete_channel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let res = state.registry_db.with_conn(|conn| {
+        conn.execute(
+            "DELETE FROM channels WHERE tenant_id=?1 AND id=?2",
+            rusqlite::params![tenant, id],
+        )?;
+        Ok(())
+    });
+    match res { Ok(()) => api_ok(serde_json::json!({"id": id, "deleted": true})), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+}
+
+async fn api_list_cron(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let res = state.registry_db.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, name, schedule_data, status, created_at, updated_at FROM aria_cron_functions
+             WHERE tenant_id=?1 ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![tenant], |row| {
+            let schedule = row
+                .get::<_, String>(2)
+                .unwrap_or_else(|_| "{\"cron\":\"* * * * *\"}".to_string());
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "name": row.get::<_, String>(1)?,
+                "schedule": schedule,
+                "status": row.get::<_, String>(3)?,
+                "lastRun": serde_json::Value::Null,
+                "nextRun": serde_json::Value::Null,
+                "handler": "cron_handler",
+                "description": "",
+                "createdAt": row.get::<_, String>(4)?,
+                "updatedAt": row.get::<_, String>(5)?,
+            }))
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
+    });
+    match res {
+        Ok(items) => api_ok(items),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn api_patch_cron(Path(id): Path<String>, Json(body): Json<ApiUpdateStatusBody>) -> impl IntoResponse {
+    api_ok(serde_json::json!({ "id": id, "status": body.status.unwrap_or_else(|| "active".to_string()) }))
+}
+async fn api_delete_cron(Path(id): Path<String>) -> impl IntoResponse {
+    api_ok(serde_json::json!({"id": id, "deleted": true}))
+}
+async fn api_run_cron(Path(id): Path<String>) -> impl IntoResponse {
+    api_ok(serde_json::json!({"id": id, "ran": true}))
+}
+
+async fn api_list_skills(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let res = state.registry_db.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id,name,description,enabled,call_count,version,category,permissions_json
+             FROM skills WHERE tenant_id=?1 ORDER BY name ASC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![tenant], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "name": row.get::<_, String>(1)?,
+                "description": row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                "enabled": row.get::<_, i64>(3)? != 0,
+                "callCount": row.get::<_, i64>(4)?,
+                "version": row.get::<_, Option<String>>(5)?.unwrap_or_else(|| "1.0.0".to_string()),
+                "category": row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "system".to_string()),
+                "permissions": row
+                    .get::<_, Option<String>>(7)?
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                    .unwrap_or(serde_json::json!([])),
+            }))
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
+    });
+    match res { Ok(v) => api_ok(v), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+}
+async fn api_patch_skill(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<ApiPatchSkillBody>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let enabled = body.enabled.unwrap_or(true);
+    let res = state.registry_db.with_conn(|conn| {
+        let updated = conn.execute(
+            "UPDATE skills SET enabled=?1 WHERE tenant_id=?2 AND id=?3",
+            rusqlite::params![if enabled { 1 } else { 0 }, tenant, id],
+        )?;
+        if updated == 0 {
+            conn.execute(
+                "INSERT INTO skills (id, tenant_id, name, description, enabled, call_count, version, category, permissions_json)
+                 VALUES (?1, ?2, ?3, '', ?4, 0, '1.0.0', 'system', '[]')",
+                rusqlite::params![id, tenant, id, if enabled { 1 } else { 0 }],
+            )?;
+        }
+        Ok(())
+    });
+    match res { Ok(()) => api_ok(serde_json::json!({ "id": id, "enabled": enabled })), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+}
+
+async fn api_get_config(_state: State<AppState>, _headers: HeaderMap) -> impl IntoResponse {
+    api_ok(serde_json::json!({
+        "gateway": { "port": 4040, "host": "127.0.0.1", "cors": {"enabled": true, "origins": ["*"]}},
+        "auth": { "provider": "apikey" },
+        "limits": { "maxConcurrentRuns": 8, "timeoutMs": 30000, "maxTokensPerRequest": 8192, "rateLimitPerMinute": 120 }
+    }))
+}
+async fn api_put_config(Json(body): Json<ApiUpdateConfigBody>) -> impl IntoResponse {
+    api_ok(serde_json::json!({
+        "gateway": body.gateway.unwrap_or(serde_json::json!({})),
+        "auth": body.auth.unwrap_or(serde_json::json!({})),
+        "limits": body.limits.unwrap_or(serde_json::json!({}))
+    }))
+}
+
+async fn api_list_tools(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let res = state.registry_db.with_conn(|conn| {
+        let mut stmt = conn.prepare("SELECT id,name,description,version,updated_at FROM aria_tools WHERE tenant_id=?1 AND status!='deleted' ORDER BY created_at DESC")?;
+        let rows = stmt.query_map(rusqlite::params![tenant], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "name": row.get::<_, String>(1)?,
+                "description": row.get::<_, String>(2)?,
+                "category": "custom",
+                "enabled": true,
+                "version": row.get::<_, i64>(3)?.to_string(),
+                "callCount": 0,
+                "avgDurationMs": 0,
+                "lastUsed": row.get::<_, String>(4)?,
+            }))
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
+    });
+    match res { Ok(v) => api_ok(v), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+}
+
+async fn api_list_agents(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let res = state.registry_db.with_conn(|conn| {
+        let mut stmt = conn.prepare("SELECT id,name,description,status,model,tools,created_at,updated_at FROM aria_agents WHERE tenant_id=?1 AND status!='deleted' ORDER BY created_at DESC")?;
+        let rows = stmt.query_map(rusqlite::params![tenant], |row| {
+            let tools_json = row.get::<_, String>(5).unwrap_or_else(|_| "[]".to_string());
+            let tools = serde_json::from_str::<serde_json::Value>(&tools_json).unwrap_or(serde_json::json!([]));
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "name": row.get::<_, String>(1)?,
+                "description": row.get::<_, String>(2)?,
+                "status": match row.get::<_, String>(3)?.as_str() { "active" => "online", other => other },
+                "model": row.get::<_, Option<String>>(4)?.unwrap_or_else(|| "default".to_string()),
+                "tools": tools,
+                "runCount": 0,
+                "successRate": 1.0,
+                "createdAt": row.get::<_, String>(6)?,
+                "lastActive": row.get::<_, String>(7)?,
+            }))
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
+    });
+    match res { Ok(v) => api_ok(v), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+}
+
+async fn api_list_teams(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let res = state.registry_db.with_conn(|conn| {
+        let mut stmt = conn.prepare("SELECT id,name,description,mode,members,shared_context,timeout_seconds,status,created_at,updated_at FROM aria_teams WHERE tenant_id=?1 AND status!='deleted' ORDER BY created_at DESC")?;
+        let rows = stmt.query_map(rusqlite::params![tenant], |row| {
+            let members_json = row.get::<_, String>(4).unwrap_or_else(|_| "[]".to_string());
+            let members = serde_json::from_str::<serde_json::Value>(&members_json).unwrap_or(serde_json::json!([]));
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "name": row.get::<_, String>(1)?,
+                "description": row.get::<_, String>(2)?,
+                "mode": row.get::<_, String>(3)?,
+                "agents": members,
+                "coordinator": serde_json::Value::Null,
+                "sharedContext": row.get::<_, Option<String>>(5)?.unwrap_or_else(|| "false".to_string()) == "true",
+                "timeoutSeconds": row.get::<_, Option<i64>>(6)?,
+                "status": row.get::<_, String>(7)?,
+                "createdAt": row.get::<_, String>(8)?,
+                "updatedAt": row.get::<_, String>(9)?,
+            }))
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
+    });
+    match res { Ok(v) => api_ok(v), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+}
+
+async fn api_get_team(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let res = state.registry_db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT id,name,description,mode,members,shared_context,timeout_seconds,status,created_at,updated_at
+             FROM aria_teams WHERE tenant_id=?1 AND id=?2 AND status!='deleted'",
+            rusqlite::params![tenant, id],
+            |row| {
+                let members_json = row.get::<_, String>(4).unwrap_or_else(|_| "[]".to_string());
+                let members = serde_json::from_str::<serde_json::Value>(&members_json).unwrap_or(serde_json::json!([]));
+                Ok(serde_json::json!({
+                    "id": row.get::<_, String>(0)?,
+                    "name": row.get::<_, String>(1)?,
+                    "description": row.get::<_, String>(2)?,
+                    "mode": row.get::<_, String>(3)?,
+                    "agents": members,
+                    "coordinator": serde_json::Value::Null,
+                    "sharedContext": row.get::<_, Option<String>>(5)?.unwrap_or_else(|| "false".to_string()) == "true",
+                    "timeoutSeconds": row.get::<_, Option<i64>>(6)?,
+                    "status": row.get::<_, String>(7)?,
+                    "createdAt": row.get::<_, String>(8)?,
+                    "updatedAt": row.get::<_, String>(9)?,
+                }))
+            },
+        )
+        .map_err(anyhow::Error::from)
+    });
+    match res { Ok(v) => api_ok(v), Err(_) => api_err(StatusCode::NOT_FOUND, "Team not found") }
+}
+
+async fn api_list_pipelines(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let res = state.registry_db.with_conn(|conn| {
+        let mut stmt = conn.prepare("SELECT id,name,description,status,steps,created_at,updated_at FROM aria_pipelines WHERE tenant_id=?1 AND status!='deleted' ORDER BY created_at DESC")?;
+        let rows = stmt.query_map(rusqlite::params![tenant], |row| {
+            let steps_json = row.get::<_, String>(4).unwrap_or_else(|_| "[]".to_string());
+            let stages = serde_json::from_str::<serde_json::Value>(&steps_json).unwrap_or(serde_json::json!([]));
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "name": row.get::<_, String>(1)?,
+                "description": row.get::<_, String>(2)?,
+                "status": row.get::<_, String>(3)?,
+                "stages": stages,
+                "runCount": 0,
+                "lastRun": serde_json::Value::Null,
+                "createdAt": row.get::<_, String>(5)?,
+            }))
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
+    });
+    match res { Ok(v) => api_ok(v), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+}
+
+async fn api_get_pipeline(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let res = state.registry_db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT id,name,description,status,steps,created_at FROM aria_pipelines WHERE tenant_id=?1 AND id=?2 AND status!='deleted'",
+            rusqlite::params![tenant, id],
+            |row| {
+                let steps_json = row.get::<_, String>(4).unwrap_or_else(|_| "[]".to_string());
+                let stages = serde_json::from_str::<serde_json::Value>(&steps_json).unwrap_or(serde_json::json!([]));
+                Ok(serde_json::json!({
+                    "id": row.get::<_, String>(0)?,
+                    "name": row.get::<_, String>(1)?,
+                    "description": row.get::<_, String>(2)?,
+                    "status": row.get::<_, String>(3)?,
+                    "stages": stages,
+                    "runCount": 0,
+                    "lastRun": serde_json::Value::Null,
+                    "createdAt": row.get::<_, String>(5)?,
+                }))
+            },
+        )
+        .map_err(anyhow::Error::from)
+    });
+    match res { Ok(v) => api_ok(v), Err(_) => api_err(StatusCode::NOT_FOUND, "Pipeline not found") }
+}
+
+async fn api_list_kv(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let res = state.registry_db.with_conn(|conn| {
+        let mut stmt = conn.prepare("SELECT key,value,created_at,updated_at FROM aria_kv WHERE tenant_id=?1 ORDER BY updated_at DESC")?;
+        let rows = stmt.query_map(rusqlite::params![tenant], |row| {
+            let val_str: String = row.get(1)?;
+            let value = serde_json::from_str::<serde_json::Value>(&val_str).unwrap_or(serde_json::Value::String(val_str));
+            Ok(serde_json::json!({
+                "key": row.get::<_, String>(0)?,
+                "value": value,
+                "createdAt": row.get::<_, String>(2)?,
+                "updatedAt": row.get::<_, String>(3)?,
+            }))
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
+    });
+    match res { Ok(v) => api_ok(v), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+}
+
+async fn api_get_kv(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(key): Path<String>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let res = state.registry_db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT key,value,created_at,updated_at FROM aria_kv WHERE tenant_id=?1 AND key=?2",
+            rusqlite::params![tenant, key],
+            |row| {
+                let val_str: String = row.get(1)?;
+                let value = serde_json::from_str::<serde_json::Value>(&val_str).unwrap_or(serde_json::Value::String(val_str));
+                Ok(serde_json::json!({
+                    "key": row.get::<_, String>(0)?,
+                    "value": value,
+                    "createdAt": row.get::<_, String>(2)?,
+                    "updatedAt": row.get::<_, String>(3)?,
+                }))
+            },
+        )
+        .map_err(anyhow::Error::from)
+    });
+    match res { Ok(v) => api_ok(v), Err(_) => api_err(StatusCode::NOT_FOUND, "KV key not found") }
+}
+
+async fn api_list_containers(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let res = state.registry_db.with_conn(|conn| {
+        let mut stmt = conn.prepare("SELECT id,name,image,state,created_at FROM aria_containers WHERE tenant_id=?1 ORDER BY created_at DESC")?;
+        let rows = stmt.query_map(rusqlite::params![tenant], |row| {
+            let status = match row.get::<_, String>(3)?.as_str() {
+                "running" => "running",
+                "pending" => "starting",
+                "stopped" => "stopped",
+                _ => "error",
+            };
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "name": row.get::<_, String>(1)?,
+                "image": row.get::<_, String>(2)?,
+                "status": status,
+                "cpuUsage": 0,
+                "memoryUsage": 0,
+                "ports": [],
+                "createdAt": row.get::<_, String>(4)?,
+                "uptime": "0m",
+            }))
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
+    });
+    match res { Ok(v) => api_ok(v), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+}
+
+async fn api_list_logs(State(state): State<AppState>, headers: HeaderMap, Query(q): Query<ListQuery>) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let limit = q.limit.unwrap_or(200) as i64;
+    let offset = q.offset.unwrap_or(0) as i64;
+    let res = state.registry_db.with_conn(|conn| {
+        let mut stmt = conn.prepare("SELECT id,timestamp,level,source,message,metadata_json,trace_id,span_id,session_id,agent_id,duration FROM logs WHERE tenant_id=?1 ORDER BY timestamp DESC LIMIT ?2 OFFSET ?3")?;
+        let rows = stmt.query_map(rusqlite::params![tenant, limit, offset], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "timestamp": iso_from_millis(row.get::<_, i64>(1)?),
+                "level": row.get::<_, String>(2)?,
+                "source": row.get::<_, Option<String>>(3)?.unwrap_or_else(|| "system".to_string()),
+                "message": row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                "metadata": row.get::<_, Option<String>>(5)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
+                "traceId": row.get::<_, Option<String>>(6)?,
+                "spanId": row.get::<_, Option<String>>(7)?,
+                "sessionId": row.get::<_, Option<String>>(8)?,
+                "agentId": row.get::<_, Option<String>>(9)?,
+                "duration": row.get::<_, Option<i64>>(10)?,
+            }))
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
+    });
+    match res { Ok(v) => api_ok(v), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+}
+
+async fn api_list_api_keys(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let res = state.registry_db.with_conn(|conn| {
+        let mut stmt = conn.prepare("SELECT id,name,key_preview,status,scopes_json,created_at,last_used_at,expires_at,request_count,rate_limit FROM api_keys WHERE tenant_id=?1 ORDER BY created_at DESC")?;
+        let rows = stmt.query_map(rusqlite::params![tenant], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "name": row.get::<_, String>(1)?,
+                "keyPreview": row.get::<_, String>(2)?,
+                "status": row.get::<_, String>(3)?,
+                "scopes": row
+                    .get::<_, Option<String>>(4)?
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                    .unwrap_or(serde_json::json!(["full"])),
+                "createdAt": iso_from_millis(row.get::<_, i64>(5)?),
+                "lastUsedAt": row.get::<_, Option<i64>>(6)?.map(iso_from_millis),
+                "expiresAt": row.get::<_, Option<i64>>(7)?.map(iso_from_millis),
+                "requestCount": row.get::<_, i64>(8)?,
+                "rateLimit": row.get::<_, i64>(9)?,
+            }))
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
+    });
+    match res { Ok(v) => api_ok(v), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+}
+
+async fn api_create_api_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ApiCreateKeyBody>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let id = uuid::Uuid::new_v4().to_string();
+    let raw_key = format!("sk_{}", uuid::Uuid::new_v4().as_simple());
+    let preview = format!("{}...{}", &raw_key[..7], &raw_key[raw_key.len()-4..]);
+    let now = now_ms();
+    let name = body.name.unwrap_or_else(|| "Default API Key".to_string());
+    let scopes = serde_json::to_string(&body.scopes.unwrap_or_else(|| vec!["full".to_string()])).unwrap_or_else(|_| "[]".to_string());
+    let res = state.registry_db.with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO api_keys (id, tenant_id, name, key_hash, key_preview, status, scopes_json, rate_limit, request_count, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, 1000, 0, ?7)",
+            rusqlite::params![id, tenant, name, raw_key, preview, scopes, now],
+        )?;
+        Ok(())
+    });
+    match res {
+        Ok(()) => api_ok(serde_json::json!({
+            "id": id,
+            "name": name,
+            "keyPreview": preview,
+            "status": "active",
+            "scopes": serde_json::from_str::<serde_json::Value>(&scopes).unwrap_or(serde_json::json!(["full"])),
+            "createdAt": iso_from_millis(now),
+            "lastUsedAt": serde_json::Value::Null,
+            "expiresAt": serde_json::Value::Null,
+            "requestCount": 0,
+            "rateLimit": 1000,
+            "rawKey": raw_key,
+        })),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn api_revoke_api_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let _ = state.registry_db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE api_keys SET status='revoked' WHERE tenant_id=?1 AND id=?2",
+            rusqlite::params![tenant, id],
+        )?;
+        Ok(())
+    });
+    api_ok(serde_json::json!({"revoked": true}))
+}
+
+async fn api_create_magic_number(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let id = uuid::Uuid::new_v4().to_string();
+    let raw = format!("mn_{}", uuid::Uuid::new_v4().as_simple());
+    let preview = format!("{}...{}", &raw[..7], &raw[raw.len()-4..]);
+    let now = now_ms();
+    let _ = state.registry_db.with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO magic_numbers (id, tenant_id, user_id, email, key_hash, key_preview, name, status, created_at)
+             VALUES (?1, ?2, 'dev-user', NULL, ?3, ?4, 'default', 'active', ?5)",
+            rusqlite::params![id, tenant, raw, preview, now],
+        )?;
+        Ok(())
+    });
+    api_ok(serde_json::json!({
+        "id": id,
+        "magicNumber": raw,
+        "keyPreview": preview,
+        "tenantId": tenant,
+        "userId": "dev-user",
+    }))
+}
+
+async fn api_list_magic_numbers(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let res = state.registry_db.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id,name,key_preview,user_id,email,created_at,last_used_at FROM magic_numbers WHERE tenant_id=?1 AND status='active' ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![tenant], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "name": row.get::<_, String>(1)?,
+                "keyPreview": row.get::<_, String>(2)?,
+                "userId": row.get::<_, String>(3)?,
+                "email": row.get::<_, Option<String>>(4)?,
+                "createdAt": row.get::<_, i64>(5)?,
+                "lastUsedAt": row.get::<_, Option<i64>>(6)?,
+            }))
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
+    });
+    match res {
+        Ok(items) => api_ok(serde_json::json!({ "magicNumbers": items })),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn api_revoke_magic_number(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let _ = state.registry_db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE magic_numbers SET status='revoked', revoked_at=?1 WHERE tenant_id=?2 AND id=?3",
+            rusqlite::params![now_ms(), tenant, id],
+        )?;
+        Ok(())
+    });
+    api_ok(serde_json::json!({ "revoked": true }))
+}
+
+async fn api_get_billing(_state: State<AppState>, _headers: HeaderMap) -> impl IntoResponse {
+    api_ok(serde_json::json!({
+        "plan": "free",
+        "status": "active",
+        "nextInvoiceDate": serde_json::Value::Null,
+    }))
+}
+async fn api_get_billing_usage(_state: State<AppState>, _headers: HeaderMap) -> impl IntoResponse {
+    api_ok(serde_json::json!({
+        "requests": 0,
+        "tokens": 0,
+        "storageBytes": 0
+    }))
+}
+async fn api_get_billing_invoices(_state: State<AppState>, _headers: HeaderMap) -> impl IntoResponse {
+    api_ok(Vec::<serde_json::Value>::new())
+}
+async fn api_get_billing_methods(_state: State<AppState>, _headers: HeaderMap) -> impl IntoResponse {
+    api_ok(Vec::<serde_json::Value>::new())
+}
+
+async fn api_list_feeds(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let res = state.registry_db.with_conn(|conn| {
+        let mut stmt = conn.prepare("SELECT id,name,description,schedule,refresh_seconds,category,status,created_at,updated_at FROM aria_feeds WHERE tenant_id=?1 AND status!='deleted' ORDER BY created_at DESC")?;
+        let rows = stmt.query_map(rusqlite::params![tenant], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "name": row.get::<_, String>(1)?,
+                "description": row.get::<_, String>(2)?,
+                "type": serde_json::Value::Null,
+                "schedule": row.get::<_, String>(3)?,
+                "timezone": serde_json::Value::Null,
+                "refreshSeconds": row.get::<_, Option<i64>>(4)?,
+                "agent": "feed-agent",
+                "tools": [],
+                "category": row.get::<_, Option<String>>(5)?,
+                "status": row.get::<_, String>(6)?,
+                "itemCount": 0,
+                "createdAt": row.get::<_, String>(7)?,
+                "updatedAt": row.get::<_, String>(8)?,
+            }))
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
+    });
+    match res { Ok(v) => api_ok(v), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+}
+
+async fn api_get_feed(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let res = state.registry_db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT id,name,description,schedule,refresh_seconds,category,status,created_at,updated_at FROM aria_feeds WHERE tenant_id=?1 AND id=?2 AND status!='deleted'",
+            rusqlite::params![tenant, id],
+            |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, String>(0)?,
+                    "name": row.get::<_, String>(1)?,
+                    "description": row.get::<_, String>(2)?,
+                    "type": serde_json::Value::Null,
+                    "schedule": row.get::<_, String>(3)?,
+                    "timezone": serde_json::Value::Null,
+                    "refreshSeconds": row.get::<_, Option<i64>>(4)?,
+                    "agent": "feed-agent",
+                    "tools": [],
+                    "category": row.get::<_, Option<String>>(5)?,
+                    "status": row.get::<_, String>(6)?,
+                    "itemCount": 0,
+                    "createdAt": row.get::<_, String>(7)?,
+                    "updatedAt": row.get::<_, String>(8)?,
+                }))
+            },
+        )
+        .map_err(anyhow::Error::from)
+    });
+    match res { Ok(v) => api_ok(v), Err(_) => api_err(StatusCode::NOT_FOUND, "Feed not found") }
+}
+
+async fn api_list_feed_items(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<ListQuery>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let limit = q.limit.unwrap_or(100) as i64;
+    let offset = q.offset.unwrap_or(0) as i64;
+    let res = state.registry_db.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id,card_type,source,metadata,timestamp FROM aria_feed_items
+             WHERE tenant_id=?1 AND feed_id=?2 ORDER BY created_at DESC LIMIT ?3 OFFSET ?4",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![tenant, id, limit, offset], |row| {
+            let card_type = row.get::<_, String>(1)?;
+            let metadata_str = row.get::<_, Option<String>>(3)?.unwrap_or_else(|| "{}".to_string());
+            let data = serde_json::from_str::<serde_json::Value>(&metadata_str).unwrap_or(serde_json::json!({}));
+            let ts = row
+                .get::<_, Option<i64>>(4)?
+                .map(iso_from_millis)
+                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "type": card_type,
+                "timestamp": ts,
+                "source": row.get::<_, Option<String>>(2)?,
+                "data": data
+            }))
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
+    });
+    match res { Ok(v) => api_ok(v), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+}
+
+async fn api_patch_feed(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<ApiUpdateFeedBody>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let status = body.status.unwrap_or_else(|| "active".to_string());
+    let res = state.registry_db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE aria_feeds SET status=?1, updated_at=?2 WHERE tenant_id=?3 AND id=?4",
+            rusqlite::params![status, chrono::Utc::now().to_rfc3339(), tenant, id],
+        )?;
+        Ok(())
+    });
+    match res { Ok(()) => api_ok(serde_json::json!({ "id": id, "status": status })), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+}
+
+async fn api_list_feed_files(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let res = state.registry_db.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id,name,extension,content_type,size,source_id,description,tags_json,created_at,updated_at
+             FROM feed_files WHERE tenant_id=?1 ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![tenant], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "name": row.get::<_, String>(1)?,
+                "extension": row.get::<_, String>(2)?,
+                "contentType": row.get::<_, String>(3)?,
+                "size": row.get::<_, i64>(4)?,
+                "sourceId": row.get::<_, Option<String>>(5)?,
+                "description": row.get::<_, Option<String>>(6)?,
+                "tags": row
+                    .get::<_, Option<String>>(7)?
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                    .unwrap_or(serde_json::json!([])),
+                "createdAt": iso_from_millis(row.get::<_, i64>(8)?),
+                "updatedAt": row.get::<_, Option<i64>>(9)?.map(iso_from_millis),
+            }))
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
+    });
+    match res { Ok(v) => api_ok(v), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+}
+async fn api_upload_feed_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let now = now_ms();
+    let mut filename = "upload.bin".to_string();
+    let mut content_type = "application/octet-stream".to_string();
+    let mut content_raw = String::new();
+    while let Ok(Some(field)) = multipart.next_field().await {
+        if let Some(name) = field.file_name() {
+            filename = name.to_string();
+        }
+        if let Some(ct) = field.content_type() {
+            content_type = ct.to_string();
+        }
+        if let Ok(bytes) = field.bytes().await {
+            content_raw = String::from_utf8_lossy(&bytes).to_string();
+            break;
+        }
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    let ext = filename
+        .split('.')
+        .next_back()
+        .unwrap_or("bin")
+        .to_string();
+    let size = content_raw.len() as i64;
+    let res = state.registry_db.with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO feed_files (id, tenant_id, name, extension, content_type, size, blob_key, source_id, description, tags_json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, '[]', ?8, ?8)",
+            rusqlite::params![id, tenant, filename, ext, content_type, size, content_raw, now],
+        )?;
+        Ok(())
+    });
+    match res {
+        Ok(()) => api_ok(serde_json::json!({
+            "id": id,
+            "name": filename,
+            "extension": ext,
+            "contentType": content_type,
+            "size": size,
+            "createdAt": iso_from_millis(now),
+        })),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+async fn api_get_feed_file_content(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(file_id): Path<String>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let res = state.registry_db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT blob_key, content_type FROM feed_files WHERE tenant_id=?1 AND id=?2",
+            rusqlite::params![tenant, file_id],
+            |row| {
+                let raw: String = row.get(0)?;
+                let ctype: String = row.get(1)?;
+                Ok(serde_json::json!({
+                    "fileId": file_id,
+                    "contentType": if ctype.contains("json") { "json" } else if ctype.contains("csv") { "csv" } else if ctype.contains("markdown") || ctype.contains("md") { "markdown" } else { "plaintext" },
+                    "raw": raw
+                }))
+            },
+        )
+        .map_err(anyhow::Error::from)
+    });
+    match res { Ok(v) => api_ok(v), Err(_) => api_err(StatusCode::NOT_FOUND, "File not found") }
+}
+async fn api_delete_feed_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(file_id): Path<String>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let res = state.registry_db.with_conn(|conn| {
+        conn.execute(
+            "DELETE FROM feed_files WHERE tenant_id=?1 AND id=?2",
+            rusqlite::params![tenant, file_id],
+        )?;
+        Ok(())
+    });
+    match res { Ok(()) => api_ok(serde_json::json!({ "id": file_id, "deleted": true })), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+}
+
+async fn api_list_tool_calls(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let res = state.registry_db.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id,session_id,run_id,agent_id,tool_name,status,args_json,result_json,error,duration_ms,created_at,updated_at
+             FROM tool_calls WHERE tenant_id=?1 ORDER BY created_at DESC LIMIT 200",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![tenant], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "sessionId": row.get::<_, Option<String>>(1)?,
+                "runId": row.get::<_, Option<String>>(2)?,
+                "agentId": row.get::<_, Option<String>>(3)?,
+                "toolName": row.get::<_, String>(4)?,
+                "status": row.get::<_, String>(5)?,
+                "args": row.get::<_, Option<String>>(6)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
+                "result": row.get::<_, Option<String>>(7)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
+                "error": row.get::<_, Option<String>>(8)?,
+                "durationMs": row.get::<_, Option<i64>>(9)?,
+                "createdAt": iso_from_millis(row.get::<_, i64>(10)?),
+                "updatedAt": iso_from_millis(row.get::<_, i64>(11)?),
+            }))
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
+    });
+    match res { Ok(v) => api_ok(v), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+}
+
+async fn api_tool_calls_stats(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let res = state.registry_db.with_conn(|conn| {
+        let total: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM tool_calls WHERE tenant_id=?1",
+            rusqlite::params![tenant],
+            |row| row.get(0),
+        )?;
+        let errors: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM tool_calls WHERE tenant_id=?1 AND status='error'",
+            rusqlite::params![tenant],
+            |row| row.get(0),
+        )?;
+        Ok(serde_json::json!({ "total": total, "errors": errors }))
+    });
+    match res { Ok(v) => api_ok(v), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+}
+
+async fn api_get_tool_call(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let res = state.registry_db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT id,session_id,run_id,agent_id,tool_name,status,args_json,result_json,error,duration_ms,created_at,updated_at
+             FROM tool_calls WHERE tenant_id=?1 AND id=?2",
+            rusqlite::params![tenant, id],
+            |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, String>(0)?,
+                    "sessionId": row.get::<_, Option<String>>(1)?,
+                    "runId": row.get::<_, Option<String>>(2)?,
+                    "agentId": row.get::<_, Option<String>>(3)?,
+                    "toolName": row.get::<_, String>(4)?,
+                    "status": row.get::<_, String>(5)?,
+                    "args": row.get::<_, Option<String>>(6)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
+                    "result": row.get::<_, Option<String>>(7)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
+                    "error": row.get::<_, Option<String>>(8)?,
+                    "durationMs": row.get::<_, Option<i64>>(9)?,
+                    "createdAt": iso_from_millis(row.get::<_, i64>(10)?),
+                    "updatedAt": iso_from_millis(row.get::<_, i64>(11)?),
+                }))
+            },
+        )
+        .map_err(anyhow::Error::from)
+    });
+    match res { Ok(v) => api_ok(v), Err(_) => api_err(StatusCode::NOT_FOUND, "Tool call not found") }
 }
 
 /// `WhatsApp` verification query params

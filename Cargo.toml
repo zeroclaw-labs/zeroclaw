@@ -61,9 +61,9 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 hostname = "0.4.2"
 
 # HTTP server (gateway) — replaces raw TCP for proper HTTP/1.1 compliance
-axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio", "query", "ws"] }
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio", "query", "ws", "multipart"] }
 tower = { version = "0.5", default-features = false }
-tower-http = { version = "0.6", default-features = false, features = ["limit", "timeout"] }
+tower-http = { version = "0.6", default-features = false, features = ["limit", "timeout", "cors"] }
 http-body-util = "0.1"
 
 [profile.release]
