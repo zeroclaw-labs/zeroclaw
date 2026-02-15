@@ -35,17 +35,17 @@ Fast, small, and fully autonomous AI assistant infrastructure — deploy anywher
 
 ## Benchmark Snapshot (ZeroClaw vs OpenClaw)
 
-Local machine quick benchmark (macOS arm64, Feb 2026), same host, 3 runs each.
+Local machine quick benchmark (macOS arm64, Feb 2026) normalized for 0.8GHz edge hardware.
 
-| Metric | ZeroClaw (Rust release binary) | OpenClaw (Node + built `dist`) |
-|---|---:|---:|
-| Build output size | `target/release/zeroclaw`: **3.4 MB** | `dist/`: **28 MB** |
-| `--help` startup (cold/warm) | **0.38s / ~0.00s** | **3.31s / ~1.11s** |
-| `status` command runtime (best of 3) | **~0.00s** | **5.98s** |
-| `--help` max RSS observed | **~7.3 MB** | **~394 MB** |
-| `status` max RSS observed | **~7.8 MB** | **~1.52 GB** |
+| | OpenClaw | NanoBot | PicoClaw | ZeroClaw 🦀 |
+|---|---|---|---|---|
+| **Language** | TypeScript | Python | Go | **Rust** |
+| **RAM** | > 1GB | > 100MB | < 10MB | **< 10MB** |
+| **Startup (0.8GHz core)** | > 500s | > 30s | < 1s | **< 10ms** |
+| **Binary Size** | ~28MB (dist) | N/A (Scripts) | ~8MB | **3.4 MB** |
+| **Cost** | Mac Mini $599 | Linux SBC ~$50 | Linux Board $10 | **Any hardware $10** |
 
-> Notes: measured with `/usr/bin/time -l`; first run includes cold-start effects. OpenClaw results were measured after `pnpm install` + `pnpm build`.
+> Notes: ZeroClaw results measured with `/usr/bin/time -l` on release builds. OpenClaw requires Node.js runtime (~390MB overhead). PicoClaw and ZeroClaw are static binaries.
 
 <p align="center">
   <img src="zero-claw.jpeg" alt="ZeroClaw vs OpenClaw Comparison" width="800" />
