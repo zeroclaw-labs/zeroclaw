@@ -123,10 +123,12 @@ pub fn build_system_prompt(
                 "    <description>{}</description>",
                 skill.description
             );
-            let location = workspace_dir
-                .join("skills")
-                .join(&skill.name)
-                .join("SKILL.md");
+            let location = skill.location.clone().unwrap_or_else(|| {
+                workspace_dir
+                    .join("skills")
+                    .join(&skill.name)
+                    .join("SKILL.md")
+            });
             let _ = writeln!(prompt, "    <location>{}</location>", location.display());
             let _ = writeln!(prompt, "  </skill>");
         }
@@ -825,6 +827,7 @@ mod tests {
             tags: vec![],
             tools: vec![],
             prompts: vec!["Long prompt content that should NOT appear in system prompt".into()],
+            location: None,
         }];
 
         let prompt = build_system_prompt(ws.path(), "model", &[], &skills);
@@ -937,8 +940,8 @@ mod tests {
             calls: Arc::clone(&calls),
         });
 
-        let (_tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(1);
-        let handle = spawn_supervised_listener(channel, _tx, 1, 1);
+        let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(1);
+        let handle = spawn_supervised_listener(channel, tx, 1, 1);
 
         tokio::time::sleep(Duration::from_millis(80)).await;
         drop(rx);
