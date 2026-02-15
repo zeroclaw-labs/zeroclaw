@@ -151,7 +151,7 @@ pub async fn run(
         // Auto-save assistant response to daily log
         if config.memory.auto_save {
             let summary = if response.len() > 100 {
-                format!("{}...", &response[..100])
+                format!("{}...", &response[..response.floor_char_boundary(100)])
             } else {
                 response.clone()
             };
@@ -194,7 +194,7 @@ pub async fn run(
 
             if config.memory.auto_save {
                 let summary = if response.len() > 100 {
-                    format!("{}...", &response[..100])
+                    format!("{}...", &response[..response.floor_char_boundary(100)])
                 } else {
                     response.clone()
                 };

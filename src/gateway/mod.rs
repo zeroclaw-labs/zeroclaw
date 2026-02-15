@@ -379,7 +379,7 @@ async fn handle_whatsapp_message(State(state): State<AppState>, body: Bytes) -> 
             "WhatsApp message from {}: {}",
             msg.sender,
             if msg.content.len() > 50 {
-                format!("{}...", &msg.content[..50])
+                format!("{}...", &msg.content[..msg.content.floor_char_boundary(50)])
             } else {
                 msg.content.clone()
             }
