@@ -153,7 +153,7 @@ fn resolve_api_key(name: &str, api_key: Option<&str>) -> Option<String> {
 /// Factory: create the right provider from config
 #[allow(clippy::too_many_lines)]
 pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<dyn Provider>> {
-    let resolved_key = resolve_api_key(name, api_key);
+    let _resolved_key = resolve_api_key(name, api_key);
     match name {
         // ── Primary providers (custom implementations) ───────
         "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(api_key))),
