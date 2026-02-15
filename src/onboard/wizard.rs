@@ -1018,18 +1018,7 @@ fn anthropic_models_for_onboarding(credential: Option<&str>) -> Vec<(String, Str
 
     let mut dynamic: Vec<(String, String)> = dynamic_ids
         .into_iter()
-        .map(|id| {
-            let label = if id.contains("opus") {
-                format!("{id} (live)")
-            } else if id.contains("sonnet") {
-                format!("{id} (live)")
-            } else if id.contains("haiku") {
-                format!("{id} (live)")
-            } else {
-                id.clone()
-            };
-            (id, label)
-        })
+        .map(|id| (id.clone(), format!("{id} (live)")))
         .collect();
 
     dynamic.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1424,20 +1413,17 @@ fn setup_channels() -> Result<ChannelsConfig> {
                             .to_string(),
                     )
                 });
-                match bot_name {
-                    Some(bot_name) => {
-                        println!(
-                            "\r  {} Connected as @{bot_name}        ",
-                            style("✅").green().bold()
-                        );
-                    }
-                    _ => {
-                        println!(
-                            "\r  {} Connection failed — check your token and try again",
-                            style("❌").red().bold()
-                        );
-                        continue;
-                    }
+                if let Some(bot_name) = bot_name {
+                    println!(
+                        "\r  {} Connected as @{bot_name}        ",
+                        style("✅").green().bold()
+                    );
+                } else {
+                    println!(
+                        "\r  {} Connection failed — check your token and try again",
+                        style("❌").red().bold()
+                    );
+                    continue;
                 }
 
                 print_bullet(
@@ -1519,20 +1505,17 @@ fn setup_channels() -> Result<ChannelsConfig> {
                             .to_string(),
                     )
                 });
-                match bot_name {
-                    Some(bot_name) => {
-                        println!(
-                            "\r  {} Connected as {bot_name}        ",
-                            style("✅").green().bold()
-                        );
-                    }
-                    _ => {
-                        println!(
-                            "\r  {} Connection failed — check your token and try again",
-                            style("❌").red().bold()
-                        );
-                        continue;
-                    }
+                if let Some(bot_name) = bot_name {
+                    println!(
+                        "\r  {} Connected as {bot_name}        ",
+                        style("✅").green().bold()
+                    );
+                } else {
+                    println!(
+                        "\r  {} Connection failed — check your token and try again",
+                        style("❌").red().bold()
+                    );
+                    continue;
                 }
 
                 let guild: String = Input::new()
@@ -1799,20 +1782,17 @@ fn setup_channels() -> Result<ChannelsConfig> {
                             .to_string(),
                     )
                 });
-                match user_id {
-                    Some(user_id) => {
-                        println!(
-                            "\r  {} Connected as {user_id}        ",
-                            style("✅").green().bold()
-                        );
-                    }
-                    _ => {
-                        println!(
-                            "\r  {} Connection failed — check homeserver URL and token",
-                            style("❌").red().bold()
-                        );
-                        continue;
-                    }
+                if let Some(user_id) = user_id {
+                    println!(
+                        "\r  {} Connected as {user_id}        ",
+                        style("✅").green().bold()
+                    );
+                } else {
+                    println!(
+                        "\r  {} Connection failed — check homeserver URL and token",
+                        style("❌").red().bold()
+                    );
+                    continue;
                 }
 
                 let room_id: String = Input::new()
@@ -1890,20 +1870,17 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         .ok()?;
                     Some(resp.status().is_success())
                 });
-                match connected {
-                    Some(true) => {
-                        println!(
-                            "\r  {} Connected to WhatsApp API        ",
-                            style("✅").green().bold()
-                        );
-                    }
-                    _ => {
-                        println!(
-                            "\r  {} Connection failed — check access token and phone number ID",
-                            style("❌").red().bold()
-                        );
-                        continue;
-                    }
+                if let Some(true) = connected {
+                    println!(
+                        "\r  {} Connected to WhatsApp API        ",
+                        style("✅").green().bold()
+                    );
+                } else {
+                    println!(
+                        "\r  {} Connection failed — check access token and phone number ID",
+                        style("❌").red().bold()
+                    );
+                    continue;
                 }
 
                 let users_str: String = Input::new()
