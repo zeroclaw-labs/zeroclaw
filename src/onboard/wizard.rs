@@ -1385,6 +1385,10 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
             ("venice", "Venice AI — privacy-first (Llama, Opus)"),
             ("anthropic", "Anthropic — Claude Sonnet & Opus (direct)"),
             ("openai", "OpenAI — GPT-4o, o1, GPT-5 (direct)"),
+            (
+                "openai-codex",
+                "OpenAI Codex (ChatGPT subscription OAuth, no API key)",
+            ),
             ("deepseek", "DeepSeek — V3 & R1 (affordable)"),
             ("mistral", "Mistral — Large & Codestral"),
             ("xai", "xAI — Grok 3 & 4"),
@@ -1718,6 +1722,10 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
             ("gpt-4o", "GPT-4o (flagship)"),
             ("gpt-4o-mini", "GPT-4o Mini (fast, cheap)"),
             ("o1-mini", "o1-mini (reasoning)"),
+        ],
+        "openai-codex" => vec![
+            ("gpt-5-codex", "GPT-5 Codex (recommended)"),
+            ("o4-mini", "o4-mini (fallback)"),
         ],
         "venice" => vec![
             ("llama-3.3-70b", "Llama 3.3 70B (default, fast)"),
@@ -4054,15 +4062,41 @@ fn print_summary(config: &Config) {
     let mut step = 1u8;
 
     if config.api_key.is_none() {
-        let env_var = provider_env_var(config.default_provider.as_deref().unwrap_or("openrouter"));
-        println!(
-            "    {} Set your API key:",
-            style(format!("{step}.")).cyan().bold()
-        );
-        println!(
-            "       {}",
-            style(format!("export {env_var}=\"sk-...\"")).yellow()
-        );
+        let provider = config.default_provider.as_deref().unwrap_or("openrouter");
+        if provider == "openai-codex" {
+            println!(
+                "    {} Authenticate OpenAI Codex:",
+                style(format!("{step}.")).cyan().bold()
+            );
+            println!(
+                "       {}",
+                style("zeroclaw auth login --provider openai-codex --device-code").yellow()
+            );
+        } else if provider == "anthropic" {
+            println!(
+                "    {} Configure Anthropic auth:",
+                style(format!("{step}.")).cyan().bold()
+            );
+            println!(
+                "       {}",
+                style("export ANTHROPIC_API_KEY=\"sk-ant-...\"").yellow()
+            );
+            println!(
+                "       {}",
+                style("or: zeroclaw auth paste-token --provider anthropic --auth-kind authorization")
+                    .yellow()
+            );
+        } else {
+            let env_var = provider_env_var(provider);
+            println!(
+                "    {} Set your API key:",
+                style(format!("{step}.")).cyan().bold()
+            );
+            println!(
+                "       {}",
+                style(format!("export {env_var}=\"sk-...\"")).yellow()
+            );
+        }
         println!();
         step += 1;
     }

@@ -960,6 +960,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
         config.api_key.as_deref(),
         config.api_url.as_deref(),
         &config.reliability,
+        &providers::ProviderRuntimeOptions {
+            auth_profile_override: None,
+            zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
+            secrets_encrypt: config.secrets.encrypt,
+        },
     )?);
 
     // Warm up the provider connection pool (TLS handshake, DNS, HTTP/2 setup)

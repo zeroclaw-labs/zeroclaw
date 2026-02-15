@@ -60,6 +60,7 @@ chacha20poly1305 = "0.10"
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
+base64 = "0.22"
 
 # CSPRNG for secure token generation
 rand = "0.9"
@@ -169,7 +170,6 @@ strip = true
 panic = "abort"
 
 [dev-dependencies]
-tokio-test = "0.4"
 tempfile = "3.14"
 criterion = { version = "0.5", features = ["async_tokio"] }
 
