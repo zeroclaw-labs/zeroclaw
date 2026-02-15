@@ -1700,8 +1700,8 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     access_token: access_token.trim().to_string(),
                     phone_number_id: phone_number_id.trim().to_string(),
                     verify_token: verify_token.trim().to_string(),
-                    allowed_numbers,
                     app_secret: None, // Can be set via ZEROCLAW_WHATSAPP_APP_SECRET env var
+                    allowed_numbers,
                 });
             }
             6 => {

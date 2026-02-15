@@ -763,7 +763,8 @@ pub struct WhatsAppConfig {
     pub phone_number_id: String,
     /// Webhook verify token (you define this, Meta sends it back for verification)
     pub verify_token: String,
-    /// App secret for webhook signature verification (X-Hub-Signature-256)
+    /// App secret from Meta Business Suite (for webhook signature verification)
+    /// Can also be set via `ZEROCLAW_WHATSAPP_APP_SECRET` environment variable
     #[serde(default)]
     pub app_secret: Option<String>,
     /// Allowed phone numbers (E.164 format: +1234567890) or "*" for all
@@ -1488,7 +1489,7 @@ channel_id = "C123"
             access_token: "tok".into(),
             phone_number_id: "12345".into(),
             verify_token: "verify".into(),
-            app_secret: None,
+            app_secret: Some("secret123".into()),
             allowed_numbers: vec!["+1".into()],
         };
         let toml_str = toml::to_string(&wc).unwrap();
