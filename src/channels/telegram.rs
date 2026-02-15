@@ -370,26 +370,52 @@ impl Channel for TelegramChannel {
     }
 
     async fn send(&self, message: &str, chat_id: &str) -> anyhow::Result<()> {
-        let body = serde_json::json!({
+        let markdown_body = serde_json::json!({
             "chat_id": chat_id,
             "text": message,
             "parse_mode": "Markdown"
         });
 
-        let resp = self
+        let markdown_resp = self
             .client
             .post(self.api_url("sendMessage"))
-            .json(&body)
+            .json(&markdown_body)
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let err = resp
-                .text()
-                .await
-                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
-            anyhow::bail!("Telegram sendMessage failed ({status}): {err}");
+        if markdown_resp.status().is_success() {
+            return Ok(());
+        }
+
+        let markdown_status = markdown_resp.status();
+        let markdown_err = markdown_resp.text().await.unwrap_or_default();
+        tracing::warn!(
+            status = ?markdown_status,
+            "Telegram sendMessage with Markdown failed; retrying without parse_mode"
+        );
+
+        // Retry without parse_mode as a compatibility fallback.
+        let plain_body = serde_json::json!({
+            "chat_id": chat_id,
+            "text": message,
+        });
+        let plain_resp = self
+            .client
+            .post(self.api_url("sendMessage"))
+            .json(&plain_body)
+            .send()
+            .await?;
+
+        if !plain_resp.status().is_success() {
+            let plain_status = plain_resp.status();
+            let plain_err = plain_resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Telegram sendMessage failed (markdown {}: {}; plain {}: {})",
+                markdown_status,
+                markdown_err,
+                plain_status,
+                plain_err
+            );
         }
 
         Ok(())

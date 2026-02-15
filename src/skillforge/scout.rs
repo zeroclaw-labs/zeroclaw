@@ -79,9 +79,7 @@ impl GitHubScout {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             reqwest::header::ACCEPT,
-            "application/vnd.github+json"
-                .parse()
-                .expect("valid header"),
+            "application/vnd.github+json".parse().expect("valid header"),
         );
         headers.insert(
             reqwest::header::USER_AGENT,
@@ -101,10 +99,7 @@ impl GitHubScout {
 
         Self {
             client,
-            queries: vec![
-                "zeroclaw skill".into(),
-                "ai agent skill".into(),
-            ],
+            queries: vec!["zeroclaw skill".into(), "ai agent skill".into()],
         }
     }
 
@@ -143,10 +138,7 @@ impl GitHubScout {
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown")
                     .to_string();
-                let has_license = item
-                    .get("license")
-                    .map(|v| !v.is_null())
-                    .unwrap_or(false);
+                let has_license = item.get("license").map(|v| !v.is_null()).unwrap_or(false);
 
                 Some(ScoutResult {
                     name,
@@ -225,9 +217,7 @@ impl Scout for GitHubScout {
 
 /// Minimal percent-encoding for query strings (space → +).
 fn urlencoding(s: &str) -> String {
-    s.replace(' ', "+")
-        .replace('&', "%26")
-        .replace('#', "%23")
+    s.replace(' ', "+").replace('&', "%26").replace('#', "%23")
 }
 
 /// Deduplicate scout results by URL (keeps first occurrence).
@@ -246,13 +236,31 @@ mod tests {
 
     #[test]
     fn scout_source_from_str() {
-        assert_eq!("github".parse::<ScoutSource>().unwrap(), ScoutSource::GitHub);
-        assert_eq!("GitHub".parse::<ScoutSource>().unwrap(), ScoutSource::GitHub);
-        assert_eq!("clawhub".parse::<ScoutSource>().unwrap(), ScoutSource::ClawHub);
-        assert_eq!("huggingface".parse::<ScoutSource>().unwrap(), ScoutSource::HuggingFace);
-        assert_eq!("hf".parse::<ScoutSource>().unwrap(), ScoutSource::HuggingFace);
+        assert_eq!(
+            "github".parse::<ScoutSource>().unwrap(),
+            ScoutSource::GitHub
+        );
+        assert_eq!(
+            "GitHub".parse::<ScoutSource>().unwrap(),
+            ScoutSource::GitHub
+        );
+        assert_eq!(
+            "clawhub".parse::<ScoutSource>().unwrap(),
+            ScoutSource::ClawHub
+        );
+        assert_eq!(
+            "huggingface".parse::<ScoutSource>().unwrap(),
+            ScoutSource::HuggingFace
+        );
+        assert_eq!(
+            "hf".parse::<ScoutSource>().unwrap(),
+            ScoutSource::HuggingFace
+        );
         // unknown falls back to GitHub
-        assert_eq!("unknown".parse::<ScoutSource>().unwrap(), ScoutSource::GitHub);
+        assert_eq!(
+            "unknown".parse::<ScoutSource>().unwrap(),
+            ScoutSource::GitHub
+        );
     }
 
     #[test]

@@ -154,7 +154,8 @@ mod tests {
 
     #[test]
     fn creates_with_custom_base_url() {
-        let p = AnthropicProvider::with_base_url(Some("sk-ant-test"), Some("https://api.example.com"));
+        let p =
+            AnthropicProvider::with_base_url(Some("sk-ant-test"), Some("https://api.example.com"));
         assert_eq!(p.base_url, "https://api.example.com");
         assert_eq!(p.credential.as_deref(), Some("sk-ant-test"));
     }

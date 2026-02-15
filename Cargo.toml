@@ -33,6 +33,9 @@ shellexpand = "3.1"
 tracing = { version = "0.1", default-features = false }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi"] }
 
+# Observability - Prometheus metrics
+prometheus = { version = "0.13", default-features = false }
+
 # Base64 encoding (screenshots, image data)
 base64 = "0.22"
 
@@ -79,6 +82,11 @@ axum = { version = "0.7", default-features = false, features = ["http1", "json",
 tower = { version = "0.5", default-features = false }
 tower-http = { version = "0.6", default-features = false, features = ["limit", "timeout"] }
 http-body-util = "0.1"
+
+# OpenTelemetry — OTLP trace + metrics export
+opentelemetry = { version = "0.31", default-features = false, features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "metrics"] }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client"] }
 
 [profile.release]
 opt-level = "z"      # Optimize for size

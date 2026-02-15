@@ -1,0 +1,10 @@
+# Default owner for all files
+* @theonlyhennygod
+
+# High-risk surfaces
+/src/security/** @theonlyhennygod
+/src/runtime/** @theonlyhennygod
+/src/memory/** @theonlyhennygod
+/.github/** @theonlyhennygod
+/Cargo.toml @theonlyhennygod
+/Cargo.lock @theonlyhennygod

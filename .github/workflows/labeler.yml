@@ -1,0 +1,70 @@
+name: PR Labeler
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, edited]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Apply path labels
+        uses: actions/labeler@v5
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Apply size label
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const sizeLabels = ["size: XS", "size: S", "size: M", "size: L", "size: XL"];
+            const labelColor = "BFDADC";
+            const changedLines = (pr.additions || 0) + (pr.deletions || 0);
+
+            let sizeLabel = "size: XL";
+            if (changedLines <= 80) sizeLabel = "size: XS";
+            else if (changedLines <= 250) sizeLabel = "size: S";
+            else if (changedLines <= 500) sizeLabel = "size: M";
+            else if (changedLines <= 1000) sizeLabel = "size: L";
+
+            for (const label of sizeLabels) {
+              try {
+                await github.rest.issues.getLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: label,
+                });
+              } catch (error) {
+                if (error.status !== 404) throw error;
+                await github.rest.issues.createLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: label,
+                  color: labelColor,
+                });
+              }
+            }
+
+            const { data: currentLabels } = await github.rest.issues.listLabelsOnIssue({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+            });
+
+            const keepLabels = currentLabels
+              .map((label) => label.name)
+              .filter((label) => !sizeLabels.includes(label));
+
+            const nextLabels = [...new Set([...keepLabels, sizeLabel])];
+            await github.rest.issues.setLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              labels: nextLabels,
+            });

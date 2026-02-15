@@ -37,6 +37,33 @@ git push --no-verify
 
 > **Note:** CI runs the same checks, so skipped hooks will be caught on the PR.
 
+## High-Volume Collaboration Rules
+
+When PR traffic is high (especially with AI-assisted contributions), these rules keep quality and throughput stable:
+
+- **One concern per PR**: avoid mixing refactor + feature + infra in one change.
+- **Small PRs first**: prefer PR size `XS/S/M`; split large work into stacked PRs.
+- **Template is mandatory**: complete every section in `.github/pull_request_template.md`.
+- **Explicit rollback**: every PR must include a fast rollback path.
+- **Security-first review**: changes in `src/security/`, runtime, and CI need stricter validation.
+
+Full maintainer workflow: [`docs/pr-workflow.md`](docs/pr-workflow.md).
+
+## Agent Collaboration Guidance
+
+Agent-assisted contributions are welcome and treated as first-class contributions.
+
+For smoother agent-to-agent and human-to-agent review:
+
+- Keep PR summaries concrete (problem, change, non-goals).
+- Include reproducible validation evidence (`fmt`, `clippy`, `test`, scenario checks).
+- Add brief workflow notes when automation materially influenced design/code.
+- Call out uncertainty and risky edges explicitly.
+
+We do **not** require PRs to declare an AI-vs-human line ratio.
+
+Agent implementation playbook lives in [`AGENTS.md`](AGENTS.md).
+
 ## Architecture: Trait-Based Pluggability
 
 ZeroClaw's architecture is built on **traits** — every subsystem is swappable. This means contributing a new integration is as simple as implementing a trait and registering it in the factory function.
@@ -184,8 +211,9 @@ impl Tool for YourTool {
 
 ## Pull Request Checklist
 
-- [ ] `cargo fmt` — code is formatted
-- [ ] `cargo clippy -- -D warnings` — no warnings
+- [ ] PR template sections are completed (including security + rollback)
+- [ ] `cargo fmt --all -- --check` — code is formatted
+- [ ] `cargo clippy --all-targets -- -D warnings` — no warnings
 - [ ] `cargo test` — all 129+ tests pass
 - [ ] New code has inline `#[cfg(test)]` tests
 - [ ] No new dependencies unless absolutely necessary (we optimize for binary size)
@@ -198,12 +226,17 @@ We use [Conventional Commits](https://www.conventionalcommits.org/):
 
 ```
 feat: add Anthropic provider
+feat(provider): add Anthropic provider
 fix: path traversal edge case with symlinks
 docs: update contributing guide
 test: add heartbeat unicode parsing tests
 refactor: extract common security checks
 chore: bump tokio to 1.43
 ```
+
+Recommended scope keys in commit titles:
+
+- `provider`, `channel`, `memory`, `security`, `runtime`, `ci`, `docs`, `tests`
 
 ## Code Style
 
@@ -218,6 +251,14 @@ chore: bump tokio to 1.43
 - **Bugs**: Include OS, Rust version, steps to reproduce, expected vs actual
 - **Features**: Describe the use case, propose which trait to extend
 - **Security**: See [SECURITY.md](SECURITY.md) for responsible disclosure
+
+## Maintainer Merge Policy
+
+- Require passing `CI Required Gate` before merge.
+- Require review approval for non-trivial changes.
+- Require CODEOWNERS review for protected paths.
+- Prefer squash merge with conventional commit title.
+- Revert fast on regressions; re-land with tests.
 
 ## License
 
