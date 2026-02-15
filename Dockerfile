@@ -28,13 +28,25 @@ RUN cargo build --release --locked && \
 # ── Stage 2: Permissions & Config Prep ───────────────────────
 FROM busybox:latest AS permissions
 # Create directory structure (simplified workspace path)
-RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace && \
-    chown -R 65534:65534 /zeroclaw-data
+RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace
 
-# Copy config template to be the default config for DEV environments
-# (Prod overrides this with env vars or mounted config)
-COPY dev/config.template.toml /zeroclaw-data/.zeroclaw/config.toml
-RUN chown 65534:65534 /zeroclaw-data/.zeroclaw/config.toml
+# Create minimal config for PRODUCTION (allows binding to public interfaces)
+# NOTE: Provider configuration must be done via environment variables at runtime
+RUN cat > /zeroclaw-data/.zeroclaw/config.toml << 'EOF'
+workspace_dir = "/zeroclaw-data/workspace"
+config_path = "/zeroclaw-data/.zeroclaw/config.toml"
+api_key = ""
+default_provider = "openrouter"
+default_model = "anthropic/claude-sonnet-4-20250514"
+default_temperature = 0.7
+
+[gateway]
+port = 3000
+host = "[::]"
+allow_public_bind = true
+EOF
+
+RUN chown -R 65534:65534 /zeroclaw-data
 
 # ── Stage 3: Development Runtime (Debian) ────────────────────
 FROM debian:bookworm-slim AS dev
@@ -51,6 +63,10 @@ RUN apt-get update && apt-get install -y \
 
 COPY --from=permissions /zeroclaw-data /zeroclaw-data
 COPY --from=builder /app/target/release/zeroclaw /usr/local/bin/zeroclaw
+
+# Overwrite minimal config with DEV template (Ollama defaults)
+COPY dev/config.template.toml /zeroclaw-data/.zeroclaw/config.toml
+RUN chown 65534:65534 /zeroclaw-data/.zeroclaw/config.toml
 
 # Environment setup
 # Use consistent workspace path

@@ -4,7 +4,8 @@ A fully containerized development sandbox for ZeroClaw agents. This environment 
 
 ## Directory Structure
 
-- **`agent/`**: Dockerfile for the Agent in development mode.
+- **`agent/`**: (Merged into root Dockerfile)
+  - The development image is built from the root `Dockerfile` using the `dev` stage (`target: dev`).
   - Based on `debian:bookworm-slim` (unlike production `distroless`).
   - Includes `bash`, `curl`, and debug tools.
 - **`sandbox/`**: Dockerfile for the simulated user environment.
