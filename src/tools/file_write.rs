@@ -112,7 +112,11 @@ impl Tool for FileWriteTool {
 
         // Atomic write: write to a temporary file then rename, so a failed
         // write never leaves a partially-written file at the target path.
-        let tmp_path = resolved_target.with_extension("tmp");
+        let tmp_path = {
+            let mut name = resolved_target.file_name().unwrap().to_os_string();
+            name.push(".tmp");
+            resolved_parent.join(name)
+        };
 
         if let Err(e) = tokio::fs::write(&tmp_path, content).await {
             // Clean up partial temp file on write failure
