@@ -27,24 +27,11 @@ function ensure_config {
     WORKSPACE_DIR="$CONFIG_DIR/workspace"
 
     if [ ! -f "$CONFIG_FILE" ]; then
-        echo -e "${YELLOW}⚙️  Config file missing in target/.zeroclaw. Creating default dev config...${NC}"
+        echo -e "${YELLOW}⚙️  Config file missing in target/.zeroclaw. Creating default dev config from template...${NC}"
         mkdir -p "$WORKSPACE_DIR"
         
-        # Default config required for docker networking (0.0.0.0 bind)
-        cat > "$CONFIG_FILE" <<EOF
-workspace_dir = "/zeroclaw-data/workspace"
-config_path = "/zeroclaw-data/.zeroclaw/config.toml"
-# This is the Ollama Base URL, not a secret key
-api_key = "http://host.docker.internal:11434"
-default_provider = "ollama"
-default_model = "llama3.2"
-default_temperature = 0.7
-
-[gateway]
-port = 3000
-host = "0.0.0.0"
-allow_public_bind = true
-EOF
+        # Copy template
+        cat "$BASE_DIR/config.template.toml" > "$CONFIG_FILE"
     fi
 }
 
@@ -71,8 +58,8 @@ case "$1" in
     up)
         ensure_config
         echo -e "${GREEN}🚀 Starting Dev Environment...${NC}"
-        # Build context MUST be set correctly for docker-compose
-        docker-compose -f "$COMPOSE_FILE" up -d
+        # Build context MUST be set correctly for docker compose
+        docker compose -f "$COMPOSE_FILE" up -d
         echo -e "${GREEN}✅ Environment is running!${NC}"
         echo -e "   - Agent: http://127.0.0.1:3000"
         echo -e "   - Sandbox: running (background)"
@@ -81,7 +68,7 @@ case "$1" in
     
     down)
         echo -e "${YELLOW}🛑 Stopping services...${NC}"
-        docker-compose -f "$COMPOSE_FILE" down
+        docker compose -f "$COMPOSE_FILE" down
         echo -e "${GREEN}✅ Stopped.${NC}"
         ;;
 
@@ -96,25 +83,25 @@ case "$1" in
         ;;
 
     logs)
-        docker-compose -f "$COMPOSE_FILE" logs -f
+        docker compose -f "$COMPOSE_FILE" logs -f
         ;;
 
     build)
         echo -e "${YELLOW}🔨 Rebuilding images...${NC}"
-        docker-compose -f "$COMPOSE_FILE" build
+        docker compose -f "$COMPOSE_FILE" build
         ensure_config
-        docker-compose -f "$COMPOSE_FILE" up -d
+        docker compose -f "$COMPOSE_FILE" up -d
         echo -e "${GREEN}✅ Rebuild complete.${NC}"
         ;;
 
     clean)
-        echo -e "${RED}⚠️  WARNING: This will delete 'target/.zeroclaw' data.${NC}"
+        echo -e "${RED}⚠️  WARNING: This will delete 'target/.zeroclaw' data and Docker volumes.${NC}"
         read -p "Are you sure? (y/N) " -n 1 -r
         echo
         if [[ $REPLY =~ ^[Yy]$ ]]; then
-            docker-compose -f "$COMPOSE_FILE" down -v
+            docker compose -f "$COMPOSE_FILE" down -v
             rm -rf "$HOST_TARGET_DIR/.zeroclaw"
-            echo -e "${GREEN}🧹 Cleaned up.${NC}"
+            echo -e "${GREEN}🧹 Cleaned up (playground/ remains intact).${NC}"
         else
             echo "Cancelled."
         fi

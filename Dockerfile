@@ -1,7 +1,15 @@
+# syntax=docker/dockerfile:1
+
 # ── Stage 1: Build ────────────────────────────────────────────
-FROM rust:1.83-slim AS builder
+FROM rust:1.93-slim AS builder
 
 WORKDIR /app
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 # 1. Copy manifests to cache dependencies
 COPY Cargo.toml Cargo.lock ./
@@ -17,72 +25,69 @@ RUN touch src/main.rs
 RUN cargo build --release --locked && \
     strip target/release/zeroclaw
 
-# ── Stage 2: Create data directories with correct permissions ──
+# ── Stage 2: Permissions & Config Prep ───────────────────────
 FROM busybox:latest AS permissions
-# Create the directory structure that the app expects
-# This includes a minimal config.toml that allows Docker deployments to work
-RUN mkdir -p /zeroclaw-data/.zeroclaw/workspace && \
+# Create directory structure (simplified workspace path)
+RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace && \
     chown -R 65534:65534 /zeroclaw-data
 
-# Create minimal config.toml required for Docker (allows binding to public interfaces)
-# NOTE: Provider configuration should be done via environment variables at runtime
-# These are placeholder values that will be overridden by environment variables
-RUN cat > /zeroclaw-data/.zeroclaw/config.toml << 'EOF'
-workspace_dir = "/zeroclaw-data/.zeroclaw/workspace"
-config_path = "/zeroclaw-data/.zeroclaw/config.toml"
-api_key = ""
-default_provider = "openrouter"
-default_model = ""
-default_temperature = 0.7
+# Copy config template to be the default config for DEV environments
+# (Prod overrides this with env vars or mounted config)
+COPY dev/config.template.toml /zeroclaw-data/.zeroclaw/config.toml
+RUN chown 65534:65534 /zeroclaw-data/.zeroclaw/config.toml
 
-[gateway]
-port = 3000
-host = "0.0.0.0"
-allow_public_bind = true
-EOF
-RUN chown -R 65534:65534 /zeroclaw-data
+# ── Stage 3: Development Runtime (Debian) ────────────────────
+FROM debian:bookworm-slim AS dev
 
-# ── Stage 3: Runtime (distroless nonroot — no shell, no OS, tiny, UID 65534) ──
-FROM gcr.io/distroless/cc-debian12:nonroot
+# Install runtime dependencies + basic debug tools
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    openssl \
+    curl \
+    git \
+    iputils-ping \
+    vim \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=permissions /zeroclaw-data /zeroclaw-data
+COPY --from=builder /app/target/release/zeroclaw /usr/local/bin/zeroclaw
+
+# Environment setup
+# Use consistent workspace path
+ENV ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace
+ENV HOME=/zeroclaw-data
+# Defaults for local dev (Ollama) - matches config.template.toml
+ENV PROVIDER="ollama"
+ENV ZEROCLAW_MODEL="llama3.2"
+ENV ZEROCLAW_GATEWAY_PORT=3000
+
+# Note: API_KEY is intentionally NOT set here to avoid confusion.
+# It is set in config.toml as the Ollama URL.
+
+WORKDIR /zeroclaw-data
+USER 65534:65534
+EXPOSE 3000
+ENTRYPOINT ["zeroclaw"]
+CMD ["gateway", "--port", "3000", "--host", "[::]"]
+
+# ── Stage 4: Production Runtime (Distroless) ─────────────────
+FROM gcr.io/distroless/cc-debian12:nonroot AS release
 
 COPY --from=builder /app/target/release/zeroclaw /usr/local/bin/zeroclaw
 COPY --from=permissions /zeroclaw-data /zeroclaw-data
 
-# Environment variables with sensible defaults (overridable at runtime)
-ENV ZEROCLAW_WORKSPACE=/zeroclaw-data/.zeroclaw/workspace
+# Environment setup
+ENV ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace
 ENV HOME=/zeroclaw-data
-ENV API_KEY=${API_KEY:-}
-ENV PROVIDER=${PROVIDER:-openrouter}
-ENV ZEROCLAW_MODEL=${ZEROCLAW_MODEL:-anthropic/claude-sonnet-4-20250514}
-ENV ZEROCLAW_GATEWAY_PORT=${ZEROCLAW_GATEWAY_PORT:-3000}
+# Defaults for prod (OpenRouter)
+ENV PROVIDER="openrouter"
+ENV ZEROCLAW_MODEL="anthropic/claude-sonnet-4-20250514"
+ENV ZEROCLAW_GATEWAY_PORT=3000
 
-# Set working directory so that relative paths resolve correctly
+# API_KEY must be provided at runtime!
+
 WORKDIR /zeroclaw-data
-
-# ── Environment variable configuration (Docker-native setup) ──
-# These can be overridden at runtime via docker run -e or docker-compose
-#
-# Required:
-#   API_KEY or ZEROCLAW_API_KEY     - Your LLM provider API key
-#
-# Optional:
-#   PROVIDER or ZEROCLAW_PROVIDER   - LLM provider (default: openrouter)
-#                                     Options: openrouter, openai, anthropic, ollama
-#   ZEROCLAW_MODEL                  - Model to use (provider-specific)
-#   ZEROCLAW_GATEWAY_PORT           - Gateway port (default: 3000)
-#   ZEROCLAW_WORKSPACE              - Workspace directory (default: /zeroclaw-data/.zeroclaw/workspace)
-#
-# For Ollama:
-#   API_KEY=http://host.docker.internal:11434  (Ollama base URL)
-#
-# Example:
-#   docker run -e API_KEY=sk-... -e PROVIDER=openrouter zeroclaw/zeroclaw
-#   docker run -e API_KEY=http://host.docker.internal:11434 -e PROVIDER=ollama -e ZEROCLAW_MODEL=llama3.2:latest zeroclaw/zeroclaw
-
-# Explicitly set non-root user (distroless:nonroot defaults to 65534, but be explicit)
 USER 65534:65534
-
 EXPOSE 3000
-
 ENTRYPOINT ["zeroclaw"]
 CMD ["gateway", "--port", "3000", "--host", "[::]"]

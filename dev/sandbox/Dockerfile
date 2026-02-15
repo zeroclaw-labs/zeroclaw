@@ -18,9 +18,10 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Create a non-root user 'developer' with UID 1000
-# Grant passwordless sudo to simulate a local dev environment
+# Grant passwordless sudo to simulate a local dev environment (using safe sudoers.d)
 RUN useradd -m -s /bin/bash -u 1000 developer && \
-    echo "developer ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+    echo "developer ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/developer && \
+    chmod 0440 /etc/sudoers.d/developer
 
 # Set up the workspace
 USER developer

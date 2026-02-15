@@ -11,11 +11,12 @@
 name: zeroclaw-dev
 services:
   # ── The Agent (Development Image) ──
-  # Builds from source but uses a Debian-based image (with shell) instead of distroless.
+  # Builds from source using the 'dev' stage of the root Dockerfile
   zeroclaw-dev:
     build:
-      context: ..  # Build context is the REPO ROOT (../)
-      dockerfile: dev/agent/Dockerfile
+      context: ..
+      dockerfile: Dockerfile
+      target: dev
     container_name: zeroclaw-dev
     restart: unless-stopped
     environment:
@@ -25,8 +26,10 @@ services:
       - ZEROCLAW_GATEWAY_PORT=3000
       - SANDBOX_HOST=zeroclaw-sandbox
     volumes:
-      - ../target/.zeroclaw:/zeroclaw-data/.zeroclaw # Config only
-      - ../playground:/zeroclaw-data/workspace # Shared workspace with Sandbox
+      # Mount single config file (avoids shadowing other files in .zeroclaw)
+      - ../target/.zeroclaw/config.toml:/zeroclaw-data/.zeroclaw/config.toml
+      # Mount shared workspace
+      - ../playground:/zeroclaw-data/workspace
     ports:
       - "127.0.0.1:3000:3000"
     networks:
