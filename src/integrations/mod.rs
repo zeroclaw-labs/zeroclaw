@@ -67,9 +67,9 @@ pub struct IntegrationEntry {
 }
 
 /// Handle the `integrations` CLI command
-pub fn handle_command(command: super::IntegrationCommands, config: &Config) -> Result<()> {
+pub fn handle_command(command: crate::IntegrationCommands, config: &Config) -> Result<()> {
     match command {
-        super::IntegrationCommands::Info { name } => show_integration_info(config, &name),
+        crate::IntegrationCommands::Info { name } => show_integration_info(config, &name),
     }
 }
 

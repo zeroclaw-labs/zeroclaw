@@ -23,9 +23,9 @@ struct MigrationStats {
     renamed_conflicts: usize,
 }
 
-pub async fn handle_command(command: super::MigrateCommands, config: &Config) -> Result<()> {
+pub async fn handle_command(command: crate::MigrateCommands, config: &Config) -> Result<()> {
     match command {
-        super::MigrateCommands::Openclaw { source, dry_run } => {
+        crate::MigrateCommands::Openclaw { source, dry_run } => {
             migrate_openclaw_memory(config, source, dry_run).await
         }
     }

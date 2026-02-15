@@ -453,9 +453,9 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
 
 /// Handle the `skills` CLI command
 #[allow(clippy::too_many_lines)]
-pub fn handle_command(command: super::SkillCommands, workspace_dir: &Path) -> Result<()> {
+pub fn handle_command(command: crate::SkillCommands, workspace_dir: &Path) -> Result<()> {
     match command {
-        super::SkillCommands::List => {
+        crate::SkillCommands::List => {
             let skills = load_skills(workspace_dir);
             if skills.is_empty() {
                 println!("No skills installed.");
@@ -493,7 +493,7 @@ pub fn handle_command(command: super::SkillCommands, workspace_dir: &Path) -> Re
             println!();
             Ok(())
         }
-        super::SkillCommands::Install { source } => {
+        crate::SkillCommands::Install { source } => {
             println!("Installing skill from: {source}");
 
             let skills_path = skills_dir(workspace_dir);
@@ -584,7 +584,7 @@ pub fn handle_command(command: super::SkillCommands, workspace_dir: &Path) -> Re
 
             Ok(())
         }
-        super::SkillCommands::Remove { name } => {
+        crate::SkillCommands::Remove { name } => {
             let skill_path = skills_dir(workspace_dir).join(&name);
             if !skill_path.exists() {
                 anyhow::bail!("Skill not found: {name}");

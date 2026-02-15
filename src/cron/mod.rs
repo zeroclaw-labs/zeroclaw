@@ -19,9 +19,9 @@ pub struct CronJob {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-pub fn handle_command(command: super::CronCommands, config: &Config) -> Result<()> {
+pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<()> {
     match command {
-        super::CronCommands::List => {
+        crate::CronCommands::List => {
             let jobs = list_jobs(config)?;
             if jobs.is_empty() {
                 println!("No scheduled tasks yet.");
@@ -48,7 +48,7 @@ pub fn handle_command(command: super::CronCommands, config: &Config) -> Result<(
             }
             Ok(())
         }
-        super::CronCommands::Add {
+        crate::CronCommands::Add {
             expression,
             command,
         } => {
@@ -59,7 +59,7 @@ pub fn handle_command(command: super::CronCommands, config: &Config) -> Result<(
             println!("  Cmd : {}", job.command);
             Ok(())
         }
-        super::CronCommands::Remove { id } => remove_job(config, &id),
+        crate::CronCommands::Remove { id } => remove_job(config, &id),
     }
 }
 
