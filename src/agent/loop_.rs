@@ -10,6 +10,13 @@ use std::fmt::Write;
 use std::sync::Arc;
 use std::time::Instant;
 
+fn truncate_for_log(value: &str, max_chars: usize) -> String {
+    match value.char_indices().nth(max_chars) {
+        Some((idx, _)) => format!("{}...", &value[..idx]),
+        None => value.to_string(),
+    }
+}
+
 /// Build context preamble by searching memory for relevant entries
 async fn build_context(mem: &dyn Memory, user_msg: &str) -> String {
     let mut context = String::new();
@@ -150,11 +157,7 @@ pub async fn run(
 
         // Auto-save assistant response to daily log
         if config.memory.auto_save {
-            let summary = if response.len() > 100 {
-                format!("{}...", &response[..100])
-            } else {
-                response.clone()
-            };
+            let summary = truncate_for_log(&response, 100);
             let _ = mem
                 .store("assistant_resp", &summary, MemoryCategory::Daily)
                 .await;
@@ -193,11 +196,7 @@ pub async fn run(
             println!("\n{response}\n");
 
             if config.memory.auto_save {
-                let summary = if response.len() > 100 {
-                    format!("{}...", &response[..100])
-                } else {
-                    response.clone()
-                };
+                let summary = truncate_for_log(&response, 100);
                 let _ = mem
                     .store("assistant_resp", &summary, MemoryCategory::Daily)
                     .await;

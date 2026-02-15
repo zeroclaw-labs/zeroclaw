@@ -30,6 +30,13 @@ const DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS: u64 = 2;
 const DEFAULT_CHANNEL_MAX_BACKOFF_SECS: u64 = 60;
 const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 90;
 
+fn truncate_for_log(value: &str, max_chars: usize) -> String {
+    match value.char_indices().nth(max_chars) {
+        Some((idx, _)) => format!("{}...", &value[..idx]),
+        None => value.to_string(),
+    }
+}
+
 fn spawn_supervised_listener(
     ch: Arc<dyn Channel>,
     tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
@@ -603,11 +610,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             "  💬 [{}] from {}: {}",
             msg.channel,
             msg.sender,
-            if msg.content.len() > 80 {
-                format!("{}...", &msg.content[..80])
-            } else {
-                msg.content.clone()
-            }
+            truncate_for_log(&msg.content, 80)
         );
         println!("  ⏳ Processing message...");
         let started_at = Instant::now();
@@ -635,11 +638,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 println!(
                     "  🤖 Reply ({}ms): {}",
                     started_at.elapsed().as_millis(),
-                    if response.len() > 80 {
-                        format!("{}...", &response[..80])
-                    } else {
-                        response.clone()
-                    }
+                    truncate_for_log(&response, 80)
                 );
                 // Find the channel that sent this message and reply
                 for ch in &channels {

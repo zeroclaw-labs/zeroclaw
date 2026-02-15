@@ -32,6 +32,13 @@ pub const MAX_BODY_SIZE: usize = 65_536;
 /// Request timeout (30s) — prevents slow-loris attacks
 pub const REQUEST_TIMEOUT_SECS: u64 = 30;
 
+fn truncate_for_log(value: &str, max_chars: usize) -> String {
+    match value.char_indices().nth(max_chars) {
+        Some((idx, _)) => format!("{}...", &value[..idx]),
+        None => value.to_string(),
+    }
+}
+
 /// Shared state for all axum handlers
 #[derive(Clone)]
 pub struct AppState {
@@ -378,11 +385,7 @@ async fn handle_whatsapp_message(State(state): State<AppState>, body: Bytes) -> 
         tracing::info!(
             "WhatsApp message from {}: {}",
             msg.sender,
-            if msg.content.len() > 50 {
-                format!("{}...", &msg.content[..50])
-            } else {
-                msg.content.clone()
-            }
+            truncate_for_log(&msg.content, 50)
         );
 
         // Auto-save to memory
@@ -412,7 +415,10 @@ async fn handle_whatsapp_message(State(state): State<AppState>, body: Bytes) -> 
             Err(e) => {
                 tracing::error!("LLM error for WhatsApp message: {e:#}");
                 let _ = wa
-                    .send("Sorry, I couldn't process your message right now.", &msg.sender)
+                    .send(
+                        "Sorry, I couldn't process your message right now.",
+                        &msg.sender,
+                    )
                     .await;
             }
         }
