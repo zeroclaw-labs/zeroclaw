@@ -18,6 +18,13 @@ pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
         "none" | "noop" => Box::new(NoopObserver),
         #[cfg(feature = "prometheus")]
         "prometheus" => Box::new(prometheus::PrometheusObserver::new()),
+        #[cfg(not(feature = "prometheus"))]
+        "prometheus" => {
+            tracing::warn!(
+                "Prometheus backend requested but the 'prometheus' feature is not enabled. Rebuild with --features prometheus. Falling back to noop."
+            );
+            Box::new(NoopObserver)
+        }
         _ => {
             tracing::warn!(
                 "Unknown observability backend '{}', falling back to noop",

@@ -151,6 +151,7 @@ pub(crate) fn setup_provider() -> Result<(String, String, String)> {
             .allow_empty(true)
             .interact_text()?;
 
+        let key = key.trim().to_string();
         if key.is_empty() {
             let env_var = provider_env_var(provider_name);
             print_bullet(&format!(

@@ -37,7 +37,8 @@ pub(crate) fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
             .allow_empty(true)
             .interact_text()?;
 
-        if api_key.trim().is_empty() {
+        let api_key = api_key.trim().to_string();
+        if api_key.is_empty() {
             println!(
                 "  {} Skipped — set composio.api_key in config.toml later",
                 style("→").dim()

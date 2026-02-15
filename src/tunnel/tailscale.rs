@@ -136,7 +136,10 @@ mod tests {
     #[tokio::test]
     async fn tailscale_start_returns_result() {
         let tunnel = TailscaleTunnel::new(false, None);
-        let _result = tunnel.start("127.0.0.1", 8080).await;
+        let result = tunnel.start("127.0.0.1", 8080).await;
+        // tailscale may or may not be installed on the host — either outcome is valid,
+        // but it must not panic
+        let _ = result;
     }
 
     #[tokio::test]

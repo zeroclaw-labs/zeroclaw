@@ -166,6 +166,12 @@ impl PrometheusObserver {
     }
 }
 
+impl Default for PrometheusObserver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Observer for PrometheusObserver {
     fn record_event(&self, event: &ObserverEvent) {
         match event {

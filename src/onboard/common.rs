@@ -1,11 +1,11 @@
 use console::style;
 
 #[derive(Debug, Clone, Default)]
-pub struct ProjectContext {
-    pub user_name: String,
-    pub timezone: String,
-    pub agent_name: String,
-    pub communication_style: String,
+pub(crate) struct ProjectContext {
+    pub(crate) user_name: String,
+    pub(crate) timezone: String,
+    pub(crate) agent_name: String,
+    pub(crate) communication_style: String,
 }
 
 pub(crate) const BANNER: &str = r"

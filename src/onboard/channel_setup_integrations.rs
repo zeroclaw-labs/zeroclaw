@@ -78,7 +78,7 @@ pub(crate) fn setup_matrix_channel(config: &mut ChannelsConfig) -> Result<()> {
 
     config.matrix = Some(MatrixConfig {
         homeserver: homeserver.trim_end_matches('/').to_string(),
-        access_token,
+        access_token: access_token.trim().to_string(),
         room_id,
         allowed_users,
     });

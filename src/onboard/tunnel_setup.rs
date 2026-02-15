@@ -35,7 +35,8 @@ pub(crate) fn setup_tunnel() -> Result<TunnelConfig> {
             let token: String = Input::new()
                 .with_prompt("  Cloudflare tunnel token")
                 .interact_text()?;
-            if token.trim().is_empty() {
+            let token = token.trim().to_string();
+            if token.is_empty() {
                 println!("  {} Skipped", style("→").dim());
                 TunnelConfig::default()
             } else {
@@ -85,7 +86,8 @@ pub(crate) fn setup_tunnel() -> Result<TunnelConfig> {
             let auth_token: String = Input::new()
                 .with_prompt("  ngrok auth token")
                 .interact_text()?;
-            if auth_token.trim().is_empty() {
+            let auth_token = auth_token.trim().to_string();
+            if auth_token.is_empty() {
                 println!("  {} Skipped", style("→").dim());
                 TunnelConfig::default()
             } else {
@@ -93,6 +95,7 @@ pub(crate) fn setup_tunnel() -> Result<TunnelConfig> {
                     .with_prompt("  Custom domain (optional, Enter to skip)")
                     .allow_empty(true)
                     .interact_text()?;
+                let domain = domain.trim().to_string();
                 println!(
                     "  {} Tunnel: {}",
                     style("✓").green().bold(),
@@ -120,7 +123,8 @@ pub(crate) fn setup_tunnel() -> Result<TunnelConfig> {
             let cmd: String = Input::new()
                 .with_prompt("  Start command")
                 .interact_text()?;
-            if cmd.trim().is_empty() {
+            let cmd = cmd.trim().to_string();
+            if cmd.is_empty() {
                 println!("  {} Skipped", style("→").dim());
                 TunnelConfig::default()
             } else {
