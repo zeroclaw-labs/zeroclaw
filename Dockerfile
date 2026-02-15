@@ -51,7 +51,7 @@ EOF
 RUN chown -R 65534:65534 /zeroclaw-data
 
 # ── Stage 3: Development Runtime (Debian) ────────────────────
-FROM debian:bookworm-slim AS dev
+FROM debian:trixie-slim AS dev
 
 # Install runtime dependencies + basic debug tools
 RUN apt-get update && apt-get install -y \
@@ -89,7 +89,7 @@ ENTRYPOINT ["zeroclaw"]
 CMD ["gateway", "--port", "3000", "--host", "[::]"]
 
 # ── Stage 4: Production Runtime (Distroless) ─────────────────
-FROM gcr.io/distroless/cc-debian12:nonroot AS release
+FROM gcr.io/distroless/cc-debian13:nonroot AS release
 
 COPY --from=builder /app/target/release/zeroclaw /usr/local/bin/zeroclaw
 COPY --from=permissions /zeroclaw-data /zeroclaw-data
