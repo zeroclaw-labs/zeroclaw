@@ -159,13 +159,13 @@ where
                 Err(e) => {
                     crate::health::mark_component_error(name, e.to_string());
                     tracing::error!("Daemon component '{name}' failed: {e}");
-                    // Error — increase backoff for next restart
-                    backoff = backoff.saturating_mul(2).min(max_backoff);
                 }
             }
 
             crate::health::bump_component_restart(name);
             tokio::time::sleep(Duration::from_secs(backoff)).await;
+            // Double backoff AFTER sleeping so first error uses initial_backoff
+            backoff = backoff.saturating_mul(2).min(max_backoff);
         }
     })
 }
