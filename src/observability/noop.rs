@@ -38,10 +38,14 @@ mod tests {
             model: "test".into(),
         });
         obs.record_event(&ObserverEvent::AgentEnd {
+            provider: "test".into(),
+            model: "test".into(),
             duration: Duration::from_millis(100),
             tokens_used: Some(42),
         });
         obs.record_event(&ObserverEvent::AgentEnd {
+            provider: "test".into(),
+            model: "test".into(),
             duration: Duration::ZERO,
             tokens_used: None,
         });

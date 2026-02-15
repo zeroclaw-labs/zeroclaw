@@ -208,6 +208,8 @@ pub async fn run(
 
     let duration = start.elapsed();
     observer.record_event(&ObserverEvent::AgentEnd {
+        provider: provider_name.to_string(),
+        model: model_name.to_string(),
         duration,
         tokens_used: None,
     });

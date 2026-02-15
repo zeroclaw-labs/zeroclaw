@@ -8,6 +8,8 @@ pub enum ObserverEvent {
         model: String,
     },
     AgentEnd {
+        provider: String,
+        model: String,
         duration: Duration,
         tokens_used: Option<u64>,
     },

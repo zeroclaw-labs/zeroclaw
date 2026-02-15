@@ -17,11 +17,13 @@ impl Observer for LogObserver {
                 info!(provider = %provider, model = %model, "agent.start");
             }
             ObserverEvent::AgentEnd {
+                provider,
+                model,
                 duration,
                 tokens_used,
             } => {
                 let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
-                info!(duration_ms = ms, tokens = ?tokens_used, "agent.end");
+                info!(provider = %provider, model = %model, duration_ms = ms, tokens = ?tokens_used, "agent.end");
             }
             ObserverEvent::ToolCall {
                 tool,
@@ -88,10 +90,14 @@ mod tests {
             model: "claude-sonnet".into(),
         });
         obs.record_event(&ObserverEvent::AgentEnd {
+            provider: "openrouter".into(),
+            model: "claude-sonnet".into(),
             duration: Duration::from_millis(500),
             tokens_used: Some(100),
         });
         obs.record_event(&ObserverEvent::AgentEnd {
+            provider: "openrouter".into(),
+            model: "claude-sonnet".into(),
             duration: Duration::ZERO,
             tokens_used: None,
         });

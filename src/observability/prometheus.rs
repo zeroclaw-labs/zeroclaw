@@ -159,6 +159,8 @@ impl Observer for PrometheusObserver {
                     .inc();
             }
             ObserverEvent::AgentEnd {
+                provider: _,
+                model: _,
                 duration,
                 tokens_used,
             } => {
@@ -243,10 +245,14 @@ mod tests {
             model: "claude-sonnet".into(),
         });
         obs.record_event(&ObserverEvent::AgentEnd {
+            provider: "openrouter".into(),
+            model: "claude-sonnet".into(),
             duration: Duration::from_millis(500),
             tokens_used: Some(100),
         });
         obs.record_event(&ObserverEvent::AgentEnd {
+            provider: "openrouter".into(),
+            model: "claude-sonnet".into(),
             duration: Duration::ZERO,
             tokens_used: None,
         });
