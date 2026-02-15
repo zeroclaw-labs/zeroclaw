@@ -677,14 +677,16 @@ fn extract_host(url_str: &str) -> anyhow::Result<String> {
         .or_else(|| url.strip_prefix("file://"))
         .unwrap_or(url);
 
-    // Extract host (before first / or :)
-    let host = without_scheme
-        .split('/')
-        .next()
-        .unwrap_or(without_scheme)
-        .split(':')
-        .next()
-        .unwrap_or(without_scheme);
+    // Extract host — handle bracketed IPv6 addresses like [::1]:8080
+    let authority = without_scheme.split('/').next().unwrap_or(without_scheme);
+
+    let host = if authority.starts_with('[') {
+        // IPv6: take everything up to and including the closing ']'
+        authority.find(']').map_or(authority, |i| &authority[..=i])
+    } else {
+        // IPv4 or hostname: take everything before the port separator
+        authority.split(':').next().unwrap_or(authority)
+    };
 
     if host.is_empty() {
         anyhow::bail!("Invalid URL: no host");
@@ -715,8 +717,13 @@ fn is_private_host(host: &str) -> bool {
                     || v4.is_broadcast()
             }
             std::net::IpAddr::V6(v6) => {
+                let segs = v6.segments();
                 v6.is_loopback()
                     || v6.is_unspecified()
+                    // Unique-local (fc00::/7) — IPv6 equivalent of RFC 1918
+                    || (segs[0] & 0xfe00) == 0xfc00
+                    // Link-local (fe80::/10)
+                    || (segs[0] & 0xffc0) == 0xfe80
                     // IPv4-mapped addresses (::ffff:127.0.0.1)
                     || v6.to_ipv4_mapped().is_some_and(|v4| {
                         v4.is_loopback()
@@ -805,6 +812,28 @@ mod tests {
         assert!(is_private_host("::ffff:127.0.0.1"));
         assert!(is_private_host("::ffff:10.0.0.1"));
         assert!(is_private_host("::ffff:192.168.1.1"));
+    }
+
+    #[test]
+    fn is_private_host_catches_ipv6_private_ranges() {
+        // Unique-local (fc00::/7)
+        assert!(is_private_host("fd00::1"));
+        assert!(is_private_host("fc00::1"));
+        // Link-local (fe80::/10)
+        assert!(is_private_host("fe80::1"));
+        // Public IPv6 should pass
+        assert!(!is_private_host("2001:db8::1"));
+    }
+
+    #[test]
+    fn validate_url_blocks_ipv6_ssrf() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new(security, vec!["*".into()], None);
+        assert!(tool.validate_url("https://[::1]/").is_err());
+        assert!(tool.validate_url("https://[::ffff:127.0.0.1]/").is_err());
+        assert!(tool
+            .validate_url("https://[::ffff:10.0.0.1]:8080/")
+            .is_err());
     }
 
     #[test]
