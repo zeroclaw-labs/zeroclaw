@@ -499,7 +499,7 @@ pub fn handle_command(command: crate::SkillCommands, workspace_dir: &Path) -> Re
             let skills_path = skills_dir(workspace_dir);
             std::fs::create_dir_all(&skills_path)?;
 
-            if source.starts_with("http") || source.contains("github.com") {
+            if source.starts_with("https://") || source.starts_with("http://") {
                 // Git clone
                 let output = std::process::Command::new("git")
                     .args(["clone", "--depth", "1", &source])
@@ -585,7 +585,23 @@ pub fn handle_command(command: crate::SkillCommands, workspace_dir: &Path) -> Re
             Ok(())
         }
         crate::SkillCommands::Remove { name } => {
+            // Reject path traversal attempts
+            if name.contains("..") || name.contains('/') || name.contains('\\') {
+                anyhow::bail!("Invalid skill name: {name}");
+            }
+
             let skill_path = skills_dir(workspace_dir).join(&name);
+
+            // Verify the resolved path is actually inside the skills directory
+            let canonical_skills = skills_dir(workspace_dir)
+                .canonicalize()
+                .unwrap_or_else(|_| skills_dir(workspace_dir));
+            if let Ok(canonical_skill) = skill_path.canonicalize() {
+                if !canonical_skill.starts_with(&canonical_skills) {
+                    anyhow::bail!("Skill path escapes skills directory: {name}");
+                }
+            }
+
             if !skill_path.exists() {
                 anyhow::bail!("Skill not found: {name}");
             }
