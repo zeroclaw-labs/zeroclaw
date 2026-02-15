@@ -3,9 +3,11 @@ pub mod browser_open;
 pub mod composio;
 pub mod file_read;
 pub mod file_write;
+pub mod image_info;
 pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
+pub mod screenshot;
 pub mod shell;
 pub mod traits;
 
@@ -14,9 +16,11 @@ pub use browser_open::BrowserOpenTool;
 pub use composio::ComposioTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
+pub use image_info::ImageInfoTool;
 pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
+pub use screenshot::ScreenshotTool;
 pub use shell::ShellTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
@@ -90,6 +94,10 @@ pub fn all_tools_with_runtime(
             browser_config.session_name.clone(),
         )));
     }
+
+    // Vision tools are always available
+    tools.push(Box::new(ScreenshotTool::new(security.clone())));
+    tools.push(Box::new(ImageInfoTool::new(security.clone())));
 
     if let Some(key) = composio_key {
         if !key.is_empty() {

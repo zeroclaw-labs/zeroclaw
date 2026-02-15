@@ -321,6 +321,14 @@ pub async fn run(
             "Delete a memory entry. Use when: memory is incorrect/stale or explicitly requested for removal. Don't use when: impact is uncertain.",
         ),
     ];
+    tool_descs.push((
+        "screenshot",
+        "Capture a screenshot of the current screen. Returns file path and base64-encoded PNG. Use when: visual verification, UI inspection, debugging displays.",
+    ));
+    tool_descs.push((
+        "image_info",
+        "Read image file metadata (format, dimensions, size) and optionally base64-encode it. Use when: inspecting images, preparing visual data for analysis.",
+    ));
     if config.browser.enabled {
         tool_descs.push((
             "browser_open",
