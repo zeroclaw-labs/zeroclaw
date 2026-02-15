@@ -143,3 +143,73 @@ impl Tunnel for CustomTunnel {
             .and_then(|g| g.as_ref().map(|tp| tp.public_url.clone()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn custom_new_creates_valid_instance() {
+        let tunnel = CustomTunnel::new("echo test".into(), None, None);
+        assert_eq!(tunnel.start_command, "echo test");
+        assert!(tunnel.health_url.is_none());
+        assert!(tunnel.url_pattern.is_none());
+        assert_eq!(tunnel.name(), "custom");
+    }
+
+    #[test]
+    fn custom_new_with_health_and_pattern() {
+        let tunnel = CustomTunnel::new(
+            "bore local {port}".into(),
+            Some("http://localhost:8080/health".into()),
+            Some("bore.pub".into()),
+        );
+        assert_eq!(tunnel.start_command, "bore local {port}");
+        assert_eq!(
+            tunnel.health_url,
+            Some("http://localhost:8080/health".into())
+        );
+        assert_eq!(tunnel.url_pattern, Some("bore.pub".into()));
+        assert_eq!(tunnel.name(), "custom");
+    }
+
+    #[test]
+    fn custom_name_returns_custom() {
+        let tunnel = CustomTunnel::new("echo hi".into(), None, None);
+        assert_eq!(tunnel.name(), "custom");
+    }
+
+    #[test]
+    fn custom_public_url_none_before_start() {
+        let tunnel = CustomTunnel::new("echo hi".into(), None, None);
+        assert!(tunnel.public_url().is_none());
+    }
+
+    #[tokio::test]
+    async fn custom_start_empty_command_errors() {
+        let tunnel = CustomTunnel::new("".into(), None, None);
+        let result = tunnel.start("127.0.0.1", 8080).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("empty"));
+    }
+
+    #[tokio::test]
+    async fn custom_start_replaces_placeholders() {
+        let tunnel = CustomTunnel::new("echo {host}:{port}".into(), None, None);
+        let result = tunnel.start("localhost", 9000).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn custom_health_check_false_before_start() {
+        let tunnel = CustomTunnel::new("echo test".into(), None, None);
+        assert!(!tunnel.health_check().await);
+    }
+
+    #[tokio::test]
+    async fn custom_stop_succeeds_when_not_started() {
+        let tunnel = CustomTunnel::new("echo test".into(), None, None);
+        let result = tunnel.stop().await;
+        assert!(result.is_ok());
+    }
+}

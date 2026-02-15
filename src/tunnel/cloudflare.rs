@@ -109,3 +109,48 @@ impl Tunnel for CloudflareTunnel {
             .and_then(|g| g.as_ref().map(|tp| tp.public_url.clone()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cloudflare_new_creates_valid_instance() {
+        let tunnel = CloudflareTunnel::new("test-token-123".into());
+        assert_eq!(tunnel.token, "test-token-123");
+        assert_eq!(tunnel.name(), "cloudflare");
+    }
+
+    #[test]
+    fn cloudflare_name_returns_cloudflare() {
+        let tunnel = CloudflareTunnel::new("tok".into());
+        assert_eq!(tunnel.name(), "cloudflare");
+    }
+
+    #[test]
+    fn cloudflare_public_url_none_before_start() {
+        let tunnel = CloudflareTunnel::new("tok".into());
+        assert!(tunnel.public_url().is_none());
+    }
+
+    #[tokio::test]
+    async fn cloudflare_start_missing_binary_errors() {
+        let tunnel = CloudflareTunnel::new("test-token".into());
+        let result = tunnel.start("127.0.0.1", 8080).await;
+        // Should fail because cloudflared binary is not installed
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn cloudflare_health_check_false_before_start() {
+        let tunnel = CloudflareTunnel::new("tok".into());
+        assert!(!tunnel.health_check().await);
+    }
+
+    #[tokio::test]
+    async fn cloudflare_stop_succeeds_when_not_started() {
+        let tunnel = CloudflareTunnel::new("tok".into());
+        let result = tunnel.stop().await;
+        assert!(result.is_ok());
+    }
+}

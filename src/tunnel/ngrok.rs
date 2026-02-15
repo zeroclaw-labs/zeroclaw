@@ -119,3 +119,55 @@ impl Tunnel for NgrokTunnel {
             .and_then(|g| g.as_ref().map(|tp| tp.public_url.clone()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ngrok_new_creates_valid_instance() {
+        let tunnel = NgrokTunnel::new("test-auth-token".into(), None);
+        assert_eq!(tunnel.auth_token, "test-auth-token");
+        assert!(tunnel.domain.is_none());
+        assert_eq!(tunnel.name(), "ngrok");
+    }
+
+    #[test]
+    fn ngrok_new_with_custom_domain() {
+        let tunnel = NgrokTunnel::new("tok".into(), Some("my.ngrok.io".into()));
+        assert_eq!(tunnel.domain, Some("my.ngrok.io".into()));
+        assert_eq!(tunnel.name(), "ngrok");
+    }
+
+    #[test]
+    fn ngrok_name_returns_ngrok() {
+        let tunnel = NgrokTunnel::new("tok".into(), None);
+        assert_eq!(tunnel.name(), "ngrok");
+    }
+
+    #[test]
+    fn ngrok_public_url_none_before_start() {
+        let tunnel = NgrokTunnel::new("tok".into(), None);
+        assert!(tunnel.public_url().is_none());
+    }
+
+    #[tokio::test]
+    async fn ngrok_start_missing_binary_errors() {
+        let tunnel = NgrokTunnel::new("test-token".into(), None);
+        let result = tunnel.start("127.0.0.1", 8080).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn ngrok_health_check_false_before_start() {
+        let tunnel = NgrokTunnel::new("tok".into(), None);
+        assert!(!tunnel.health_check().await);
+    }
+
+    #[tokio::test]
+    async fn ngrok_stop_succeeds_when_not_started() {
+        let tunnel = NgrokTunnel::new("tok".into(), None);
+        let result = tunnel.stop().await;
+        assert!(result.is_ok());
+    }
+}

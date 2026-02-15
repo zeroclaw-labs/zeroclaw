@@ -26,3 +26,47 @@ impl Tunnel for NoneTunnel {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn none_tunnel_name_returns_none() {
+        let tunnel = NoneTunnel;
+        assert_eq!(tunnel.name(), "none");
+    }
+
+    #[test]
+    fn none_tunnel_public_url_always_none() {
+        let tunnel = NoneTunnel;
+        assert!(tunnel.public_url().is_none());
+    }
+
+    #[tokio::test]
+    async fn none_tunnel_start_returns_local_url() {
+        let tunnel = NoneTunnel;
+        let url = tunnel.start("127.0.0.1", 8080).await.unwrap();
+        assert_eq!(url, "http://127.0.0.1:8080");
+    }
+
+    #[tokio::test]
+    async fn none_tunnel_start_with_custom_host_port() {
+        let tunnel = NoneTunnel;
+        let url = tunnel.start("localhost", 3000).await.unwrap();
+        assert_eq!(url, "http://localhost:3000");
+    }
+
+    #[tokio::test]
+    async fn none_tunnel_health_check_always_true() {
+        let tunnel = NoneTunnel;
+        assert!(tunnel.health_check().await);
+    }
+
+    #[tokio::test]
+    async fn none_tunnel_stop_always_succeeds() {
+        let tunnel = NoneTunnel;
+        let result = tunnel.stop().await;
+        assert!(result.is_ok());
+    }
+}

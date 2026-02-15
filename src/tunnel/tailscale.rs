@@ -100,3 +100,55 @@ impl Tunnel for TailscaleTunnel {
             .and_then(|g| g.as_ref().map(|tp| tp.public_url.clone()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tailscale_new_creates_valid_instance() {
+        let tunnel = TailscaleTunnel::new(false, None);
+        assert!(!tunnel.funnel);
+        assert!(tunnel.hostname.is_none());
+        assert_eq!(tunnel.name(), "tailscale");
+    }
+
+    #[test]
+    fn tailscale_new_with_funnel_and_hostname() {
+        let tunnel = TailscaleTunnel::new(true, Some("myhost.tail-scale.ts.net".into()));
+        assert!(tunnel.funnel);
+        assert_eq!(tunnel.hostname, Some("myhost.tail-scale.ts.net".into()));
+        assert_eq!(tunnel.name(), "tailscale");
+    }
+
+    #[test]
+    fn tailscale_name_returns_tailscale() {
+        let tunnel = TailscaleTunnel::new(false, None);
+        assert_eq!(tunnel.name(), "tailscale");
+    }
+
+    #[test]
+    fn tailscale_public_url_none_before_start() {
+        let tunnel = TailscaleTunnel::new(false, None);
+        assert!(tunnel.public_url().is_none());
+    }
+
+    #[tokio::test]
+    async fn tailscale_start_returns_result() {
+        let tunnel = TailscaleTunnel::new(false, None);
+        let _result = tunnel.start("127.0.0.1", 8080).await;
+    }
+
+    #[tokio::test]
+    async fn tailscale_health_check_false_before_start() {
+        let tunnel = TailscaleTunnel::new(false, None);
+        assert!(!tunnel.health_check().await);
+    }
+
+    #[tokio::test]
+    async fn tailscale_stop_succeeds_when_not_started() {
+        let tunnel = TailscaleTunnel::new(false, None);
+        let result = tunnel.stop().await;
+        assert!(result.is_ok());
+    }
+}
