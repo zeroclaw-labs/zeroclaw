@@ -9,7 +9,7 @@
 
 services:
   zeroclaw:
-    image: zeroclaw/zeroclaw:latest
+    image: ghcr.io/theonlyhennygod/zeroclaw:latest
     # Or build locally:
     # build: .
     container_name: zeroclaw
