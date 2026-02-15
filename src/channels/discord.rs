@@ -146,7 +146,7 @@ impl Channel for DiscordChannel {
             "op": 2,
             "d": {
                 "token": self.bot_token,
-                "intents": 33281, // GUILDS | GUILD_MESSAGES | MESSAGE_CONTENT | DIRECT_MESSAGES
+                "intents": 37377, // GUILDS | GUILD_MESSAGES | MESSAGE_CONTENT | DIRECT_MESSAGES
                 "properties": {
                     "os": "linux",
                     "browser": "zeroclaw",
@@ -258,9 +258,12 @@ impl Channel for DiscordChannel {
 
                     // Guild filter
                     if let Some(ref gid) = guild_filter {
-                        let msg_guild = d.get("guild_id").and_then(serde_json::Value::as_str).unwrap_or("");
-                        if msg_guild != gid {
-                            continue;
+                        let msg_guild = d.get("guild_id").and_then(serde_json::Value::as_str);
+                        // DMs have no guild_id — let them through; for guild messages, enforce the filter
+                        if let Some(g) = msg_guild {
+                            if g != gid {
+                                continue;
+                            }
                         }
                     }
 
