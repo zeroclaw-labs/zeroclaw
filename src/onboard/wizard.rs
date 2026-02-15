@@ -779,6 +779,7 @@ fn setup_provider() -> Result<(String, String, String)> {
             ("moonshot-v1-32k", "Moonshot V1 32K"),
         ],
         "glm" => vec![
+            ("glm-5", "GLM-5 (latest)"),
             ("glm-4-plus", "GLM-4 Plus (flagship)"),
             ("glm-4-flash", "GLM-4 Flash (fast)"),
         ],
