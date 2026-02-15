@@ -5,6 +5,7 @@
 
 use crate::aria::db::AriaDb;
 use crate::feed::executor::FeedExecutor;
+use crate::status_events;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use cron::Schedule;
@@ -192,7 +193,37 @@ impl FeedScheduler {
                     .await
                 {
                     Ok(result) => {
+                        if result.success {
+                            status_events::emit(
+                                "feed.run.completed",
+                                serde_json::json!({
+                                    "feedId": feed_id_owned.as_str(),
+                                    "feedName": feed_id_owned.as_str(),
+                                    "inserted": result.items.len(),
+                                }),
+                            );
+                        } else {
+                            status_events::emit(
+                                "feed.run.failed",
+                                serde_json::json!({
+                                    "feedId": feed_id_owned.as_str(),
+                                    "feedName": feed_id_owned.as_str(),
+                                    "error": result.error.clone().unwrap_or_else(|| "feed execution failed".to_string()),
+                                }),
+                            );
+                        }
+
                         if result.success && !result.items.is_empty() {
+                            for item in &result.items {
+                                status_events::emit(
+                                    "feed.item.added",
+                                    serde_json::json!({
+                                        "feedId": feed_id_owned.as_str(),
+                                        "title": item.title,
+                                        "cardType": format!("{:?}", item.card_type),
+                                    }),
+                                );
+                            }
                             if let Err(e) = executor.store_items(
                                 &tenant_id_owned,
                                 &feed_id_owned,
@@ -221,6 +252,14 @@ impl FeedScheduler {
                         }
                     }
                     Err(e) => {
+                        status_events::emit(
+                            "feed.run.failed",
+                            serde_json::json!({
+                                "feedId": feed_id_owned.as_str(),
+                                "feedName": feed_id_owned.as_str(),
+                                "error": e.to_string(),
+                            }),
+                        );
                         tracing::warn!(
                             feed_id = feed_id_owned.as_str(),
                             error = %e,

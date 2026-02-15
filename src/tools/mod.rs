@@ -5,6 +5,7 @@ pub mod file_write;
 pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
+pub mod registry_tool;
 pub mod shell;
 pub mod traits;
 
@@ -59,6 +60,41 @@ pub fn all_tools(
     if let Some(key) = composio_key {
         if !key.is_empty() {
             tools.push(Box::new(ComposioTool::new(key)));
+        }
+    }
+
+    tools
+}
+
+/// Create full tool registry plus tenant-scoped uploaded registry tools.
+pub fn all_tools_for_tenant(
+    security: &Arc<SecurityPolicy>,
+    memory: Arc<dyn Memory>,
+    composio_key: Option<&str>,
+    browser_config: &crate::config::BrowserConfig,
+    registry_db: &crate::aria::db::AriaDb,
+    tenant_id: &str,
+) -> Vec<Box<dyn Tool>> {
+    let mut tools = all_tools(security, memory, composio_key, browser_config);
+    let mut existing: std::collections::HashSet<String> =
+        tools.iter().map(|t| t.name().to_string()).collect();
+
+    match registry_tool::load_registry_tools(registry_db, tenant_id) {
+        Ok(registry_tools) => {
+            for tool in registry_tools {
+                if !existing.insert(tool.name.clone()) {
+                    tracing::warn!(
+                        tenant_id,
+                        tool_name = %tool.name,
+                        "Skipping registry tool because the name already exists in runtime tool set"
+                    );
+                    continue;
+                }
+                tools.push(Box::new(tool));
+            }
+        }
+        Err(e) => {
+            tracing::warn!(tenant_id, error = %e, "Failed to load registry tools for tenant");
         }
     }
 

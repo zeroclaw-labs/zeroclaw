@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::cron::{due_jobs, reschedule_after_run, CronJob};
 use crate::security::SecurityPolicy;
+use crate::status_events;
 use anyhow::Result;
 use chrono::Utc;
 use tokio::process::Command;
@@ -30,6 +31,23 @@ pub async fn run(config: Config) -> Result<()> {
         for job in jobs {
             crate::health::mark_component_ok("scheduler");
             let (success, output) = execute_job_with_retry(&config, &security, &job).await;
+            if success {
+                status_events::emit(
+                    "cron.completed",
+                    serde_json::json!({
+                        "jobId": job.id,
+                        "summary": output.lines().next().unwrap_or("ok"),
+                    }),
+                );
+            } else {
+                status_events::emit(
+                    "cron.failed",
+                    serde_json::json!({
+                        "jobId": job.id,
+                        "error": output,
+                    }),
+                );
+            }
 
             if !success {
                 crate::health::mark_component_error("scheduler", format!("job {} failed", job.id));

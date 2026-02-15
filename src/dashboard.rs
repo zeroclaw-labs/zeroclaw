@@ -315,8 +315,11 @@ pub fn import_from_cloud_db(db: &AriaDb, source_path: &Path) -> Result<usize> {
     ];
 
     db.with_conn(|conn| {
-        conn.execute("ATTACH DATABASE ?1 AS cloud", params![source_path.to_string_lossy()])
-            .context("Failed to attach cloud dashboard DB")?;
+        conn.execute(
+            "ATTACH DATABASE ?1 AS cloud",
+            params![source_path.to_string_lossy()],
+        )
+        .context("Failed to attach cloud dashboard DB")?;
 
         let mut imported = 0usize;
         for table in tables {
