@@ -781,7 +781,7 @@ fn provider_env_var(name: &str) -> &'static str {
         "perplexity" => "PERPLEXITY_API_KEY",
         "cohere" => "COHERE_API_KEY",
         "moonshot" | "moonshot-cn" | "moonshotai" | "moonshotai-cn" => "MOONSHOT_API_KEY",
-        "kimi-coding" | "kimi-for-coding" => "KIMI_API_KEY",
+        "kimi-coding" | "kimi-for-coding" | "kimi" => "KIMI_API_KEY",
         "glm" | "zhipu" => "GLM_API_KEY",
         "minimax" => "MINIMAX_API_KEY",
         "qianfan" | "baidu" => "QIANFAN_API_KEY",

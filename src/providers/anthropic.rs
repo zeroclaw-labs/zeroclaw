@@ -39,17 +39,18 @@ struct ContentBlock {
 }
 
 impl AnthropicProvider {
+    /// Build a configured HTTP client
+    fn build_client() -> Client {
+        Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| Client::new())
+    }
+
     /// Create provider for official Anthropic API
     pub fn new(api_key: Option<&str>) -> Self {
-        Self {
-            base_url: ANTHROPIC_API_BASE.to_string(),
-            api_key: api_key.map(ToString::to_string),
-            client: Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
-        }
+        Self::new_with_url(api_key, ANTHROPIC_API_BASE)
     }
 
     /// Create provider with custom base URL (for Anthropic-compatible APIs like Kimi Coding)
@@ -57,11 +58,7 @@ impl AnthropicProvider {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.map(ToString::to_string),
-            client: Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
+            client: Self::build_client(),
         }
     }
 
@@ -87,15 +84,14 @@ impl Provider for AnthropicProvider {
         let provider_name = self.provider_name();
 
         let api_key = self.api_key.as_ref().ok_or_else(|| {
-            if self.base_url == ANTHROPIC_API_BASE {
-                anyhow::anyhow!(
-                    "Anthropic API key not set. Set ANTHROPIC_API_KEY or edit config.toml."
-                )
-            } else {
-                anyhow::anyhow!(
-                    "Kimi Coding API key not set. Set KIMI_API_KEY or edit config.toml."
-                )
-            }
+            anyhow::anyhow!(
+                "{provider_name} API key not set. Set {} or edit config.toml.",
+                if provider_name == "Anthropic" {
+                    "ANTHROPIC_API_KEY"
+                } else {
+                    "KIMI_API_KEY"
+                }
+            )
         })?;
 
         let request = ChatRequest {
@@ -150,10 +146,9 @@ mod tests {
 
     #[test]
     fn creates_with_custom_url() {
-        let p =
-            AnthropicProvider::new_with_url(Some("kimi-key"), "https://api.kimi.com/coding/v1/");
+        let p = AnthropicProvider::new_with_url(Some("kimi-key"), "https://api.kimi.com/coding");
         assert_eq!(p.api_key.as_deref(), Some("kimi-key"));
-        assert_eq!(p.base_url, "https://api.kimi.com/coding/v1");
+        assert_eq!(p.base_url, "https://api.kimi.com/coding");
     }
 
     #[test]
