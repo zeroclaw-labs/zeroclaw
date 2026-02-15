@@ -209,8 +209,18 @@ fn inject_workspace_file(prompt: &mut String, workspace_dir: &std::path::Path, f
                 return;
             }
             let _ = writeln!(prompt, "### {filename}\n");
-            if trimmed.len() > BOOTSTRAP_MAX_CHARS {
-                prompt.push_str(&trimmed[..BOOTSTRAP_MAX_CHARS]);
+            // Use character-boundary-safe truncation for UTF-8
+            let truncated = if trimmed.chars().count() > BOOTSTRAP_MAX_CHARS {
+                trimmed
+                    .char_indices()
+                    .nth(BOOTSTRAP_MAX_CHARS)
+                    .map(|(idx, _)| &trimmed[..idx])
+                    .unwrap_or(trimmed)
+            } else {
+                trimmed
+            };
+            if truncated.len() < trimmed.len() {
+                prompt.push_str(truncated);
                 let _ = writeln!(
                     prompt,
                     "\n\n[... truncated at {BOOTSTRAP_MAX_CHARS} chars — use `read` for full file]\n"
