@@ -150,7 +150,13 @@ mod tests {
             session_name: None,
         };
 
-        let tools = all_tools(&security, mem, None, &browser, &HttpRequestConfig::default());
+        let tools = all_tools(
+            &security,
+            mem,
+            None,
+            &browser,
+            &HttpRequestConfig::default(),
+        );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"browser_open"));
     }
@@ -172,7 +178,13 @@ mod tests {
             session_name: None,
         };
 
-        let tools = all_tools(&security, mem, None, &browser, &HttpRequestConfig::default());
+        let tools = all_tools(
+            &security,
+            mem,
+            None,
+            &browser,
+            &HttpRequestConfig::default(),
+        );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"browser_open"));
     }

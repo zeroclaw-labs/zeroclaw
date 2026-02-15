@@ -163,7 +163,9 @@ impl Tool for ImageInfoTool {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("Path not allowed: {path_str} (must be within workspace)")),
+                error: Some(format!(
+                    "Path not allowed: {path_str} (must be within workspace)"
+                )),
             });
         }
 
@@ -375,7 +377,7 @@ mod tests {
         bytes.extend_from_slice(&[
             0xFF, 0xC0, // SOF0 marker
             0x00, 0x11, // SOF0 length
-            0x08,       // precision
+            0x08, // precision
             0x01, 0xE0, // height: 480
             0x02, 0x80, // width: 640
         ]);

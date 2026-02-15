@@ -24,10 +24,7 @@ pub struct HttpRequestTool {
 }
 
 impl HttpRequestTool {
-    pub fn new(
-        security: Arc<SecurityPolicy>,
-        config: HttpRequestConfig,
-    ) -> anyhow::Result<Self> {
+    pub fn new(security: Arc<SecurityPolicy>, config: HttpRequestConfig) -> anyhow::Result<Self> {
         let allowed_domains = normalize_allowed_domains(config.allowed_domains.clone());
         let allowed_for_redirect = allowed_domains.clone();
 
@@ -48,8 +45,7 @@ impl HttpRequestTool {
             }
 
             if !host_matches_allowlist(&host, &allowed_for_redirect) {
-                return attempt
-                    .error(format!("redirect blocked: host '{host}' not in allowlist"));
+                return attempt.error(format!("redirect blocked: host '{host}' not in allowlist"));
             }
 
             if attempt.previous().len() >= 5 {
@@ -589,8 +585,7 @@ mod tests {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
-        let tool =
-            HttpRequestTool::new(security, test_config(vec!["example.com"])).unwrap();
+        let tool = HttpRequestTool::new(security, test_config(vec!["example.com"])).unwrap();
         let result = tool
             .execute(json!({"method": "GET", "url": "https://example.com"}))
             .await
@@ -607,8 +602,7 @@ mod tests {
             max_actions_per_hour: 0,
             ..SecurityPolicy::default()
         });
-        let tool =
-            HttpRequestTool::new(security, test_config(vec!["example.com"])).unwrap();
+        let tool = HttpRequestTool::new(security, test_config(vec!["example.com"])).unwrap();
         let result = tool
             .execute(json!({"method": "GET", "url": "https://example.com"}))
             .await

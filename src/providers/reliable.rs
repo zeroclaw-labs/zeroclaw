@@ -424,10 +424,7 @@ mod tests {
             1,
         );
 
-        let messages = vec![
-            ChatMessage::system("system"),
-            ChatMessage::user("hello"),
-        ];
+        let messages = vec![ChatMessage::system("system"), ChatMessage::user("hello")];
         let result = provider
             .chat_with_history(&messages, "test", 0.0)
             .await
