@@ -20,6 +20,7 @@ pub use whatsapp::WhatsAppChannel;
 use crate::config::Config;
 use crate::memory::{self, Memory};
 use crate::providers::{self, Provider};
+use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use std::sync::Arc;
 use std::time::Duration;
@@ -253,17 +254,17 @@ fn inject_workspace_file(prompt: &mut String, workspace_dir: &std::path::Path, f
     }
 }
 
-pub fn handle_command(command: super::ChannelCommands, config: &Config) -> Result<()> {
+pub fn handle_command(command: crate::ChannelCommands, config: &Config) -> Result<()> {
     match command {
-        super::ChannelCommands::Start => {
+        crate::ChannelCommands::Start => {
             // Handled in main.rs (needs async), this is unreachable
             unreachable!("Start is handled in main.rs")
         }
-        super::ChannelCommands::Doctor => {
+        crate::ChannelCommands::Doctor => {
             // Handled in main.rs (needs async), this is unreachable
             unreachable!("Doctor is handled in main.rs")
         }
-        super::ChannelCommands::List => {
+        crate::ChannelCommands::List => {
             println!("Channels:");
             println!("  ✅ CLI (always available)");
             for (name, configured) in [
@@ -282,7 +283,7 @@ pub fn handle_command(command: super::ChannelCommands, config: &Config) -> Resul
             println!("To configure:      zeroclaw onboard");
             Ok(())
         }
-        super::ChannelCommands::Add {
+        crate::ChannelCommands::Add {
             channel_type,
             config: _,
         } => {
@@ -290,7 +291,7 @@ pub fn handle_command(command: super::ChannelCommands, config: &Config) -> Resul
                 "Channel type '{channel_type}' — use `zeroclaw onboard` to configure channels"
             );
         }
-        super::ChannelCommands::Remove { name } => {
+        crate::ChannelCommands::Remove { name } => {
             anyhow::bail!("Remove channel '{name}' — edit ~/.zeroclaw/config.toml directly");
         }
     }
@@ -603,11 +604,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             "  💬 [{}] from {}: {}",
             msg.channel,
             msg.sender,
-            if msg.content.len() > 80 {
-                format!("{}...", &msg.content[..80])
-            } else {
-                msg.content.clone()
-            }
+            truncate_with_ellipsis(&msg.content, 80)
         );
 
         // Auto-save to memory
@@ -629,11 +626,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             Ok(response) => {
                 println!(
                     "  🤖 Reply: {}",
-                    if response.len() > 80 {
-                        format!("{}...", &response[..80])
-                    } else {
-                        response.clone()
-                    }
+                    truncate_with_ellipsis(&response, 80)
                 );
                 // Find the channel that sent this message and reply
                 for ch in &channels {

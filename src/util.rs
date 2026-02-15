@@ -87,7 +87,7 @@ mod tests {
     #[test]
     fn test_truncate_mixed_ascii_emoji() {
         // Mixed ASCII and emoji
-        assert_eq!(truncate_with_ellipsis("Hello 🦀 World", 8), "Hello 🦀...");
+        assert_eq!(truncate_with_ellipsis("Hello 🦀 World", 8), "Hello 🦀 ...");
         assert_eq!(truncate_with_ellipsis("Hi 😊", 10), "Hi 😊");
     }
 
@@ -107,14 +107,14 @@ mod tests {
     fn test_truncate_accented_characters() {
         // Accented characters (2 bytes each in UTF-8)
         let s = "café résumé naïve";
-        assert_eq!(truncate_with_ellipsis(s, 10), "café résumé...");
+        assert_eq!(truncate_with_ellipsis(s, 10), "café résum...");
     }
 
     #[test]
     fn test_truncate_unicode_edge_case() {
         // Mix of 1-byte, 2-byte, 3-byte, and 4-byte characters
         let s = "aé你好🦀"; // 1 + 1 + 2 + 2 + 4 bytes = 10 bytes, 5 chars
-        assert_eq!(truncate_with_ellipsis(s, 3), "aé你好...");
+        assert_eq!(truncate_with_ellipsis(s, 3), "aé你...");
     }
 
     #[test]
