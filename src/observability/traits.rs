@@ -37,7 +37,7 @@ pub enum ObserverMetric {
 }
 
 /// Core observability trait — implement for any backend
-pub trait Observer: Send + Sync {
+pub trait Observer: Send + Sync + 'static {
     /// Record a discrete event
     fn record_event(&self, event: &ObserverEvent);
 
@@ -52,9 +52,6 @@ pub trait Observer: Send + Sync {
 
     /// Downcast to `Any` for backend-specific operations
     fn as_any(&self) -> &dyn std::any::Any where Self: Sized {
-        // Default implementation returns a placeholder that will fail on downcast.
-        // Implementors should override this to return `self`.
-        struct Placeholder;
-        std::any::TypeId::of::<Placeholder>()
+        self
     }
 }

@@ -13,7 +13,7 @@ use std::path::Path;
 ///
 /// This follows the AIEOS schema for defining AI agent identity, personality,
 /// and behavior. See https://aieos.org for the full specification.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AieosIdentity {
     /// Core identity: names, bio, origin, residence
     #[serde(default)]
@@ -580,6 +580,7 @@ mod tests {
                     first: Some("Nova".into()),
                     last: Some("AI".into()),
                     nickname: Some("Nov".into()),
+                    full: Some("Nova AI".into()),
                 }),
                 bio: Some("A helpful assistant.".into()),
                 origin: Some("Silicon Valley".into()),

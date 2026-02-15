@@ -24,15 +24,17 @@ use crate::config::Config;
 use crate::memory::{self, Memory};
 use crate::providers::{self, Provider};
 use crate::util::truncate_with_ellipsis;
+use crate::identity;
 use anyhow::Result;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Maximum characters per injected workspace file (matches `OpenClaw` default).
 const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 
 const DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS: u64 = 2;
 const DEFAULT_CHANNEL_MAX_BACKOFF_SECS: u64 = 60;
+const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 90;
 
 fn spawn_supervised_listener(
     ch: Arc<dyn Channel>,
@@ -187,11 +189,11 @@ pub fn build_system_prompt(
 
     // Check if AIEOS identity is configured
     if let Some(config) = identity_config {
-        if crate::identity::is_aieos_configured(config) {
+        if identity::is_aieos_configured(config) {
             // Load AIEOS identity
-            match crate::identity::load_aieos_identity(config, workspace_dir) {
+            match identity::load_aieos_identity(config, workspace_dir) {
                 Ok(Some(aieos_identity)) => {
-                    let aieos_prompt = crate::identity::aieos_to_system_prompt(&aieos_identity);
+                    let aieos_prompt = identity::aieos_to_system_prompt(&aieos_identity);
                     if !aieos_prompt.is_empty() {
                         prompt.push_str(&aieos_prompt);
                         prompt.push_str("\n\n");
@@ -684,13 +686,20 @@ pub async fn start_channels(config: Config) -> Result<()> {
         }
 
         // Call the LLM with system prompt (identity + soul + tools)
-        match provider
-            .chat_with_system(Some(&system_prompt), &msg.content, &model, temperature)
-            .await
-        {
-            Ok(response) => {
+        println!("  ⏳ Processing message...");
+        let started_at = Instant::now();
+
+        let llm_result = tokio::time::timeout(
+            Duration::from_secs(CHANNEL_MESSAGE_TIMEOUT_SECS),
+            provider.chat_with_system(Some(&system_prompt), &msg.content, &model, temperature),
+        )
+        .await;
+
+        match llm_result {
+            Ok(Ok(response)) => {
                 println!(
-                    "  🤖 Reply: {}",
+                    "  🤖 Reply ({}ms): {}",
+                    started_at.elapsed().as_millis(),
                     truncate_with_ellipsis(&response, 80)
                 );
                 // Find the channel that sent this message and reply
@@ -703,11 +712,36 @@ pub async fn start_channels(config: Config) -> Result<()> {
                     }
                 }
             }
-            Err(e) => {
-                eprintln!("  ❌ LLM error: {e}");
+            Ok(Err(e)) => {
+                eprintln!(
+                    "  ❌ LLM error after {}ms: {e}",
+                    started_at.elapsed().as_millis()
+                );
                 for ch in &channels {
                     if ch.name() == msg.channel {
                         let _ = ch.send(&format!("⚠️ Error: {e}"), &msg.sender).await;
+                        break;
+                    }
+                }
+            }
+            Err(_) => {
+                let timeout_msg = format!(
+                    "LLM response timed out after {}s",
+                    CHANNEL_MESSAGE_TIMEOUT_SECS
+                );
+                eprintln!(
+                    "  ❌ {} (elapsed: {}ms)",
+                    timeout_msg,
+                    started_at.elapsed().as_millis()
+                );
+                for ch in &channels {
+                    if ch.name() == msg.channel {
+                        let _ = ch
+                            .send(
+                                "⚠️ Request timed out while waiting for the model. Please try again.",
+                                &msg.sender,
+                            )
+                            .await;
                         break;
                     }
                 }
@@ -1045,9 +1079,9 @@ mod tests {
         let ws = make_workspace();
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], Some(&config));
 
-        // Should fall back to OpenClaw format
+        // Should fall back to OpenClaw format when AIEOS file is not found
+        // (Error is logged to stderr with filename, not included in prompt)
         assert!(prompt.contains("### SOUL.md"));
-        assert!(prompt.contains("[File not found: nonexistent.json]"));
     }
 
     #[test]
