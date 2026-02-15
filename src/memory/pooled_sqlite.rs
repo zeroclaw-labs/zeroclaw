@@ -101,14 +101,16 @@ impl PooledSqliteMemory {
         drop(conn);
 
         // Configure connection pool
-        let max_connections = std::thread::available_parallelism()
+        let max_connections: usize = std::thread::available_parallelism()
             .map(|n| n.get() * 2)
             .unwrap_or(4)
-            .max(4) as usize;
+            .max(4);
 
-        let pool = Config::new(db_path.to_str().unwrap())
-            .max_connections(max_connections)
-            .create_pool(Runtime::Tokio1)?;
+        let manager = SqliteManager::new(db_path.clone());
+        let pool = Pool::builder(manager)
+            .max_size(max_connections)
+            .runtime(deadpool::Runtime::Tokio1)
+            .build()?;
 
         // Test pool connectivity
         let _conn = pool.get().await?;

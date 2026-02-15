@@ -70,6 +70,26 @@ pub enum TaskResult<T> {
     Rejected(String),
 }
 
+/// 任务提交错误
+#[derive(Debug, Clone)]
+pub enum TrySubmitError {
+    /// 队列已满
+    Full,
+    /// 通道已关闭
+    Closed,
+}
+
+impl std::fmt::Display for TrySubmitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TrySubmitError::Full => write!(f, "Task queue is full"),
+            TrySubmitError::Closed => write!(f, "Worker pool is closed"),
+        }
+    }
+}
+
+impl std::error::Error for TrySubmitError {}
+
 /// 可执行的任务 trait
 pub trait Executable: Send + Sync {
     type Output: Send + Sync;
@@ -361,20 +381,20 @@ impl WorkerPool {
     }
 
     /// 尝试提交任务（非阻塞）
-    pub fn try_submit<F, T>(&self, task: Task<F, T>) -> Result<oneshot::Receiver<TaskResult<Box<dyn std::any::Any + Send + Sync>>>, Task<F, T>>
+    pub fn try_submit<F, T>(&self, task: Task<F, T>) -> Result<oneshot::Receiver<TaskResult<Box<dyn std::any::Any + Send + Sync>>>, TrySubmitError>
     where
         F: Future<Output = T> + Send + 'static,
         T: Send + Sync + 'static,
     {
         let (tx, rx) = oneshot::channel();
-        
+
         // Store task fields separately to avoid partial move
         let task_id = task.id;
         let task_priority = task.priority;
         let task_timeout = task.timeout;
         let task_created_at = task.created_at;
         let timeout = task.timeout.or(Some(self.config.default_timeout));
-        
+
         // Take ownership of the future via Option dance
         let mut task_opt = Some(task);
         let task_future = std::mem::replace(
@@ -383,7 +403,7 @@ impl WorkerPool {
         );
         // Now we can drop the task without dropping the future
         drop(task_opt);
-        
+
         let queued_task = QueuedTask {
             id: task_id,
             priority: task_priority,
@@ -400,27 +420,8 @@ impl WorkerPool {
 
         match self.tx.try_send(queued_task) {
             Ok(_) => Ok(rx),
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                // Return reconstructed task with placeholder future
-                Err(Task {
-                    id: task_id,
-                    priority: task_priority,
-                    future: Box::pin(async move { unreachable!() }),
-                    timeout: task_timeout,
-                    created_at: task_created_at,
-                    _phantom: std::marker::PhantomData,
-                })
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                Err(Task {
-                    id: task_id,
-                    priority: task_priority,
-                    future: Box::pin(async move { unreachable!() }),
-                    timeout: task_timeout,
-                    created_at: task_created_at,
-                    _phantom: std::marker::PhantomData,
-                })
-            }
+            Err(mpsc::error::TrySendError::Full(_)) => Err(TrySubmitError::Full),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(TrySubmitError::Closed),
         }
     }
 
