@@ -677,14 +677,16 @@ fn extract_host(url_str: &str) -> anyhow::Result<String> {
         .or_else(|| url.strip_prefix("file://"))
         .unwrap_or(url);
 
-    // Extract host (before first / or :)
-    let host = without_scheme
-        .split('/')
-        .next()
-        .unwrap_or(without_scheme)
-        .split(':')
-        .next()
-        .unwrap_or(without_scheme);
+    // Extract host — handle bracketed IPv6 addresses like [::1]:8080
+    let authority = without_scheme.split('/').next().unwrap_or(without_scheme);
+
+    let host = if authority.starts_with('[') {
+        // IPv6: take everything up to and including the closing ']'
+        authority.find(']').map_or(authority, |i| &authority[..=i])
+    } else {
+        // IPv4 or hostname: take everything before the port separator
+        authority.split(':').next().unwrap_or(authority)
+    };
 
     if host.is_empty() {
         anyhow::bail!("Invalid URL: no host");
@@ -694,35 +696,55 @@ fn extract_host(url_str: &str) -> anyhow::Result<String> {
 }
 
 fn is_private_host(host: &str) -> bool {
-    let private_patterns = [
-        "localhost",
-        "127.",
-        "10.",
-        "192.168.",
-        "172.16.",
-        "172.17.",
-        "172.18.",
-        "172.19.",
-        "172.20.",
-        "172.21.",
-        "172.22.",
-        "172.23.",
-        "172.24.",
-        "172.25.",
-        "172.26.",
-        "172.27.",
-        "172.28.",
-        "172.29.",
-        "172.30.",
-        "172.31.",
-        "0.0.0.0",
-        "::1",
-        "[::1]",
+    // Strip brackets from IPv6 addresses like [::1]
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+
+    if bare == "localhost" {
+        return true;
+    }
+
+    // Parse as IP address to catch all representations (decimal, hex, octal, mapped)
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_unspecified()
+                    || v4.is_broadcast()
+            }
+            std::net::IpAddr::V6(v6) => {
+                let segs = v6.segments();
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    // Unique-local (fc00::/7) — IPv6 equivalent of RFC 1918
+                    || (segs[0] & 0xfe00) == 0xfc00
+                    // Link-local (fe80::/10)
+                    || (segs[0] & 0xffc0) == 0xfe80
+                    // IPv4-mapped addresses (::ffff:127.0.0.1)
+                    || v6.to_ipv4_mapped().is_some_and(|v4| {
+                        v4.is_loopback()
+                            || v4.is_private()
+                            || v4.is_link_local()
+                            || v4.is_unspecified()
+                            || v4.is_broadcast()
+                    })
+            }
+        };
+    }
+
+    // Fallback string patterns for hostnames that look like IPs but don't parse
+    // (e.g., partial addresses used in DNS names).
+    let string_patterns = [
+        "127.", "10.", "192.168.", "0.0.0.0", "172.16.", "172.17.", "172.18.", "172.19.",
+        "172.20.", "172.21.", "172.22.", "172.23.", "172.24.", "172.25.", "172.26.", "172.27.",
+        "172.28.", "172.29.", "172.30.", "172.31.",
     ];
 
-    private_patterns
-        .iter()
-        .any(|p| host.starts_with(p) || host == *p)
+    string_patterns.iter().any(|p| bare.starts_with(p))
 }
 
 fn host_matches_allowlist(host: &str, allowed: &[String]) -> bool {
@@ -776,6 +798,43 @@ mod tests {
         assert!(is_private_host("10.0.0.1"));
         assert!(!is_private_host("example.com"));
         assert!(!is_private_host("google.com"));
+    }
+
+    #[test]
+    fn is_private_host_catches_ipv6() {
+        assert!(is_private_host("::1"));
+        assert!(is_private_host("[::1]"));
+        assert!(is_private_host("0.0.0.0"));
+    }
+
+    #[test]
+    fn is_private_host_catches_mapped_ipv4() {
+        // IPv4-mapped IPv6 addresses
+        assert!(is_private_host("::ffff:127.0.0.1"));
+        assert!(is_private_host("::ffff:10.0.0.1"));
+        assert!(is_private_host("::ffff:192.168.1.1"));
+    }
+
+    #[test]
+    fn is_private_host_catches_ipv6_private_ranges() {
+        // Unique-local (fc00::/7)
+        assert!(is_private_host("fd00::1"));
+        assert!(is_private_host("fc00::1"));
+        // Link-local (fe80::/10)
+        assert!(is_private_host("fe80::1"));
+        // Public IPv6 should pass
+        assert!(!is_private_host("2001:db8::1"));
+    }
+
+    #[test]
+    fn validate_url_blocks_ipv6_ssrf() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new(security, vec!["*".into()], None);
+        assert!(tool.validate_url("https://[::1]/").is_err());
+        assert!(tool.validate_url("https://[::ffff:127.0.0.1]/").is_err());
+        assert!(tool
+            .validate_url("https://[::ffff:10.0.0.1]:8080/")
+            .is_err());
     }
 
     #[test]
