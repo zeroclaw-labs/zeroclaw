@@ -212,6 +212,15 @@ pub fn create_resilient_provider(
             continue;
         }
 
+        if api_key.is_some() && fallback != "ollama" {
+            tracing::warn!(
+                fallback_provider = fallback,
+                primary_provider = primary_name,
+                "Fallback provider will use the primary provider's API key — \
+                 this will fail if the providers require different keys"
+            );
+        }
+
         match create_provider(fallback, api_key) {
             Ok(provider) => providers.push((fallback.clone(), provider)),
             Err(e) => {

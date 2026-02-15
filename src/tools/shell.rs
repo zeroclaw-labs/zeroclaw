@@ -79,11 +79,8 @@ impl Tool for ShellTool {
             }
         }
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(SHELL_TIMEOUT_SECS),
-            cmd.output(),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(Duration::from_secs(SHELL_TIMEOUT_SECS), cmd.output()).await;
 
         match result {
             Ok(Ok(output)) => {
