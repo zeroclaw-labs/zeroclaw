@@ -694,35 +694,49 @@ fn extract_host(url_str: &str) -> anyhow::Result<String> {
 }
 
 fn is_private_host(host: &str) -> bool {
-    let private_patterns = [
-        "localhost",
-        "127.",
-        "10.",
-        "192.168.",
-        "172.16.",
-        "172.17.",
-        "172.18.",
-        "172.19.",
-        "172.20.",
-        "172.21.",
-        "172.22.",
-        "172.23.",
-        "172.24.",
-        "172.25.",
-        "172.26.",
-        "172.27.",
-        "172.28.",
-        "172.29.",
-        "172.30.",
-        "172.31.",
-        "0.0.0.0",
-        "::1",
-        "[::1]",
+    // Strip brackets from IPv6 addresses like [::1]
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+
+    if bare == "localhost" {
+        return true;
+    }
+
+    // Parse as IP address to catch all representations (decimal, hex, octal, mapped)
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_unspecified()
+                    || v4.is_broadcast()
+            }
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    // IPv4-mapped addresses (::ffff:127.0.0.1)
+                    || v6.to_ipv4_mapped().is_some_and(|v4| {
+                        v4.is_loopback()
+                            || v4.is_private()
+                            || v4.is_link_local()
+                            || v4.is_unspecified()
+                    })
+            }
+        };
+    }
+
+    // Fallback string patterns for hostnames that look like IPs but don't parse
+    // (e.g., partial addresses used in DNS names).
+    let string_patterns = [
+        "127.", "10.", "192.168.", "0.0.0.0", "172.16.", "172.17.", "172.18.", "172.19.",
+        "172.20.", "172.21.", "172.22.", "172.23.", "172.24.", "172.25.", "172.26.", "172.27.",
+        "172.28.", "172.29.", "172.30.", "172.31.",
     ];
 
-    private_patterns
-        .iter()
-        .any(|p| host.starts_with(p) || host == *p)
+    string_patterns.iter().any(|p| bare.starts_with(p))
 }
 
 fn host_matches_allowlist(host: &str, allowed: &[String]) -> bool {
@@ -776,6 +790,21 @@ mod tests {
         assert!(is_private_host("10.0.0.1"));
         assert!(!is_private_host("example.com"));
         assert!(!is_private_host("google.com"));
+    }
+
+    #[test]
+    fn is_private_host_catches_ipv6() {
+        assert!(is_private_host("::1"));
+        assert!(is_private_host("[::1]"));
+        assert!(is_private_host("0.0.0.0"));
+    }
+
+    #[test]
+    fn is_private_host_catches_mapped_ipv4() {
+        // IPv4-mapped IPv6 addresses
+        assert!(is_private_host("::ffff:127.0.0.1"));
+        assert!(is_private_host("::ffff:10.0.0.1"));
+        assert!(is_private_host("::ffff:192.168.1.1"));
     }
 
     #[test]
