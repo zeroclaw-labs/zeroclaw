@@ -60,4 +60,4 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Lint GitHub workflows
-        uses: rhysd/actionlint@v1
+        uses: rhysd/actionlint@v1.7.11
