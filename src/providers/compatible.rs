@@ -2,7 +2,7 @@
 //! Most LLM APIs follow the same `/v1/chat/completions` format.
 //! This module provides a single implementation that works for all of them.
 
-use crate::providers::traits::Provider;
+use crate::providers::traits::{ChatMessage, Provider};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -81,7 +81,7 @@ struct Message {
 }
 
 #[derive(Debug, Deserialize)]
-struct ChatResponse {
+struct ApiChatResponse {
     choices: Vec<Choice>,
 }
 
@@ -264,6 +264,7 @@ impl Provider for OpenAiCompatibleProvider {
         if !response.status().is_success() {
             let status = response.status();
             let error = response.text().await?;
+            let sanitized = super::sanitize_api_error(&error);
 
             if status == reqwest::StatusCode::NOT_FOUND {
                 return self
@@ -271,16 +272,88 @@ impl Provider for OpenAiCompatibleProvider {
                     .await
                     .map_err(|responses_err| {
                         anyhow::anyhow!(
-                            "{} API error: {error} (chat completions unavailable; responses fallback failed: {responses_err})",
+                            "{} API error ({status}): {sanitized} (chat completions unavailable; responses fallback failed: {responses_err})",
                             self.name
                         )
                     });
             }
 
-            anyhow::bail!("{} API error: {error}", self.name);
+            anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
         }
 
-        let chat_response: ChatResponse = response.json().await?;
+        let chat_response: ApiChatResponse = response.json().await?;
+
+        chat_response
+            .choices
+            .into_iter()
+            .next()
+            .map(|c| c.message.content)
+            .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))
+    }
+
+    async fn chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<String> {
+        let api_key = self.api_key.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} API key not set. Run `zeroclaw onboard` or set the appropriate env var.",
+                self.name
+            )
+        })?;
+
+        let api_messages: Vec<Message> = messages
+            .iter()
+            .map(|m| Message {
+                role: m.role.clone(),
+                content: m.content.clone(),
+            })
+            .collect();
+
+        let request = ChatRequest {
+            model: model.to_string(),
+            messages: api_messages,
+            temperature,
+        };
+
+        let url = self.chat_completions_url();
+        let response = self
+            .apply_auth_header(self.client.post(&url).json(&request), api_key)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+
+            // Mirror chat_with_system: 404 may mean this provider uses the Responses API
+            if status == reqwest::StatusCode::NOT_FOUND {
+                // Extract system prompt and last user message for responses fallback
+                let system = messages.iter().find(|m| m.role == "system");
+                let last_user = messages.iter().rfind(|m| m.role == "user");
+                if let Some(user_msg) = last_user {
+                    return self
+                        .chat_via_responses(
+                            api_key,
+                            system.map(|m| m.content.as_str()),
+                            &user_msg.content,
+                            model,
+                        )
+                        .await
+                        .map_err(|responses_err| {
+                            anyhow::anyhow!(
+                                "{} API error (chat completions unavailable; responses fallback failed: {responses_err})",
+                                self.name
+                            )
+                        });
+                }
+            }
+
+            return Err(super::api_error(&self.name, response).await);
+        }
+
+        let chat_response: ApiChatResponse = response.json().await?;
 
         chat_response
             .choices
@@ -357,14 +430,14 @@ mod tests {
     #[test]
     fn response_deserializes() {
         let json = r#"{"choices":[{"message":{"content":"Hello from Venice!"}}]}"#;
-        let resp: ChatResponse = serde_json::from_str(json).unwrap();
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.choices[0].message.content, "Hello from Venice!");
     }
 
     #[test]
     fn response_empty_choices() {
         let json = r#"{"choices":[]}"#;
-        let resp: ChatResponse = serde_json::from_str(json).unwrap();
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         assert!(resp.choices.is_empty());
     }
 

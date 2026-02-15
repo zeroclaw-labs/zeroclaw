@@ -8,7 +8,7 @@ pub mod reliable;
 pub mod router;
 pub mod traits;
 
-pub use traits::Provider;
+pub use traits::{ChatMessage, Provider};
 
 use compatible::{AuthStyle, OpenAiCompatibleProvider};
 use reliable::ReliableProvider;

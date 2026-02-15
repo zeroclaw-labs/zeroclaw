@@ -1,3 +1,4 @@
+use super::traits::ChatMessage;
 use super::Provider;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -109,6 +110,19 @@ impl Provider for RouterProvider {
 
         provider
             .chat_with_system(system_prompt, message, &resolved_model, temperature)
+            .await
+    }
+
+    async fn chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<String> {
+        let (provider_idx, resolved_model) = self.resolve(model);
+        let (_, provider) = &self.providers[provider_idx];
+        provider
+            .chat_with_history(messages, &resolved_model, temperature)
             .await
     }
 
