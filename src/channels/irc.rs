@@ -171,7 +171,11 @@ fn split_message(message: &str, max_bytes: usize) -> Vec<String> {
                 split_at -= 1;
             }
             if split_at == 0 {
+                // No valid boundary found going backward — advance forward instead
                 split_at = max_bytes;
+                while split_at < remaining.len() && !remaining.is_char_boundary(split_at) {
+                    split_at += 1;
+                }
             }
 
             chunks.push(remaining[..split_at].to_string());
