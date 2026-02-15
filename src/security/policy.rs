@@ -235,19 +235,50 @@ impl SecurityPolicy {
             return false;
         }
 
-        // Block obvious traversal attempts
-        if path.contains("..") {
+        // Block path traversal: check for ".." as a path component
+        if Path::new(path)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
             return false;
         }
+
+        // Block URL-encoded traversal attempts (e.g. ..%2f)
+        let lower = path.to_lowercase();
+        if lower.contains("..%2f") || lower.contains("%2f..") {
+            return false;
+        }
+
+        // Expand tilde for comparison
+        let expanded = if let Some(stripped) = path.strip_prefix("~/") {
+            if let Some(home) = std::env::var("HOME").ok().map(PathBuf::from) {
+                home.join(stripped).to_string_lossy().to_string()
+            } else {
+                path.to_string()
+            }
+        } else {
+            path.to_string()
+        };
 
         // Block absolute paths when workspace_only is set
-        if self.workspace_only && Path::new(path).is_absolute() {
+        if self.workspace_only && Path::new(&expanded).is_absolute() {
             return false;
         }
 
-        // Block forbidden paths
+        // Block forbidden paths using path-component-aware matching
+        let expanded_path = Path::new(&expanded);
         for forbidden in &self.forbidden_paths {
-            if path.starts_with(forbidden.as_str()) {
+            let forbidden_expanded = if let Some(stripped) = forbidden.strip_prefix("~/") {
+                if let Some(home) = std::env::var("HOME").ok().map(PathBuf::from) {
+                    home.join(stripped).to_string_lossy().to_string()
+                } else {
+                    forbidden.clone()
+                }
+            } else {
+                forbidden.clone()
+            };
+            let forbidden_path = Path::new(&forbidden_expanded);
+            if expanded_path.starts_with(forbidden_path) {
                 return false;
             }
         }
@@ -704,8 +735,11 @@ mod tests {
     #[test]
     fn path_traversal_double_dot_in_filename() {
         let p = default_policy();
-        // ".." anywhere in the path is blocked (conservative)
-        assert!(!p.is_path_allowed("my..file.txt"));
+        // ".." in a filename (not a path component) is allowed
+        assert!(p.is_path_allowed("my..file.txt"));
+        // But actual traversal components are still blocked
+        assert!(!p.is_path_allowed("../etc/passwd"));
+        assert!(!p.is_path_allowed("foo/../etc/passwd"));
     }
 
     #[test]
