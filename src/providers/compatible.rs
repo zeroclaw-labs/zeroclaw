@@ -524,4 +524,38 @@ mod tests {
         let p = make_provider("test", "https://api.example.com/v1", None);
         assert_eq!(p.chat_completions_url(), "https://api.example.com/v1/chat/completions");
     }
+
+    // ══════════════════════════════════════════════════════════
+    // Provider-specific endpoint tests (Issue #167)
+    // ══════════════════════════════════════════════════════════
+
+    #[test]
+    fn chat_completions_url_zai() {
+        // Z.AI uses /api/paas/v4 base path
+        let p = make_provider("zai", "https://api.z.ai/api/paas/v4", None);
+        assert_eq!(
+            p.chat_completions_url(),
+            "https://api.z.ai/api/paas/v4/chat/completions"
+        );
+    }
+
+    #[test]
+    fn chat_completions_url_glm() {
+        // GLM (BigModel) uses /api/paas/v4 base path
+        let p = make_provider("glm", "https://open.bigmodel.cn/api/paas/v4", None);
+        assert_eq!(
+            p.chat_completions_url(),
+            "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        );
+    }
+
+    #[test]
+    fn chat_completions_url_opencode() {
+        // OpenCode Zen uses /zen/v1 base path
+        let p = make_provider("opencode", "https://opencode.ai/zen/v1", None);
+        assert_eq!(
+            p.chat_completions_url(),
+            "https://opencode.ai/zen/v1/chat/completions"
+        );
+    }
 }
