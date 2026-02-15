@@ -444,7 +444,7 @@ impl DatabaseInjection for DefaultDatabase {
     }
 }
 
-/// Default file system injection — stub (workspace-scoped when implemented).
+/// Default file system injection — returns errors until workspace-scoped FS is wired.
 pub struct DefaultFileSystem;
 
 #[async_trait::async_trait]
@@ -466,7 +466,7 @@ impl FileSystemInjection for DefaultFileSystem {
     }
 }
 
-/// Default network injection — stub (restricted HTTP when implemented).
+/// Default network injection — returns errors until restricted HTTP client is wired.
 pub struct DefaultNetwork;
 
 #[async_trait::async_trait]
@@ -480,7 +480,7 @@ impl NetworkInjection for DefaultNetwork {
     }
 }
 
-/// Default notification injection — stub.
+/// Default notification injection — logs notifications via tracing.
 pub struct DefaultNotifications;
 
 #[async_trait::async_trait]
@@ -504,7 +504,7 @@ impl NotificationInjection for DefaultNotifications {
     }
 }
 
-/// Default scheduler injection — stub.
+/// Default scheduler injection — returns errors until CronBridge integration is wired.
 pub struct DefaultScheduler;
 
 #[async_trait::async_trait]
@@ -556,13 +556,13 @@ impl AnalyticsInjection for DefaultAnalytics {
     }
 }
 
-/// Default secrets injection — stub (integrate with security::secrets when ready).
+/// Default secrets injection — read-only (returns None); write/delete require vault integration.
 pub struct DefaultSecrets;
 
 #[async_trait::async_trait]
 impl SecretsInjection for DefaultSecrets {
     async fn get_secret(&self, key: &str) -> Result<Option<String>> {
-        tracing::debug!(injection = "secrets", key = key, "Secret requested (stub)");
+        tracing::debug!(injection = "secrets", key = key, "Secret requested (read-only default)");
         Ok(None)
     }
 
@@ -597,7 +597,7 @@ impl ConfigInjection for DefaultConfig {
     }
 }
 
-/// Default event injection — stub.
+/// Default event injection — logs events via tracing; does not persist subscriptions.
 pub struct DefaultEvents;
 
 #[async_trait::async_trait]
@@ -618,7 +618,7 @@ impl EventInjection for DefaultEvents {
             injection = "events",
             event = event,
             subscription_id = sub_id.as_str(),
-            "Subscribed to event (stub)"
+            "Subscribed to event (default, non-persisted)"
         );
         Ok(sub_id)
     }
@@ -627,7 +627,7 @@ impl EventInjection for DefaultEvents {
         tracing::debug!(
             injection = "events",
             subscription_id = subscription_id,
-            "Unsubscribed from event (stub)"
+            "Unsubscribed from event (default, non-persisted)"
         );
         Ok(())
     }
@@ -1037,7 +1037,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ── Stub injection tests ───────────────────────────────────
+    // ── Unimplemented injection tests ──────────────────────────
 
     #[tokio::test]
     async fn filesystem_not_implemented() {

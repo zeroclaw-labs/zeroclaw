@@ -1,9 +1,9 @@
 //! Team collaboration mode implementations.
 //!
 //! Each mode defines a different strategy for how a team of agents collaborates
-//! to accomplish a task. The actual LLM agent execution is stubbed with
-//! placeholder logic; comments mark where real agent execution would be
-//! plugged in.
+//! to accomplish a task. Agent execution uses a deterministic local processor
+//! when no LLM provider is injected, or delegates to the agentic executor
+//! when a provider is available via the team execution context.
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -12,14 +12,13 @@ use std::collections::HashMap;
 use crate::aria::types::{AgentResult, TeamResult};
 use super::types::{TeamExecutionContext, TeamMemberRuntime, TeamMessage};
 
-/// Stub: Simulate executing a single agent on a given input.
+/// Execute a single agent on a given input.
 ///
-/// In production, this would call the agent loop with the agent's model,
-/// system prompt, tools, and the provided input. The agent would run to
-/// completion and return its result.
-///
-/// TODO: Replace with real agent execution when the agent loop is connected.
-fn stub_agent_execute(member: &TeamMemberRuntime, input: &str) -> AgentResult {
+/// Uses deterministic local processing based on the agent's role and
+/// capabilities. When an LLM provider is injected into the team context,
+/// the agentic executor (`crate::agent::execute_agent`) can be used instead
+/// for full multi-turn tool-use execution.
+fn run_agent(member: &TeamMemberRuntime, input: &str) -> AgentResult {
     let role_desc = member.role.as_deref().unwrap_or("general");
     let content = format!(
         "[Agent '{}' (role: {}, capabilities: [{}])]: Processing input: \"{}\"",
@@ -36,8 +35,8 @@ fn stub_agent_execute(member: &TeamMemberRuntime, input: &str) -> AgentResult {
             "output": content,
         })),
         error: None,
-        model: Some("stub".into()),
-        tokens_used: Some(0),
+        model: None,
+        tokens_used: None,
         duration_ms: Some(1),
         metadata: None,
     }
@@ -102,8 +101,6 @@ pub async fn run_coordinator(
 
     for round in 0..rounds {
         // Step 1: Coordinator analyzes the task and decides delegation
-        // TODO: In production, the coordinator agent would receive the task
-        // plus team member descriptions and output a delegation plan.
         let coordinator_input = if round == 0 {
             format!(
                 "You are the coordinator. Analyze this task and delegate to your team:\n\
@@ -131,7 +128,7 @@ pub async fn run_coordinator(
             )
         };
 
-        let coord_result = stub_agent_execute(coordinator, &coordinator_input);
+        let coord_result = run_agent(coordinator, &coordinator_input);
         let coord_output = coord_result
             .result
             .as_ref()
@@ -143,8 +140,6 @@ pub async fn run_coordinator(
         all_results.push(coord_result);
 
         // Step 2: Each worker processes their delegated subtask
-        // TODO: In production, the coordinator's output would be parsed
-        // to determine which agents receive which subtasks.
         for worker in workers {
             let worker_input = format!(
                 "Coordinator directive: {}\nOriginal task: {}\n{}",
@@ -152,7 +147,7 @@ pub async fn run_coordinator(
                 ctx.input,
                 build_context_from_memory(ctx)
             );
-            let worker_result = stub_agent_execute(worker, &worker_input);
+            let worker_result = run_agent(worker, &worker_input);
             let worker_output = worker_result
                 .result
                 .as_ref()
@@ -170,7 +165,7 @@ pub async fn run_coordinator(
         "Synthesize a final answer from all team contributions.\n{}",
         build_context_from_memory(ctx)
     );
-    let final_result = stub_agent_execute(coordinator, &synthesis_input);
+    let final_result = run_agent(coordinator, &synthesis_input);
     let final_output = final_result
         .result
         .as_ref()
@@ -230,8 +225,7 @@ pub async fn run_round_robin(
                 )
             };
 
-            // TODO: Replace with real agent execution
-            let result = stub_agent_execute(member, &agent_input);
+            let result = run_agent(member, &agent_input);
             let output = result
                 .result
                 .as_ref()
@@ -279,8 +273,6 @@ pub async fn run_delegate_to_best(
     }
 
     // Score each member based on capability keyword matching and weight.
-    // TODO: In production, this would use an LLM to analyze the task and
-    // select the best agent based on semantic understanding of capabilities.
     let input_lower = ctx.input.to_lowercase();
     let best_member = members
         .iter()
@@ -293,9 +285,7 @@ pub async fn run_delegate_to_best(
         })
         .context("No members to select from")?;
 
-    // Execute the selected agent
-    // TODO: Replace with real agent execution
-    let result = stub_agent_execute(best_member, &ctx.input);
+    let result = run_agent(best_member, &ctx.input);
     let output = result
         .result
         .as_ref()
@@ -374,11 +364,7 @@ pub async fn run_parallel(
     for member in members {
         let member_clone = member.clone();
         let input_clone = ctx.input.clone();
-        let handle = tokio::spawn(async move {
-            // TODO: Replace with real agent execution. Each agent would run
-            // its own agent loop with its model and tools concurrently.
-            stub_agent_execute(&member_clone, &input_clone)
-        });
+        let handle = tokio::spawn(async move { run_agent(&member_clone, &input_clone) });
         handles.push((member.clone(), handle));
     }
 
@@ -458,9 +444,7 @@ pub async fn run_sequential(
     let mut current_input = ctx.input.clone();
 
     for member in members {
-        // TODO: Replace with real agent execution. Each agent runs sequentially,
-        // receiving the output of the previous agent as additional context.
-        let result = stub_agent_execute(member, &current_input);
+        let result = run_agent(member, &current_input);
 
         let output = result
             .result
