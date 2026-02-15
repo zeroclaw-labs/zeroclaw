@@ -1,0 +1,64 @@
+name: Feature Request
+description: Propose an improvement or new capability
+title: "[Feature]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for sharing your idea.
+        Please focus on user value, constraints, and rollout safety.
+
+  - type: input
+    id: problem
+    attributes:
+      label: Problem statement
+      description: What user problem are you trying to solve?
+      placeholder: Teams need a way to ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the preferred solution.
+      placeholder: Add a new subcommand / trait implementation ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What alternatives did you evaluate?
+      placeholder: Keep current behavior, use external tool, etc.
+    validations:
+      required: false
+
+  - type: textarea
+    id: architecture
+    attributes:
+      label: Architecture impact
+      description: Which subsystem(s) are affected?
+      placeholder: providers/, channels/, memory/, runtime/, security/ ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: risk
+    attributes:
+      label: Risk and rollback
+      description: Main risk + how to disable/revert quickly.
+      placeholder: Risk is ... rollback is ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: breaking
+    attributes:
+      label: Breaking change?
+      options:
+        - No
+        - Yes
+    validations:
+      required: true
