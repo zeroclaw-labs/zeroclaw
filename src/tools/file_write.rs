@@ -110,18 +110,34 @@ impl Tool for FileWriteTool {
 
         let resolved_target = resolved_parent.join(file_name);
 
-        match tokio::fs::write(&resolved_target, content).await {
-            Ok(()) => Ok(ToolResult {
-                success: true,
-                output: format!("Written {} bytes to {path}", content.len()),
-                error: None,
-            }),
-            Err(e) => Ok(ToolResult {
+        // Atomic write: write to a temporary file then rename, so a failed
+        // write never leaves a partially-written file at the target path.
+        let tmp_path = resolved_target.with_extension("tmp");
+
+        if let Err(e) = tokio::fs::write(&tmp_path, content).await {
+            // Clean up partial temp file on write failure
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to write file: {e}")),
-            }),
+            });
         }
+
+        if let Err(e) = tokio::fs::rename(&tmp_path, &resolved_target).await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Failed to finalize file write: {e}")),
+            });
+        }
+
+        Ok(ToolResult {
+            success: true,
+            output: format!("Written {} bytes to {path}", content.len()),
+            error: None,
+        })
     }
 }
 
