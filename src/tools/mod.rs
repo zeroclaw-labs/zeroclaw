@@ -3,6 +3,7 @@ pub mod browser_open;
 pub mod composio;
 pub mod file_read;
 pub mod file_write;
+pub mod http_request;
 pub mod image_info;
 pub mod memory_forget;
 pub mod memory_recall;
@@ -16,6 +17,7 @@ pub use browser_open::BrowserOpenTool;
 pub use composio::ComposioTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
+pub use http_request::HttpRequestTool;
 pub use image_info::ImageInfoTool;
 pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
@@ -54,6 +56,7 @@ pub fn all_tools(
     memory: Arc<dyn Memory>,
     composio_key: Option<&str>,
     browser_config: &crate::config::BrowserConfig,
+    http_request_config: &crate::config::HttpRequestConfig,
 ) -> Vec<Box<dyn Tool>> {
     all_tools_with_runtime(
         security,
@@ -61,6 +64,7 @@ pub fn all_tools(
         memory,
         composio_key,
         browser_config,
+        http_request_config,
     )
 }
 
@@ -71,6 +75,7 @@ pub fn all_tools_with_runtime(
     memory: Arc<dyn Memory>,
     composio_key: Option<&str>,
     browser_config: &crate::config::BrowserConfig,
+    http_request_config: &crate::config::HttpRequestConfig,
 ) -> Vec<Box<dyn Tool>> {
     let mut tools: Vec<Box<dyn Tool>> = vec![
         Box::new(ShellTool::new(security.clone(), runtime)),
@@ -99,6 +104,13 @@ pub fn all_tools_with_runtime(
     tools.push(Box::new(ScreenshotTool::new(security.clone())));
     tools.push(Box::new(ImageInfoTool::new(security.clone())));
 
+    if http_request_config.enabled {
+        tools.push(Box::new(HttpRequestTool::new(
+            security.clone(),
+            http_request_config.clone(),
+        )));
+    }
+
     if let Some(key) = composio_key {
         if !key.is_empty() {
             tools.push(Box::new(ComposioTool::new(key)));
@@ -111,7 +123,7 @@ pub fn all_tools_with_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BrowserConfig, MemoryConfig};
+    use crate::config::{BrowserConfig, HttpRequestConfig, MemoryConfig};
     use tempfile::TempDir;
 
     #[test]
@@ -138,7 +150,7 @@ mod tests {
             session_name: None,
         };
 
-        let tools = all_tools(&security, mem, None, &browser);
+        let tools = all_tools(&security, mem, None, &browser, &HttpRequestConfig::default());
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"browser_open"));
     }
@@ -160,7 +172,7 @@ mod tests {
             session_name: None,
         };
 
-        let tools = all_tools(&security, mem, None, &browser);
+        let tools = all_tools(&security, mem, None, &browser, &HttpRequestConfig::default());
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"browser_open"));
     }
@@ -257,5 +269,51 @@ mod tests {
         let parsed: ToolSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.name, "test");
         assert_eq!(parsed.description, "A test tool");
+    }
+
+    #[test]
+    fn all_tools_excludes_http_request_when_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig::default();
+        let http = HttpRequestConfig {
+            enabled: false,
+            allowed_domains: vec!["example.com".into()],
+            ..HttpRequestConfig::default()
+        };
+
+        let tools = all_tools(&security, mem, None, &browser, &http);
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(!names.contains(&"http_request"));
+    }
+
+    #[test]
+    fn all_tools_includes_http_request_when_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig::default();
+        let http = HttpRequestConfig {
+            enabled: true,
+            allowed_domains: vec!["example.com".into()],
+            ..HttpRequestConfig::default()
+        };
+
+        let tools = all_tools(&security, mem, None, &browser, &http);
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"http_request"));
     }
 }

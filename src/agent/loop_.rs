@@ -267,6 +267,7 @@ pub async fn run(
         mem.clone(),
         composio_key,
         &config.browser,
+        &config.http_request,
     );
 
     // ── Resolve provider ─────────────────────────────────────────
@@ -333,6 +334,12 @@ pub async fn run(
         tool_descs.push((
             "browser_open",
             "Open approved HTTPS URLs in Brave Browser (allowlist-only, no scraping)",
+        ));
+    }
+    if config.http_request.enabled {
+        tool_descs.push((
+            "http_request",
+            "Make outbound HTTP requests to allowlisted HTTPS endpoints (GET, POST, PUT, DELETE, PATCH). Use when: calling REST APIs, webhooks, or external services.",
         ));
     }
     if config.composio.enabled {

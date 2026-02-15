@@ -62,6 +62,9 @@ pub struct Config {
     pub browser: BrowserConfig,
 
     #[serde(default)]
+    pub http_request: HttpRequestConfig,
+
+    #[serde(default)]
     pub identity: IdentityConfig,
 }
 
@@ -223,6 +226,32 @@ pub struct BrowserConfig {
     /// Browser session name (for agent-browser automation)
     #[serde(default)]
     pub session_name: Option<String>,
+}
+
+// ── HTTP Request (outbound API calls) ───────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HttpRequestConfig {
+    /// Enable `http_request` tool
+    #[serde(default)]
+    pub enabled: bool,
+    /// Allowed domains for HTTP requests (exact or subdomain match)
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+    /// Request timeout in seconds (default: 30)
+    #[serde(default = "default_http_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Max response body size in bytes (default: 1 MB)
+    #[serde(default = "default_http_max_response_bytes")]
+    pub max_response_bytes: usize,
+}
+
+fn default_http_timeout_secs() -> u64 {
+    30
+}
+
+fn default_http_max_response_bytes() -> usize {
+    1_048_576 // 1 MB
 }
 
 // ── Memory ───────────────────────────────────────────────────
@@ -830,6 +859,7 @@ impl Default for Config {
             composio: ComposioConfig::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
+            http_request: HttpRequestConfig::default(),
             identity: IdentityConfig::default(),
         }
     }
@@ -1140,6 +1170,7 @@ mod tests {
             composio: ComposioConfig::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
+            http_request: HttpRequestConfig::default(),
             identity: IdentityConfig::default(),
         };
 
@@ -1211,6 +1242,7 @@ default_temperature = 0.7
             composio: ComposioConfig::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
+            http_request: HttpRequestConfig::default(),
             identity: IdentityConfig::default(),
         };
 
