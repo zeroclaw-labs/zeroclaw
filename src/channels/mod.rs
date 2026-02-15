@@ -21,13 +21,14 @@ use crate::memory::{self, Memory};
 use crate::providers::{self, Provider};
 use anyhow::Result;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Maximum characters per injected workspace file (matches `OpenClaw` default).
 const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 
 const DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS: u64 = 2;
 const DEFAULT_CHANNEL_MAX_BACKOFF_SECS: u64 = 60;
+const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 90;
 
 fn spawn_supervised_listener(
     ch: Arc<dyn Channel>,
@@ -608,6 +609,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 msg.content.clone()
             }
         );
+        println!("  ⏳ Processing message...");
+        let started_at = Instant::now();
 
         // Auto-save to memory
         if config.memory.auto_save {
@@ -621,13 +624,17 @@ pub async fn start_channels(config: Config) -> Result<()> {
         }
 
         // Call the LLM with system prompt (identity + soul + tools)
-        match provider
-            .chat_with_system(Some(&system_prompt), &msg.content, &model, temperature)
-            .await
-        {
-            Ok(response) => {
+        let llm_result = tokio::time::timeout(
+            Duration::from_secs(CHANNEL_MESSAGE_TIMEOUT_SECS),
+            provider.chat_with_system(Some(&system_prompt), &msg.content, &model, temperature),
+        )
+        .await;
+
+        match llm_result {
+            Ok(Ok(response)) => {
                 println!(
-                    "  🤖 Reply: {}",
+                    "  🤖 Reply ({}ms): {}",
+                    started_at.elapsed().as_millis(),
                     if response.len() > 80 {
                         format!("{}...", &response[..80])
                     } else {
@@ -644,11 +651,36 @@ pub async fn start_channels(config: Config) -> Result<()> {
                     }
                 }
             }
-            Err(e) => {
-                eprintln!("  ❌ LLM error: {e}");
+            Ok(Err(e)) => {
+                eprintln!(
+                    "  ❌ LLM error after {}ms: {e}",
+                    started_at.elapsed().as_millis()
+                );
                 for ch in &channels {
                     if ch.name() == msg.channel {
                         let _ = ch.send(&format!("⚠️ Error: {e}"), &msg.sender).await;
+                        break;
+                    }
+                }
+            }
+            Err(_) => {
+                let timeout_msg = format!(
+                    "LLM response timed out after {}s",
+                    CHANNEL_MESSAGE_TIMEOUT_SECS
+                );
+                eprintln!(
+                    "  ❌ {} (elapsed: {}ms)",
+                    timeout_msg,
+                    started_at.elapsed().as_millis()
+                );
+                for ch in &channels {
+                    if ch.name() == msg.channel {
+                        let _ = ch
+                            .send(
+                                "⚠️ Request timed out while waiting for the model. Please try again.",
+                                &msg.sender,
+                            )
+                            .await;
                         break;
                     }
                 }

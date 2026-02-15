@@ -102,7 +102,8 @@ pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<
                 base_url,
                 api_key,
                 AuthStyle::Bearer,
-            )))
+            )
+            .with_responses_api_preference(true)))
         }
 
         _ => anyhow::bail!(

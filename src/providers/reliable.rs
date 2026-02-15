@@ -46,6 +46,12 @@ impl Provider for ReliableProvider {
             let mut backoff_ms = self.base_backoff_ms;
 
             for attempt in 0..=self.max_retries {
+                tracing::info!(
+                    provider = provider_name,
+                    attempt = attempt + 1,
+                    max_attempts = self.max_retries + 1,
+                    "Calling provider"
+                );
                 match provider
                     .chat_with_system(system_prompt, message, model, temperature)
                     .await
