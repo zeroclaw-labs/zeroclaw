@@ -55,26 +55,6 @@ impl Tool for FileReadTool {
 
         let full_path = self.security.workspace_dir.join(path);
 
-        // Check file size before reading to prevent OOM on huge files (10 MB limit)
-        const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
-        match tokio::fs::metadata(&full_path).await {
-            Ok(meta) => {
-                if meta.len() > MAX_FILE_SIZE {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!(
-                            "File too large: {} bytes (limit: {MAX_FILE_SIZE} bytes)",
-                            meta.len()
-                        )),
-                    });
-                }
-            }
-            Err(_) => {
-                // File might not exist yet — let canonicalize handle it below
-            }
-        }
-
         // Resolve path before reading to block symlink escapes.
         let resolved_path = match tokio::fs::canonicalize(&full_path).await {
             Ok(p) => p,
@@ -96,6 +76,30 @@ impl Tool for FileReadTool {
                     resolved_path.display()
                 )),
             });
+        }
+
+        // Check file size AFTER canonicalization to prevent TOCTOU symlink bypass
+        const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+        match tokio::fs::metadata(&resolved_path).await {
+            Ok(meta) => {
+                if meta.len() > MAX_FILE_SIZE {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "File too large: {} bytes (limit: {MAX_FILE_SIZE} bytes)",
+                            meta.len()
+                        )),
+                    });
+                }
+            }
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to read file metadata: {e}")),
+                });
+            }
         }
 
         match tokio::fs::read_to_string(&resolved_path).await {
