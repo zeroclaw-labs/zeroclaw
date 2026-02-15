@@ -161,9 +161,11 @@ impl MessageProcessor {
         let circuit_breaker = self.circuit_breaker.clone();
         let timeout = self.config.processing_timeout;
 
+        // Clone message for use after the move
+        let message_for_priority = message.clone();
         let task = Task::new(async move {
             let start = Instant::now();
-            
+
             let result = match tokio::time::timeout(timeout, processor(message.clone())).await {
                 Ok(Ok(response)) => {
                     // 记录成功
@@ -197,7 +199,7 @@ impl MessageProcessor {
             // 发送响应
             let _ = response_tx.send((channel_name, message, result)).await;
         })
-        .with_priority(self.priority_from_channel(&message.channel))
+        .with_priority(self.priority_from_channel(&message_for_priority.channel))
         .with_timeout(timeout + Duration::from_secs(5));
 
         // 提交任务（不等待结果，通过 response_rx 接收）
@@ -426,7 +428,7 @@ impl ConcurrentMessageProcessor {
                         let prompt = prompt.clone();
                         async move {
                             provider
-                                .chat_with_system(Some(&prompt), &msg.content, "default", None)
+                                .chat_with_system(Some(&prompt), &msg.content, "default", 0.7)
                                 .await
                         }
                     })

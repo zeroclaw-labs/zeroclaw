@@ -56,50 +56,50 @@ impl SqliteConnectionManager {
     }
 }
 
-#[async_trait::async_trait]
 impl managed::Manager for SqliteConnectionManager {
     type Type = Connection;
     type Error = rusqlite::Error;
 
-    async fn create(&self) -> Result<Connection, rusqlite::Error> {
-        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_CREATE
-            | OpenFlags::SQLITE_OPEN_FULL_MUTEX;
+    fn create(&self) -> impl std::future::Future<Output = Result<Connection, rusqlite::Error>> + Send {
+        let db_path = self.db_path.clone();
+        let busy_timeout_ms = self.config.busy_timeout_ms;
+        let enable_wal = self.config.enable_wal;
+        let init_sql = self.init_sql.clone();
 
-        let conn = Connection::open_with_flags(&self.db_path, flags)?;
+        async move {
+            let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_FULL_MUTEX;
 
-        // Configure connection
-        conn.busy_timeout(std::time::Duration::from_millis(
-            self.config.busy_timeout_ms,
-        ))?;
+            let conn = Connection::open_with_flags(&db_path, flags)?;
 
-        if self.config.enable_wal {
-            conn.pragma_update(None, "journal_mode", "WAL")?;
-            conn.pragma_update(None, "synchronous", "NORMAL")?;
+            // Configure connection
+            conn.busy_timeout(std::time::Duration::from_millis(busy_timeout_ms))?;
+
+            if enable_wal {
+                conn.pragma_update(None, "journal_mode", "WAL")?;
+                conn.pragma_update(None, "synchronous", "NORMAL")?;
+            }
+
+            // Execute initialization SQL
+            for sql in init_sql.iter() {
+                conn.execute_batch(sql)?;
+            }
+
+            debug!("Created new SQLite connection for pool");
+            Ok(conn)
         }
-
-        // Execute initialization SQL
-        for sql in self.init_sql.iter() {
-            conn.execute_batch(sql)?;
-        }
-
-        debug!("Created new SQLite connection for pool");
-        Ok(conn)
     }
 
-    async fn recycle(&self, conn: &mut Connection, _: &Metrics) -> RecycleResult<rusqlite::Error> {
+    fn recycle(&self, conn: &mut Connection, _: &Metrics) -> impl std::future::Future<Output = RecycleResult<rusqlite::Error>> + Send {
         // Check if connection is still valid
         match conn.execute_batch("SELECT 1") {
-            Ok(()) => Ok(()),
+            Ok(()) => std::future::ready(Ok(())),
             Err(e) => {
                 warn!("Recycling invalid SQLite connection: {}", e);
-                Err(e.into())
+                std::future::ready(Err(e.into()))
             }
         }
-    }
-
-    fn detach(&self, _conn: &mut Connection) {
-        // No special cleanup needed for SQLite connections
     }
 }
 

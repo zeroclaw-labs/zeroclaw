@@ -361,22 +361,28 @@ impl WorkerPool {
     }
 
     /// 尝试提交任务（非阻塞）
-    pub fn try_submit<F, T>(&self, mut task: Task<F, T>) -> Result<oneshot::Receiver<TaskResult<Box<dyn std::any::Any + Send + Sync>>>, Task<F, T>>
+    pub fn try_submit<F, T>(&self, task: Task<F, T>) -> Result<oneshot::Receiver<TaskResult<Box<dyn std::any::Any + Send + Sync>>>, Task<F, T>>
     where
         F: Future<Output = T> + Send + 'static,
         T: Send + Sync + 'static,
     {
         let (tx, rx) = oneshot::channel();
         
-        let timeout = task.timeout.or(Some(self.config.default_timeout));
-        // Extract all fields from task to avoid partial move
+        // Store task fields separately to avoid partial move
         let task_id = task.id;
         let task_priority = task.priority;
+        let task_timeout = task.timeout;
         let task_created_at = task.created_at;
-        // Use Option::take pattern to extract the future
-        let task_future = std::mem::replace(&mut task.future, Box::pin(async move {
-            panic!("Placeholder future should never be executed")
-        }));
+        let timeout = task.timeout.or(Some(self.config.default_timeout));
+        
+        // Take ownership of the future via Option dance
+        let mut task_opt = Some(task);
+        let task_future = std::mem::replace(
+            &mut task_opt.as_mut().unwrap().future,
+            Box::pin(async move { unreachable!() })
+        );
+        // Now we can drop the task without dropping the future
+        drop(task_opt);
         
         let queued_task = QueuedTask {
             id: task_id,
@@ -394,8 +400,27 @@ impl WorkerPool {
 
         match self.tx.try_send(queued_task) {
             Ok(_) => Ok(rx),
-            Err(mpsc::error::TrySendError::Full(_)) => Err(task),
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(task),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // Return reconstructed task with placeholder future
+                Err(Task {
+                    id: task_id,
+                    priority: task_priority,
+                    future: Box::pin(async move { unreachable!() }),
+                    timeout: task_timeout,
+                    created_at: task_created_at,
+                    _phantom: std::marker::PhantomData,
+                })
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(Task {
+                    id: task_id,
+                    priority: task_priority,
+                    future: Box::pin(async move { unreachable!() }),
+                    timeout: task_timeout,
+                    created_at: task_created_at,
+                    _phantom: std::marker::PhantomData,
+                })
+            }
         }
     }
 
@@ -428,7 +453,7 @@ impl WorkerPool {
     /// 优雅关闭 Worker Pool
     pub async fn shutdown(mut self) {
         info!("Shutting down worker pool with {} workers", self.workers.len());
-        
+
         // 发送关闭信号
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
@@ -436,8 +461,10 @@ impl WorkerPool {
 
         // 等待所有工作线程完成
         let timeout = tokio::time::Duration::from_secs(30);
+        // Take workers out to avoid moving from type implementing Drop
+        let workers = std::mem::take(&mut self.workers);
         let shutdown_future = async {
-            for handle in self.workers {
+            for handle in workers {
                 let _ = handle.await;
             }
         };

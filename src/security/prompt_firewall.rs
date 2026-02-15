@@ -516,7 +516,7 @@ impl PromptFirewall {
         for word in input.split_whitespace() {
             if word.len() >= 20 && word.len() % 4 == 0 && base64_pattern.is_match(word) {
                 // Try to decode and check if it's an instruction
-                if let Ok(decoded) = base64_decode(word) {
+                if let Some(decoded) = base64_decode(word) {
                     if Self::is_suspicious_decoded_content(&decoded) {
                         threats.push((ThreatType::Obfuscation, 0.85));
                         break;

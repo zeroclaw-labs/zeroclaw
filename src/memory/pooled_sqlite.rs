@@ -3,7 +3,7 @@ use super::traits::{Memory, MemoryCategory, MemoryEntry};
 use super::vector;
 use async_trait::async_trait;
 use chrono::Local;
-use deadpool_sqlite::{Config, Pool, PoolConfig, Runtime};
+use deadpool_sqlite::{Config, Pool, Runtime};
 use rusqlite::{params, Connection};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -107,8 +107,8 @@ impl PooledSqliteMemory {
             .max(4) as usize;
 
         let pool = Config::new(db_path.to_str().unwrap())
+            .max_connections(max_connections)
             .create_pool(Runtime::Tokio1)?;
-        pool.resize(max_connections);
 
         // Test pool connectivity
         let _conn = pool.get().await?;
