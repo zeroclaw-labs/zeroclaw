@@ -1,5 +1,5 @@
-use crate::auth::AuthService;
 use crate::auth::openai_oauth::extract_account_id_from_jwt;
+use crate::auth::AuthService;
 use crate::providers::traits::Provider;
 use crate::providers::ProviderRuntimeOptions;
 use async_trait::async_trait;
@@ -9,7 +9,8 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 const CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
-const DEFAULT_CODEX_INSTRUCTIONS: &str = "You are ZeroClaw, a concise and helpful coding assistant.";
+const DEFAULT_CODEX_INSTRUCTIONS: &str =
+    "You are ZeroClaw, a concise and helpful coding assistant.";
 
 pub struct OpenAiCodexProvider {
     auth: AuthService,
@@ -140,13 +141,13 @@ fn clamp_reasoning_effort(model: &str, effort: &str) -> String {
     effort.to_string()
 }
 
-fn resolve_reasoning_effort(model: &str) -> String {
+fn resolve_reasoning_effort(model_id: &str) -> String {
     let raw = std::env::var("ZEROCLAW_CODEX_REASONING_EFFORT")
         .ok()
         .and_then(|value| first_nonempty(Some(&value)))
         .unwrap_or_else(|| "xhigh".to_string())
         .to_ascii_lowercase();
-    clamp_reasoning_effort(model, &raw)
+    clamp_reasoning_effort(model_id, &raw)
 }
 
 fn nonempty_preserve(text: Option<&str>) -> Option<String> {
@@ -363,9 +364,10 @@ impl Provider for OpenAiCodexProvider {
                     "OpenAI Codex account id not found in auth profile/token. Run `zeroclaw auth login --provider openai-codex` again."
                 )
             })?;
+        let normalized_model = normalize_model_id(model);
 
         let request = ResponsesRequest {
-            model: model.to_string(),
+            model: normalized_model.to_string(),
             input: vec![ResponsesInput {
                 role: "user".to_string(),
                 content: vec![ResponsesInputContent {
@@ -380,7 +382,7 @@ impl Provider for OpenAiCodexProvider {
                 verbosity: "medium".to_string(),
             },
             reasoning: ResponsesReasoningOptions {
-                effort: resolve_reasoning_effort(model),
+                effort: resolve_reasoning_effort(normalized_model),
                 summary: "auto".to_string(),
             },
             include: vec!["reasoning.encrypted_content".to_string()],

@@ -3,7 +3,9 @@ pub mod openai_oauth;
 pub mod profiles;
 
 use crate::auth::openai_oauth::refresh_access_token;
-use crate::auth::profiles::{profile_id, AuthProfile, AuthProfileKind, AuthProfilesData, AuthProfilesStore};
+use crate::auth::profiles::{
+    profile_id, AuthProfile, AuthProfileKind, AuthProfilesData, AuthProfilesStore,
+};
 use crate::config::Config;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -131,7 +133,12 @@ impl AuthService {
         &self,
         profile_override: Option<&str>,
     ) -> Result<Option<String>> {
-        let data = self.store.load()?;
+        let data = tokio::task::spawn_blocking({
+            let store = self.store.clone();
+            move || store.load()
+        })
+        .await
+        .map_err(|err| anyhow::anyhow!("Auth profile load task failed: {err}"))??;
         let Some(profile_id) = select_profile_id(&data, OPENAI_CODEX_PROVIDER, profile_override)
         else {
             return Ok(None);
@@ -157,7 +164,12 @@ impl AuthService {
         let _guard = refresh_lock.lock().await;
 
         // Re-load after waiting for lock to avoid duplicate refreshes.
-        let data = self.store.load()?;
+        let data = tokio::task::spawn_blocking({
+            let store = self.store.clone();
+            move || store.load()
+        })
+        .await
+        .map_err(|err| anyhow::anyhow!("Auth profile load task failed: {err}"))??;
         let Some(latest_profile) = data.profiles.get(&profile_id) else {
             return Ok(None);
         };
@@ -170,10 +182,7 @@ impl AuthService {
             return Ok(Some(latest_tokens.access_token.clone()));
         }
 
-        let refresh_token = latest_tokens
-            .refresh_token
-            .clone()
-            .unwrap_or(refresh_token);
+        let refresh_token = latest_tokens.refresh_token.clone().unwrap_or(refresh_token);
 
         if let Some(remaining) = refresh_backoff_remaining(&profile_id) {
             anyhow::bail!(
@@ -200,16 +209,25 @@ impl AuthService {
                 .clone_from(&latest_tokens.refresh_token);
         }
 
-        let refreshed_clone = refreshed.clone();
         let account_id = openai_oauth::extract_account_id_from_jwt(&refreshed.access_token)
             .or_else(|| latest_profile.account_id.clone());
 
-        let updated = self.store.update_profile(&profile_id, |profile| {
-            profile.kind = AuthProfileKind::OAuth;
-            profile.token_set = Some(refreshed_clone.clone());
-            profile.account_id.clone_from(&account_id);
-            Ok(())
-        })?;
+        let updated = tokio::task::spawn_blocking({
+            let store = self.store.clone();
+            let profile_id = profile_id.clone();
+            let refreshed = refreshed.clone();
+            let account_id = account_id.clone();
+            move || {
+                store.update_profile(&profile_id, |profile| {
+                    profile.kind = AuthProfileKind::OAuth;
+                    profile.token_set = Some(refreshed.clone());
+                    profile.account_id.clone_from(&account_id);
+                    Ok(())
+                })
+            }
+        })
+        .await
+        .map_err(|err| anyhow::anyhow!("Auth profile update task failed: {err}"))??;
 
         Ok(updated.token_set.map(|t| t.access_token))
     }

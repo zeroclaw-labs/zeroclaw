@@ -455,7 +455,7 @@ impl Default for PeripheralBoardConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewayConfig {
-    /// Gateway port (default: 8080)
+    /// Gateway port (default: 3000)
     #[serde(default = "default_gateway_port")]
     pub port: u16,
     /// Gateway host (default: 127.0.0.1)
