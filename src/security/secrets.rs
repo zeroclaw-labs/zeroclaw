@@ -237,16 +237,12 @@ fn xor_cipher(data: &[u8], key: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-/// Generate a random key using system entropy (UUID v4 + process ID + timestamp).
+/// Generate a random 256-bit key using the OS CSPRNG.
+///
+/// Uses `OsRng` (via `getrandom`) directly, providing full 256-bit entropy
+/// without the fixed version/variant bits that UUID v4 introduces.
 fn generate_random_key() -> Vec<u8> {
-    // Use two UUIDs (32 random bytes) as our key material
-    let u1 = uuid::Uuid::new_v4();
-    let u2 = uuid::Uuid::new_v4();
-    let mut key = Vec::with_capacity(KEY_LEN);
-    key.extend_from_slice(u1.as_bytes());
-    key.extend_from_slice(u2.as_bytes());
-    key.truncate(KEY_LEN);
-    key
+    ChaCha20Poly1305::generate_key(&mut OsRng).to_vec()
 }
 
 /// Hex-encode bytes to a lowercase hex string.
@@ -802,6 +798,39 @@ mod tests {
         let k1 = generate_random_key();
         let k2 = generate_random_key();
         assert_ne!(k1, k2, "Two random keys should differ");
+    }
+
+    #[test]
+    fn generate_random_key_has_no_uuid_fixed_bits() {
+        // UUID v4 has fixed bits at positions 6 (version = 0b0100xxxx) and
+        // 8 (variant = 0b10xxxxxx). A direct CSPRNG key should not consistently
+        // have these patterns across multiple samples.
+        let mut version_match = 0;
+        let mut variant_match = 0;
+        let samples = 100;
+        for _ in 0..samples {
+            let key = generate_random_key();
+            // In UUID v4, byte 6 always has top nibble = 0x4
+            if key[6] & 0xf0 == 0x40 {
+                version_match += 1;
+            }
+            // In UUID v4, byte 8 always has top 2 bits = 0b10
+            if key[8] & 0xc0 == 0x80 {
+                variant_match += 1;
+            }
+        }
+        // With true randomness, each pattern should appear ~1/16 and ~1/4 of
+        // the time. UUID would hit 100/100 on both. Allow generous margin.
+        assert!(
+            version_match < 30,
+            "byte[6] matched UUID v4 version nibble {version_match}/100 times — \
+             likely still using UUID-based key generation"
+        );
+        assert!(
+            variant_match < 50,
+            "byte[8] matched UUID v4 variant bits {variant_match}/100 times — \
+             likely still using UUID-based key generation"
+        );
     }
 
     #[cfg(unix)]
