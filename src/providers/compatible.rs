@@ -43,6 +43,28 @@ impl OpenAiCompatibleProvider {
                 .unwrap_or_else(|_| Client::new()),
         }
     }
+
+    /// Build the full URL for chat completions, detecting if base_url already includes the path.
+    /// This allows custom providers with non-standard endpoints (e.g., VolcEngine ARK uses
+    /// `/api/coding/v3/chat/completions` instead of `/v1/chat/completions`).
+    fn chat_completions_url(&self) -> String {
+        // If base_url already contains "chat/completions", use it as-is
+        if self.base_url.contains("chat/completions") {
+            self.base_url.clone()
+        } else {
+            format!("{}/chat/completions", self.base_url)
+        }
+    }
+
+    /// Build the full URL for responses API, detecting if base_url already includes the path.
+    fn responses_url(&self) -> String {
+        // If base_url already contains "responses", use it as-is
+        if self.base_url.contains("responses") {
+            self.base_url.clone()
+        } else {
+            format!("{}/v1/responses", self.base_url)
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -177,7 +199,7 @@ impl OpenAiCompatibleProvider {
             stream: Some(false),
         };
 
-        let url = format!("{}/v1/responses", self.base_url);
+        let url = self.responses_url();
 
         let response = self
             .apply_auth_header(self.client.post(&url).json(&request), api_key)
@@ -232,7 +254,7 @@ impl Provider for OpenAiCompatibleProvider {
             temperature,
         };
 
-        let url = format!("{}/v1/chat/completions", self.base_url);
+        let url = self.chat_completions_url();
 
         let response = self
             .apply_auth_header(self.client.post(&url).json(&request), api_key)
@@ -419,6 +441,133 @@ mod tests {
         assert_eq!(
             extract_responses_text(response).as_deref(),
             Some("Fallback text")
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // Custom endpoint path tests (Issue #114)
+    // ══════════════════════════════════════════════════════════
+
+    #[test]
+    fn chat_completions_url_standard_openai() {
+        // Standard OpenAI-compatible providers get /chat/completions appended
+        let p = make_provider("openai", "https://api.openai.com/v1", None);
+        assert_eq!(
+            p.chat_completions_url(),
+            "https://api.openai.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn chat_completions_url_trailing_slash() {
+        // Trailing slash is stripped, then /chat/completions appended
+        let p = make_provider("test", "https://api.example.com/v1/", None);
+        assert_eq!(
+            p.chat_completions_url(),
+            "https://api.example.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn chat_completions_url_volcengine_ark() {
+        // VolcEngine ARK uses custom path - should use as-is
+        let p = make_provider(
+            "volcengine",
+            "https://ark.cn-beijing.volces.com/api/coding/v3/chat/completions",
+            None,
+        );
+        assert_eq!(
+            p.chat_completions_url(),
+            "https://ark.cn-beijing.volces.com/api/coding/v3/chat/completions"
+        );
+    }
+
+    #[test]
+    fn chat_completions_url_custom_full_endpoint() {
+        // Custom provider with full endpoint path
+        let p = make_provider(
+            "custom",
+            "https://my-api.example.com/v2/llm/chat/completions",
+            None,
+        );
+        assert_eq!(
+            p.chat_completions_url(),
+            "https://my-api.example.com/v2/llm/chat/completions"
+        );
+    }
+
+    #[test]
+    fn responses_url_standard() {
+        // Standard providers get /v1/responses appended
+        let p = make_provider("test", "https://api.example.com", None);
+        assert_eq!(p.responses_url(), "https://api.example.com/v1/responses");
+    }
+
+    #[test]
+    fn responses_url_custom_full_endpoint() {
+        // Custom provider with full responses endpoint
+        let p = make_provider(
+            "custom",
+            "https://my-api.example.com/api/v2/responses",
+            None,
+        );
+        assert_eq!(
+            p.responses_url(),
+            "https://my-api.example.com/api/v2/responses"
+        );
+    }
+
+    #[test]
+    fn chat_completions_url_without_v1() {
+        // Provider configured without /v1 in base URL
+        let p = make_provider("test", "https://api.example.com", None);
+        assert_eq!(
+            p.chat_completions_url(),
+            "https://api.example.com/chat/completions"
+        );
+    }
+
+    #[test]
+    fn chat_completions_url_base_with_v1() {
+        // Provider configured with /v1 in base URL
+        let p = make_provider("test", "https://api.example.com/v1", None);
+        assert_eq!(
+            p.chat_completions_url(),
+            "https://api.example.com/v1/chat/completions"
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // Provider-specific endpoint tests (Issue #167)
+    // ══════════════════════════════════════════════════════════
+
+    #[test]
+    fn chat_completions_url_zai() {
+        // Z.AI uses /api/paas/v4 base path
+        let p = make_provider("zai", "https://api.z.ai/api/paas/v4", None);
+        assert_eq!(
+            p.chat_completions_url(),
+            "https://api.z.ai/api/paas/v4/chat/completions"
+        );
+    }
+
+    #[test]
+    fn chat_completions_url_glm() {
+        // GLM (BigModel) uses /api/paas/v4 base path
+        let p = make_provider("glm", "https://open.bigmodel.cn/api/paas/v4", None);
+        assert_eq!(
+            p.chat_completions_url(),
+            "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        );
+    }
+
+    #[test]
+    fn chat_completions_url_opencode() {
+        // OpenCode Zen uses /zen/v1 base path
+        let p = make_provider("opencode", "https://opencode.ai/zen/v1", None);
+        assert_eq!(
+            p.chat_completions_url(),
+            "https://opencode.ai/zen/v1/chat/completions"
         );
     }
 }

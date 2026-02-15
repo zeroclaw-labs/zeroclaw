@@ -40,7 +40,8 @@ pub async fn run(
     // ── Wire up agnostic subsystems ──────────────────────────────
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
-    let _runtime = runtime::create_runtime(&config.runtime)?;
+    let runtime: Arc<dyn runtime::RuntimeAdapter> =
+        Arc::from(runtime::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(
         &config.autonomy,
         &config.workspace_dir,
@@ -60,7 +61,13 @@ pub async fn run(
     } else {
         None
     };
-    let _tools = tools::all_tools(&security, mem.clone(), composio_key, &config.browser);
+    let _tools = tools::all_tools_with_runtime(
+        &security,
+        runtime,
+        mem.clone(),
+        composio_key,
+        &config.browser,
+    );
 
     // ── Resolve provider ─────────────────────────────────────────
     let provider_name = provider_override
@@ -73,10 +80,12 @@ pub async fn run(
         .or(config.default_model.as_deref())
         .unwrap_or("anthropic/claude-sonnet-4-20250514");
 
-    let provider: Box<dyn Provider> = providers::create_resilient_provider(
+    let provider: Box<dyn Provider> = providers::create_routed_provider(
         provider_name,
         config.api_key.as_deref(),
         &config.reliability,
+        &config.model_routes,
+        model_name,
     )?;
 
     observer.record_event(&ObserverEvent::AgentStart {
@@ -118,11 +127,18 @@ pub async fn run(
             "Open approved HTTPS URLs in Brave Browser (allowlist-only, no scraping)",
         ));
     }
+    if config.composio.enabled {
+        tool_descs.push((
+            "composio",
+            "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover, 'execute' to run, 'connect' to OAuth.",
+        ));
+    }
     let system_prompt = crate::channels::build_system_prompt(
         &config.workspace_dir,
         model_name,
         &tool_descs,
         &skills,
+        Some(&config.identity),
     );
 
     // ── Execute ──────────────────────────────────────────────────

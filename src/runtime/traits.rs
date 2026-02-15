@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Runtime adapter — abstracts platform differences so the same agent
 /// code runs on native, Docker, Cloudflare Workers, Raspberry Pi, etc.
@@ -22,4 +22,11 @@ pub trait RuntimeAdapter: Send + Sync {
     fn memory_budget(&self) -> u64 {
         0
     }
+
+    /// Build a shell command process for this runtime.
+    fn build_shell_command(
+        &self,
+        command: &str,
+        workspace_dir: &Path,
+    ) -> anyhow::Result<tokio::process::Command>;
 }

@@ -2,6 +2,7 @@ pub mod cli;
 pub mod discord;
 pub mod email_channel;
 pub mod imessage;
+pub mod irc;
 pub mod matrix;
 pub mod slack;
 pub mod telegram;
@@ -10,7 +11,9 @@ pub mod whatsapp;
 
 pub use cli::CliChannel;
 pub use discord::DiscordChannel;
+pub use email_channel::EmailChannel;
 pub use imessage::IMessageChannel;
+pub use irc::IrcChannel;
 pub use matrix::MatrixChannel;
 pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
@@ -18,18 +21,20 @@ pub use traits::Channel;
 pub use whatsapp::WhatsAppChannel;
 
 use crate::config::Config;
+use crate::identity;
 use crate::memory::{self, Memory};
 use crate::providers::{self, Provider};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Maximum characters per injected workspace file (matches `OpenClaw` default).
 const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 
 const DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS: u64 = 2;
 const DEFAULT_CHANNEL_MAX_BACKOFF_SECS: u64 = 60;
+const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 90;
 
 fn spawn_supervised_listener(
     ch: Arc<dyn Channel>,
@@ -54,6 +59,8 @@ fn spawn_supervised_listener(
                 Ok(()) => {
                     tracing::warn!("Channel {} exited unexpectedly; restarting", ch.name());
                     crate::health::mark_component_error(&component, "listener exited unexpectedly");
+                    // Clean exit — reset backoff since the listener ran successfully
+                    backoff = initial_backoff_secs.max(1);
                 }
                 Err(e) => {
                     tracing::error!("Channel {} error: {e}; restarting", ch.name());
@@ -63,14 +70,42 @@ fn spawn_supervised_listener(
 
             crate::health::bump_component_restart(&component);
             tokio::time::sleep(Duration::from_secs(backoff)).await;
+            // Double backoff AFTER sleeping so first error uses initial_backoff
             backoff = backoff.saturating_mul(2).min(max_backoff);
         }
     })
 }
 
+/// Load OpenClaw format bootstrap files into the prompt.
+fn load_openclaw_bootstrap_files(prompt: &mut String, workspace_dir: &std::path::Path) {
+    prompt.push_str("The following workspace files define your identity, behavior, and context.\n\n");
+
+    let bootstrap_files = [
+        "AGENTS.md",
+        "SOUL.md",
+        "TOOLS.md",
+        "IDENTITY.md",
+        "USER.md",
+        "HEARTBEAT.md",
+    ];
+
+    for filename in &bootstrap_files {
+        inject_workspace_file(prompt, workspace_dir, filename);
+    }
+
+    // BOOTSTRAP.md — only if it exists (first-run ritual)
+    let bootstrap_path = workspace_dir.join("BOOTSTRAP.md");
+    if bootstrap_path.exists() {
+        inject_workspace_file(prompt, workspace_dir, "BOOTSTRAP.md");
+    }
+
+    // MEMORY.md — curated long-term memory (main session only)
+    inject_workspace_file(prompt, workspace_dir, "MEMORY.md");
+}
+
 /// Load workspace identity files and build a system prompt.
 ///
-/// Follows the `OpenClaw` framework structure:
+/// Follows the `OpenClaw` framework structure by default:
 /// 1. Tooling — tool list + descriptions
 /// 2. Safety — guardrail reminder
 /// 3. Skills — compact list with paths (loaded on-demand)
@@ -79,6 +114,9 @@ fn spawn_supervised_listener(
 /// 6. Date & Time — timezone for cache stability
 /// 7. Runtime — host, OS, model
 ///
+/// When `identity_config` is set to AIEOS format, the bootstrap files section
+/// is replaced with the AIEOS identity data loaded from file or inline JSON.
+///
 /// Daily memory files (`memory/*.md`) are NOT injected — they are accessed
 /// on-demand via `memory_recall` / `memory_search` tools.
 pub fn build_system_prompt(
@@ -86,6 +124,7 @@ pub fn build_system_prompt(
     model_name: &str,
     tools: &[(&str, &str)],
     skills: &[crate::skills::Skill],
+    identity_config: Option<&crate::config::IdentityConfig>,
 ) -> String {
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
@@ -146,30 +185,40 @@ pub fn build_system_prompt(
 
     // ── 5. Bootstrap files (injected into context) ──────────────
     prompt.push_str("## Project Context\n\n");
-    prompt
-        .push_str("The following workspace files define your identity, behavior, and context.\n\n");
 
-    let bootstrap_files = [
-        "AGENTS.md",
-        "SOUL.md",
-        "TOOLS.md",
-        "IDENTITY.md",
-        "USER.md",
-        "HEARTBEAT.md",
-    ];
-
-    for filename in &bootstrap_files {
-        inject_workspace_file(&mut prompt, workspace_dir, filename);
+    // Check if AIEOS identity is configured
+    if let Some(config) = identity_config {
+        if identity::is_aieos_configured(config) {
+            // Load AIEOS identity
+            match identity::load_aieos_identity(config, workspace_dir) {
+                Ok(Some(aieos_identity)) => {
+                    let aieos_prompt = identity::aieos_to_system_prompt(&aieos_identity);
+                    if !aieos_prompt.is_empty() {
+                        prompt.push_str(&aieos_prompt);
+                        prompt.push_str("\n\n");
+                    }
+                }
+                Ok(None) => {
+                    // No AIEOS identity loaded (shouldn't happen if is_aieos_configured returned true)
+                    // Fall back to OpenClaw bootstrap files
+                    load_openclaw_bootstrap_files(&mut prompt, workspace_dir);
+                }
+                Err(e) => {
+                    // Log error but don't fail - fall back to OpenClaw
+                    eprintln!(
+                        "Warning: Failed to load AIEOS identity: {e}. Using OpenClaw format."
+                    );
+                    load_openclaw_bootstrap_files(&mut prompt, workspace_dir);
+                }
+            }
+        } else {
+            // OpenClaw format
+            load_openclaw_bootstrap_files(&mut prompt, workspace_dir);
+        }
+    } else {
+        // No identity config - use OpenClaw format
+        load_openclaw_bootstrap_files(&mut prompt, workspace_dir);
     }
-
-    // BOOTSTRAP.md — only if it exists (first-run ritual)
-    let bootstrap_path = workspace_dir.join("BOOTSTRAP.md");
-    if bootstrap_path.exists() {
-        inject_workspace_file(&mut prompt, workspace_dir, "BOOTSTRAP.md");
-    }
-
-    // MEMORY.md — curated long-term memory (main session only)
-    inject_workspace_file(&mut prompt, workspace_dir, "MEMORY.md");
 
     // ── 6. Date & Time ──────────────────────────────────────────
     let now = chrono::Local::now();
@@ -204,8 +253,18 @@ fn inject_workspace_file(prompt: &mut String, workspace_dir: &std::path::Path, f
                 return;
             }
             let _ = writeln!(prompt, "### {filename}\n");
-            if trimmed.len() > BOOTSTRAP_MAX_CHARS {
-                prompt.push_str(&trimmed[..BOOTSTRAP_MAX_CHARS]);
+            // Use character-boundary-safe truncation for UTF-8
+            let truncated = if trimmed.chars().count() > BOOTSTRAP_MAX_CHARS {
+                trimmed
+                    .char_indices()
+                    .nth(BOOTSTRAP_MAX_CHARS)
+                    .map(|(idx, _)| &trimmed[..idx])
+                    .unwrap_or(trimmed)
+            } else {
+                trimmed
+            };
+            if truncated.len() < trimmed.len() {
+                prompt.push_str(truncated);
                 let _ = writeln!(
                     prompt,
                     "\n\n[... truncated at {BOOTSTRAP_MAX_CHARS} chars — use `read` for full file]\n"
@@ -241,6 +300,8 @@ pub fn handle_command(command: crate::ChannelCommands, config: &Config) -> Resul
                 ("iMessage", config.channels_config.imessage.is_some()),
                 ("Matrix", config.channels_config.matrix.is_some()),
                 ("WhatsApp", config.channels_config.whatsapp.is_some()),
+                ("Email", config.channels_config.email.is_some()),
+                ("IRC", config.channels_config.irc.is_some()),
             ] {
                 println!("  {} {name}", if configured { "✅" } else { "❌" });
             }
@@ -343,6 +404,28 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 wa.phone_number_id.clone(),
                 wa.verify_token.clone(),
                 wa.allowed_numbers.clone(),
+            )),
+        ));
+    }
+
+    if let Some(ref email_cfg) = config.channels_config.email {
+        channels.push(("Email", Arc::new(EmailChannel::new(email_cfg.clone()))));
+    }
+
+    if let Some(ref irc) = config.channels_config.irc {
+        channels.push((
+            "IRC",
+            Arc::new(IrcChannel::new(
+                irc.server.clone(),
+                irc.port,
+                irc.nickname.clone(),
+                irc.username.clone(),
+                irc.channels.clone(),
+                irc.allowed_users.clone(),
+                irc.server_password.clone(),
+                irc.nickserv_password.clone(),
+                irc.sasl_password.clone(),
+                irc.verify_tls.unwrap_or(true),
             )),
         ));
     }
@@ -453,7 +536,13 @@ pub async fn start_channels(config: Config) -> Result<()> {
         ));
     }
 
-    let system_prompt = build_system_prompt(&workspace, &model, &tool_descs, &skills);
+    let system_prompt = build_system_prompt(
+        &workspace,
+        &model,
+        &tool_descs,
+        &skills,
+        Some(&config.identity),
+    );
 
     if !skills.is_empty() {
         println!(
@@ -511,6 +600,25 @@ pub async fn start_channels(config: Config) -> Result<()> {
             wa.phone_number_id.clone(),
             wa.verify_token.clone(),
             wa.allowed_numbers.clone(),
+        )));
+    }
+
+    if let Some(ref email_cfg) = config.channels_config.email {
+        channels.push(Arc::new(EmailChannel::new(email_cfg.clone())));
+    }
+
+    if let Some(ref irc) = config.channels_config.irc {
+        channels.push(Arc::new(IrcChannel::new(
+            irc.server.clone(),
+            irc.port,
+            irc.nickname.clone(),
+            irc.username.clone(),
+            irc.channels.clone(),
+            irc.allowed_users.clone(),
+            irc.server_password.clone(),
+            irc.nickserv_password.clone(),
+            irc.sasl_password.clone(),
+            irc.verify_tls.unwrap_or(true),
         )));
     }
 
@@ -585,13 +693,20 @@ pub async fn start_channels(config: Config) -> Result<()> {
         }
 
         // Call the LLM with system prompt (identity + soul + tools)
-        match provider
-            .chat_with_system(Some(&system_prompt), &msg.content, &model, temperature)
-            .await
-        {
-            Ok(response) => {
+        println!("  ⏳ Processing message...");
+        let started_at = Instant::now();
+
+        let llm_result = tokio::time::timeout(
+            Duration::from_secs(CHANNEL_MESSAGE_TIMEOUT_SECS),
+            provider.chat_with_system(Some(&system_prompt), &msg.content, &model, temperature),
+        )
+        .await;
+
+        match llm_result {
+            Ok(Ok(response)) => {
                 println!(
-                    "  🤖 Reply: {}",
+                    "  🤖 Reply ({}ms): {}",
+                    started_at.elapsed().as_millis(),
                     truncate_with_ellipsis(&response, 80)
                 );
                 // Find the channel that sent this message and reply
@@ -604,11 +719,36 @@ pub async fn start_channels(config: Config) -> Result<()> {
                     }
                 }
             }
-            Err(e) => {
-                eprintln!("  ❌ LLM error: {e}");
+            Ok(Err(e)) => {
+                eprintln!(
+                    "  ❌ LLM error after {}ms: {e}",
+                    started_at.elapsed().as_millis()
+                );
                 for ch in &channels {
                     if ch.name() == msg.channel {
                         let _ = ch.send(&format!("⚠️ Error: {e}"), &msg.sender).await;
+                        break;
+                    }
+                }
+            }
+            Err(_) => {
+                let timeout_msg = format!(
+                    "LLM response timed out after {}s",
+                    CHANNEL_MESSAGE_TIMEOUT_SECS
+                );
+                eprintln!(
+                    "  ❌ {} (elapsed: {}ms)",
+                    timeout_msg,
+                    started_at.elapsed().as_millis()
+                );
+                for ch in &channels {
+                    if ch.name() == msg.channel {
+                        let _ = ch
+                            .send(
+                                "⚠️ Request timed out while waiting for the model. Please try again.",
+                                &msg.sender,
+                            )
+                            .await;
                         break;
                     }
                 }
@@ -656,7 +796,7 @@ mod tests {
     fn prompt_contains_all_sections() {
         let ws = make_workspace();
         let tools = vec![("shell", "Run commands"), ("file_read", "Read files")];
-        let prompt = build_system_prompt(ws.path(), "test-model", &tools, &[]);
+        let prompt = build_system_prompt(ws.path(), "test-model", &tools, &[], None);
 
         // Section headers
         assert!(prompt.contains("## Tools"), "missing Tools section");
@@ -680,7 +820,7 @@ mod tests {
             ("shell", "Run commands"),
             ("memory_recall", "Search memory"),
         ];
-        let prompt = build_system_prompt(ws.path(), "gpt-4o", &tools, &[]);
+        let prompt = build_system_prompt(ws.path(), "gpt-4o", &tools, &[], None);
 
         assert!(prompt.contains("**shell**"));
         assert!(prompt.contains("Run commands"));
@@ -690,7 +830,7 @@ mod tests {
     #[test]
     fn prompt_injects_safety() {
         let ws = make_workspace();
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[]);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None);
 
         assert!(prompt.contains("Do not exfiltrate private data"));
         assert!(prompt.contains("Do not run destructive commands"));
@@ -700,7 +840,7 @@ mod tests {
     #[test]
     fn prompt_injects_workspace_files() {
         let ws = make_workspace();
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[]);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None);
 
         assert!(prompt.contains("### SOUL.md"), "missing SOUL.md header");
         assert!(prompt.contains("Be helpful"), "missing SOUL content");
@@ -721,7 +861,7 @@ mod tests {
     fn prompt_missing_file_markers() {
         let tmp = TempDir::new().unwrap();
         // Empty workspace — no files at all
-        let prompt = build_system_prompt(tmp.path(), "model", &[], &[]);
+        let prompt = build_system_prompt(tmp.path(), "model", &[], &[], None);
 
         assert!(prompt.contains("[File not found: SOUL.md]"));
         assert!(prompt.contains("[File not found: AGENTS.md]"));
@@ -732,7 +872,7 @@ mod tests {
     fn prompt_bootstrap_only_if_exists() {
         let ws = make_workspace();
         // No BOOTSTRAP.md — should not appear
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[]);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None);
         assert!(
             !prompt.contains("### BOOTSTRAP.md"),
             "BOOTSTRAP.md should not appear when missing"
@@ -740,7 +880,7 @@ mod tests {
 
         // Create BOOTSTRAP.md — should appear
         std::fs::write(ws.path().join("BOOTSTRAP.md"), "# Bootstrap\nFirst run.").unwrap();
-        let prompt2 = build_system_prompt(ws.path(), "model", &[], &[]);
+        let prompt2 = build_system_prompt(ws.path(), "model", &[], &[], None);
         assert!(
             prompt2.contains("### BOOTSTRAP.md"),
             "BOOTSTRAP.md should appear when present"
@@ -760,7 +900,7 @@ mod tests {
         )
         .unwrap();
 
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[]);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None);
 
         // Daily notes should NOT be in the system prompt (on-demand via tools)
         assert!(
@@ -776,7 +916,7 @@ mod tests {
     #[test]
     fn prompt_runtime_metadata() {
         let ws = make_workspace();
-        let prompt = build_system_prompt(ws.path(), "claude-sonnet-4", &[], &[]);
+        let prompt = build_system_prompt(ws.path(), "claude-sonnet-4", &[], &[], None);
 
         assert!(prompt.contains("Model: claude-sonnet-4"));
         assert!(prompt.contains(&format!("OS: {}", std::env::consts::OS)));
@@ -797,7 +937,7 @@ mod tests {
             location: None,
         }];
 
-        let prompt = build_system_prompt(ws.path(), "model", &[], &skills);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &skills, None);
 
         assert!(prompt.contains("<available_skills>"), "missing skills XML");
         assert!(prompt.contains("<name>code-review</name>"));
@@ -818,7 +958,7 @@ mod tests {
         let big_content = "x".repeat(BOOTSTRAP_MAX_CHARS + 1000);
         std::fs::write(ws.path().join("AGENTS.md"), &big_content).unwrap();
 
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[]);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None);
 
         assert!(
             prompt.contains("truncated at"),
@@ -835,7 +975,7 @@ mod tests {
         let ws = make_workspace();
         std::fs::write(ws.path().join("TOOLS.md"), "").unwrap();
 
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[]);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None);
 
         // Empty file should not produce a header
         assert!(
@@ -847,9 +987,157 @@ mod tests {
     #[test]
     fn prompt_workspace_path() {
         let ws = make_workspace();
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[]);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None);
 
         assert!(prompt.contains(&format!("Working directory: `{}`", ws.path().display())));
+    }
+
+    // ── AIEOS Identity Tests (Issue #168) ─────────────────────────
+
+    #[test]
+    fn aieos_identity_from_file() {
+        use crate::config::IdentityConfig;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let identity_path = tmp.path().join("aieos_identity.json");
+
+        // Write AIEOS identity file
+        let aieos_json = r#"{
+            "identity": {
+                "names": {"first": "Nova", "nickname": "Nov"},
+                "bio": "A helpful AI assistant.",
+                "origin": "Silicon Valley"
+            },
+            "psychology": {
+                "mbti": "INTJ",
+                "moral_compass": ["Be helpful", "Do no harm"]
+            },
+            "linguistics": {
+                "style": "concise",
+                "formality": "casual"
+            }
+        }"#;
+        std::fs::write(&identity_path, aieos_json).unwrap();
+
+        // Create identity config pointing to the file
+        let config = IdentityConfig {
+            format: "aieos".into(),
+            aieos_path: Some("aieos_identity.json".into()),
+            aieos_inline: None,
+        };
+
+        let prompt = build_system_prompt(tmp.path(), "model", &[], &[], Some(&config));
+
+        // Should contain AIEOS sections
+        assert!(prompt.contains("## Identity"));
+        assert!(prompt.contains("**Name:** Nova"));
+        assert!(prompt.contains("**Nickname:** Nov"));
+        assert!(prompt.contains("**Bio:** A helpful AI assistant."));
+        assert!(prompt.contains("**Origin:** Silicon Valley"));
+
+        assert!(prompt.contains("## Personality"));
+        assert!(prompt.contains("**MBTI:** INTJ"));
+        assert!(prompt.contains("**Moral Compass:**"));
+        assert!(prompt.contains("- Be helpful"));
+
+        assert!(prompt.contains("## Communication Style"));
+        assert!(prompt.contains("**Style:** concise"));
+        assert!(prompt.contains("**Formality Level:** casual"));
+
+        // Should NOT contain OpenClaw bootstrap file headers
+        assert!(!prompt.contains("### SOUL.md"));
+        assert!(!prompt.contains("### IDENTITY.md"));
+        assert!(!prompt.contains("[File not found"));
+    }
+
+    #[test]
+    fn aieos_identity_from_inline() {
+        use crate::config::IdentityConfig;
+
+        let config = IdentityConfig {
+            format: "aieos".into(),
+            aieos_path: None,
+            aieos_inline: Some(r#"{"identity":{"names":{"first":"Claw"}}}"#.into()),
+        };
+
+        let prompt = build_system_prompt(
+            std::env::temp_dir().as_path(),
+            "model",
+            &[],
+            &[],
+            Some(&config),
+        );
+
+        assert!(prompt.contains("**Name:** Claw"));
+        assert!(prompt.contains("## Identity"));
+    }
+
+    #[test]
+    fn aieos_fallback_to_openclaw_on_parse_error() {
+        use crate::config::IdentityConfig;
+
+        let config = IdentityConfig {
+            format: "aieos".into(),
+            aieos_path: Some("nonexistent.json".into()),
+            aieos_inline: None,
+        };
+
+        let ws = make_workspace();
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], Some(&config));
+
+        // Should fall back to OpenClaw format when AIEOS file is not found
+        // (Error is logged to stderr with filename, not included in prompt)
+        assert!(prompt.contains("### SOUL.md"));
+    }
+
+    #[test]
+    fn aieos_empty_uses_openclaw() {
+        use crate::config::IdentityConfig;
+
+        // Format is "aieos" but neither path nor inline is set
+        let config = IdentityConfig {
+            format: "aieos".into(),
+            aieos_path: None,
+            aieos_inline: None,
+        };
+
+        let ws = make_workspace();
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], Some(&config));
+
+        // Should use OpenClaw format (not configured for AIEOS)
+        assert!(prompt.contains("### SOUL.md"));
+        assert!(prompt.contains("Be helpful"));
+    }
+
+    #[test]
+    fn openclaw_format_uses_bootstrap_files() {
+        use crate::config::IdentityConfig;
+
+        let config = IdentityConfig {
+            format: "openclaw".into(),
+            aieos_path: Some("identity.json".into()),
+            aieos_inline: None,
+        };
+
+        let ws = make_workspace();
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], Some(&config));
+
+        // Should use OpenClaw format even if aieos_path is set
+        assert!(prompt.contains("### SOUL.md"));
+        assert!(prompt.contains("Be helpful"));
+        assert!(!prompt.contains("## Identity"));
+    }
+
+    #[test]
+    fn none_identity_config_uses_openclaw() {
+        let ws = make_workspace();
+        // Pass None for identity config
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None);
+
+        // Should use OpenClaw format
+        assert!(prompt.contains("### SOUL.md"));
+        assert!(prompt.contains("Be helpful"));
     }
 
     #[test]

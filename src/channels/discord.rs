@@ -87,12 +87,22 @@ impl Channel for DiscordChannel {
         let url = format!("https://discord.com/api/v10/channels/{channel_id}/messages");
         let body = json!({ "content": message });
 
-        self.client
+        let resp = self
+            .client
             .post(&url)
             .header("Authorization", format!("Bot {}", self.bot_token))
             .json(&body)
             .send()
             .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+            anyhow::bail!("Discord send message failed ({status}): {err}");
+        }
 
         Ok(())
     }
@@ -148,7 +158,12 @@ impl Channel for DiscordChannel {
 
         tracing::info!("Discord: connected and identified");
 
-        // Spawn heartbeat task
+        // Track the last sequence number for heartbeats and resume.
+        // Only accessed in the select! loop below, so a plain i64 suffices.
+        let mut sequence: i64 = -1;
+
+        // Spawn heartbeat timer — sends a tick signal, actual heartbeat
+        // is assembled in the select! loop where `sequence` lives.
         let (hb_tx, mut hb_rx) = tokio::sync::mpsc::channel::<()>(1);
         let hb_interval = heartbeat_interval;
         tokio::spawn(async move {
@@ -166,7 +181,8 @@ impl Channel for DiscordChannel {
         loop {
             tokio::select! {
                 _ = hb_rx.recv() => {
-                    let hb = json!({"op": 1, "d": null});
+                    let d = if sequence >= 0 { json!(sequence) } else { json!(null) };
+                    let hb = json!({"op": 1, "d": d});
                     if write.send(Message::Text(hb.to_string())).await.is_err() {
                         break;
                     }
@@ -182,6 +198,36 @@ impl Channel for DiscordChannel {
                         Ok(e) => e,
                         Err(_) => continue,
                     };
+
+                    // Track sequence number from all dispatch events
+                    if let Some(s) = event.get("s").and_then(serde_json::Value::as_i64) {
+                        sequence = s;
+                    }
+
+                    let op = event.get("op").and_then(serde_json::Value::as_u64).unwrap_or(0);
+
+                    match op {
+                        // Op 1: Server requests an immediate heartbeat
+                        1 => {
+                            let d = if sequence >= 0 { json!(sequence) } else { json!(null) };
+                            let hb = json!({"op": 1, "d": d});
+                            if write.send(Message::Text(hb.to_string())).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        // Op 7: Reconnect
+                        7 => {
+                            tracing::warn!("Discord: received Reconnect (op 7), closing for restart");
+                            break;
+                        }
+                        // Op 9: Invalid Session
+                        9 => {
+                            tracing::warn!("Discord: received Invalid Session (op 9), closing for restart");
+                            break;
+                        }
+                        _ => {}
+                    }
 
                     // Only handle MESSAGE_CREATE (opcode 0, type "MESSAGE_CREATE")
                     let event_type = event.get("t").and_then(|t| t.as_str()).unwrap_or("");

@@ -4,7 +4,8 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 pub struct AnthropicProvider {
-    api_key: Option<String>,
+    credential: Option<String>,
+    base_url: String,
     client: Client,
 }
 
@@ -36,14 +37,30 @@ struct ContentBlock {
 
 impl AnthropicProvider {
     pub fn new(api_key: Option<&str>) -> Self {
+        Self::with_base_url(api_key, None)
+    }
+
+    pub fn with_base_url(api_key: Option<&str>, base_url: Option<&str>) -> Self {
+        let base_url = base_url
+            .map(|u| u.trim_end_matches('/'))
+            .unwrap_or("https://api.anthropic.com")
+            .to_string();
         Self {
-            api_key: api_key.map(ToString::to_string),
+            credential: api_key
+                .map(str::trim)
+                .filter(|k| !k.is_empty())
+                .map(ToString::to_string),
+            base_url,
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
         }
+    }
+
+    fn is_setup_token(token: &str) -> bool {
+        token.starts_with("sk-ant-oat01-")
     }
 }
 
@@ -56,8 +73,10 @@ impl Provider for AnthropicProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let api_key = self.api_key.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("Anthropic API key not set. Set ANTHROPIC_API_KEY or edit config.toml.")
+        let credential = self.credential.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token)."
+            )
         })?;
 
         let request = ChatRequest {
@@ -71,15 +90,20 @@ impl Provider for AnthropicProvider {
             temperature,
         };
 
-        let response = self
+        let mut request = self
             .client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", api_key)
+            .post(format!("{}/v1/messages", self.base_url))
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
-            .json(&request)
-            .send()
-            .await?;
+            .json(&request);
+
+        if Self::is_setup_token(credential) {
+            request = request.header("Authorization", format!("Bearer {credential}"));
+        } else {
+            request = request.header("x-api-key", credential);
+        }
+
+        let response = request.send().await?;
 
         if !response.status().is_success() {
             return Err(super::api_error("Anthropic", response).await);
@@ -103,21 +127,49 @@ mod tests {
     #[test]
     fn creates_with_key() {
         let p = AnthropicProvider::new(Some("sk-ant-test123"));
-        assert!(p.api_key.is_some());
-        assert_eq!(p.api_key.as_deref(), Some("sk-ant-test123"));
+        assert!(p.credential.is_some());
+        assert_eq!(p.credential.as_deref(), Some("sk-ant-test123"));
+        assert_eq!(p.base_url, "https://api.anthropic.com");
     }
 
     #[test]
     fn creates_without_key() {
         let p = AnthropicProvider::new(None);
-        assert!(p.api_key.is_none());
+        assert!(p.credential.is_none());
+        assert_eq!(p.base_url, "https://api.anthropic.com");
     }
 
     #[test]
     fn creates_with_empty_key() {
         let p = AnthropicProvider::new(Some(""));
-        assert!(p.api_key.is_some());
-        assert_eq!(p.api_key.as_deref(), Some(""));
+        assert!(p.credential.is_none());
+    }
+
+    #[test]
+    fn creates_with_whitespace_key() {
+        let p = AnthropicProvider::new(Some("  sk-ant-test123  "));
+        assert!(p.credential.is_some());
+        assert_eq!(p.credential.as_deref(), Some("sk-ant-test123"));
+    }
+
+    #[test]
+    fn creates_with_custom_base_url() {
+        let p =
+            AnthropicProvider::with_base_url(Some("sk-ant-test"), Some("https://api.example.com"));
+        assert_eq!(p.base_url, "https://api.example.com");
+        assert_eq!(p.credential.as_deref(), Some("sk-ant-test"));
+    }
+
+    #[test]
+    fn custom_base_url_trims_trailing_slash() {
+        let p = AnthropicProvider::with_base_url(None, Some("https://api.example.com/"));
+        assert_eq!(p.base_url, "https://api.example.com");
+    }
+
+    #[test]
+    fn default_base_url_when_none_provided() {
+        let p = AnthropicProvider::with_base_url(None, None);
+        assert_eq!(p.base_url, "https://api.anthropic.com");
     }
 
     #[tokio::test]
@@ -129,9 +181,15 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("API key not set"),
+            err.contains("credentials not set"),
             "Expected key error, got: {err}"
         );
+    }
+
+    #[test]
+    fn setup_token_detection_works() {
+        assert!(AnthropicProvider::is_setup_token("sk-ant-oat01-abcdef"));
+        assert!(!AnthropicProvider::is_setup_token("sk-ant-api-key"));
     }
 
     #[tokio::test]

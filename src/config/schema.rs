@@ -2,14 +2,19 @@ use crate::security::AutonomyLevel;
 use anyhow::{Context, Result};
 use directories::UserDirs;
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::path::PathBuf;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 // ── Top-level config ──────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// Workspace directory - computed from home, not serialized
+    #[serde(skip)]
     pub workspace_dir: PathBuf,
+    /// Path to config.toml - computed from home, not serialized
+    #[serde(skip)]
     pub config_path: PathBuf,
     pub api_key: Option<String>,
     pub default_provider: Option<String>,
@@ -27,6 +32,10 @@ pub struct Config {
 
     #[serde(default)]
     pub reliability: ReliabilityConfig,
+
+    /// Model routing rules — route `hint:<name>` to specific provider+model combos.
+    #[serde(default)]
+    pub model_routes: Vec<ModelRouteConfig>,
 
     #[serde(default)]
     pub heartbeat: HeartbeatConfig,
@@ -104,6 +113,18 @@ pub struct GatewayConfig {
     /// Paired bearer tokens (managed automatically, not user-edited)
     #[serde(default)]
     pub paired_tokens: Vec<String>,
+
+    /// Max `/pair` requests per minute per client key.
+    #[serde(default = "default_pair_rate_limit")]
+    pub pair_rate_limit_per_minute: u32,
+
+    /// Max `/webhook` requests per minute per client key.
+    #[serde(default = "default_webhook_rate_limit")]
+    pub webhook_rate_limit_per_minute: u32,
+
+    /// TTL for webhook idempotency keys.
+    #[serde(default = "default_idempotency_ttl_secs")]
+    pub idempotency_ttl_secs: u64,
 }
 
 fn default_gateway_port() -> u16 {
@@ -112,6 +133,18 @@ fn default_gateway_port() -> u16 {
 
 fn default_gateway_host() -> String {
     "127.0.0.1".into()
+}
+
+fn default_pair_rate_limit() -> u32 {
+    10
+}
+
+fn default_webhook_rate_limit() -> u32 {
+    60
+}
+
+fn default_idempotency_ttl_secs() -> u64 {
+    300
 }
 
 fn default_true() -> bool {
@@ -126,6 +159,9 @@ impl Default for GatewayConfig {
             require_pairing: true,
             allow_public_bind: false,
             paired_tokens: Vec::new(),
+            pair_rate_limit_per_minute: default_pair_rate_limit(),
+            webhook_rate_limit_per_minute: default_webhook_rate_limit(),
+            idempotency_ttl_secs: default_idempotency_ttl_secs(),
         }
     }
 }
@@ -312,6 +348,14 @@ pub struct AutonomyConfig {
     pub forbidden_paths: Vec<String>,
     pub max_actions_per_hour: u32,
     pub max_cost_per_day_cents: u32,
+
+    /// Require explicit approval for medium-risk shell commands.
+    #[serde(default = "default_true")]
+    pub require_approval_for_medium_risk: bool,
+
+    /// Block high-risk shell commands even if allowlisted.
+    #[serde(default = "default_true")]
+    pub block_high_risk_commands: bool,
 }
 
 impl Default for AutonomyConfig {
@@ -355,6 +399,8 @@ impl Default for AutonomyConfig {
             ],
             max_actions_per_hour: 20,
             max_cost_per_day_cents: 500,
+            require_approval_for_medium_risk: true,
+            block_high_risk_commands: true,
         }
     }
 }
@@ -363,16 +409,85 @@ impl Default for AutonomyConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeConfig {
-    /// Runtime kind (currently supported: "native").
-    ///
-    /// Reserved values (not implemented yet): "docker", "cloudflare".
+    /// Runtime kind (`native` | `docker`).
+    #[serde(default = "default_runtime_kind")]
     pub kind: String,
+
+    /// Docker runtime settings (used when `kind = "docker"`).
+    #[serde(default)]
+    pub docker: DockerRuntimeConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DockerRuntimeConfig {
+    /// Runtime image used to execute shell commands.
+    #[serde(default = "default_docker_image")]
+    pub image: String,
+
+    /// Docker network mode (`none`, `bridge`, etc.).
+    #[serde(default = "default_docker_network")]
+    pub network: String,
+
+    /// Optional memory limit in MB (`None` = no explicit limit).
+    #[serde(default = "default_docker_memory_limit_mb")]
+    pub memory_limit_mb: Option<u64>,
+
+    /// Optional CPU limit (`None` = no explicit limit).
+    #[serde(default = "default_docker_cpu_limit")]
+    pub cpu_limit: Option<f64>,
+
+    /// Mount root filesystem as read-only.
+    #[serde(default = "default_true")]
+    pub read_only_rootfs: bool,
+
+    /// Mount configured workspace into `/workspace`.
+    #[serde(default = "default_true")]
+    pub mount_workspace: bool,
+
+    /// Optional workspace root allowlist for Docker mount validation.
+    #[serde(default)]
+    pub allowed_workspace_roots: Vec<String>,
+}
+
+fn default_runtime_kind() -> String {
+    "native".into()
+}
+
+fn default_docker_image() -> String {
+    "alpine:3.20".into()
+}
+
+fn default_docker_network() -> String {
+    "none".into()
+}
+
+fn default_docker_memory_limit_mb() -> Option<u64> {
+    Some(512)
+}
+
+fn default_docker_cpu_limit() -> Option<f64> {
+    Some(1.0)
+}
+
+impl Default for DockerRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            image: default_docker_image(),
+            network: default_docker_network(),
+            memory_limit_mb: default_docker_memory_limit_mb(),
+            cpu_limit: default_docker_cpu_limit(),
+            read_only_rootfs: true,
+            mount_workspace: true,
+            allowed_workspace_roots: Vec::new(),
+        }
+    }
 }
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
-            kind: "native".into(),
+            kind: default_runtime_kind(),
+            docker: DockerRuntimeConfig::default(),
         }
     }
 }
@@ -440,6 +555,36 @@ impl Default for ReliabilityConfig {
             scheduler_retries: default_scheduler_retries(),
         }
     }
+}
+
+// ── Model routing ────────────────────────────────────────────────
+
+/// Route a task hint to a specific provider + model.
+///
+/// ```toml
+/// [[model_routes]]
+/// hint = "reasoning"
+/// provider = "openrouter"
+/// model = "anthropic/claude-opus-4-20250514"
+///
+/// [[model_routes]]
+/// hint = "fast"
+/// provider = "groq"
+/// model = "llama-3.3-70b-versatile"
+/// ```
+///
+/// Usage: pass `hint:reasoning` as the model parameter to route the request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelRouteConfig {
+    /// Task hint name (e.g. "reasoning", "fast", "code", "summarize")
+    pub hint: String,
+    /// Provider to route to (must match a known provider name)
+    pub provider: String,
+    /// Model to use with that provider
+    pub model: String,
+    /// Optional API key override for this route's provider
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 // ── Heartbeat ────────────────────────────────────────────────────
@@ -537,6 +682,8 @@ pub struct ChannelsConfig {
     pub imessage: Option<IMessageConfig>,
     pub matrix: Option<MatrixConfig>,
     pub whatsapp: Option<WhatsAppConfig>,
+    pub email: Option<crate::channels::email_channel::EmailConfig>,
+    pub irc: Option<IrcConfig>,
 }
 
 impl Default for ChannelsConfig {
@@ -550,6 +697,8 @@ impl Default for ChannelsConfig {
             imessage: None,
             matrix: None,
             whatsapp: None,
+            email: None,
+            irc: None,
         }
     }
 }
@@ -612,6 +761,37 @@ pub struct WhatsAppConfig {
     pub allowed_numbers: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IrcConfig {
+    /// IRC server hostname
+    pub server: String,
+    /// IRC server port (default: 6697 for TLS)
+    #[serde(default = "default_irc_port")]
+    pub port: u16,
+    /// Bot nickname
+    pub nickname: String,
+    /// Username (defaults to nickname if not set)
+    pub username: Option<String>,
+    /// Channels to join on connect
+    #[serde(default)]
+    pub channels: Vec<String>,
+    /// Allowed nicknames (case-insensitive) or "*" for all
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// Server password (for bouncers like ZNC)
+    pub server_password: Option<String>,
+    /// NickServ IDENTIFY password
+    pub nickserv_password: Option<String>,
+    /// SASL PLAIN password (IRCv3)
+    pub sasl_password: Option<String>,
+    /// Verify TLS certificate (default: true)
+    pub verify_tls: Option<bool>,
+}
+
+fn default_irc_port() -> u16 {
+    6697
+}
+
 // ── Config impl ──────────────────────────────────────────────────
 
 impl Default for Config {
@@ -631,6 +811,7 @@ impl Default for Config {
             autonomy: AutonomyConfig::default(),
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
+            model_routes: Vec::new(),
             heartbeat: HeartbeatConfig::default(),
             channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
@@ -661,11 +842,16 @@ impl Config {
         if config_path.exists() {
             let contents =
                 fs::read_to_string(&config_path).context("Failed to read config file")?;
-            let config: Config =
+            let mut config: Config =
                 toml::from_str(&contents).context("Failed to parse config file")?;
+            // Set computed paths that are skipped during serialization
+            config.config_path = config_path.clone();
+            config.workspace_dir = zeroclaw_dir.join("workspace");
             Ok(config)
         } else {
-            let config = Config::default();
+            let mut config = Config::default();
+            config.config_path = config_path.clone();
+            config.workspace_dir = zeroclaw_dir.join("workspace");
             config.save()?;
             Ok(config)
         }
@@ -732,9 +918,84 @@ impl Config {
 
     pub fn save(&self) -> Result<()> {
         let toml_str = toml::to_string_pretty(self).context("Failed to serialize config")?;
-        fs::write(&self.config_path, toml_str).context("Failed to write config file")?;
+
+        let parent_dir = self
+            .config_path
+            .parent()
+            .context("Config path must have a parent directory")?;
+        fs::create_dir_all(parent_dir).with_context(|| {
+            format!(
+                "Failed to create config directory: {}",
+                parent_dir.display()
+            )
+        })?;
+
+        let file_name = self
+            .config_path
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or("config.toml");
+        let temp_path = parent_dir.join(format!(".{file_name}.tmp-{}", uuid::Uuid::new_v4()));
+        let backup_path = parent_dir.join(format!("{file_name}.bak"));
+
+        let mut temp_file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp_path)
+            .with_context(|| {
+                format!(
+                    "Failed to create temporary config file: {}",
+                    temp_path.display()
+                )
+            })?;
+        temp_file
+            .write_all(toml_str.as_bytes())
+            .context("Failed to write temporary config contents")?;
+        temp_file
+            .sync_all()
+            .context("Failed to fsync temporary config file")?;
+        drop(temp_file);
+
+        let had_existing_config = self.config_path.exists();
+        if had_existing_config {
+            fs::copy(&self.config_path, &backup_path).with_context(|| {
+                format!(
+                    "Failed to create config backup before atomic replace: {}",
+                    backup_path.display()
+                )
+            })?;
+        }
+
+        if let Err(e) = fs::rename(&temp_path, &self.config_path) {
+            let _ = fs::remove_file(&temp_path);
+            if had_existing_config && backup_path.exists() {
+                let _ = fs::copy(&backup_path, &self.config_path);
+            }
+            anyhow::bail!("Failed to atomically replace config file: {e}");
+        }
+
+        sync_directory(parent_dir)?;
+
+        if had_existing_config {
+            let _ = fs::remove_file(&backup_path);
+        }
+
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<()> {
+    let dir = File::open(path)
+        .with_context(|| format!("Failed to open directory for fsync: {}", path.display()))?;
+    dir.sync_all()
+        .with_context(|| format!("Failed to fsync directory metadata: {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -771,12 +1032,20 @@ mod tests {
         assert!(a.forbidden_paths.contains(&"/etc".to_string()));
         assert_eq!(a.max_actions_per_hour, 20);
         assert_eq!(a.max_cost_per_day_cents, 500);
+        assert!(a.require_approval_for_medium_risk);
+        assert!(a.block_high_risk_commands);
     }
 
     #[test]
     fn runtime_config_default() {
         let r = RuntimeConfig::default();
         assert_eq!(r.kind, "native");
+        assert_eq!(r.docker.image, "alpine:3.20");
+        assert_eq!(r.docker.network, "none");
+        assert_eq!(r.docker.memory_limit_mb, Some(512));
+        assert_eq!(r.docker.cpu_limit, Some(1.0));
+        assert!(r.docker.read_only_rootfs);
+        assert!(r.docker.mount_workspace);
     }
 
     #[test]
@@ -826,11 +1095,15 @@ mod tests {
                 forbidden_paths: vec!["/secret".into()],
                 max_actions_per_hour: 50,
                 max_cost_per_day_cents: 1000,
+                require_approval_for_medium_risk: false,
+                block_high_risk_commands: true,
             },
             runtime: RuntimeConfig {
                 kind: "docker".into(),
+                ..RuntimeConfig::default()
             },
             reliability: ReliabilityConfig::default(),
+            model_routes: Vec::new(),
             heartbeat: HeartbeatConfig {
                 enabled: true,
                 interval_minutes: 15,
@@ -847,6 +1120,8 @@ mod tests {
                 imessage: None,
                 matrix: None,
                 whatsapp: None,
+                email: None,
+                irc: None,
             },
             memory: MemoryConfig::default(),
             tunnel: TunnelConfig::default(),
@@ -916,6 +1191,7 @@ default_temperature = 0.7
             autonomy: AutonomyConfig::default(),
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
+            model_routes: Vec::new(),
             heartbeat: HeartbeatConfig::default(),
             channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
@@ -935,6 +1211,37 @@ default_temperature = 0.7
         assert_eq!(loaded.api_key.as_deref(), Some("sk-roundtrip"));
         assert_eq!(loaded.default_model.as_deref(), Some("test-model"));
         assert!((loaded.default_temperature - 0.9).abs() < f64::EPSILON);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_save_atomic_cleanup() {
+        let dir =
+            std::env::temp_dir().join(format!("zeroclaw_test_config_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let config_path = dir.join("config.toml");
+        let mut config = Config::default();
+        config.workspace_dir = dir.join("workspace");
+        config.config_path = config_path.clone();
+        config.default_model = Some("model-a".into());
+
+        config.save().unwrap();
+        assert!(config_path.exists());
+
+        config.default_model = Some("model-b".into());
+        config.save().unwrap();
+
+        let contents = fs::read_to_string(&config_path).unwrap();
+        assert!(contents.contains("model-b"));
+
+        let names: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(!names.iter().any(|name| name.contains(".tmp-")));
+        assert!(!names.iter().any(|name| name.ends_with(".bak")));
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1059,6 +1366,8 @@ default_temperature = 0.7
                 allowed_users: vec!["@u:m".into()],
             }),
             whatsapp: None,
+            email: None,
+            irc: None,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -1215,6 +1524,8 @@ channel_id = "C123"
                 app_secret: None,
                 allowed_numbers: vec!["+1".into()],
             }),
+            email: None,
+            irc: None,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -1256,6 +1567,9 @@ channel_id = "C123"
             g.paired_tokens.is_empty(),
             "No pre-paired tokens by default"
         );
+        assert_eq!(g.pair_rate_limit_per_minute, 10);
+        assert_eq!(g.webhook_rate_limit_per_minute, 60);
+        assert_eq!(g.idempotency_ttl_secs, 300);
     }
 
     #[test]
@@ -1281,12 +1595,18 @@ channel_id = "C123"
             require_pairing: true,
             allow_public_bind: false,
             paired_tokens: vec!["zc_test_token".into()],
+            pair_rate_limit_per_minute: 12,
+            webhook_rate_limit_per_minute: 80,
+            idempotency_ttl_secs: 600,
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();
         assert!(parsed.require_pairing);
         assert!(!parsed.allow_public_bind);
         assert_eq!(parsed.paired_tokens, vec!["zc_test_token"]);
+        assert_eq!(parsed.pair_rate_limit_per_minute, 12);
+        assert_eq!(parsed.webhook_rate_limit_per_minute, 80);
+        assert_eq!(parsed.idempotency_ttl_secs, 600);
     }
 
     #[test]
@@ -1599,7 +1919,7 @@ default_temperature = 0.7
     fn env_override_temperature_out_of_range_ignored() {
         // Clean up any leftover env vars from other tests
         std::env::remove_var("ZEROCLAW_TEMPERATURE");
-        
+
         let mut config = Config::default();
         let original_temp = config.default_temperature;
 

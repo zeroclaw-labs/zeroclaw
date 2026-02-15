@@ -33,6 +33,9 @@ shellexpand = "3.1"
 tracing = { version = "0.1", default-features = false }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi"] }
 
+# Observability - Prometheus metrics
+prometheus = { version = "0.13", default-features = false }
+
 # Error handling
 anyhow = "1.0"
 thiserror = "2.0"
@@ -73,8 +76,9 @@ console = "0.15"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 hostname = "0.4.2"
-lettre = { version = "0.11.19", features = ["smtp-transport", "rustls-tls"] }
+lettre = { version = "0.11.19", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }
 mail-parser = "0.11.2"
+rustls = "0.23"
 rustls-pki-types = "1.14.0"
 tokio-rustls = "0.26.4"
 webpki-roots = "1.0.6"

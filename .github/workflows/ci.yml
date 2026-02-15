@@ -6,14 +6,86 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  changes:
+    name: Detect Change Scope
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.scope.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect docs-only changes
+        id: scope
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+          fi
+
+          if [ -z "$BASE" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CHANGED="$(git diff --name-only "$BASE" HEAD || true)"
+          if [ -z "$CHANGED" ]; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          docs_only=true
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            case "$file" in
+              docs/*|*.md|*.mdx|LICENSE|.github/ISSUE_TEMPLATE/*|.github/pull_request_template.md)
+                ;;
+              *)
+                docs_only=false
+                break
+                ;;
+            esac
+          done <<< "$CHANGED"
+
+          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+
+  lint:
+    name: Format & Lint
+    needs: [changes]
+    if: needs.changes.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run rustfmt
+        run: cargo fmt --all -- --check
+      - name: Run clippy
+        run: cargo clippy --all-targets -- -D warnings
+
   test:
     name: Test
+    needs: [changes]
+    if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
-    continue-on-error: true  # Don't block PRs
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -22,24 +94,55 @@ jobs:
         run: cargo test --verbose
 
   build:
-    name: Build
-    runs-on: ${{ matrix.os }}
-    continue-on-error: true  # Don't block PRs on build failures
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: macos-latest
-            target: x86_64-apple-darwin
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
+    name: Build (Smoke)
+    needs: [changes]
+    if: needs.changes.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build
-        run: cargo build --release --verbose
+      - name: Build release binary
+        run: cargo build --release --locked --verbose
+
+  docs-only:
+    name: Docs-Only Fast Path
+    needs: [changes]
+    if: needs.changes.outputs.docs_only == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Skip heavy jobs for docs-only change
+        run: echo "Docs-only change detected. Rust lint/test/build skipped."
+
+  ci-required:
+    name: CI Required Gate
+    if: always()
+    needs: [changes, lint, test, build, docs-only]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce required status
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ needs.changes.outputs.docs_only }}" = "true" ]; then
+            echo "Docs-only fast path passed."
+            exit 0
+          fi
+
+          lint_result="${{ needs.lint.result }}"
+          test_result="${{ needs.test.result }}"
+          build_result="${{ needs.build.result }}"
+
+          echo "lint=${lint_result}"
+          echo "test=${test_result}"
+          echo "build=${build_result}"
+
+          if [ "$lint_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ]; then
+            echo "Required CI jobs did not pass."
+            exit 1
+          fi
+
+          echo "All required CI jobs passed."
