@@ -537,6 +537,7 @@ pub struct ChannelsConfig {
     pub imessage: Option<IMessageConfig>,
     pub matrix: Option<MatrixConfig>,
     pub whatsapp: Option<WhatsAppConfig>,
+    pub irc: Option<IrcConfig>,
 }
 
 impl Default for ChannelsConfig {
@@ -550,6 +551,7 @@ impl Default for ChannelsConfig {
             imessage: None,
             matrix: None,
             whatsapp: None,
+            irc: None,
         }
     }
 }
@@ -610,6 +612,37 @@ pub struct WhatsAppConfig {
     /// Allowed phone numbers (E.164 format: +1234567890) or "*" for all
     #[serde(default)]
     pub allowed_numbers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IrcConfig {
+    /// IRC server hostname
+    pub server: String,
+    /// IRC server port (default: 6697 for TLS)
+    #[serde(default = "default_irc_port")]
+    pub port: u16,
+    /// Bot nickname
+    pub nickname: String,
+    /// Username (defaults to nickname if not set)
+    pub username: Option<String>,
+    /// Channels to join on connect
+    #[serde(default)]
+    pub channels: Vec<String>,
+    /// Allowed nicknames (case-insensitive) or "*" for all
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// Server password (for bouncers like ZNC)
+    pub server_password: Option<String>,
+    /// NickServ IDENTIFY password
+    pub nickserv_password: Option<String>,
+    /// SASL PLAIN password (IRCv3)
+    pub sasl_password: Option<String>,
+    /// Verify TLS certificate (default: true)
+    pub verify_tls: Option<bool>,
+}
+
+fn default_irc_port() -> u16 {
+    6697
 }
 
 // ── Config impl ──────────────────────────────────────────────────
@@ -847,6 +880,7 @@ mod tests {
                 imessage: None,
                 matrix: None,
                 whatsapp: None,
+                irc: None,
             },
             memory: MemoryConfig::default(),
             tunnel: TunnelConfig::default(),
@@ -1059,6 +1093,7 @@ default_temperature = 0.7
                 allowed_users: vec!["@u:m".into()],
             }),
             whatsapp: None,
+            irc: None,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -1215,6 +1250,7 @@ channel_id = "C123"
                 app_secret: None,
                 allowed_numbers: vec!["+1".into()],
             }),
+            irc: None,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();

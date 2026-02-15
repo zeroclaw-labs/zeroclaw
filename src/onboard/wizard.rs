@@ -1,4 +1,4 @@
-use crate::config::schema::WhatsAppConfig;
+use crate::config::schema::{IrcConfig, WhatsAppConfig};
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
     HeartbeatConfig, IMessageConfig, MatrixConfig, MemoryConfig, ObservabilityConfig,
@@ -1114,6 +1114,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
         imessage: None,
         matrix: None,
         whatsapp: None,
+        irc: None,
     };
 
     loop {
@@ -1167,6 +1168,14 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 }
             ),
             format!(
+                "IRC        {}",
+                if config.irc.is_some() {
+                    "✅ configured"
+                } else {
+                    "— IRC over TLS"
+                }
+            ),
+            format!(
                 "Webhook    {}",
                 if config.webhook.is_some() {
                     "✅ configured"
@@ -1180,7 +1189,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
         let choice = Select::new()
             .with_prompt("  Connect a channel (or Done to continue)")
             .items(&options)
-            .default(7)
+            .default(8)
             .interact()?;
 
         match choice {
@@ -1687,6 +1696,144 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 });
             }
             6 => {
+                // ── IRC ──
+                println!();
+                println!(
+                    "  {} {}",
+                    style("IRC Setup").white().bold(),
+                    style("— IRC over TLS").dim()
+                );
+                print_bullet("IRC connects over TLS to any IRC server");
+                print_bullet("Supports SASL PLAIN and NickServ authentication");
+                println!();
+
+                let server: String = Input::new()
+                    .with_prompt("  IRC server (hostname)")
+                    .interact_text()?;
+
+                if server.trim().is_empty() {
+                    println!("  {} Skipped", style("→").dim());
+                    continue;
+                }
+
+                let port_str: String = Input::new()
+                    .with_prompt("  Port")
+                    .default("6697".into())
+                    .interact_text()?;
+
+                let port: u16 = match port_str.trim().parse() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        println!("  {} Invalid port, using 6697", style("→").dim());
+                        6697
+                    }
+                };
+
+                let nickname: String = Input::new()
+                    .with_prompt("  Bot nickname")
+                    .interact_text()?;
+
+                if nickname.trim().is_empty() {
+                    println!("  {} Skipped — nickname required", style("→").dim());
+                    continue;
+                }
+
+                let channels_str: String = Input::new()
+                    .with_prompt("  Channels to join (comma-separated: #channel1,#channel2)")
+                    .allow_empty(true)
+                    .interact_text()?;
+
+                let channels = if channels_str.trim().is_empty() {
+                    vec![]
+                } else {
+                    channels_str
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                };
+
+                print_bullet(
+                    "Allowlist nicknames that can interact with the bot (case-insensitive).",
+                );
+                print_bullet("Use '*' to allow anyone (not recommended for production).");
+
+                let users_str: String = Input::new()
+                    .with_prompt("  Allowed nicknames (comma-separated, or * for all)")
+                    .allow_empty(true)
+                    .interact_text()?;
+
+                let allowed_users = if users_str.trim() == "*" {
+                    vec!["*".into()]
+                } else {
+                    users_str
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                };
+
+                if allowed_users.is_empty() {
+                    print_bullet("⚠️  Empty allowlist — only you can interact. Add nicknames above.");
+                }
+
+                println!();
+                print_bullet("Optional authentication (press Enter to skip each):");
+
+                let server_password: String = Input::new()
+                    .with_prompt("  Server password (for bouncers like ZNC, leave empty if none)")
+                    .allow_empty(true)
+                    .interact_text()?;
+
+                let nickserv_password: String = Input::new()
+                    .with_prompt("  NickServ password (leave empty if none)")
+                    .allow_empty(true)
+                    .interact_text()?;
+
+                let sasl_password: String = Input::new()
+                    .with_prompt("  SASL PLAIN password (leave empty if none)")
+                    .allow_empty(true)
+                    .interact_text()?;
+
+                let verify_tls: bool = Confirm::new()
+                    .with_prompt("  Verify TLS certificate?")
+                    .default(true)
+                    .interact()?;
+
+                println!(
+                    "  {} IRC configured as {}@{}:{}",
+                    style("✅").green().bold(),
+                    style(&nickname).cyan(),
+                    style(&server).cyan(),
+                    style(port).cyan()
+                );
+
+                config.irc = Some(IrcConfig {
+                    server: server.trim().to_string(),
+                    port,
+                    nickname: nickname.trim().to_string(),
+                    username: None,
+                    channels,
+                    allowed_users,
+                    server_password: if server_password.trim().is_empty() {
+                        None
+                    } else {
+                        Some(server_password.trim().to_string())
+                    },
+                    nickserv_password: if nickserv_password.trim().is_empty() {
+                        None
+                    } else {
+                        Some(nickserv_password.trim().to_string())
+                    },
+                    sasl_password: if sasl_password.trim().is_empty() {
+                        None
+                    } else {
+                        Some(sasl_password.trim().to_string())
+                    },
+                    verify_tls: Some(verify_tls),
+                });
+            }
+            7 => {
                 // ── Webhook ──
                 println!();
                 println!(
@@ -1743,6 +1890,9 @@ fn setup_channels() -> Result<ChannelsConfig> {
     }
     if config.whatsapp.is_some() {
         active.push("WhatsApp");
+    }
+    if config.irc.is_some() {
+        active.push("IRC");
     }
     if config.webhook.is_some() {
         active.push("Webhook");
