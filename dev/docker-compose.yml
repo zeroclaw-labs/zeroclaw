@@ -1,0 +1,56 @@
+# Development Environment for ZeroClaw Agentic Testing
+#
+# Use this for:
+# - Running the agent in a sandboxed environment
+# - Testing dangerous commands safely
+# - Developing new skills/integrations
+#
+# Usage:
+#   cd dev && ./cli.sh up
+#   or from root: ./dev/cli.sh up
+name: zeroclaw-dev
+services:
+  # ── The Agent (Development Image) ──
+  # Builds from source but uses a Debian-based image (with shell) instead of distroless.
+  zeroclaw-dev:
+    build:
+      context: ..  # Build context is the REPO ROOT (../)
+      dockerfile: dev/agent/Dockerfile
+    container_name: zeroclaw-dev
+    restart: unless-stopped
+    environment:
+      - API_KEY
+      - PROVIDER
+      - ZEROCLAW_MODEL
+      - ZEROCLAW_GATEWAY_PORT=3000
+      - SANDBOX_HOST=zeroclaw-sandbox
+    volumes:
+      - ../target/.zeroclaw:/zeroclaw-data/.zeroclaw # Config only
+      - ../playground:/zeroclaw-data/workspace # Shared workspace with Sandbox
+    ports:
+      - "127.0.0.1:3000:3000"
+    networks:
+      - dev-net
+
+  # ── The Sandbox (Ubuntu Environment) ──
+  # A fully loaded Ubuntu environment for the agent to play in.
+  sandbox:
+    build:
+      context: sandbox # Context relative to dev/
+      dockerfile: Dockerfile
+    container_name: zeroclaw-sandbox
+    hostname: dev-box
+    command: ["tail", "-f", "/dev/null"]
+    working_dir: /home/developer/workspace
+    user: developer
+    environment:
+      - TERM=xterm-256color
+      - SHELL=/bin/bash
+    volumes:
+      - ../playground:/home/developer/workspace # Mount local playground
+    networks:
+      - dev-net
+
+networks:
+  dev-net:
+    driver: bridge
