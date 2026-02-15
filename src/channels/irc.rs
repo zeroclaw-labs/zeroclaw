@@ -336,11 +336,12 @@ impl Channel for IrcChannel {
     }
 
     async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+        let mut current_nick = self.nickname.clone();
         tracing::info!(
             "IRC channel connecting to {}:{} as {}...",
             self.server,
             self.port,
-            self.nickname
+            current_nick
         );
 
         let tls = self.connect().await?;
@@ -357,7 +358,7 @@ impl Channel for IrcChannel {
         }
 
         // --- Nick/User registration ---
-        Self::send_raw(&mut writer, &format!("NICK {}", self.nickname)).await?;
+        Self::send_raw(&mut writer, &format!("NICK {current_nick}")).await?;
         Self::send_raw(
             &mut writer,
             &format!("USER {} 0 * :ZeroClaw", self.username),
@@ -422,7 +423,7 @@ impl Channel for IrcChannel {
                     // Server sends "AUTHENTICATE +" to request credentials
                     if sasl_pending && msg.params.first().is_some_and(|p| p == "+") {
                         let encoded = encode_sasl_plain(
-                            &self.nickname,
+                            &current_nick,
                             self.sasl_password.as_deref().unwrap_or(""),
                         );
                         let mut guard = self.writer.lock().await;
@@ -454,7 +455,7 @@ impl Channel for IrcChannel {
                 // RPL_WELCOME — registration complete
                 "001" => {
                     registered = true;
-                    tracing::info!("IRC registered as {}", self.nickname);
+                    tracing::info!("IRC registered as {}", current_nick);
 
                     // NickServ authentication
                     if let Some(ref pass) = self.nickserv_password {
@@ -476,12 +477,13 @@ impl Channel for IrcChannel {
 
                 // ERR_NICKNAMEINUSE (433)
                 "433" => {
-                    tracing::warn!("IRC nickname {} is in use", self.nickname);
-                    let alt = format!("{}_", self.nickname);
+                    let alt = format!("{current_nick}_");
+                    tracing::warn!("IRC nickname {current_nick} is in use, trying {alt}");
                     let mut guard = self.writer.lock().await;
                     if let Some(ref mut w) = *guard {
                         Self::send_raw(w, &format!("NICK {alt}")).await?;
                     }
+                    current_nick = alt;
                 }
 
                 "PRIVMSG" => {
