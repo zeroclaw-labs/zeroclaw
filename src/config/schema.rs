@@ -320,6 +320,14 @@ pub struct AutonomyConfig {
     pub forbidden_paths: Vec<String>,
     pub max_actions_per_hour: u32,
     pub max_cost_per_day_cents: u32,
+
+    /// Require explicit approval for medium-risk shell commands.
+    #[serde(default = "default_true")]
+    pub require_approval_for_medium_risk: bool,
+
+    /// Block high-risk shell commands even if allowlisted.
+    #[serde(default = "default_true")]
+    pub block_high_risk_commands: bool,
 }
 
 impl Default for AutonomyConfig {
@@ -363,6 +371,8 @@ impl Default for AutonomyConfig {
             ],
             max_actions_per_hour: 20,
             max_cost_per_day_cents: 500,
+            require_approval_for_medium_risk: true,
+            block_high_risk_commands: true,
         }
     }
 }
@@ -919,6 +929,8 @@ mod tests {
         assert!(a.forbidden_paths.contains(&"/etc".to_string()));
         assert_eq!(a.max_actions_per_hour, 20);
         assert_eq!(a.max_cost_per_day_cents, 500);
+        assert!(a.require_approval_for_medium_risk);
+        assert!(a.block_high_risk_commands);
     }
 
     #[test]
@@ -980,6 +992,8 @@ mod tests {
                 forbidden_paths: vec!["/secret".into()],
                 max_actions_per_hour: 50,
                 max_cost_per_day_cents: 1000,
+                require_approval_for_medium_risk: false,
+                block_high_risk_commands: true,
             },
             runtime: RuntimeConfig {
                 kind: "docker".into(),
