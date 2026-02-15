@@ -131,6 +131,7 @@ pub async fn run(
         model_name,
         &tool_descs,
         &skills,
+        Some(&config.identity),
     );
 
     // ── Execute ──────────────────────────────────────────────────

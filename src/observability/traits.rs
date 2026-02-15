@@ -49,4 +49,12 @@ pub trait Observer: Send + Sync {
 
     /// Human-readable name of this observer
     fn name(&self) -> &str;
+
+    /// Downcast to `Any` for backend-specific operations
+    fn as_any(&self) -> &dyn std::any::Any where Self: Sized {
+        // Default implementation returns a placeholder that will fail on downcast.
+        // Implementors should override this to return `self`.
+        struct Placeholder;
+        std::any::TypeId::of::<Placeholder>()
+    }
 }
