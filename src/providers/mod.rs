@@ -1,5 +1,6 @@
 pub mod anthropic;
 pub mod compatible;
+pub mod glm;
 pub mod ollama;
 pub mod openai;
 pub mod openrouter;
@@ -48,9 +49,7 @@ pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<
         "zai" | "z.ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Z.AI", "https://api.z.ai", api_key, AuthStyle::Bearer,
         ))),
-        "glm" | "zhipu" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "GLM", "https://open.bigmodel.cn/api/paas", api_key, AuthStyle::Bearer,
-        ))),
+        "glm" | "zhipu" => Ok(Box::new(glm::GlmProvider::new(api_key))),
         "minimax" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "MiniMax", "https://api.minimax.chat", api_key, AuthStyle::Bearer,
         ))),

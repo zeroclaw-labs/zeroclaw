@@ -2545,6 +2545,7 @@ dependencies = [
  "hostname",
  "http-body-util",
  "reqwest",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",

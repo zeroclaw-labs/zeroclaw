@@ -46,6 +46,9 @@ chacha20poly1305 = "0.10"
 # Async traits
 async-trait = "0.1"
 
+# HMAC-SHA256 (Zhipu/GLM JWT auth)
+ring = "0.17"
+
 # Memory / persistence
 rusqlite = { version = "0.32", features = ["bundled"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

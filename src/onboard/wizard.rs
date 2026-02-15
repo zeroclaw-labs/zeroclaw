@@ -398,6 +398,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "ollama" => "llama3.2".into(),
         "groq" => "llama-3.3-70b-versatile".into(),
         "deepseek" => "deepseek-chat".into(),
+        "glm" | "zhipu" => "glm-4.7".into(),
         _ => "anthropic/claude-sonnet-4-20250514".into(),
     }
 }
@@ -722,8 +723,10 @@ fn setup_provider() -> Result<(String, String, String)> {
             ("moonshot-v1-32k", "Moonshot V1 32K"),
         ],
         "glm" => vec![
-            ("glm-4-plus", "GLM-4 Plus (flagship)"),
-            ("glm-4-flash", "GLM-4 Flash (fast)"),
+            ("glm-4.7", "GLM-4.7 (flagship, 358B, recommended)"),
+            ("glm-4.7-flash", "GLM-4.7 Flash (fast, free-tier)"),
+            ("glm-4-plus", "GLM-4 Plus (previous gen)"),
+            ("glm-4-flash", "GLM-4 Flash (previous gen, fast)"),
         ],
         "minimax" => vec![
             ("abab6.5s-chat", "ABAB 6.5s Chat"),
