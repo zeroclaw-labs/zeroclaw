@@ -350,7 +350,7 @@ fn pick_optional_column_expr(columns: &[String], candidates: &[&str]) -> Option<
     candidates
         .iter()
         .find(|candidate| columns.iter().any(|c| c == *candidate))
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
 }
 
 fn pick_column_expr(columns: &[String], candidates: &[&str], fallback: &str) -> String {

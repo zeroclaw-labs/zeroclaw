@@ -17,7 +17,9 @@ pub enum Role {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
-    Text { text: String },
+    Text {
+        text: String,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -28,7 +30,9 @@ pub enum ContentBlock {
         content: String,
         is_error: bool,
     },
-    Thinking { thinking: String },
+    Thinking {
+        thinking: String,
+    },
 }
 
 /// Normalized token usage across providers.
@@ -181,9 +185,7 @@ mod tests {
 
     #[test]
     fn content_block_variants() {
-        let text = ContentBlock::Text {
-            text: "hi".into(),
-        };
+        let text = ContentBlock::Text { text: "hi".into() };
         let json = serde_json::to_string(&text).unwrap();
         assert!(json.contains("\"type\":\"text\""));
 

@@ -51,12 +51,12 @@ pub struct ToolDefinition {
 #[derive(Debug, Clone)]
 pub struct ChatCompletionResponse {
     pub content: Vec<ContentBlock>,
-    /// "end_turn", "tool_use", "max_tokens", or provider-specific values.
+    /// "`end_turn`", "`tool_use`", "`max_tokens`", or provider-specific values.
     pub stop_reason: Option<String>,
 }
 
 impl ChatCompletionResponse {
-    /// Returns `true` if the response contains any tool_use blocks.
+    /// Returns `true` if the response contains any `tool_use` blocks.
     pub fn has_tool_use(&self) -> bool {
         self.content
             .iter()
@@ -75,7 +75,7 @@ impl ChatCompletionResponse {
             .join("")
     }
 
-    /// Extract all tool_use blocks.
+    /// Extract all `tool_use` blocks.
     pub fn tool_uses(&self) -> Vec<(&str, &str, &serde_json::Value)> {
         self.content
             .iter()

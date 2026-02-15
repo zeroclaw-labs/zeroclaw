@@ -47,6 +47,21 @@ pub struct AriaAgentEntry {
     pub updated_at: String,
 }
 
+pub struct AgentUploadRequest<'a> {
+    pub tenant_id: &'a str,
+    pub name: &'a str,
+    pub description: &'a str,
+    pub model: Option<&'a str>,
+    pub temperature: Option<f64>,
+    pub system_prompt: Option<&'a str>,
+    pub tools: &'a str,
+    pub thinking: Option<&'a str>,
+    pub max_retries: Option<i64>,
+    pub timeout_seconds: Option<i64>,
+    pub handler_code: &'a str,
+    pub sandbox_config: Option<&'a str>,
+}
+
 // ── Registry ─────────────────────────────────────────────────────
 
 pub struct AriaAgentRegistry {
@@ -117,7 +132,9 @@ impl AriaAgentRegistry {
         ni.clear();
 
         for e in entries {
-            ti.entry(e.tenant_id.clone()).or_default().insert(e.id.clone());
+            ti.entry(e.tenant_id.clone())
+                .or_default()
+                .insert(e.id.clone());
             ni.insert(format!("{}:{}", e.tenant_id, e.name), e.id.clone());
             cache.insert(e.id.clone(), e);
         }
@@ -126,37 +143,45 @@ impl AriaAgentRegistry {
     }
 
     fn index_entry(&self, entry: &AriaAgentEntry) {
-        self.tenant_index.lock().unwrap()
-            .entry(entry.tenant_id.clone()).or_default().insert(entry.id.clone());
-        self.name_index.lock().unwrap()
-            .insert(format!("{}:{}", entry.tenant_id, entry.name), entry.id.clone());
+        self.tenant_index
+            .lock()
+            .unwrap()
+            .entry(entry.tenant_id.clone())
+            .or_default()
+            .insert(entry.id.clone());
+        self.name_index.lock().unwrap().insert(
+            format!("{}:{}", entry.tenant_id, entry.name),
+            entry.id.clone(),
+        );
     }
 
     fn deindex_entry(&self, entry: &AriaAgentEntry) {
         if let Some(set) = self.tenant_index.lock().unwrap().get_mut(&entry.tenant_id) {
             set.remove(&entry.id);
         }
-        self.name_index.lock().unwrap()
+        self.name_index
+            .lock()
+            .unwrap()
             .remove(&format!("{}:{}", entry.tenant_id, entry.name));
     }
 
     // ── Public API ───────────────────────────────────────────────
 
-    pub fn upload(
-        &self,
-        tenant_id: &str,
-        name: &str,
-        description: &str,
-        model: Option<&str>,
-        temperature: Option<f64>,
-        system_prompt: Option<&str>,
-        tools: &str,
-        thinking: Option<&str>,
-        max_retries: Option<i64>,
-        timeout_seconds: Option<i64>,
-        handler_code: &str,
-        sandbox_config: Option<&str>,
-    ) -> Result<AriaAgentEntry> {
+    pub fn upload(&self, req: AgentUploadRequest<'_>) -> Result<AriaAgentEntry> {
+        let AgentUploadRequest {
+            tenant_id,
+            name,
+            description,
+            model,
+            temperature,
+            system_prompt,
+            tools,
+            thinking,
+            max_retries,
+            timeout_seconds,
+            handler_code,
+            sandbox_config,
+        } = req;
         self.ensure_loaded()?;
         let now = Utc::now().to_rfc3339();
         let hash = sha256_hex(handler_code);
@@ -178,9 +203,20 @@ impl AriaAgentRegistry {
                      sandbox_config=?11, version=?12, updated_at=?13
                      WHERE id=?14",
                     params![
-                        description, model, temperature, system_prompt, tools,
-                        thinking, max_retries, timeout_seconds, handler_code,
-                        hash, sandbox_config, new_version, now, eid
+                        description,
+                        model,
+                        temperature,
+                        system_prompt,
+                        tools,
+                        thinking,
+                        max_retries,
+                        timeout_seconds,
+                        handler_code,
+                        hash,
+                        sandbox_config,
+                        new_version,
+                        now,
+                        eid
                     ],
                 )?;
                 Ok(())
@@ -233,11 +269,24 @@ impl AriaAgentRegistry {
                      status, version, created_at, updated_at)
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
                     params![
-                        entry.id, entry.tenant_id, entry.name, entry.description,
-                        entry.model, entry.temperature, entry.system_prompt, entry.tools,
-                        entry.thinking, entry.max_retries, entry.timeout_seconds,
-                        entry.handler_code, entry.handler_hash, entry.sandbox_config,
-                        entry.status, entry.version, entry.created_at, entry.updated_at
+                        entry.id,
+                        entry.tenant_id,
+                        entry.name,
+                        entry.description,
+                        entry.model,
+                        entry.temperature,
+                        entry.system_prompt,
+                        entry.tools,
+                        entry.thinking,
+                        entry.max_retries,
+                        entry.timeout_seconds,
+                        entry.handler_code,
+                        entry.handler_hash,
+                        entry.sandbox_config,
+                        entry.status,
+                        entry.version,
+                        entry.created_at,
+                        entry.updated_at
                     ],
                 )?;
                 Ok(())
@@ -255,8 +304,12 @@ impl AriaAgentRegistry {
 
     pub fn get_by_name(&self, tenant_id: &str, name: &str) -> Result<Option<AriaAgentEntry>> {
         self.ensure_loaded()?;
-        let id = self.name_index.lock().unwrap()
-            .get(&format!("{tenant_id}:{name}")).cloned();
+        let id = self
+            .name_index
+            .lock()
+            .unwrap()
+            .get(&format!("{tenant_id}:{name}"))
+            .cloned();
         match id {
             Some(id) => self.get(&id),
             None => Ok(None),
@@ -277,14 +330,17 @@ impl AriaAgentRegistry {
 
     pub fn count(&self, tenant_id: &str) -> Result<usize> {
         self.ensure_loaded()?;
-        Ok(self.tenant_index.lock().unwrap().get(tenant_id).map_or(0, |s| s.len()))
+        Ok(self
+            .tenant_index
+            .lock()
+            .unwrap()
+            .get(tenant_id)
+            .map_or(0, std::collections::HashSet::len))
     }
 
     pub fn delete(&self, id: &str) -> Result<bool> {
         self.ensure_loaded()?;
-        let entry = {
-            self.cache.lock().unwrap().get(id).cloned()
-        };
+        let entry = { self.cache.lock().unwrap().get(id).cloned() };
         let Some(entry) = entry else { return Ok(false) };
         let now = Utc::now().to_rfc3339();
         self.db.with_conn(|conn| {
@@ -331,10 +387,21 @@ mod tests {
     }
 
     fn upload_default(reg: &AriaAgentRegistry, tenant: &str, name: &str) -> AriaAgentEntry {
-        reg.upload(
-            tenant, name, "desc", Some("claude-3"), Some(0.7),
-            Some("You are helpful"), "[]", None, None, None, "handler()", None,
-        ).unwrap()
+        reg.upload(AgentUploadRequest {
+            tenant_id: tenant,
+            name,
+            description: "desc",
+            model: Some("claude-3"),
+            temperature: Some(0.7),
+            system_prompt: Some("You are helpful"),
+            tools: "[]",
+            thinking: None,
+            max_retries: None,
+            timeout_seconds: None,
+            handler_code: "handler()",
+            sandbox_config: None,
+        })
+        .unwrap()
     }
 
     #[test]
@@ -353,10 +420,22 @@ mod tests {
     fn upsert_by_name_updates_existing() {
         let reg = setup();
         let v1 = upload_default(&reg, "t1", "agent");
-        let v2 = reg.upload(
-            "t1", "agent", "new desc", Some("gpt-4"), Some(0.5),
-            Some("Be concise"), "[]", None, None, None, "handler_v2()", None,
-        ).unwrap();
+        let v2 = reg
+            .upload(AgentUploadRequest {
+                tenant_id: "t1",
+                name: "agent",
+                description: "new desc",
+                model: Some("gpt-4"),
+                temperature: Some(0.5),
+                system_prompt: Some("Be concise"),
+                tools: "[]",
+                thinking: None,
+                max_retries: None,
+                timeout_seconds: None,
+                handler_code: "handler_v2()",
+                sandbox_config: None,
+            })
+            .unwrap();
         assert_eq!(v2.id, v1.id);
         assert_eq!(v2.version, 2);
         assert_eq!(v2.model.as_deref(), Some("gpt-4"));

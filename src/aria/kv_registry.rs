@@ -51,9 +51,8 @@ impl AriaKvRegistry {
             return Ok(());
         }
         let entries = self.db.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, tenant_id, key, value, created_at, updated_at FROM aria_kv",
-            )?;
+            let mut stmt = conn
+                .prepare("SELECT id, tenant_id, key, value, created_at, updated_at FROM aria_kv")?;
             let rows = stmt.query_map([], |row| {
                 Ok(AriaKvEntry {
                     id: row.get(0)?,
@@ -79,7 +78,9 @@ impl AriaKvRegistry {
         ni.clear();
 
         for e in entries {
-            ti.entry(e.tenant_id.clone()).or_default().insert(e.id.clone());
+            ti.entry(e.tenant_id.clone())
+                .or_default()
+                .insert(e.id.clone());
             ni.insert(format!("{}:{}", e.tenant_id, e.key), e.id.clone());
             cache.insert(e.id.clone(), e);
         }
@@ -88,29 +89,32 @@ impl AriaKvRegistry {
     }
 
     fn index_entry(&self, entry: &AriaKvEntry) {
-        self.tenant_index.lock().unwrap()
-            .entry(entry.tenant_id.clone()).or_default().insert(entry.id.clone());
-        self.name_index.lock().unwrap()
-            .insert(format!("{}:{}", entry.tenant_id, entry.key), entry.id.clone());
+        self.tenant_index
+            .lock()
+            .unwrap()
+            .entry(entry.tenant_id.clone())
+            .or_default()
+            .insert(entry.id.clone());
+        self.name_index.lock().unwrap().insert(
+            format!("{}:{}", entry.tenant_id, entry.key),
+            entry.id.clone(),
+        );
     }
 
     fn deindex_entry(&self, entry: &AriaKvEntry) {
         if let Some(set) = self.tenant_index.lock().unwrap().get_mut(&entry.tenant_id) {
             set.remove(&entry.id);
         }
-        self.name_index.lock().unwrap()
+        self.name_index
+            .lock()
+            .unwrap()
             .remove(&format!("{}:{}", entry.tenant_id, entry.key));
     }
 
     // ── Public API ───────────────────────────────────────────────
 
     /// Create or update a KV entry. Upserts on tenant+key.
-    pub fn create(
-        &self,
-        tenant_id: &str,
-        key: &str,
-        value: &str,
-    ) -> Result<AriaKvEntry> {
+    pub fn create(&self, tenant_id: &str, key: &str, value: &str) -> Result<AriaKvEntry> {
         self.ensure_loaded()?;
         let now = Utc::now().to_rfc3339();
 
@@ -151,8 +155,12 @@ impl AriaKvRegistry {
                     "INSERT INTO aria_kv (id, tenant_id, key, value, created_at, updated_at)
                      VALUES (?1,?2,?3,?4,?5,?6)",
                     params![
-                        entry.id, entry.tenant_id, entry.key, entry.value,
-                        entry.created_at, entry.updated_at
+                        entry.id,
+                        entry.tenant_id,
+                        entry.key,
+                        entry.value,
+                        entry.created_at,
+                        entry.updated_at
                     ],
                 )?;
                 Ok(())
@@ -170,8 +178,12 @@ impl AriaKvRegistry {
 
     pub fn get_by_name(&self, tenant_id: &str, key: &str) -> Result<Option<AriaKvEntry>> {
         self.ensure_loaded()?;
-        let id = self.name_index.lock().unwrap()
-            .get(&format!("{tenant_id}:{key}")).cloned();
+        let id = self
+            .name_index
+            .lock()
+            .unwrap()
+            .get(&format!("{tenant_id}:{key}"))
+            .cloned();
         match id {
             Some(id) => self.get(&id),
             None => Ok(None),
@@ -192,7 +204,12 @@ impl AriaKvRegistry {
 
     pub fn count(&self, tenant_id: &str) -> Result<usize> {
         self.ensure_loaded()?;
-        Ok(self.tenant_index.lock().unwrap().get(tenant_id).map_or(0, |s| s.len()))
+        Ok(self
+            .tenant_index
+            .lock()
+            .unwrap()
+            .get(tenant_id)
+            .map_or(0, std::collections::HashSet::len))
     }
 
     /// Delete a KV entry.

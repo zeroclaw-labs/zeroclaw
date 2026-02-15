@@ -1,7 +1,7 @@
 //! Cron function registry — SQLite-backed store for scheduled function definitions.
 //!
 //! Unlike other registries, cron functions use HARD deletes. Supports
-//! schedule_kind (at|every|cron), session targeting, wake modes, and
+//! `schedule_kind` (at|every|cron), session targeting, wake modes, and
 //! optional delete-after-run semantics.
 
 use super::db::AriaDb;
@@ -106,7 +106,9 @@ impl AriaCronFunctionRegistry {
         ni.clear();
 
         for e in entries {
-            ti.entry(e.tenant_id.clone()).or_default().insert(e.id.clone());
+            ti.entry(e.tenant_id.clone())
+                .or_default()
+                .insert(e.id.clone());
             ni.insert(format!("{}:{}", e.tenant_id, e.name), e.id.clone());
             cache.insert(e.id.clone(), e);
         }
@@ -115,17 +117,25 @@ impl AriaCronFunctionRegistry {
     }
 
     fn index_entry(&self, entry: &AriaCronFunctionEntry) {
-        self.tenant_index.lock().unwrap()
-            .entry(entry.tenant_id.clone()).or_default().insert(entry.id.clone());
-        self.name_index.lock().unwrap()
-            .insert(format!("{}:{}", entry.tenant_id, entry.name), entry.id.clone());
+        self.tenant_index
+            .lock()
+            .unwrap()
+            .entry(entry.tenant_id.clone())
+            .or_default()
+            .insert(entry.id.clone());
+        self.name_index.lock().unwrap().insert(
+            format!("{}:{}", entry.tenant_id, entry.name),
+            entry.id.clone(),
+        );
     }
 
     fn deindex_entry(&self, entry: &AriaCronFunctionEntry) {
         if let Some(set) = self.tenant_index.lock().unwrap().get_mut(&entry.tenant_id) {
             set.remove(&entry.id);
         }
-        self.name_index.lock().unwrap()
+        self.name_index
+            .lock()
+            .unwrap()
             .remove(&format!("{}:{}", entry.tenant_id, entry.name));
     }
 
@@ -165,9 +175,18 @@ impl AriaCronFunctionRegistry {
                      payload_data=?7, isolation=?8, enabled=?9, delete_after_run=?10,
                      updated_at=?11 WHERE id=?12",
                     params![
-                        description, schedule_kind, schedule_data, session_target,
-                        wake_mode, payload_kind, payload_data, isolation, enabled,
-                        delete_after_run, now, eid
+                        description,
+                        schedule_kind,
+                        schedule_data,
+                        session_target,
+                        wake_mode,
+                        payload_kind,
+                        payload_data,
+                        isolation,
+                        enabled,
+                        delete_after_run,
+                        now,
+                        eid
                     ],
                 )?;
                 Ok(())
@@ -217,11 +236,23 @@ impl AriaCronFunctionRegistry {
                      status, created_at, updated_at)
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
                     params![
-                        entry.id, entry.tenant_id, entry.name, entry.description,
-                        entry.schedule_kind, entry.schedule_data, entry.session_target,
-                        entry.wake_mode, entry.payload_kind, entry.payload_data,
-                        entry.isolation, entry.enabled, entry.delete_after_run,
-                        entry.cron_job_id, entry.status, entry.created_at, entry.updated_at
+                        entry.id,
+                        entry.tenant_id,
+                        entry.name,
+                        entry.description,
+                        entry.schedule_kind,
+                        entry.schedule_data,
+                        entry.session_target,
+                        entry.wake_mode,
+                        entry.payload_kind,
+                        entry.payload_data,
+                        entry.isolation,
+                        entry.enabled,
+                        entry.delete_after_run,
+                        entry.cron_job_id,
+                        entry.status,
+                        entry.created_at,
+                        entry.updated_at
                     ],
                 )?;
                 Ok(())
@@ -237,10 +268,18 @@ impl AriaCronFunctionRegistry {
         Ok(self.cache.lock().unwrap().get(id).cloned())
     }
 
-    pub fn get_by_name(&self, tenant_id: &str, name: &str) -> Result<Option<AriaCronFunctionEntry>> {
+    pub fn get_by_name(
+        &self,
+        tenant_id: &str,
+        name: &str,
+    ) -> Result<Option<AriaCronFunctionEntry>> {
         self.ensure_loaded()?;
-        let id = self.name_index.lock().unwrap()
-            .get(&format!("{tenant_id}:{name}")).cloned();
+        let id = self
+            .name_index
+            .lock()
+            .unwrap()
+            .get(&format!("{tenant_id}:{name}"))
+            .cloned();
         match id {
             Some(id) => self.get(&id),
             None => Ok(None),
@@ -261,7 +300,12 @@ impl AriaCronFunctionRegistry {
 
     pub fn count(&self, tenant_id: &str) -> Result<usize> {
         self.ensure_loaded()?;
-        Ok(self.tenant_index.lock().unwrap().get(tenant_id).map_or(0, |s| s.len()))
+        Ok(self
+            .tenant_index
+            .lock()
+            .unwrap()
+            .get(tenant_id)
+            .map_or(0, std::collections::HashSet::len))
     }
 
     /// HARD delete — permanently removes the cron function from DB and cache.
@@ -300,11 +344,12 @@ impl AriaCronFunctionRegistry {
         Ok(true)
     }
 
-    /// Look up a cron function by its platform cron_job_id.
+    /// Look up a cron function by its platform `cron_job_id`.
     pub fn get_by_cron_job_id(&self, cron_job_id: &str) -> Result<Option<AriaCronFunctionEntry>> {
         self.ensure_loaded()?;
         let cache = self.cache.lock().unwrap();
-        Ok(cache.values()
+        Ok(cache
+            .values()
             .find(|e| e.cron_job_id.as_deref() == Some(cron_job_id))
             .cloned())
     }
@@ -322,12 +367,26 @@ mod tests {
         AriaCronFunctionRegistry::new(db)
     }
 
-    fn create_default(reg: &AriaCronFunctionRegistry, tenant: &str, name: &str) -> AriaCronFunctionEntry {
+    fn create_default(
+        reg: &AriaCronFunctionRegistry,
+        tenant: &str,
+        name: &str,
+    ) -> AriaCronFunctionEntry {
         reg.create(
-            tenant, name, "desc", "every", r#"{"every_ms":60000}"#,
-            "main", "next-heartbeat", "systemEvent", r#"{"text":"tick"}"#,
-            None, true, false,
-        ).unwrap()
+            tenant,
+            name,
+            "desc",
+            "every",
+            r#"{"every_ms":60000}"#,
+            "main",
+            "next-heartbeat",
+            "systemEvent",
+            r#"{"text":"tick"}"#,
+            None,
+            true,
+            false,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -346,11 +405,22 @@ mod tests {
     fn upsert_by_name_updates_existing() {
         let reg = setup();
         let v1 = create_default(&reg, "t1", "cron");
-        let v2 = reg.create(
-            "t1", "cron", "updated", "cron", r#"{"expr":"0 * * * *"}"#,
-            "isolated", "now", "agentTurn", r#"{"message":"go"}"#,
-            None, false, true,
-        ).unwrap();
+        let v2 = reg
+            .create(
+                "t1",
+                "cron",
+                "updated",
+                "cron",
+                r#"{"expr":"0 * * * *"}"#,
+                "isolated",
+                "now",
+                "agentTurn",
+                r#"{"message":"go"}"#,
+                None,
+                false,
+                true,
+            )
+            .unwrap();
         assert_eq!(v2.id, v1.id);
         assert_eq!(v2.schedule_kind, "cron");
         assert!(!v2.enabled);
@@ -379,14 +449,17 @@ mod tests {
         assert!(reg.get(&entry.id).unwrap().is_none());
 
         // Verify it's actually gone from DB (not just soft-deleted)
-        let exists = reg.db.with_conn(|conn| {
-            let count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM aria_cron_functions WHERE id=?1",
-                params![entry.id],
-                |row| row.get(0),
-            )?;
-            Ok(count > 0)
-        }).unwrap();
+        let exists = reg
+            .db
+            .with_conn(|conn| {
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM aria_cron_functions WHERE id=?1",
+                    params![entry.id],
+                    |row| row.get(0),
+                )?;
+                Ok(count > 0)
+            })
+            .unwrap();
         assert!(!exists);
     }
 

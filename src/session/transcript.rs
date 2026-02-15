@@ -5,7 +5,7 @@
 //! A [`SessionStore`] manages the `sessions.json` index for listing and
 //! looking up sessions by ID.
 
-use super::types::*;
+use super::types::{AgentMessage, NormalizedUsage, SessionEntry, SessionHeader};
 
 use anyhow::{Context, Result};
 use serde_json;
@@ -48,10 +48,8 @@ impl TranscriptWriter {
 
         let mut writer = BufWriter::new(file);
 
-        let header_json = serde_json::to_string(header)
-            .context("serializing session header")?;
-        writeln!(writer, "{header_json}")
-            .context("writing session header")?;
+        let header_json = serde_json::to_string(header).context("serializing session header")?;
+        writeln!(writer, "{header_json}").context("writing session header")?;
         writer.flush().context("flushing session header")?;
 
         Ok(Self {
@@ -62,16 +60,16 @@ impl TranscriptWriter {
 
     /// Serialize `message` as JSON and append it as a single JSONL line.
     pub fn append(&self, message: &AgentMessage) -> Result<()> {
-        let line = serde_json::to_string(message)
-            .context("serializing agent message")?;
+        let line = serde_json::to_string(message).context("serializing agent message")?;
 
-        let mut guard = self.file.lock().map_err(|e| {
-            anyhow::anyhow!("transcript writer lock poisoned: {e}")
-        })?;
+        let mut guard = self
+            .file
+            .lock()
+            .map_err(|e| anyhow::anyhow!("transcript writer lock poisoned: {e}"))?;
 
-        let writer = guard.as_mut().ok_or_else(|| {
-            anyhow::anyhow!("transcript writer already closed")
-        })?;
+        let writer = guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("transcript writer already closed"))?;
 
         writeln!(writer, "{line}")
             .with_context(|| format!("appending to transcript {}", self.path.display()))?;
@@ -86,19 +84,21 @@ impl TranscriptWriter {
             return Ok(());
         }
 
-        let mut guard = self.file.lock().map_err(|e| {
-            anyhow::anyhow!("transcript writer lock poisoned: {e}")
-        })?;
+        let mut guard = self
+            .file
+            .lock()
+            .map_err(|e| anyhow::anyhow!("transcript writer lock poisoned: {e}"))?;
 
-        let writer = guard.as_mut().ok_or_else(|| {
-            anyhow::anyhow!("transcript writer already closed")
-        })?;
+        let writer = guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("transcript writer already closed"))?;
 
         for message in messages {
-            let line = serde_json::to_string(message)
-                .context("serializing agent message in batch")?;
-            writeln!(writer, "{line}")
-                .with_context(|| format!("appending batch to transcript {}", self.path.display()))?;
+            let line =
+                serde_json::to_string(message).context("serializing agent message in batch")?;
+            writeln!(writer, "{line}").with_context(|| {
+                format!("appending batch to transcript {}", self.path.display())
+            })?;
         }
 
         writer.flush().context("flushing transcript after batch")?;
@@ -108,16 +108,20 @@ impl TranscriptWriter {
 
     /// Force an fsync on the underlying file descriptor.
     pub fn sync(&self) -> Result<()> {
-        let mut guard = self.file.lock().map_err(|e| {
-            anyhow::anyhow!("transcript writer lock poisoned: {e}")
-        })?;
+        let mut guard = self
+            .file
+            .lock()
+            .map_err(|e| anyhow::anyhow!("transcript writer lock poisoned: {e}"))?;
 
-        let writer = guard.as_mut().ok_or_else(|| {
-            anyhow::anyhow!("transcript writer already closed")
-        })?;
+        let writer = guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("transcript writer already closed"))?;
 
         writer.flush().context("flushing before sync")?;
-        writer.get_ref().sync_all().context("fsync transcript file")?;
+        writer
+            .get_ref()
+            .sync_all()
+            .context("fsync transcript file")?;
 
         Ok(())
     }
@@ -297,9 +301,10 @@ impl SessionStore {
     /// Look up a session by ID. Returns `None` if it does not exist.
     pub fn get(&self, session_id: &str) -> Result<Option<SessionEntry>> {
         self.ensure_loaded()?;
-        let guard = self.cache.lock().map_err(|e| {
-            anyhow::anyhow!("session store lock poisoned: {e}")
-        })?;
+        let guard = self
+            .cache
+            .lock()
+            .map_err(|e| anyhow::anyhow!("session store lock poisoned: {e}"))?;
         Ok(guard.get(session_id).cloned())
     }
 
@@ -307,9 +312,10 @@ impl SessionStore {
     pub fn set(&self, entry: SessionEntry) -> Result<()> {
         self.ensure_loaded()?;
         {
-            let mut guard = self.cache.lock().map_err(|e| {
-                anyhow::anyhow!("session store lock poisoned: {e}")
-            })?;
+            let mut guard = self
+                .cache
+                .lock()
+                .map_err(|e| anyhow::anyhow!("session store lock poisoned: {e}"))?;
             guard.insert(entry.session_id.clone(), entry);
         }
         self.persist()
@@ -318,9 +324,10 @@ impl SessionStore {
     /// Return all session entries (unordered).
     pub fn list(&self) -> Result<Vec<SessionEntry>> {
         self.ensure_loaded()?;
-        let guard = self.cache.lock().map_err(|e| {
-            anyhow::anyhow!("session store lock poisoned: {e}")
-        })?;
+        let guard = self
+            .cache
+            .lock()
+            .map_err(|e| anyhow::anyhow!("session store lock poisoned: {e}"))?;
         Ok(guard.values().cloned().collect())
     }
 
@@ -329,9 +336,10 @@ impl SessionStore {
         self.ensure_loaded()?;
         let existed;
         {
-            let mut guard = self.cache.lock().map_err(|e| {
-                anyhow::anyhow!("session store lock poisoned: {e}")
-            })?;
+            let mut guard = self
+                .cache
+                .lock()
+                .map_err(|e| anyhow::anyhow!("session store lock poisoned: {e}"))?;
             existed = guard.remove(session_id).is_some();
         }
         if existed {
@@ -344,12 +352,13 @@ impl SessionStore {
     pub fn update_usage(&self, session_id: &str, usage: &NormalizedUsage) -> Result<()> {
         self.ensure_loaded()?;
         {
-            let mut guard = self.cache.lock().map_err(|e| {
-                anyhow::anyhow!("session store lock poisoned: {e}")
-            })?;
-            let entry = guard.get_mut(session_id).ok_or_else(|| {
-                anyhow::anyhow!("session not found: {session_id}")
-            })?;
+            let mut guard = self
+                .cache
+                .lock()
+                .map_err(|e| anyhow::anyhow!("session store lock poisoned: {e}"))?;
+            let entry = guard
+                .get_mut(session_id)
+                .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
             entry.total_input_tokens += usage.input_tokens;
             entry.total_output_tokens += usage.output_tokens;
             entry.message_count += 1;
@@ -366,9 +375,10 @@ impl SessionStore {
         }
 
         let index_path = self.index_path();
-        let mut guard = self.cache.lock().map_err(|e| {
-            anyhow::anyhow!("session store lock poisoned: {e}")
-        })?;
+        let mut guard = self
+            .cache
+            .lock()
+            .map_err(|e| anyhow::anyhow!("session store lock poisoned: {e}"))?;
 
         // Double-check under the lock.
         if self.loaded.load(Ordering::Relaxed) {
@@ -401,20 +411,25 @@ impl SessionStore {
                 .with_context(|| format!("creating directory {}", parent.display()))?;
         }
 
-        let guard = self.cache.lock().map_err(|e| {
-            anyhow::anyhow!("session store lock poisoned: {e}")
-        })?;
+        let guard = self
+            .cache
+            .lock()
+            .map_err(|e| anyhow::anyhow!("session store lock poisoned: {e}"))?;
 
         let entries: Vec<&SessionEntry> = guard.values().collect();
-        let data = serde_json::to_string_pretty(&entries)
-            .context("serializing sessions index")?;
+        let data = serde_json::to_string_pretty(&entries).context("serializing sessions index")?;
 
         // Atomic write: temp file → rename
         let tmp_path = index_path.with_extension("json.tmp");
         fs::write(&tmp_path, &data)
             .with_context(|| format!("writing temp file {}", tmp_path.display()))?;
-        fs::rename(&tmp_path, &index_path)
-            .with_context(|| format!("renaming {} to {}", tmp_path.display(), index_path.display()))?;
+        fs::rename(&tmp_path, &index_path).with_context(|| {
+            format!(
+                "renaming {} to {}",
+                tmp_path.display(),
+                index_path.display()
+            )
+        })?;
 
         Ok(())
     }
@@ -430,6 +445,7 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::types::{ContentBlock, Role};
     use tempfile::TempDir;
 
     /// Helper: create a minimal session header.
@@ -447,7 +463,11 @@ mod tests {
     fn test_message(index: usize) -> AgentMessage {
         AgentMessage {
             message_id: None,
-            role: if index % 2 == 0 { Role::User } else { Role::Assistant },
+            role: if index % 2 == 0 {
+                Role::User
+            } else {
+                Role::Assistant
+            },
             content: vec![ContentBlock::Text {
                 text: format!("Message {index}"),
             }],
@@ -518,10 +538,7 @@ mod tests {
 
         let raw = fs::read_to_string(&path).unwrap();
         for (i, line) in raw.lines().enumerate() {
-            assert!(
-                !line.trim().is_empty(),
-                "line {i} should not be empty"
-            );
+            assert!(!line.trim().is_empty(), "line {i} should not be empty");
             let parsed: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|e| {
                 panic!("line {i} is not valid JSON: {e}\n  content: {line}");
             });

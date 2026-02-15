@@ -33,8 +33,7 @@ pub fn handle_command(command: super::CronCommands, config: Config) -> Result<()
             for job in jobs {
                 let last_run = job
                     .last_run
-                    .map(|d| d.to_rfc3339())
-                    .unwrap_or_else(|| "never".into());
+                    .map_or_else(|| "never".into(), |d| d.to_rfc3339());
                 let last_status = job.last_status.unwrap_or_else(|| "n/a".into());
                 println!(
                     "- {} | {} | next={} | last={} ({})\n    cmd: {}",

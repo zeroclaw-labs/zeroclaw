@@ -44,6 +44,19 @@ pub struct AriaFeedEntry {
     pub updated_at: String,
 }
 
+pub struct FeedUploadRequest<'a> {
+    pub tenant_id: &'a str,
+    pub name: &'a str,
+    pub description: &'a str,
+    pub handler_code: &'a str,
+    pub schedule: &'a str,
+    pub refresh_seconds: Option<i64>,
+    pub category: Option<&'a str>,
+    pub retention: Option<&'a str>,
+    pub display: Option<&'a str>,
+    pub sandbox_config: Option<&'a str>,
+}
+
 // ── Registry ─────────────────────────────────────────────────────
 
 pub struct AriaFeedRegistry {
@@ -110,7 +123,9 @@ impl AriaFeedRegistry {
         ni.clear();
 
         for e in entries {
-            ti.entry(e.tenant_id.clone()).or_default().insert(e.id.clone());
+            ti.entry(e.tenant_id.clone())
+                .or_default()
+                .insert(e.id.clone());
             ni.insert(format!("{}:{}", e.tenant_id, e.name), e.id.clone());
             cache.insert(e.id.clone(), e);
         }
@@ -119,35 +134,43 @@ impl AriaFeedRegistry {
     }
 
     fn index_entry(&self, entry: &AriaFeedEntry) {
-        self.tenant_index.lock().unwrap()
-            .entry(entry.tenant_id.clone()).or_default().insert(entry.id.clone());
-        self.name_index.lock().unwrap()
-            .insert(format!("{}:{}", entry.tenant_id, entry.name), entry.id.clone());
+        self.tenant_index
+            .lock()
+            .unwrap()
+            .entry(entry.tenant_id.clone())
+            .or_default()
+            .insert(entry.id.clone());
+        self.name_index.lock().unwrap().insert(
+            format!("{}:{}", entry.tenant_id, entry.name),
+            entry.id.clone(),
+        );
     }
 
     fn deindex_entry(&self, entry: &AriaFeedEntry) {
         if let Some(set) = self.tenant_index.lock().unwrap().get_mut(&entry.tenant_id) {
             set.remove(&entry.id);
         }
-        self.name_index.lock().unwrap()
+        self.name_index
+            .lock()
+            .unwrap()
             .remove(&format!("{}:{}", entry.tenant_id, entry.name));
     }
 
     // ── Public API ───────────────────────────────────────────────
 
-    pub fn upload(
-        &self,
-        tenant_id: &str,
-        name: &str,
-        description: &str,
-        handler_code: &str,
-        schedule: &str,
-        refresh_seconds: Option<i64>,
-        category: Option<&str>,
-        retention: Option<&str>,
-        display: Option<&str>,
-        sandbox_config: Option<&str>,
-    ) -> Result<AriaFeedEntry> {
+    pub fn upload(&self, req: FeedUploadRequest<'_>) -> Result<AriaFeedEntry> {
+        let FeedUploadRequest {
+            tenant_id,
+            name,
+            description,
+            handler_code,
+            schedule,
+            refresh_seconds,
+            category,
+            retention,
+            display,
+            sandbox_config,
+        } = req;
         self.ensure_loaded()?;
         let now = Utc::now().to_rfc3339();
         let hash = sha256_hex(handler_code);
@@ -166,8 +189,17 @@ impl AriaFeedRegistry {
                      schedule=?4, refresh_seconds=?5, category=?6, retention=?7,
                      display=?8, sandbox_config=?9, updated_at=?10 WHERE id=?11",
                     params![
-                        description, handler_code, hash, schedule, refresh_seconds,
-                        category, retention, display, sandbox_config, now, eid
+                        description,
+                        handler_code,
+                        hash,
+                        schedule,
+                        refresh_seconds,
+                        category,
+                        retention,
+                        display,
+                        sandbox_config,
+                        now,
+                        eid
                     ],
                 )?;
                 Ok(())
@@ -213,11 +245,21 @@ impl AriaFeedRegistry {
                      sandbox_config, status, created_at, updated_at)
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
                     params![
-                        entry.id, entry.tenant_id, entry.name, entry.description,
-                        entry.handler_code, entry.handler_hash, entry.schedule,
-                        entry.refresh_seconds, entry.category, entry.retention,
-                        entry.display, entry.sandbox_config, entry.status,
-                        entry.created_at, entry.updated_at
+                        entry.id,
+                        entry.tenant_id,
+                        entry.name,
+                        entry.description,
+                        entry.handler_code,
+                        entry.handler_hash,
+                        entry.schedule,
+                        entry.refresh_seconds,
+                        entry.category,
+                        entry.retention,
+                        entry.display,
+                        entry.sandbox_config,
+                        entry.status,
+                        entry.created_at,
+                        entry.updated_at
                     ],
                 )?;
                 Ok(())
@@ -235,8 +277,12 @@ impl AriaFeedRegistry {
 
     pub fn get_by_name(&self, tenant_id: &str, name: &str) -> Result<Option<AriaFeedEntry>> {
         self.ensure_loaded()?;
-        let id = self.name_index.lock().unwrap()
-            .get(&format!("{tenant_id}:{name}")).cloned();
+        let id = self
+            .name_index
+            .lock()
+            .unwrap()
+            .get(&format!("{tenant_id}:{name}"))
+            .cloned();
         match id {
             Some(id) => self.get(&id),
             None => Ok(None),
@@ -264,7 +310,12 @@ impl AriaFeedRegistry {
 
     pub fn count(&self, tenant_id: &str) -> Result<usize> {
         self.ensure_loaded()?;
-        Ok(self.tenant_index.lock().unwrap().get(tenant_id).map_or(0, |s| s.len()))
+        Ok(self
+            .tenant_index
+            .lock()
+            .unwrap()
+            .get(tenant_id)
+            .map_or(0, std::collections::HashSet::len))
     }
 
     /// Soft-delete a feed.
@@ -327,10 +378,19 @@ mod tests {
     }
 
     fn upload_default(reg: &AriaFeedRegistry, tenant: &str, name: &str) -> AriaFeedEntry {
-        reg.upload(
-            tenant, name, "desc", "handler()", "*/5 * * * *",
-            Some(300), Some("news"), None, None, None,
-        ).unwrap()
+        reg.upload(FeedUploadRequest {
+            tenant_id: tenant,
+            name,
+            description: "desc",
+            handler_code: "handler()",
+            schedule: "*/5 * * * *",
+            refresh_seconds: Some(300),
+            category: Some("news"),
+            retention: None,
+            display: None,
+            sandbox_config: None,
+        })
+        .unwrap()
     }
 
     #[test]
@@ -349,10 +409,20 @@ mod tests {
     fn upsert_by_name_updates_existing() {
         let reg = setup();
         let v1 = upload_default(&reg, "t1", "feed");
-        let v2 = reg.upload(
-            "t1", "feed", "updated desc", "handler_v2()", "0 * * * *",
-            Some(600), None, None, None, None,
-        ).unwrap();
+        let v2 = reg
+            .upload(FeedUploadRequest {
+                tenant_id: "t1",
+                name: "feed",
+                description: "updated desc",
+                handler_code: "handler_v2()",
+                schedule: "0 * * * *",
+                refresh_seconds: Some(600),
+                category: None,
+                retention: None,
+                display: None,
+                sandbox_config: None,
+            })
+            .unwrap();
         assert_eq!(v2.id, v1.id);
         assert_eq!(v2.description, "updated desc");
         assert_eq!(reg.count("t1").unwrap(), 1);

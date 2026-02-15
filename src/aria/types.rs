@@ -95,7 +95,7 @@ pub enum ParameterType {
 /// Top-level Aria SDK configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AriaConfig {
-    /// Database path for the shared SQLite registry
+    /// Database path for the shared `SQLite` registry
     pub db_path: String,
     /// Quilt API URL for sandboxed execution
     pub quilt_api_url: Option<String>,
@@ -208,21 +208,17 @@ pub struct ContainerPort {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum PortProtocol {
+    #[default]
     Tcp,
     Udp,
-}
-
-impl Default for PortProtocol {
-    fn default() -> Self {
-        Self::Tcp
-    }
 }
 
 // ── Container Configuration ─────────────────────────────────────
 
 /// Full container configuration for Quilt lifecycle management
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ContainerConfig {
     pub image: String,
     pub name: Option<String>,
@@ -239,35 +235,13 @@ pub struct ContainerConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum RestartPolicy {
+    #[default]
     No,
     Always,
     OnFailure,
     UnlessStopped,
-}
-
-impl Default for RestartPolicy {
-    fn default() -> Self {
-        Self::No
-    }
-}
-
-impl Default for ContainerConfig {
-    fn default() -> Self {
-        Self {
-            image: String::new(),
-            name: None,
-            command: None,
-            environment: HashMap::new(),
-            volumes: Vec::new(),
-            ports: Vec::new(),
-            memory_limit_mb: None,
-            cpu_limit_percent: None,
-            restart_policy: RestartPolicy::default(),
-            labels: HashMap::new(),
-            network: None,
-        }
-    }
 }
 
 // ── Network Configuration ────────────────────────────────────────
@@ -286,7 +260,9 @@ pub struct NetworkConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum NetworkDriver {
+    #[default]
     Bridge,
     Host,
     Overlay,
@@ -294,23 +270,13 @@ pub enum NetworkDriver {
     None,
 }
 
-impl Default for NetworkDriver {
-    fn default() -> Self {
-        Self::Bridge
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum NetworkIsolation {
+    #[default]
     Default,
     Isolated,
-}
-
-impl Default for NetworkIsolation {
-    fn default() -> Self {
-        Self::Default
-    }
 }
 
 /// DNS configuration for container networks
@@ -443,38 +409,27 @@ pub enum CronSchedule {
         anchor_ms: Option<i64>,
     },
     /// Standard cron expression with optional timezone
-    Cron {
-        expr: String,
-        tz: Option<String>,
-    },
+    Cron { expr: String, tz: Option<String> },
 }
 
 /// Session target for cron job execution
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum CronSessionTarget {
+    #[default]
     Main,
     Isolated,
-}
-
-impl Default for CronSessionTarget {
-    fn default() -> Self {
-        Self::Main
-    }
 }
 
 /// Wake mode for cron execution
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum CronWakeMode {
+    #[default]
     NextHeartbeat,
     Now,
-}
-
-impl Default for CronWakeMode {
-    fn default() -> Self {
-        Self::NextHeartbeat
-    }
 }
 
 /// Payload types for cron job execution
@@ -539,19 +494,15 @@ pub struct CronConfig {
 /// Memory storage tiers
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum MemoryTier {
     /// Session-scoped, cleared when session ends
     Scratchpad,
     /// TTL-based, auto-expires
     Ephemeral,
     /// Persistent, never expires (default)
+    #[default]
     Longterm,
-}
-
-impl Default for MemoryTier {
-    fn default() -> Self {
-        Self::Longterm
-    }
 }
 
 impl std::fmt::Display for MemoryTier {
@@ -635,8 +586,10 @@ pub struct AgentRuntimeOptions {
 /// Team collaboration modes
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum TeamMode {
     /// A coordinator agent delegates to team members
+    #[default]
     Coordinator,
     /// Agents take turns in order
     RoundRobin,
@@ -646,12 +599,6 @@ pub enum TeamMode {
     Parallel,
     /// Agents execute in strict sequence, each building on prior output
     Sequential,
-}
-
-impl Default for TeamMode {
-    fn default() -> Self {
-        Self::Coordinator
-    }
 }
 
 /// Configuration for a team member
@@ -797,16 +744,12 @@ impl MetadataKeys {
 /// Status for registry entities (tools, agents, feeds, etc.)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum EntityStatus {
+    #[default]
     Active,
     Paused,
     Deleted,
-}
-
-impl Default for EntityStatus {
-    fn default() -> Self {
-        Self::Active
-    }
 }
 
 impl std::fmt::Display for EntityStatus {
@@ -822,18 +765,14 @@ impl std::fmt::Display for EntityStatus {
 /// Task-specific status
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum TaskStatus {
+    #[default]
     Pending,
     Running,
     Completed,
     Failed,
     Cancelled,
-}
-
-impl Default for TaskStatus {
-    fn default() -> Self {
-        Self::Pending
-    }
 }
 
 impl std::fmt::Display for TaskStatus {
@@ -851,18 +790,14 @@ impl std::fmt::Display for TaskStatus {
 /// Container runtime state
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum ContainerState {
+    #[default]
     Pending,
     Running,
     Stopped,
     Exited,
     Error,
-}
-
-impl Default for ContainerState {
-    fn default() -> Self {
-        Self::Pending
-    }
 }
 
 impl std::fmt::Display for ContainerState {
@@ -929,7 +864,9 @@ mod tests {
 
     #[test]
     fn cron_schedule_variants_serialize() {
-        let at = CronSchedule::At { at_ms: 1_700_000_000_000 };
+        let at = CronSchedule::At {
+            at_ms: 1_700_000_000_000,
+        };
         let json = serde_json::to_string(&at).unwrap();
         assert!(json.contains("\"kind\":\"at\""));
 

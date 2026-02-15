@@ -1,22 +1,22 @@
 //! Aria SDK — the complete registry, execution, and orchestration surface area.
 //!
-//! All 11 registries share a single SQLite database initialized via `AriaRegistries::new()`.
+//! All 11 registries share a single `SQLite` database initialized via `AriaRegistries::new()`.
 //! The registries provide tenant-isolated persistence with in-memory caching.
 
 pub mod db;
 pub mod types;
 
-pub mod tool_registry;
 pub mod agent_registry;
-pub mod memory_registry;
-pub mod task_registry;
-pub mod feed_registry;
-pub mod cron_registry;
-pub mod kv_registry;
-pub mod team_registry;
-pub mod pipeline_registry;
 pub mod container_registry;
+pub mod cron_registry;
+pub mod feed_registry;
+pub mod kv_registry;
+pub mod memory_registry;
 pub mod network_registry;
+pub mod pipeline_registry;
+pub mod task_registry;
+pub mod team_registry;
+pub mod tool_registry;
 
 // cron_bridge depends on crate::cron which references binary-only modules (CronCommands, health).
 // It is available in the binary crate but not in the library crate.
@@ -27,7 +27,7 @@ use db::AriaDb;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
-/// All 11 Aria registries, backed by a shared SQLite database.
+/// All 11 Aria registries, backed by a shared `SQLite` database.
 pub struct AriaRegistries {
     pub db: AriaDb,
     pub tools: tool_registry::AriaToolRegistry,

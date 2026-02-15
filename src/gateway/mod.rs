@@ -15,7 +15,7 @@ use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use anyhow::Result;
 use axum::{
     body::Bytes,
-    extract::{Query, State, WebSocketUpgrade, ws},
+    extract::{ws, Query, State, WebSocketUpgrade},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json},
     routing::{get, post},
@@ -163,11 +163,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     };
 
     // ── Aria Registry API ──────────────────────────────────────
-    let aria_db_path = config
-        .workspace_dir
-        .join("aria.db");
-    let aria_registries = crate::aria::initialize_aria_registries(&aria_db_path)
-        .unwrap_or_else(|e| {
+    let aria_db_path = config.workspace_dir.join("aria.db");
+    let aria_registries =
+        crate::aria::initialize_aria_registries(&aria_db_path).unwrap_or_else(|e| {
             tracing::warn!("Failed to initialize Aria registries: {e}");
             // Create a fallback in-memory DB
             let db = crate::aria::db::AriaDb::open_in_memory().expect("fallback in-memory DB");
@@ -456,7 +454,7 @@ async fn handle_events_socket(mut socket: ws::WebSocket) {
         if let Ok(json) = serde_json::to_string(evt) {
             if tx.try_send(json).is_err() {
                 let n = dropped_inner.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if n % 100 == 0 {
+                if n.is_multiple_of(100) {
                     tracing::warn!(
                         dropped = n + 1,
                         "Event stream backpressure: dropping events (WebSocket too slow)"
@@ -472,7 +470,7 @@ async fn handle_events_socket(mut socket: ws::WebSocket) {
     loop {
         tokio::select! {
             Some(json) = rx.recv() => {
-                if socket.send(ws::Message::Text(json.into())).await.is_err() {
+                if socket.send(ws::Message::Text(json)).await.is_err() {
                     break; // Client disconnected
                 }
             }
@@ -489,7 +487,10 @@ async fn handle_events_socket(mut socket: ws::WebSocket) {
     bus.unsubscribe(listener_id);
     let total_dropped = dropped.load(std::sync::atomic::Ordering::Relaxed);
     if total_dropped > 0 {
-        tracing::warn!(total_dropped, "WebSocket session dropped events due to backpressure");
+        tracing::warn!(
+            total_dropped,
+            "WebSocket session dropped events due to backpressure"
+        );
     }
     tracing::info!("Dashboard WebSocket disconnected");
 }

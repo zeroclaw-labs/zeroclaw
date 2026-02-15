@@ -30,6 +30,16 @@ pub struct AriaMemoryEntry {
     pub updated_at: String,
 }
 
+pub struct MemoryCreateRequest<'a> {
+    pub tenant_id: &'a str,
+    pub key: &'a str,
+    pub value: &'a str,
+    pub tier: &'a str,
+    pub namespace: Option<&'a str>,
+    pub session_id: Option<&'a str>,
+    pub ttl_seconds: Option<i64>,
+}
+
 // ── Registry ─────────────────────────────────────────────────────
 
 pub struct AriaMemoryRegistry {
@@ -96,7 +106,9 @@ impl AriaMemoryRegistry {
         ni.clear();
 
         for e in entries {
-            ti.entry(e.tenant_id.clone()).or_default().insert(e.id.clone());
+            ti.entry(e.tenant_id.clone())
+                .or_default()
+                .insert(e.id.clone());
             ni.insert(Self::nkey(&e.tenant_id, &e.key, &e.tier), e.id.clone());
             cache.insert(e.id.clone(), e);
         }
@@ -105,38 +117,46 @@ impl AriaMemoryRegistry {
     }
 
     fn index_entry(&self, entry: &AriaMemoryEntry) {
-        self.tenant_index.lock().unwrap()
-            .entry(entry.tenant_id.clone()).or_default().insert(entry.id.clone());
-        self.name_index.lock().unwrap()
-            .insert(Self::nkey(&entry.tenant_id, &entry.key, &entry.tier), entry.id.clone());
+        self.tenant_index
+            .lock()
+            .unwrap()
+            .entry(entry.tenant_id.clone())
+            .or_default()
+            .insert(entry.id.clone());
+        self.name_index.lock().unwrap().insert(
+            Self::nkey(&entry.tenant_id, &entry.key, &entry.tier),
+            entry.id.clone(),
+        );
     }
 
     fn deindex_entry(&self, entry: &AriaMemoryEntry) {
         if let Some(set) = self.tenant_index.lock().unwrap().get_mut(&entry.tenant_id) {
             set.remove(&entry.id);
         }
-        self.name_index.lock().unwrap()
-            .remove(&Self::nkey(&entry.tenant_id, &entry.key, &entry.tier));
+        self.name_index.lock().unwrap().remove(&Self::nkey(
+            &entry.tenant_id,
+            &entry.key,
+            &entry.tier,
+        ));
     }
 
     // ── Public API ───────────────────────────────────────────────
 
     /// Create or update a memory entry. Upserts on tenant+key+tier.
-    pub fn create(
-        &self,
-        tenant_id: &str,
-        key: &str,
-        value: &str,
-        tier: &str,
-        namespace: Option<&str>,
-        session_id: Option<&str>,
-        ttl_seconds: Option<i64>,
-    ) -> Result<AriaMemoryEntry> {
+    pub fn create(&self, req: MemoryCreateRequest<'_>) -> Result<AriaMemoryEntry> {
+        let MemoryCreateRequest {
+            tenant_id,
+            key,
+            value,
+            tier,
+            namespace,
+            session_id,
+            ttl_seconds,
+        } = req;
         self.ensure_loaded()?;
         let now = Utc::now().to_rfc3339();
-        let expires_at = ttl_seconds.map(|ttl| {
-            (Utc::now() + chrono::Duration::seconds(ttl)).to_rfc3339()
-        });
+        let expires_at =
+            ttl_seconds.map(|ttl| (Utc::now() + chrono::Duration::seconds(ttl)).to_rfc3339());
 
         let existing_id = {
             let ni = self.name_index.lock().unwrap();
@@ -150,7 +170,15 @@ impl AriaMemoryRegistry {
                 conn.execute(
                     "UPDATE aria_memory SET value=?1, namespace=?2, session_id=?3,
                      ttl_seconds=?4, expires_at=?5, updated_at=?6 WHERE id=?7",
-                    params![value, namespace, session_id, ttl_seconds, expires_at, now, eid],
+                    params![
+                        value,
+                        namespace,
+                        session_id,
+                        ttl_seconds,
+                        expires_at,
+                        now,
+                        eid
+                    ],
                 )?;
                 Ok(())
             })?;
@@ -186,9 +214,17 @@ impl AriaMemoryRegistry {
                      session_id, ttl_seconds, expires_at, created_at, updated_at)
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                     params![
-                        entry.id, entry.tenant_id, entry.key, entry.value, entry.tier,
-                        entry.namespace, entry.session_id, entry.ttl_seconds,
-                        entry.expires_at, entry.created_at, entry.updated_at
+                        entry.id,
+                        entry.tenant_id,
+                        entry.key,
+                        entry.value,
+                        entry.tier,
+                        entry.namespace,
+                        entry.session_id,
+                        entry.ttl_seconds,
+                        entry.expires_at,
+                        entry.created_at,
+                        entry.updated_at
                     ],
                 )?;
                 Ok(())
@@ -204,10 +240,19 @@ impl AriaMemoryRegistry {
         Ok(self.cache.lock().unwrap().get(id).cloned())
     }
 
-    pub fn get_by_name(&self, tenant_id: &str, key: &str, tier: &str) -> Result<Option<AriaMemoryEntry>> {
+    pub fn get_by_name(
+        &self,
+        tenant_id: &str,
+        key: &str,
+        tier: &str,
+    ) -> Result<Option<AriaMemoryEntry>> {
         self.ensure_loaded()?;
-        let id = self.name_index.lock().unwrap()
-            .get(&Self::nkey(tenant_id, key, tier)).cloned();
+        let id = self
+            .name_index
+            .lock()
+            .unwrap()
+            .get(&Self::nkey(tenant_id, key, tier))
+            .cloned();
         match id {
             Some(id) => self.get(&id),
             None => Ok(None),
@@ -228,7 +273,12 @@ impl AriaMemoryRegistry {
 
     pub fn count(&self, tenant_id: &str) -> Result<usize> {
         self.ensure_loaded()?;
-        Ok(self.tenant_index.lock().unwrap().get(tenant_id).map_or(0, |s| s.len()))
+        Ok(self
+            .tenant_index
+            .lock()
+            .unwrap()
+            .get(tenant_id)
+            .map_or(0, std::collections::HashSet::len))
     }
 
     /// Soft-delete (remove) a memory entry.
@@ -245,13 +295,14 @@ impl AriaMemoryRegistry {
         Ok(true)
     }
 
-    /// Sweep expired ephemeral entries (where expires_at < now).
+    /// Sweep expired ephemeral entries (where `expires_at` < now).
     pub fn sweep_expired(&self) -> Result<usize> {
         self.ensure_loaded()?;
         let now = Utc::now().to_rfc3339();
         let expired_ids: Vec<String> = {
             let cache = self.cache.lock().unwrap();
-            cache.values()
+            cache
+                .values()
                 .filter(|e| {
                     if let Some(ref exp) = e.expires_at {
                         exp.as_str() < now.as_str()
@@ -274,11 +325,9 @@ impl AriaMemoryRegistry {
         self.ensure_loaded()?;
         let session_ids: Vec<String> = {
             let cache = self.cache.lock().unwrap();
-            cache.values()
-                .filter(|e| {
-                    e.tier == "scratchpad"
-                        && e.session_id.as_deref() == Some(session_id)
-                })
+            cache
+                .values()
+                .filter(|e| e.tier == "scratchpad" && e.session_id.as_deref() == Some(session_id))
                 .map(|e| e.id.clone())
                 .collect()
         };
@@ -302,12 +351,41 @@ mod tests {
         AriaMemoryRegistry::new(db)
     }
 
+    fn create_mem<'a>(
+        reg: &AriaMemoryRegistry,
+        tenant_id: &'a str,
+        key: &'a str,
+        value: &'a str,
+        tier: &'a str,
+        namespace: Option<&'a str>,
+        session_id: Option<&'a str>,
+        ttl_seconds: Option<i64>,
+    ) -> AriaMemoryEntry {
+        reg.create(MemoryCreateRequest {
+            tenant_id,
+            key,
+            value,
+            tier,
+            namespace,
+            session_id,
+            ttl_seconds,
+        })
+        .unwrap()
+    }
+
     #[test]
     fn create_and_get_roundtrip() {
         let reg = setup();
-        let entry = reg
-            .create("t1", "user_pref", "dark_mode", "longterm", None, None, None)
-            .unwrap();
+        let entry = create_mem(
+            &reg,
+            "t1",
+            "user_pref",
+            "dark_mode",
+            "longterm",
+            None,
+            None,
+            None,
+        );
         assert_eq!(entry.key, "user_pref");
         assert_eq!(entry.tier, "longterm");
 
@@ -318,12 +396,8 @@ mod tests {
     #[test]
     fn upsert_by_key_and_tier() {
         let reg = setup();
-        let v1 = reg
-            .create("t1", "counter", "1", "longterm", None, None, None)
-            .unwrap();
-        let v2 = reg
-            .create("t1", "counter", "2", "longterm", None, None, None)
-            .unwrap();
+        let v1 = create_mem(&reg, "t1", "counter", "1", "longterm", None, None, None);
+        let v2 = create_mem(&reg, "t1", "counter", "2", "longterm", None, None, None);
         assert_eq!(v2.id, v1.id);
         assert_eq!(v2.value, "2");
         assert_eq!(reg.count("t1").unwrap(), 1);
@@ -332,10 +406,17 @@ mod tests {
     #[test]
     fn different_tiers_are_separate() {
         let reg = setup();
-        reg.create("t1", "key", "scratch_val", "scratchpad", None, Some("s1"), None)
-            .unwrap();
-        reg.create("t1", "key", "long_val", "longterm", None, None, None)
-            .unwrap();
+        create_mem(
+            &reg,
+            "t1",
+            "key",
+            "scratch_val",
+            "scratchpad",
+            None,
+            Some("s1"),
+            None,
+        );
+        create_mem(&reg, "t1", "key", "long_val", "longterm", None, None, None);
         assert_eq!(reg.count("t1").unwrap(), 2);
 
         let scratch = reg.get_by_name("t1", "key", "scratchpad").unwrap().unwrap();
@@ -347,9 +428,9 @@ mod tests {
     #[test]
     fn list_with_tenant_isolation() {
         let reg = setup();
-        reg.create("t1", "a", "1", "longterm", None, None, None).unwrap();
-        reg.create("t1", "b", "2", "longterm", None, None, None).unwrap();
-        reg.create("t2", "c", "3", "longterm", None, None, None).unwrap();
+        create_mem(&reg, "t1", "a", "1", "longterm", None, None, None);
+        create_mem(&reg, "t1", "b", "2", "longterm", None, None, None);
+        create_mem(&reg, "t2", "c", "3", "longterm", None, None, None);
 
         assert_eq!(reg.list("t1").unwrap().len(), 2);
         assert_eq!(reg.list("t2").unwrap().len(), 1);
@@ -359,9 +440,7 @@ mod tests {
     #[test]
     fn delete_removes_entry() {
         let reg = setup();
-        let entry = reg
-            .create("t1", "temp", "val", "longterm", None, None, None)
-            .unwrap();
+        let entry = create_mem(&reg, "t1", "temp", "val", "longterm", None, None, None);
         assert!(reg.delete(&entry.id).unwrap());
         assert_eq!(reg.count("t1").unwrap(), 0);
         assert!(reg.get(&entry.id).unwrap().is_none());
@@ -377,7 +456,7 @@ mod tests {
     fn count_accuracy() {
         let reg = setup();
         assert_eq!(reg.count("t1").unwrap(), 0);
-        reg.create("t1", "a", "1", "longterm", None, None, None).unwrap();
+        create_mem(&reg, "t1", "a", "1", "longterm", None, None, None);
         assert_eq!(reg.count("t1").unwrap(), 1);
     }
 
@@ -385,18 +464,27 @@ mod tests {
     fn sweep_expired_removes_old_entries() {
         let reg = setup();
         // Create an entry with 0 TTL (already expired)
-        let entry = reg
-            .create("t1", "ephemeral_key", "val", "ephemeral", None, None, Some(0))
-            .unwrap();
+        let entry = create_mem(
+            &reg,
+            "t1",
+            "ephemeral_key",
+            "val",
+            "ephemeral",
+            None,
+            None,
+            Some(0),
+        );
         // Manually set expires_at in the past
         let past = "2000-01-01T00:00:00+00:00";
-        reg.db.with_conn(|conn| {
-            conn.execute(
-                "UPDATE aria_memory SET expires_at=?1 WHERE id=?2",
-                params![past, entry.id],
-            )?;
-            Ok(())
-        }).unwrap();
+        reg.db
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE aria_memory SET expires_at=?1 WHERE id=?2",
+                    params![past, entry.id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
         // Update cache
         {
             let mut cache = reg.cache.lock().unwrap();
@@ -413,14 +501,37 @@ mod tests {
     #[test]
     fn clear_session_removes_scratchpad_entries() {
         let reg = setup();
-        reg.create("t1", "scratch1", "v1", "scratchpad", None, Some("sess-abc"), None)
-            .unwrap();
-        reg.create("t1", "scratch2", "v2", "scratchpad", None, Some("sess-abc"), None)
-            .unwrap();
-        reg.create("t1", "scratch3", "v3", "scratchpad", None, Some("sess-other"), None)
-            .unwrap();
-        reg.create("t1", "persist", "v4", "longterm", None, None, None)
-            .unwrap();
+        create_mem(
+            &reg,
+            "t1",
+            "scratch1",
+            "v1",
+            "scratchpad",
+            None,
+            Some("sess-abc"),
+            None,
+        );
+        create_mem(
+            &reg,
+            "t1",
+            "scratch2",
+            "v2",
+            "scratchpad",
+            None,
+            Some("sess-abc"),
+            None,
+        );
+        create_mem(
+            &reg,
+            "t1",
+            "scratch3",
+            "v3",
+            "scratchpad",
+            None,
+            Some("sess-other"),
+            None,
+        );
+        create_mem(&reg, "t1", "persist", "v4", "longterm", None, None, None);
 
         let cleared = reg.clear_session("sess-abc").unwrap();
         assert_eq!(cleared, 2);
@@ -430,8 +541,16 @@ mod tests {
     #[test]
     fn clear_session_does_not_touch_other_tiers() {
         let reg = setup();
-        reg.create("t1", "k", "v", "longterm", None, Some("sess-abc"), None)
-            .unwrap();
+        create_mem(
+            &reg,
+            "t1",
+            "k",
+            "v",
+            "longterm",
+            None,
+            Some("sess-abc"),
+            None,
+        );
         let cleared = reg.clear_session("sess-abc").unwrap();
         assert_eq!(cleared, 0);
         assert_eq!(reg.count("t1").unwrap(), 1);
@@ -442,7 +561,7 @@ mod tests {
         let db = AriaDb::open_in_memory().unwrap();
         {
             let reg = AriaMemoryRegistry::new(db.clone());
-            reg.create("t1", "keep", "value", "longterm", None, None, None).unwrap();
+            create_mem(&reg, "t1", "keep", "value", "longterm", None, None, None);
         }
         let reg2 = AriaMemoryRegistry::new(db);
         let entry = reg2.get_by_name("t1", "keep", "longterm").unwrap().unwrap();

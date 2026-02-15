@@ -11,9 +11,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use super::types::{PipelineExecutionContext, StepExecutionResult};
 use crate::aria::db::AriaDb;
 use crate::aria::types::{PipelineResult, PipelineStep, RetryPolicy, StepResult};
-use super::types::{PipelineExecutionContext, StepExecutionResult};
 
 /// Pipeline execution engine that resolves a DAG of steps and executes them
 /// with dependency ordering, parallelism, retries, and condition evaluation.
@@ -106,8 +106,8 @@ impl PipelineEngine {
             steps.iter().map(|s| (s.id.as_str(), s)).collect();
 
         // Validate and compute topological order
-        let execution_order = topological_sort(steps)
-            .context("Failed to resolve pipeline step dependencies")?;
+        let execution_order =
+            topological_sort(steps).context("Failed to resolve pipeline step dependencies")?;
 
         let mut completed: HashSet<String> = HashSet::new();
         let mut step_results: Vec<StepResult> = Vec::new();
@@ -166,9 +166,7 @@ impl PipelineEngine {
             for step_id in &ready {
                 let step = (*step_map.get(step_id.as_str()).unwrap()).clone();
                 let ctx_clone = ctx.clone();
-                let handle = tokio::spawn(async move {
-                    execute_step(&ctx_clone, &step).await
-                });
+                let handle = tokio::spawn(async move { execute_step(&ctx_clone, &step).await });
                 handles.push((step_id.clone(), handle));
             }
 
@@ -274,11 +272,7 @@ fn topological_sort(steps: &[PipelineStep]) -> Result<Vec<String>> {
     for step in steps {
         for dep in &step.dependencies {
             if !step_ids.contains(dep.as_str()) {
-                bail!(
-                    "Step '{}' depends on non-existent step '{}'",
-                    step.id,
-                    dep
-                );
+                bail!("Step '{}' depends on non-existent step '{}'", step.id, dep);
             }
         }
     }
@@ -485,8 +479,7 @@ async fn execute_step(
         success: false,
         output: None,
         error: Some(format!(
-            "Step failed after {} attempts: {}",
-            max_attempts, last_error
+            "Step failed after {max_attempts} attempts: {last_error}"
         )),
         duration_ms: step_start.elapsed().as_millis() as u64,
         retries_used: retry_policy.max_retries,
@@ -494,14 +487,14 @@ async fn execute_step(
 }
 
 /// Compute the backoff delay for a retry attempt using exponential backoff.
-/// delay = initial_delay_ms * backoff_multiplier^attempt, capped at max_delay_ms.
+/// delay = `initial_delay_ms` * `backoff_multiplier^attempt`, capped at `max_delay_ms`.
 fn compute_backoff_delay(policy: &RetryPolicy, attempt: u32) -> u64 {
     let delay = (policy.initial_delay_ms as f64) * policy.backoff_multiplier.powi(attempt as i32);
     let capped = delay.min(policy.max_delay_ms as f64) as u64;
     capped.max(1) // Ensure at least 1ms delay
 }
 
-/// Dispatch a pipeline step to the appropriate executor based on step_type.
+/// Dispatch a pipeline step to the appropriate executor based on `step_type`.
 ///
 /// - Agent: Processes input with the referenced agent
 /// - Tool: Executes the referenced tool with mapped inputs
@@ -552,26 +545,22 @@ fn dispatch_step(
                 "status": "completed",
             }))
         }
-        PipelineStepType::Condition => {
-            Ok(serde_json::json!({
-                "step_id": step.id,
-                "step_name": step.name,
-                "step_type": "Condition",
-                "inputs": mapped_inputs,
-                "output": true,
-                "status": "completed",
-            }))
-        }
-        PipelineStepType::Transform => {
-            Ok(serde_json::json!({
-                "step_id": step.id,
-                "step_name": step.name,
-                "step_type": "Transform",
-                "inputs": mapped_inputs,
-                "output": mapped_inputs,
-                "status": "completed",
-            }))
-        }
+        PipelineStepType::Condition => Ok(serde_json::json!({
+            "step_id": step.id,
+            "step_name": step.name,
+            "step_type": "Condition",
+            "inputs": mapped_inputs,
+            "output": true,
+            "status": "completed",
+        })),
+        PipelineStepType::Transform => Ok(serde_json::json!({
+            "step_id": step.id,
+            "step_name": step.name,
+            "step_type": "Transform",
+            "inputs": mapped_inputs,
+            "output": mapped_inputs,
+            "status": "completed",
+        })),
     }
 }
 
@@ -746,7 +735,10 @@ mod tests {
         mapping.insert("input_text".to_string(), "step1".to_string());
 
         let resolved = resolve_input_mapping(&mapping, &outputs, &vars);
-        assert_eq!(resolved.get("input_text"), Some(&serde_json::json!("hello")));
+        assert_eq!(
+            resolved.get("input_text"),
+            Some(&serde_json::json!("hello"))
+        );
     }
 
     #[test]
@@ -759,10 +751,7 @@ mod tests {
         mapping.insert("key".to_string(), "$api_key".to_string());
 
         let resolved = resolve_input_mapping(&mapping, &outputs, &vars);
-        assert_eq!(
-            resolved.get("key"),
-            Some(&serde_json::json!("secret123"))
-        );
+        assert_eq!(resolved.get("key"), Some(&serde_json::json!("secret123")));
     }
 
     #[test]

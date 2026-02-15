@@ -433,15 +433,13 @@ mod tests {
 
     #[test]
     fn client_strips_trailing_slash_from_url() {
-        let client =
-            QuiltClient::new("https://backend.quilt.sh/", "qlt_test_key").unwrap();
+        let client = QuiltClient::new("https://backend.quilt.sh/", "qlt_test_key").unwrap();
         assert_eq!(client.api_url(), "https://backend.quilt.sh");
     }
 
     #[test]
     fn client_url_builder() {
-        let client =
-            QuiltClient::new("https://backend.quilt.sh", "qlt_test_key").unwrap();
+        let client = QuiltClient::new("https://backend.quilt.sh", "qlt_test_key").unwrap();
         assert_eq!(
             client.url("/api/containers"),
             "https://backend.quilt.sh/api/containers"
@@ -813,11 +811,15 @@ mod tests {
     #[tokio::test]
     async fn singleton_reset_clears_client() {
         reset_client().await;
-        let c = get_client("https://example.com", "qlt_test_key").await.unwrap();
+        let c = get_client("https://example.com", "qlt_test_key")
+            .await
+            .unwrap();
         assert_eq!(c.api_url(), "https://example.com");
 
         reset_client().await;
-        let c2 = get_client("https://other.com", "qlt_other_key").await.unwrap();
+        let c2 = get_client("https://other.com", "qlt_other_key")
+            .await
+            .unwrap();
         assert_eq!(c2.api_url(), "https://other.com");
 
         // Clean up

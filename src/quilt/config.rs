@@ -164,7 +164,7 @@ impl SandboxQuiltConfig {
                 return Some(v);
             }
         }
-        hardcoded.map(|s| s.to_string())
+        hardcoded.map(std::string::ToString::to_string)
     }
 
     fn resolve_u32(
@@ -193,22 +193,32 @@ impl SandboxQuiltConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{LazyLock, Mutex};
+
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     // Helper: ensure env vars don't leak between tests
     fn with_clean_env<F: FnOnce()>(vars: &[&str], f: F) {
+        let _guard = ENV_LOCK.lock().unwrap();
         // Save originals
         let originals: Vec<_> = vars.iter().map(|v| (*v, std::env::var(v).ok())).collect();
         // Clear
         for v in vars {
             std::env::remove_var(v);
         }
-        f();
-        // Restore
-        for (var, val) in originals {
-            match val {
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+
+        // Restore env even if the test closure panics.
+        for (var, value) in originals {
+            match value {
                 Some(v) => std::env::set_var(var, v),
                 None => std::env::remove_var(var),
             }
+        }
+
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
         }
     }
 

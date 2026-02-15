@@ -30,6 +30,17 @@ pub struct AriaNetworkEntry {
     pub updated_at: String,
 }
 
+pub struct NetworkCreateRequest<'a> {
+    pub tenant_id: &'a str,
+    pub name: &'a str,
+    pub driver: &'a str,
+    pub isolation: &'a str,
+    pub ipv6: bool,
+    pub dns_config: Option<&'a str>,
+    pub labels: &'a str,
+    pub options: &'a str,
+}
+
 // ── Registry ─────────────────────────────────────────────────────
 
 pub struct AriaNetworkRegistry {
@@ -91,7 +102,9 @@ impl AriaNetworkRegistry {
         ni.clear();
 
         for e in entries {
-            ti.entry(e.tenant_id.clone()).or_default().insert(e.id.clone());
+            ti.entry(e.tenant_id.clone())
+                .or_default()
+                .insert(e.id.clone());
             ni.insert(format!("{}:{}", e.tenant_id, e.name), e.id.clone());
             cache.insert(e.id.clone(), e);
         }
@@ -100,33 +113,41 @@ impl AriaNetworkRegistry {
     }
 
     fn index_entry(&self, entry: &AriaNetworkEntry) {
-        self.tenant_index.lock().unwrap()
-            .entry(entry.tenant_id.clone()).or_default().insert(entry.id.clone());
-        self.name_index.lock().unwrap()
-            .insert(format!("{}:{}", entry.tenant_id, entry.name), entry.id.clone());
+        self.tenant_index
+            .lock()
+            .unwrap()
+            .entry(entry.tenant_id.clone())
+            .or_default()
+            .insert(entry.id.clone());
+        self.name_index.lock().unwrap().insert(
+            format!("{}:{}", entry.tenant_id, entry.name),
+            entry.id.clone(),
+        );
     }
 
     fn deindex_entry(&self, entry: &AriaNetworkEntry) {
         if let Some(set) = self.tenant_index.lock().unwrap().get_mut(&entry.tenant_id) {
             set.remove(&entry.id);
         }
-        self.name_index.lock().unwrap()
+        self.name_index
+            .lock()
+            .unwrap()
             .remove(&format!("{}:{}", entry.tenant_id, entry.name));
     }
 
     // ── Public API ───────────────────────────────────────────────
 
-    pub fn create(
-        &self,
-        tenant_id: &str,
-        name: &str,
-        driver: &str,
-        isolation: &str,
-        ipv6: bool,
-        dns_config: Option<&str>,
-        labels: &str,
-        options: &str,
-    ) -> Result<AriaNetworkEntry> {
+    pub fn create(&self, req: NetworkCreateRequest<'_>) -> Result<AriaNetworkEntry> {
+        let NetworkCreateRequest {
+            tenant_id,
+            name,
+            driver,
+            isolation,
+            ipv6,
+            dns_config,
+            labels,
+            options,
+        } = req;
         self.ensure_loaded()?;
         let now = Utc::now().to_rfc3339();
 
@@ -179,9 +200,17 @@ impl AriaNetworkRegistry {
                      ipv6, dns_config, labels, options, created_at, updated_at)
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                     params![
-                        entry.id, entry.tenant_id, entry.name, entry.driver,
-                        entry.isolation, entry.ipv6, entry.dns_config, entry.labels,
-                        entry.options, entry.created_at, entry.updated_at
+                        entry.id,
+                        entry.tenant_id,
+                        entry.name,
+                        entry.driver,
+                        entry.isolation,
+                        entry.ipv6,
+                        entry.dns_config,
+                        entry.labels,
+                        entry.options,
+                        entry.created_at,
+                        entry.updated_at
                     ],
                 )?;
                 Ok(())
@@ -199,8 +228,12 @@ impl AriaNetworkRegistry {
 
     pub fn get_by_name(&self, tenant_id: &str, name: &str) -> Result<Option<AriaNetworkEntry>> {
         self.ensure_loaded()?;
-        let id = self.name_index.lock().unwrap()
-            .get(&format!("{tenant_id}:{name}")).cloned();
+        let id = self
+            .name_index
+            .lock()
+            .unwrap()
+            .get(&format!("{tenant_id}:{name}"))
+            .cloned();
         match id {
             Some(id) => self.get(&id),
             None => Ok(None),
@@ -221,7 +254,12 @@ impl AriaNetworkRegistry {
 
     pub fn count(&self, tenant_id: &str) -> Result<usize> {
         self.ensure_loaded()?;
-        Ok(self.tenant_index.lock().unwrap().get(tenant_id).map_or(0, |s| s.len()))
+        Ok(self
+            .tenant_index
+            .lock()
+            .unwrap()
+            .get(tenant_id)
+            .map_or(0, std::collections::HashSet::len))
     }
 
     /// Soft-delete a network.
@@ -251,8 +289,34 @@ mod tests {
         AriaNetworkRegistry::new(db)
     }
 
+    fn create_net(
+        reg: &AriaNetworkRegistry,
+        tenant: &str,
+        name: &str,
+        driver: &str,
+        isolation: &str,
+        ipv6: bool,
+        dns_config: Option<&str>,
+        labels: &str,
+        options: &str,
+    ) -> AriaNetworkEntry {
+        reg.create(NetworkCreateRequest {
+            tenant_id: tenant,
+            name,
+            driver,
+            isolation,
+            ipv6,
+            dns_config,
+            labels,
+            options,
+        })
+        .unwrap()
+    }
+
     fn create_default(reg: &AriaNetworkRegistry, tenant: &str, name: &str) -> AriaNetworkEntry {
-        reg.create(tenant, name, "bridge", "default", false, None, "{}", "{}").unwrap()
+        create_net(
+            reg, tenant, name, "bridge", "default", false, None, "{}", "{}",
+        )
     }
 
     #[test]
@@ -272,10 +336,17 @@ mod tests {
     fn upsert_by_name_updates_existing() {
         let reg = setup();
         let v1 = create_default(&reg, "t1", "net");
-        let v2 = reg.create(
-            "t1", "net", "overlay", "isolated", true,
-            Some(r#"{"nameservers":["8.8.8.8"]}"#), "{}", "{}",
-        ).unwrap();
+        let v2 = create_net(
+            &reg,
+            "t1",
+            "net",
+            "overlay",
+            "isolated",
+            true,
+            Some(r#"{"nameservers":["8.8.8.8"]}"#),
+            "{}",
+            "{}",
+        );
         assert_eq!(v2.id, v1.id);
         assert_eq!(v2.driver, "overlay");
         assert_eq!(v2.isolation, "isolated");
@@ -334,7 +405,9 @@ mod tests {
     #[test]
     fn ipv6_flag_persists() {
         let reg = setup();
-        let entry = reg.create("t1", "v6-net", "bridge", "default", true, None, "{}", "{}").unwrap();
+        let entry = create_net(
+            &reg, "t1", "v6-net", "bridge", "default", true, None, "{}", "{}",
+        );
         assert!(entry.ipv6);
         let fetched = reg.get(&entry.id).unwrap().unwrap();
         assert!(fetched.ipv6);
@@ -345,7 +418,17 @@ mod tests {
         let db = AriaDb::open_in_memory().unwrap();
         {
             let reg = AriaNetworkRegistry::new(db.clone());
-            reg.create("t1", "persist-net", "host", "isolated", true, None, "{}", "{}").unwrap();
+            create_net(
+                &reg,
+                "t1",
+                "persist-net",
+                "host",
+                "isolated",
+                true,
+                None,
+                "{}",
+                "{}",
+            );
         }
         let reg2 = AriaNetworkRegistry::new(db);
         let entry = reg2.get_by_name("t1", "persist-net").unwrap().unwrap();

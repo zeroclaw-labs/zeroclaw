@@ -110,7 +110,9 @@ impl AriaTaskRegistry {
         ni.clear();
 
         for e in entries {
-            ti.entry(e.tenant_id.clone()).or_default().insert(e.id.clone());
+            ti.entry(e.tenant_id.clone())
+                .or_default()
+                .insert(e.id.clone());
             ni.insert(format!("{}:{}", e.tenant_id, e.name), e.id.clone());
             cache.insert(e.id.clone(), e);
         }
@@ -119,17 +121,25 @@ impl AriaTaskRegistry {
     }
 
     fn index_entry(&self, entry: &AriaTaskEntry) {
-        self.tenant_index.lock().unwrap()
-            .entry(entry.tenant_id.clone()).or_default().insert(entry.id.clone());
-        self.name_index.lock().unwrap()
-            .insert(format!("{}:{}", entry.tenant_id, entry.name), entry.id.clone());
+        self.tenant_index
+            .lock()
+            .unwrap()
+            .entry(entry.tenant_id.clone())
+            .or_default()
+            .insert(entry.id.clone());
+        self.name_index.lock().unwrap().insert(
+            format!("{}:{}", entry.tenant_id, entry.name),
+            entry.id.clone(),
+        );
     }
 
     fn deindex_entry(&self, entry: &AriaTaskEntry) {
         if let Some(set) = self.tenant_index.lock().unwrap().get_mut(&entry.tenant_id) {
             set.remove(&entry.id);
         }
-        self.name_index.lock().unwrap()
+        self.name_index
+            .lock()
+            .unwrap()
             .remove(&format!("{}:{}", entry.tenant_id, entry.name));
     }
 
@@ -209,10 +219,20 @@ impl AriaTaskRegistry {
                      completed_at, created_at, updated_at)
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
                     params![
-                        entry.id, entry.tenant_id, entry.name, entry.description,
-                        entry.handler_code, entry.handler_hash, entry.params,
-                        entry.status, entry.result, entry.error, entry.agent_id,
-                        entry.started_at, entry.completed_at, entry.created_at,
+                        entry.id,
+                        entry.tenant_id,
+                        entry.name,
+                        entry.description,
+                        entry.handler_code,
+                        entry.handler_hash,
+                        entry.params,
+                        entry.status,
+                        entry.result,
+                        entry.error,
+                        entry.agent_id,
+                        entry.started_at,
+                        entry.completed_at,
+                        entry.created_at,
                         entry.updated_at
                     ],
                 )?;
@@ -231,8 +251,12 @@ impl AriaTaskRegistry {
 
     pub fn get_by_name(&self, tenant_id: &str, name: &str) -> Result<Option<AriaTaskEntry>> {
         self.ensure_loaded()?;
-        let id = self.name_index.lock().unwrap()
-            .get(&format!("{tenant_id}:{name}")).cloned();
+        let id = self
+            .name_index
+            .lock()
+            .unwrap()
+            .get(&format!("{tenant_id}:{name}"))
+            .cloned();
         match id {
             Some(id) => self.get(&id),
             None => Ok(None),
@@ -253,7 +277,12 @@ impl AriaTaskRegistry {
 
     pub fn count(&self, tenant_id: &str) -> Result<usize> {
         self.ensure_loaded()?;
-        Ok(self.tenant_index.lock().unwrap().get(tenant_id).map_or(0, |s| s.len()))
+        Ok(self
+            .tenant_index
+            .lock()
+            .unwrap()
+            .get(tenant_id)
+            .map_or(0, std::collections::HashSet::len))
     }
 
     /// Soft-delete a task.
@@ -337,7 +366,9 @@ mod tests {
     #[test]
     fn create_and_get_roundtrip() {
         let reg = setup();
-        let entry = reg.create("t1", "my-task", "desc", "run()", "{}", None).unwrap();
+        let entry = reg
+            .create("t1", "my-task", "desc", "run()", "{}", None)
+            .unwrap();
         assert_eq!(entry.name, "my-task");
         assert_eq!(entry.status, "pending");
         let fetched = reg.get(&entry.id).unwrap().unwrap();
@@ -348,7 +379,8 @@ mod tests {
     fn upsert_by_name_resets_task() {
         let reg = setup();
         let v1 = reg.create("t1", "task", "d1", "code1", "{}", None).unwrap();
-        reg.update_status(&v1.id, "completed", Some("done"), None).unwrap();
+        reg.update_status(&v1.id, "completed", Some("done"), None)
+            .unwrap();
 
         let v2 = reg.create("t1", "task", "d2", "code2", "{}", None).unwrap();
         assert_eq!(v2.id, v1.id);
@@ -395,7 +427,9 @@ mod tests {
     #[test]
     fn status_transitions() {
         let reg = setup();
-        let entry = reg.create("t1", "lifecycle", "d", "code", "{}", None).unwrap();
+        let entry = reg
+            .create("t1", "lifecycle", "d", "code", "{}", None)
+            .unwrap();
         assert_eq!(entry.status, "pending");
 
         reg.update_status(&entry.id, "running", None, None).unwrap();
@@ -404,7 +438,8 @@ mod tests {
         assert!(running.started_at.is_some());
         assert!(running.completed_at.is_none());
 
-        reg.update_status(&entry.id, "completed", Some("result_data"), None).unwrap();
+        reg.update_status(&entry.id, "completed", Some("result_data"), None)
+            .unwrap();
         let completed = reg.get(&entry.id).unwrap().unwrap();
         assert_eq!(completed.status, "completed");
         assert_eq!(completed.result.as_deref(), Some("result_data"));
@@ -414,9 +449,12 @@ mod tests {
     #[test]
     fn status_transition_to_failed() {
         let reg = setup();
-        let entry = reg.create("t1", "fail-task", "", "code", "{}", None).unwrap();
+        let entry = reg
+            .create("t1", "fail-task", "", "code", "{}", None)
+            .unwrap();
         reg.update_status(&entry.id, "running", None, None).unwrap();
-        reg.update_status(&entry.id, "failed", None, Some("timeout")).unwrap();
+        reg.update_status(&entry.id, "failed", None, Some("timeout"))
+            .unwrap();
 
         let failed = reg.get(&entry.id).unwrap().unwrap();
         assert_eq!(failed.status, "failed");
@@ -427,7 +465,9 @@ mod tests {
     #[test]
     fn cancel_task() {
         let reg = setup();
-        let entry = reg.create("t1", "cancel-me", "", "code", "{}", None).unwrap();
+        let entry = reg
+            .create("t1", "cancel-me", "", "code", "{}", None)
+            .unwrap();
         reg.update_status(&entry.id, "running", None, None).unwrap();
         reg.cancel(&entry.id).unwrap();
 
@@ -439,7 +479,8 @@ mod tests {
     #[test]
     fn get_by_name_works() {
         let reg = setup();
-        reg.create("t1", "named-task", "d", "code", "{}", None).unwrap();
+        reg.create("t1", "named-task", "d", "code", "{}", None)
+            .unwrap();
         let found = reg.get_by_name("t1", "named-task").unwrap().unwrap();
         assert_eq!(found.name, "named-task");
         assert!(reg.get_by_name("t1", "nope").unwrap().is_none());
@@ -450,7 +491,8 @@ mod tests {
         let db = AriaDb::open_in_memory().unwrap();
         {
             let reg = AriaTaskRegistry::new(db.clone());
-            reg.create("t1", "persist-task", "d", "code", "{}", None).unwrap();
+            reg.create("t1", "persist-task", "d", "code", "{}", None)
+                .unwrap();
         }
         let reg2 = AriaTaskRegistry::new(db);
         let entry = reg2.get_by_name("t1", "persist-task").unwrap().unwrap();

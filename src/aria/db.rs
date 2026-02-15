@@ -1,6 +1,6 @@
-//! Shared SQLite database initialization for all Aria registries.
+//! Shared `SQLite` database initialization for all Aria registries.
 //!
-//! All 11 registries share a single SQLite database with WAL mode.
+//! All 11 registries share a single `SQLite` database with WAL mode.
 //! This module provides thread-safe database access via a singleton pattern.
 
 use anyhow::{Context, Result};
@@ -8,7 +8,7 @@ use rusqlite::Connection;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-/// Thread-safe database handle wrapping a SQLite connection.
+/// Thread-safe database handle wrapping a `SQLite` connection.
 /// All registries share a single instance via `AriaDb::open()`.
 #[derive(Clone)]
 pub struct AriaDb {
@@ -20,8 +20,9 @@ impl AriaDb {
     /// Configures WAL mode and synchronous = NORMAL for performance.
     pub fn open(db_path: &Path) -> Result<Self> {
         if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create Aria DB directory: {}", parent.display()))?;
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create Aria DB directory: {}", parent.display())
+            })?;
         }
 
         let conn = Connection::open(db_path)
@@ -47,8 +48,7 @@ impl AriaDb {
 
     /// Open an in-memory database for testing.
     pub fn open_in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()
-            .context("Failed to open in-memory Aria DB")?;
+        let conn = Connection::open_in_memory().context("Failed to open in-memory Aria DB")?;
 
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -68,7 +68,10 @@ impl AriaDb {
 
     /// Execute a closure with the database connection.
     pub fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
         f(&conn)
     }
 

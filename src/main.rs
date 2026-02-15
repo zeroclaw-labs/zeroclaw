@@ -1,4 +1,4 @@
-#![warn(clippy::all, clippy::pedantic)]
+#![warn(clippy::all)]
 #![allow(
     clippy::missing_errors_doc,
     clippy::missing_panics_doc,
@@ -179,9 +179,9 @@ enum Commands {
 
 #[derive(Subcommand, Debug)]
 enum MigrateCommands {
-    /// Import memory from an OpenClaw workspace into this Aria workspace
+    /// Import memory from an `OpenClaw` workspace into this Aria workspace
     Openclaw {
-        /// Optional path to OpenClaw workspace (defaults to ~/.openclaw/workspace)
+        /// Optional path to `OpenClaw` workspace (defaults to ~/.openclaw/workspace)
         #[arg(long)]
         source: Option<std::path::PathBuf>,
 

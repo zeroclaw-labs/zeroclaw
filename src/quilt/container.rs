@@ -99,7 +99,7 @@ fn config_hash_matches(status: &QuiltContainerStatus, desired_hash: &str) -> boo
         .labels
         .as_ref()
         .and_then(|l| l.get(LABEL_CONFIG_HASH))
-        .map_or(false, |h| h == desired_hash)
+        .is_some_and(|h| h == desired_hash)
 }
 
 /// Build labels for a new sandbox container.
@@ -117,7 +117,13 @@ fn container_name(session_key: &str) -> String {
     // Sanitize session key for use as a container name: keep alphanumeric + hyphens
     let sanitized: String = session_key
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     format!("sandbox-{sanitized}")
 }
@@ -223,11 +229,7 @@ pub async fn ensure_sandbox_container(
     let create_params = QuiltCreateParams {
         name: name.clone(),
         image: DEFAULT_IMAGE.into(),
-        command: Some(vec![
-            "bash".into(),
-            "-c".into(),
-            "sleep infinity".into(),
-        ]),
+        command: Some(vec!["bash".into(), "-c".into(), "sleep infinity".into()]),
         environment: HashMap::new(),
         volumes: vec![],
         ports: vec![],
@@ -300,7 +302,10 @@ mod tests {
 
     #[test]
     fn container_name_sanitizes_special_chars() {
-        assert_eq!(container_name("user@host:session"), "sandbox-user-host-session");
+        assert_eq!(
+            container_name("user@host:session"),
+            "sandbox-user-host-session"
+        );
     }
 
     #[test]
@@ -341,9 +346,7 @@ mod tests {
             ip_address: None,
             memory_limit_mb: None,
             cpu_limit_percent: None,
-            labels: Some(HashMap::from([
-                (LABEL_CONFIG_HASH.into(), "abc123".into()),
-            ])),
+            labels: Some(HashMap::from([(LABEL_CONFIG_HASH.into(), "abc123".into())])),
             started_at_ms: None,
             exited_at_ms: None,
         };
@@ -382,9 +385,7 @@ mod tests {
             ip_address: None,
             memory_limit_mb: None,
             cpu_limit_percent: None,
-            labels: Some(HashMap::from([
-                ("other.label".into(), "value".into()),
-            ])),
+            labels: Some(HashMap::from([("other.label".into(), "value".into())])),
             started_at_ms: None,
             exited_at_ms: None,
         };

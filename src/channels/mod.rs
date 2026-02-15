@@ -573,10 +573,7 @@ mod tests {
         assert!(prompt.contains("### SOUL.md"), "missing SOUL.md header");
         assert!(prompt.contains("Be helpful"), "missing SOUL content");
         assert!(prompt.contains("### IDENTITY.md"), "missing IDENTITY.md");
-        assert!(
-            prompt.contains("Name: Aria"),
-            "missing IDENTITY content"
-        );
+        assert!(prompt.contains("Name: Aria"), "missing IDENTITY content");
         assert!(prompt.contains("### USER.md"), "missing USER.md");
         assert!(prompt.contains("### AGENTS.md"), "missing AGENTS.md");
         assert!(prompt.contains("### TOOLS.md"), "missing TOOLS.md");

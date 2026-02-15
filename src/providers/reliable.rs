@@ -96,7 +96,14 @@ impl Provider for ReliableProvider {
 
             for attempt in 0..=self.max_retries {
                 match provider
-                    .chat_completion(system_prompt, messages, tools, model, temperature, max_tokens)
+                    .chat_completion(
+                        system_prompt,
+                        messages,
+                        tools,
+                        model,
+                        temperature,
+                        max_tokens,
+                    )
                     .await
                 {
                     Ok(resp) => {

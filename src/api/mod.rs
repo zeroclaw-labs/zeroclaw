@@ -66,7 +66,10 @@ impl<T: Serialize> ApiResponse<T> {
         })
     }
 
-    pub fn err(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<ApiResponse<()>>) {
+    pub fn err(
+        status: StatusCode,
+        message: impl Into<String>,
+    ) -> (StatusCode, Json<ApiResponse<()>>) {
         (
             status,
             Json(ApiResponse::<()> {
@@ -81,8 +84,10 @@ impl<T: Serialize> ApiResponse<T> {
 
 /// Extract tenant context from Bearer token.
 /// In production, this would validate the token and extract tenant/user IDs.
-/// For now, we use a simple extraction from the token format: "tenant_id:token".
-fn extract_route_context(headers: &HeaderMap) -> Result<RouteContext, (StatusCode, Json<ApiResponse<()>>)> {
+/// For now, we use a simple extraction from the token format: "`tenant_id:token`".
+fn extract_route_context(
+    headers: &HeaderMap,
+) -> Result<RouteContext, (StatusCode, Json<ApiResponse<()>>)> {
     let auth = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -109,6 +114,20 @@ fn extract_route_context(headers: &HeaderMap) -> Result<RouteContext, (StatusCod
     })
 }
 
+/// Parse either a JSON object/array value or a JSON-encoded string into a canonical JSON value.
+fn parse_json_value_or_string(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(s) => serde_json::from_str::<serde_json::Value>(s)
+            .unwrap_or_else(|_| serde_json::Value::String(s.clone())),
+        other => other.clone(),
+    }
+}
+
+/// Convert JSON payload to a stable string representation, decoding JSON-encoded strings first.
+fn normalize_json_string(value: &serde_json::Value) -> String {
+    serde_json::to_string(&parse_json_value_or_string(value)).unwrap_or_default()
+}
+
 /// Build the full registry API router with all 48+ endpoints
 pub fn registry_router(db: AriaDb) -> Router {
     let state = RegistryApiState { db };
@@ -129,11 +148,20 @@ pub fn registry_router(db: AriaDb) -> Router {
         .route("/api/v1/registry/memory", get(memory_list))
         .route("/api/v1/registry/memory/{id}", get(memory_get))
         .route("/api/v1/registry/memory/{id}", delete(memory_delete))
+        .route("/api/v1/registry/memory/sweep", post(memory_sweep))
+        .route(
+            "/api/v1/registry/memory/session/{session_id}",
+            delete(memory_clear_session),
+        )
         // ── Tasks ─────────────────────────────────────────────
         .route("/api/v1/registry/tasks", post(tasks_create))
         .route("/api/v1/registry/tasks", get(tasks_list))
         .route("/api/v1/registry/tasks/{id}", get(tasks_get))
-        .route("/api/v1/registry/tasks/{id}/status", patch(tasks_update_status))
+        .route("/api/v1/registry/tasks/{id}", delete(tasks_delete_unused))
+        .route(
+            "/api/v1/registry/tasks/{id}/status",
+            patch(tasks_update_status),
+        )
         .route("/api/v1/registry/tasks/{id}/cancel", post(tasks_cancel))
         // ── Feeds ─────────────────────────────────────────────
         .route("/api/v1/registry/feeds", post(feeds_upload))
@@ -166,19 +194,16 @@ pub fn registry_router(db: AriaDb) -> Router {
             "/api/v1/registry/pipelines/{id}/execute",
             post(pipelines_execute),
         )
-        .route(
-            "/api/v1/registry/teams/{id}/execute",
-            post(teams_execute),
-        )
-        .route(
-            "/api/v1/registry/feeds/{id}/execute",
-            post(feeds_execute),
-        )
+        .route("/api/v1/registry/teams/{id}/execute", post(teams_execute))
+        .route("/api/v1/registry/feeds/{id}/execute", post(feeds_execute))
         // ── Containers ────────────────────────────────────────
         .route("/api/v1/registry/containers", post(containers_upload))
         .route("/api/v1/registry/containers", get(containers_list))
         .route("/api/v1/registry/containers/{id}", get(containers_get))
-        .route("/api/v1/registry/containers/{id}", delete(containers_delete))
+        .route(
+            "/api/v1/registry/containers/{id}",
+            delete(containers_delete),
+        )
         // ── Networks ──────────────────────────────────────────
         .route("/api/v1/registry/networks", post(networks_upload))
         .route("/api/v1/registry/networks", get(networks_list))
@@ -267,9 +292,15 @@ async fn tools_upload(
     match result {
         Ok(tool_id) => {
             let resp = serde_json::json!({"id": tool_id, "name": body.name});
-            (StatusCode::CREATED, Json(serde_json::json!({"success": true, "data": resp}))).into_response()
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({"success": true, "data": resp})),
+            )
+                .into_response()
         }
-        Err(e) => ApiResponse::<()>::err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => {
+            ApiResponse::<()>::err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
     }
 }
 
@@ -302,7 +333,7 @@ async fn tools_list(
                 "updated_at": row.get::<_, String>(6)?,
             }))
         })?;
-        let items: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
+        let items: Vec<serde_json::Value> = rows.filter_map(std::result::Result::ok).collect();
 
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM aria_tools WHERE tenant_id = ?1 AND status != 'deleted'",
@@ -314,8 +345,14 @@ async fn tools_list(
     });
 
     match result {
-        Ok(data) => (StatusCode::OK, Json(serde_json::json!({"success": true, "data": data}))).into_response(),
-        Err(e) => ApiResponse::<()>::err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Ok(data) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"success": true, "data": data})),
+        )
+            .into_response(),
+        Err(e) => {
+            ApiResponse::<()>::err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
     }
 }
 
@@ -355,7 +392,11 @@ async fn tools_get(
     });
 
     match result {
-        Ok(data) => (StatusCode::OK, Json(serde_json::json!({"success": true, "data": data}))).into_response(),
+        Ok(data) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"success": true, "data": data})),
+        )
+            .into_response(),
         Err(_) => ApiResponse::<()>::err(StatusCode::NOT_FOUND, "Tool not found").into_response(),
     }
 }
@@ -444,7 +485,7 @@ async fn agents_upload(
                     body.system_prompt,
                     tools_json,
                     body.thinking,
-                    body.max_retries.map(|v| v as i64),
+                    body.max_retries.map(i64::from),
                     body.timeout_seconds.map(|v| v as i64),
                     body.handler_code.as_deref().unwrap_or(""),
                     handler_hash,
@@ -465,7 +506,7 @@ async fn agents_upload(
                     body.description.as_deref().unwrap_or(""),
                     body.model, body.temperature, body.system_prompt, tools_json,
                     body.thinking,
-                    body.max_retries.map(|v| v as i64),
+                    body.max_retries.map(i64::from),
                     body.timeout_seconds.map(|v| v as i64),
                     body.handler_code.as_deref().unwrap_or(""),
                     handler_hash,
@@ -478,8 +519,14 @@ async fn agents_upload(
     });
 
     match result {
-        Ok(agent_id) => (StatusCode::CREATED, Json(serde_json::json!({"success": true, "data": {"id": agent_id, "name": body.name}}))).into_response(),
-        Err(e) => ApiResponse::<()>::err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Ok(agent_id) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({"success": true, "data": {"id": agent_id, "name": body.name}})),
+        )
+            .into_response(),
+        Err(e) => {
+            ApiResponse::<()>::err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
     }
 }
 
@@ -641,7 +688,7 @@ impl_list_get_delete!(
 #[derive(Deserialize)]
 struct MemorySetBody {
     key: String,
-    value: String,
+    value: serde_json::Value,
     tier: Option<String>,
     namespace: Option<String>,
     session_id: Option<String>,
@@ -661,9 +708,9 @@ async fn memory_set(
     let now_str = now.to_rfc3339();
     let id = uuid::Uuid::new_v4().to_string();
     let tier = body.tier.as_deref().unwrap_or("longterm");
-    let expires_at = body.ttl_seconds.map(|ttl| {
-        (now + chrono::Duration::seconds(ttl as i64)).to_rfc3339()
-    });
+    let expires_at = body
+        .ttl_seconds
+        .map(|ttl| (now + chrono::Duration::seconds(ttl as i64)).to_rfc3339());
 
     let result = state.db.with_conn(|conn| {
         let existing: Option<String> = conn
@@ -679,9 +726,13 @@ async fn memory_set(
                 "UPDATE aria_memory SET value = ?1, namespace = ?2, session_id = ?3,
                  ttl_seconds = ?4, expires_at = ?5, updated_at = ?6 WHERE id = ?7",
                 rusqlite::params![
-                    body.value, body.namespace, body.session_id,
-                    body.ttl_seconds.map(|v| v as i64), expires_at,
-                    now_str, existing_id,
+                    serde_json::to_string(&body.value).unwrap_or_default(),
+                    body.namespace,
+                    body.session_id,
+                    body.ttl_seconds.map(|v| v as i64),
+                    expires_at,
+                    now_str,
+                    existing_id,
                 ],
             )?;
             Ok(existing_id)
@@ -691,9 +742,16 @@ async fn memory_set(
                  ttl_seconds, expires_at, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
                 rusqlite::params![
-                    id, ctx.tenant_id, body.key, body.value, tier,
-                    body.namespace, body.session_id,
-                    body.ttl_seconds.map(|v| v as i64), expires_at, now_str,
+                    id,
+                    ctx.tenant_id,
+                    body.key,
+                    serde_json::to_string(&body.value).unwrap_or_default(),
+                    tier,
+                    body.namespace,
+                    body.session_id,
+                    body.ttl_seconds.map(|v| v as i64),
+                    expires_at,
+                    now_str,
                 ],
             )?;
             Ok(id)
@@ -701,8 +759,14 @@ async fn memory_set(
     });
 
     match result {
-        Ok(mem_id) => (StatusCode::CREATED, Json(serde_json::json!({"success": true, "data": {"id": mem_id}}))).into_response(),
-        Err(e) => ApiResponse::<()>::err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Ok(mem_id) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({"success": true, "data": {"id": mem_id}})),
+        )
+            .into_response(),
+        Err(e) => {
+            ApiResponse::<()>::err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
     }
 }
 
@@ -712,6 +776,68 @@ impl_list_get_delete!(
     columns: "id, key, value, tier, namespace, session_id, ttl_seconds, expires_at, created_at, updated_at",
     soft_delete: false
 );
+
+async fn memory_sweep(
+    State(state): State<RegistryApiState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let ctx = match extract_route_context(&headers) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+
+    let result = state.db.with_conn(|conn| {
+        let deleted = conn.execute(
+            "DELETE FROM aria_memory
+             WHERE tenant_id = ?1
+             AND expires_at IS NOT NULL
+             AND expires_at <= ?2",
+            rusqlite::params![ctx.tenant_id, chrono::Utc::now().to_rfc3339()],
+        )?;
+        Ok(deleted as u64)
+    });
+
+    match result {
+        Ok(deleted) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"success": true, "data": {"deleted": deleted}})),
+        )
+            .into_response(),
+        Err(e) => {
+            ApiResponse::<()>::err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
+}
+
+async fn memory_clear_session(
+    State(state): State<RegistryApiState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    let ctx = match extract_route_context(&headers) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+
+    let result = state.db.with_conn(|conn| {
+        let deleted = conn.execute(
+            "DELETE FROM aria_memory WHERE tenant_id = ?1 AND session_id = ?2",
+            rusqlite::params![ctx.tenant_id, session_id],
+        )?;
+        Ok(deleted as u64)
+    });
+
+    match result {
+        Ok(deleted) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"success": true, "data": {"deleted": deleted}})),
+        )
+            .into_response(),
+        Err(e) => {
+            ApiResponse::<()>::err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
+}
 
 // ══════════════════════════════════════════════════════════════════
 // TASK HANDLERS
@@ -745,11 +871,14 @@ async fn tasks_create(
              params, status, agent_id, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?9)",
             rusqlite::params![
-                id, ctx.tenant_id, body.name,
+                id,
+                ctx.tenant_id,
+                body.name,
                 body.description.as_deref().unwrap_or(""),
                 body.handler_code.as_deref().unwrap_or(""),
                 handler_hash,
-                serde_json::to_string(&body.params.unwrap_or(serde_json::json!({}))).unwrap_or_default(),
+                serde_json::to_string(&body.params.unwrap_or(serde_json::json!({})))
+                    .unwrap_or_default(),
                 body.agent_id,
                 now,
             ],
@@ -758,8 +887,16 @@ async fn tasks_create(
     });
 
     match result {
-        Ok(task_id) => (StatusCode::CREATED, Json(serde_json::json!({"success": true, "data": {"id": task_id, "status": "pending"}}))).into_response(),
-        Err(e) => ApiResponse::<()>::err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Ok(task_id) => (
+            StatusCode::CREATED,
+            Json(
+                serde_json::json!({"success": true, "data": {"id": task_id, "status": "pending"}}),
+            ),
+        )
+            .into_response(),
+        Err(e) => {
+            ApiResponse::<()>::err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
     }
 }
 
@@ -786,21 +923,26 @@ async fn tasks_update_status(
         let mut extra_set = String::new();
         if body.status == "running" {
             extra_set = format!(", started_at = '{now}'");
-        } else if body.status == "completed" || body.status == "failed" || body.status == "cancelled" {
+        } else if body.status == "completed"
+            || body.status == "failed"
+            || body.status == "cancelled"
+        {
             extra_set = format!(", completed_at = '{now}'");
         }
 
         let changed = conn.execute(
             &format!(
-                "UPDATE aria_tasks SET status = ?1, result = ?2, error = ?3, updated_at = ?4{}
-                 WHERE id = ?5 AND tenant_id = ?6",
-                extra_set
+                "UPDATE aria_tasks SET status = ?1, result = ?2, error = ?3, updated_at = ?4{extra_set}
+                 WHERE id = ?5 AND tenant_id = ?6"
             ),
             rusqlite::params![
                 body.status,
-                body.result.map(|v| serde_json::to_string(&v).unwrap_or_default()),
+                body.result
+                    .map(|v| serde_json::to_string(&v).unwrap_or_default()),
                 body.error,
-                now, id, ctx.tenant_id,
+                now,
+                id,
+                ctx.tenant_id,
             ],
         )?;
         if changed == 0 {
@@ -810,7 +952,11 @@ async fn tasks_update_status(
     });
 
     match result {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"success": true, "data": {"status": body.status}}))).into_response(),
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"success": true, "data": {"status": body.status}})),
+        )
+            .into_response(),
         Err(_) => ApiResponse::<()>::err(StatusCode::NOT_FOUND, "Task not found").into_response(),
     }
 }
@@ -839,7 +985,11 @@ async fn tasks_cancel(
     });
 
     match result {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"success": true, "data": {"status": "cancelled"}}))).into_response(),
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"success": true, "data": {"status": "cancelled"}})),
+        )
+            .into_response(),
         Err(e) => ApiResponse::<()>::err(StatusCode::NOT_FOUND, e.to_string()).into_response(),
     }
 }
@@ -937,8 +1087,14 @@ async fn feeds_upload(
     });
 
     match result {
-        Ok(feed_id) => (StatusCode::CREATED, Json(serde_json::json!({"success": true, "data": {"id": feed_id, "name": body.name}}))).into_response(),
-        Err(e) => ApiResponse::<()>::err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Ok(feed_id) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({"success": true, "data": {"id": feed_id, "name": body.name}})),
+        )
+            .into_response(),
+        Err(e) => {
+            ApiResponse::<()>::err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
     }
 }
 
@@ -1009,6 +1165,8 @@ async fn crons_upload(
     };
     let now = chrono::Utc::now().to_rfc3339();
     let id = uuid::Uuid::new_v4().to_string();
+    let schedule_data_json = normalize_json_string(&body.schedule_data);
+    let payload_data_json = normalize_json_string(&body.payload_data);
 
     let result = state.db.with_conn(|conn| {
         let existing: Option<String> = conn
@@ -1029,14 +1187,14 @@ async fn crons_upload(
                 rusqlite::params![
                     body.description.as_deref().unwrap_or(""),
                     body.schedule_kind,
-                    serde_json::to_string(&body.schedule_data).unwrap_or_default(),
+                    schedule_data_json,
                     body.session_target.as_deref().unwrap_or("main"),
                     body.wake_mode.as_deref().unwrap_or("next-heartbeat"),
                     body.payload_kind,
-                    serde_json::to_string(&body.payload_data).unwrap_or_default(),
+                    payload_data_json,
                     body.isolation.as_ref().map(|v| serde_json::to_string(v).unwrap_or_default()),
-                    body.enabled.unwrap_or(true) as i64,
-                    body.delete_after_run.unwrap_or(false) as i64,
+                    i64::from(body.enabled.unwrap_or(true)),
+                    i64::from(body.delete_after_run.unwrap_or(false)),
                     now, existing_id,
                 ],
             )?;
@@ -1051,14 +1209,14 @@ async fn crons_upload(
                     id, ctx.tenant_id, body.name,
                     body.description.as_deref().unwrap_or(""),
                     body.schedule_kind,
-                    serde_json::to_string(&body.schedule_data).unwrap_or_default(),
+                    schedule_data_json,
                     body.session_target.as_deref().unwrap_or("main"),
                     body.wake_mode.as_deref().unwrap_or("next-heartbeat"),
                     body.payload_kind,
-                    serde_json::to_string(&body.payload_data).unwrap_or_default(),
+                    payload_data_json,
                     body.isolation.as_ref().map(|v| serde_json::to_string(v).unwrap_or_default()),
-                    body.enabled.unwrap_or(true) as i64,
-                    body.delete_after_run.unwrap_or(false) as i64,
+                    i64::from(body.enabled.unwrap_or(true)),
+                    i64::from(body.delete_after_run.unwrap_or(false)),
                     now,
                 ],
             )?;
@@ -1070,8 +1228,14 @@ async fn crons_upload(
     });
 
     match result {
-        Ok(cron_id) => (StatusCode::CREATED, Json(serde_json::json!({"success": true, "data": {"id": cron_id, "name": body.name}}))).into_response(),
-        Err(e) => ApiResponse::<()>::err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Ok(cron_id) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({"success": true, "data": {"id": cron_id, "name": body.name}})),
+        )
+            .into_response(),
+        Err(e) => {
+            ApiResponse::<()>::err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
     }
 }
 
@@ -1108,7 +1272,9 @@ async fn crons_delete(
 
     match result {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"success": true}))).into_response(),
-        Err(_) => ApiResponse::<()>::err(StatusCode::NOT_FOUND, "Cron function not found").into_response(),
+        Err(_) => {
+            ApiResponse::<()>::err(StatusCode::NOT_FOUND, "Cron function not found").into_response()
+        }
     }
 }
 
@@ -1119,7 +1285,7 @@ async fn crons_delete(
 #[derive(Deserialize)]
 struct KvSetBody {
     key: String,
-    value: String,
+    value: serde_json::Value,
 }
 
 async fn kv_set(
@@ -1146,22 +1312,38 @@ async fn kv_set(
         if let Some(existing_id) = existing {
             conn.execute(
                 "UPDATE aria_kv SET value = ?1, updated_at = ?2 WHERE id = ?3",
-                rusqlite::params![body.value, now, existing_id],
+                rusqlite::params![
+                    serde_json::to_string(&body.value).unwrap_or_default(),
+                    now,
+                    existing_id
+                ],
             )?;
             Ok(existing_id)
         } else {
             conn.execute(
                 "INSERT INTO aria_kv (id, tenant_id, key, value, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-                rusqlite::params![id, ctx.tenant_id, body.key, body.value, now],
+                rusqlite::params![
+                    id,
+                    ctx.tenant_id,
+                    body.key,
+                    serde_json::to_string(&body.value).unwrap_or_default(),
+                    now
+                ],
             )?;
             Ok(id)
         }
     });
 
     match result {
-        Ok(kv_id) => (StatusCode::CREATED, Json(serde_json::json!({"success": true, "data": {"id": kv_id}}))).into_response(),
-        Err(e) => ApiResponse::<()>::err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Ok(kv_id) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({"success": true, "data": {"id": kv_id}})),
+        )
+            .into_response(),
+        Err(e) => {
+            ApiResponse::<()>::err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
     }
 }
 
@@ -1195,22 +1377,31 @@ async fn kv_query(
              WHERE tenant_id = ?1 AND key LIKE ?2 ORDER BY key LIMIT ?3",
         )?;
         let prefix_pattern = format!("{}%", params.prefix);
-        let rows = stmt.query_map(rusqlite::params![ctx.tenant_id, prefix_pattern, limit], |row| {
-            Ok(serde_json::json!({
-                "id": row.get::<_, String>(0)?,
-                "key": row.get::<_, String>(1)?,
-                "value": row.get::<_, String>(2)?,
-                "created_at": row.get::<_, String>(3)?,
-                "updated_at": row.get::<_, String>(4)?,
-            }))
-        })?;
-        let items: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
+        let rows = stmt.query_map(
+            rusqlite::params![ctx.tenant_id, prefix_pattern, limit],
+            |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, String>(0)?,
+                    "key": row.get::<_, String>(1)?,
+                    "value": row.get::<_, String>(2)?,
+                    "created_at": row.get::<_, String>(3)?,
+                    "updated_at": row.get::<_, String>(4)?,
+                }))
+            },
+        )?;
+        let items: Vec<serde_json::Value> = rows.filter_map(std::result::Result::ok).collect();
         Ok(serde_json::json!({"items": items}))
     });
 
     match result {
-        Ok(data) => (StatusCode::OK, Json(serde_json::json!({"success": true, "data": data}))).into_response(),
-        Err(e) => ApiResponse::<()>::err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Ok(data) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"success": true, "data": data})),
+        )
+            .into_response(),
+        Err(e) => {
+            ApiResponse::<()>::err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
     }
 }
 
@@ -1224,7 +1415,7 @@ struct TeamUploadBody {
     name: String,
     description: Option<String>,
     mode: Option<String>,
-    members: Option<serde_json::Value>,
+    members: Vec<crate::team::types::TeamMemberRuntime>,
     shared_context: Option<serde_json::Value>,
     timeout_seconds: Option<u64>,
     max_rounds: Option<u32>,
@@ -1259,10 +1450,10 @@ async fn teams_upload(
                 rusqlite::params![
                     body.description.as_deref().unwrap_or(""),
                     body.mode.as_deref().unwrap_or("coordinator"),
-                    serde_json::to_string(&body.members.unwrap_or(serde_json::json!([]))).unwrap_or_default(),
+                    serde_json::to_string(&body.members).unwrap_or_default(),
                     body.shared_context.as_ref().map(|v| serde_json::to_string(v).unwrap_or_default()),
                     body.timeout_seconds.map(|v| v as i64),
-                    body.max_rounds.map(|v| v as i64),
+                    body.max_rounds.map(i64::from),
                     now, existing_id,
                 ],
             )?;
@@ -1276,10 +1467,10 @@ async fn teams_upload(
                     id, ctx.tenant_id, body.name,
                     body.description.as_deref().unwrap_or(""),
                     body.mode.as_deref().unwrap_or("coordinator"),
-                    serde_json::to_string(&body.members.unwrap_or(serde_json::json!([]))).unwrap_or_default(),
+                    serde_json::to_string(&body.members).unwrap_or_default(),
                     body.shared_context.as_ref().map(|v| serde_json::to_string(v).unwrap_or_default()),
                     body.timeout_seconds.map(|v| v as i64),
-                    body.max_rounds.map(|v| v as i64),
+                    body.max_rounds.map(i64::from),
                     now,
                 ],
             )?;
@@ -1289,8 +1480,14 @@ async fn teams_upload(
     });
 
     match result {
-        Ok(team_id) => (StatusCode::CREATED, Json(serde_json::json!({"success": true, "data": {"id": team_id, "name": body.name}}))).into_response(),
-        Err(e) => ApiResponse::<()>::err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Ok(team_id) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({"success": true, "data": {"id": team_id, "name": body.name}})),
+        )
+            .into_response(),
+        Err(e) => {
+            ApiResponse::<()>::err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
     }
 }
 
@@ -1306,8 +1503,8 @@ impl_list_get_delete!(
 struct PipelineUploadBody {
     name: String,
     description: Option<String>,
-    steps: Option<serde_json::Value>,
-    variables: Option<serde_json::Value>,
+    steps: Vec<crate::aria::types::PipelineStep>,
+    variables: Option<std::collections::HashMap<String, serde_json::Value>>,
     timeout_seconds: Option<u64>,
     max_parallel: Option<u32>,
 }
@@ -1340,10 +1537,10 @@ async fn pipelines_upload(
                  WHERE id = ?7",
                 rusqlite::params![
                     body.description.as_deref().unwrap_or(""),
-                    serde_json::to_string(&body.steps.unwrap_or(serde_json::json!([]))).unwrap_or_default(),
-                    serde_json::to_string(&body.variables.unwrap_or(serde_json::json!({}))).unwrap_or_default(),
+                    serde_json::to_string(&body.steps).unwrap_or_default(),
+                    serde_json::to_string(&body.variables.clone().unwrap_or_default()).unwrap_or_default(),
                     body.timeout_seconds.map(|v| v as i64),
-                    body.max_parallel.map(|v| v as i64),
+                    body.max_parallel.map(i64::from),
                     now, existing_id,
                 ],
             )?;
@@ -1356,10 +1553,10 @@ async fn pipelines_upload(
                 rusqlite::params![
                     id, ctx.tenant_id, body.name,
                     body.description.as_deref().unwrap_or(""),
-                    serde_json::to_string(&body.steps.unwrap_or(serde_json::json!([]))).unwrap_or_default(),
-                    serde_json::to_string(&body.variables.unwrap_or(serde_json::json!({}))).unwrap_or_default(),
+                    serde_json::to_string(&body.steps).unwrap_or_default(),
+                    serde_json::to_string(&body.variables.clone().unwrap_or_default()).unwrap_or_default(),
                     body.timeout_seconds.map(|v| v as i64),
-                    body.max_parallel.map(|v| v as i64),
+                    body.max_parallel.map(i64::from),
                     now,
                 ],
             )?;
@@ -1418,10 +1615,13 @@ async fn containers_upload(
                  labels = ?4, updated_at = ?5 WHERE id = ?6",
                 rusqlite::params![
                     body.image,
-                    serde_json::to_string(&body.config.unwrap_or(serde_json::json!({}))).unwrap_or_default(),
+                    serde_json::to_string(&body.config.unwrap_or(serde_json::json!({})))
+                        .unwrap_or_default(),
                     body.network_id,
-                    serde_json::to_string(&body.labels.unwrap_or(serde_json::json!({}))).unwrap_or_default(),
-                    now, existing_id,
+                    serde_json::to_string(&body.labels.unwrap_or(serde_json::json!({})))
+                        .unwrap_or_default(),
+                    now,
+                    existing_id,
                 ],
             )?;
             existing_id
@@ -1431,10 +1631,15 @@ async fn containers_upload(
                  network_id, labels, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7, ?8, ?8)",
                 rusqlite::params![
-                    id, ctx.tenant_id, body.name, body.image,
-                    serde_json::to_string(&body.config.unwrap_or(serde_json::json!({}))).unwrap_or_default(),
+                    id,
+                    ctx.tenant_id,
+                    body.name,
+                    body.image,
+                    serde_json::to_string(&body.config.unwrap_or(serde_json::json!({})))
+                        .unwrap_or_default(),
                     body.network_id,
-                    serde_json::to_string(&body.labels.unwrap_or(serde_json::json!({}))).unwrap_or_default(),
+                    serde_json::to_string(&body.labels.unwrap_or(serde_json::json!({})))
+                        .unwrap_or_default(),
                     now,
                 ],
             )?;
@@ -1497,11 +1702,16 @@ async fn networks_upload(
                 rusqlite::params![
                     body.driver.as_deref().unwrap_or("bridge"),
                     body.isolation.as_deref().unwrap_or("default"),
-                    body.ipv6.unwrap_or(false) as i64,
-                    body.dns_config.as_ref().map(|v| serde_json::to_string(v).unwrap_or_default()),
-                    serde_json::to_string(&body.labels.unwrap_or(serde_json::json!({}))).unwrap_or_default(),
-                    serde_json::to_string(&body.options.unwrap_or(serde_json::json!({}))).unwrap_or_default(),
-                    now, existing_id,
+                    i64::from(body.ipv6.unwrap_or(false)),
+                    body.dns_config
+                        .as_ref()
+                        .map(|v| serde_json::to_string(v).unwrap_or_default()),
+                    serde_json::to_string(&body.labels.unwrap_or(serde_json::json!({})))
+                        .unwrap_or_default(),
+                    serde_json::to_string(&body.options.unwrap_or(serde_json::json!({})))
+                        .unwrap_or_default(),
+                    now,
+                    existing_id,
                 ],
             )?;
             existing_id
@@ -1511,13 +1721,19 @@ async fn networks_upload(
                  dns_config, labels, options, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
                 rusqlite::params![
-                    id, ctx.tenant_id, body.name,
+                    id,
+                    ctx.tenant_id,
+                    body.name,
                     body.driver.as_deref().unwrap_or("bridge"),
                     body.isolation.as_deref().unwrap_or("default"),
-                    body.ipv6.unwrap_or(false) as i64,
-                    body.dns_config.as_ref().map(|v| serde_json::to_string(v).unwrap_or_default()),
-                    serde_json::to_string(&body.labels.unwrap_or(serde_json::json!({}))).unwrap_or_default(),
-                    serde_json::to_string(&body.options.unwrap_or(serde_json::json!({}))).unwrap_or_default(),
+                    i64::from(body.ipv6.unwrap_or(false)),
+                    body.dns_config
+                        .as_ref()
+                        .map(|v| serde_json::to_string(v).unwrap_or_default()),
+                    serde_json::to_string(&body.labels.unwrap_or(serde_json::json!({})))
+                        .unwrap_or_default(),
+                    serde_json::to_string(&body.options.unwrap_or(serde_json::json!({})))
+                        .unwrap_or_default(),
                     now,
                 ],
             )?;
@@ -1527,8 +1743,16 @@ async fn networks_upload(
     });
 
     match result {
-        Ok(network_id) => (StatusCode::CREATED, Json(serde_json::json!({"success": true, "data": {"id": network_id, "name": body.name}}))).into_response(),
-        Err(e) => ApiResponse::<()>::err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Ok(network_id) => (
+            StatusCode::CREATED,
+            Json(
+                serde_json::json!({"success": true, "data": {"id": network_id, "name": body.name}}),
+            ),
+        )
+            .into_response(),
+        Err(e) => {
+            ApiResponse::<()>::err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
     }
 }
 
@@ -1566,27 +1790,237 @@ async fn bulk_upload(
     };
 
     let mut results = Vec::new();
-    let now = chrono::Utc::now().to_rfc3339();
 
     for (index, item) in body.items.iter().enumerate() {
-        let id = uuid::Uuid::new_v4().to_string();
-        let name = item.data.get("name").and_then(|v| v.as_str()).unwrap_or("unnamed");
+        let name = item
+            .data
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unnamed");
 
         let result = match item.item_type.as_str() {
-            "tool" | "agent" | "feed" | "team" | "pipeline" | "container" | "network" => {
-                let table = format!("aria_{}s", item.item_type);
-                state.db.with_conn(|conn| {
-                    // Simplified bulk insert — just the core fields
-                    conn.execute(
-                        &format!(
-                            "INSERT OR REPLACE INTO {} (id, tenant_id, name, created_at, updated_at)
-                             VALUES (?1, ?2, ?3, ?4, ?4)",
-                            table
-                        ),
-                        rusqlite::params![id, ctx.tenant_id, name, now],
-                    )?;
-                    Ok(())
-                })
+            "tool" => {
+                let body: Result<ToolUploadBody, _> = serde_json::from_value(item.data.clone());
+                match body {
+                    Ok(v) => {
+                        let schema =
+                            serde_json::to_string(&v.schema.unwrap_or(serde_json::json!({})))
+                                .unwrap_or_default();
+                        let sandbox = v
+                            .sandbox_config
+                            .as_ref()
+                            .map(|j| serde_json::to_string(j).unwrap_or_default());
+                        crate::aria::tool_registry::AriaToolRegistry::new(state.db.clone())
+                            .upload(
+                                &ctx.tenant_id,
+                                &v.name,
+                                v.description.as_deref().unwrap_or(""),
+                                &schema,
+                                v.handler_code.as_deref().unwrap_or(""),
+                                sandbox.as_deref(),
+                            )
+                            .map(|_| ())
+                    }
+                    Err(e) => Err(anyhow::anyhow!("Invalid tool payload: {e}")),
+                }
+            }
+            "agent" => {
+                let body: Result<AgentUploadBody, _> = serde_json::from_value(item.data.clone());
+                match body {
+                    Ok(v) => {
+                        let tools_json =
+                            serde_json::to_string(&v.tools.unwrap_or_default()).unwrap_or_default();
+                        let sandbox = v
+                            .sandbox_config
+                            .as_ref()
+                            .map(|j| serde_json::to_string(j).unwrap_or_default());
+                        crate::aria::agent_registry::AriaAgentRegistry::new(state.db.clone())
+                            .upload(crate::aria::agent_registry::AgentUploadRequest {
+                                tenant_id: &ctx.tenant_id,
+                                name: &v.name,
+                                description: v.description.as_deref().unwrap_or(""),
+                                model: v.model.as_deref(),
+                                temperature: v.temperature,
+                                system_prompt: v.system_prompt.as_deref(),
+                                tools: &tools_json,
+                                thinking: v.thinking.as_deref(),
+                                max_retries: v.max_retries.map(i64::from),
+                                timeout_seconds: v.timeout_seconds.map(|n| n as i64),
+                                handler_code: v.handler_code.as_deref().unwrap_or(""),
+                                sandbox_config: sandbox.as_deref(),
+                            })
+                            .map(|_| ())
+                    }
+                    Err(e) => Err(anyhow::anyhow!("Invalid agent payload: {e}")),
+                }
+            }
+            "feed" => {
+                let body: Result<FeedUploadBody, _> = serde_json::from_value(item.data.clone());
+                match body {
+                    Ok(v) => {
+                        let retention = v
+                            .retention
+                            .as_ref()
+                            .map(|j| serde_json::to_string(j).unwrap_or_default());
+                        let display = v
+                            .display
+                            .as_ref()
+                            .map(|j| serde_json::to_string(j).unwrap_or_default());
+                        let sandbox = v
+                            .sandbox_config
+                            .as_ref()
+                            .map(|j| serde_json::to_string(j).unwrap_or_default());
+                        crate::aria::feed_registry::AriaFeedRegistry::new(state.db.clone())
+                            .upload(crate::aria::feed_registry::FeedUploadRequest {
+                                tenant_id: &ctx.tenant_id,
+                                name: &v.name,
+                                description: v.description.as_deref().unwrap_or(""),
+                                handler_code: v.handler_code.as_deref().unwrap_or(""),
+                                schedule: &v.schedule,
+                                refresh_seconds: v.refresh_seconds.map(|n| n as i64),
+                                category: v.category.as_deref(),
+                                retention: retention.as_deref(),
+                                display: display.as_deref(),
+                                sandbox_config: sandbox.as_deref(),
+                            })
+                            .map(|_| ())
+                    }
+                    Err(e) => Err(anyhow::anyhow!("Invalid feed payload: {e}")),
+                }
+            }
+            "cron" => {
+                let body: Result<CronUploadBody, _> = serde_json::from_value(item.data.clone());
+                match body {
+                    Ok(v) => {
+                        let schedule = normalize_json_string(&v.schedule_data);
+                        let payload = normalize_json_string(&v.payload_data);
+                        let isolation = v
+                            .isolation
+                            .as_ref()
+                            .map(|j| serde_json::to_string(j).unwrap_or_default());
+                        crate::aria::cron_registry::AriaCronFunctionRegistry::new(state.db.clone())
+                            .create(
+                                &ctx.tenant_id,
+                                &v.name,
+                                v.description.as_deref().unwrap_or(""),
+                                &v.schedule_kind,
+                                &schedule,
+                                v.session_target.as_deref().unwrap_or("main"),
+                                v.wake_mode.as_deref().unwrap_or("next-heartbeat"),
+                                &v.payload_kind,
+                                &payload,
+                                isolation.as_deref(),
+                                v.enabled.unwrap_or(true),
+                                v.delete_after_run.unwrap_or(false),
+                            )
+                            .map(|_| ())
+                    }
+                    Err(e) => Err(anyhow::anyhow!("Invalid cron payload: {e}")),
+                }
+            }
+            "team" => {
+                let body: Result<TeamUploadBody, _> = serde_json::from_value(item.data.clone());
+                match body {
+                    Ok(v) => {
+                        let members = serde_json::to_string(&v.members).unwrap_or_default();
+                        let shared = v
+                            .shared_context
+                            .as_ref()
+                            .map(|j| serde_json::to_string(j).unwrap_or_default());
+                        crate::aria::team_registry::AriaTeamRegistry::new(state.db.clone())
+                            .create(crate::aria::team_registry::TeamCreateRequest {
+                                tenant_id: &ctx.tenant_id,
+                                name: &v.name,
+                                description: v.description.as_deref().unwrap_or(""),
+                                mode: v.mode.as_deref().unwrap_or("coordinator"),
+                                members: &members,
+                                shared_context: shared.as_deref(),
+                                timeout_seconds: v.timeout_seconds.map(|n| n as i64),
+                                max_rounds: v.max_rounds.map(i64::from),
+                            })
+                            .map(|_| ())
+                    }
+                    Err(e) => Err(anyhow::anyhow!("Invalid team payload: {e}")),
+                }
+            }
+            "pipeline" => {
+                let body: Result<PipelineUploadBody, _> = serde_json::from_value(item.data.clone());
+                match body {
+                    Ok(v) => {
+                        let steps = serde_json::to_string(&v.steps).unwrap_or_default();
+                        let vars = serde_json::to_string(&v.variables.unwrap_or_default())
+                            .unwrap_or_default();
+                        crate::aria::pipeline_registry::AriaPipelineRegistry::new(state.db.clone())
+                            .create(crate::aria::pipeline_registry::PipelineCreateRequest {
+                                tenant_id: &ctx.tenant_id,
+                                name: &v.name,
+                                description: v.description.as_deref().unwrap_or(""),
+                                steps: &steps,
+                                variables: &vars,
+                                timeout_seconds: v.timeout_seconds.map(|n| n as i64),
+                                max_parallel: v.max_parallel.map(i64::from),
+                            })
+                            .map(|_| ())
+                    }
+                    Err(e) => Err(anyhow::anyhow!("Invalid pipeline payload: {e}")),
+                }
+            }
+            "container" => {
+                let body: Result<ContainerUploadBody, _> =
+                    serde_json::from_value(item.data.clone());
+                match body {
+                    Ok(v) => {
+                        let config_json =
+                            serde_json::to_string(&v.config.unwrap_or(serde_json::json!({})))
+                                .unwrap_or_default();
+                        let labels =
+                            serde_json::to_string(&v.labels.unwrap_or(serde_json::json!({})))
+                                .unwrap_or_default();
+                        crate::aria::container_registry::AriaContainerRegistry::new(
+                            state.db.clone(),
+                        )
+                        .create(
+                            &ctx.tenant_id,
+                            &v.name,
+                            &v.image,
+                            &config_json,
+                            v.network_id.as_deref(),
+                            &labels,
+                        )
+                        .map(|_| ())
+                    }
+                    Err(e) => Err(anyhow::anyhow!("Invalid container payload: {e}")),
+                }
+            }
+            "network" => {
+                let body: Result<NetworkUploadBody, _> = serde_json::from_value(item.data.clone());
+                match body {
+                    Ok(v) => {
+                        let labels =
+                            serde_json::to_string(&v.labels.unwrap_or(serde_json::json!({})))
+                                .unwrap_or_default();
+                        let options =
+                            serde_json::to_string(&v.options.unwrap_or(serde_json::json!({})))
+                                .unwrap_or_default();
+                        let dns = v
+                            .dns_config
+                            .as_ref()
+                            .map(|j| serde_json::to_string(j).unwrap_or_default());
+                        crate::aria::network_registry::AriaNetworkRegistry::new(state.db.clone())
+                            .create(crate::aria::network_registry::NetworkCreateRequest {
+                                tenant_id: &ctx.tenant_id,
+                                name: &v.name,
+                                driver: v.driver.as_deref().unwrap_or("bridge"),
+                                isolation: v.isolation.as_deref().unwrap_or("default"),
+                                ipv6: v.ipv6.unwrap_or(false),
+                                dns_config: dns.as_deref(),
+                                labels: &labels,
+                                options: &options,
+                            })
+                            .map(|_| ())
+                    }
+                    Err(e) => Err(anyhow::anyhow!("Invalid network payload: {e}")),
+                }
             }
             _ => Err(anyhow::anyhow!("Unknown item type: {}", item.item_type)),
         };
@@ -1600,10 +2034,14 @@ async fn bulk_upload(
         }));
     }
 
-    (StatusCode::OK, Json(serde_json::json!({
-        "success": true,
-        "data": {"results": results, "total": body.items.len()}
-    }))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "success": true,
+            "data": {"results": results, "total": body.items.len()}
+        })),
+    )
+        .into_response()
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -1664,18 +2102,31 @@ async fn pipelines_execute(
 
     let timeout = body
         .get("timeout_ms")
-        .and_then(|v| v.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .map(std::time::Duration::from_millis);
 
-    let max_parallel = body.get("max_parallel").and_then(|v| v.as_u64()).map(|v| v as u32);
+    let max_parallel = body
+        .get("max_parallel")
+        .and_then(serde_json::Value::as_u64)
+        .map(|v| v as u32);
 
     // Execute the pipeline
     let engine = crate::pipeline::executor::PipelineEngine::new(state.db.clone());
     match engine
-        .execute(&id, &ctx.tenant_id, &steps, variables, timeout, max_parallel)
+        .execute(
+            &id,
+            &ctx.tenant_id,
+            &steps,
+            variables,
+            timeout,
+            max_parallel,
+        )
         .await
     {
-        Ok(result) => (StatusCode::OK, Json(serde_json::json!({"success": true, "data": result})))
+        Ok(result) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"success": true, "data": result})),
+        )
             .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1698,9 +2149,7 @@ async fn teams_execute(
     };
 
     // Load team definition
-    let team = match crate::aria::team_registry::AriaTeamRegistry::new(state.db.clone())
-        .get(&id)
-    {
+    let team = match crate::aria::team_registry::AriaTeamRegistry::new(state.db.clone()).get(&id) {
         Ok(Some(t)) => t,
         Ok(None) => {
             return (
@@ -1726,10 +2175,13 @@ async fn teams_execute(
 
     let timeout = body
         .get("timeout_ms")
-        .and_then(|v| v.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .map(std::time::Duration::from_millis);
 
-    let max_rounds = body.get("max_rounds").and_then(|v| v.as_u64()).map(|v| v as u32);
+    let max_rounds = body
+        .get("max_rounds")
+        .and_then(serde_json::Value::as_u64)
+        .map(|v| v as u32);
 
     // Deserialize members and mode from JSON strings
     let members: Vec<crate::team::types::TeamMemberRuntime> =
@@ -1758,10 +2210,21 @@ async fn teams_execute(
     // Execute the team
     let engine = crate::team::engine::TeamEngine::new(state.db.clone());
     match engine
-        .execute(&id, &ctx.tenant_id, &input, &mode, &members, timeout, max_rounds)
+        .execute(crate::team::engine::TeamExecutionRequest {
+            team_id: &id,
+            tenant_id: &ctx.tenant_id,
+            input: &input,
+            mode: &mode,
+            members: &members,
+            timeout,
+            max_rounds,
+        })
         .await
     {
-        Ok(result) => (StatusCode::OK, Json(serde_json::json!({"success": true, "data": result})))
+        Ok(result) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"success": true, "data": result})),
+        )
             .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1783,9 +2246,7 @@ async fn feeds_execute(
     };
 
     // Load feed definition
-    let feed = match crate::aria::feed_registry::AriaFeedRegistry::new(state.db.clone())
-        .get(&id)
-    {
+    let feed = match crate::aria::feed_registry::AriaFeedRegistry::new(state.db.clone()).get(&id) {
         Ok(Some(f)) => f,
         Ok(None) => {
             return (
@@ -1815,7 +2276,10 @@ async fn feeds_execute(
             if result.success && !result.items.is_empty() {
                 let _ = executor.store_items(&ctx.tenant_id, &id, &run_id, &result.items);
             }
-            (StatusCode::OK, Json(serde_json::json!({"success": true, "data": result})))
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"success": true, "data": result})),
+            )
                 .into_response()
         }
         Err(e) => (
@@ -1868,7 +2332,10 @@ mod tests {
     #[test]
     fn extract_route_context_parses_tenant() {
         let mut headers = HeaderMap::new();
-        headers.insert(header::AUTHORIZATION, "Bearer tenant123:secret".parse().unwrap());
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer tenant123:secret".parse().unwrap(),
+        );
         let ctx = extract_route_context(&headers).unwrap();
         assert_eq!(ctx.tenant_id, "tenant123");
     }
@@ -1876,7 +2343,10 @@ mod tests {
     #[test]
     fn extract_route_context_uses_token_as_tenant() {
         let mut headers = HeaderMap::new();
-        headers.insert(header::AUTHORIZATION, "Bearer simple_token".parse().unwrap());
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer simple_token".parse().unwrap(),
+        );
         let ctx = extract_route_context(&headers).unwrap();
         assert_eq!(ctx.tenant_id, "simple_token");
     }

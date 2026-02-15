@@ -1,7 +1,7 @@
 //! Container registry — SQLite-backed store for Aria container lifecycle management.
 //!
 //! Tracks container state (pending/running/stopped/exited/error), runtime
-//! properties (IP, PID), and network associations. Includes a network_index
+//! properties (IP, PID), and network associations. Includes a `network_index`
 //! for O(1) container-to-network lookups. Soft-deleted when removed.
 
 use super::db::AriaDb;
@@ -39,7 +39,7 @@ pub struct AriaContainerRegistry {
     cache: Mutex<HashMap<String, AriaContainerEntry>>,
     tenant_index: Mutex<HashMap<String, HashSet<String>>>,
     name_index: Mutex<HashMap<String, String>>,
-    /// Maps network_id -> set of container IDs for O(1) network lookups.
+    /// Maps `network_id` -> set of container IDs for O(1) network lookups.
     network_index: Mutex<HashMap<String, HashSet<String>>>,
     loaded: AtomicBool,
 }
@@ -100,7 +100,9 @@ impl AriaContainerRegistry {
         nwi.clear();
 
         for e in entries {
-            ti.entry(e.tenant_id.clone()).or_default().insert(e.id.clone());
+            ti.entry(e.tenant_id.clone())
+                .or_default()
+                .insert(e.id.clone());
             ni.insert(format!("{}:{}", e.tenant_id, e.name), e.id.clone());
             if let Some(ref nid) = e.network_id {
                 nwi.entry(nid.clone()).or_default().insert(e.id.clone());
@@ -112,13 +114,23 @@ impl AriaContainerRegistry {
     }
 
     fn index_entry(&self, entry: &AriaContainerEntry) {
-        self.tenant_index.lock().unwrap()
-            .entry(entry.tenant_id.clone()).or_default().insert(entry.id.clone());
-        self.name_index.lock().unwrap()
-            .insert(format!("{}:{}", entry.tenant_id, entry.name), entry.id.clone());
+        self.tenant_index
+            .lock()
+            .unwrap()
+            .entry(entry.tenant_id.clone())
+            .or_default()
+            .insert(entry.id.clone());
+        self.name_index.lock().unwrap().insert(
+            format!("{}:{}", entry.tenant_id, entry.name),
+            entry.id.clone(),
+        );
         if let Some(ref nid) = entry.network_id {
-            self.network_index.lock().unwrap()
-                .entry(nid.clone()).or_default().insert(entry.id.clone());
+            self.network_index
+                .lock()
+                .unwrap()
+                .entry(nid.clone())
+                .or_default()
+                .insert(entry.id.clone());
         }
     }
 
@@ -126,7 +138,9 @@ impl AriaContainerRegistry {
         if let Some(set) = self.tenant_index.lock().unwrap().get_mut(&entry.tenant_id) {
             set.remove(&entry.id);
         }
-        self.name_index.lock().unwrap()
+        self.name_index
+            .lock()
+            .unwrap()
             .remove(&format!("{}:{}", entry.tenant_id, entry.name));
         if let Some(ref nid) = entry.network_id {
             if let Some(set) = self.network_index.lock().unwrap().get_mut(nid) {
@@ -188,8 +202,12 @@ impl AriaContainerRegistry {
             };
             // Re-index with new network_id
             if let Some(ref nid) = updated.network_id {
-                self.network_index.lock().unwrap()
-                    .entry(nid.clone()).or_default().insert(eid.clone());
+                self.network_index
+                    .lock()
+                    .unwrap()
+                    .entry(nid.clone())
+                    .or_default()
+                    .insert(eid.clone());
             }
             self.cache.lock().unwrap().insert(eid, updated.clone());
             Ok(updated)
@@ -215,10 +233,18 @@ impl AriaContainerRegistry {
                      container_ip, container_pid, network_id, labels, created_at, updated_at)
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
                     params![
-                        entry.id, entry.tenant_id, entry.name, entry.image,
-                        entry.config, entry.state, entry.container_ip,
-                        entry.container_pid, entry.network_id, entry.labels,
-                        entry.created_at, entry.updated_at
+                        entry.id,
+                        entry.tenant_id,
+                        entry.name,
+                        entry.image,
+                        entry.config,
+                        entry.state,
+                        entry.container_ip,
+                        entry.container_pid,
+                        entry.network_id,
+                        entry.labels,
+                        entry.created_at,
+                        entry.updated_at
                     ],
                 )?;
                 Ok(())
@@ -236,8 +262,12 @@ impl AriaContainerRegistry {
 
     pub fn get_by_name(&self, tenant_id: &str, name: &str) -> Result<Option<AriaContainerEntry>> {
         self.ensure_loaded()?;
-        let id = self.name_index.lock().unwrap()
-            .get(&format!("{tenant_id}:{name}")).cloned();
+        let id = self
+            .name_index
+            .lock()
+            .unwrap()
+            .get(&format!("{tenant_id}:{name}"))
+            .cloned();
         match id {
             Some(id) => self.get(&id),
             None => Ok(None),
@@ -258,7 +288,12 @@ impl AriaContainerRegistry {
 
     pub fn count(&self, tenant_id: &str) -> Result<usize> {
         self.ensure_loaded()?;
-        Ok(self.tenant_index.lock().unwrap().get(tenant_id).map_or(0, |s| s.len()))
+        Ok(self
+            .tenant_index
+            .lock()
+            .unwrap()
+            .get(tenant_id)
+            .map_or(0, std::collections::HashSet::len))
     }
 
     /// Soft-delete a container.
@@ -332,12 +367,9 @@ mod tests {
         AriaContainerRegistry::new(db)
     }
 
-    fn create_default(
-        reg: &AriaContainerRegistry,
-        tenant: &str,
-        name: &str,
-    ) -> AriaContainerEntry {
-        reg.create(tenant, name, "node:20-slim", "{}", None, "{}").unwrap()
+    fn create_default(reg: &AriaContainerRegistry, tenant: &str, name: &str) -> AriaContainerEntry {
+        reg.create(tenant, name, "node:20-slim", "{}", None, "{}")
+            .unwrap()
     }
 
     #[test]
@@ -356,7 +388,9 @@ mod tests {
     fn upsert_by_name_updates_existing() {
         let reg = setup();
         let v1 = create_default(&reg, "t1", "ctr");
-        let v2 = reg.create("t1", "ctr", "python:3.12", "{}", None, "{}").unwrap();
+        let v2 = reg
+            .create("t1", "ctr", "python:3.12", "{}", None, "{}")
+            .unwrap();
         assert_eq!(v2.id, v1.id);
         assert_eq!(v2.image, "python:3.12");
         assert_eq!(v2.state, "pending");
@@ -412,7 +446,8 @@ mod tests {
         assert_eq!(running.container_pid, Some(12345));
 
         // Transition to stopped
-        reg.update_runtime_state(&entry.id, "stopped", None, None).unwrap();
+        reg.update_runtime_state(&entry.id, "stopped", None, None)
+            .unwrap();
         let stopped = reg.get(&entry.id).unwrap().unwrap();
         assert_eq!(stopped.state, "stopped");
         assert!(stopped.container_ip.is_none());
@@ -421,9 +456,12 @@ mod tests {
     #[test]
     fn list_by_network() {
         let reg = setup();
-        reg.create("t1", "ctr-a", "node:20", "{}", Some("net-1"), "{}").unwrap();
-        reg.create("t1", "ctr-b", "node:20", "{}", Some("net-1"), "{}").unwrap();
-        reg.create("t1", "ctr-c", "node:20", "{}", Some("net-2"), "{}").unwrap();
+        reg.create("t1", "ctr-a", "node:20", "{}", Some("net-1"), "{}")
+            .unwrap();
+        reg.create("t1", "ctr-b", "node:20", "{}", Some("net-1"), "{}")
+            .unwrap();
+        reg.create("t1", "ctr-c", "node:20", "{}", Some("net-2"), "{}")
+            .unwrap();
         create_default(&reg, "t1", "ctr-d"); // no network
 
         let net1 = reg.list_by_network("net-1").unwrap();
@@ -439,11 +477,13 @@ mod tests {
     #[test]
     fn network_index_updates_on_upsert() {
         let reg = setup();
-        reg.create("t1", "ctr", "node:20", "{}", Some("net-old"), "{}").unwrap();
+        reg.create("t1", "ctr", "node:20", "{}", Some("net-old"), "{}")
+            .unwrap();
         assert_eq!(reg.list_by_network("net-old").unwrap().len(), 1);
 
         // Upsert changes network
-        reg.create("t1", "ctr", "node:20", "{}", Some("net-new"), "{}").unwrap();
+        reg.create("t1", "ctr", "node:20", "{}", Some("net-new"), "{}")
+            .unwrap();
         assert_eq!(reg.list_by_network("net-old").unwrap().len(), 0);
         assert_eq!(reg.list_by_network("net-new").unwrap().len(), 1);
     }
@@ -463,7 +503,8 @@ mod tests {
         let db = AriaDb::open_in_memory().unwrap();
         {
             let reg = AriaContainerRegistry::new(db.clone());
-            reg.create("t1", "persist-ctr", "img", "{}", Some("net"), "{}").unwrap();
+            reg.create("t1", "persist-ctr", "img", "{}", Some("net"), "{}")
+                .unwrap();
         }
         let reg2 = AriaContainerRegistry::new(db);
         let entry = reg2.get_by_name("t1", "persist-ctr").unwrap().unwrap();

@@ -58,8 +58,11 @@ impl Provider for OpenRouterProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let api_key = self.api_key.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("OpenRouter API key not set. Run `afw onboard` or set OPENROUTER_API_KEY env var."))?;
+        let api_key = self.api_key.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "OpenRouter API key not set. Run `afw onboard` or set OPENROUTER_API_KEY env var."
+            )
+        })?;
 
         let mut messages = Vec::new();
 
@@ -85,10 +88,7 @@ impl Provider for OpenRouterProvider {
             .client
             .post("https://openrouter.ai/api/v1/chat/completions")
             .header("Authorization", format!("Bearer {api_key}"))
-            .header(
-                "HTTP-Referer",
-                "https://github.com/theonlyhennygod/afw",
-            )
+            .header("HTTP-Referer", "https://github.com/theonlyhennygod/afw")
             .header("X-Title", "Aria")
             .json(&request)
             .send()

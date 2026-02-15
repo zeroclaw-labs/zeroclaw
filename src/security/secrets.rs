@@ -194,7 +194,10 @@ impl SecretStore {
                 let _ = std::process::Command::new("icacls")
                     .arg(&self.key_path)
                     .args(["/inheritance:r", "/grant:r"])
-                    .arg(format!("{}:F", std::env::var("USERNAME").unwrap_or_default()))
+                    .arg(format!(
+                        "{}:F",
+                        std::env::var("USERNAME").unwrap_or_default()
+                    ))
                     .output();
             }
 

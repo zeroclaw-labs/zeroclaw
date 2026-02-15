@@ -30,6 +30,16 @@ pub struct AriaPipelineEntry {
     pub updated_at: String,
 }
 
+pub struct PipelineCreateRequest<'a> {
+    pub tenant_id: &'a str,
+    pub name: &'a str,
+    pub description: &'a str,
+    pub steps: &'a str,
+    pub variables: &'a str,
+    pub timeout_seconds: Option<i64>,
+    pub max_parallel: Option<i64>,
+}
+
 // ── Registry ─────────────────────────────────────────────────────
 
 pub struct AriaPipelineRegistry {
@@ -91,7 +101,9 @@ impl AriaPipelineRegistry {
         ni.clear();
 
         for e in entries {
-            ti.entry(e.tenant_id.clone()).or_default().insert(e.id.clone());
+            ti.entry(e.tenant_id.clone())
+                .or_default()
+                .insert(e.id.clone());
             ni.insert(format!("{}:{}", e.tenant_id, e.name), e.id.clone());
             cache.insert(e.id.clone(), e);
         }
@@ -100,32 +112,40 @@ impl AriaPipelineRegistry {
     }
 
     fn index_entry(&self, entry: &AriaPipelineEntry) {
-        self.tenant_index.lock().unwrap()
-            .entry(entry.tenant_id.clone()).or_default().insert(entry.id.clone());
-        self.name_index.lock().unwrap()
-            .insert(format!("{}:{}", entry.tenant_id, entry.name), entry.id.clone());
+        self.tenant_index
+            .lock()
+            .unwrap()
+            .entry(entry.tenant_id.clone())
+            .or_default()
+            .insert(entry.id.clone());
+        self.name_index.lock().unwrap().insert(
+            format!("{}:{}", entry.tenant_id, entry.name),
+            entry.id.clone(),
+        );
     }
 
     fn deindex_entry(&self, entry: &AriaPipelineEntry) {
         if let Some(set) = self.tenant_index.lock().unwrap().get_mut(&entry.tenant_id) {
             set.remove(&entry.id);
         }
-        self.name_index.lock().unwrap()
+        self.name_index
+            .lock()
+            .unwrap()
             .remove(&format!("{}:{}", entry.tenant_id, entry.name));
     }
 
     // ── Public API ───────────────────────────────────────────────
 
-    pub fn create(
-        &self,
-        tenant_id: &str,
-        name: &str,
-        description: &str,
-        steps: &str,
-        variables: &str,
-        timeout_seconds: Option<i64>,
-        max_parallel: Option<i64>,
-    ) -> Result<AriaPipelineEntry> {
+    pub fn create(&self, req: PipelineCreateRequest<'_>) -> Result<AriaPipelineEntry> {
+        let PipelineCreateRequest {
+            tenant_id,
+            name,
+            description,
+            steps,
+            variables,
+            timeout_seconds,
+            max_parallel,
+        } = req;
         self.ensure_loaded()?;
         let now = Utc::now().to_rfc3339();
 
@@ -141,7 +161,15 @@ impl AriaPipelineRegistry {
                 conn.execute(
                     "UPDATE aria_pipelines SET description=?1, steps=?2, variables=?3,
                      timeout_seconds=?4, max_parallel=?5, updated_at=?6 WHERE id=?7",
-                    params![description, steps, variables, timeout_seconds, max_parallel, now, eid],
+                    params![
+                        description,
+                        steps,
+                        variables,
+                        timeout_seconds,
+                        max_parallel,
+                        now,
+                        eid
+                    ],
                 )?;
                 Ok(())
             })?;
@@ -177,9 +205,17 @@ impl AriaPipelineRegistry {
                      variables, timeout_seconds, max_parallel, status, created_at, updated_at)
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                     params![
-                        entry.id, entry.tenant_id, entry.name, entry.description,
-                        entry.steps, entry.variables, entry.timeout_seconds,
-                        entry.max_parallel, entry.status, entry.created_at, entry.updated_at
+                        entry.id,
+                        entry.tenant_id,
+                        entry.name,
+                        entry.description,
+                        entry.steps,
+                        entry.variables,
+                        entry.timeout_seconds,
+                        entry.max_parallel,
+                        entry.status,
+                        entry.created_at,
+                        entry.updated_at
                     ],
                 )?;
                 Ok(())
@@ -197,8 +233,12 @@ impl AriaPipelineRegistry {
 
     pub fn get_by_name(&self, tenant_id: &str, name: &str) -> Result<Option<AriaPipelineEntry>> {
         self.ensure_loaded()?;
-        let id = self.name_index.lock().unwrap()
-            .get(&format!("{tenant_id}:{name}")).cloned();
+        let id = self
+            .name_index
+            .lock()
+            .unwrap()
+            .get(&format!("{tenant_id}:{name}"))
+            .cloned();
         match id {
             Some(id) => self.get(&id),
             None => Ok(None),
@@ -226,7 +266,12 @@ impl AriaPipelineRegistry {
 
     pub fn count(&self, tenant_id: &str) -> Result<usize> {
         self.ensure_loaded()?;
-        Ok(self.tenant_index.lock().unwrap().get(tenant_id).map_or(0, |s| s.len()))
+        Ok(self
+            .tenant_index
+            .lock()
+            .unwrap()
+            .get(tenant_id)
+            .map_or(0, std::collections::HashSet::len))
     }
 
     /// Soft-delete a pipeline.
@@ -260,12 +305,39 @@ mod tests {
         AriaPipelineRegistry::new(db)
     }
 
+    fn create_pipe(
+        reg: &AriaPipelineRegistry,
+        tenant: &str,
+        name: &str,
+        description: &str,
+        steps: &str,
+        variables: &str,
+        timeout_seconds: Option<i64>,
+        max_parallel: Option<i64>,
+    ) -> AriaPipelineEntry {
+        reg.create(PipelineCreateRequest {
+            tenant_id: tenant,
+            name,
+            description,
+            steps,
+            variables,
+            timeout_seconds,
+            max_parallel,
+        })
+        .unwrap()
+    }
+
     fn create_default(reg: &AriaPipelineRegistry, tenant: &str, name: &str) -> AriaPipelineEntry {
-        reg.create(
-            tenant, name, "desc",
+        create_pipe(
+            reg,
+            tenant,
+            name,
+            "desc",
             r#"[{"id":"s1","name":"step1","step_type":"agent"}]"#,
-            r#"{"input":"hello"}"#, Some(600), Some(4),
-        ).unwrap()
+            r#"{"input":"hello"}"#,
+            Some(600),
+            Some(4),
+        )
     }
 
     #[test]
@@ -284,9 +356,16 @@ mod tests {
     fn upsert_by_name_updates_existing() {
         let reg = setup();
         let v1 = create_default(&reg, "t1", "pipe");
-        let v2 = reg.create(
-            "t1", "pipe", "updated", "[]", "{}", Some(300), Some(2),
-        ).unwrap();
+        let v2 = create_pipe(
+            &reg,
+            "t1",
+            "pipe",
+            "updated",
+            "[]",
+            "{}",
+            Some(300),
+            Some(2),
+        );
         assert_eq!(v2.id, v1.id);
         assert_eq!(v2.description, "updated");
         assert_eq!(v2.max_parallel, Some(2));

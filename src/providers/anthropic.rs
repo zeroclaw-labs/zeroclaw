@@ -371,7 +371,10 @@ mod tests {
         let json = r#"{"content":[{"type":"text","text":"Let me check."},{"type":"tool_use","id":"call_1","name":"shell","input":{"command":"ls"}}],"stop_reason":"tool_use"}"#;
         let resp: ToolChatResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.content.len(), 2);
-        assert!(matches!(&resp.content[0], AnthropicContentBlock::Text { .. }));
+        assert!(matches!(
+            &resp.content[0],
+            AnthropicContentBlock::Text { .. }
+        ));
         assert!(matches!(
             &resp.content[1],
             AnthropicContentBlock::ToolUse { name, .. } if name == "shell"

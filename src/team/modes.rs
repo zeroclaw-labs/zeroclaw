@@ -9,8 +9,8 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use std::collections::HashMap;
 
-use crate::aria::types::{AgentResult, TeamResult};
 use super::types::{TeamExecutionContext, TeamMemberRuntime, TeamMessage};
+use crate::aria::types::{AgentResult, TeamResult};
 
 /// Execute a single agent on a given input.
 ///
@@ -25,7 +25,11 @@ fn run_agent(member: &TeamMemberRuntime, input: &str) -> AgentResult {
         member.agent_name,
         role_desc,
         member.capabilities.join(", "),
-        if input.len() > 200 { &input[..200] } else { input }
+        if input.len() > 200 {
+            &input[..200]
+        } else {
+            input
+        }
     );
     AgentResult {
         success: true,
@@ -182,12 +186,12 @@ pub async fn run_coordinator(
         agent_results: all_results,
         mode: "coordinator".into(),
         duration_ms: Some(start.elapsed().as_millis() as u64),
-        metadata: Some(HashMap::new().into()),
+        metadata: Some(HashMap::new()),
     })
 }
 
 /// **Round-robin mode**: Each agent gets a turn in order. Agent N receives
-/// the accumulated context from agents 0..N-1. Continues for max_rounds
+/// the accumulated context from agents 0..N-1. Continues for `max_rounds`
 /// iterations. Each agent builds on the previous output.
 pub async fn run_round_robin(
     ctx: &TeamExecutionContext,

@@ -31,6 +31,17 @@ pub struct AriaTeamEntry {
     pub updated_at: String,
 }
 
+pub struct TeamCreateRequest<'a> {
+    pub tenant_id: &'a str,
+    pub name: &'a str,
+    pub description: &'a str,
+    pub mode: &'a str,
+    pub members: &'a str,
+    pub shared_context: Option<&'a str>,
+    pub timeout_seconds: Option<i64>,
+    pub max_rounds: Option<i64>,
+}
+
 // ── Registry ─────────────────────────────────────────────────────
 
 pub struct AriaTeamRegistry {
@@ -94,7 +105,9 @@ impl AriaTeamRegistry {
         ni.clear();
 
         for e in entries {
-            ti.entry(e.tenant_id.clone()).or_default().insert(e.id.clone());
+            ti.entry(e.tenant_id.clone())
+                .or_default()
+                .insert(e.id.clone());
             ni.insert(format!("{}:{}", e.tenant_id, e.name), e.id.clone());
             cache.insert(e.id.clone(), e);
         }
@@ -103,33 +116,41 @@ impl AriaTeamRegistry {
     }
 
     fn index_entry(&self, entry: &AriaTeamEntry) {
-        self.tenant_index.lock().unwrap()
-            .entry(entry.tenant_id.clone()).or_default().insert(entry.id.clone());
-        self.name_index.lock().unwrap()
-            .insert(format!("{}:{}", entry.tenant_id, entry.name), entry.id.clone());
+        self.tenant_index
+            .lock()
+            .unwrap()
+            .entry(entry.tenant_id.clone())
+            .or_default()
+            .insert(entry.id.clone());
+        self.name_index.lock().unwrap().insert(
+            format!("{}:{}", entry.tenant_id, entry.name),
+            entry.id.clone(),
+        );
     }
 
     fn deindex_entry(&self, entry: &AriaTeamEntry) {
         if let Some(set) = self.tenant_index.lock().unwrap().get_mut(&entry.tenant_id) {
             set.remove(&entry.id);
         }
-        self.name_index.lock().unwrap()
+        self.name_index
+            .lock()
+            .unwrap()
             .remove(&format!("{}:{}", entry.tenant_id, entry.name));
     }
 
     // ── Public API ───────────────────────────────────────────────
 
-    pub fn create(
-        &self,
-        tenant_id: &str,
-        name: &str,
-        description: &str,
-        mode: &str,
-        members: &str,
-        shared_context: Option<&str>,
-        timeout_seconds: Option<i64>,
-        max_rounds: Option<i64>,
-    ) -> Result<AriaTeamEntry> {
+    pub fn create(&self, req: TeamCreateRequest<'_>) -> Result<AriaTeamEntry> {
+        let TeamCreateRequest {
+            tenant_id,
+            name,
+            description,
+            mode,
+            members,
+            shared_context,
+            timeout_seconds,
+            max_rounds,
+        } = req;
         self.ensure_loaded()?;
         let now = Utc::now().to_rfc3339();
 
@@ -147,8 +168,14 @@ impl AriaTeamRegistry {
                      shared_context=?4, timeout_seconds=?5, max_rounds=?6,
                      updated_at=?7 WHERE id=?8",
                     params![
-                        description, mode, members, shared_context,
-                        timeout_seconds, max_rounds, now, eid
+                        description,
+                        mode,
+                        members,
+                        shared_context,
+                        timeout_seconds,
+                        max_rounds,
+                        now,
+                        eid
                     ],
                 )?;
                 Ok(())
@@ -188,10 +215,18 @@ impl AriaTeamRegistry {
                      created_at, updated_at)
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
                     params![
-                        entry.id, entry.tenant_id, entry.name, entry.description,
-                        entry.mode, entry.members, entry.shared_context,
-                        entry.timeout_seconds, entry.max_rounds, entry.status,
-                        entry.created_at, entry.updated_at
+                        entry.id,
+                        entry.tenant_id,
+                        entry.name,
+                        entry.description,
+                        entry.mode,
+                        entry.members,
+                        entry.shared_context,
+                        entry.timeout_seconds,
+                        entry.max_rounds,
+                        entry.status,
+                        entry.created_at,
+                        entry.updated_at
                     ],
                 )?;
                 Ok(())
@@ -209,8 +244,12 @@ impl AriaTeamRegistry {
 
     pub fn get_by_name(&self, tenant_id: &str, name: &str) -> Result<Option<AriaTeamEntry>> {
         self.ensure_loaded()?;
-        let id = self.name_index.lock().unwrap()
-            .get(&format!("{tenant_id}:{name}")).cloned();
+        let id = self
+            .name_index
+            .lock()
+            .unwrap()
+            .get(&format!("{tenant_id}:{name}"))
+            .cloned();
         match id {
             Some(id) => self.get(&id),
             None => Ok(None),
@@ -238,7 +277,12 @@ impl AriaTeamRegistry {
 
     pub fn count(&self, tenant_id: &str) -> Result<usize> {
         self.ensure_loaded()?;
-        Ok(self.tenant_index.lock().unwrap().get(tenant_id).map_or(0, |s| s.len()))
+        Ok(self
+            .tenant_index
+            .lock()
+            .unwrap()
+            .get(tenant_id)
+            .map_or(0, std::collections::HashSet::len))
     }
 
     /// Soft-delete a team.
@@ -273,11 +317,17 @@ mod tests {
     }
 
     fn create_default(reg: &AriaTeamRegistry, tenant: &str, name: &str) -> AriaTeamEntry {
-        reg.create(
-            tenant, name, "desc", "coordinator",
-            r#"[{"agent_id":"a1","role":"leader"}]"#,
-            None, Some(300), Some(10),
-        ).unwrap()
+        reg.create(TeamCreateRequest {
+            tenant_id: tenant,
+            name,
+            description: "desc",
+            mode: "coordinator",
+            members: r#"[{"agent_id":"a1","role":"leader"}]"#,
+            shared_context: None,
+            timeout_seconds: Some(300),
+            max_rounds: Some(10),
+        })
+        .unwrap()
     }
 
     #[test]
@@ -296,9 +346,18 @@ mod tests {
     fn upsert_by_name_updates_existing() {
         let reg = setup();
         let v1 = create_default(&reg, "t1", "team");
-        let v2 = reg.create(
-            "t1", "team", "updated", "parallel", "[]", None, Some(600), None,
-        ).unwrap();
+        let v2 = reg
+            .create(TeamCreateRequest {
+                tenant_id: "t1",
+                name: "team",
+                description: "updated",
+                mode: "parallel",
+                members: "[]",
+                shared_context: None,
+                timeout_seconds: Some(600),
+                max_rounds: None,
+            })
+            .unwrap();
         assert_eq!(v2.id, v1.id);
         assert_eq!(v2.mode, "parallel");
         assert_eq!(reg.count("t1").unwrap(), 1);

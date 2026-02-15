@@ -58,7 +58,7 @@ pub fn is_sandbox_container(status: &QuiltContainerStatus) -> bool {
         .labels
         .as_ref()
         .and_then(|l| l.get(LABEL_SANDBOX))
-        .map_or(false, |v| v == "true")
+        .is_some_and(|v| v == "true")
 }
 
 /// Extract the creation timestamp from labels, if present.
@@ -139,7 +139,9 @@ pub async fn prune_sandbox_containers(
         return Ok(0);
     }
 
-    info!("Starting sandbox container prune (idle_hours={idle_hours}, max_age_days={max_age_days})");
+    info!(
+        "Starting sandbox container prune (idle_hours={idle_hours}, max_age_days={max_age_days})"
+    );
 
     let containers = client.list_containers().await?;
     let mut deleted = 0;
@@ -150,8 +152,7 @@ pub async fn prune_sandbox_containers(
             continue;
         }
 
-        let should_delete = is_too_old(container, max_age_days)
-            || is_idle(container, idle_hours);
+        let should_delete = is_too_old(container, max_age_days) || is_idle(container, idle_hours);
 
         if should_delete {
             info!(
@@ -391,13 +392,7 @@ mod tests {
 
     #[test]
     fn container_no_timestamps_not_too_old() {
-        let c = make_container(
-            "nots",
-            QuiltContainerState::Running,
-            None,
-            None,
-            None,
-        );
+        let c = make_container("nots", QuiltContainerState::Running, None, None, None);
         assert!(!is_too_old(&c, 7));
     }
 
@@ -468,13 +463,7 @@ mod tests {
                 None,
             ),
             // No labels -> keep
-            make_container(
-                "keep3",
-                QuiltContainerState::Running,
-                None,
-                Some(now),
-                None,
-            ),
+            make_container("keep3", QuiltContainerState::Running, None, Some(now), None),
         ];
 
         let idle_hours = 2;
@@ -483,8 +472,7 @@ mod tests {
         let to_prune: Vec<_> = containers
             .iter()
             .filter(|c| {
-                is_sandbox_container(c)
-                    && (is_idle(c, idle_hours) || is_too_old(c, max_age_days))
+                is_sandbox_container(c) && (is_idle(c, idle_hours) || is_too_old(c, max_age_days))
             })
             .map(|c| c.id.as_str())
             .collect();
@@ -496,10 +484,28 @@ mod tests {
     fn filter_all_sandbox_containers() {
         let now = now_ms();
         let containers = vec![
-            make_container("s1", QuiltContainerState::Running, Some(sandbox_labels(now)), Some(now), None),
-            make_container("s2", QuiltContainerState::Exited, Some(sandbox_labels(now)), Some(now), Some(now)),
+            make_container(
+                "s1",
+                QuiltContainerState::Running,
+                Some(sandbox_labels(now)),
+                Some(now),
+                None,
+            ),
+            make_container(
+                "s2",
+                QuiltContainerState::Exited,
+                Some(sandbox_labels(now)),
+                Some(now),
+                Some(now),
+            ),
             make_container("ns1", QuiltContainerState::Running, None, Some(now), None),
-            make_container("ns2", QuiltContainerState::Running, Some(non_sandbox_labels()), Some(now), None),
+            make_container(
+                "ns2",
+                QuiltContainerState::Running,
+                Some(non_sandbox_labels()),
+                Some(now),
+                None,
+            ),
         ];
 
         let sandbox: Vec<_> = containers

@@ -2,7 +2,7 @@
 //!
 //! Supports two execution modes:
 //! - **URL feeds**: When `handler_code` is an HTTP(S) URL, the executor fetches
-//!   the content and returns it as a single `FeedItem` with card_type `Text`.
+//!   the content and returns it as a single `FeedItem` with `card_type` `Text`.
 //! - **Code handlers**: Dispatched to the Quilt container runtime for sandboxed
 //!   execution. Requires `QUILT_API_URL` and `QUILT_API_KEY` to be configured.
 
@@ -35,7 +35,10 @@ impl FeedExecutor {
     /// Falls back to the full URL if parsing fails.
     fn title_from_url(url: &str) -> String {
         // Try to extract host + path for a concise title
-        if let Some(rest) = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")) {
+        if let Some(rest) = url
+            .strip_prefix("https://")
+            .or_else(|| url.strip_prefix("http://"))
+        {
             let trimmed = rest.trim_end_matches('/');
             if trimmed.is_empty() {
                 return url.to_string();
@@ -50,11 +53,7 @@ impl FeedExecutor {
     ///
     /// Returns a `FeedResult` containing a single `FeedItem` with the
     /// fetched body as text content.
-    async fn execute_url_feed(
-        feed_id: &str,
-        url: &str,
-        run_id: &str,
-    ) -> Result<FeedResult> {
+    async fn execute_url_feed(feed_id: &str, url: &str, run_id: &str) -> Result<FeedResult> {
         let url = url.trim();
 
         tracing::info!(
@@ -75,9 +74,7 @@ impl FeedExecutor {
                 items: Vec::new(),
                 summary: None,
                 metadata: None,
-                error: Some(format!(
-                    "HTTP {status} fetching feed URL: {url}"
-                )),
+                error: Some(format!("HTTP {status} fetching feed URL: {url}")),
             });
         }
 
@@ -96,14 +93,8 @@ impl FeedExecutor {
         let title = Self::title_from_url(url);
 
         let mut metadata = std::collections::HashMap::new();
-        metadata.insert(
-            "content_type".to_string(),
-            serde_json::json!(content_type),
-        );
-        metadata.insert(
-            "source_url".to_string(),
-            serde_json::json!(url),
-        );
+        metadata.insert("content_type".to_string(), serde_json::json!(content_type));
+        metadata.insert("source_url".to_string(), serde_json::json!(url));
         metadata.insert(
             "fetched_at".to_string(),
             serde_json::json!(Utc::now().to_rfc3339()),
@@ -122,9 +113,7 @@ impl FeedExecutor {
         Ok(FeedResult {
             success: true,
             items: vec![item],
-            summary: Some(format!(
-                "Fetched URL feed for {feed_id} (run_id={run_id})"
-            )),
+            summary: Some(format!("Fetched URL feed for {feed_id} (run_id={run_id})")),
             metadata: None,
             error: None,
         })
@@ -250,11 +239,7 @@ impl FeedExecutor {
 
         // Execute the handler code inside the container
         let exec_params = crate::quilt::client::QuiltExecParams {
-            command: vec![
-                "node".into(),
-                "-e".into(),
-                handler_code.to_string(),
-            ],
+            command: vec!["node".into(), "-e".into(), handler_code.to_string()],
             timeout_ms: Some(60_000), // 60 second timeout
             working_dir: Some("/app".into()),
             environment: Some(std::collections::HashMap::from([
@@ -280,8 +265,7 @@ impl FeedExecutor {
                         metadata: None,
                         error: Some(format!(
                             "Handler exited with code {}: {}",
-                            result.exit_code,
-                            result.stderr
+                            result.exit_code, result.stderr
                         )),
                     });
                 }
@@ -446,10 +430,7 @@ mod tests {
                 body: Some(format!("Body of item {i}")),
                 source: Some("test".to_string()),
                 url: Some(format!("https://example.com/{i}")),
-                metadata: Some(HashMap::from([(
-                    "index".to_string(),
-                    serde_json::json!(i),
-                )])),
+                metadata: Some(HashMap::from([("index".to_string(), serde_json::json!(i))])),
                 timestamp: Some(Utc::now().timestamp()),
             })
             .collect()
@@ -543,9 +524,7 @@ mod tests {
             metadata: None,
             timestamp: Some(1_700_000_000),
         }];
-        executor
-            .store_items("t1", "f1", "r1", &items)
-            .unwrap();
+        executor.store_items("t1", "f1", "r1", &items).unwrap();
 
         db.with_conn(|conn| {
             let (title, card_type, source): (String, String, String) = conn.query_row(
@@ -564,9 +543,7 @@ mod tests {
     #[test]
     fn store_empty_items_is_noop() {
         let (_db, executor) = setup();
-        executor
-            .store_items("t1", "f1", "r1", &[])
-            .unwrap();
+        executor.store_items("t1", "f1", "r1", &[]).unwrap();
     }
 
     #[test]

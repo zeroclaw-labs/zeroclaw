@@ -132,7 +132,7 @@ impl AgentEventBus {
         }
     }
 
-    /// Emit an event to all subscribers. Assigns monotonic seq per run_id.
+    /// Emit an event to all subscribers. Assigns monotonic seq per `run_id`.
     pub fn emit(&self, mut event: AgentEvent) {
         // Assign sequence number
         {
@@ -196,7 +196,13 @@ impl AgentEventBus {
     }
 
     /// Emit an assistant text delta.
-    pub fn emit_assistant(&self, run_id: &str, session_key: Option<&str>, delta: &str, accumulated: &str) {
+    pub fn emit_assistant(
+        &self,
+        run_id: &str,
+        session_key: Option<&str>,
+        delta: &str,
+        accumulated: &str,
+    ) {
         self.emit(AgentEvent {
             run_id: run_id.to_string(),
             seq: 0,
@@ -205,7 +211,8 @@ impl AgentEventBus {
             data: serde_json::to_value(&AssistantEventData {
                 delta: delta.to_string(),
                 text: accumulated.to_string(),
-            }).unwrap_or_default(),
+            })
+            .unwrap_or_default(),
             session_key: session_key.map(String::from),
             tenant_id: None,
         });
@@ -220,7 +227,8 @@ impl AgentEventBus {
             stream: EventStream::Thinking,
             data: serde_json::to_value(&ThinkingEventData {
                 delta: delta.to_string(),
-            }).unwrap_or_default(),
+            })
+            .unwrap_or_default(),
             session_key: session_key.map(String::from),
             tenant_id: None,
         });
@@ -230,7 +238,12 @@ impl AgentEventBus {
     ///
     /// When `SessionEnd` or `TurnEnd` is emitted, the run's sequence counter
     /// is automatically cleaned up to prevent unbounded memory growth.
-    pub fn emit_lifecycle(&self, run_id: &str, session_key: Option<&str>, data: LifecycleEventData) {
+    pub fn emit_lifecycle(
+        &self,
+        run_id: &str,
+        session_key: Option<&str>,
+        data: LifecycleEventData,
+    ) {
         let is_terminal = matches!(
             data.phase,
             LifecyclePhase::SessionEnd | LifecyclePhase::TurnEnd
@@ -326,19 +339,31 @@ mod tests {
         });
 
         bus.emit(AgentEvent {
-            run_id: "run-a".into(), seq: 0, ts: 0,
-            stream: EventStream::Tool, data: serde_json::json!({}),
-            session_key: None, tenant_id: None,
+            run_id: "run-a".into(),
+            seq: 0,
+            ts: 0,
+            stream: EventStream::Tool,
+            data: serde_json::json!({}),
+            session_key: None,
+            tenant_id: None,
         });
         bus.emit(AgentEvent {
-            run_id: "run-b".into(), seq: 0, ts: 0,
-            stream: EventStream::Tool, data: serde_json::json!({}),
-            session_key: None, tenant_id: None,
+            run_id: "run-b".into(),
+            seq: 0,
+            ts: 0,
+            stream: EventStream::Tool,
+            data: serde_json::json!({}),
+            session_key: None,
+            tenant_id: None,
         });
         bus.emit(AgentEvent {
-            run_id: "run-a".into(), seq: 0, ts: 0,
-            stream: EventStream::Tool, data: serde_json::json!({}),
-            session_key: None, tenant_id: None,
+            run_id: "run-a".into(),
+            seq: 0,
+            ts: 0,
+            stream: EventStream::Tool,
+            data: serde_json::json!({}),
+            session_key: None,
+            tenant_id: None,
         });
 
         let events = received.lock().unwrap();
@@ -360,9 +385,13 @@ mod tests {
         bus.unsubscribe(id);
 
         bus.emit(AgentEvent {
-            run_id: "run-x".into(), seq: 0, ts: 0,
-            stream: EventStream::Lifecycle, data: serde_json::json!({}),
-            session_key: None, tenant_id: None,
+            run_id: "run-x".into(),
+            seq: 0,
+            ts: 0,
+            stream: EventStream::Lifecycle,
+            data: serde_json::json!({}),
+            session_key: None,
+            tenant_id: None,
         });
 
         assert!(!called.load(Ordering::Relaxed));
@@ -378,18 +407,22 @@ mod tests {
             rx.lock().unwrap().push(evt.clone());
         });
 
-        bus.emit_tool("run-1", Some("sess-1"), ToolEventData {
-            phase: ToolPhase::Start,
-            tool_call_id: "toolu_abc".into(),
-            name: "exec".into(),
-            args: Some(serde_json::json!({"cmd": "ls"})),
-            partial_json: None,
-            partial_result: None,
-            result: None,
-            error: None,
-            is_error: None,
-            duration_ms: None,
-        });
+        bus.emit_tool(
+            "run-1",
+            Some("sess-1"),
+            ToolEventData {
+                phase: ToolPhase::Start,
+                tool_call_id: "toolu_abc".into(),
+                name: "exec".into(),
+                args: Some(serde_json::json!({"cmd": "ls"})),
+                partial_json: None,
+                partial_result: None,
+                result: None,
+                error: None,
+                is_error: None,
+                duration_ms: None,
+            },
+        );
 
         let events = received.lock().unwrap();
         assert_eq!(events.len(), 1);
@@ -408,17 +441,25 @@ mod tests {
         });
 
         bus.emit(AgentEvent {
-            run_id: "run-1".into(), seq: 0, ts: 0,
-            stream: EventStream::Lifecycle, data: serde_json::json!({}),
-            session_key: None, tenant_id: None,
+            run_id: "run-1".into(),
+            seq: 0,
+            ts: 0,
+            stream: EventStream::Lifecycle,
+            data: serde_json::json!({}),
+            session_key: None,
+            tenant_id: None,
         });
 
         bus.clear_run("run-1");
 
         bus.emit(AgentEvent {
-            run_id: "run-1".into(), seq: 0, ts: 0,
-            stream: EventStream::Lifecycle, data: serde_json::json!({}),
-            session_key: None, tenant_id: None,
+            run_id: "run-1".into(),
+            seq: 0,
+            ts: 0,
+            stream: EventStream::Lifecycle,
+            data: serde_json::json!({}),
+            session_key: None,
+            tenant_id: None,
         });
 
         let events = received.lock().unwrap();
@@ -461,9 +502,13 @@ mod tests {
         });
 
         bus.emit(AgentEvent {
-            run_id: "run-ts".into(), seq: 0, ts: 0,
-            stream: EventStream::Lifecycle, data: serde_json::json!({}),
-            session_key: None, tenant_id: None,
+            run_id: "run-ts".into(),
+            seq: 0,
+            ts: 0,
+            stream: EventStream::Lifecycle,
+            data: serde_json::json!({}),
+            session_key: None,
+            tenant_id: None,
         });
 
         let events = received.lock().unwrap();

@@ -3,7 +3,7 @@
 //! This is the core "brain" of Aria. Given a provider, tools, system prompt,
 //! and user input, it runs the agent loop:
 //!   1. Send messages + tool specs to the LLM
-//!   2. If response contains tool_use blocks → execute tools → append results
+//!   2. If response contains `tool_use` blocks → execute tools → append results
 //!   3. Loop until the LLM emits a final text response (no tool calls)
 //!   4. Return the final text and execution metadata
 
@@ -16,7 +16,7 @@ use std::time::Instant;
 
 /// Maximum agentic turns (LLM calls) before forcing stop.
 const DEFAULT_MAX_TURNS: u32 = 25;
-/// Default max_tokens per LLM call.
+/// Default `max_tokens` per LLM call.
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 
 /// Result of an agent execution run.
@@ -36,7 +36,7 @@ pub struct AgentExecutionResult {
     pub error: Option<String>,
 }
 
-/// Convert a Tool trait object to a ToolDefinition for the LLM.
+/// Convert a Tool trait object to a `ToolDefinition` for the LLM.
 fn tool_to_definition(tool: &dyn Tool) -> ToolDefinition {
     ToolDefinition {
         name: tool.name().to_string(),
@@ -68,7 +68,10 @@ pub async fn execute_agent(
     let max = max_turns.unwrap_or(DEFAULT_MAX_TURNS);
 
     // Build tool definitions for the LLM
-    let tool_defs: Vec<ToolDefinition> = tools.iter().map(|t| tool_to_definition(t.as_ref())).collect();
+    let tool_defs: Vec<ToolDefinition> = tools
+        .iter()
+        .map(|t| tool_to_definition(t.as_ref()))
+        .collect();
 
     // Build initial conversation
     let mut messages: Vec<ChatMessage> = vec![ChatMessage {
@@ -125,21 +128,19 @@ pub async fn execute_agent(
             let tool = tools.iter().find(|t| t.name() == tool_name);
 
             let result_content = match tool {
-                Some(tool) => {
-                    match tool.execute(tool_input.clone()).await {
-                        Ok(result) => {
-                            if result.success {
-                                result.output
-                            } else {
-                                format!(
-                                    "Error: {}",
-                                    result.error.unwrap_or_else(|| "Unknown error".into())
-                                )
-                            }
+                Some(tool) => match tool.execute(tool_input.clone()).await {
+                    Ok(result) => {
+                        if result.success {
+                            result.output
+                        } else {
+                            format!(
+                                "Error: {}",
+                                result.error.unwrap_or_else(|| "Unknown error".into())
+                            )
                         }
-                        Err(e) => format!("Tool execution error: {e}"),
                     }
-                }
+                    Err(e) => format!("Tool execution error: {e}"),
+                },
                 None => format!("Unknown tool: {tool_name}"),
             };
 

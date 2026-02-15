@@ -83,12 +83,9 @@ fn status(config: &Config) -> Result<()> {
     }
 
     if cfg!(target_os = "linux") {
-        let out = run_capture(Command::new("systemctl").args([
-            "--user",
-            "is-active",
-            "afw.service",
-        ]))
-        .unwrap_or_else(|_| "unknown".into());
+        let out =
+            run_capture(Command::new("systemctl").args(["--user", "is-active", "afw.service"]))
+                .unwrap_or_else(|_| "unknown".into());
         println!("Service state: {}", out.trim());
         println!("Unit: {}", linux_service_file(config)?.display());
         return Ok(());

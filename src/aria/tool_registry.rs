@@ -105,7 +105,9 @@ impl AriaToolRegistry {
         ni.clear();
 
         for e in entries {
-            ti.entry(e.tenant_id.clone()).or_default().insert(e.id.clone());
+            ti.entry(e.tenant_id.clone())
+                .or_default()
+                .insert(e.id.clone());
             ni.insert(format!("{}:{}", e.tenant_id, e.name), e.id.clone());
             cache.insert(e.id.clone(), e);
         }
@@ -115,9 +117,14 @@ impl AriaToolRegistry {
 
     fn index_entry(&self, entry: &AriaToolEntry) {
         let mut ti = self.tenant_index.lock().unwrap();
-        ti.entry(entry.tenant_id.clone()).or_default().insert(entry.id.clone());
+        ti.entry(entry.tenant_id.clone())
+            .or_default()
+            .insert(entry.id.clone());
         let mut ni = self.name_index.lock().unwrap();
-        ni.insert(format!("{}:{}", entry.tenant_id, entry.name), entry.id.clone());
+        ni.insert(
+            format!("{}:{}", entry.tenant_id, entry.name),
+            entry.id.clone(),
+        );
     }
 
     fn deindex_entry(&self, entry: &AriaToolEntry) {
@@ -162,8 +169,16 @@ impl AriaToolRegistry {
                     "UPDATE aria_tools SET description=?1, schema=?2, handler_code=?3,
                      handler_hash=?4, sandbox_config=?5, version=?6, updated_at=?7
                      WHERE id=?8",
-                    params![description, schema, handler_code, hash,
-                            sandbox_config, new_version, now, eid],
+                    params![
+                        description,
+                        schema,
+                        handler_code,
+                        hash,
+                        sandbox_config,
+                        new_version,
+                        now,
+                        eid
+                    ],
                 )?;
                 Ok(())
             })?;
@@ -213,10 +228,18 @@ impl AriaToolRegistry {
                      created_at, updated_at)
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
                     params![
-                        entry.id, entry.tenant_id, entry.name, entry.description,
-                        entry.schema, entry.handler_code, entry.handler_hash,
-                        entry.sandbox_config, entry.status, entry.version,
-                        entry.created_at, entry.updated_at
+                        entry.id,
+                        entry.tenant_id,
+                        entry.name,
+                        entry.description,
+                        entry.schema,
+                        entry.handler_code,
+                        entry.handler_hash,
+                        entry.sandbox_config,
+                        entry.status,
+                        entry.version,
+                        entry.created_at,
+                        entry.updated_at
                     ],
                 )?;
                 Ok(())
@@ -259,7 +282,7 @@ impl AriaToolRegistry {
     pub fn count(&self, tenant_id: &str) -> Result<usize> {
         self.ensure_loaded()?;
         let ti = self.tenant_index.lock().unwrap();
-        Ok(ti.get(tenant_id).map_or(0, |s| s.len()))
+        Ok(ti.get(tenant_id).map_or(0, std::collections::HashSet::len))
     }
 
     /// Soft-delete a tool by ID.
@@ -410,8 +433,15 @@ mod tests {
     #[test]
     fn get_prompt_section_generates_output() {
         let reg = setup();
-        reg.upload("t1", "calc", "Calculator", r#"{"type":"object"}"#, "fn", None)
-            .unwrap();
+        reg.upload(
+            "t1",
+            "calc",
+            "Calculator",
+            r#"{"type":"object"}"#,
+            "fn",
+            None,
+        )
+        .unwrap();
         let section = reg.get_prompt_section("t1").unwrap();
         assert!(section.contains("calc"));
         assert!(section.contains("Calculator"));
@@ -429,7 +459,8 @@ mod tests {
         let db = AriaDb::open_in_memory().unwrap();
         {
             let reg = AriaToolRegistry::new(db.clone());
-            reg.upload("t1", "persist", "d", "{}", "code", None).unwrap();
+            reg.upload("t1", "persist", "d", "{}", "code", None)
+                .unwrap();
         }
         // New registry instance, same DB
         let reg2 = AriaToolRegistry::new(db);

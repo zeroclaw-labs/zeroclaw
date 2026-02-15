@@ -264,9 +264,7 @@ impl SystemPromptBuilder {
             AutonomyLevel::Supervised => {
                 "**Supervised** — you may act but must ask before risky operations."
             }
-            AutonomyLevel::Full => {
-                "**Full** — you may act autonomously within policy bounds."
-            }
+            AutonomyLevel::Full => "**Full** — you may act autonomously within policy bounds.",
         };
         let _ = writeln!(prompt, "Level: {level_desc}");
 
@@ -374,8 +372,8 @@ impl SystemPromptBuilder {
     }
 
     fn build_runtime_section(&self, prompt: &mut String) {
-        let host = hostname::get()
-            .map_or_else(|_| "unknown".into(), |h| h.to_string_lossy().to_string());
+        let host =
+            hostname::get().map_or_else(|_| "unknown".into(), |h| h.to_string_lossy().to_string());
         let model = if self.model_name.is_empty() {
             "unknown"
         } else {
@@ -420,7 +418,7 @@ fn inject_workspace_file(prompt: &mut String, workspace_dir: &Path, filename: &s
 
 // ── Convenience ──────────────────────────────────────────────────
 
-/// Quick one-shot prompt builder (backwards-compatible with channels::build_system_prompt).
+/// Quick one-shot prompt builder (backwards-compatible with `channels::build_system_prompt`).
 ///
 /// Accepts any type that has `name: String` and `description: String` fields by
 /// converting to `SkillDescriptor` via the `name` and `description` closures.
@@ -469,8 +467,14 @@ mod tests {
         assert!(prompt.contains("## Safety"), "missing Safety section");
         assert!(prompt.contains("## Autonomy"), "missing Autonomy section");
         assert!(prompt.contains("## Workspace"), "missing Workspace section");
-        assert!(prompt.contains("## Project Context"), "missing Project Context");
-        assert!(prompt.contains("## Current Date & Time"), "missing DateTime");
+        assert!(
+            prompt.contains("## Project Context"),
+            "missing Project Context"
+        );
+        assert!(
+            prompt.contains("## Current Date & Time"),
+            "missing DateTime"
+        );
         assert!(prompt.contains("## Runtime"), "missing Runtime");
     }
 
@@ -605,9 +609,7 @@ mod tests {
             description: "Review code for bugs".into(),
         }];
 
-        let prompt = SystemPromptBuilder::new(ws.path())
-            .skills(&skills)
-            .build();
+        let prompt = SystemPromptBuilder::new(ws.path()).skills(&skills).build();
 
         assert!(prompt.contains("<available_skills>"));
         assert!(prompt.contains("<name>code-review</name>"));
@@ -660,12 +662,8 @@ mod tests {
     #[test]
     fn backwards_compatible_convenience() {
         let ws = make_workspace();
-        let prompt = build_system_prompt(
-            ws.path(),
-            "test-model",
-            &[("shell", "Run commands")],
-            &[],
-        );
+        let prompt =
+            build_system_prompt(ws.path(), "test-model", &[("shell", "Run commands")], &[]);
 
         assert!(prompt.contains("## Tools"));
         assert!(prompt.contains("**shell**"));

@@ -12,7 +12,7 @@ pub struct PipelineExecutionContext {
     pub tenant_id: String,
     /// Initial variables available to all steps
     pub variables: HashMap<String, serde_json::Value>,
-    /// Accumulated outputs from completed steps, keyed by output_key
+    /// Accumulated outputs from completed steps, keyed by `output_key`
     pub step_outputs: Arc<Mutex<HashMap<String, serde_json::Value>>>,
     /// Optional overall timeout for the entire pipeline execution
     pub timeout: Option<Duration>,

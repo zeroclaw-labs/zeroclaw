@@ -2,7 +2,7 @@ use super::traits::{Channel, ChannelMessage};
 use async_trait::async_trait;
 use uuid::Uuid;
 
-/// WhatsApp channel — uses WhatsApp Business Cloud API
+/// `WhatsApp` channel — uses `WhatsApp` Business Cloud API
 ///
 /// This channel operates in webhook mode (push-based) rather than polling.
 /// Messages are received via the gateway's `/whatsapp` webhook endpoint.

@@ -65,9 +65,7 @@ impl FeedScheduler {
     /// Sync all feeds from registry — schedule active, remove stale.
     pub async fn sync_all(&self) -> Result<()> {
         let feed_ids = self.db.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id FROM aria_feeds WHERE status = 'active'",
-            )?;
+            let mut stmt = conn.prepare("SELECT id FROM aria_feeds WHERE status = 'active'")?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
             let mut ids = Vec::new();
             for r in rows {
@@ -211,11 +209,9 @@ impl FeedScheduler {
 
                         // Apply retention policy
                         if max_items.is_some() || max_age_days.is_some() {
-                            if let Err(e) = executor.prune_by_retention(
-                                &feed_id_owned,
-                                max_items,
-                                max_age_days,
-                            ) {
+                            if let Err(e) =
+                                executor.prune_by_retention(&feed_id_owned, max_items, max_age_days)
+                            {
                                 tracing::warn!(
                                     feed_id = feed_id_owned.as_str(),
                                     error = %e,
@@ -366,28 +362,26 @@ pub fn parse_schedule_to_interval(schedule: &str) -> u64 {
     let now = Utc::now();
     let mut upcoming = cron_schedule.after(&now);
 
-    let first = match upcoming.next() {
-        Some(t) => t,
-        None => {
-            tracing::warn!(
-                schedule = schedule,
-                fallback_secs = FALLBACK_SECS,
-                "Cron expression has no future fire time, falling back to daily interval"
-            );
-            return FALLBACK_SECS;
-        }
+    let first = if let Some(t) = upcoming.next() {
+        t
+    } else {
+        tracing::warn!(
+            schedule = schedule,
+            fallback_secs = FALLBACK_SECS,
+            "Cron expression has no future fire time, falling back to daily interval"
+        );
+        return FALLBACK_SECS;
     };
 
-    let second = match upcoming.next() {
-        Some(t) => t,
-        None => {
-            tracing::warn!(
-                schedule = schedule,
-                fallback_secs = FALLBACK_SECS,
-                "Cron expression has only one future fire time, falling back to daily interval"
-            );
-            return FALLBACK_SECS;
-        }
+    let second = if let Some(t) = upcoming.next() {
+        t
+    } else {
+        tracing::warn!(
+            schedule = schedule,
+            fallback_secs = FALLBACK_SECS,
+            "Cron expression has only one future fire time, falling back to daily interval"
+        );
+        return FALLBACK_SECS;
     };
 
     let interval = (second - first).num_seconds().unsigned_abs();

@@ -19,7 +19,7 @@ use super::types::{AgentMessage, ContentBlock, Role};
 pub struct ToolRepairReport {
     /// Tool-use IDs that had no matching result — a synthetic error result was inserted.
     pub missing_results: Vec<String>,
-    /// Tool-result IDs that had no matching tool_use — dropped.
+    /// Tool-result IDs that had no matching `tool_use` — dropped.
     pub orphaned_results: Vec<String>,
     /// Tool-result IDs that appeared more than once — duplicates removed.
     pub deduplicated_results: Vec<String>,
@@ -201,7 +201,7 @@ pub fn repair_role_ordering(messages: &[AgentMessage]) -> Vec<AgentMessage> {
     result
 }
 
-/// Extract all tool_use IDs from a message list.
+/// Extract all `tool_use` IDs from a message list.
 pub fn extract_tool_call_ids(messages: &[AgentMessage]) -> Vec<String> {
     let mut ids = Vec::new();
     for msg in messages {
@@ -313,7 +313,10 @@ mod tests {
         // Should have appended a synthetic result message.
         let last = repaired.last().unwrap();
         assert_eq!(last.role, Role::User);
-        assert!(matches!(&last.content[0], ContentBlock::ToolResult { is_error: true, .. }));
+        assert!(matches!(
+            &last.content[0],
+            ContentBlock::ToolResult { is_error: true, .. }
+        ));
     }
 
     #[test]
@@ -501,7 +504,9 @@ mod tests {
             AgentMessage {
                 message_id: None,
                 role: Role::System,
-                content: vec![ContentBlock::Text { text: "system prompt".into() }],
+                content: vec![ContentBlock::Text {
+                    text: "system prompt".into(),
+                }],
                 timestamp: None,
                 usage: None,
                 model: None,

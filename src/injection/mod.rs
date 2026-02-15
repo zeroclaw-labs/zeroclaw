@@ -138,7 +138,7 @@ pub enum ResolvedInjection {
 
 // ── Runtime Injector ────────────────────────────────────────────
 
-/// The RuntimeInjector resolves and provides injections to agents.
+/// The `RuntimeInjector` resolves and provides injections to agents.
 pub struct RuntimeInjector {
     #[allow(dead_code)]
     db: AriaDb,
@@ -200,16 +200,37 @@ impl LoggingInjection for DefaultLogging {
     ) {
         let fields_str = serde_json::to_string(fields).unwrap_or_default();
         match level {
-            "error" => tracing::error!(injection = "logging", fields = fields_str.as_str(), "{message}"),
-            "warn" => tracing::warn!(injection = "logging", fields = fields_str.as_str(), "{message}"),
-            "info" => tracing::info!(injection = "logging", fields = fields_str.as_str(), "{message}"),
-            "debug" => tracing::debug!(injection = "logging", fields = fields_str.as_str(), "{message}"),
-            _ => tracing::info!(injection = "logging", fields = fields_str.as_str(), level = level, "{message}"),
+            "error" => tracing::error!(
+                injection = "logging",
+                fields = fields_str.as_str(),
+                "{message}"
+            ),
+            "warn" => tracing::warn!(
+                injection = "logging",
+                fields = fields_str.as_str(),
+                "{message}"
+            ),
+            "info" => tracing::info!(
+                injection = "logging",
+                fields = fields_str.as_str(),
+                "{message}"
+            ),
+            "debug" => tracing::debug!(
+                injection = "logging",
+                fields = fields_str.as_str(),
+                "{message}"
+            ),
+            _ => tracing::info!(
+                injection = "logging",
+                fields = fields_str.as_str(),
+                level = level,
+                "{message}"
+            ),
         }
     }
 }
 
-/// Default memory injection backed by AriaDb memory registry.
+/// Default memory injection backed by `AriaDb` memory registry.
 pub struct DefaultMemory {
     db: AriaDb,
     tenant_id: String,
@@ -266,7 +287,7 @@ impl MemoryInjection for DefaultMemory {
     }
 }
 
-/// Default task injection backed by AriaDb task registry.
+/// Default task injection backed by `AriaDb` task registry.
 pub struct DefaultTasks {
     db: AriaDb,
     tenant_id: String,
@@ -361,7 +382,7 @@ impl TaskInjection for DefaultTasks {
     }
 }
 
-/// Default database injection backed by AriaDb KV registry.
+/// Default database injection backed by `AriaDb` KV registry.
 pub struct DefaultDatabase {
     db: AriaDb,
     tenant_id: String,
@@ -429,9 +450,8 @@ impl DatabaseInjection for DefaultDatabase {
                     keys.push(r?);
                 }
             } else {
-                let mut stmt = conn.prepare(
-                    "SELECT key FROM aria_kv WHERE tenant_id = ?1 ORDER BY key",
-                )?;
+                let mut stmt =
+                    conn.prepare("SELECT key FROM aria_kv WHERE tenant_id = ?1 ORDER BY key")?;
                 let rows = stmt.query_map(rusqlite::params![self.tenant_id], |row| {
                     row.get::<_, String>(0)
                 })?;
@@ -504,7 +524,7 @@ impl NotificationInjection for DefaultNotifications {
     }
 }
 
-/// Default scheduler injection — returns errors until CronBridge integration is wired.
+/// Default scheduler injection — returns errors until `CronBridge` integration is wired.
 pub struct DefaultScheduler;
 
 #[async_trait::async_trait]
@@ -562,7 +582,11 @@ pub struct DefaultSecrets;
 #[async_trait::async_trait]
 impl SecretsInjection for DefaultSecrets {
     async fn get_secret(&self, key: &str) -> Result<Option<String>> {
-        tracing::debug!(injection = "secrets", key = key, "Secret requested (read-only default)");
+        tracing::debug!(
+            injection = "secrets",
+            key = key,
+            "Secret requested (read-only default)"
+        );
         Ok(None)
     }
 
@@ -682,10 +706,7 @@ mod tests {
         );
         injector.register(
             InjectionType::Memory,
-            ResolvedInjection::Memory(Arc::new(DefaultMemory::new(
-                db.clone(),
-                "test".to_string(),
-            ))),
+            ResolvedInjection::Memory(Arc::new(DefaultMemory::new(db.clone(), "test".to_string()))),
         );
         injector.register(
             InjectionType::Analytics,
@@ -1077,17 +1098,11 @@ mod tests {
         );
         injector.register(
             InjectionType::Memory,
-            ResolvedInjection::Memory(Arc::new(DefaultMemory::new(
-                db.clone(),
-                "t1".to_string(),
-            ))),
+            ResolvedInjection::Memory(Arc::new(DefaultMemory::new(db.clone(), "t1".to_string()))),
         );
         injector.register(
             InjectionType::Tasks,
-            ResolvedInjection::Tasks(Arc::new(DefaultTasks::new(
-                db.clone(),
-                "t1".to_string(),
-            ))),
+            ResolvedInjection::Tasks(Arc::new(DefaultTasks::new(db.clone(), "t1".to_string()))),
         );
         injector.register(
             InjectionType::Database,

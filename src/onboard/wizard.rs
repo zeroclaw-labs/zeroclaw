@@ -1975,8 +1975,18 @@ fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> 
 
     // Create subdirectories
     let subdirs = [
-        "sessions", "memory", "state", "cron", "skills",
-        "hooks", "plugins", "tools", "agents", "teams", "pipelines", "feeds",
+        "sessions",
+        "memory",
+        "state",
+        "cron",
+        "skills",
+        "hooks",
+        "plugins",
+        "tools",
+        "agents",
+        "teams",
+        "pipelines",
+        "feeds",
     ];
     for dir in &subdirs {
         fs::create_dir_all(workspace_dir.join(dir))?;
@@ -2196,10 +2206,7 @@ fn print_summary(config: &Config) {
         "    {} Send a quick message:",
         style(format!("{step}.")).cyan().bold()
     );
-    println!(
-        "       {}",
-        style("afw agent -m \"Hello, Aria!\"").yellow()
-    );
+    println!("       {}", style("afw agent -m \"Hello, Aria!\"").yellow());
     println!();
     step += 1;
 
