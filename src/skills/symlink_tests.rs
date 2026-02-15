@@ -1,5 +1,5 @@
 #[cfg(test)]
-mod symlink_tests {
+mod tests {
     use crate::skills::skills_dir;
     use std::path::Path;
     use tempfile::TempDir;

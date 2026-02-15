@@ -365,8 +365,8 @@ impl BrowserTool {
     }
 }
 
-#[async_trait]
 #[allow(clippy::too_many_lines)]
+#[async_trait]
 impl Tool for BrowserTool {
     fn name(&self) -> &str {
         "browser"
@@ -750,7 +750,7 @@ mod tests {
         let domains = vec![
             "  Example.COM  ".into(),
             "docs.example.com".into(),
-            "".into(),
+            String::new(),
         ];
         let normalized = normalize_domains(domains);
         assert_eq!(normalized, vec!["example.com", "docs.example.com"]);
