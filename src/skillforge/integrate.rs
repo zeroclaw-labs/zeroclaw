@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use tracing::info;
 
@@ -26,7 +26,8 @@ impl Integrator {
 
     /// Write SKILL.toml and SKILL.md for the given candidate.
     pub fn integrate(&self, candidate: &ScoutResult) -> Result<PathBuf> {
-        let skill_dir = self.output_dir.join(&candidate.name);
+        let safe_name = sanitize_path_component(&candidate.name)?;
+        let skill_dir = self.output_dir.join(&safe_name);
         fs::create_dir_all(&skill_dir)
             .with_context(|| format!("Failed to create dir: {}", skill_dir.display()))?;
 
@@ -146,6 +147,26 @@ fn escape_toml(s: &str) -> String {
         .replace('\u{0C}', "\\f")
 }
 
+/// Sanitize a string for use as a single path component.
+/// Rejects empty names, "..", and names containing path separators or NUL.
+fn sanitize_path_component(name: &str) -> Result<String> {
+    let trimmed = name.trim().trim_matches('.');
+    if trimmed.is_empty() {
+        bail!("Skill name is empty or only dots after sanitization");
+    }
+    let sanitized: String = trimmed
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | '\0' => '_',
+            _ => c,
+        })
+        .collect();
+    if sanitized == ".." || sanitized.contains('/') || sanitized.contains('\\') {
+        bail!("Skill name '{}' is unsafe as a path component", name);
+    }
+    Ok(sanitized)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -200,5 +221,28 @@ mod tests {
         assert_eq!(escape_toml("line\nbreak"), "line\\nbreak");
         assert_eq!(escape_toml("tab\there"), "tab\\there");
         assert_eq!(escape_toml("cr\rhere"), "cr\\rhere");
+    }
+
+    #[test]
+    fn sanitize_rejects_traversal() {
+        assert!(sanitize_path_component("..").is_err());
+        assert!(sanitize_path_component("...").is_err());
+        assert!(sanitize_path_component("").is_err());
+        assert!(sanitize_path_component("  ").is_err());
+    }
+
+    #[test]
+    fn sanitize_replaces_separators() {
+        let s = sanitize_path_component("foo/bar\\baz\0qux").unwrap();
+        assert!(!s.contains('/'));
+        assert!(!s.contains('\\'));
+        assert!(!s.contains('\0'));
+        assert_eq!(s, "foo_bar_baz_qux");
+    }
+
+    #[test]
+    fn sanitize_trims_dots() {
+        let s = sanitize_path_component(".hidden.").unwrap();
+        assert_eq!(s, "hidden");
     }
 }
