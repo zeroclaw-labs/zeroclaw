@@ -51,6 +51,20 @@ impl OpenRouterProvider {
 
 #[async_trait]
 impl Provider for OpenRouterProvider {
+    async fn warmup(&self) -> anyhow::Result<()> {
+        // Hit a lightweight endpoint to establish TLS + HTTP/2 connection pool.
+        // This prevents the first real chat request from timing out on cold start.
+        if let Some(api_key) = self.api_key.as_ref() {
+            self.client
+                .get("https://openrouter.ai/api/v1/auth/key")
+                .header("Authorization", format!("Bearer {api_key}"))
+                .send()
+                .await?
+                .error_for_status()?;
+        }
+        Ok(())
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,

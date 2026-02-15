@@ -25,6 +25,14 @@ impl ReliableProvider {
 
 #[async_trait]
 impl Provider for ReliableProvider {
+    async fn warmup(&self) -> anyhow::Result<()> {
+        if let Some((name, provider)) = self.providers.first() {
+            tracing::info!(provider = name, "Warming up provider connection pool");
+            provider.warmup().await?;
+        }
+        Ok(())
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
