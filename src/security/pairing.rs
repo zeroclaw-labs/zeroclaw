@@ -204,15 +204,27 @@ fn is_token_hash(value: &str) -> bool {
     value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// Constant-time string comparison to prevent timing attacks on pairing code.
+/// Constant-time string comparison to prevent timing attacks.
+///
+/// Does not short-circuit on length mismatch — always iterates over the
+/// longer input to avoid leaking length information via timing.
 pub fn constant_time_eq(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+
+    // Track length mismatch as a usize (non-zero = different lengths)
+    let len_diff = a.len() ^ b.len();
+
+    // XOR each byte, padding the shorter input with zeros.
+    // Iterates over max(a.len(), b.len()) to avoid timing differences.
+    let max_len = a.len().max(b.len());
+    let mut byte_diff = 0u8;
+    for i in 0..max_len {
+        let x = *a.get(i).unwrap_or(&0);
+        let y = *b.get(i).unwrap_or(&0);
+        byte_diff |= x ^ y;
     }
-    a.bytes()
-        .zip(b.bytes())
-        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-        == 0
+    (len_diff == 0) & (byte_diff == 0)
 }
 
 /// Check if a host string represents a non-localhost bind address.

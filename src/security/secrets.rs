@@ -191,14 +191,34 @@ impl SecretStore {
             #[cfg(windows)]
             {
                 // On Windows, use icacls to restrict permissions to current user only
-                let _ = std::process::Command::new("icacls")
+                let username = std::env::var("USERNAME").unwrap_or_default();
+                let Some(grant_arg) = build_windows_icacls_grant_arg(&username) else {
+                    tracing::warn!(
+                        "USERNAME environment variable is empty; \
+                         cannot restrict key file permissions via icacls"
+                    );
+                    return Ok(key);
+                };
+
+                match std::process::Command::new("icacls")
                     .arg(&self.key_path)
                     .args(["/inheritance:r", "/grant:r"])
-                    .arg(format!(
-                        "{}:F",
-                        std::env::var("USERNAME").unwrap_or_default()
-                    ))
-                    .output();
+                    .arg(grant_arg)
+                    .output()
+                {
+                    Ok(o) if !o.status.success() => {
+                        tracing::warn!(
+                            "Failed to set key file permissions via icacls (exit code {:?})",
+                            o.status.code()
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("Could not set key file permissions: {e}");
+                    }
+                    _ => {
+                        tracing::debug!("Key file permissions restricted via icacls");
+                    }
+                }
             }
 
             Ok(key)
@@ -217,16 +237,12 @@ fn xor_cipher(data: &[u8], key: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-/// Generate a random key using system entropy (UUID v4 + process ID + timestamp).
+/// Generate a random 256-bit key using the OS CSPRNG.
+///
+/// Uses `OsRng` (via `getrandom`) directly, providing full 256-bit entropy
+/// without the fixed version/variant bits that UUID v4 introduces.
 fn generate_random_key() -> Vec<u8> {
-    // Use two UUIDs (32 random bytes) as our key material
-    let u1 = uuid::Uuid::new_v4();
-    let u2 = uuid::Uuid::new_v4();
-    let mut key = Vec::with_capacity(KEY_LEN);
-    key.extend_from_slice(u1.as_bytes());
-    key.extend_from_slice(u2.as_bytes());
-    key.truncate(KEY_LEN);
-    key
+    ChaCha20Poly1305::generate_key(&mut OsRng).to_vec()
 }
 
 /// Hex-encode bytes to a lowercase hex string.
@@ -237,6 +253,16 @@ fn hex_encode(data: &[u8]) -> String {
         let _ = write!(s, "{b:02x}");
     }
     s
+}
+
+/// Build the `/grant` argument for `icacls` using a normalized username.
+/// Returns `None` when the username is empty or whitespace-only.
+fn build_windows_icacls_grant_arg(username: &str) -> Option<String> {
+    let normalized = username.trim();
+    if normalized.is_empty() {
+        return None;
+    }
+    Some(format!("{normalized}:F"))
 }
 
 /// Hex-decode a hex string to bytes.
@@ -734,6 +760,28 @@ mod tests {
     }
 
     #[test]
+    fn windows_icacls_grant_arg_rejects_empty_username() {
+        assert_eq!(build_windows_icacls_grant_arg(""), None);
+        assert_eq!(build_windows_icacls_grant_arg("   \t\n"), None);
+    }
+
+    #[test]
+    fn windows_icacls_grant_arg_trims_username() {
+        assert_eq!(
+            build_windows_icacls_grant_arg("  alice  "),
+            Some("alice:F".to_string())
+        );
+    }
+
+    #[test]
+    fn windows_icacls_grant_arg_preserves_valid_characters() {
+        assert_eq!(
+            build_windows_icacls_grant_arg("DOMAIN\\svc-user"),
+            Some("DOMAIN\\svc-user:F".to_string())
+        );
+    }
+
+    #[test]
     fn generate_random_key_correct_length() {
         let key = generate_random_key();
         assert_eq!(key.len(), KEY_LEN);
@@ -750,6 +798,39 @@ mod tests {
         let k1 = generate_random_key();
         let k2 = generate_random_key();
         assert_ne!(k1, k2, "Two random keys should differ");
+    }
+
+    #[test]
+    fn generate_random_key_has_no_uuid_fixed_bits() {
+        // UUID v4 has fixed bits at positions 6 (version = 0b0100xxxx) and
+        // 8 (variant = 0b10xxxxxx). A direct CSPRNG key should not consistently
+        // have these patterns across multiple samples.
+        let mut version_match = 0;
+        let mut variant_match = 0;
+        let samples = 100;
+        for _ in 0..samples {
+            let key = generate_random_key();
+            // In UUID v4, byte 6 always has top nibble = 0x4
+            if key[6] & 0xf0 == 0x40 {
+                version_match += 1;
+            }
+            // In UUID v4, byte 8 always has top 2 bits = 0b10
+            if key[8] & 0xc0 == 0x80 {
+                variant_match += 1;
+            }
+        }
+        // With true randomness, each pattern should appear ~1/16 and ~1/4 of
+        // the time. UUID would hit 100/100 on both. Allow generous margin.
+        assert!(
+            version_match < 30,
+            "byte[6] matched UUID v4 version nibble {version_match}/100 times — \
+             likely still using UUID-based key generation"
+        );
+        assert!(
+            variant_match < 50,
+            "byte[8] matched UUID v4 variant bits {variant_match}/100 times — \
+             likely still using UUID-based key generation"
+        );
     }
 
     #[cfg(unix)]
