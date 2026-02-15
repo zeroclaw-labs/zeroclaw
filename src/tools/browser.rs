@@ -730,6 +730,7 @@ fn is_private_host(host: &str) -> bool {
                             || v4.is_private()
                             || v4.is_link_local()
                             || v4.is_unspecified()
+                            || v4.is_broadcast()
                     })
             }
         };
