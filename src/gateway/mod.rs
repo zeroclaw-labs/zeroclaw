@@ -12,6 +12,7 @@ use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::providers::{self, Provider};
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
+use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use axum::{
     body::Bytes,
@@ -457,11 +458,7 @@ async fn handle_whatsapp_message(
         tracing::info!(
             "WhatsApp message from {}: {}",
             msg.sender,
-            if msg.content.len() > 50 {
-                format!("{}...", &msg.content[..50])
-            } else {
-                msg.content.clone()
-            }
+            truncate_with_ellipsis(&msg.content, 50)
         );
 
         // Auto-save to memory
