@@ -53,7 +53,7 @@ async-trait = "0.1"
 
 # Memory / persistence
 rusqlite = { version = "0.32", features = ["bundled"] }
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 cron = "0.12"
 
 # Interactive CLI prompts

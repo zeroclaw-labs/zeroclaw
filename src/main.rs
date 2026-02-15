@@ -31,6 +31,7 @@ mod providers;
 mod runtime;
 mod security;
 mod service;
+mod skillforge;
 mod skills;
 mod tools;
 mod tunnel;
