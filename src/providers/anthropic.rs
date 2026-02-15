@@ -82,8 +82,7 @@ impl Provider for AnthropicProvider {
             .await?;
 
         if !response.status().is_success() {
-            let error = response.text().await?;
-            anyhow::bail!("Anthropic API error: {error}");
+            return Err(super::api_error("Anthropic", response).await);
         }
 
         let chat_response: ChatResponse = response.json().await?;

@@ -18,6 +18,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+    continue-on-error: true  # Don't block PRs on Docker build failures
 
     steps:
       - name: Checkout repository

@@ -43,8 +43,10 @@ uuid = { version = "1.11", default-features = false, features = ["v4", "std"] }
 # Authenticated encryption (AEAD) for secret store
 chacha20poly1305 = "0.10"
 
-# SHA-256 for bearer token hashing
+# HMAC for webhook signature verification
+hmac = "0.12"
 sha2 = "0.10"
+hex = "0.4"
 
 # Async traits
 async-trait = "0.1"

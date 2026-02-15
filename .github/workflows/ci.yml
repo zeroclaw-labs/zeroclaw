@@ -24,7 +24,7 @@ jobs:
   build:
     name: Build
     runs-on: ${{ matrix.os }}
-    continue-on-error: true  # Don't block PRs
+    continue-on-error: true  # Don't block PRs on build failures
     strategy:
       matrix:
         include:

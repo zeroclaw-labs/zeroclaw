@@ -43,6 +43,8 @@ pub struct AppState {
     pub webhook_secret: Option<Arc<str>>,
     pub pairing: Arc<PairingGuard>,
     pub whatsapp: Option<Arc<WhatsAppChannel>>,
+    /// `WhatsApp` app secret for webhook signature verification (`X-Hub-Signature-256`)
+    pub whatsapp_app_secret: Option<Arc<str>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -97,6 +99,25 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                 wa.allowed_numbers.clone(),
             ))
         });
+
+    // WhatsApp app secret for webhook signature verification
+    // Priority: environment variable > config file
+    let whatsapp_app_secret: Option<Arc<str>> = std::env::var("ZEROCLAW_WHATSAPP_APP_SECRET")
+        .ok()
+        .and_then(|secret| {
+            let secret = secret.trim();
+            (!secret.is_empty()).then(|| secret.to_owned())
+        })
+        .or_else(|| {
+            config.channels_config.whatsapp.as_ref().and_then(|wa| {
+                wa.app_secret
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|secret| !secret.is_empty())
+                    .map(ToOwned::to_owned)
+            })
+        })
+        .map(Arc::from);
 
     // ── Pairing guard ──────────────────────────────────────
     let pairing = Arc::new(PairingGuard::new(
@@ -162,6 +183,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         webhook_secret,
         pairing,
         whatsapp: whatsapp_channel,
+        whatsapp_app_secret,
     };
 
     // Build router with middleware
@@ -306,8 +328,11 @@ async fn handle_webhook(
             (StatusCode::OK, Json(body))
         }
         Err(e) => {
-            tracing::error!("LLM error: {e:#}");
-            let err = serde_json::json!({"error": "Internal error processing your request"});
+            tracing::error!(
+                "Webhook provider error: {}",
+                providers::sanitize_api_error(&e.to_string())
+            );
+            let err = serde_json::json!({"error": "LLM request failed"});
             (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
         }
     }
@@ -348,14 +373,68 @@ async fn handle_whatsapp_verify(
     (StatusCode::FORBIDDEN, "Forbidden".to_string())
 }
 
+/// Verify `WhatsApp` webhook signature (`X-Hub-Signature-256`).
+/// Returns true if the signature is valid, false otherwise.
+/// See: <https://developers.facebook.com/docs/graph-api/webhooks/getting-started#verification-requests>
+pub fn verify_whatsapp_signature(app_secret: &str, body: &[u8], signature_header: &str) -> bool {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    // Signature format: "sha256=<hex_signature>"
+    let Some(hex_sig) = signature_header.strip_prefix("sha256=") else {
+        return false;
+    };
+
+    // Decode hex signature
+    let Ok(expected) = hex::decode(hex_sig) else {
+        return false;
+    };
+
+    // Compute HMAC-SHA256
+    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(app_secret.as_bytes()) else {
+        return false;
+    };
+    mac.update(body);
+
+    // Constant-time comparison
+    mac.verify_slice(&expected).is_ok()
+}
+
 /// POST /whatsapp — incoming message webhook
-async fn handle_whatsapp_message(State(state): State<AppState>, body: Bytes) -> impl IntoResponse {
+async fn handle_whatsapp_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
     let Some(ref wa) = state.whatsapp else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "WhatsApp not configured"})),
         );
     };
+
+    // ── Security: Verify X-Hub-Signature-256 if app_secret is configured ──
+    if let Some(ref app_secret) = state.whatsapp_app_secret {
+        let signature = headers
+            .get("X-Hub-Signature-256")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        if !verify_whatsapp_signature(app_secret, &body, signature) {
+            tracing::warn!(
+                "WhatsApp webhook signature verification failed (signature: {})",
+                if signature.is_empty() {
+                    "missing"
+                } else {
+                    "invalid"
+                }
+            );
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Invalid signature"})),
+            );
+        }
+    }
 
     // Parse JSON body
     let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
@@ -462,5 +541,172 @@ mod tests {
     fn app_state_is_clone() {
         fn assert_clone<T: Clone>() {}
         assert_clone::<AppState>();
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // WhatsApp Signature Verification Tests (CWE-345 Prevention)
+    // ══════════════════════════════════════════════════════════
+
+    fn compute_whatsapp_signature_hex(secret: &str, body: &[u8]) -> String {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(body);
+        hex::encode(mac.finalize().into_bytes())
+    }
+
+    fn compute_whatsapp_signature_header(secret: &str, body: &[u8]) -> String {
+        format!("sha256={}", compute_whatsapp_signature_hex(secret, body))
+    }
+
+    #[test]
+    fn whatsapp_signature_valid() {
+        // Test with known values
+        let app_secret = "test_secret_key";
+        let body = b"test body content";
+
+        let signature_header = compute_whatsapp_signature_header(app_secret, body);
+
+        assert!(verify_whatsapp_signature(app_secret, body, &signature_header));
+    }
+
+    #[test]
+    fn whatsapp_signature_invalid_wrong_secret() {
+        let app_secret = "correct_secret";
+        let wrong_secret = "wrong_secret";
+        let body = b"test body content";
+
+        let signature_header = compute_whatsapp_signature_header(wrong_secret, body);
+
+        assert!(!verify_whatsapp_signature(app_secret, body, &signature_header));
+    }
+
+    #[test]
+    fn whatsapp_signature_invalid_wrong_body() {
+        let app_secret = "test_secret";
+        let original_body = b"original body";
+        let tampered_body = b"tampered body";
+
+        let signature_header = compute_whatsapp_signature_header(app_secret, original_body);
+
+        // Verify with tampered body should fail
+        assert!(!verify_whatsapp_signature(
+            app_secret,
+            tampered_body,
+            &signature_header
+        ));
+    }
+
+    #[test]
+    fn whatsapp_signature_missing_prefix() {
+        let app_secret = "test_secret";
+        let body = b"test body";
+
+        // Signature without "sha256=" prefix
+        let signature_header = "abc123def456";
+
+        assert!(!verify_whatsapp_signature(app_secret, body, signature_header));
+    }
+
+    #[test]
+    fn whatsapp_signature_empty_header() {
+        let app_secret = "test_secret";
+        let body = b"test body";
+
+        assert!(!verify_whatsapp_signature(app_secret, body, ""));
+    }
+
+    #[test]
+    fn whatsapp_signature_invalid_hex() {
+        let app_secret = "test_secret";
+        let body = b"test body";
+
+        // Invalid hex characters
+        let signature_header = "sha256=not_valid_hex_zzz";
+
+        assert!(!verify_whatsapp_signature(
+            app_secret,
+            body,
+            signature_header
+        ));
+    }
+
+    #[test]
+    fn whatsapp_signature_empty_body() {
+        let app_secret = "test_secret";
+        let body = b"";
+
+        let signature_header = compute_whatsapp_signature_header(app_secret, body);
+
+        assert!(verify_whatsapp_signature(app_secret, body, &signature_header));
+    }
+
+    #[test]
+    fn whatsapp_signature_unicode_body() {
+        let app_secret = "test_secret";
+        let body = "Hello 🦀 世界".as_bytes();
+
+        let signature_header = compute_whatsapp_signature_header(app_secret, body);
+
+        assert!(verify_whatsapp_signature(app_secret, body, &signature_header));
+    }
+
+    #[test]
+    fn whatsapp_signature_json_payload() {
+        let app_secret = "my_app_secret_from_meta";
+        let body = br#"{"entry":[{"changes":[{"value":{"messages":[{"from":"1234567890","text":{"body":"Hello"}}]}}]}]}"#;
+
+        let signature_header = compute_whatsapp_signature_header(app_secret, body);
+
+        assert!(verify_whatsapp_signature(app_secret, body, &signature_header));
+    }
+
+    #[test]
+    fn whatsapp_signature_case_sensitive_prefix() {
+        let app_secret = "test_secret";
+        let body = b"test body";
+
+        let hex_sig = compute_whatsapp_signature_hex(app_secret, body);
+
+        // Wrong case prefix should fail
+        let wrong_prefix = format!("SHA256={hex_sig}");
+        assert!(!verify_whatsapp_signature(app_secret, body, &wrong_prefix));
+
+        // Correct prefix should pass
+        let correct_prefix = format!("sha256={hex_sig}");
+        assert!(verify_whatsapp_signature(app_secret, body, &correct_prefix));
+    }
+
+    #[test]
+    fn whatsapp_signature_truncated_hex() {
+        let app_secret = "test_secret";
+        let body = b"test body";
+
+        let hex_sig = compute_whatsapp_signature_hex(app_secret, body);
+        let truncated = &hex_sig[..32]; // Only half the signature
+        let signature_header = format!("sha256={truncated}");
+
+        assert!(!verify_whatsapp_signature(
+            app_secret,
+            body,
+            &signature_header
+        ));
+    }
+
+    #[test]
+    fn whatsapp_signature_extra_bytes() {
+        let app_secret = "test_secret";
+        let body = b"test body";
+
+        let hex_sig = compute_whatsapp_signature_hex(app_secret, body);
+        let extended = format!("{hex_sig}deadbeef");
+        let signature_header = format!("sha256={extended}");
+
+        assert!(!verify_whatsapp_signature(
+            app_secret,
+            body,
+            &signature_header
+        ));
     }
 }

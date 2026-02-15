@@ -88,10 +88,8 @@ impl Provider for OllamaProvider {
         let response = self.client.post(&url).json(&request).send().await?;
 
         if !response.status().is_success() {
-            let error = response.text().await?;
-            anyhow::bail!(
-                "Ollama error: {error}. Is Ollama running? (brew install ollama && ollama serve)"
-            );
+            let err = super::api_error("Ollama", response).await;
+            anyhow::bail!("{err}. Is Ollama running? (brew install ollama && ollama serve)");
         }
 
         let chat_response: ChatResponse = response.json().await?;
