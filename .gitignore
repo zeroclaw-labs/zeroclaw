@@ -2,3 +2,4 @@
 *.db
 *.db-journal
 .DS_Store
+.wt-pr37/
