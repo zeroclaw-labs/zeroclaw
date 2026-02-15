@@ -395,14 +395,11 @@ impl WorkerPool {
         let task_created_at = task.created_at;
         let timeout = task.timeout.or(Some(self.config.default_timeout));
 
-        // Take ownership of the future via Option dance
-        let mut task_opt = Some(task);
-        let task_future = std::mem::replace(
-            &mut task_opt.as_mut().unwrap().future,
-            Box::pin(async move { unreachable!() })
-        );
-        // Now we can drop the task without dropping the future
-        drop(task_opt);
+        // Take ownership of the future via Option::take()
+        let task_future = task
+            .future
+            .take()
+            .expect("task.future must be present in try_submit");
 
         let queued_task = QueuedTask {
             id: task_id,
