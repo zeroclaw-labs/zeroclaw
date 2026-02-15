@@ -64,11 +64,6 @@ impl Tool for FileWriteTool {
 
         let full_path = self.security.workspace_dir.join(path);
 
-        // Ensure parent directory exists
-        if let Some(parent) = full_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-
         let Some(parent) = full_path.parent() else {
             return Ok(ToolResult {
                 success: false,
@@ -77,7 +72,10 @@ impl Tool for FileWriteTool {
             });
         };
 
-        // Resolve parent before writing to block symlink escapes.
+        // Ensure parent directory exists
+        tokio::fs::create_dir_all(parent).await?;
+
+        // Resolve parent AFTER creation to block symlink escapes.
         let resolved_parent = match tokio::fs::canonicalize(parent).await {
             Ok(p) => p,
             Err(e) => {
@@ -109,6 +107,20 @@ impl Tool for FileWriteTool {
         };
 
         let resolved_target = resolved_parent.join(file_name);
+
+        // If the target already exists and is a symlink, refuse to follow it
+        if let Ok(meta) = tokio::fs::symlink_metadata(&resolved_target).await {
+            if meta.file_type().is_symlink() {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Refusing to write through symlink: {}",
+                        resolved_target.display()
+                    )),
+                });
+            }
+        }
 
         match tokio::fs::write(&resolved_target, content).await {
             Ok(()) => Ok(ToolResult {
