@@ -8,7 +8,7 @@ pub mod evaluate;
 pub mod integrate;
 pub mod scout;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -140,16 +140,19 @@ impl SkillForge {
         let mut candidates: Vec<ScoutResult> = Vec::new();
 
         for src in &self.config.sources {
-            let source = ScoutSource::from_str(src);
+            let source: ScoutSource = src.parse().unwrap(); // Infallible
             match source {
                 ScoutSource::GitHub => {
                     let scout = GitHubScout::new(self.config.github_token.clone());
-                    let mut found = scout
-                        .discover()
-                        .await
-                        .context("GitHub scout failed")?;
-                    info!(count = found.len(), "GitHub scout returned candidates");
-                    candidates.append(&mut found);
+                    match scout.discover().await {
+                        Ok(mut found) => {
+                            info!(count = found.len(), "GitHub scout returned candidates");
+                            candidates.append(&mut found);
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "GitHub scout failed, continuing with other sources");
+                        }
+                    }
                 }
                 ScoutSource::ClawHub | ScoutSource::HuggingFace => {
                     info!(source = src.as_str(), "Source not yet implemented — skipping");

@@ -1,6 +1,6 @@
 //! Scout — skill discovery from external sources.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -17,9 +17,11 @@ pub enum ScoutSource {
     HuggingFace,
 }
 
-impl ScoutSource {
-    pub fn from_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
+impl std::str::FromStr for ScoutSource {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Ok(match s.to_lowercase().as_str() {
             "github" => Self::GitHub,
             "clawhub" => Self::ClawHub,
             "huggingface" | "hf" => Self::HuggingFace,
@@ -27,7 +29,7 @@ impl ScoutSource {
                 warn!(source = s, "Unknown scout source, defaulting to GitHub");
                 Self::GitHub
             }
-        }
+        })
     }
 }
 
@@ -174,12 +176,17 @@ impl Scout for GitHubScout {
             );
             debug!(query = query.as_str(), "Searching GitHub");
 
-            let resp = self
-                .client
-                .get(&url)
-                .send()
-                .await
-                .context("GitHub API request failed")?;
+            let resp = match self.client.get(&url).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(
+                        query = query.as_str(),
+                        error = %e,
+                        "GitHub API request failed, skipping query"
+                    );
+                    continue;
+                }
+            };
 
             if !resp.status().is_success() {
                 warn!(
@@ -190,10 +197,17 @@ impl Scout for GitHubScout {
                 continue;
             }
 
-            let body: serde_json::Value = resp
-                .json()
-                .await
-                .context("Failed to parse GitHub response")?;
+            let body: serde_json::Value = match resp.json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(
+                        query = query.as_str(),
+                        error = %e,
+                        "Failed to parse GitHub response, skipping query"
+                    );
+                    continue;
+                }
+            };
 
             let mut items = Self::parse_items(&body);
             debug!(count = items.len(), query = query.as_str(), "Parsed items");
@@ -232,13 +246,13 @@ mod tests {
 
     #[test]
     fn scout_source_from_str() {
-        assert_eq!(ScoutSource::from_str("github"), ScoutSource::GitHub);
-        assert_eq!(ScoutSource::from_str("GitHub"), ScoutSource::GitHub);
-        assert_eq!(ScoutSource::from_str("clawhub"), ScoutSource::ClawHub);
-        assert_eq!(ScoutSource::from_str("huggingface"), ScoutSource::HuggingFace);
-        assert_eq!(ScoutSource::from_str("hf"), ScoutSource::HuggingFace);
+        assert_eq!("github".parse::<ScoutSource>().unwrap(), ScoutSource::GitHub);
+        assert_eq!("GitHub".parse::<ScoutSource>().unwrap(), ScoutSource::GitHub);
+        assert_eq!("clawhub".parse::<ScoutSource>().unwrap(), ScoutSource::ClawHub);
+        assert_eq!("huggingface".parse::<ScoutSource>().unwrap(), ScoutSource::HuggingFace);
+        assert_eq!("hf".parse::<ScoutSource>().unwrap(), ScoutSource::HuggingFace);
         // unknown falls back to GitHub
-        assert_eq!(ScoutSource::from_str("unknown"), ScoutSource::GitHub);
+        assert_eq!("unknown".parse::<ScoutSource>().unwrap(), ScoutSource::GitHub);
     }
 
     #[test]
