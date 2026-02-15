@@ -1,6 +1,8 @@
 pub mod log;
 pub mod multi;
 pub mod noop;
+#[cfg(feature = "prometheus")]
+pub mod prometheus;
 pub mod traits;
 
 pub use self::log::LogObserver;
@@ -14,6 +16,8 @@ pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
     match config.backend.as_str() {
         "log" => Box::new(LogObserver::new()),
         "none" | "noop" => Box::new(NoopObserver),
+        #[cfg(feature = "prometheus")]
+        "prometheus" => Box::new(prometheus::PrometheusObserver::new()),
         _ => {
             tracing::warn!(
                 "Unknown observability backend '{}', falling back to noop",
@@ -55,9 +59,18 @@ mod tests {
     #[test]
     fn factory_unknown_falls_back_to_noop() {
         let cfg = ObservabilityConfig {
-            backend: "prometheus".into(),
+            backend: "otlp".into(),
         };
         assert_eq!(create_observer(&cfg).name(), "noop");
+    }
+
+    #[cfg(feature = "prometheus")]
+    #[test]
+    fn factory_prometheus_returns_prometheus() {
+        let cfg = ObservabilityConfig {
+            backend: "prometheus".into(),
+        };
+        assert_eq!(create_observer(&cfg).name(), "prometheus");
     }
 
     #[test]

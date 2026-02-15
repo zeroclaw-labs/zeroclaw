@@ -60,11 +60,17 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 hostname = "0.4.2"
 
+# Prometheus metrics (optional, behind feature gate)
+prometheus-client = { version = "0.22", optional = true }
+
 # HTTP server (gateway) — replaces raw TCP for proper HTTP/1.1 compliance
 axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio", "query"] }
 tower = { version = "0.5", default-features = false }
 tower-http = { version = "0.6", default-features = false, features = ["limit", "timeout"] }
 http-body-util = "0.1"
+
+[features]
+prometheus = ["dep:prometheus-client"]
 
 [profile.release]
 opt-level = "z"      # Optimize for size
