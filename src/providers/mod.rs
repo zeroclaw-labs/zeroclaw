@@ -98,9 +98,9 @@ pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<
         "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(api_key))),
         "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(api_key))),
         "openai" => Ok(Box::new(openai::OpenAiProvider::new(api_key))),
-        "ollama" => Ok(Box::new(ollama::OllamaProvider::new(
-            api_key.filter(|k| !k.is_empty()),
-        ))),
+        // Ollama is a local service that doesn't use API keys.
+        // The api_key parameter is ignored to avoid it being misinterpreted as a base_url.
+        "ollama" => Ok(Box::new(ollama::OllamaProvider::new(None))),
         "gemini" | "google" | "google-gemini" => {
             Ok(Box::new(gemini::GeminiProvider::new(api_key)))
         }
@@ -267,6 +267,9 @@ mod tests {
     #[test]
     fn factory_ollama() {
         assert!(create_provider("ollama", None).is_ok());
+        // Ollama ignores the api_key parameter since it's a local service
+        assert!(create_provider("ollama", Some("dummy")).is_ok());
+        assert!(create_provider("ollama", Some("any-value-here")).is_ok());
     }
 
     #[test]
