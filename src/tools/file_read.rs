@@ -55,6 +55,26 @@ impl Tool for FileReadTool {
 
         let full_path = self.security.workspace_dir.join(path);
 
+        // Check file size before reading to prevent OOM on huge files (10 MB limit)
+        const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+        match tokio::fs::metadata(&full_path).await {
+            Ok(meta) => {
+                if meta.len() > MAX_FILE_SIZE {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "File too large: {} bytes (limit: {MAX_FILE_SIZE} bytes)",
+                            meta.len()
+                        )),
+                    });
+                }
+            }
+            Err(_) => {
+                // File might not exist yet — let canonicalize handle it below
+            }
+        }
+
         // Resolve path before reading to block symlink escapes.
         let resolved_path = match tokio::fs::canonicalize(&full_path).await {
             Ok(p) => p,
@@ -220,6 +240,24 @@ mod tests {
             .unwrap();
         assert!(result.success);
         assert_eq!(result.output, "deep content");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_read_rejects_oversized_file() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_large");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // Create a file just over 10 MB
+        let big = vec![b'x'; 10 * 1024 * 1024 + 1];
+        tokio::fs::write(dir.join("huge.bin"), &big).await.unwrap();
+
+        let tool = FileReadTool::new(test_security(dir.clone()));
+        let result = tool.execute(json!({"path": "huge.bin"})).await.unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_ref().unwrap().contains("File too large"));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
