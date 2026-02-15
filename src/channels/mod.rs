@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod discord;
+pub mod email_channel;
 pub mod imessage;
 pub mod matrix;
 pub mod slack;

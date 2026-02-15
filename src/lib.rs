@@ -11,10 +11,17 @@
     dead_code
 )]
 
+pub mod channels;
 pub mod config;
+pub mod gateway;
+pub mod health;
 pub mod heartbeat;
 pub mod memory;
 pub mod observability;
 pub mod providers;
 pub mod runtime;
 pub mod security;
+pub mod skills;
+pub mod tools;
+pub mod tunnel;
+pub mod util;
