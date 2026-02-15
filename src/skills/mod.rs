@@ -1,7 +1,14 @@
 use anyhow::Result;
+use directories::UserDirs;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, SystemTime};
+
+const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
+const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
+const OPEN_SKILLS_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24 * 7;
 
 /// A skill is a user-defined or community-built capability.
 /// Skills live in `~/.zeroclaw/workspace/skills/<name>/SKILL.md`
@@ -19,6 +26,8 @@ pub struct Skill {
     pub tools: Vec<SkillTool>,
     #[serde(default)]
     pub prompts: Vec<String>,
+    #[serde(skip)]
+    pub location: Option<PathBuf>,
 }
 
 /// A tool defined by a skill (shell command, HTTP call, etc.)
@@ -62,14 +71,29 @@ fn default_version() -> String {
 
 /// Load all skills from the workspace skills directory
 pub fn load_skills(workspace_dir: &Path) -> Vec<Skill> {
+    let mut skills = Vec::new();
+
+    if let Some(open_skills_dir) = ensure_open_skills_repo() {
+        skills.extend(load_open_skills(&open_skills_dir));
+    }
+
+    skills.extend(load_workspace_skills(workspace_dir));
+    skills
+}
+
+fn load_workspace_skills(workspace_dir: &Path) -> Vec<Skill> {
     let skills_dir = workspace_dir.join("skills");
+    load_skills_from_directory(&skills_dir)
+}
+
+fn load_skills_from_directory(skills_dir: &Path) -> Vec<Skill> {
     if !skills_dir.exists() {
         return Vec::new();
     }
 
     let mut skills = Vec::new();
 
-    let Ok(entries) = std::fs::read_dir(&skills_dir) else {
+    let Ok(entries) = std::fs::read_dir(skills_dir) else {
         return skills;
     };
 
@@ -97,6 +121,172 @@ pub fn load_skills(workspace_dir: &Path) -> Vec<Skill> {
     skills
 }
 
+fn load_open_skills(repo_dir: &Path) -> Vec<Skill> {
+    let mut skills = Vec::new();
+
+    let Ok(entries) = std::fs::read_dir(repo_dir) else {
+        return skills;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        let is_markdown = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
+        if !is_markdown {
+            continue;
+        }
+
+        let is_readme = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("README.md"));
+        if is_readme {
+            continue;
+        }
+
+        if let Ok(skill) = load_open_skill_md(&path) {
+            skills.push(skill);
+        }
+    }
+
+    skills
+}
+
+fn open_skills_enabled() -> bool {
+    if let Ok(raw) = std::env::var("ZEROCLAW_OPEN_SKILLS_ENABLED") {
+        let value = raw.trim().to_ascii_lowercase();
+        return !matches!(value.as_str(), "0" | "false" | "off" | "no");
+    }
+
+    // Keep tests deterministic and network-free by default.
+    !cfg!(test)
+}
+
+fn resolve_open_skills_dir() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("ZEROCLAW_OPEN_SKILLS_DIR") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+
+    UserDirs::new().map(|dirs| dirs.home_dir().join("open-skills"))
+}
+
+fn ensure_open_skills_repo() -> Option<PathBuf> {
+    if !open_skills_enabled() {
+        return None;
+    }
+
+    let repo_dir = resolve_open_skills_dir()?;
+
+    if !repo_dir.exists() {
+        if !clone_open_skills_repo(&repo_dir) {
+            return None;
+        }
+        let _ = mark_open_skills_synced(&repo_dir);
+        return Some(repo_dir);
+    }
+
+    if should_sync_open_skills(&repo_dir) {
+        if pull_open_skills_repo(&repo_dir) {
+            let _ = mark_open_skills_synced(&repo_dir);
+        } else {
+            tracing::warn!(
+                "open-skills update failed; using local copy from {}",
+                repo_dir.display()
+            );
+        }
+    }
+
+    Some(repo_dir)
+}
+
+fn clone_open_skills_repo(repo_dir: &Path) -> bool {
+    if let Some(parent) = repo_dir.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            tracing::warn!(
+                "failed to create open-skills parent directory {}: {err}",
+                parent.display()
+            );
+            return false;
+        }
+    }
+
+    let output = Command::new("git")
+        .args(["clone", "--depth", "1", OPEN_SKILLS_REPO_URL])
+        .arg(repo_dir)
+        .output();
+
+    match output {
+        Ok(result) if result.status.success() => {
+            tracing::info!("initialized open-skills at {}", repo_dir.display());
+            true
+        }
+        Ok(result) => {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            tracing::warn!("failed to clone open-skills: {stderr}");
+            false
+        }
+        Err(err) => {
+            tracing::warn!("failed to run git clone for open-skills: {err}");
+            false
+        }
+    }
+}
+
+fn pull_open_skills_repo(repo_dir: &Path) -> bool {
+    // If user points to a non-git directory via env var, keep using it without pulling.
+    if !repo_dir.join(".git").exists() {
+        return true;
+    }
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .args(["pull", "--ff-only"])
+        .output();
+
+    match output {
+        Ok(result) if result.status.success() => true,
+        Ok(result) => {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            tracing::warn!("failed to pull open-skills updates: {stderr}");
+            false
+        }
+        Err(err) => {
+            tracing::warn!("failed to run git pull for open-skills: {err}");
+            false
+        }
+    }
+}
+
+fn should_sync_open_skills(repo_dir: &Path) -> bool {
+    let marker = repo_dir.join(OPEN_SKILLS_SYNC_MARKER);
+    let Ok(metadata) = std::fs::metadata(marker) else {
+        return true;
+    };
+    let Ok(modified_at) = metadata.modified() else {
+        return true;
+    };
+    let Ok(age) = SystemTime::now().duration_since(modified_at) else {
+        return true;
+    };
+
+    age >= Duration::from_secs(OPEN_SKILLS_SYNC_INTERVAL_SECS)
+}
+
+fn mark_open_skills_synced(repo_dir: &Path) -> Result<()> {
+    std::fs::write(repo_dir.join(OPEN_SKILLS_SYNC_MARKER), b"synced")?;
+    Ok(())
+}
+
 /// Load a skill from a SKILL.toml manifest
 fn load_skill_toml(path: &Path) -> Result<Skill> {
     let content = std::fs::read_to_string(path)?;
@@ -110,6 +300,7 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
         tags: manifest.skill.tags,
         tools: manifest.tools,
         prompts: manifest.prompts,
+        location: Some(path.to_path_buf()),
     })
 }
 
@@ -122,23 +313,45 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
         .unwrap_or("unknown")
         .to_string();
 
-    // Extract description from first non-heading line
-    let description = content
-        .lines()
-        .find(|l| !l.starts_with('#') && !l.trim().is_empty())
-        .unwrap_or("No description")
-        .trim()
-        .to_string();
-
     Ok(Skill {
         name,
-        description,
+        description: extract_description(&content),
         version: "0.1.0".to_string(),
         author: None,
         tags: Vec::new(),
         tools: Vec::new(),
         prompts: vec![content],
+        location: Some(path.to_path_buf()),
     })
+}
+
+fn load_open_skill_md(path: &Path) -> Result<Skill> {
+    let content = std::fs::read_to_string(path)?;
+    let name = path
+        .file_stem()
+        .and_then(|n| n.to_str())
+        .unwrap_or("open-skill")
+        .to_string();
+
+    Ok(Skill {
+        name,
+        description: extract_description(&content),
+        version: "open-skills".to_string(),
+        author: Some("besoeasy/open-skills".to_string()),
+        tags: vec!["open-skills".to_string()],
+        tools: Vec::new(),
+        prompts: vec![content],
+        location: Some(path.to_path_buf()),
+    })
+}
+
+fn extract_description(content: &str) -> String {
+    content
+        .lines()
+        .find(|line| !line.starts_with('#') && !line.trim().is_empty())
+        .unwrap_or("No description")
+        .trim()
+        .to_string()
 }
 
 /// Build a system prompt addition from all loaded skills
@@ -468,6 +681,7 @@ command = "echo hello"
             tags: vec![],
             tools: vec![],
             prompts: vec!["Do the thing.".to_string()],
+            location: None,
         }];
         let prompt = skills_to_prompt(&skills);
         assert!(prompt.contains("test"));
@@ -657,6 +871,7 @@ description = "Bare minimum"
                 args: HashMap::new(),
             }],
             prompts: vec![],
+            location: None,
         }];
         let prompt = skills_to_prompt(&skills);
         assert!(prompt.contains("weather"));
