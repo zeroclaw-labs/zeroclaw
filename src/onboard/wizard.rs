@@ -129,7 +129,8 @@ pub fn run_wizard() -> Result<Config> {
         || config.channels_config.discord.is_some()
         || config.channels_config.slack.is_some()
         || config.channels_config.imessage.is_some()
-        || config.channels_config.matrix.is_some();
+        || config.channels_config.matrix.is_some()
+        || config.channels_config.email.is_some();
 
     if has_channels && config.api_key.is_some() {
         let launch: bool = Confirm::new()
@@ -184,7 +185,8 @@ pub fn run_channels_repair_wizard() -> Result<Config> {
         || config.channels_config.discord.is_some()
         || config.channels_config.slack.is_some()
         || config.channels_config.imessage.is_some()
-        || config.channels_config.matrix.is_some();
+        || config.channels_config.matrix.is_some()
+        || config.channels_config.email.is_some();
 
     if has_channels && config.api_key.is_some() {
         let launch: bool = Confirm::new()
@@ -1745,6 +1747,9 @@ fn setup_channels() -> Result<ChannelsConfig> {
     if config.whatsapp.is_some() {
         active.push("WhatsApp");
     }
+    if config.email.is_some() {
+        active.push("Email");
+    }
     if config.webhook.is_some() {
         active.push("Webhook");
     }
@@ -2197,7 +2202,8 @@ fn print_summary(config: &Config) {
         || config.channels_config.discord.is_some()
         || config.channels_config.slack.is_some()
         || config.channels_config.imessage.is_some()
-        || config.channels_config.matrix.is_some();
+        || config.channels_config.matrix.is_some()
+        || config.channels_config.email.is_some();
 
     println!();
     println!(
@@ -2258,6 +2264,9 @@ fn print_summary(config: &Config) {
     }
     if config.channels_config.matrix.is_some() {
         channels.push("Matrix");
+    }
+    if config.channels_config.email.is_some() {
+        channels.push("Email");
     }
     if config.channels_config.webhook.is_some() {
         channels.push("Webhook");
