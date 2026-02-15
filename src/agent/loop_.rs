@@ -59,7 +59,7 @@ pub async fn run(
     } else {
         None
     };
-    let _tools = tools::all_tools(&security, mem.clone(), composio_key, &config.browser);
+    let agent_tools = tools::all_tools(&security, mem.clone(), composio_key, &config.browser);
 
     // ── Resolve provider ─────────────────────────────────────────
     let provider_name = provider_override
@@ -143,24 +143,42 @@ pub async fn run(
             format!("{context}{msg}")
         };
 
-        let response = provider
-            .chat_with_system(Some(&system_prompt), &enriched, model_name, temperature)
-            .await?;
-        println!("{response}");
+        // Run the agentic loop with tool execution
+        let result = super::executor::execute_agent(
+            provider.as_ref(),
+            &agent_tools,
+            &system_prompt,
+            &enriched,
+            model_name,
+            temperature,
+            Some(25),
+        )
+        .await?;
+
+        println!("{}", result.output);
+
+        if result.tool_calls > 0 {
+            tracing::info!(
+                turns = result.turns,
+                tool_calls = result.tool_calls,
+                duration_ms = result.duration_ms,
+                "Agent completed with tool use"
+            );
+        }
 
         // Auto-save assistant response to daily log
         if config.memory.auto_save {
-            let summary = if response.len() > 100 {
-                format!("{}...", &response[..100])
+            let summary = if result.output.len() > 100 {
+                format!("{}...", &result.output[..100])
             } else {
-                response.clone()
+                result.output.clone()
             };
             let _ = mem
                 .store("assistant_resp", &summary, MemoryCategory::Daily)
                 .await;
         }
     } else {
-        println!("🦀 Aria Interactive Mode");
+        println!("🦀 Aria Interactive Mode (agentic)");
         println!("Type /quit to exit.\n");
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
@@ -187,16 +205,34 @@ pub async fn run(
                 format!("{context}{}", msg.content)
             };
 
-            let response = provider
-                .chat_with_system(Some(&system_prompt), &enriched, model_name, temperature)
-                .await?;
-            println!("\n{response}\n");
+            // Run the agentic loop with tool execution
+            let result = super::executor::execute_agent(
+                provider.as_ref(),
+                &agent_tools,
+                &system_prompt,
+                &enriched,
+                model_name,
+                temperature,
+                Some(25),
+            )
+            .await?;
+
+            println!("\n{}\n", result.output);
+
+            if result.tool_calls > 0 {
+                tracing::info!(
+                    turns = result.turns,
+                    tool_calls = result.tool_calls,
+                    duration_ms = result.duration_ms,
+                    "Agent turn completed with tool use"
+                );
+            }
 
             if config.memory.auto_save {
-                let summary = if response.len() > 100 {
-                    format!("{}...", &response[..100])
+                let summary = if result.output.len() > 100 {
+                    format!("{}...", &result.output[..100])
                 } else {
-                    response.clone()
+                    result.output.clone()
                 };
                 let _ = mem
                     .store("assistant_resp", &summary, MemoryCategory::Daily)

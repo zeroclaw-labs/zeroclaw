@@ -1,4 +1,6 @@
-use crate::providers::traits::Provider;
+use crate::providers::traits::{
+    ChatCompletionResponse, ChatContent, ChatMessage, ContentBlock, Provider, ToolDefinition,
+};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -8,30 +10,73 @@ pub struct AnthropicProvider {
     client: Client,
 }
 
+// ── Simple chat types (legacy) ─────────────────────────────────
+
 #[derive(Debug, Serialize)]
-struct ChatRequest {
+struct SimpleChatRequest {
     model: String,
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<String>,
-    messages: Vec<Message>,
+    messages: Vec<SimpleMessage>,
     temperature: f64,
 }
 
 #[derive(Debug, Serialize)]
-struct Message {
+struct SimpleMessage {
     role: String,
     content: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct ChatResponse {
-    content: Vec<ContentBlock>,
+struct SimpleChatResponse {
+    content: Vec<SimpleContentBlock>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ContentBlock {
+struct SimpleContentBlock {
     text: String,
+}
+
+// ── Structured chat types (tool-use) ───────────────────────────
+
+#[derive(Debug, Serialize)]
+struct ToolChatRequest {
+    model: String,
+    max_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system: Option<String>,
+    messages: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<AnthropicTool>,
+    temperature: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct AnthropicTool {
+    name: String,
+    description: String,
+    input_schema: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolChatResponse {
+    content: Vec<AnthropicContentBlock>,
+    #[serde(default)]
+    stop_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum AnthropicContentBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "tool_use")]
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
 }
 
 impl AnthropicProvider {
@@ -45,6 +90,12 @@ impl AnthropicProvider {
                 .unwrap_or_else(|_| Client::new()),
         }
     }
+
+    fn get_key(&self) -> anyhow::Result<&str> {
+        self.api_key.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("Anthropic API key not set. Set ANTHROPIC_API_KEY or edit config.toml.")
+        })
+    }
 }
 
 #[async_trait]
@@ -56,15 +107,13 @@ impl Provider for AnthropicProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let api_key = self.api_key.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("Anthropic API key not set. Set ANTHROPIC_API_KEY or edit config.toml.")
-        })?;
+        let api_key = self.get_key()?;
 
-        let request = ChatRequest {
+        let request = SimpleChatRequest {
             model: model.to_string(),
             max_tokens: 4096,
             system: system_prompt.map(ToString::to_string),
-            messages: vec![Message {
+            messages: vec![SimpleMessage {
                 role: "user".to_string(),
                 content: message.to_string(),
             }],
@@ -86,7 +135,7 @@ impl Provider for AnthropicProvider {
             anyhow::bail!("Anthropic API error: {error}");
         }
 
-        let chat_response: ChatResponse = response.json().await?;
+        let chat_response: SimpleChatResponse = response.json().await?;
 
         chat_response
             .content
@@ -94,6 +143,103 @@ impl Provider for AnthropicProvider {
             .next()
             .map(|c| c.text)
             .ok_or_else(|| anyhow::anyhow!("No response from Anthropic"))
+    }
+
+    async fn chat_completion(
+        &self,
+        system_prompt: Option<&str>,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        model: &str,
+        temperature: f64,
+        max_tokens: u32,
+    ) -> anyhow::Result<ChatCompletionResponse> {
+        let api_key = self.get_key()?;
+
+        // Convert messages to Anthropic format
+        let api_messages: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|msg| {
+                let content = match &msg.content {
+                    ChatContent::Text(t) => serde_json::json!(t),
+                    ChatContent::Blocks(blocks) => {
+                        let api_blocks: Vec<serde_json::Value> = blocks
+                            .iter()
+                            .map(|b| match b {
+                                ContentBlock::Text { text } => {
+                                    serde_json::json!({"type": "text", "text": text})
+                                }
+                                ContentBlock::ToolUse { id, name, input } => {
+                                    serde_json::json!({"type": "tool_use", "id": id, "name": name, "input": input})
+                                }
+                                ContentBlock::ToolResult {
+                                    tool_use_id,
+                                    content,
+                                    is_error,
+                                } => {
+                                    serde_json::json!({"type": "tool_result", "tool_use_id": tool_use_id, "content": content, "is_error": is_error})
+                                }
+                            })
+                            .collect();
+                        serde_json::json!(api_blocks)
+                    }
+                };
+                serde_json::json!({"role": msg.role, "content": content})
+            })
+            .collect();
+
+        // Convert tools to Anthropic format
+        let api_tools: Vec<AnthropicTool> = tools
+            .iter()
+            .map(|t| AnthropicTool {
+                name: t.name.clone(),
+                description: t.description.clone(),
+                input_schema: t.input_schema.clone(),
+            })
+            .collect();
+
+        let request = ToolChatRequest {
+            model: model.to_string(),
+            max_tokens,
+            system: system_prompt.map(ToString::to_string),
+            messages: api_messages,
+            tools: api_tools,
+            temperature,
+        };
+
+        let response = self
+            .client
+            .post("https://api.anthropic.com/v1/messages")
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&request)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let error = response.text().await?;
+            anyhow::bail!("Anthropic API error: {error}");
+        }
+
+        let api_response: ToolChatResponse = response.json().await?;
+
+        // Convert Anthropic content blocks to our ContentBlock type
+        let content = api_response
+            .content
+            .into_iter()
+            .map(|b| match b {
+                AnthropicContentBlock::Text { text } => ContentBlock::Text { text },
+                AnthropicContentBlock::ToolUse { id, name, input } => {
+                    ContentBlock::ToolUse { id, name, input }
+                }
+            })
+            .collect();
+
+        Ok(ChatCompletionResponse {
+            content,
+            stop_reason: api_response.stop_reason,
+        })
     }
 }
 
@@ -144,13 +290,32 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[tokio::test]
+    async fn chat_completion_fails_without_key() {
+        let p = AnthropicProvider::new(None);
+        let result = p
+            .chat_completion(
+                Some("You are Aria"),
+                &[ChatMessage {
+                    role: "user".into(),
+                    content: ChatContent::Text("hello".into()),
+                }],
+                &[],
+                "claude-3-opus",
+                0.7,
+                4096,
+            )
+            .await;
+        assert!(result.is_err());
+    }
+
     #[test]
-    fn chat_request_serializes_without_system() {
-        let req = ChatRequest {
+    fn simple_request_serializes_without_system() {
+        let req = SimpleChatRequest {
             model: "claude-3-opus".to_string(),
             max_tokens: 4096,
             system: None,
-            messages: vec![Message {
+            messages: vec![SimpleMessage {
                 role: "user".to_string(),
                 content: "hello".to_string(),
             }],
@@ -166,12 +331,12 @@ mod tests {
     }
 
     #[test]
-    fn chat_request_serializes_with_system() {
-        let req = ChatRequest {
+    fn simple_request_serializes_with_system() {
+        let req = SimpleChatRequest {
             model: "claude-3-opus".to_string(),
             max_tokens: 4096,
             system: Some("You are Aria".to_string()),
-            messages: vec![Message {
+            messages: vec![SimpleMessage {
                 role: "user".to_string(),
                 content: "hello".to_string(),
             }],
@@ -182,34 +347,83 @@ mod tests {
     }
 
     #[test]
-    fn chat_response_deserializes() {
+    fn simple_response_deserializes() {
         let json = r#"{"content":[{"type":"text","text":"Hello there!"}]}"#;
-        let resp: ChatResponse = serde_json::from_str(json).unwrap();
+        let resp: SimpleChatResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.content.len(), 1);
         assert_eq!(resp.content[0].text, "Hello there!");
     }
 
     #[test]
-    fn chat_response_empty_content() {
-        let json = r#"{"content":[]}"#;
-        let resp: ChatResponse = serde_json::from_str(json).unwrap();
-        assert!(resp.content.is_empty());
+    fn tool_response_deserializes_text() {
+        let json = r#"{"content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn"}"#;
+        let resp: ToolChatResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.content.len(), 1);
+        assert!(matches!(
+            &resp.content[0],
+            AnthropicContentBlock::Text { text } if text == "Hello"
+        ));
+        assert_eq!(resp.stop_reason.as_deref(), Some("end_turn"));
     }
 
     #[test]
-    fn chat_response_multiple_blocks() {
-        let json =
-            r#"{"content":[{"type":"text","text":"First"},{"type":"text","text":"Second"}]}"#;
-        let resp: ChatResponse = serde_json::from_str(json).unwrap();
+    fn tool_response_deserializes_tool_use() {
+        let json = r#"{"content":[{"type":"text","text":"Let me check."},{"type":"tool_use","id":"call_1","name":"shell","input":{"command":"ls"}}],"stop_reason":"tool_use"}"#;
+        let resp: ToolChatResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.content.len(), 2);
-        assert_eq!(resp.content[0].text, "First");
-        assert_eq!(resp.content[1].text, "Second");
+        assert!(matches!(&resp.content[0], AnthropicContentBlock::Text { .. }));
+        assert!(matches!(
+            &resp.content[1],
+            AnthropicContentBlock::ToolUse { name, .. } if name == "shell"
+        ));
+        assert_eq!(resp.stop_reason.as_deref(), Some("tool_use"));
+    }
+
+    #[test]
+    fn tool_request_serializes_with_tools() {
+        let req = ToolChatRequest {
+            model: "claude-3-opus".to_string(),
+            max_tokens: 4096,
+            system: Some("You are Aria".to_string()),
+            messages: vec![serde_json::json!({"role": "user", "content": "list files"})],
+            tools: vec![AnthropicTool {
+                name: "shell".to_string(),
+                description: "Run commands".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"]
+                }),
+            }],
+            temperature: 0.7,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"tools\""));
+        assert!(json.contains("\"name\":\"shell\""));
+        assert!(json.contains("\"input_schema\""));
+    }
+
+    #[test]
+    fn tool_request_serializes_without_tools() {
+        let req = ToolChatRequest {
+            model: "claude-3-opus".to_string(),
+            max_tokens: 4096,
+            system: None,
+            messages: vec![serde_json::json!({"role": "user", "content": "hello"})],
+            tools: vec![],
+            temperature: 0.7,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            !json.contains("\"tools\""),
+            "tools should be skipped when empty"
+        );
     }
 
     #[test]
     fn temperature_range_serializes() {
         for temp in [0.0, 0.5, 1.0, 2.0] {
-            let req = ChatRequest {
+            let req = SimpleChatRequest {
                 model: "claude-3-opus".to_string(),
                 max_tokens: 4096,
                 system: None,

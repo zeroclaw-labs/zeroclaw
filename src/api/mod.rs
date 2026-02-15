@@ -13,7 +13,6 @@ use axum::{
     Router,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 
 /// Shared state for registry API routes
 #[derive(Clone)]
@@ -162,6 +161,19 @@ pub fn registry_router(db: AriaDb) -> Router {
         .route("/api/v1/registry/pipelines", get(pipelines_list))
         .route("/api/v1/registry/pipelines/{id}", get(pipelines_get))
         .route("/api/v1/registry/pipelines/{id}", delete(pipelines_delete))
+        // ── Execution ───────────────────────────────────────
+        .route(
+            "/api/v1/registry/pipelines/{id}/execute",
+            post(pipelines_execute),
+        )
+        .route(
+            "/api/v1/registry/teams/{id}/execute",
+            post(teams_execute),
+        )
+        .route(
+            "/api/v1/registry/feeds/{id}/execute",
+            post(feeds_execute),
+        )
         // ── Containers ────────────────────────────────────────
         .route("/api/v1/registry/containers", post(containers_upload))
         .route("/api/v1/registry/containers", get(containers_list))
@@ -1592,6 +1604,226 @@ async fn bulk_upload(
         "success": true,
         "data": {"results": results, "total": body.items.len()}
     }))).into_response()
+}
+
+// ══════════════════════════════════════════════════════════════════
+// EXECUTION ENDPOINTS
+// ══════════════════════════════════════════════════════════════════
+
+/// Execute a pipeline by ID.
+async fn pipelines_execute(
+    State(state): State<RegistryApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let ctx = match extract_route_context(&headers) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+
+    // Load pipeline definition
+    let pipeline = match crate::aria::pipeline_registry::AriaPipelineRegistry::new(state.db.clone())
+        .get(&id)
+    {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"success": false, "error": "Pipeline not found"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"success": false, "error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+
+    // Deserialize steps from JSON string
+    let steps: Vec<crate::aria::types::PipelineStep> = match serde_json::from_str(&pipeline.steps)
+    {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"success": false, "error": format!("Invalid pipeline steps: {e}")})),
+            )
+                .into_response()
+        }
+    };
+
+    // Extract variables from request body
+    let variables: std::collections::HashMap<String, serde_json::Value> = body
+        .get("variables")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+
+    let timeout = body
+        .get("timeout_ms")
+        .and_then(|v| v.as_u64())
+        .map(std::time::Duration::from_millis);
+
+    let max_parallel = body.get("max_parallel").and_then(|v| v.as_u64()).map(|v| v as u32);
+
+    // Execute the pipeline
+    let engine = crate::pipeline::executor::PipelineEngine::new(state.db.clone());
+    match engine
+        .execute(&id, &ctx.tenant_id, &steps, variables, timeout, max_parallel)
+        .await
+    {
+        Ok(result) => (StatusCode::OK, Json(serde_json::json!({"success": true, "data": result})))
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"success": false, "error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// Execute a team by ID.
+async fn teams_execute(
+    State(state): State<RegistryApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let ctx = match extract_route_context(&headers) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+
+    // Load team definition
+    let team = match crate::aria::team_registry::AriaTeamRegistry::new(state.db.clone())
+        .get(&id)
+    {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"success": false, "error": "Team not found"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"success": false, "error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+
+    let input = body
+        .get("input")
+        .and_then(|v| v.as_str())
+        .unwrap_or("No input provided")
+        .to_string();
+
+    let timeout = body
+        .get("timeout_ms")
+        .and_then(|v| v.as_u64())
+        .map(std::time::Duration::from_millis);
+
+    let max_rounds = body.get("max_rounds").and_then(|v| v.as_u64()).map(|v| v as u32);
+
+    // Deserialize members and mode from JSON strings
+    let members: Vec<crate::team::types::TeamMemberRuntime> =
+        match serde_json::from_str(&team.members) {
+            Ok(m) => m,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"success": false, "error": format!("Invalid team members: {e}")})),
+                )
+                    .into_response()
+            }
+        };
+
+    let mode: crate::aria::types::TeamMode = match serde_json::from_str(&format!("\"{}\"", team.mode)) {
+        Ok(m) => m,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"success": false, "error": format!("Invalid team mode '{}': {e}", team.mode)})),
+            )
+                .into_response()
+        }
+    };
+
+    // Execute the team
+    let engine = crate::team::engine::TeamEngine::new(state.db.clone());
+    match engine
+        .execute(&id, &ctx.tenant_id, &input, &mode, &members, timeout, max_rounds)
+        .await
+    {
+        Ok(result) => (StatusCode::OK, Json(serde_json::json!({"success": true, "data": result})))
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"success": false, "error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// Execute a feed by ID (one-shot).
+async fn feeds_execute(
+    State(state): State<RegistryApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let ctx = match extract_route_context(&headers) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+
+    // Load feed definition
+    let feed = match crate::aria::feed_registry::AriaFeedRegistry::new(state.db.clone())
+        .get(&id)
+    {
+        Ok(Some(f)) => f,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"success": false, "error": "Feed not found"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"success": false, "error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let executor = crate::feed::executor::FeedExecutor::new(state.db.clone());
+
+    match executor
+        .execute(&id, &ctx.tenant_id, &feed.handler_code, &run_id)
+        .await
+    {
+        Ok(result) => {
+            // Store items if execution was successful
+            if result.success && !result.items.is_empty() {
+                let _ = executor.store_items(&ctx.tenant_id, &id, &run_id, &result.items);
+            }
+            (StatusCode::OK, Json(serde_json::json!({"success": true, "data": result})))
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"success": false, "error": e.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════

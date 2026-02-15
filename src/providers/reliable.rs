@@ -1,3 +1,4 @@
+use super::traits::{ChatCompletionResponse, ChatMessage, ToolDefinition};
 use super::Provider;
 use async_trait::async_trait;
 use std::time::Duration;
@@ -65,6 +66,62 @@ impl Provider for ReliableProvider {
                                 attempt = attempt + 1,
                                 max_retries = self.max_retries,
                                 "Provider call failed, retrying"
+                            );
+                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                            backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+                        }
+                    }
+                }
+            }
+
+            tracing::warn!(provider = provider_name, "Switching to fallback provider");
+        }
+
+        anyhow::bail!("All providers failed. Attempts:\n{}", failures.join("\n"))
+    }
+
+    async fn chat_completion(
+        &self,
+        system_prompt: Option<&str>,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        model: &str,
+        temperature: f64,
+        max_tokens: u32,
+    ) -> anyhow::Result<ChatCompletionResponse> {
+        let mut failures = Vec::new();
+
+        for (provider_name, provider) in &self.providers {
+            let mut backoff_ms = self.base_backoff_ms;
+
+            for attempt in 0..=self.max_retries {
+                match provider
+                    .chat_completion(system_prompt, messages, tools, model, temperature, max_tokens)
+                    .await
+                {
+                    Ok(resp) => {
+                        if attempt > 0 {
+                            tracing::info!(
+                                provider = provider_name,
+                                attempt,
+                                "Provider recovered after retries (chat_completion)"
+                            );
+                        }
+                        return Ok(resp);
+                    }
+                    Err(e) => {
+                        failures.push(format!(
+                            "{provider_name} attempt {}/{}: {e}",
+                            attempt + 1,
+                            self.max_retries + 1
+                        ));
+
+                        if attempt < self.max_retries {
+                            tracing::warn!(
+                                provider = provider_name,
+                                attempt = attempt + 1,
+                                max_retries = self.max_retries,
+                                "Provider chat_completion failed, retrying"
                             );
                             tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                             backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);

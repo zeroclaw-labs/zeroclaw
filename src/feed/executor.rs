@@ -3,8 +3,8 @@
 //! Supports two execution modes:
 //! - **URL feeds**: When `handler_code` is an HTTP(S) URL, the executor fetches
 //!   the content and returns it as a single `FeedItem` with card_type `Text`.
-//! - **Code handlers**: Requires the Quilt container runtime (not yet available).
-//!   Returns an error indicating that code-based handlers are not yet supported.
+//! - **Code handlers**: Dispatched to the Quilt container runtime for sandboxed
+//!   execution. Requires `QUILT_API_URL` and `QUILT_API_KEY` to be configured.
 
 use crate::aria::db::AriaDb;
 use crate::aria::types::{FeedCardType, FeedItem, FeedResult};
@@ -132,11 +132,12 @@ impl FeedExecutor {
 
     /// Execute a feed's handler and return the result.
     ///
-    /// Two execution modes are supported:
+    /// Three execution modes are supported:
     /// - **URL feeds** (`handler_code` starts with `http://` or `https://`):
     ///   Fetches the URL content and returns it as a single `FeedItem`.
-    /// - **Code handlers**: Requires the Quilt container runtime. Currently
-    ///   returns an error since Quilt is not yet available.
+    /// - **Code handlers**: Dispatched to the Quilt container runtime for
+    ///   sandboxed execution. Requires a Quilt endpoint to be configured.
+    /// - **Empty handler**: Returns an error.
     pub async fn execute(
         &self,
         feed_id: &str,
@@ -167,18 +168,157 @@ impl FeedExecutor {
             return Self::execute_url_feed(feed_id, handler_code, run_id).await;
         }
 
-        // Non-URL handler code requires Quilt container runtime (not yet available).
-        Ok(FeedResult {
-            success: false,
-            items: Vec::new(),
-            summary: None,
-            metadata: None,
-            error: Some(
-                "Handler execution requires Quilt container runtime (not yet available). \
-                 Use a URL as handler_code for basic HTTP feeds."
-                    .to_string(),
-            ),
-        })
+        // Code handler: dispatch to Quilt container runtime.
+        Self::execute_code_handler(feed_id, tenant_id, handler_code, run_id).await
+    }
+
+    /// Execute a code-based feed handler via the Quilt container runtime.
+    ///
+    /// Creates a sandboxed container, injects the handler code, executes it,
+    /// and parses the output as feed items.
+    async fn execute_code_handler(
+        feed_id: &str,
+        tenant_id: &str,
+        handler_code: &str,
+        run_id: &str,
+    ) -> Result<FeedResult> {
+        use crate::quilt::client::QuiltClient;
+
+        // Attempt to connect to Quilt runtime
+        let quilt = match QuiltClient::from_env() {
+            Ok(client) => client,
+            Err(_) => {
+                return Ok(FeedResult {
+                    success: false,
+                    items: Vec::new(),
+                    summary: None,
+                    metadata: None,
+                    error: Some(
+                        "Code handler execution requires a running Quilt container runtime. \
+                         Set QUILT_API_URL and QUILT_API_KEY, or use a URL as handler_code \
+                         for basic HTTP feeds."
+                            .to_string(),
+                    ),
+                });
+            }
+        };
+
+        // Create a sandboxed container for the feed execution
+        let container_name = format!("feed-{feed_id}-{run_id}");
+        let params = crate::quilt::client::QuiltCreateParams {
+            image: "node:20-slim".to_string(),
+            name: container_name,
+            command: None,
+            labels: std::collections::HashMap::from([
+                ("aria.feed_id".to_string(), feed_id.to_string()),
+                ("aria.tenant_id".to_string(), tenant_id.to_string()),
+                ("aria.run_id".to_string(), run_id.to_string()),
+            ]),
+            memory_limit_mb: Some(256),
+            cpu_limit_percent: Some(50),
+            environment: std::collections::HashMap::new(),
+            volumes: Vec::new(),
+            ports: Vec::new(),
+            network: None,
+            restart_policy: None,
+        };
+
+        let container = match quilt.create_container(params).await {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(FeedResult {
+                    success: false,
+                    items: Vec::new(),
+                    summary: None,
+                    metadata: None,
+                    error: Some(format!("Failed to create Quilt container: {e}")),
+                });
+            }
+        };
+
+        // Start the container
+        if let Err(e) = quilt.start_container(&container.container_id).await {
+            let _ = quilt.delete_container(&container.container_id).await;
+            return Ok(FeedResult {
+                success: false,
+                items: Vec::new(),
+                summary: None,
+                metadata: None,
+                error: Some(format!("Failed to start container: {e}")),
+            });
+        }
+
+        // Execute the handler code inside the container
+        let exec_params = crate::quilt::client::QuiltExecParams {
+            command: vec![
+                "node".into(),
+                "-e".into(),
+                handler_code.to_string(),
+            ],
+            timeout_ms: Some(60_000), // 60 second timeout
+            working_dir: Some("/app".into()),
+            environment: Some(std::collections::HashMap::from([
+                ("FEED_ID".to_string(), feed_id.to_string()),
+                ("TENANT_ID".to_string(), tenant_id.to_string()),
+                ("RUN_ID".to_string(), run_id.to_string()),
+            ])),
+        };
+
+        let exec_result = quilt.exec(&container.container_id, exec_params).await;
+
+        // Clean up the container regardless of result
+        let _ = quilt.stop_container(&container.container_id).await;
+        let _ = quilt.delete_container(&container.container_id).await;
+
+        match exec_result {
+            Ok(result) => {
+                if result.exit_code != 0 {
+                    return Ok(FeedResult {
+                        success: false,
+                        items: Vec::new(),
+                        summary: None,
+                        metadata: None,
+                        error: Some(format!(
+                            "Handler exited with code {}: {}",
+                            result.exit_code,
+                            result.stderr
+                        )),
+                    });
+                }
+
+                // Parse stdout as JSON feed items
+                let item = FeedItem {
+                    card_type: FeedCardType::Text,
+                    title: format!("Feed {feed_id} run {run_id}"),
+                    body: Some(result.stdout),
+                    source: Some("quilt".to_string()),
+                    url: None,
+                    metadata: Some(std::collections::HashMap::from([
+                        ("run_id".to_string(), serde_json::json!(run_id)),
+                        (
+                            "executed_at".to_string(),
+                            serde_json::json!(Utc::now().to_rfc3339()),
+                        ),
+                    ])),
+                    timestamp: Some(Utc::now().timestamp()),
+                };
+
+                Ok(FeedResult {
+                    success: true,
+                    items: vec![item],
+                    summary: Some(format!("Executed code handler for {feed_id}")),
+                    metadata: None,
+                    error: None,
+                })
+            }
+            Err(e) => Ok(FeedResult {
+                success: false,
+                items: Vec::new(),
+                summary: None,
+                metadata: None,
+                error: Some(format!("Handler execution failed: {e}")),
+            }),
+        }
     }
 
     /// Store feed items in the database.
@@ -340,10 +480,6 @@ mod tests {
         assert!(
             error.contains("Quilt container runtime"),
             "Expected Quilt error message, got: {error}"
-        );
-        assert!(
-            error.contains("not yet available"),
-            "Expected 'not yet available' in error, got: {error}"
         );
     }
 

@@ -6,7 +6,9 @@ pub mod openrouter;
 pub mod reliable;
 pub mod traits;
 
-pub use traits::Provider;
+pub use traits::{
+    ChatCompletionResponse, ChatContent, ChatMessage, ContentBlock, Provider, ToolDefinition,
+};
 
 use compatible::{AuthStyle, OpenAiCompatibleProvider};
 use reliable::ReliableProvider;

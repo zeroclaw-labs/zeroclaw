@@ -164,6 +164,17 @@ pub async fn reset_client() {
 }
 
 impl QuiltClient {
+    /// Create a `QuiltClient` from environment variables.
+    ///
+    /// Reads `QUILT_API_URL` and `QUILT_API_KEY` from the environment.
+    pub fn from_env() -> Result<Self, anyhow::Error> {
+        let api_url =
+            std::env::var("QUILT_API_URL").map_err(|_| anyhow::anyhow!("QUILT_API_URL not set"))?;
+        let api_key =
+            std::env::var("QUILT_API_KEY").map_err(|_| anyhow::anyhow!("QUILT_API_KEY not set"))?;
+        Self::new(&api_url, &api_key)
+    }
+
     /// Build a new `QuiltClient`. The `api_key` must start with `qlt_`.
     pub fn new(api_url: &str, api_key: &str) -> Result<Self, anyhow::Error> {
         if !api_key.starts_with("qlt_") {
