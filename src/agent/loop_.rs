@@ -118,6 +118,12 @@ pub async fn run(
             "Open approved HTTPS URLs in Brave Browser (allowlist-only, no scraping)",
         ));
     }
+    if config.composio.enabled {
+        tool_descs.push((
+            "composio",
+            "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover, 'execute' to run, 'connect' to OAuth.",
+        ));
+    }
     let system_prompt = crate::channels::build_system_prompt(
         &config.workspace_dir,
         model_name,
