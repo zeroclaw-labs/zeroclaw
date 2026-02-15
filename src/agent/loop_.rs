@@ -40,7 +40,8 @@ pub async fn run(
     // ── Wire up agnostic subsystems ──────────────────────────────
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
-    let _runtime = runtime::create_runtime(&config.runtime)?;
+    let runtime: Arc<dyn runtime::RuntimeAdapter> =
+        Arc::from(runtime::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(
         &config.autonomy,
         &config.workspace_dir,
@@ -60,7 +61,13 @@ pub async fn run(
     } else {
         None
     };
-    let _tools = tools::all_tools(&security, mem.clone(), composio_key, &config.browser);
+    let _tools = tools::all_tools_with_runtime(
+        &security,
+        runtime,
+        mem.clone(),
+        composio_key,
+        &config.browser,
+    );
 
     // ── Resolve provider ─────────────────────────────────────────
     let provider_name = provider_override

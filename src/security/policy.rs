@@ -16,6 +16,14 @@ pub enum AutonomyLevel {
     Full,
 }
 
+/// Risk score for shell command execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandRiskLevel {
+    Low,
+    Medium,
+    High,
+}
+
 /// Sliding-window action tracker for rate limiting.
 #[derive(Debug)]
 pub struct ActionTracker {
@@ -80,6 +88,8 @@ pub struct SecurityPolicy {
     pub forbidden_paths: Vec<String>,
     pub max_actions_per_hour: u32,
     pub max_cost_per_day_cents: u32,
+    pub require_approval_for_medium_risk: bool,
+    pub block_high_risk_commands: bool,
     pub tracker: ActionTracker,
 }
 
@@ -127,6 +137,8 @@ impl Default for SecurityPolicy {
             ],
             max_actions_per_hour: 20,
             max_cost_per_day_cents: 500,
+            require_approval_for_medium_risk: true,
+            block_high_risk_commands: true,
             tracker: ActionTracker::new(),
         }
     }
@@ -156,6 +168,163 @@ fn skip_env_assignments(s: &str) -> &str {
 }
 
 impl SecurityPolicy {
+    /// Classify command risk. Any high-risk segment marks the whole command high.
+    pub fn command_risk_level(&self, command: &str) -> CommandRiskLevel {
+        let mut normalized = command.to_string();
+        for sep in ["&&", "||"] {
+            normalized = normalized.replace(sep, "\x00");
+        }
+        for sep in ['\n', ';', '|'] {
+            normalized = normalized.replace(sep, "\x00");
+        }
+
+        let mut saw_medium = false;
+
+        for segment in normalized.split('\x00') {
+            let segment = segment.trim();
+            if segment.is_empty() {
+                continue;
+            }
+
+            let cmd_part = skip_env_assignments(segment);
+            let mut words = cmd_part.split_whitespace();
+            let Some(base_raw) = words.next() else {
+                continue;
+            };
+
+            let base = base_raw
+                .rsplit('/')
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+
+            let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
+            let joined_segment = cmd_part.to_ascii_lowercase();
+
+            // High-risk commands
+            if matches!(
+                base.as_str(),
+                "rm" | "mkfs"
+                    | "dd"
+                    | "shutdown"
+                    | "reboot"
+                    | "halt"
+                    | "poweroff"
+                    | "sudo"
+                    | "su"
+                    | "chown"
+                    | "chmod"
+                    | "useradd"
+                    | "userdel"
+                    | "usermod"
+                    | "passwd"
+                    | "mount"
+                    | "umount"
+                    | "iptables"
+                    | "ufw"
+                    | "firewall-cmd"
+                    | "curl"
+                    | "wget"
+                    | "nc"
+                    | "ncat"
+                    | "netcat"
+                    | "scp"
+                    | "ssh"
+                    | "ftp"
+                    | "telnet"
+            ) {
+                return CommandRiskLevel::High;
+            }
+
+            if joined_segment.contains("rm -rf /")
+                || joined_segment.contains("rm -fr /")
+                || joined_segment.contains(":(){:|:&};:")
+            {
+                return CommandRiskLevel::High;
+            }
+
+            // Medium-risk commands (state-changing, but not inherently destructive)
+            let medium = match base.as_str() {
+                "git" => args.first().is_some_and(|verb| {
+                    matches!(
+                        verb.as_str(),
+                        "commit"
+                            | "push"
+                            | "reset"
+                            | "clean"
+                            | "rebase"
+                            | "merge"
+                            | "cherry-pick"
+                            | "revert"
+                            | "branch"
+                            | "checkout"
+                            | "switch"
+                            | "tag"
+                    )
+                }),
+                "npm" | "pnpm" | "yarn" => args.first().is_some_and(|verb| {
+                    matches!(
+                        verb.as_str(),
+                        "install" | "add" | "remove" | "uninstall" | "update" | "publish"
+                    )
+                }),
+                "cargo" => args.first().is_some_and(|verb| {
+                    matches!(
+                        verb.as_str(),
+                        "add" | "remove" | "install" | "clean" | "publish"
+                    )
+                }),
+                "touch" | "mkdir" | "mv" | "cp" | "ln" => true,
+                _ => false,
+            };
+
+            saw_medium |= medium;
+        }
+
+        if saw_medium {
+            CommandRiskLevel::Medium
+        } else {
+            CommandRiskLevel::Low
+        }
+    }
+
+    /// Validate full command execution policy (allowlist + risk gate).
+    pub fn validate_command_execution(
+        &self,
+        command: &str,
+        approved: bool,
+    ) -> Result<CommandRiskLevel, String> {
+        if !self.is_command_allowed(command) {
+            return Err(format!("Command not allowed by security policy: {command}"));
+        }
+
+        let risk = self.command_risk_level(command);
+
+        if risk == CommandRiskLevel::High {
+            if self.block_high_risk_commands {
+                return Err("Command blocked: high-risk command is disallowed by policy".into());
+            }
+            if self.autonomy == AutonomyLevel::Supervised && !approved {
+                return Err(
+                    "Command requires explicit approval (approved=true): high-risk operation"
+                        .into(),
+                );
+            }
+        }
+
+        if risk == CommandRiskLevel::Medium
+            && self.autonomy == AutonomyLevel::Supervised
+            && self.require_approval_for_medium_risk
+            && !approved
+        {
+            return Err(
+                "Command requires explicit approval (approved=true): medium-risk operation".into(),
+            );
+        }
+
+        Ok(risk)
+    }
+
     /// Check if a shell command is allowed.
     ///
     /// Validates the **entire** command string, not just the first word:
@@ -329,6 +498,8 @@ impl SecurityPolicy {
             forbidden_paths: autonomy_config.forbidden_paths.clone(),
             max_actions_per_hour: autonomy_config.max_actions_per_hour,
             max_cost_per_day_cents: autonomy_config.max_cost_per_day_cents,
+            require_approval_for_medium_risk: autonomy_config.require_approval_for_medium_risk,
+            block_high_risk_commands: autonomy_config.block_high_risk_commands,
             tracker: ActionTracker::new(),
         }
     }
@@ -473,6 +644,71 @@ mod tests {
         assert!(!p.is_command_allowed("echo hello"));
     }
 
+    #[test]
+    fn command_risk_low_for_read_commands() {
+        let p = default_policy();
+        assert_eq!(p.command_risk_level("git status"), CommandRiskLevel::Low);
+        assert_eq!(p.command_risk_level("ls -la"), CommandRiskLevel::Low);
+    }
+
+    #[test]
+    fn command_risk_medium_for_mutating_commands() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into(), "touch".into()],
+            ..SecurityPolicy::default()
+        };
+        assert_eq!(
+            p.command_risk_level("git reset --hard HEAD~1"),
+            CommandRiskLevel::Medium
+        );
+        assert_eq!(
+            p.command_risk_level("touch file.txt"),
+            CommandRiskLevel::Medium
+        );
+    }
+
+    #[test]
+    fn command_risk_high_for_dangerous_commands() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["rm".into()],
+            ..SecurityPolicy::default()
+        };
+        assert_eq!(
+            p.command_risk_level("rm -rf /tmp/test"),
+            CommandRiskLevel::High
+        );
+    }
+
+    #[test]
+    fn validate_command_requires_approval_for_medium_risk() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            allowed_commands: vec!["touch".into()],
+            ..SecurityPolicy::default()
+        };
+
+        let denied = p.validate_command_execution("touch test.txt", false);
+        assert!(denied.is_err());
+        assert!(denied.unwrap_err().contains("requires explicit approval"),);
+
+        let allowed = p.validate_command_execution("touch test.txt", true);
+        assert_eq!(allowed.unwrap(), CommandRiskLevel::Medium);
+    }
+
+    #[test]
+    fn validate_command_blocks_high_risk_by_default() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            allowed_commands: vec!["rm".into()],
+            ..SecurityPolicy::default()
+        };
+
+        let result = p.validate_command_execution("rm -rf /tmp/test", true);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("high-risk"));
+    }
+
     // ── is_path_allowed ─────────────────────────────────────
 
     #[test]
@@ -546,6 +782,8 @@ mod tests {
             forbidden_paths: vec!["/secret".into()],
             max_actions_per_hour: 100,
             max_cost_per_day_cents: 1000,
+            require_approval_for_medium_risk: false,
+            block_high_risk_commands: false,
         };
         let workspace = PathBuf::from("/tmp/test-workspace");
         let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
@@ -556,6 +794,8 @@ mod tests {
         assert_eq!(policy.forbidden_paths, vec!["/secret"]);
         assert_eq!(policy.max_actions_per_hour, 100);
         assert_eq!(policy.max_cost_per_day_cents, 1000);
+        assert!(!policy.require_approval_for_medium_risk);
+        assert!(!policy.block_high_risk_commands);
         assert_eq!(policy.workspace_dir, PathBuf::from("/tmp/test-workspace"));
     }
 
@@ -570,6 +810,8 @@ mod tests {
         assert!(!p.forbidden_paths.is_empty());
         assert!(p.max_actions_per_hour > 0);
         assert!(p.max_cost_per_day_cents > 0);
+        assert!(p.require_approval_for_medium_risk);
+        assert!(p.block_high_risk_commands);
     }
 
     // ── ActionTracker / rate limiting ───────────────────────
@@ -853,6 +1095,8 @@ mod tests {
             forbidden_paths: vec![],
             max_actions_per_hour: 10,
             max_cost_per_day_cents: 100,
+            require_approval_for_medium_risk: true,
+            block_high_risk_commands: true,
         };
         let workspace = PathBuf::from("/tmp/test");
         let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
