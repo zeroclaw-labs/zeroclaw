@@ -11,6 +11,7 @@ pub struct DiscordChannel {
     guild_id: Option<String>,
     allowed_users: Vec<String>,
     client: reqwest::Client,
+    typing_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl DiscordChannel {
@@ -20,6 +21,7 @@ impl DiscordChannel {
             guild_id,
             allowed_users,
             client: reqwest::Client::new(),
+            typing_handle: std::sync::Mutex::new(None),
         }
     }
 
@@ -357,6 +359,41 @@ impl Channel for DiscordChannel {
             .map(|r| r.status().is_success())
             .unwrap_or(false)
     }
+
+    async fn start_typing(&self, recipient: &str) -> anyhow::Result<()> {
+        self.stop_typing(recipient).await?;
+
+        let client = self.client.clone();
+        let token = self.bot_token.clone();
+        let channel_id = recipient.to_string();
+
+        let handle = tokio::spawn(async move {
+            let url = format!("https://discord.com/api/v10/channels/{channel_id}/typing");
+            loop {
+                let _ = client
+                    .post(&url)
+                    .header("Authorization", format!("Bot {token}"))
+                    .send()
+                    .await;
+                tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+            }
+        });
+
+        if let Ok(mut guard) = self.typing_handle.lock() {
+            *guard = Some(handle);
+        }
+
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        if let Ok(mut guard) = self.typing_handle.lock() {
+            if let Some(handle) = guard.take() {
+                handle.abort();
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -580,5 +617,45 @@ mod tests {
         assert!(chunks.len() > 1);
         let reconstructed = chunks.concat();
         assert_eq!(reconstructed, msg);
+    }
+
+    #[test]
+    fn typing_handle_starts_as_none() {
+        let ch = DiscordChannel::new("fake".into(), None, vec![]);
+        let guard = ch.typing_handle.lock().unwrap();
+        assert!(guard.is_none());
+    }
+
+    #[tokio::test]
+    async fn start_typing_sets_handle() {
+        let ch = DiscordChannel::new("fake".into(), None, vec![]);
+        let _ = ch.start_typing("123456").await;
+        let guard = ch.typing_handle.lock().unwrap();
+        assert!(guard.is_some());
+    }
+
+    #[tokio::test]
+    async fn stop_typing_clears_handle() {
+        let ch = DiscordChannel::new("fake".into(), None, vec![]);
+        let _ = ch.start_typing("123456").await;
+        let _ = ch.stop_typing("123456").await;
+        let guard = ch.typing_handle.lock().unwrap();
+        assert!(guard.is_none());
+    }
+
+    #[tokio::test]
+    async fn stop_typing_is_idempotent() {
+        let ch = DiscordChannel::new("fake".into(), None, vec![]);
+        assert!(ch.stop_typing("123456").await.is_ok());
+        assert!(ch.stop_typing("123456").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn start_typing_replaces_existing_task() {
+        let ch = DiscordChannel::new("fake".into(), None, vec![]);
+        let _ = ch.start_typing("111").await;
+        let _ = ch.start_typing("222").await;
+        let guard = ch.typing_handle.lock().unwrap();
+        assert!(guard.is_some());
     }
 }

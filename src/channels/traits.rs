@@ -26,4 +26,15 @@ pub trait Channel: Send + Sync {
     async fn health_check(&self) -> bool {
         true
     }
+
+    /// Signal that the bot is processing a response (e.g. "typing" indicator).
+    /// Implementations should repeat the indicator as needed for their platform.
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Stop any active typing indicator.
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
