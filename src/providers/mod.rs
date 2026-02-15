@@ -90,9 +90,70 @@ pub async fn api_error(provider: &str, response: reqwest::Response) -> anyhow::E
     anyhow::anyhow!("{provider} API error ({status}): {sanitized}")
 }
 
+/// Resolve API key for a provider from config and environment variables.
+///
+/// Resolution order:
+/// 1. Explicitly provided `api_key` parameter (trimmed, filtered if empty)
+/// 2. Provider-specific environment variable (e.g., `ANTHROPIC_OAUTH_TOKEN`, `OPENROUTER_API_KEY`)
+/// 3. Generic fallback variables (`ZEROCLAW_API_KEY`, `API_KEY`)
+///
+/// For Anthropic, the provider-specific env var is `ANTHROPIC_OAUTH_TOKEN` (for setup-tokens)
+/// followed by `ANTHROPIC_API_KEY` (for regular API keys).
+fn resolve_api_key(name: &str, api_key: Option<&str>) -> Option<String> {
+    if let Some(key) = api_key.map(str::trim).filter(|k| !k.is_empty()) {
+        return Some(key.to_string());
+    }
+
+    let provider_env_candidates: Vec<&str> = match name {
+        "anthropic" => vec!["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
+        "openrouter" => vec!["OPENROUTER_API_KEY"],
+        "openai" => vec!["OPENAI_API_KEY"],
+        "venice" => vec!["VENICE_API_KEY"],
+        "groq" => vec!["GROQ_API_KEY"],
+        "mistral" => vec!["MISTRAL_API_KEY"],
+        "deepseek" => vec!["DEEPSEEK_API_KEY"],
+        "xai" | "grok" => vec!["XAI_API_KEY"],
+        "together" | "together-ai" => vec!["TOGETHER_API_KEY"],
+        "fireworks" | "fireworks-ai" => vec!["FIREWORKS_API_KEY"],
+        "perplexity" => vec!["PERPLEXITY_API_KEY"],
+        "cohere" => vec!["COHERE_API_KEY"],
+        "moonshot" | "kimi" => vec!["MOONSHOT_API_KEY"],
+        "glm" | "zhipu" => vec!["GLM_API_KEY"],
+        "minimax" => vec!["MINIMAX_API_KEY"],
+        "qianfan" | "baidu" => vec!["QIANFAN_API_KEY"],
+        "zai" | "z.ai" => vec!["ZAI_API_KEY"],
+        "synthetic" => vec!["SYNTHETIC_API_KEY"],
+        "opencode" | "opencode-zen" => vec!["OPENCODE_API_KEY"],
+        "vercel" | "vercel-ai" => vec!["VERCEL_API_KEY"],
+        "cloudflare" | "cloudflare-ai" => vec!["CLOUDFLARE_API_KEY"],
+        _ => vec![],
+    };
+
+    for env_var in provider_env_candidates {
+        if let Ok(value) = std::env::var(env_var) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+
+    for env_var in ["ZEROCLAW_API_KEY", "API_KEY"] {
+        if let Ok(value) = std::env::var(env_var) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+
+    None
+}
+
 /// Factory: create the right provider from config
 #[allow(clippy::too_many_lines)]
 pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<dyn Provider>> {
+    let resolved_key = resolve_api_key(name, api_key);
     match name {
         // ── Primary providers (custom implementations) ───────
         "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(api_key))),
