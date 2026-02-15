@@ -2432,6 +2432,8 @@ pub struct ChannelsConfig {
     /// QQ Official Bot channel configuration.
     pub qq: Option<QQConfig>,
     pub nostr: Option<NostrConfig>,
+    /// ClawdTalk voice channel configuration.
+    pub clawdtalk: Option<crate::channels::clawdtalk::ClawdTalkConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
     /// (up to 4x, capped) so one slow/retried model call does not consume the
@@ -2439,10 +2441,6 @@ pub struct ChannelsConfig {
     /// Default: 300s for on-device LLMs (Ollama) which are slower than cloud APIs.
     #[serde(default = "default_channel_message_timeout_secs")]
     pub message_timeout_secs: u64,
-}
-
-fn default_channel_message_timeout_secs() -> u64 {
-    300
 }
 
 impl Default for ChannelsConfig {
@@ -2466,9 +2464,14 @@ impl Default for ChannelsConfig {
             dingtalk: None,
             qq: None,
             nostr: None,
+            clawdtalk: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
         }
     }
+}
+
+fn default_channel_message_timeout_secs() -> u64 {
+    300
 }
 
 /// Streaming mode for channels that support progressive message updates.

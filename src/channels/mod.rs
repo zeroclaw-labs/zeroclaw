@@ -15,6 +15,7 @@
 //! [`start_channels`]. See `AGENTS.md` §7.2 for the full change playbook.
 
 pub mod cli;
+pub mod clawdtalk;
 pub mod dingtalk;
 pub mod discord;
 pub mod email_channel;
@@ -41,6 +42,7 @@ pub mod whatsapp_storage;
 pub mod whatsapp_web;
 
 pub use cli::CliChannel;
+pub use clawdtalk::{ClawdTalkChannel, ClawdTalkConfig};
 pub use dingtalk::DingTalkChannel;
 pub use discord::DiscordChannel;
 pub use email_channel::EmailChannel;
@@ -2574,6 +2576,7 @@ pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Con
                 ("DingTalk", config.channels_config.dingtalk.is_some()),
                 ("QQ", config.channels_config.qq.is_some()),
                 ("Nostr", config.channels_config.nostr.is_some()),
+                ("ClawdTalk", config.channels_config.clawdtalk.is_some()),
             ] {
                 println!("  {} {name}", if configured { "✅" } else { "❌" });
             }
@@ -2871,6 +2874,13 @@ fn collect_configured_channels(
         });
     }
 
+    if let Some(ref ct) = config.channels_config.clawdtalk {
+        channels.push(ConfiguredChannel {
+            display_name: "ClawdTalk",
+            channel: Arc::new(ClawdTalkChannel::new(ct.clone())),
+        });
+    }
+
     channels
 }
 
@@ -3121,7 +3131,6 @@ pub async fn start_channels(config: Config) -> Result<()> {
             NostrChannel::new(&ns.private_key, ns.relays.clone(), &ns.allowed_pubkeys).await?,
         ));
     }
-
     if channels.is_empty() {
         println!("No channels configured. Run `zeroclaw onboard` to set up channels.");
         return Ok(());
