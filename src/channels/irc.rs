@@ -35,6 +35,9 @@ Never use triple backtick code fences. Use a single blank line to separate block
 Be terse and concise. \
 Use short lines. Avoid walls of text.]\n";
 
+/// Reserved bytes for the server-prepended sender prefix (`:nick!user@host `).
+const SENDER_PREFIX_RESERVE: usize = 64;
+
 /// A parsed IRC message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct IrcMessage {
@@ -319,8 +322,9 @@ impl Channel for IrcChannel {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("IRC not connected"))?;
 
-        // Calculate safe payload size: 512 - "PRIVMSG " - target - " :" - "\r\n"
-        let overhead = 10 + recipient.len() + 2;
+        // Calculate safe payload size:
+        // 512 - sender prefix (~64 bytes for :nick!user@host) - "PRIVMSG " - target - " :" - "\r\n"
+        let overhead = SENDER_PREFIX_RESERVE + 10 + recipient.len() + 2;
         let max_payload = 512_usize.saturating_sub(overhead);
         let chunks = split_message(message, max_payload);
 
