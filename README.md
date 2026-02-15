@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>Zero overhead. Zero compromise. 100% Rust. 100% Agnostic.</strong><br>
-  ⚡️ <strong>Runs on $10 hardware with <10MB RAM: That's 99% less memory than OpenClaw and 98% cheaper than a Mac mini!</strong>
+  ⚡️ <strong>Runs on $10 hardware with <5MB RAM: That's 99% less memory than OpenClaw and 98% cheaper than a Mac mini!</strong>
 </p>
 
 <p align="center">
@@ -21,7 +21,7 @@ Fast, small, and fully autonomous AI assistant infrastructure — deploy anywher
 
 ### ✨ Features
 
-- 🏎️ **Ultra-Lightweight:** <10MB Memory footprint — 99% smaller than OpenClaw core.
+- 🏎️ **Ultra-Lightweight:** <5MB Memory footprint — 99% smaller than OpenClaw core.
 - 💰 **Minimal Cost:** Efficient enough to run on $10 Hardware — 98% cheaper than a Mac mini.
 - ⚡ **Lightning Fast:** 400X Faster startup time, boot in <10ms (under 1s even on 0.6GHz cores).
 - 🌍 **True Portability:** Single self-contained binary across ARM, x86, and RISC-V.
@@ -40,7 +40,7 @@ Local machine quick benchmark (macOS arm64, Feb 2026) normalized for 0.8GHz edge
 | | OpenClaw | NanoBot | PicoClaw | ZeroClaw 🦀 |
 |---|---|---|---|---|
 | **Language** | TypeScript | Python | Go | **Rust** |
-| **RAM** | > 1GB | > 100MB | < 10MB | **< 10MB** |
+| **RAM** | > 1GB | > 100MB | < 10MB | **< 5MB** |
 | **Startup (0.8GHz core)** | > 500s | > 30s | < 1s | **< 10ms** |
 | **Binary Size** | ~28MB (dist) | N/A (Scripts) | ~8MB | **3.4 MB** |
 | **Cost** | Mac Mini $599 | Linux SBC ~$50 | Linux Board $10 | **Any hardware $10** |
