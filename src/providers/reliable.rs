@@ -214,6 +214,19 @@ mod tests {
             }
             Ok(self.response.to_string())
         }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt <= self.fail_until_attempt {
+                anyhow::bail!(self.error);
+            }
+            Ok(self.response.to_string())
+        }
     }
 
     #[tokio::test]
@@ -393,6 +406,75 @@ mod tests {
         assert_eq!(result, "from fallback");
         // Primary should have been called only once (no retries)
         assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn chat_with_history_retries_then_recovers() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![(
+                "primary".into(),
+                Box::new(MockProvider {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: 1,
+                    response: "history ok",
+                    error: "temporary",
+                }),
+            )],
+            2,
+            1,
+        );
+
+        let messages = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("hello"),
+        ];
+        let result = provider
+            .chat_with_history(&messages, "test", 0.0)
+            .await
+            .unwrap();
+        assert_eq!(result, "history ok");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn chat_with_history_falls_back() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(MockProvider {
+                        calls: Arc::clone(&primary_calls),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "primary down",
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(MockProvider {
+                        calls: Arc::clone(&fallback_calls),
+                        fail_until_attempt: 0,
+                        response: "fallback ok",
+                        error: "fallback err",
+                    }),
+                ),
+            ],
+            1,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let result = provider
+            .chat_with_history(&messages, "test", 0.0)
+            .await
+            .unwrap();
+        assert_eq!(result, "fallback ok");
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
     }
 }

@@ -264,6 +264,7 @@ impl Provider for OpenAiCompatibleProvider {
         if !response.status().is_success() {
             let status = response.status();
             let error = response.text().await?;
+            let sanitized = super::sanitize_api_error(&error);
 
             if status == reqwest::StatusCode::NOT_FOUND {
                 return self
@@ -271,13 +272,13 @@ impl Provider for OpenAiCompatibleProvider {
                     .await
                     .map_err(|responses_err| {
                         anyhow::anyhow!(
-                            "{} API error: {error} (chat completions unavailable; responses fallback failed: {responses_err})",
+                            "{} API error ({status}): {sanitized} (chat completions unavailable; responses fallback failed: {responses_err})",
                             self.name
                         )
                     });
             }
 
-            anyhow::bail!("{} API error: {error}", self.name);
+            anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
         }
 
         let chat_response: ApiChatResponse = response.json().await?;

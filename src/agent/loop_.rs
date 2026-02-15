@@ -8,6 +8,7 @@ use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use std::fmt::Write;
+use std::io::Write as IoWrite;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -85,17 +86,22 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
 
         if let Some(end) = remaining[start..].find("</tool_call>") {
             let inner = &remaining[start + 11..start + end];
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(inner.trim()) {
-                let name = parsed
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let arguments = parsed
-                    .get("arguments")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-                calls.push(ParsedToolCall { name, arguments });
+            match serde_json::from_str::<serde_json::Value>(inner.trim()) {
+                Ok(parsed) => {
+                    let name = parsed
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let arguments = parsed
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                    calls.push(ParsedToolCall { name, arguments });
+                }
+                Err(e) => {
+                    tracing::warn!("Malformed <tool_call> JSON: {e}");
+                }
             }
             remaining = &remaining[start + end + 12..];
         } else {
@@ -147,6 +153,7 @@ async fn agent_turn(
         // Print any text the LLM produced alongside tool calls
         if !text.is_empty() {
             print!("{text}");
+            let _ = std::io::stdout().flush();
         }
 
         // Execute each tool call and build results
@@ -412,7 +419,7 @@ pub async fn run(
 
             history.push(ChatMessage::user(&enriched));
 
-            let response = agent_turn(
+            let response = match agent_turn(
                 provider.as_ref(),
                 &mut history,
                 &tools_registry,
@@ -420,7 +427,14 @@ pub async fn run(
                 model_name,
                 temperature,
             )
-            .await?;
+            .await
+            {
+                Ok(resp) => resp,
+                Err(e) => {
+                    eprintln!("\nError: {e}\n");
+                    continue;
+                }
+            };
             println!("\n{response}\n");
 
             // Prevent unbounded history growth in long interactive sessions
