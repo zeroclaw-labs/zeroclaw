@@ -78,7 +78,6 @@ fn spawn_supervised_listener(
 
 /// Load OpenClaw format bootstrap files into the prompt.
 fn load_openclaw_bootstrap_files(prompt: &mut String, workspace_dir: &std::path::Path) {
-    use std::fmt::Write;
     prompt.push_str("The following workspace files define your identity, behavior, and context.\n\n");
 
     let bootstrap_files = [
