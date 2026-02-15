@@ -7,6 +7,7 @@ pub mod image_info;
 pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
+pub mod schedule;
 pub mod screenshot;
 pub mod shell;
 pub mod traits;
@@ -20,6 +21,7 @@ pub use image_info::ImageInfoTool;
 pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
+pub use schedule::ScheduleTool;
 pub use screenshot::ScreenshotTool;
 pub use shell::ShellTool;
 pub use traits::Tool;
@@ -54,6 +56,7 @@ pub fn all_tools(
     memory: Arc<dyn Memory>,
     composio_key: Option<&str>,
     browser_config: &crate::config::BrowserConfig,
+    config: &crate::config::Config,
 ) -> Vec<Box<dyn Tool>> {
     all_tools_with_runtime(
         security,
@@ -61,6 +64,7 @@ pub fn all_tools(
         memory,
         composio_key,
         browser_config,
+        config,
     )
 }
 
@@ -71,6 +75,7 @@ pub fn all_tools_with_runtime(
     memory: Arc<dyn Memory>,
     composio_key: Option<&str>,
     browser_config: &crate::config::BrowserConfig,
+    config: &crate::config::Config,
 ) -> Vec<Box<dyn Tool>> {
     let mut tools: Vec<Box<dyn Tool>> = vec![
         Box::new(ShellTool::new(security.clone(), runtime)),
@@ -105,14 +110,28 @@ pub fn all_tools_with_runtime(
         }
     }
 
+    // Schedule tool is always available
+    tools.push(Box::new(ScheduleTool::new(
+        security.clone(),
+        config.clone(),
+    )));
+
     tools
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BrowserConfig, MemoryConfig};
+    use crate::config::{BrowserConfig, Config, MemoryConfig};
     use tempfile::TempDir;
+
+    fn test_config(tmp: &TempDir) -> Config {
+        Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        }
+    }
 
     #[test]
     fn default_tools_has_three() {
@@ -138,7 +157,8 @@ mod tests {
             session_name: None,
         };
 
-        let tools = all_tools(&security, mem, None, &browser);
+        let cfg = test_config(&tmp);
+        let tools = all_tools(&security, mem, None, &browser, &cfg);
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"browser_open"));
     }
@@ -160,7 +180,8 @@ mod tests {
             session_name: None,
         };
 
-        let tools = all_tools(&security, mem, None, &browser);
+        let cfg = test_config(&tmp);
+        let tools = all_tools(&security, mem, None, &browser, &cfg);
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"browser_open"));
     }

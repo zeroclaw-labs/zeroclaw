@@ -16,6 +16,7 @@ pub struct CronJob {
     pub next_run: DateTime<Utc>,
     pub last_run: Option<DateTime<Utc>>,
     pub last_status: Option<String>,
+    pub one_shot: bool,
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -59,7 +60,11 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             println!("  Cmd : {}", job.command);
             Ok(())
         }
-        crate::CronCommands::Remove { id } => remove_job(config, &id),
+        crate::CronCommands::Remove { id } => {
+            remove_job(config, &id)?;
+            println!("✅ Removed cron job {id}");
+            Ok(())
+        }
     }
 }
 
@@ -70,8 +75,8 @@ pub fn add_job(config: &Config, expression: &str, command: &str) -> Result<CronJ
 
     with_connection(config, |conn| {
         conn.execute(
-            "INSERT INTO cron_jobs (id, expression, command, created_at, next_run)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO cron_jobs (id, expression, command, created_at, next_run, one_shot)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0)",
             params![
                 id,
                 expression,
@@ -91,43 +96,64 @@ pub fn add_job(config: &Config, expression: &str, command: &str) -> Result<CronJ
         next_run,
         last_run: None,
         last_status: None,
+        one_shot: false,
+    })
+}
+
+pub fn add_one_shot_job(config: &Config, run_at: DateTime<Utc>, command: &str) -> Result<CronJob> {
+    let now = Utc::now();
+    let id = Uuid::new_v4().to_string();
+
+    with_connection(config, |conn| {
+        conn.execute(
+            "INSERT INTO cron_jobs (id, expression, command, created_at, next_run, one_shot)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+            params![id, "@once", command, now.to_rfc3339(), run_at.to_rfc3339()],
+        )
+        .context("Failed to insert one-shot job")?;
+        Ok(())
+    })?;
+
+    Ok(CronJob {
+        id,
+        expression: "@once".to_string(),
+        command: command.to_string(),
+        next_run: run_at,
+        last_run: None,
+        last_status: None,
+        one_shot: true,
+    })
+}
+
+pub fn get_job(config: &Config, id: &str) -> Result<Option<CronJob>> {
+    with_connection(config, |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, expression, command, next_run, last_run, last_status, one_shot
+             FROM cron_jobs WHERE id = ?1",
+        )?;
+
+        let mut rows = stmt.query_map(params![id], |row| Ok(parse_job_row(row)))?;
+
+        match rows.next() {
+            Some(Ok(job_result)) => Ok(Some(job_result?)),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
     })
 }
 
 pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
     with_connection(config, |conn| {
         let mut stmt = conn.prepare(
-            "SELECT id, expression, command, next_run, last_run, last_status
+            "SELECT id, expression, command, next_run, last_run, last_status, one_shot
              FROM cron_jobs ORDER BY next_run ASC",
         )?;
 
-        let rows = stmt.query_map([], |row| {
-            let next_run_raw: String = row.get(3)?;
-            let last_run_raw: Option<String> = row.get(4)?;
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                next_run_raw,
-                last_run_raw,
-                row.get::<_, Option<String>>(5)?,
-            ))
-        })?;
+        let rows = stmt.query_map([], |row| Ok(parse_job_row(row)))?;
 
         let mut jobs = Vec::new();
         for row in rows {
-            let (id, expression, command, next_run_raw, last_run_raw, last_status) = row?;
-            jobs.push(CronJob {
-                id,
-                expression,
-                command,
-                next_run: parse_rfc3339(&next_run_raw)?,
-                last_run: match last_run_raw {
-                    Some(raw) => Some(parse_rfc3339(&raw)?),
-                    None => None,
-                },
-                last_status,
-            });
+            jobs.push(row??);
         }
         Ok(jobs)
     })
@@ -143,44 +169,21 @@ pub fn remove_job(config: &Config, id: &str) -> Result<()> {
         anyhow::bail!("Cron job '{id}' not found");
     }
 
-    println!("✅ Removed cron job {id}");
     Ok(())
 }
 
 pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
     with_connection(config, |conn| {
         let mut stmt = conn.prepare(
-            "SELECT id, expression, command, next_run, last_run, last_status
+            "SELECT id, expression, command, next_run, last_run, last_status, one_shot
              FROM cron_jobs WHERE next_run <= ?1 ORDER BY next_run ASC",
         )?;
 
-        let rows = stmt.query_map(params![now.to_rfc3339()], |row| {
-            let next_run_raw: String = row.get(3)?;
-            let last_run_raw: Option<String> = row.get(4)?;
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                next_run_raw,
-                last_run_raw,
-                row.get::<_, Option<String>>(5)?,
-            ))
-        })?;
+        let rows = stmt.query_map(params![now.to_rfc3339()], |row| Ok(parse_job_row(row)))?;
 
         let mut jobs = Vec::new();
         for row in rows {
-            let (id, expression, command, next_run_raw, last_run_raw, last_status) = row?;
-            jobs.push(CronJob {
-                id,
-                expression,
-                command,
-                next_run: parse_rfc3339(&next_run_raw)?,
-                last_run: match last_run_raw {
-                    Some(raw) => Some(parse_rfc3339(&raw)?),
-                    None => None,
-                },
-                last_status,
-            });
+            jobs.push(row??);
         }
         Ok(jobs)
     })
@@ -239,6 +242,31 @@ fn normalize_expression(expression: &str) -> Result<String> {
     }
 }
 
+/// Parse a row from the cron_jobs table into a CronJob.
+/// Expects columns: id, expression, command, next_run, last_run, last_status, one_shot
+fn parse_job_row(row: &rusqlite::Row<'_>) -> Result<CronJob> {
+    let id: String = row.get(0)?;
+    let expression: String = row.get(1)?;
+    let command: String = row.get(2)?;
+    let next_run_raw: String = row.get(3)?;
+    let last_run_raw: Option<String> = row.get(4)?;
+    let last_status: Option<String> = row.get(5)?;
+    let one_shot_int: i32 = row.get(6)?;
+
+    Ok(CronJob {
+        id,
+        expression,
+        command,
+        next_run: parse_rfc3339(&next_run_raw)?,
+        last_run: match last_run_raw {
+            Some(raw) => Some(parse_rfc3339(&raw)?),
+            None => None,
+        },
+        last_status,
+        one_shot: one_shot_int != 0,
+    })
+}
+
 fn parse_rfc3339(raw: &str) -> Result<DateTime<Utc>> {
     let parsed = DateTime::parse_from_rfc3339(raw)
         .with_context(|| format!("Invalid RFC3339 timestamp in cron DB: {raw}"))?;
@@ -264,11 +292,16 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
             next_run    TEXT NOT NULL,
             last_run    TEXT,
             last_status TEXT,
-            last_output TEXT
+            last_output TEXT,
+            one_shot    INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_cron_jobs_next_run ON cron_jobs(next_run);",
     )
     .context("Failed to initialize cron schema")?;
+
+    // Migration: add one_shot column to existing databases (silently ignore if already present)
+    let _ =
+        conn.execute_batch("ALTER TABLE cron_jobs ADD COLUMN one_shot INTEGER NOT NULL DEFAULT 0");
 
     f(&conn)
 }
@@ -351,5 +384,100 @@ mod tests {
         let stored = listed.iter().find(|j| j.id == job.id).unwrap();
         assert_eq!(stored.last_status.as_deref(), Some("error"));
         assert!(stored.last_run.is_some());
+    }
+
+    #[test]
+    fn get_job_found() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let job = add_job(&config, "*/5 * * * *", "echo found").unwrap();
+        let fetched = get_job(&config, &job.id).unwrap();
+        assert!(fetched.is_some());
+        let fetched = fetched.unwrap();
+        assert_eq!(fetched.id, job.id);
+        assert_eq!(fetched.command, "echo found");
+        assert!(!fetched.one_shot);
+    }
+
+    #[test]
+    fn get_job_not_found() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let fetched = get_job(&config, "nonexistent-id").unwrap();
+        assert!(fetched.is_none());
+    }
+
+    #[test]
+    fn add_one_shot_job_sets_fields() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let run_at = Utc::now() + ChronoDuration::hours(1);
+        let job = add_one_shot_job(&config, run_at, "echo once").unwrap();
+
+        assert_eq!(job.expression, "@once");
+        assert_eq!(job.command, "echo once");
+        assert!(job.one_shot);
+        assert!((job.next_run - run_at).num_seconds().abs() < 2);
+
+        // Verify persisted correctly
+        let fetched = get_job(&config, &job.id).unwrap().unwrap();
+        assert!(fetched.one_shot);
+        assert_eq!(fetched.expression, "@once");
+    }
+
+    #[test]
+    fn one_shot_column_migration() {
+        // Simulate a pre-migration database by creating the table without one_shot,
+        // then calling with_connection which runs the migration.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let db_path = config.workspace_dir.join("cron").join("jobs.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+
+        // Create old-schema table manually
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE cron_jobs (
+                    id TEXT PRIMARY KEY,
+                    expression TEXT NOT NULL,
+                    command TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    next_run TEXT NOT NULL,
+                    last_run TEXT,
+                    last_status TEXT,
+                    last_output TEXT
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO cron_jobs (id, expression, command, created_at, next_run)
+                 VALUES ('old-job', '* * * * *', 'echo old', '2025-01-01T00:00:00Z', '2025-01-02T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Now call list_jobs which triggers with_connection → migration
+        let jobs = list_jobs(&config).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, "old-job");
+        assert!(!jobs[0].one_shot); // DEFAULT 0
+    }
+
+    #[test]
+    fn add_job_sets_one_shot_false() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let job = add_job(&config, "*/5 * * * *", "echo recurring").unwrap();
+        assert!(!job.one_shot);
+
+        let listed = list_jobs(&config).unwrap();
+        assert!(!listed[0].one_shot);
     }
 }

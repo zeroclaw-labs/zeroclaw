@@ -267,6 +267,7 @@ pub async fn run(
         mem.clone(),
         composio_key,
         &config.browser,
+        &config,
     );
 
     // ── Resolve provider ─────────────────────────────────────────
@@ -341,6 +342,10 @@ pub async fn run(
             "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover, 'execute' to run, 'connect' to OAuth.",
         ));
     }
+    tool_descs.push((
+        "schedule",
+        "Create, list, get, or cancel scheduled tasks (recurring cron or one-shot delays).",
+    ));
     let mut system_prompt = crate::channels::build_system_prompt(
         &config.workspace_dir,
         model_name,

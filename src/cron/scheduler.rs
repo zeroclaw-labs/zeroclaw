@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::cron::{due_jobs, reschedule_after_run, CronJob};
+use crate::cron::{due_jobs, remove_job, reschedule_after_run, CronJob};
 use crate::security::SecurityPolicy;
 use anyhow::Result;
 use chrono::Utc;
@@ -35,7 +35,12 @@ pub async fn run(config: Config) -> Result<()> {
                 crate::health::mark_component_error("scheduler", format!("job {} failed", job.id));
             }
 
-            if let Err(e) = reschedule_after_run(&config, &job, success, &output) {
+            if job.one_shot {
+                if let Err(e) = remove_job(&config, &job.id) {
+                    crate::health::mark_component_error("scheduler", e.to_string());
+                    tracing::warn!("Failed to remove one-shot job {}: {e}", job.id);
+                }
+            } else if let Err(e) = reschedule_after_run(&config, &job, success, &output) {
                 crate::health::mark_component_error("scheduler", e.to_string());
                 tracing::warn!("Failed to persist scheduler run result: {e}");
             }
@@ -203,6 +208,7 @@ mod tests {
             next_run: Utc::now(),
             last_run: None,
             last_status: None,
+            one_shot: false,
         }
     }
 
