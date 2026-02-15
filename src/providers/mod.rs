@@ -171,6 +171,9 @@ pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<
         "cohere" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Cohere", "https://api.cohere.com/compatibility", api_key, AuthStyle::Bearer,
         ))),
+        "copilot" | "github-copilot" => Ok(Box::new(OpenAiCompatibleProvider::new(
+            "GitHub Copilot", "https://api.githubcopilot.com", api_key, AuthStyle::Bearer,
+        ))),
 
         // ── Bring Your Own Provider (custom URL) ───────────
         // Format: "custom:https://your-api.com" or "custom:http://localhost:1234"
@@ -385,6 +388,12 @@ mod tests {
         assert!(create_provider("cohere", Some("key")).is_ok());
     }
 
+    #[test]
+    fn factory_copilot() {
+        assert!(create_provider("copilot", Some("key")).is_ok());
+        assert!(create_provider("github-copilot", Some("key")).is_ok());
+    }
+
     // ── Custom / BYOP provider ─────────────────────────────
 
     #[test]
@@ -487,6 +496,7 @@ mod tests {
             "fireworks",
             "perplexity",
             "cohere",
+            "copilot",
         ];
         for name in providers {
             assert!(
