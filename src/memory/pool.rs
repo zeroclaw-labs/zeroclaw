@@ -97,6 +97,10 @@ impl managed::Manager for SqliteConnectionManager {
             }
         }
     }
+
+    fn detach(&self, _conn: &mut Connection) {
+        // No special cleanup needed for SQLite connections
+    }
 }
 
 /// Pooled SQLite connection wrapper
@@ -140,7 +144,7 @@ impl SqlitePool {
         PoolStats {
             size: status.size,
             available: status.available,
-            max_size: self.inner.max_size(),
+            max_size: status.size,
         }
     }
 

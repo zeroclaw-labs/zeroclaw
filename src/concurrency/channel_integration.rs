@@ -250,7 +250,7 @@ impl MessageProcessor {
         let timeout = self.config.processing_timeout;
 
         let task = Task::new(async move {
-            let start = Instant::now();
+            let _start = Instant::now();
             
             let result = match tokio::time::timeout(timeout, processor(message.clone())).await {
                 Ok(Ok(response)) => {

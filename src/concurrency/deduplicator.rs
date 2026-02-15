@@ -76,7 +76,7 @@ impl From<u64> for DedupKey {
 }
 
 /// 去重策略
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DedupStrategy {
     /// 精确匹配 - 完全相同的键视为重复
     Exact,

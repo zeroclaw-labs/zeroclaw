@@ -10,7 +10,7 @@ pub mod traits;
 pub mod vector;
 
 pub use markdown::MarkdownMemory;
-pub use pool::{SqlitePool, PoolConfig, PoolStats};
+pub use pool::{SqlitePool, PoolConfig, PoolStats, PooledConnection, SqliteConnectionManager};
 pub use pooled_sqlite::PooledSqliteMemory;
 pub use sqlite::SqliteMemory;
 pub use tiered_cache::{TieredMemory, TieredCacheConfig, CacheStats, CacheTier, TieredMemoryBuilder};

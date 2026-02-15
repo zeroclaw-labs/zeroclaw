@@ -16,10 +16,20 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::memory::embeddings::{EmbeddingProvider, NoopEmbedding};
+use crate::memory::vector::cosine_similarity;
 use crate::security::policy::{AutonomyLevel, SecurityPolicy};
 
+/// Simple base64 decode helper
+fn base64_decode(input: &str) -> Option<String> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(input)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+}
+
 /// Classification of detected threats
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ThreatType {
     /// Attempt to impersonate system/developer/admin
     RolePlaying,
@@ -33,6 +43,44 @@ pub enum ThreatType {
     Obfuscation,
     /// Unknown/Novel threat pattern
     Unknown,
+}
+
+/// Type of injection attack detected
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum InjectionType {
+    /// Prompt injection via role-playing
+    RolePlaying,
+    /// Direct instruction override
+    InstructionOverride,
+    /// Jailbreak attempt
+    Jailbreak,
+    /// System prompt extraction
+    PromptExtraction,
+    /// Encoding-based bypass
+    EncodingBypass,
+    /// Other injection type
+    Other,
+}
+
+/// Result of scanning a prompt for injection attacks
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptScanResult {
+    /// Whether the prompt is safe
+    pub is_safe: bool,
+    /// Detected injection types
+    pub injection_types: Vec<InjectionType>,
+    /// Threat types detected
+    pub threats: Vec<ThreatType>,
+    /// Confidence score (0.0 - 1.0)
+    pub confidence: f32,
+    /// Action taken
+    pub action: DefenseAction,
+    /// Original input
+    pub original: String,
+    /// Sanitized input (if action is Sanitize)
+    pub sanitized: Option<String>,
+    /// Explanation of detection
+    pub explanation: String,
 }
 
 impl std::fmt::Display for ThreatType {
