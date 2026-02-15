@@ -281,9 +281,7 @@ mod tests {
             "API error with 400 Bad Request"
         )));
         // Retryable: 429 Too Many Requests
-        assert!(!is_non_retryable(&anyhow::anyhow!(
-            "429 Too Many Requests"
-        )));
+        assert!(!is_non_retryable(&anyhow::anyhow!("429 Too Many Requests")));
         // Retryable: 408 Request Timeout
         assert!(!is_non_retryable(&anyhow::anyhow!("408 Request Timeout")));
         // Retryable: 5xx server errors

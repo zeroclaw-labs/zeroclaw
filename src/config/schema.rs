@@ -1215,7 +1215,6 @@ default_temperature = 0.7
         let _ = fs::remove_dir_all(&dir);
     }
 
-
     #[test]
     fn config_save_atomic_cleanup() {
         let dir =
@@ -1920,7 +1919,7 @@ default_temperature = 0.7
     fn env_override_temperature_out_of_range_ignored() {
         // Clean up any leftover env vars from other tests
         std::env::remove_var("ZEROCLAW_TEMPERATURE");
-        
+
         let mut config = Config::default();
         let original_temp = config.default_temperature;
 

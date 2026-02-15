@@ -183,8 +183,8 @@ pub fn load_aieos_identity(
 
     // Fall back to aieos_inline
     if let Some(ref inline) = config.aieos_inline {
-        let identity: AieosIdentity = serde_json::from_str(inline)
-            .context("Failed to parse inline AIEOS JSON")?;
+        let identity: AieosIdentity =
+            serde_json::from_str(inline).context("Failed to parse inline AIEOS JSON")?;
 
         return Ok(Some(identity));
     }
@@ -544,10 +544,7 @@ mod tests {
 
         // Check motivations
         let mot = identity.motivations.unwrap();
-        assert_eq!(
-            mot.core_drive.unwrap(),
-            "Help users accomplish their goals"
-        );
+        assert_eq!(mot.core_drive.unwrap(), "Help users accomplish their goals");
 
         // Check capabilities
         let cap = identity.capabilities.unwrap();

@@ -51,7 +51,10 @@ pub trait Observer: Send + Sync + 'static {
     fn name(&self) -> &str;
 
     /// Downcast to `Any` for backend-specific operations
-    fn as_any(&self) -> &dyn std::any::Any where Self: Sized {
+    fn as_any(&self) -> &dyn std::any::Any
+    where
+        Self: Sized,
+    {
         self
     }
 }

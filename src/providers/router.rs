@@ -181,7 +181,10 @@ mod tests {
             .iter()
             .zip(mocks.iter())
             .map(|((name, _), mock)| {
-                (name.to_string(), Box::new(Arc::clone(mock)) as Box<dyn Provider>)
+                (
+                    name.to_string(),
+                    Box::new(Arc::clone(mock)) as Box<dyn Provider>,
+                )
             })
             .collect();
 
@@ -198,11 +201,7 @@ mod tests {
             })
             .collect();
 
-        let router = RouterProvider::new(
-            provider_list,
-            route_list,
-            "default-model".to_string(),
-        );
+        let router = RouterProvider::new(provider_list, route_list, "default-model".to_string());
 
         (router, mocks)
     }
@@ -270,7 +269,10 @@ mod tests {
     #[tokio::test]
     async fn non_hint_model_uses_default_provider() {
         let (router, mocks) = make_router(
-            vec![("primary", "primary-response"), ("secondary", "secondary-response")],
+            vec![
+                ("primary", "primary-response"),
+                ("secondary", "secondary-response"),
+            ],
             vec![("code", "secondary", "codellama")],
         );
 
@@ -285,10 +287,7 @@ mod tests {
 
     #[test]
     fn resolve_preserves_model_for_non_hints() {
-        let (router, _) = make_router(
-            vec![("default", "ok")],
-            vec![],
-        );
+        let (router, _) = make_router(vec![("default", "ok")], vec![]);
 
         let (idx, model) = router.resolve("gpt-4o");
         assert_eq!(idx, 0);
@@ -320,10 +319,7 @@ mod tests {
 
     #[tokio::test]
     async fn warmup_calls_all_providers() {
-        let (router, _) = make_router(
-            vec![("a", "ok"), ("b", "ok")],
-            vec![],
-        );
+        let (router, _) = make_router(vec![("a", "ok"), ("b", "ok")], vec![]);
 
         // Warmup should not error
         assert!(router.warmup().await.is_ok());
@@ -333,7 +329,10 @@ mod tests {
     async fn chat_with_system_passes_system_prompt() {
         let mock = Arc::new(MockProvider::new("response"));
         let router = RouterProvider::new(
-            vec![("default".into(), Box::new(Arc::clone(&mock)) as Box<dyn Provider>)],
+            vec![(
+                "default".into(),
+                Box::new(Arc::clone(&mock)) as Box<dyn Provider>,
+            )],
             vec![],
             "model".into(),
         );

@@ -452,14 +452,20 @@ mod tests {
     fn chat_completions_url_standard_openai() {
         // Standard OpenAI-compatible providers get /chat/completions appended
         let p = make_provider("openai", "https://api.openai.com/v1", None);
-        assert_eq!(p.chat_completions_url(), "https://api.openai.com/v1/chat/completions");
+        assert_eq!(
+            p.chat_completions_url(),
+            "https://api.openai.com/v1/chat/completions"
+        );
     }
 
     #[test]
     fn chat_completions_url_trailing_slash() {
         // Trailing slash is stripped, then /chat/completions appended
         let p = make_provider("test", "https://api.example.com/v1/", None);
-        assert_eq!(p.chat_completions_url(), "https://api.example.com/v1/chat/completions");
+        assert_eq!(
+            p.chat_completions_url(),
+            "https://api.example.com/v1/chat/completions"
+        );
     }
 
     #[test]
@@ -515,14 +521,20 @@ mod tests {
     fn chat_completions_url_without_v1() {
         // Provider configured without /v1 in base URL
         let p = make_provider("test", "https://api.example.com", None);
-        assert_eq!(p.chat_completions_url(), "https://api.example.com/chat/completions");
+        assert_eq!(
+            p.chat_completions_url(),
+            "https://api.example.com/chat/completions"
+        );
     }
 
     #[test]
     fn chat_completions_url_base_with_v1() {
         // Provider configured with /v1 in base URL
         let p = make_provider("test", "https://api.example.com/v1", None);
-        assert_eq!(p.chat_completions_url(), "https://api.example.com/v1/chat/completions");
+        assert_eq!(
+            p.chat_completions_url(),
+            "https://api.example.com/v1/chat/completions"
+        );
     }
 
     // ══════════════════════════════════════════════════════════

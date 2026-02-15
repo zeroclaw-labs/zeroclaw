@@ -21,10 +21,10 @@ pub use traits::Channel;
 pub use whatsapp::WhatsAppChannel;
 
 use crate::config::Config;
+use crate::identity;
 use crate::memory::{self, Memory};
 use crate::providers::{self, Provider};
 use crate::util::truncate_with_ellipsis;
-use crate::identity;
 use anyhow::Result;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -205,7 +205,9 @@ pub fn build_system_prompt(
                 }
                 Err(e) => {
                     // Log error but don't fail - fall back to OpenClaw
-                    eprintln!("Warning: Failed to load AIEOS identity: {e}. Using OpenClaw format.");
+                    eprintln!(
+                        "Warning: Failed to load AIEOS identity: {e}. Using OpenClaw format."
+                    );
                     load_openclaw_bootstrap_files(&mut prompt, workspace_dir);
                 }
             }
@@ -534,7 +536,13 @@ pub async fn start_channels(config: Config) -> Result<()> {
         ));
     }
 
-    let system_prompt = build_system_prompt(&workspace, &model, &tool_descs, &skills, Some(&config.identity));
+    let system_prompt = build_system_prompt(
+        &workspace,
+        &model,
+        &tool_descs,
+        &skills,
+        Some(&config.identity),
+    );
 
     if !skills.is_empty() {
         println!(
