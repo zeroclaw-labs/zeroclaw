@@ -254,10 +254,13 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/tool-calls/:id", get(api_get_tool_call))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
-        .route("/events", get(handle_events_ws))
-        .route("/ws/chat", get(handle_events_ws))
-        .route("/ws/status", get(handle_events_ws))
-        .route("/ws/logs", get(handle_events_ws))
+        // WebSocket endpoints (canonical /ws/* paths)
+        .route("/ws/events", get(handle_events_ws_events))
+        .route("/ws/chat", get(handle_events_ws_chat))
+        .route("/ws/status", get(handle_events_ws_status))
+        .route("/ws/logs", get(handle_events_ws_logs))
+        // Backward-compat alias; keep temporarily while clients migrate.
+        .route("/events", get(handle_events_ws_events))
         .with_state(state)
         .merge(registry_api)
         .layer(
@@ -438,12 +441,8 @@ fn api_tenant(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let token = auth.strip_prefix("Bearer ").unwrap_or("");
-    if state.pairing.require_pairing() && !state.pairing.is_authenticated(token) {
-        return Err(api_err(
-            StatusCode::UNAUTHORIZED,
-            "Missing or invalid Authorization header. Use: Bearer <token>",
-        ));
-    }
+    // Dashboard API routes intentionally do not enforce pairing tokens.
+    // Pairing remains available for webhook-level hardening.
     if token.is_empty() {
         return Ok("dev-tenant".to_string());
     }
@@ -2120,19 +2119,40 @@ async fn handle_whatsapp_message(State(state): State<AppState>, body: Bytes) -> 
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
-/// GET /events — WebSocket endpoint for real-time agent event streaming.
+/// GET /ws/events — WebSocket endpoint for real-time agent event streaming.
 ///
 /// Clients connect via WebSocket and receive JSON-serialized `AgentEvent` messages
 /// for all tool executions, assistant text, thinking, and lifecycle events.
 /// This powers the dashboard's real-time agent activity display.
-async fn handle_events_ws(
+async fn handle_events_ws_events(
     ws: WebSocketUpgrade,
     State(_state): State<AppState>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(handle_events_socket)
+    ws.on_upgrade(|socket| handle_events_socket(socket, "events"))
 }
 
-async fn handle_events_socket(mut socket: ws::WebSocket) {
+async fn handle_events_ws_chat(
+    ws: WebSocketUpgrade,
+    State(_state): State<AppState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(|socket| handle_events_socket(socket, "chat"))
+}
+
+async fn handle_events_ws_status(
+    ws: WebSocketUpgrade,
+    State(_state): State<AppState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(|socket| handle_events_socket(socket, "status"))
+}
+
+async fn handle_events_ws_logs(
+    ws: WebSocketUpgrade,
+    State(_state): State<AppState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(|socket| handle_events_socket(socket, "logs"))
+}
+
+async fn handle_events_socket(mut socket: ws::WebSocket, channel: &'static str) {
     let bus = crate::events::event_bus();
 
     // Bounded channel prevents unbounded memory growth if the WebSocket can't
@@ -2156,7 +2176,7 @@ async fn handle_events_socket(mut socket: ws::WebSocket) {
         }
     });
 
-    tracing::info!("Dashboard WebSocket connected (events stream)");
+    tracing::info!(channel, "Dashboard WebSocket connected");
 
     // Stream events to the client until they disconnect
     loop {
@@ -2184,7 +2204,7 @@ async fn handle_events_socket(mut socket: ws::WebSocket) {
             "WebSocket session dropped events due to backpressure"
         );
     }
-    tracing::info!("Dashboard WebSocket disconnected");
+    tracing::info!(channel, "Dashboard WebSocket disconnected");
 }
 
 #[cfg(test)]
