@@ -78,6 +78,30 @@ impl Tool for FileReadTool {
             });
         }
 
+        // Check file size AFTER canonicalization to prevent TOCTOU symlink bypass
+        const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+        match tokio::fs::metadata(&resolved_path).await {
+            Ok(meta) => {
+                if meta.len() > MAX_FILE_SIZE {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "File too large: {} bytes (limit: {MAX_FILE_SIZE} bytes)",
+                            meta.len()
+                        )),
+                    });
+                }
+            }
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to read file metadata: {e}")),
+                });
+            }
+        }
+
         match tokio::fs::read_to_string(&resolved_path).await {
             Ok(contents) => Ok(ToolResult {
                 success: true,
@@ -254,5 +278,23 @@ mod tests {
             .contains("escapes workspace"));
 
         let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn file_read_rejects_oversized_file() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_large");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // Create a file just over 10 MB
+        let big = vec![b'x'; 10 * 1024 * 1024 + 1];
+        tokio::fs::write(dir.join("huge.bin"), &big).await.unwrap();
+
+        let tool = FileReadTool::new(test_security(dir.clone()));
+        let result = tool.execute(json!({"path": "huge.bin"})).await.unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_ref().unwrap().contains("File too large"));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }
