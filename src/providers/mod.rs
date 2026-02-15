@@ -1,4 +1,5 @@
 pub mod anthropic;
+pub mod claude_cli;
 pub mod compatible;
 pub mod ollama;
 pub mod openai;
@@ -7,7 +8,8 @@ pub mod reliable;
 pub mod traits;
 
 pub use traits::{
-    ChatCompletionResponse, ChatContent, ChatMessage, ContentBlock, Provider, ToolDefinition,
+    ChatCompletionResponse, ChatContent, ChatMessage, ContentBlock, Provider, ProviderStreamSink,
+    ToolDefinition,
 };
 
 use compatible::{AuthStyle, OpenAiCompatibleProvider};
@@ -20,6 +22,9 @@ pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<
         // ── Primary providers (custom implementations) ───────
         "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(api_key))),
         "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(api_key))),
+        "claude-cli" | "claude_code" | "claudecode" => {
+            Ok(Box::new(claude_cli::ClaudeCliProvider::new()))
+        }
         "openai" => Ok(Box::new(openai::OpenAiProvider::new(api_key))),
         "ollama" => Ok(Box::new(ollama::OllamaProvider::new(
             api_key.filter(|k| !k.is_empty()),

@@ -158,6 +158,40 @@ pub trait Provider: Send + Sync {
             stop_reason: Some("end_turn".into()),
         })
     }
+
+    /// Streaming structured completion.
+    ///
+    /// Providers can override this to emit incremental assistant deltas while a
+    /// completion is running. The default implementation falls back to
+    /// `chat_completion` and emits no intermediate deltas.
+    async fn chat_completion_stream(
+        &self,
+        system_prompt: Option<&str>,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        model: &str,
+        temperature: f64,
+        max_tokens: u32,
+        _sink: Option<&mut dyn ProviderStreamSink>,
+    ) -> anyhow::Result<ChatCompletionResponse> {
+        self.chat_completion(
+            system_prompt,
+            messages,
+            tools,
+            model,
+            temperature,
+            max_tokens,
+        )
+        .await
+    }
+}
+
+#[async_trait]
+pub trait ProviderStreamSink: Send {
+    async fn on_assistant_delta(&mut self, _delta: &str) {}
+    async fn on_thinking_start(&mut self) {}
+    async fn on_thinking_delta(&mut self, _delta: &str) {}
+    async fn on_thinking_end(&mut self) {}
 }
 
 #[cfg(test)]

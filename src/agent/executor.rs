@@ -8,10 +8,12 @@
 //!   4. Return the final text and execution metadata
 
 use crate::providers::{
-    ChatCompletionResponse, ChatContent, ChatMessage, ContentBlock, Provider, ToolDefinition,
+    ChatCompletionResponse, ChatContent, ChatMessage, ContentBlock, Provider, ProviderStreamSink,
+    ToolDefinition,
 };
 use crate::tools::Tool;
 use anyhow::Result;
+use async_trait::async_trait;
 use std::time::Instant;
 
 /// Maximum agentic turns (LLM calls) before forcing stop.
@@ -34,6 +36,36 @@ pub struct AgentExecutionResult {
     pub duration_ms: u64,
     /// Error message if failed.
     pub error: Option<String>,
+    /// Tool execution traces (args/results/durations) for observability.
+    pub tool_traces: Vec<AgentToolTrace>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentToolTrace {
+    pub id: String,
+    pub name: String,
+    pub args: serde_json::Value,
+    pub result: String,
+    pub is_error: bool,
+    pub duration_ms: u64,
+}
+
+#[async_trait]
+pub trait AgentExecutionSink: Send {
+    async fn on_assistant_delta(&mut self, _delta: &str, _accumulated: &str) {}
+    async fn on_thinking_start(&mut self) {}
+    async fn on_thinking_delta(&mut self, _delta: &str) {}
+    async fn on_thinking_end(&mut self) {}
+    async fn on_tool_start(&mut self, _id: &str, _name: &str, _args: &serde_json::Value) {}
+    async fn on_tool_end(
+        &mut self,
+        _id: &str,
+        _name: &str,
+        _result: &str,
+        _is_error: bool,
+        _duration_ms: u64,
+    ) {
+    }
 }
 
 /// Convert a Tool trait object to a `ToolDefinition` for the LLM.
@@ -64,6 +96,29 @@ pub async fn execute_agent(
     temperature: f64,
     max_turns: Option<u32>,
 ) -> Result<AgentExecutionResult> {
+    execute_agent_with_sink(
+        provider,
+        tools,
+        system_prompt,
+        user_input,
+        model,
+        temperature,
+        max_turns,
+        None,
+    )
+    .await
+}
+
+pub async fn execute_agent_with_sink(
+    provider: &dyn Provider,
+    tools: &[Box<dyn Tool>],
+    system_prompt: &str,
+    user_input: &str,
+    model: &str,
+    temperature: f64,
+    max_turns: Option<u32>,
+    mut sink: Option<&mut dyn AgentExecutionSink>,
+) -> Result<AgentExecutionResult> {
     let start = Instant::now();
     let max = max_turns.unwrap_or(DEFAULT_MAX_TURNS);
 
@@ -81,25 +136,84 @@ pub async fn execute_agent(
 
     let mut total_turns: u32 = 0;
     let mut total_tool_calls: u32 = 0;
+    let mut tool_traces: Vec<AgentToolTrace> = Vec::new();
+    let mut accumulated_assistant = String::new();
+
+    struct ExecutionProviderSink<'a> {
+        sink: &'a mut dyn AgentExecutionSink,
+        accumulated: &'a mut String,
+    }
+
+    #[async_trait]
+    impl ProviderStreamSink for ExecutionProviderSink<'_> {
+        async fn on_assistant_delta(&mut self, delta: &str) {
+            if delta.is_empty() {
+                return;
+            }
+            self.accumulated.push_str(delta);
+            self.sink.on_assistant_delta(delta, self.accumulated).await;
+        }
+
+        async fn on_thinking_start(&mut self) {
+            self.sink.on_thinking_start().await;
+        }
+
+        async fn on_thinking_delta(&mut self, delta: &str) {
+            if delta.is_empty() {
+                return;
+            }
+            self.sink.on_thinking_delta(delta).await;
+        }
+
+        async fn on_thinking_end(&mut self) {
+            self.sink.on_thinking_end().await;
+        }
+    }
 
     for _turn in 0..max {
         total_turns += 1;
 
         // Call the LLM
-        let response: ChatCompletionResponse = provider
-            .chat_completion(
-                Some(system_prompt),
-                &messages,
-                &tool_defs,
-                model,
-                temperature,
-                DEFAULT_MAX_TOKENS,
-            )
-            .await?;
+        let response: ChatCompletionResponse = if let Some(agent_sink) = sink.as_deref_mut() {
+            let mut provider_sink = ExecutionProviderSink {
+                sink: agent_sink,
+                accumulated: &mut accumulated_assistant,
+            };
+            provider
+                .chat_completion_stream(
+                    Some(system_prompt),
+                    &messages,
+                    &tool_defs,
+                    model,
+                    temperature,
+                    DEFAULT_MAX_TOKENS,
+                    Some(&mut provider_sink),
+                )
+                .await?
+        } else {
+            provider
+                .chat_completion_stream(
+                    Some(system_prompt),
+                    &messages,
+                    &tool_defs,
+                    model,
+                    temperature,
+                    DEFAULT_MAX_TOKENS,
+                    None,
+                )
+                .await?
+        };
 
         // If no tool_use in response, we're done — return the text
         if !response.has_tool_use() {
             let output = response.text();
+            // If provider streaming didn't emit deltas, fall back to one-shot.
+            if !output.is_empty() && accumulated_assistant.is_empty() {
+                accumulated_assistant.push_str(&output);
+                if let Some(s) = sink.as_deref_mut() {
+                    s.on_assistant_delta(&output, &accumulated_assistant).await;
+                }
+            }
             return Ok(AgentExecutionResult {
                 output,
                 success: true,
@@ -107,6 +221,7 @@ pub async fn execute_agent(
                 tool_calls: total_tool_calls,
                 duration_ms: start.elapsed().as_millis() as u64,
                 error: None,
+                tool_traces,
             });
         }
 
@@ -123,31 +238,60 @@ pub async fn execute_agent(
 
         for (call_id, tool_name, tool_input) in response.tool_uses() {
             total_tool_calls += 1;
+            let tool_started = Instant::now();
+            let tool_input_owned = tool_input.clone();
+            if let Some(s) = sink.as_deref_mut() {
+                s.on_tool_start(call_id, tool_name, &tool_input_owned).await;
+            }
 
             // Find the matching tool
             let tool = tools.iter().find(|t| t.name() == tool_name);
 
-            let result_content = match tool {
+            let (result_content, is_error) = match tool {
                 Some(tool) => match tool.execute(tool_input.clone()).await {
                     Ok(result) => {
                         if result.success {
-                            result.output
+                            (result.output, false)
                         } else {
-                            format!(
-                                "Error: {}",
-                                result.error.unwrap_or_else(|| "Unknown error".into())
+                            (
+                                format!(
+                                    "Error: {}",
+                                    result.error.unwrap_or_else(|| "Unknown error".into())
+                                ),
+                                true,
                             )
                         }
                     }
-                    Err(e) => format!("Tool execution error: {e}"),
+                    Err(e) => (format!("Tool execution error: {e}"), true),
                 },
-                None => format!("Unknown tool: {tool_name}"),
+                None => (format!("Unknown tool: {tool_name}"), true),
             };
+            let tool_duration_ms = tool_started.elapsed().as_millis() as u64;
+
+            if let Some(s) = sink.as_deref_mut() {
+                s.on_tool_end(
+                    call_id,
+                    tool_name,
+                    &result_content,
+                    is_error,
+                    tool_duration_ms,
+                )
+                .await;
+            }
+
+            tool_traces.push(AgentToolTrace {
+                id: call_id.to_string(),
+                name: tool_name.to_string(),
+                args: tool_input_owned,
+                result: result_content.clone(),
+                is_error,
+                duration_ms: tool_duration_ms,
+            });
 
             result_blocks.push(ContentBlock::ToolResult {
                 tool_use_id: call_id.to_string(),
                 content: result_content,
-                is_error: false,
+                is_error,
             });
         }
 
@@ -189,6 +333,7 @@ pub async fn execute_agent(
         tool_calls: total_tool_calls,
         duration_ms: start.elapsed().as_millis() as u64,
         error: Some(format!("Agent reached max turns ({max})")),
+        tool_traces,
     })
 }
 
@@ -219,6 +364,7 @@ mod tests {
             tool_calls: 0,
             duration_ms: 42,
             error: None,
+            tool_traces: Vec::new(),
         };
         assert!(result.success);
         assert_eq!(result.output, "hello");

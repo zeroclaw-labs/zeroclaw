@@ -12,7 +12,11 @@ use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::providers::{self, Provider};
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
+use crate::security::SecurityPolicy;
+use crate::status_events;
+use crate::tools;
 use anyhow::Result;
+use async_trait::async_trait;
 use axum::{
     body::Bytes,
     extract::{ws, Multipart, Path, Query, State, WebSocketUpgrade},
@@ -21,6 +25,7 @@ use axum::{
     routing::{delete, get, patch, post, put},
     Router,
 };
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
@@ -38,6 +43,10 @@ pub struct AppState {
     pub model: String,
     pub temperature: f64,
     pub mem: Arc<dyn Memory>,
+    pub security: Arc<SecurityPolicy>,
+    pub composio_api_key: Option<String>,
+    pub browser_config: crate::config::BrowserConfig,
+    pub base_system_prompt: String,
     pub registry_db: crate::aria::db::AriaDb,
     pub auto_save: bool,
     pub webhook_secret: Option<Arc<str>>,
@@ -78,6 +87,41 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         &config.workspace_dir,
         config.api_key.as_deref(),
     )?);
+    let security = Arc::new(SecurityPolicy::from_config(
+        &config.autonomy,
+        &config.workspace_dir,
+    ));
+    let composio_api_key = if config.composio.enabled {
+        config.composio.api_key.clone()
+    } else {
+        None
+    };
+    let mut tool_descs: Vec<(&str, &str)> = vec![
+        (
+            "shell",
+            "Execute terminal commands for diagnostics/build/test and controlled automation.",
+        ),
+        ("file_read", "Read file contents from workspace paths."),
+        ("file_write", "Write files in workspace paths."),
+        (
+            "memory_store",
+            "Store durable facts, preferences, and decisions in memory.",
+        ),
+        (
+            "memory_recall",
+            "Recall relevant memory entries for context.",
+        ),
+        ("memory_forget", "Delete stale or incorrect memory entries."),
+    ];
+    if config.browser.enabled {
+        tool_descs.push((
+            "browser_open",
+            "Open allowlisted HTTPS URLs in Brave Browser.",
+        ));
+    }
+    let skills = crate::skills::load_skills(&config.workspace_dir);
+    let base_system_prompt =
+        crate::channels::build_system_prompt(&config.workspace_dir, &model, &tool_descs, &skills);
 
     // Extract webhook secret for authentication
     let webhook_secret: Option<Arc<str>> = config
@@ -163,8 +207,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         });
     crate::dashboard::ensure_schema(&aria_registries.db)?;
     if let Ok(src) = std::env::var("AFW_IMPORT_CLOUD_DB") {
-        let imported =
-            crate::dashboard::import_from_cloud_db(&aria_registries.db, std::path::Path::new(&src))?;
+        let imported = crate::dashboard::import_from_cloud_db(
+            &aria_registries.db,
+            std::path::Path::new(&src),
+        )?;
         if imported > 0 {
             tracing::info!(imported_tables = imported, source = %src, "Imported dashboard tables from cloud DB");
         }
@@ -177,6 +223,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         model,
         temperature,
         mem,
+        security,
+        composio_api_key,
+        browser_config: config.browser.clone(),
+        base_system_prompt,
         registry_db: aria_registries.db.clone(),
         auto_save: config.memory.auto_save,
         webhook_secret,
@@ -236,7 +286,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/api-keys/:id", delete(api_revoke_api_key))
         .route("/api/v1/auth/magic-number", post(api_create_magic_number))
         .route("/api/v1/auth/magic-numbers", get(api_list_magic_numbers))
-        .route("/api/v1/auth/magic-number/:id", delete(api_revoke_magic_number))
+        .route(
+            "/api/v1/auth/magic-number/:id",
+            delete(api_revoke_magic_number),
+        )
         .route("/api/billing", get(api_get_billing))
         .route("/api/billing/usage", get(api_get_billing_usage))
         .route("/api/billing/invoices", get(api_get_billing_invoices))
@@ -247,7 +300,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/feeds/:id", patch(api_patch_feed))
         .route("/api/feed/files", get(api_list_feed_files))
         .route("/api/feed/files", post(api_upload_feed_file))
-        .route("/api/feed/files/:file_id/content", get(api_get_feed_file_content))
+        .route(
+            "/api/feed/files/:file_id/content",
+            get(api_get_feed_file_content),
+        )
         .route("/api/feed/files/:file_id", delete(api_delete_feed_file))
         .route("/api/tool-calls", get(api_list_tool_calls))
         .route("/api/tool-calls/stats", get(api_tool_calls_stats))
@@ -419,7 +475,10 @@ fn api_ok<T: serde::Serialize>(data: T) -> (StatusCode, Json<serde_json::Value>)
     )
 }
 
-fn api_err(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {
+fn api_err(
+    status: StatusCode,
+    message: impl Into<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
     (
         status,
         Json(serde_json::json!({
@@ -430,6 +489,25 @@ fn api_err(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<
             }
         })),
     )
+}
+
+fn resolve_tenant_from_token(state: &AppState, token: &str) -> String {
+    if token.is_empty() {
+        return "dev-tenant".to_string();
+    }
+
+    if let Some((tenant, _)) = token.split_once(':') {
+        return tenant.to_string();
+    }
+
+    if token.starts_with("zc_") {
+        if let Some(primary) = detect_primary_tenant(&state.registry_db) {
+            return primary;
+        }
+        return "dev-tenant".to_string();
+    }
+
+    token.to_string()
 }
 
 fn api_tenant(
@@ -443,13 +521,34 @@ fn api_tenant(
     let token = auth.strip_prefix("Bearer ").unwrap_or("");
     // Dashboard API routes intentionally do not enforce pairing tokens.
     // Pairing remains available for webhook-level hardening.
-    if token.is_empty() {
-        return Ok("dev-tenant".to_string());
-    }
-    Ok(token
-        .split_once(':')
-        .map(|(t, _)| t.to_string())
-        .unwrap_or_else(|| token.to_string()))
+    Ok(resolve_tenant_from_token(state, token))
+}
+
+fn detect_primary_tenant(db: &crate::aria::db::AriaDb) -> Option<String> {
+    db.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT tenant_id, score
+            FROM (
+              SELECT tenant_id, COUNT(*) AS score FROM aria_tools GROUP BY tenant_id
+              UNION ALL
+              SELECT tenant_id, COUNT(*) AS score FROM aria_agents GROUP BY tenant_id
+              UNION ALL
+              SELECT tenant_id, COUNT(*) AS score FROM aria_feeds GROUP BY tenant_id
+              UNION ALL
+              SELECT tenant_id, COUNT(*) AS score FROM aria_tasks GROUP BY tenant_id
+            )
+            WHERE tenant_id NOT LIKE 'zc_%'
+            ORDER BY score DESC, tenant_id ASC
+            LIMIT 1
+            "#,
+        )?;
+
+        let tenant = stmt.query_row([], |row| row.get::<_, String>(0)).ok();
+        Ok(tenant)
+    })
+    .ok()
+    .flatten()
 }
 
 fn iso_from_millis(ms: i64) -> String {
@@ -474,6 +573,19 @@ struct ApiSendMessageBody {
     message: Option<String>,
     #[serde(rename = "sessionId")]
     session_id: Option<String>,
+    mode: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct WsChatMessage {
+    #[serde(rename = "type")]
+    message_type: String,
+    content: Option<String>,
+    #[serde(rename = "sessionId")]
+    session_id: Option<String>,
+    mode: Option<String>,
+    #[serde(rename = "requestId")]
+    request_id: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -521,6 +633,136 @@ struct ApiCreateKeyBody {
 struct ListQuery {
     limit: Option<usize>,
     offset: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ChatRunMode {
+    Default,
+    Plan,
+    Autonomous,
+}
+
+fn parse_chat_mode(raw: Option<&str>) -> ChatRunMode {
+    match raw.map(str::trim).unwrap_or_default() {
+        "plan" => ChatRunMode::Plan,
+        "autonomous" => ChatRunMode::Autonomous,
+        _ => ChatRunMode::Default,
+    }
+}
+
+async fn build_chat_memory_context(mem: &dyn Memory, user_msg: &str) -> String {
+    let mut context = String::new();
+    if let Ok(entries) = mem.recall(user_msg, 5).await {
+        if !entries.is_empty() {
+            context.push_str("[Memory context]\n");
+            for entry in &entries {
+                context.push_str("- ");
+                context.push_str(&entry.key);
+                context.push_str(": ");
+                context.push_str(&entry.content);
+                context.push('\n');
+            }
+            context.push('\n');
+        }
+    }
+    context
+}
+
+fn mode_prompt(mode: ChatRunMode) -> &'static str {
+    match mode {
+        ChatRunMode::Plan => {
+            "PLAN MODE: analyze and propose an implementation plan only. Do not execute changes yet."
+        }
+        ChatRunMode::Autonomous => {
+            "AUTONOMOUS MODE: execute end-to-end. Prefer decisive action and report concise progress."
+        }
+        ChatRunMode::Default => "",
+    }
+}
+
+fn ensure_chat_row(state: &AppState, tenant: &str, chat_id: &str, seed: &str, ts: i64) {
+    let _ = state.registry_db.with_conn(|conn| {
+        let exists: Option<String> = conn
+            .query_row(
+                "SELECT id FROM chats WHERE tenant_id=?1 AND session_id=?2 LIMIT 1",
+                rusqlite::params![tenant, chat_id],
+                |row| row.get(0),
+            )
+            .ok();
+        if exists.is_none() {
+            let title = seed.chars().take(64).collect::<String>();
+            conn.execute(
+                "INSERT INTO chats (id, tenant_id, title, preview, session_id, message_count, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, '', ?4, 0, ?5, ?5)",
+                rusqlite::params![uuid::Uuid::new_v4().to_string(), tenant, title, chat_id, ts],
+            )?;
+        }
+        Ok(())
+    });
+}
+
+fn insert_chat_message(
+    state: &AppState,
+    tenant: &str,
+    chat_id: &str,
+    role: &str,
+    content: &str,
+    ts: i64,
+) -> String {
+    let msg_id = uuid::Uuid::new_v4().to_string();
+    let _ = state.registry_db.with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO messages (id, tenant_id, chat_id, role, content, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![msg_id, tenant, chat_id, role, content, ts],
+        )?;
+        Ok(())
+    });
+    msg_id
+}
+
+fn update_chat_preview(state: &AppState, tenant: &str, chat_id: &str, preview: &str, ts: i64) {
+    let _ = state.registry_db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE chats
+             SET preview=?1, message_count=(SELECT COUNT(*) FROM messages WHERE chat_id=?2 AND tenant_id=?3), updated_at=?4
+             WHERE session_id=?2 AND tenant_id=?3",
+            rusqlite::params![preview.chars().take(140).collect::<String>(), chat_id, tenant, ts],
+        )?;
+        Ok(())
+    });
+}
+
+fn persist_tool_trace(
+    state: &AppState,
+    tenant: &str,
+    chat_id: &str,
+    run_id: &str,
+    trace: &crate::agent::executor::AgentToolTrace,
+    now: i64,
+) {
+    let status = if trace.is_error { "error" } else { "success" };
+    let _ = state.registry_db.with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO tool_calls (id, tenant_id, session_id, run_id, agent_id, tool_name, status, args_json, result_json, error, duration_ms, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
+            rusqlite::params![
+                trace.id.clone(),
+                tenant,
+                chat_id,
+                run_id,
+                "main",
+                trace.name.clone(),
+                status,
+                trace.args.to_string(),
+                trace.result.clone(),
+                if trace.is_error { Some(trace.result.clone()) } else { None::<String> },
+                trace.duration_ms as i64,
+                now,
+            ],
+        )?;
+        Ok(())
+    });
 }
 
 async fn api_create_chat(
@@ -578,61 +820,83 @@ async fn api_send_message(
     let session_id = body
         .session_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let mode = parse_chat_mode(body.mode.as_deref());
+    let run_id = format!("run-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let now = now_ms();
 
-    // Ensure chat row exists
-    let _ = state.registry_db.with_conn(|conn| {
-        let exists: Option<String> = conn
-            .query_row(
-                "SELECT id FROM chats WHERE tenant_id=?1 AND session_id=?2 LIMIT 1",
-                rusqlite::params![tenant, session_id],
-                |row| row.get(0),
-            )
-            .ok();
-        if exists.is_none() {
-            let title = content.chars().take(64).collect::<String>();
-            conn.execute(
-                "INSERT INTO chats (id, tenant_id, title, preview, session_id, message_count, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, '', ?4, 0, ?5, ?5)",
-                rusqlite::params![uuid::Uuid::new_v4().to_string(), tenant, title, session_id, now],
-            )?;
-        }
-        Ok(())
-    });
+    ensure_chat_row(&state, &tenant, &session_id, &content, now);
+    let _ = insert_chat_message(&state, &tenant, &session_id, "user", &content, now);
 
-    let user_msg_id = uuid::Uuid::new_v4().to_string();
-    let _ = state.registry_db.with_conn(|conn| {
-        conn.execute(
-            "INSERT INTO messages (id, tenant_id, chat_id, role, content, created_at)
-             VALUES (?1, ?2, ?3, 'user', ?4, ?5)",
-            rusqlite::params![user_msg_id, tenant, session_id, content, now],
-        )?;
-        Ok(())
-    });
-
-    let assistant_text = match state
-        .provider
-        .chat(&content, &state.model, state.temperature)
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => format!("LLM error: {e}"),
+    let tools = tools::all_tools_for_tenant(
+        &state.security,
+        state.mem.clone(),
+        state.composio_api_key.as_deref(),
+        &state.browser_config,
+        &state.registry_db,
+        &tenant,
+    );
+    let memory_context = build_chat_memory_context(state.mem.as_ref(), &content).await;
+    let mode_hint = mode_prompt(mode);
+    let system_prompt = if mode_hint.is_empty() {
+        state.base_system_prompt.clone()
+    } else {
+        format!("{}\n\n{}", state.base_system_prompt, mode_hint)
     };
-    let assistant_id = uuid::Uuid::new_v4().to_string();
-    let _ = state.registry_db.with_conn(|conn| {
-        conn.execute(
-            "INSERT INTO messages (id, tenant_id, chat_id, role, content, created_at)
-             VALUES (?1, ?2, ?3, 'assistant', ?4, ?5)",
-            rusqlite::params![assistant_id, tenant, session_id, assistant_text, now_ms()],
-        )?;
-        conn.execute(
-            "UPDATE chats
-             SET preview=?1, message_count=(SELECT COUNT(*) FROM messages WHERE chat_id=?2 AND tenant_id=?3), updated_at=?4
-             WHERE session_id=?2 AND tenant_id=?3",
-            rusqlite::params![assistant_text.chars().take(140).collect::<String>(), session_id, tenant, now_ms()],
-        )?;
-        Ok(())
-    });
+    let enriched = if memory_context.is_empty() {
+        content.clone()
+    } else {
+        format!("{memory_context}{content}")
+    };
+
+    let run_result = crate::agent::executor::execute_agent_with_sink(
+        state.provider.as_ref(),
+        &tools,
+        &system_prompt,
+        &enriched,
+        &state.model,
+        state.temperature,
+        Some(25),
+        None,
+    )
+    .await;
+
+    let assistant_text = match run_result {
+        Ok(res) => {
+            let finished_at = now_ms();
+            for trace in &res.tool_traces {
+                persist_tool_trace(&state, &tenant, &session_id, &run_id, trace, finished_at);
+            }
+            status_events::emit(
+                "task.completed",
+                serde_json::json!({
+                    "id": run_id,
+                    "name": "chat",
+                    "durationMs": res.duration_ms,
+                }),
+            );
+            res.output
+        }
+        Err(e) => {
+            status_events::emit(
+                "task.failed",
+                serde_json::json!({
+                    "id": run_id,
+                    "name": "chat",
+                    "errorMessage": e.to_string(),
+                }),
+            );
+            format!("LLM error: {e}")
+        }
+    };
+    let assistant_id = insert_chat_message(
+        &state,
+        &tenant,
+        &session_id,
+        "assistant",
+        &assistant_text,
+        now_ms(),
+    );
+    update_chat_preview(&state, &tenant, &session_id, &assistant_text, now_ms());
 
     api_ok(serde_json::json!({
         "id": assistant_id,
@@ -863,7 +1127,10 @@ async fn api_list_conversations(
     }
 }
 
-async fn api_list_approvals(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+async fn api_list_approvals(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
     let tenant = match api_tenant(&state, &headers) {
         Ok(t) => t,
         Err(e) => return e,
@@ -906,7 +1173,11 @@ async fn api_respond_approval(
     if id.is_empty() {
         return api_err(StatusCode::BAD_REQUEST, "requestId is required");
     }
-    let status = if action == "deny" { "denied" } else { "approved" };
+    let status = if action == "deny" {
+        "denied"
+    } else {
+        "approved"
+    };
     let _ = state.registry_db.with_conn(|conn| {
         conn.execute(
             "UPDATE approvals SET status=?1 WHERE tenant_id=?2 AND id=?3",
@@ -952,7 +1223,10 @@ async fn api_patch_session(
     Path(key): Path<String>,
     Json(body): Json<ApiUpdateStatusBody>,
 ) -> impl IntoResponse {
-    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let status = body.status.unwrap_or_else(|| "active".to_string());
     let res = state.registry_db.with_conn(|conn| {
         conn.execute(
@@ -961,7 +1235,10 @@ async fn api_patch_session(
         )?;
         Ok(())
     });
-    match res { Ok(()) => api_ok(serde_json::json!({"id": key, "status": status})), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+    match res {
+        Ok(()) => api_ok(serde_json::json!({"id": key, "status": status})),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
 async fn api_reset_session(
@@ -969,7 +1246,10 @@ async fn api_reset_session(
     headers: HeaderMap,
     Path(key): Path<String>,
 ) -> impl IntoResponse {
-    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let res = state.registry_db.with_conn(|conn| {
         conn.execute(
             "UPDATE sessions SET run_count=0, last_activity=?1 WHERE tenant_id=?2 AND id=?3",
@@ -977,7 +1257,10 @@ async fn api_reset_session(
         )?;
         Ok(())
     });
-    match res { Ok(()) => api_ok(serde_json::json!({"reset": true})), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+    match res {
+        Ok(()) => api_ok(serde_json::json!({"reset": true})),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
 async fn api_delete_session(
@@ -985,7 +1268,10 @@ async fn api_delete_session(
     headers: HeaderMap,
     Path(key): Path<String>,
 ) -> impl IntoResponse {
-    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let res = state.registry_db.with_conn(|conn| {
         conn.execute(
             "DELETE FROM sessions WHERE tenant_id=?1 AND id=?2",
@@ -993,7 +1279,10 @@ async fn api_delete_session(
         )?;
         Ok(())
     });
-    match res { Ok(()) => api_ok(serde_json::json!({"deleted": true})), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+    match res {
+        Ok(()) => api_ok(serde_json::json!({"deleted": true})),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
 async fn api_list_events(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
@@ -1098,7 +1387,10 @@ async fn api_get_status(State(_state): State<AppState>, _headers: HeaderMap) -> 
 }
 
 async fn api_list_channels(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let res = state.registry_db.with_conn(|conn| {
         let mut stmt = conn.prepare(
             "SELECT id,name,type,status,requests_per_min,endpoint,created_at,updated_at
@@ -1118,7 +1410,10 @@ async fn api_list_channels(State(state): State<AppState>, headers: HeaderMap) ->
         })?;
         Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
     });
-    match res { Ok(v) => api_ok(v), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+    match res {
+        Ok(v) => api_ok(v),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
 async fn api_patch_channel(
@@ -1127,7 +1422,10 @@ async fn api_patch_channel(
     Path(id): Path<String>,
     Json(body): Json<ApiPatchChannelBody>,
 ) -> impl IntoResponse {
-    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let status = body.status.unwrap_or_else(|| "active".to_string());
     let name = body.name.unwrap_or_else(|| id.clone());
     let now = now_ms();
@@ -1145,7 +1443,10 @@ async fn api_patch_channel(
         }
         Ok(())
     });
-    match res { Ok(()) => api_ok(serde_json::json!({ "id": id, "name": name, "status": status })), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+    match res {
+        Ok(()) => api_ok(serde_json::json!({ "id": id, "name": name, "status": status })),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
 async fn api_delete_channel(
@@ -1153,7 +1454,10 @@ async fn api_delete_channel(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let res = state.registry_db.with_conn(|conn| {
         conn.execute(
             "DELETE FROM channels WHERE tenant_id=?1 AND id=?2",
@@ -1161,7 +1465,10 @@ async fn api_delete_channel(
         )?;
         Ok(())
     });
-    match res { Ok(()) => api_ok(serde_json::json!({"id": id, "deleted": true})), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+    match res {
+        Ok(()) => api_ok(serde_json::json!({"id": id, "deleted": true})),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
 async fn api_list_cron(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
@@ -1199,8 +1506,13 @@ async fn api_list_cron(State(state): State<AppState>, headers: HeaderMap) -> imp
     }
 }
 
-async fn api_patch_cron(Path(id): Path<String>, Json(body): Json<ApiUpdateStatusBody>) -> impl IntoResponse {
-    api_ok(serde_json::json!({ "id": id, "status": body.status.unwrap_or_else(|| "active".to_string()) }))
+async fn api_patch_cron(
+    Path(id): Path<String>,
+    Json(body): Json<ApiUpdateStatusBody>,
+) -> impl IntoResponse {
+    api_ok(
+        serde_json::json!({ "id": id, "status": body.status.unwrap_or_else(|| "active".to_string()) }),
+    )
 }
 async fn api_delete_cron(Path(id): Path<String>) -> impl IntoResponse {
     api_ok(serde_json::json!({"id": id, "deleted": true}))
@@ -1210,7 +1522,10 @@ async fn api_run_cron(Path(id): Path<String>) -> impl IntoResponse {
 }
 
 async fn api_list_skills(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let res = state.registry_db.with_conn(|conn| {
         let mut stmt = conn.prepare(
             "SELECT id,name,description,enabled,call_count,version,category,permissions_json
@@ -1233,7 +1548,10 @@ async fn api_list_skills(State(state): State<AppState>, headers: HeaderMap) -> i
         })?;
         Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
     });
-    match res { Ok(v) => api_ok(v), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+    match res {
+        Ok(v) => api_ok(v),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 async fn api_patch_skill(
     State(state): State<AppState>,
@@ -1241,7 +1559,10 @@ async fn api_patch_skill(
     Path(id): Path<String>,
     Json(body): Json<ApiPatchSkillBody>,
 ) -> impl IntoResponse {
-    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let enabled = body.enabled.unwrap_or(true);
     let res = state.registry_db.with_conn(|conn| {
         let updated = conn.execute(
@@ -1257,7 +1578,10 @@ async fn api_patch_skill(
         }
         Ok(())
     });
-    match res { Ok(()) => api_ok(serde_json::json!({ "id": id, "enabled": enabled })), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+    match res {
+        Ok(()) => api_ok(serde_json::json!({ "id": id, "enabled": enabled })),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
 async fn api_get_config(_state: State<AppState>, _headers: HeaderMap) -> impl IntoResponse {
@@ -1276,7 +1600,10 @@ async fn api_put_config(Json(body): Json<ApiUpdateConfigBody>) -> impl IntoRespo
 }
 
 async fn api_list_tools(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let res = state.registry_db.with_conn(|conn| {
         let mut stmt = conn.prepare("SELECT id,name,description,version,updated_at FROM aria_tools WHERE tenant_id=?1 AND status!='deleted' ORDER BY created_at DESC")?;
         let rows = stmt.query_map(rusqlite::params![tenant], |row| {
@@ -1294,11 +1621,17 @@ async fn api_list_tools(State(state): State<AppState>, headers: HeaderMap) -> im
         })?;
         Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
     });
-    match res { Ok(v) => api_ok(v), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+    match res {
+        Ok(v) => api_ok(v),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
 async fn api_list_agents(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let res = state.registry_db.with_conn(|conn| {
         let mut stmt = conn.prepare("SELECT id,name,description,status,model,tools,created_at,updated_at FROM aria_agents WHERE tenant_id=?1 AND status!='deleted' ORDER BY created_at DESC")?;
         let rows = stmt.query_map(rusqlite::params![tenant], |row| {
@@ -1319,11 +1652,17 @@ async fn api_list_agents(State(state): State<AppState>, headers: HeaderMap) -> i
         })?;
         Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
     });
-    match res { Ok(v) => api_ok(v), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+    match res {
+        Ok(v) => api_ok(v),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
 async fn api_list_teams(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let res = state.registry_db.with_conn(|conn| {
         let mut stmt = conn.prepare("SELECT id,name,description,mode,members,shared_context,timeout_seconds,status,created_at,updated_at FROM aria_teams WHERE tenant_id=?1 AND status!='deleted' ORDER BY created_at DESC")?;
         let rows = stmt.query_map(rusqlite::params![tenant], |row| {
@@ -1345,7 +1684,10 @@ async fn api_list_teams(State(state): State<AppState>, headers: HeaderMap) -> im
         })?;
         Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
     });
-    match res { Ok(v) => api_ok(v), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+    match res {
+        Ok(v) => api_ok(v),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
 async fn api_get_team(
@@ -1353,7 +1695,10 @@ async fn api_get_team(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let res = state.registry_db.with_conn(|conn| {
         conn.query_row(
             "SELECT id,name,description,mode,members,shared_context,timeout_seconds,status,created_at,updated_at
@@ -1379,11 +1724,20 @@ async fn api_get_team(
         )
         .map_err(anyhow::Error::from)
     });
-    match res { Ok(v) => api_ok(v), Err(_) => api_err(StatusCode::NOT_FOUND, "Team not found") }
+    match res {
+        Ok(v) => api_ok(v),
+        Err(_) => api_err(StatusCode::NOT_FOUND, "Team not found"),
+    }
 }
 
-async fn api_list_pipelines(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+async fn api_list_pipelines(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let res = state.registry_db.with_conn(|conn| {
         let mut stmt = conn.prepare("SELECT id,name,description,status,steps,created_at,updated_at FROM aria_pipelines WHERE tenant_id=?1 AND status!='deleted' ORDER BY created_at DESC")?;
         let rows = stmt.query_map(rusqlite::params![tenant], |row| {
@@ -1402,7 +1756,10 @@ async fn api_list_pipelines(State(state): State<AppState>, headers: HeaderMap) -
         })?;
         Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
     });
-    match res { Ok(v) => api_ok(v), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+    match res {
+        Ok(v) => api_ok(v),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
 async fn api_get_pipeline(
@@ -1410,7 +1767,10 @@ async fn api_get_pipeline(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let res = state.registry_db.with_conn(|conn| {
         conn.query_row(
             "SELECT id,name,description,status,steps,created_at FROM aria_pipelines WHERE tenant_id=?1 AND id=?2 AND status!='deleted'",
@@ -1432,11 +1792,17 @@ async fn api_get_pipeline(
         )
         .map_err(anyhow::Error::from)
     });
-    match res { Ok(v) => api_ok(v), Err(_) => api_err(StatusCode::NOT_FOUND, "Pipeline not found") }
+    match res {
+        Ok(v) => api_ok(v),
+        Err(_) => api_err(StatusCode::NOT_FOUND, "Pipeline not found"),
+    }
 }
 
 async fn api_list_kv(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let res = state.registry_db.with_conn(|conn| {
         let mut stmt = conn.prepare("SELECT key,value,created_at,updated_at FROM aria_kv WHERE tenant_id=?1 ORDER BY updated_at DESC")?;
         let rows = stmt.query_map(rusqlite::params![tenant], |row| {
@@ -1451,7 +1817,10 @@ async fn api_list_kv(State(state): State<AppState>, headers: HeaderMap) -> impl 
         })?;
         Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
     });
-    match res { Ok(v) => api_ok(v), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+    match res {
+        Ok(v) => api_ok(v),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
 async fn api_get_kv(
@@ -1459,14 +1828,18 @@ async fn api_get_kv(
     headers: HeaderMap,
     Path(key): Path<String>,
 ) -> impl IntoResponse {
-    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let res = state.registry_db.with_conn(|conn| {
         conn.query_row(
             "SELECT key,value,created_at,updated_at FROM aria_kv WHERE tenant_id=?1 AND key=?2",
             rusqlite::params![tenant, key],
             |row| {
                 let val_str: String = row.get(1)?;
-                let value = serde_json::from_str::<serde_json::Value>(&val_str).unwrap_or(serde_json::Value::String(val_str));
+                let value = serde_json::from_str::<serde_json::Value>(&val_str)
+                    .unwrap_or(serde_json::Value::String(val_str));
                 Ok(serde_json::json!({
                     "key": row.get::<_, String>(0)?,
                     "value": value,
@@ -1477,11 +1850,20 @@ async fn api_get_kv(
         )
         .map_err(anyhow::Error::from)
     });
-    match res { Ok(v) => api_ok(v), Err(_) => api_err(StatusCode::NOT_FOUND, "KV key not found") }
+    match res {
+        Ok(v) => api_ok(v),
+        Err(_) => api_err(StatusCode::NOT_FOUND, "KV key not found"),
+    }
 }
 
-async fn api_list_containers(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+async fn api_list_containers(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let res = state.registry_db.with_conn(|conn| {
         let mut stmt = conn.prepare("SELECT id,name,image,state,created_at FROM aria_containers WHERE tenant_id=?1 ORDER BY created_at DESC")?;
         let rows = stmt.query_map(rusqlite::params![tenant], |row| {
@@ -1505,11 +1887,21 @@ async fn api_list_containers(State(state): State<AppState>, headers: HeaderMap) 
         })?;
         Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
     });
-    match res { Ok(v) => api_ok(v), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+    match res {
+        Ok(v) => api_ok(v),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
-async fn api_list_logs(State(state): State<AppState>, headers: HeaderMap, Query(q): Query<ListQuery>) -> impl IntoResponse {
-    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+async fn api_list_logs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ListQuery>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let limit = q.limit.unwrap_or(200) as i64;
     let offset = q.offset.unwrap_or(0) as i64;
     let res = state.registry_db.with_conn(|conn| {
@@ -1531,11 +1923,17 @@ async fn api_list_logs(State(state): State<AppState>, headers: HeaderMap, Query(
         })?;
         Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
     });
-    match res { Ok(v) => api_ok(v), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+    match res {
+        Ok(v) => api_ok(v),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
 async fn api_list_api_keys(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let res = state.registry_db.with_conn(|conn| {
         let mut stmt = conn.prepare("SELECT id,name,key_preview,status,scopes_json,created_at,last_used_at,expires_at,request_count,rate_limit FROM api_keys WHERE tenant_id=?1 ORDER BY created_at DESC")?;
         let rows = stmt.query_map(rusqlite::params![tenant], |row| {
@@ -1557,7 +1955,10 @@ async fn api_list_api_keys(State(state): State<AppState>, headers: HeaderMap) ->
         })?;
         Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
     });
-    match res { Ok(v) => api_ok(v), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+    match res {
+        Ok(v) => api_ok(v),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
 async fn api_create_api_key(
@@ -1565,13 +1966,17 @@ async fn api_create_api_key(
     headers: HeaderMap,
     Json(body): Json<ApiCreateKeyBody>,
 ) -> impl IntoResponse {
-    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let id = uuid::Uuid::new_v4().to_string();
     let raw_key = format!("sk_{}", uuid::Uuid::new_v4().as_simple());
-    let preview = format!("{}...{}", &raw_key[..7], &raw_key[raw_key.len()-4..]);
+    let preview = format!("{}...{}", &raw_key[..7], &raw_key[raw_key.len() - 4..]);
     let now = now_ms();
     let name = body.name.unwrap_or_else(|| "Default API Key".to_string());
-    let scopes = serde_json::to_string(&body.scopes.unwrap_or_else(|| vec!["full".to_string()])).unwrap_or_else(|_| "[]".to_string());
+    let scopes = serde_json::to_string(&body.scopes.unwrap_or_else(|| vec!["full".to_string()]))
+        .unwrap_or_else(|_| "[]".to_string());
     let res = state.registry_db.with_conn(|conn| {
         conn.execute(
             "INSERT INTO api_keys (id, tenant_id, name, key_hash, key_preview, status, scopes_json, rate_limit, request_count, created_at)
@@ -1603,7 +2008,10 @@ async fn api_revoke_api_key(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let _ = state.registry_db.with_conn(|conn| {
         conn.execute(
             "UPDATE api_keys SET status='revoked' WHERE tenant_id=?1 AND id=?2",
@@ -1618,10 +2026,13 @@ async fn api_create_magic_number(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let id = uuid::Uuid::new_v4().to_string();
     let raw = format!("mn_{}", uuid::Uuid::new_v4().as_simple());
-    let preview = format!("{}...{}", &raw[..7], &raw[raw.len()-4..]);
+    let preview = format!("{}...{}", &raw[..7], &raw[raw.len() - 4..]);
     let now = now_ms();
     let _ = state.registry_db.with_conn(|conn| {
         conn.execute(
@@ -1640,8 +2051,14 @@ async fn api_create_magic_number(
     }))
 }
 
-async fn api_list_magic_numbers(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+async fn api_list_magic_numbers(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let res = state.registry_db.with_conn(|conn| {
         let mut stmt = conn.prepare(
             "SELECT id,name,key_preview,user_id,email,created_at,last_used_at FROM magic_numbers WHERE tenant_id=?1 AND status='active' ORDER BY created_at DESC",
@@ -1670,7 +2087,10 @@ async fn api_revoke_magic_number(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let _ = state.registry_db.with_conn(|conn| {
         conn.execute(
             "UPDATE magic_numbers SET status='revoked', revoked_at=?1 WHERE tenant_id=?2 AND id=?3",
@@ -1695,15 +2115,24 @@ async fn api_get_billing_usage(_state: State<AppState>, _headers: HeaderMap) -> 
         "storageBytes": 0
     }))
 }
-async fn api_get_billing_invoices(_state: State<AppState>, _headers: HeaderMap) -> impl IntoResponse {
+async fn api_get_billing_invoices(
+    _state: State<AppState>,
+    _headers: HeaderMap,
+) -> impl IntoResponse {
     api_ok(Vec::<serde_json::Value>::new())
 }
-async fn api_get_billing_methods(_state: State<AppState>, _headers: HeaderMap) -> impl IntoResponse {
+async fn api_get_billing_methods(
+    _state: State<AppState>,
+    _headers: HeaderMap,
+) -> impl IntoResponse {
     api_ok(Vec::<serde_json::Value>::new())
 }
 
 async fn api_list_feeds(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let res = state.registry_db.with_conn(|conn| {
         let mut stmt = conn.prepare("SELECT id,name,description,schedule,refresh_seconds,category,status,created_at,updated_at FROM aria_feeds WHERE tenant_id=?1 AND status!='deleted' ORDER BY created_at DESC")?;
         let rows = stmt.query_map(rusqlite::params![tenant], |row| {
@@ -1726,7 +2155,10 @@ async fn api_list_feeds(State(state): State<AppState>, headers: HeaderMap) -> im
         })?;
         Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
     });
-    match res { Ok(v) => api_ok(v), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+    match res {
+        Ok(v) => api_ok(v),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
 async fn api_get_feed(
@@ -1734,7 +2166,10 @@ async fn api_get_feed(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let res = state.registry_db.with_conn(|conn| {
         conn.query_row(
             "SELECT id,name,description,schedule,refresh_seconds,category,status,created_at,updated_at FROM aria_feeds WHERE tenant_id=?1 AND id=?2 AND status!='deleted'",
@@ -1760,7 +2195,10 @@ async fn api_get_feed(
         )
         .map_err(anyhow::Error::from)
     });
-    match res { Ok(v) => api_ok(v), Err(_) => api_err(StatusCode::NOT_FOUND, "Feed not found") }
+    match res {
+        Ok(v) => api_ok(v),
+        Err(_) => api_err(StatusCode::NOT_FOUND, "Feed not found"),
+    }
 }
 
 async fn api_list_feed_items(
@@ -1769,7 +2207,10 @@ async fn api_list_feed_items(
     Path(id): Path<String>,
     Query(q): Query<ListQuery>,
 ) -> impl IntoResponse {
-    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let limit = q.limit.unwrap_or(100) as i64;
     let offset = q.offset.unwrap_or(0) as i64;
     let res = state.registry_db.with_conn(|conn| {
@@ -1779,8 +2220,11 @@ async fn api_list_feed_items(
         )?;
         let rows = stmt.query_map(rusqlite::params![tenant, id, limit, offset], |row| {
             let card_type = row.get::<_, String>(1)?;
-            let metadata_str = row.get::<_, Option<String>>(3)?.unwrap_or_else(|| "{}".to_string());
-            let data = serde_json::from_str::<serde_json::Value>(&metadata_str).unwrap_or(serde_json::json!({}));
+            let metadata_str = row
+                .get::<_, Option<String>>(3)?
+                .unwrap_or_else(|| "{}".to_string());
+            let data = serde_json::from_str::<serde_json::Value>(&metadata_str)
+                .unwrap_or(serde_json::json!({}));
             let ts = row
                 .get::<_, Option<i64>>(4)?
                 .map(iso_from_millis)
@@ -1795,7 +2239,10 @@ async fn api_list_feed_items(
         })?;
         Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
     });
-    match res { Ok(v) => api_ok(v), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+    match res {
+        Ok(v) => api_ok(v),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
 async fn api_patch_feed(
@@ -1804,7 +2251,10 @@ async fn api_patch_feed(
     Path(id): Path<String>,
     Json(body): Json<ApiUpdateFeedBody>,
 ) -> impl IntoResponse {
-    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let status = body.status.unwrap_or_else(|| "active".to_string());
     let res = state.registry_db.with_conn(|conn| {
         conn.execute(
@@ -1813,11 +2263,20 @@ async fn api_patch_feed(
         )?;
         Ok(())
     });
-    match res { Ok(()) => api_ok(serde_json::json!({ "id": id, "status": status })), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+    match res {
+        Ok(()) => api_ok(serde_json::json!({ "id": id, "status": status })),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
-async fn api_list_feed_files(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+async fn api_list_feed_files(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let res = state.registry_db.with_conn(|conn| {
         let mut stmt = conn.prepare(
             "SELECT id,name,extension,content_type,size,source_id,description,tags_json,created_at,updated_at
@@ -1842,14 +2301,20 @@ async fn api_list_feed_files(State(state): State<AppState>, headers: HeaderMap) 
         })?;
         Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
     });
-    match res { Ok(v) => api_ok(v), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+    match res {
+        Ok(v) => api_ok(v),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 async fn api_upload_feed_file(
     State(state): State<AppState>,
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
-    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let now = now_ms();
     let mut filename = "upload.bin".to_string();
     let mut content_type = "application/octet-stream".to_string();
@@ -1867,11 +2332,7 @@ async fn api_upload_feed_file(
         }
     }
     let id = uuid::Uuid::new_v4().to_string();
-    let ext = filename
-        .split('.')
-        .next_back()
-        .unwrap_or("bin")
-        .to_string();
+    let ext = filename.split('.').next_back().unwrap_or("bin").to_string();
     let size = content_raw.len() as i64;
     let res = state.registry_db.with_conn(|conn| {
         conn.execute(
@@ -1898,7 +2359,10 @@ async fn api_get_feed_file_content(
     headers: HeaderMap,
     Path(file_id): Path<String>,
 ) -> impl IntoResponse {
-    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let res = state.registry_db.with_conn(|conn| {
         conn.query_row(
             "SELECT blob_key, content_type FROM feed_files WHERE tenant_id=?1 AND id=?2",
@@ -1915,14 +2379,20 @@ async fn api_get_feed_file_content(
         )
         .map_err(anyhow::Error::from)
     });
-    match res { Ok(v) => api_ok(v), Err(_) => api_err(StatusCode::NOT_FOUND, "File not found") }
+    match res {
+        Ok(v) => api_ok(v),
+        Err(_) => api_err(StatusCode::NOT_FOUND, "File not found"),
+    }
 }
 async fn api_delete_feed_file(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(file_id): Path<String>,
 ) -> impl IntoResponse {
-    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let res = state.registry_db.with_conn(|conn| {
         conn.execute(
             "DELETE FROM feed_files WHERE tenant_id=?1 AND id=?2",
@@ -1930,11 +2400,20 @@ async fn api_delete_feed_file(
         )?;
         Ok(())
     });
-    match res { Ok(()) => api_ok(serde_json::json!({ "id": file_id, "deleted": true })), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+    match res {
+        Ok(()) => api_ok(serde_json::json!({ "id": file_id, "deleted": true })),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
-async fn api_list_tool_calls(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+async fn api_list_tool_calls(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let res = state.registry_db.with_conn(|conn| {
         let mut stmt = conn.prepare(
             "SELECT id,session_id,run_id,agent_id,tool_name,status,args_json,result_json,error,duration_ms,created_at,updated_at
@@ -1958,11 +2437,20 @@ async fn api_list_tool_calls(State(state): State<AppState>, headers: HeaderMap) 
         })?;
         Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
     });
-    match res { Ok(v) => api_ok(v), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+    match res {
+        Ok(v) => api_ok(v),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
-async fn api_tool_calls_stats(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+async fn api_tool_calls_stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let res = state.registry_db.with_conn(|conn| {
         let total: i64 = conn.query_row(
             "SELECT COUNT(*) FROM tool_calls WHERE tenant_id=?1",
@@ -1976,7 +2464,10 @@ async fn api_tool_calls_stats(State(state): State<AppState>, headers: HeaderMap)
         )?;
         Ok(serde_json::json!({ "total": total, "errors": errors }))
     });
-    match res { Ok(v) => api_ok(v), Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+    match res {
+        Ok(v) => api_ok(v),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
 async fn api_get_tool_call(
@@ -1984,7 +2475,10 @@ async fn api_get_tool_call(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let tenant = match api_tenant(&state, &headers) { Ok(t) => t, Err(e) => return e };
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let res = state.registry_db.with_conn(|conn| {
         conn.query_row(
             "SELECT id,session_id,run_id,agent_id,tool_name,status,args_json,result_json,error,duration_ms,created_at,updated_at
@@ -2009,7 +2503,10 @@ async fn api_get_tool_call(
         )
         .map_err(anyhow::Error::from)
     });
-    match res { Ok(v) => api_ok(v), Err(_) => api_err(StatusCode::NOT_FOUND, "Tool call not found") }
+    match res {
+        Ok(v) => api_ok(v),
+        Err(_) => api_err(StatusCode::NOT_FOUND, "Tool call not found"),
+    }
 }
 
 /// `WhatsApp` verification query params
@@ -2133,16 +2630,42 @@ async fn handle_events_ws_events(
 
 async fn handle_events_ws_chat(
     ws: WebSocketUpgrade,
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(|socket| handle_events_socket(socket, "chat"))
+    let auth = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let bearer = auth.strip_prefix("Bearer ").unwrap_or("");
+    let token = if !bearer.is_empty() {
+        bearer.to_string()
+    } else {
+        query.get("token").cloned().unwrap_or_default()
+    };
+    let tenant = resolve_tenant_from_token(&state, &token);
+    ws.on_upgrade(move |socket| handle_chat_socket(socket, state, tenant))
 }
 
 async fn handle_events_ws_status(
     ws: WebSocketUpgrade,
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(|socket| handle_events_socket(socket, "status"))
+    let auth = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let bearer = auth.strip_prefix("Bearer ").unwrap_or("");
+    let token = if !bearer.is_empty() {
+        bearer.to_string()
+    } else {
+        query.get("token").cloned().unwrap_or_default()
+    };
+    let tenant = resolve_tenant_from_token(&state, &token);
+    ws.on_upgrade(move |socket| handle_status_socket(socket, tenant))
 }
 
 async fn handle_events_ws_logs(
@@ -2150,6 +2673,551 @@ async fn handle_events_ws_logs(
     State(_state): State<AppState>,
 ) -> impl IntoResponse {
     ws.on_upgrade(|socket| handle_events_socket(socket, "logs"))
+}
+
+struct WsChatSink<'a> {
+    socket: &'a mut ws::WebSocket,
+    state: &'a AppState,
+    tenant: String,
+    chat_id: String,
+    run_id: String,
+    accumulated: String,
+    stream_seq: u64,
+    thinking_started_ms: Option<i64>,
+    thinking_content: String,
+}
+
+#[async_trait]
+impl crate::agent::executor::AgentExecutionSink for WsChatSink<'_> {
+    async fn on_assistant_delta(&mut self, delta: &str, accumulated: &str) {
+        let bus = crate::events::event_bus();
+        self.accumulated = accumulated.to_string();
+        if delta.is_empty() {
+            return;
+        }
+        // Emit in smaller chunks so the frontend renders progressively and
+        // tool cards can interleave naturally with text updates.
+        const MAX_CHUNK_CHARS: usize = 160;
+        let chars: Vec<char> = delta.chars().collect();
+        for chunk in chars.chunks(MAX_CHUNK_CHARS) {
+            let delta_chunk: String = chunk.iter().collect();
+            self.stream_seq = self.stream_seq.saturating_add(1);
+            bus.emit_assistant(&self.run_id, Some(&self.chat_id), &delta_chunk, accumulated);
+            let _ = self
+                .socket
+                .send(ws::Message::Text(
+                    serde_json::json!({
+                        "type": "run.streaming",
+                        "runId": self.run_id,
+                        "chatId": self.chat_id,
+                        "delta": delta_chunk,
+                        "seq": self.stream_seq,
+                        "charCount": chunk.len(),
+                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await;
+        }
+    }
+
+    async fn on_thinking_start(&mut self) {
+        self.thinking_started_ms = Some(now_ms());
+        self.thinking_content.clear();
+    }
+
+    async fn on_thinking_delta(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        self.thinking_content.push_str(delta);
+        let _ = self
+            .socket
+            .send(ws::Message::Text(
+                serde_json::json!({
+                    "type": "run.thinking",
+                    "runId": self.run_id,
+                    "chatId": self.chat_id,
+                    "delta": delta,
+                })
+                .to_string()
+                .into(),
+            ))
+            .await;
+    }
+
+    async fn on_thinking_end(&mut self) {
+        if self.thinking_content.is_empty() {
+            self.thinking_started_ms = None;
+            return;
+        }
+        let duration_ms = self
+            .thinking_started_ms
+            .map(|start| (now_ms() - start).max(0) as u64)
+            .unwrap_or(0);
+        let _ = self
+            .socket
+            .send(ws::Message::Text(
+                serde_json::json!({
+                    "type": "run.thinking.done",
+                    "runId": self.run_id,
+                    "chatId": self.chat_id,
+                    "thinkingContent": self.thinking_content,
+                    "durationMs": duration_ms,
+                })
+                .to_string()
+                .into(),
+            ))
+            .await;
+        self.thinking_started_ms = None;
+    }
+
+    async fn on_tool_start(&mut self, id: &str, name: &str, args: &serde_json::Value) {
+        let bus = crate::events::event_bus();
+        let now = now_ms();
+        let _ = self.state.registry_db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO tool_calls (id, tenant_id, session_id, run_id, agent_id, tool_name, status, args_json, result_json, error, duration_ms, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, '', NULL, NULL, ?8, ?8)",
+                rusqlite::params![
+                    id,
+                    self.tenant,
+                    self.chat_id,
+                    self.run_id,
+                    "main",
+                    name,
+                    args.to_string(),
+                    now,
+                ],
+            )?;
+            Ok(())
+        });
+
+        let _ = self
+            .socket
+            .send(ws::Message::Text(
+                serde_json::json!({
+                    "type": "tool.started",
+                    "runId": self.run_id,
+                    "chatId": self.chat_id,
+                    "toolCall": {
+                        "id": id,
+                        "name": name,
+                        "args": args,
+                        "startedAt": chrono::Utc::now().to_rfc3339(),
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await;
+
+        status_events::emit(
+            "tool.started",
+            serde_json::json!({
+                "runId": self.run_id,
+                "chatId": self.chat_id,
+                "tenantId": self.tenant,
+                "toolId": id,
+                "toolName": name,
+                "status": "running",
+            }),
+        );
+        bus.emit_tool(
+            &self.run_id,
+            Some(&self.chat_id),
+            crate::events::ToolEventData {
+                phase: crate::events::ToolPhase::Start,
+                tool_call_id: id.to_string(),
+                name: name.to_string(),
+                args: Some(args.clone()),
+                partial_json: None,
+                partial_result: None,
+                result: None,
+                error: None,
+                is_error: None,
+                duration_ms: None,
+            },
+        );
+    }
+
+    async fn on_tool_end(
+        &mut self,
+        id: &str,
+        name: &str,
+        result: &str,
+        is_error: bool,
+        duration_ms: u64,
+    ) {
+        let bus = crate::events::event_bus();
+        let now = now_ms();
+        let status = if is_error { "error" } else { "success" };
+        let _ = self.state.registry_db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE tool_calls
+                 SET status=?1, result_json=?2, error=?3, duration_ms=?4, updated_at=?5
+                 WHERE tenant_id=?6 AND run_id=?7 AND id=?8",
+                rusqlite::params![
+                    status,
+                    result,
+                    if is_error {
+                        Some(result.to_string())
+                    } else {
+                        None::<String>
+                    },
+                    duration_ms as i64,
+                    now,
+                    self.tenant,
+                    self.run_id,
+                    id,
+                ],
+            )?;
+            Ok(())
+        });
+
+        let _ = self
+            .socket
+            .send(ws::Message::Text(
+                serde_json::json!({
+                    "type": "tool.completed",
+                    "runId": self.run_id,
+                    "chatId": self.chat_id,
+                    "toolCall": {
+                        "id": id,
+                        "name": name,
+                        "status": status,
+                        "duration": format!("{duration_ms}ms"),
+                        "result": result,
+                        "completedAt": chrono::Utc::now().to_rfc3339(),
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await;
+
+        status_events::emit(
+            "tool.completed",
+            serde_json::json!({
+                "runId": self.run_id,
+                "chatId": self.chat_id,
+                "tenantId": self.tenant,
+                "toolId": id,
+                "toolName": name,
+                "status": status,
+                "durationMs": duration_ms,
+            }),
+        );
+        bus.emit_tool(
+            &self.run_id,
+            Some(&self.chat_id),
+            crate::events::ToolEventData {
+                phase: crate::events::ToolPhase::Result,
+                tool_call_id: id.to_string(),
+                name: name.to_string(),
+                args: None,
+                partial_json: None,
+                partial_result: None,
+                result: Some(result.to_string()),
+                error: if is_error {
+                    Some(result.to_string())
+                } else {
+                    None
+                },
+                is_error: Some(is_error),
+                duration_ms: Some(duration_ms),
+            },
+        );
+    }
+}
+
+async fn handle_chat_socket(mut socket: ws::WebSocket, state: AppState, tenant: String) {
+    tracing::info!("Dashboard chat WebSocket connected");
+    let mut seen_request_ids: HashSet<String> = HashSet::new();
+
+    while let Some(msg) = socket.recv().await {
+        let ws::Message::Text(text) = (match msg {
+            Ok(m) => m,
+            Err(_) => break,
+        }) else {
+            continue;
+        };
+
+        let parsed = serde_json::from_str::<WsChatMessage>(text.as_ref());
+        let req = match parsed {
+            Ok(v) => v,
+            Err(_) => {
+                let _ = socket
+                    .send(ws::Message::Text(
+                        serde_json::json!({
+                            "type": "error",
+                            "error": { "type": "invalid_request_error", "message": "Invalid chat payload" }
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await;
+                continue;
+            }
+        };
+
+        if req.message_type != "message" {
+            continue;
+        }
+
+        if let Some(request_id) = req.request_id.as_deref() {
+            if seen_request_ids.contains(request_id) {
+                let _ = socket
+                    .send(ws::Message::Text(
+                        serde_json::json!({
+                            "type": "run.completed",
+                            "runId": format!("dup-{}", &request_id.chars().take(8).collect::<String>()),
+                            "chatId": req.session_id.clone(),
+                            "status": "complete",
+                            "durationMs": 0,
+                            "tokenCount": 0
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await;
+                continue;
+            }
+            seen_request_ids.insert(request_id.to_string());
+            if seen_request_ids.len() > 300 {
+                seen_request_ids.clear();
+            }
+        }
+
+        let content = req.content.unwrap_or_default().trim().to_string();
+        if content.is_empty() {
+            let _ = socket
+                .send(ws::Message::Text(
+                    serde_json::json!({
+                        "type": "error",
+                        "error": { "type": "invalid_request_error", "message": "content is required" }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await;
+            continue;
+        }
+
+        let chat_id = req
+            .session_id
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let run_id = format!("run-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let started = now_ms();
+        let mode = parse_chat_mode(req.mode.as_deref());
+
+        ensure_chat_row(&state, &tenant, &chat_id, &content, started);
+        let _ = insert_chat_message(&state, &tenant, &chat_id, "user", &content, started);
+
+        let _ = socket
+            .send(ws::Message::Text(
+                serde_json::json!({
+                    "type": "run.started",
+                    "runId": run_id,
+                    "chatId": chat_id,
+                    "status": "thinking",
+                    "message": "Processing..."
+                })
+                .to_string()
+                .into(),
+            ))
+            .await;
+
+        let tools = tools::all_tools_for_tenant(
+            &state.security,
+            state.mem.clone(),
+            state.composio_api_key.as_deref(),
+            &state.browser_config,
+            &state.registry_db,
+            &tenant,
+        );
+        let memory_context = build_chat_memory_context(state.mem.as_ref(), &content).await;
+        let mode_hint = mode_prompt(mode);
+        let system_prompt = if mode_hint.is_empty() {
+            state.base_system_prompt.clone()
+        } else {
+            format!("{}\n\n{}", state.base_system_prompt, mode_hint)
+        };
+        let enriched = if memory_context.is_empty() {
+            content.clone()
+        } else {
+            format!("{memory_context}{content}")
+        };
+
+        let run_result = {
+            let mut sink = WsChatSink {
+                socket: &mut socket,
+                state: &state,
+                tenant: tenant.clone(),
+                chat_id: chat_id.clone(),
+                run_id: run_id.clone(),
+                accumulated: String::new(),
+                stream_seq: 0,
+                thinking_started_ms: None,
+                thinking_content: String::new(),
+            };
+            crate::agent::executor::execute_agent_with_sink(
+                state.provider.as_ref(),
+                &tools,
+                &system_prompt,
+                &enriched,
+                &state.model,
+                state.temperature,
+                Some(25),
+                Some(&mut sink),
+            )
+            .await
+        };
+
+        match run_result {
+            Ok(response) => {
+                let now = now_ms();
+                let assistant_text = if response.output.is_empty() {
+                    "Tool execution completed".to_string()
+                } else {
+                    response.output
+                };
+                let _ = insert_chat_message(
+                    &state,
+                    &tenant,
+                    &chat_id,
+                    "assistant",
+                    &assistant_text,
+                    now,
+                );
+                update_chat_preview(&state, &tenant, &chat_id, &assistant_text, now);
+
+                let _ = socket
+                    .send(ws::Message::Text(
+                        serde_json::json!({
+                            "type": "run.completed",
+                            "runId": run_id,
+                            "chatId": chat_id,
+                            "status": "complete",
+                            "durationMs": response.duration_ms,
+                            "tokenCount": 0
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await;
+                status_events::emit(
+                    "task.completed",
+                    serde_json::json!({
+                        "id": run_id,
+                        "name": "chat",
+                        "tenantId": tenant,
+                        "durationMs": response.duration_ms,
+                    }),
+                );
+            }
+            Err(e) => {
+                let now = now_ms();
+                let _ = state.registry_db.with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE tool_calls
+                         SET status='error', error='Run aborted', updated_at=?1
+                         WHERE tenant_id=?2 AND run_id=?3 AND status='running'",
+                        rusqlite::params![now, tenant, run_id],
+                    )?;
+                    Ok(())
+                });
+                let _ = socket
+                    .send(ws::Message::Text(
+                        serde_json::json!({
+                            "type": "error",
+                            "runId": run_id,
+                            "chatId": chat_id,
+                            "error": { "type": "server_error", "message": format!("LLM error: {e}") }
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await;
+                status_events::emit(
+                    "task.failed",
+                    serde_json::json!({
+                        "id": run_id,
+                        "name": "chat",
+                        "tenantId": tenant,
+                        "errorMessage": e.to_string(),
+                    }),
+                );
+                let _ = socket
+                    .send(ws::Message::Text(
+                        serde_json::json!({
+                            "type": "run.completed",
+                            "runId": run_id,
+                            "chatId": chat_id,
+                            "status": "error",
+                            "durationMs": (now - started).max(0),
+                            "tokenCount": 0
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await;
+            }
+        }
+    }
+
+    tracing::info!("Dashboard chat WebSocket disconnected");
+}
+
+fn status_event_visible_to_tenant(json: &str, tenant: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return true;
+    };
+    if let Some(evt_tenant) = value.get("tenantId").and_then(serde_json::Value::as_str) {
+        return evt_tenant == tenant;
+    }
+    if let Some(evt_tenant) = value
+        .get("data")
+        .and_then(|v| v.get("tenantId"))
+        .and_then(serde_json::Value::as_str)
+    {
+        return evt_tenant == tenant;
+    }
+    true
+}
+
+async fn handle_status_socket(mut socket: ws::WebSocket, tenant: String) {
+    let (subscriber_id, mut rx) = status_events::subscribe();
+    tracing::info!("Dashboard status WebSocket connected");
+
+    loop {
+        tokio::select! {
+            maybe_json = rx.recv() => {
+                match maybe_json {
+                    Some(json) => {
+                        if !status_event_visible_to_tenant(&json, &tenant) {
+                            continue;
+                        }
+                        if socket.send(ws::Message::Text(json.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+            incoming = socket.recv() => {
+                match incoming {
+                    Some(Ok(ws::Message::Close(_))) | None => break,
+                    Some(Err(_)) => break,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    status_events::unsubscribe(subscriber_id);
+    tracing::info!("Dashboard status WebSocket disconnected");
 }
 
 async fn handle_events_socket(mut socket: ws::WebSocket, channel: &'static str) {

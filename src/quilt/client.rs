@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
@@ -31,6 +31,7 @@ struct QuiltErrorBody {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QuiltContainerState {
+    Created,
     Pending,
     Starting,
     Running,
@@ -41,6 +42,7 @@ pub enum QuiltContainerState {
 impl std::fmt::Display for QuiltContainerState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Created => write!(f, "created"),
             Self::Pending => write!(f, "pending"),
             Self::Starting => write!(f, "starting"),
             Self::Running => write!(f, "running"),
@@ -54,18 +56,36 @@ impl std::fmt::Display for QuiltContainerState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuiltContainerStatus {
+    #[serde(alias = "container_id")]
     pub id: String,
+    #[serde(default)]
     pub tenant_id: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_string_or_default")]
     pub name: String,
     pub state: QuiltContainerState,
     pub pid: Option<u32>,
     pub exit_code: Option<i32>,
     pub ip_address: Option<String>,
     pub memory_limit_mb: Option<u32>,
-    pub cpu_limit_percent: Option<u32>,
+    pub cpu_limit_percent: Option<f64>,
     pub labels: Option<HashMap<String, String>>,
+    #[serde(default, alias = "started_at", deserialize_with = "deserialize_opt_epoch_ms")]
     pub started_at_ms: Option<i64>,
+    #[serde(default, alias = "exited_at", deserialize_with = "deserialize_opt_epoch_ms")]
     pub exited_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ContainersListResponse {
+    Wrapped { containers: Vec<QuiltContainerStatus> },
+    Direct(Vec<QuiltContainerStatus>),
+}
+
+#[derive(Debug, Deserialize)]
+struct GetContainerByNameResponse {
+    container_id: Option<String>,
+    found: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,10 +195,12 @@ impl QuiltClient {
         Self::new(&api_url, &api_key)
     }
 
-    /// Build a new `QuiltClient`. The `api_key` must start with `qlt_`.
+    /// Build a new `QuiltClient`.
+    ///
+    /// Requires the current Quilt key format: `quilt_sk_...`.
     pub fn new(api_url: &str, api_key: &str) -> Result<Self, anyhow::Error> {
-        if !api_key.starts_with("qlt_") {
-            anyhow::bail!("Quilt API key must start with 'qlt_' prefix");
+        if !api_key.starts_with("quilt_sk_") {
+            anyhow::bail!("Quilt API key must start with 'quilt_sk_' prefix");
         }
 
         let http = reqwest::Client::builder()
@@ -220,6 +242,17 @@ impl QuiltClient {
         }
     }
 
+    async fn parse_status_response(
+        &self,
+        resp: reqwest::Response,
+    ) -> Result<QuiltContainerStatus, anyhow::Error> {
+        if resp.status().is_success() {
+            Ok(resp.json().await?)
+        } else {
+            Err(self.handle_error(resp).await.into())
+        }
+    }
+
     // ── Container CRUD ──────────────────────────────────────────
 
     /// Create a new container.
@@ -255,11 +288,7 @@ impl QuiltClient {
             .send()
             .await?;
 
-        if resp.status().is_success() {
-            Ok(resp.json().await?)
-        } else {
-            Err(self.handle_error(resp).await.into())
-        }
+        self.parse_status_response(resp).await
     }
 
     /// Get container status by name.
@@ -276,11 +305,18 @@ impl QuiltClient {
             .send()
             .await?;
 
-        if resp.status().is_success() {
-            Ok(resp.json().await?)
-        } else {
-            Err(self.handle_error(resp).await.into())
+        if !resp.status().is_success() {
+            return Err(self.handle_error(resp).await.into());
         }
+
+        let payload: GetContainerByNameResponse = resp.json().await?;
+        if !payload.found.unwrap_or(false) {
+            anyhow::bail!("Container '{name}' not found");
+        }
+        let id = payload
+            .container_id
+            .ok_or_else(|| anyhow::anyhow!("Container '{name}' lookup returned no container_id"))?;
+        self.get_container(&id).await
     }
 
     /// Start a container.
@@ -390,7 +426,11 @@ impl QuiltClient {
             .await?;
 
         if resp.status().is_success() {
-            Ok(resp.json().await?)
+            let payload: ContainersListResponse = resp.json().await?;
+            Ok(match payload {
+                ContainersListResponse::Wrapped { containers } => containers,
+                ContainersListResponse::Direct(containers) => containers,
+            })
         } else {
             Err(self.handle_error(resp).await.into())
         }
@@ -407,6 +447,43 @@ impl QuiltClient {
     }
 }
 
+fn deserialize_string_or_default<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn deserialize_opt_epoch_ms<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum EpochValue {
+        I64(i64),
+        U64(u64),
+        F64(f64),
+        Str(String),
+    }
+
+    let raw = Option::<EpochValue>::deserialize(deserializer)?;
+    let value = match raw {
+        Some(EpochValue::I64(v)) => v,
+        Some(EpochValue::U64(v)) => v as i64,
+        Some(EpochValue::F64(v)) => v as i64,
+        Some(EpochValue::Str(v)) => v.parse::<i64>().map_err(serde::de::Error::custom)?,
+        None => return Ok(None),
+    };
+
+    // Quilt timestamps are currently seconds. Normalize to milliseconds for internal logic.
+    if value.abs() < 1_000_000_000_000 {
+        Ok(Some(value * 1000))
+    } else {
+        Ok(Some(value))
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -420,26 +497,26 @@ mod tests {
         let err = QuiltClient::new("https://backend.quilt.sh", "bad-key-no-prefix");
         assert!(err.is_err());
         assert!(
-            err.unwrap_err().to_string().contains("qlt_"),
+            err.unwrap_err().to_string().contains("quilt_sk_"),
             "error should mention the required prefix"
         );
     }
 
     #[test]
     fn client_accepts_valid_key() {
-        let client = QuiltClient::new("https://backend.quilt.sh", "qlt_test_key_12345");
+        let client = QuiltClient::new("https://backend.quilt.sh", "quilt_sk_test_key_12345");
         assert!(client.is_ok());
     }
 
     #[test]
     fn client_strips_trailing_slash_from_url() {
-        let client = QuiltClient::new("https://backend.quilt.sh/", "qlt_test_key").unwrap();
+        let client = QuiltClient::new("https://backend.quilt.sh/", "quilt_sk_test_key").unwrap();
         assert_eq!(client.api_url(), "https://backend.quilt.sh");
     }
 
     #[test]
     fn client_url_builder() {
-        let client = QuiltClient::new("https://backend.quilt.sh", "qlt_test_key").unwrap();
+        let client = QuiltClient::new("https://backend.quilt.sh", "quilt_sk_test_key").unwrap();
         assert_eq!(
             client.url("/api/containers"),
             "https://backend.quilt.sh/api/containers"
@@ -811,13 +888,13 @@ mod tests {
     #[tokio::test]
     async fn singleton_reset_clears_client() {
         reset_client().await;
-        let c = get_client("https://example.com", "qlt_test_key")
+        let c = get_client("https://example.com", "quilt_sk_test_key")
             .await
             .unwrap();
         assert_eq!(c.api_url(), "https://example.com");
 
         reset_client().await;
-        let c2 = get_client("https://other.com", "qlt_other_key")
+        let c2 = get_client("https://other.com", "quilt_sk_other_key")
             .await
             .unwrap();
         assert_eq!(c2.api_url(), "https://other.com");

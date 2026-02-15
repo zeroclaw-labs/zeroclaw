@@ -49,6 +49,11 @@ impl FeedExecutor {
         }
     }
 
+    fn shell_single_quote(input: &str) -> String {
+        let escaped = input.replace('\'', r#"'\''"#);
+        format!("'{escaped}'")
+    }
+
     /// Execute a URL-based feed by fetching the content via HTTP.
     ///
     /// Returns a `FeedResult` containing a single `FeedItem` with the
@@ -239,7 +244,11 @@ impl FeedExecutor {
 
         // Execute the handler code inside the container
         let exec_params = crate::quilt::client::QuiltExecParams {
-            command: vec!["node".into(), "-e".into(), handler_code.to_string()],
+            command: vec![
+                "node".into(),
+                "-e".into(),
+                Self::shell_single_quote(handler_code),
+            ],
             timeout_ms: Some(60_000), // 60 second timeout
             working_dir: Some("/app".into()),
             environment: Some(std::collections::HashMap::from([
