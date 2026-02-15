@@ -1613,26 +1613,23 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_temperature() {
+        // Both temperature cases tested in one function to avoid env-var
+        // races when tests run in parallel.
         std::env::remove_var("ZEROCLAW_TEMPERATURE");
-        let mut config = Config::default();
 
+        // Valid temperature is applied
+        let mut config = Config::default();
         std::env::set_var("ZEROCLAW_TEMPERATURE", "0.5");
         config.apply_env_overrides();
         assert!((config.default_temperature - 0.5).abs() < f64::EPSILON);
 
-        std::env::remove_var("ZEROCLAW_TEMPERATURE");
-    }
-
-    #[test]
-    fn env_override_temperature_out_of_range_ignored() {
-        std::env::remove_var("ZEROCLAW_TEMPERATURE");
-        let mut config = Config::default();
-        let original_temp = config.default_temperature;
-
+        // Out-of-range temperature is ignored
+        let mut config2 = Config::default();
+        let original_temp = config2.default_temperature;
         std::env::set_var("ZEROCLAW_TEMPERATURE", "3.0");
-        config.apply_env_overrides();
+        config2.apply_env_overrides();
         assert!(
-            (config.default_temperature - original_temp).abs() < f64::EPSILON,
+            (config2.default_temperature - original_temp).abs() < f64::EPSILON,
             "Temperature 3.0 should be ignored (out of range)"
         );
 
