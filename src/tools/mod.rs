@@ -3,17 +3,20 @@ pub mod browser_open;
 pub mod composio;
 pub mod file_read;
 pub mod file_write;
+pub mod http_request;
 pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
 pub mod shell;
 pub mod traits;
+pub mod web_search;
 
 pub use browser::BrowserTool;
 pub use browser_open::BrowserOpenTool;
 pub use composio::ComposioTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
+pub use http_request::HttpRequestTool;
 pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
@@ -21,6 +24,7 @@ pub use shell::ShellTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
+pub use web_search::WebSearchTool;
 
 use crate::memory::Memory;
 use crate::security::SecurityPolicy;
@@ -70,6 +74,10 @@ pub fn all_tools(
             tools.push(Box::new(ComposioTool::new(key)));
         }
     }
+
+    // Web search and HTTP tools (check for API keys at execution time)
+    tools.push(Box::new(WebSearchTool::new()));
+    tools.push(Box::new(HttpRequestTool::new()));
 
     tools
 }
