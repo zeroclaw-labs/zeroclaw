@@ -33,6 +33,9 @@ shellexpand = "3.1"
 tracing = { version = "0.1", default-features = false }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi"] }
 
+# Base64 encoding (screenshots, image data)
+base64 = "0.22"
+
 # Error handling
 anyhow = "1.0"
 thiserror = "2.0"
