@@ -399,6 +399,7 @@ fn default_model_for_provider(provider: &str) -> String {
     match provider {
         "anthropic" => "claude-sonnet-4-20250514".into(),
         "openai" => "gpt-4o".into(),
+        "glm" | "zhipu" | "zai" | "z.ai" => "glm-5".into(),
         "ollama" => "llama3.2".into(),
         "groq" => "llama-3.3-70b-versatile".into(),
         "deepseek" => "deepseek-chat".into(),
@@ -646,6 +647,8 @@ fn setup_provider() -> Result<(String, String, String)> {
             "xai" => "https://console.x.ai",
             "cohere" => "https://dashboard.cohere.com/api-keys",
             "moonshot" => "https://platform.moonshot.cn/console/api-keys",
+            "glm" | "zhipu" => "https://open.bigmodel.cn/usercenter/proj-mgmt/apikeys",
+            "zai" | "z.ai" => "https://platform.z.ai/",
             "minimax" => "https://www.minimaxi.com/user-center/basic-information",
             "vercel" => "https://vercel.com/account/tokens",
             "cloudflare" => "https://dash.cloudflare.com/profile/api-tokens",
@@ -778,7 +781,8 @@ fn setup_provider() -> Result<(String, String, String)> {
             ("moonshot-v1-128k", "Moonshot V1 128K"),
             ("moonshot-v1-32k", "Moonshot V1 32K"),
         ],
-        "glm" => vec![
+        "glm" | "zhipu" | "zai" | "z.ai" => vec![
+            ("glm-5", "GLM-5 (latest)"),
             ("glm-4-plus", "GLM-4 Plus (flagship)"),
             ("glm-4-flash", "GLM-4 Flash (fast)"),
         ],
