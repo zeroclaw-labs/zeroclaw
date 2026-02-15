@@ -192,30 +192,31 @@ impl SecretStore {
             {
                 // On Windows, use icacls to restrict permissions to current user only
                 let username = std::env::var("USERNAME").unwrap_or_default();
-                if username.is_empty() {
+                let Some(grant_arg) = build_windows_icacls_grant_arg(&username) else {
                     tracing::warn!(
                         "USERNAME environment variable is empty; \
                          cannot restrict key file permissions via icacls"
                     );
-                } else {
-                    match std::process::Command::new("icacls")
-                        .arg(&self.key_path)
-                        .args(["/inheritance:r", "/grant:r"])
-                        .arg(format!("{username}:F"))
-                        .output()
-                    {
-                        Ok(o) if !o.status.success() => {
-                            tracing::warn!(
-                                "Failed to set key file permissions via icacls (exit code {:?})",
-                                o.status.code()
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!("Could not set key file permissions: {e}");
-                        }
-                        _ => {
-                            tracing::debug!("Key file permissions restricted via icacls");
-                        }
+                    return Ok(key);
+                };
+
+                match std::process::Command::new("icacls")
+                    .arg(&self.key_path)
+                    .args(["/inheritance:r", "/grant:r"])
+                    .arg(grant_arg)
+                    .output()
+                {
+                    Ok(o) if !o.status.success() => {
+                        tracing::warn!(
+                            "Failed to set key file permissions via icacls (exit code {:?})",
+                            o.status.code()
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("Could not set key file permissions: {e}");
+                    }
+                    _ => {
+                        tracing::debug!("Key file permissions restricted via icacls");
                     }
                 }
             }
@@ -258,9 +259,19 @@ fn hex_encode(data: &[u8]) -> String {
     s
 }
 
+/// Build the `/grant` argument for `icacls` using a normalized username.
+/// Returns `None` when the username is empty or whitespace-only.
+fn build_windows_icacls_grant_arg(username: &str) -> Option<String> {
+    let normalized = username.trim();
+    if normalized.is_empty() {
+        return None;
+    }
+    Some(format!("{normalized}:F"))
+}
+
 /// Hex-decode a hex string to bytes.
 fn hex_decode(hex: &str) -> Result<Vec<u8>> {
-    if !hex.len().is_multiple_of(2) {
+    if (hex.len() & 1) != 0 {
         anyhow::bail!("Hex string has odd length");
     }
     (0..hex.len())
@@ -749,6 +760,28 @@ mod tests {
     #[test]
     fn hex_decode_invalid_chars_fails() {
         assert!(hex_decode("zzzz").is_err());
+    }
+
+    #[test]
+    fn windows_icacls_grant_arg_rejects_empty_username() {
+        assert_eq!(build_windows_icacls_grant_arg(""), None);
+        assert_eq!(build_windows_icacls_grant_arg("   \t\n"), None);
+    }
+
+    #[test]
+    fn windows_icacls_grant_arg_trims_username() {
+        assert_eq!(
+            build_windows_icacls_grant_arg("  alice  "),
+            Some("alice:F".to_string())
+        );
+    }
+
+    #[test]
+    fn windows_icacls_grant_arg_preserves_valid_characters() {
+        assert_eq!(
+            build_windows_icacls_grant_arg("DOMAIN\\svc-user"),
+            Some("DOMAIN\\svc-user:F".to_string())
+        );
     }
 
     #[test]
