@@ -64,7 +64,7 @@ console = "0.15"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 hostname = "0.4.2"
-lettre = { version = "0.11.19", features = ["smtp-transport", "rustls-tls"] }
+lettre = { version = "0.11.19", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }
 mail-parser = "0.11.2"
 rustls-pki-types = "1.14.0"
 tokio-rustls = "0.26.4"

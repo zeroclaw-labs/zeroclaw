@@ -50,10 +50,7 @@ impl AnthropicProvider {
                 .map(str::trim)
                 .filter(|k| !k.is_empty())
                 .map(ToString::to_string),
-<<<<<<< HEAD
-=======
             base_url,
->>>>>>> origin/main
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
                 .connect_timeout(std::time::Duration::from_secs(10))
@@ -95,11 +92,7 @@ impl Provider for AnthropicProvider {
 
         let mut request = self
             .client
-<<<<<<< HEAD
-            .post("https://api.anthropic.com/v1/messages")
-=======
             .post(format!("{}/v1/messages", self.base_url))
->>>>>>> origin/main
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
             .json(&request);
@@ -136,20 +129,14 @@ mod tests {
         let p = AnthropicProvider::new(Some("sk-ant-test123"));
         assert!(p.credential.is_some());
         assert_eq!(p.credential.as_deref(), Some("sk-ant-test123"));
-<<<<<<< HEAD
-=======
         assert_eq!(p.base_url, "https://api.anthropic.com");
->>>>>>> origin/main
     }
 
     #[test]
     fn creates_without_key() {
         let p = AnthropicProvider::new(None);
         assert!(p.credential.is_none());
-<<<<<<< HEAD
-=======
         assert_eq!(p.base_url, "https://api.anthropic.com");
->>>>>>> origin/main
     }
 
     #[test]
@@ -163,8 +150,6 @@ mod tests {
         let p = AnthropicProvider::new(Some("  sk-ant-test123  "));
         assert!(p.credential.is_some());
         assert_eq!(p.credential.as_deref(), Some("sk-ant-test123"));
-<<<<<<< HEAD
-=======
     }
 
     #[test]
@@ -184,7 +169,6 @@ mod tests {
     fn default_base_url_when_none_provided() {
         let p = AnthropicProvider::with_base_url(None, None);
         assert_eq!(p.base_url, "https://api.anthropic.com");
->>>>>>> origin/main
     }
 
     #[tokio::test]
