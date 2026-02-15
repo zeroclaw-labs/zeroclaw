@@ -1,0 +1,59 @@
+"type: docs":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "docs/**"
+          - "**/*.md"
+          - "LICENSE"
+
+"type: dependencies":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "Cargo.toml"
+          - "Cargo.lock"
+          - "deny.toml"
+
+"type: ci":
+  - changed-files:
+      - any-glob-to-any-file:
+          - ".github/**"
+          - ".githooks/**"
+
+"area: providers":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/providers/**"
+
+"area: channels":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/channels/**"
+
+"area: memory":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/memory/**"
+
+"area: security":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/security/**"
+
+"area: runtime":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/runtime/**"
+
+"area: tools":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/tools/**"
+
+"area: observability":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/observability/**"
+
+"area: tests":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "tests/**"
