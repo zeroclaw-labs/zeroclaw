@@ -1704,11 +1704,14 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                 // Allowlist
                 let users_str: String = Input::new()
-                    .with_prompt("  Allowed IRC nicknames (comma-separated, or * for all)")
-                    .default("*".into())
+                    .with_prompt(
+                        "  Allowed IRC nicknames (comma-separated, * for all, empty to deny all)",
+                    )
+                    .default(String::new())
+                    .allow_empty(true)
                     .interact_text()?;
 
-                let allowed_users = if users_str.trim() == "*" {
+                let allowed_users: Vec<String> = if users_str.trim() == "*" {
                     vec!["*".into()]
                 } else {
                     users_str
@@ -1717,6 +1720,13 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         .filter(|s| !s.is_empty())
                         .collect()
                 };
+
+                if allowed_users.is_empty() {
+                    println!(
+                        "  {} Empty allowlist means all IRC messages will be denied",
+                        style("⚠").yellow()
+                    );
+                }
 
                 config.irc = Some(IrcConfig {
                     server: server.trim().to_string(),
