@@ -88,7 +88,12 @@ impl AuditEvent {
     }
 
     /// Set the actor
-    pub fn with_actor(mut self, channel: String, user_id: Option<String>, username: Option<String>) -> Self {
+    pub fn with_actor(
+        mut self,
+        channel: String,
+        user_id: Option<String>,
+        username: Option<String>,
+    ) -> Self {
         self.actor = Some(Actor {
             channel,
             user_id,
@@ -98,7 +103,13 @@ impl AuditEvent {
     }
 
     /// Set the action
-    pub fn with_action(mut self, command: String, risk_level: String, approved: bool, allowed: bool) -> Self {
+    pub fn with_action(
+        mut self,
+        command: String,
+        risk_level: String,
+        approved: bool,
+        allowed: bool,
+    ) -> Self {
         self.action = Some(Action {
             command: Some(command),
             risk_level: Some(risk_level),
@@ -109,7 +120,13 @@ impl AuditEvent {
     }
 
     /// Set the result
-    pub fn with_result(mut self, success: bool, exit_code: Option<i32>, duration_ms: u64, error: Option<String>) -> Self {
+    pub fn with_result(
+        mut self,
+        success: bool,
+        exit_code: Option<i32>,
+        duration_ms: u64,
+        error: Option<String>,
+    ) -> Self {
         self.result = Some(ExecutionResult {
             success,
             exit_code,
@@ -179,7 +196,12 @@ impl AuditLogger {
     ) -> Result<()> {
         let event = AuditEvent::new(AuditEventType::CommandExecution)
             .with_actor(channel.to_string(), None, None)
-            .with_action(command.to_string(), risk_level.to_string(), approved, allowed)
+            .with_action(
+                command.to_string(),
+                risk_level.to_string(),
+                approved,
+                allowed,
+            )
             .with_result(success, None, duration_ms, None);
 
         self.log(&event)
@@ -224,8 +246,11 @@ mod tests {
 
     #[test]
     fn audit_event_with_actor() {
-        let event = AuditEvent::new(AuditEventType::CommandExecution)
-            .with_actor("telegram".to_string(), Some("123".to_string()), Some("@alice".to_string()));
+        let event = AuditEvent::new(AuditEventType::CommandExecution).with_actor(
+            "telegram".to_string(),
+            Some("123".to_string()),
+            Some("@alice".to_string()),
+        );
 
         assert!(event.actor.is_some());
         let actor = event.actor.as_ref().unwrap();
@@ -236,8 +261,12 @@ mod tests {
 
     #[test]
     fn audit_event_with_action() {
-        let event = AuditEvent::new(AuditEventType::CommandExecution)
-            .with_action("ls -la".to_string(), "low".to_string(), false, true);
+        let event = AuditEvent::new(AuditEventType::CommandExecution).with_action(
+            "ls -la".to_string(),
+            "low".to_string(),
+            false,
+            true,
+        );
 
         assert!(event.action.is_some());
         let action = event.action.as_ref().unwrap();
