@@ -852,4 +852,66 @@ mod tests {
         );
         assert_eq!(extract_api_error_message("not-json"), None);
     }
+
+    #[test]
+    fn composio_action_with_null_fields() {
+        let json_str = r#"{"name": "TEST_ACTION", "appName": null, "description": null, "enabled": false}"#;
+        let action: ComposioAction = serde_json::from_str(json_str).unwrap();
+        assert_eq!(action.name, "TEST_ACTION");
+        assert!(action.app_name.is_none());
+        assert!(action.description.is_none());
+        assert!(!action.enabled);
+    }
+
+    #[test]
+    fn composio_action_with_special_characters() {
+        let json_str = r#"{"name": "GMAIL_SEND_EMAIL_WITH_ATTACHMENT", "appName": "gmail", "description": "Send email with attachment & special chars: <>'\"\"", "enabled": true}"#;
+        let action: ComposioAction = serde_json::from_str(json_str).unwrap();
+        assert_eq!(action.name, "GMAIL_SEND_EMAIL_WITH_ATTACHMENT");
+        assert!(action.description.as_ref().unwrap().contains("&"));
+        assert!(action.description.as_ref().unwrap().contains("<"));
+    }
+
+    #[test]
+    fn composio_action_with_unicode() {
+        let json_str = r#"{"name": "SLACK_SEND_MESSAGE", "appName": "slack", "description": "Send message with emoji 🎉 and unicode 中文", "enabled": true}"#;
+        let action: ComposioAction = serde_json::from_str(json_str).unwrap();
+        assert!(action.description.as_ref().unwrap().contains("🎉"));
+        assert!(action.description.as_ref().unwrap().contains("中文"));
+    }
+
+    #[test]
+    fn composio_malformed_json_returns_error() {
+        let json_str = r#"{"name": "TEST_ACTION", "appName": "gmail", }"#;
+        let result: Result<ComposioAction, _> = serde_json::from_str(json_str);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn composio_empty_json_string_returns_error() {
+        let json_str = r#" ""#;
+        let result: Result<ComposioAction, _> = serde_json::from_str(json_str);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn composio_large_actions_list() {
+        let mut items = Vec::new();
+        for i in 0..100 {
+            items.push(json!({
+                "name": format!("ACTION_{i}"),
+                "appName": "test",
+                "description": "Test action",
+                "enabled": true
+            }));
+        }
+        let json_str = json!({"items": items}).to_string();
+        let resp: ComposioActionsResponse = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(resp.items.len(), 100);
+    }
+
+    #[test]
+    fn composio_api_base_url_is_v3() {
+        assert_eq!(COMPOSIO_API_BASE_V3, "https://backend.composio.dev/api/v3");
+    }
 }
