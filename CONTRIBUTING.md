@@ -376,6 +376,7 @@ Recommended scope keys in commit titles:
 - Require review approval for non-trivial changes.
 - Require CODEOWNERS review for protected paths.
 - Use risk labels to determine review depth (Track A/B/C), and module labels (`<module>:<component>`, e.g. `channel:telegram`, `provider:kimi`, `tool:shell`) to route subsystem expertise.
+- `trusted contributor` is auto-applied when the author has at least 5 merged PRs in this repository (PRs and issues).
 - Prefer squash merge with conventional commit title.
 - Revert fast on regressions; re-land with tests.
 

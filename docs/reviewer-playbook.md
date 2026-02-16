@@ -14,7 +14,7 @@ Use it to reduce review latency without reducing quality.
 For every new PR, do a fast intake pass:
 
 1. Confirm template completeness (`summary`, `validation`, `security`, `rollback`).
-2. Confirm labels (`size:*`, `risk:*`, `area:*`, module-scoped labels such as `channel:*`/`provider:*`/`tool:*`) are present and plausible.
+2. Confirm labels (`size:*`, `risk:*`, `area:*`, module-scoped labels such as `channel:*`/`provider:*`/`tool:*`, and `trusted contributor` when applicable) are present and plausible.
 3. Confirm CI signal status (`CI Required Gate`).
 4. Confirm scope is one concern (reject mixed mega-PRs unless justified).
 5. Confirm privacy/data-hygiene and neutral test wording requirements are satisfied.

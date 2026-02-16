@@ -49,7 +49,7 @@ Maintain these branch protection rules on `main`:
 ### Step A: Intake
 
 - Contributor opens PR with full `.github/pull_request_template.md`.
-- `PR Labeler` applies path labels + size labels + risk labels + module labels (for example `channel:telegram`, `provider:kimi`, `tool:shell`).
+- `PR Labeler` applies path labels + size labels + risk labels + module labels (for example `channel:telegram`, `provider:kimi`, `tool:shell`) and `trusted contributor` for authors with >=5 merged PRs.
 - `Auto Response` posts first-time guidance and handles label-driven routing for low-signal items.
 
 ### Step B: Validation

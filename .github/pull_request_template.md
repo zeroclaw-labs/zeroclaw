@@ -13,6 +13,7 @@ Describe this PR in 2-5 bullets:
 - Size label (`size: XS|S|M|L|XL`):
 - Area labels (`area:*`, comma-separated):
 - Module labels (`<module>:<component>`, for example `channel:telegram`, `provider:kimi`, `tool:shell`):
+- Contributor trust label (`trusted contributor`, auto when author has >=5 merged PRs):
 - Collaboration track is derived from risk (`A=low`, `B=medium`, `C=high`) unless maintainers override.
 - If any auto-label is incorrect, note requested correction:
 

@@ -33,6 +33,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
     - Guardrail: maintainers can apply `risk: manual` to freeze automated risk recalculation
 - `.github/workflows/auto-response.yml` (`Auto Response`)
     - Purpose: first-time contributor onboarding + label-driven response routing (`r:support`, `r:needs-repro`, etc.)
+    - Additional behavior: applies `trusted contributor` on issues when author has at least 5 merged PRs in this repository
     - Guardrail: label-based close routes are issue-only; PRs are never auto-closed by route labels
 - `.github/workflows/stale.yml` (`Stale`)
     - Purpose: stale issue/PR lifecycle automation

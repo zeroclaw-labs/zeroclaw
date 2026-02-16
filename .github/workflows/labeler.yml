@@ -30,6 +30,8 @@ jobs:
             const sizeLabels = ["size: XS", "size: S", "size: M", "size: L", "size: XL"];
             const computedRiskLabels = ["risk: low", "risk: medium", "risk: high"];
             const manualRiskOverrideLabel = "risk: manual";
+            const trustedContributorLabel = "trusted contributor";
+            const trustedContributorMinMergedPRs = 5;
 
             const staticLabelColors = {
               "size: XS": "BFDADC",
@@ -41,6 +43,7 @@ jobs:
               "risk: medium": "FBCA04",
               "risk: high": "D73A49",
               "risk: manual": "1F6FEB",
+              [trustedContributorLabel]: "0E8A16",
             };
 
             const modulePrefixColors = {
@@ -247,6 +250,7 @@ jobs:
               ...sizeLabels,
               ...computedRiskLabels,
               manualRiskOverrideLabel,
+              trustedContributorLabel,
               ...detectedModuleLabels,
             ]);
 
@@ -268,9 +272,25 @@ jobs:
               }
             }
 
+            let shouldApplyTrustedContributor = false;
+            const authorLogin = pr.user?.login;
+            if (authorLogin && pr.user?.type !== "Bot") {
+              try {
+                const { data: mergedSearch } = await github.rest.search.issuesAndPullRequests({
+                  q: `repo:${owner}/${repo} is:pr is:merged author:${authorLogin}`,
+                  per_page: 1,
+                });
+                const mergedCount = mergedSearch.total_count || 0;
+                shouldApplyTrustedContributor = mergedCount >= trustedContributorMinMergedPRs;
+              } catch (error) {
+                core.warning(`failed to compute trusted contributor label: ${error.message}`);
+              }
+            }
+
             const hasManualRiskOverride = currentLabelNames.includes(manualRiskOverrideLabel);
             const keepNonManagedLabels = currentLabelNames.filter((label) => {
               if (label === manualRiskOverrideLabel) return true;
+              if (label === trustedContributorLabel) return false;
               if (sizeLabels.includes(label) || computedRiskLabels.includes(label)) return false;
               if (managedModulePrefixes.some((prefix) => label.startsWith(prefix))) return false;
               return true;
@@ -280,9 +300,10 @@ jobs:
               currentLabelNames.find((label) => computedRiskLabels.includes(label)) || riskLabel;
 
             const moduleLabelList = [...detectedModuleLabels];
+            const trustedLabelList = shouldApplyTrustedContributor ? [trustedContributorLabel] : [];
             const nextLabels = hasManualRiskOverride
-              ? [...new Set([...keepNonManagedLabels, ...moduleLabelList, sizeLabel, manualRiskSelection])]
-              : [...new Set([...keepNonManagedLabels, ...moduleLabelList, sizeLabel, riskLabel])];
+              ? [...new Set([...keepNonManagedLabels, ...moduleLabelList, ...trustedLabelList, sizeLabel, manualRiskSelection])]
+              : [...new Set([...keepNonManagedLabels, ...moduleLabelList, ...trustedLabelList, sizeLabel, riskLabel])];
 
             await github.rest.issues.setLabels({
               owner,
