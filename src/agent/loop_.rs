@@ -285,12 +285,19 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     }
 
     // Fall back to XML-style <invoke> tag parsing (ZeroClaw's original format)
-    while let Some(start) = remaining.find("<invoke>").or_else(|| remaining.find("<tool_call>")) {
+    while let Some(start) = remaining
+        .find("<invoke>")
+        .or_else(|| remaining.find("<tool_call>"))
+    {
         // Find which tag matched to find the corresponding closing tag
         let is_invoke = remaining[start..].starts_with("<invoke>");
         let tag_len = if is_invoke { 8 } else { 11 };
-        let close_tag = if is_invoke { "</invoke>" } else { "</tool_call>" };
-        
+        let close_tag = if is_invoke {
+            "</invoke>"
+        } else {
+            "</tool_call>"
+        };
+
         // Everything before the tag is text
         let before = &remaining[..start];
         if !before.trim().is_empty() {

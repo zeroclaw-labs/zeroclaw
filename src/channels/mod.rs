@@ -183,7 +183,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             ctx.observer.as_ref(),
             ctx.model.as_str(),
             ctx.temperature,
-        )
+        ),
     )
     .await;
 
@@ -333,7 +333,8 @@ pub fn build_system_prompt(
         prompt.push_str("```\n<invoke>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</invoke>\n```\n\n");
         prompt.push_str("You may use multiple tool calls in a single response. ");
         prompt.push_str("After tool execution, results appear in <tool_result> tags. ");
-        prompt.push_str("Continue reasoning with the results until you can give a final answer.\n\n");
+        prompt
+            .push_str("Continue reasoning with the results until you can give a final answer.\n\n");
     }
 
     // ── 2. Safety ───────────────────────────────────────────────
@@ -886,7 +887,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.autonomy,
         &config.workspace_dir,
     ));
-    
+
     let composio_key = if config.composio.enabled {
         config.composio.api_key.as_deref()
     } else {
@@ -899,11 +900,13 @@ pub async fn start_channels(config: Config) -> Result<()> {
         mem.clone(),
         composio_key,
         &config.browser,
+        &config.http_request,
         &config.agents,
         config.api_key.as_deref(),
     );
 
-    let observer: Arc<dyn crate::observability::Observer> = Arc::from(crate::observability::create_observer(&config.observability));
+    let observer: Arc<dyn crate::observability::Observer> =
+        Arc::from(crate::observability::create_observer(&config.observability));
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
@@ -1070,6 +1073,8 @@ mod tests {
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(crate::observability::NoopObserver),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -1305,7 +1310,10 @@ mod tests {
 
         // Reproduces the production crash path where channel logs truncate at 80 chars.
         let result = std::panic::catch_unwind(|| crate::util::truncate_with_ellipsis(msg, 80));
-        assert!(result.is_ok(), "truncate_with_ellipsis should never panic on UTF-8");
+        assert!(
+            result.is_ok(),
+            "truncate_with_ellipsis should never panic on UTF-8"
+        );
 
         let truncated = result.unwrap();
         assert!(!truncated.is_empty());

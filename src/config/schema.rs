@@ -964,7 +964,7 @@ pub struct SandboxConfig {
 impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
-            enabled: None,  // Auto-detect
+            enabled: None, // Auto-detect
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
         }
@@ -2467,7 +2467,7 @@ temperature = 0.3
                 max_depth: 3,
             },
         );
-        let mut config = Config {
+        let config = Config {
             config_path: config_path.clone(),
             workspace_dir: zeroclaw_dir.join("workspace"),
             secrets: SecretsConfig { encrypt: true },
