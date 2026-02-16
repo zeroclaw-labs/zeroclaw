@@ -69,6 +69,9 @@ landlock = { version = "0.4", optional = true }
 # Async traits
 async-trait = "0.1"
 
+# Protobuf encode/decode (Feishu WS long-connection frame codec)
+prost = { version = "0.14", default-features = false }
+
 # Memory / persistence
 rusqlite = { version = "0.38", features = ["bundled"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
@@ -95,7 +98,7 @@ tokio-rustls = "0.26.4"
 webpki-roots = "1.0.6"
 
 # HTTP server (gateway) — replaces raw TCP for proper HTTP/1.1 compliance
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "ws"] }
 tower = { version = "0.5", default-features = false }
 tower-http = { version = "0.6", default-features = false, features = ["limit", "timeout"] }
 http-body-util = "0.1"
