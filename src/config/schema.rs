@@ -1567,8 +1567,7 @@ fn sync_directory(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use std::sync::{Mutex, OnceLock};
-    use tempfile::TempDir;
+        use tempfile::TempDir;
 
     // ── Defaults ─────────────────────────────────────────────
 
@@ -2373,19 +2372,18 @@ default_temperature = 0.7
         assert!(parsed.browser.allowed_domains.is_empty());
     }
 
-    fn env_override_lock() -> std::sync::MutexGuard<'static, ()> {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
+    // ── Environment variable overrides (Docker support) ─────────
+
+    fn env_override_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static ENV_OVERRIDE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        ENV_OVERRIDE_TEST_LOCK
             .lock()
             .expect("env override test lock poisoned")
     }
 
-    // ── Environment variable overrides (Docker support) ─────────
-
     #[test]
     fn env_override_api_key() {
-        let _guard = env_override_lock();
+        let _env_guard = env_override_test_guard();
         let mut config = Config::default();
         assert!(config.api_key.is_none());
 
@@ -2398,7 +2396,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_api_key_fallback() {
-        let _guard = env_override_lock();
+        let _env_guard = env_override_test_guard();
         let mut config = Config::default();
 
         std::env::remove_var("ZEROCLAW_API_KEY");
@@ -2411,7 +2409,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_provider() {
-        let _guard = env_override_lock();
+        let _env_guard = env_override_test_guard();
         let mut config = Config::default();
 
         std::env::set_var("ZEROCLAW_PROVIDER", "anthropic");
@@ -2423,7 +2421,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_provider_fallback() {
-        let _guard = env_override_lock();
+        let _env_guard = env_override_test_guard();
         let mut config = Config::default();
 
         std::env::remove_var("ZEROCLAW_PROVIDER");
@@ -2436,7 +2434,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_model() {
-        let _guard = env_override_lock();
+        let _env_guard = env_override_test_guard();
         let mut config = Config::default();
 
         std::env::set_var("ZEROCLAW_MODEL", "gpt-4o");
@@ -2448,7 +2446,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_workspace() {
-        let _guard = env_override_lock();
+        let _env_guard = env_override_test_guard();
         let mut config = Config::default();
 
         std::env::set_var("ZEROCLAW_WORKSPACE", "/custom/workspace");
@@ -2460,7 +2458,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_empty_values_ignored() {
-        let _guard = env_override_lock();
+        let _env_guard = env_override_test_guard();
         let mut config = Config::default();
         let original_provider = config.default_provider.clone();
 
@@ -2473,7 +2471,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_gateway_port() {
-        let _guard = env_override_lock();
+        let _env_guard = env_override_test_guard();
         let mut config = Config::default();
         assert_eq!(config.gateway.port, 3000);
 
@@ -2486,7 +2484,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_port_fallback() {
-        let _guard = env_override_lock();
+        let _env_guard = env_override_test_guard();
         let mut config = Config::default();
 
         std::env::remove_var("ZEROCLAW_GATEWAY_PORT");
@@ -2499,7 +2497,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_gateway_host() {
-        let _guard = env_override_lock();
+        let _env_guard = env_override_test_guard();
         let mut config = Config::default();
         assert_eq!(config.gateway.host, "127.0.0.1");
 
@@ -2512,7 +2510,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_host_fallback() {
-        let _guard = env_override_lock();
+        let _env_guard = env_override_test_guard();
         let mut config = Config::default();
 
         std::env::remove_var("ZEROCLAW_GATEWAY_HOST");
@@ -2525,7 +2523,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_temperature() {
-        let _guard = env_override_lock();
+        let _env_guard = env_override_test_guard();
         let mut config = Config::default();
 
         std::env::set_var("ZEROCLAW_TEMPERATURE", "0.5");
@@ -2537,7 +2535,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_temperature_out_of_range_ignored() {
-        let _guard = env_override_lock();
+        let _env_guard = env_override_test_guard();
         // Clean up any leftover env vars from other tests
         std::env::remove_var("ZEROCLAW_TEMPERATURE");
 
@@ -2557,7 +2555,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_invalid_port_ignored() {
-        let _guard = env_override_lock();
+        let _env_guard = env_override_test_guard();
         let mut config = Config::default();
         let original_port = config.gateway.port;
 
