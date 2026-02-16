@@ -10,7 +10,7 @@
 use crate::channels::{Channel, WhatsAppChannel};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
-use crate::providers::{self, Provider};
+use crate::providers::{self, ChatResponse, Provider};
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
@@ -43,6 +43,29 @@ fn webhook_memory_key() -> String {
 
 fn whatsapp_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
     format!("whatsapp_{}_{}", msg.sender, msg.id)
+}
+
+fn gateway_reply_from_response(response: ChatResponse) -> String {
+    let has_tool_calls = response.has_tool_calls();
+    let tool_call_count = response.tool_calls.len();
+    let mut reply = response.text.unwrap_or_default();
+
+    if has_tool_calls {
+        tracing::warn!(
+            tool_call_count,
+            "Provider requested tool calls in gateway mode; tool calls are not executed here"
+        );
+        if reply.trim().is_empty() {
+            reply = "I need to use tools to answer that, but tool execution is not enabled for gateway requests yet."
+                .to_string();
+        }
+    }
+
+    if reply.trim().is_empty() {
+        reply = "Model returned an empty response.".to_string();
+    }
+
+    reply
 }
 
 #[derive(Debug)]
@@ -497,7 +520,8 @@ async fn handle_webhook(
         .await
     {
         Ok(response) => {
-            let body = serde_json::json!({"response": response, "model": state.model});
+            let reply = gateway_reply_from_response(response);
+            let body = serde_json::json!({"response": reply, "model": state.model});
             (StatusCode::OK, Json(body))
         }
         Err(e) => {
@@ -651,8 +675,9 @@ async fn handle_whatsapp_message(
             .await
         {
             Ok(response) => {
+                let reply = gateway_reply_from_response(response);
                 // Send reply via WhatsApp
-                if let Err(e) = wa.send(&response, &msg.sender).await {
+                if let Err(e) = wa.send(&reply, &msg.sender).await {
                     tracing::error!("Failed to send WhatsApp reply: {e}");
                 }
             }
@@ -822,9 +847,9 @@ mod tests {
             _message: &str,
             _model: &str,
             _temperature: f64,
-        ) -> anyhow::Result<String> {
+        ) -> anyhow::Result<ChatResponse> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok("ok".into())
+            Ok(ChatResponse::with_text("ok"))
         }
     }
 

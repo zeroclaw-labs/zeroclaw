@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{self, Observer, ObserverEvent};
-use crate::providers::{self, ChatMessage, Provider};
+use crate::providers::{self, ChatMessage, Provider, ToolCall};
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
@@ -331,15 +331,71 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     (text_parts.join("\n"), calls)
 }
 
+fn parse_structured_tool_calls(tool_calls: &[ToolCall]) -> Vec<ParsedToolCall> {
+    tool_calls
+        .iter()
+        .map(|call| ParsedToolCall {
+            name: call.name.clone(),
+            arguments: serde_json::from_str::<serde_json::Value>(&call.arguments)
+                .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
+        })
+        .collect()
+}
+
+fn build_assistant_history_with_tool_calls(text: &str, tool_calls: &[ToolCall]) -> String {
+    let mut parts = Vec::new();
+
+    if !text.trim().is_empty() {
+        parts.push(text.trim().to_string());
+    }
+
+    for call in tool_calls {
+        let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments)
+            .unwrap_or_else(|_| serde_json::Value::String(call.arguments.clone()));
+        let payload = serde_json::json!({
+            "id": call.id,
+            "name": call.name,
+            "arguments": arguments,
+        });
+        parts.push(format!("<tool_call>\n{payload}\n</tool_call>"));
+    }
+
+    parts.join("\n")
+}
+
 #[derive(Debug)]
 struct ParsedToolCall {
     name: String,
     arguments: serde_json::Value,
 }
 
+/// Execute a single turn for channel runtime paths.
+///
+/// Channels currently do not thread an explicit provider label into this call,
+/// so we route through the full loop with a stable placeholder provider name.
+pub(crate) async fn agent_turn(
+    provider: &dyn Provider,
+    history: &mut Vec<ChatMessage>,
+    tools_registry: &[Box<dyn Tool>],
+    observer: &dyn Observer,
+    model: &str,
+    temperature: f64,
+) -> Result<String> {
+    run_tool_call_loop(
+        provider,
+        history,
+        tools_registry,
+        observer,
+        "channel-runtime",
+        model,
+        temperature,
+    )
+    .await
+}
+
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
-pub(crate) async fn agent_turn(
+pub(crate) async fn run_tool_call_loop(
     provider: &dyn Provider,
     history: &mut Vec<ChatMessage>,
     tools_registry: &[Box<dyn Tool>],
@@ -382,17 +438,36 @@ pub(crate) async fn agent_turn(
             }
         };
 
-        let (text, tool_calls) = parse_tool_calls(&response);
+        let response_text = response.text.unwrap_or_default();
+        let mut assistant_history_content = response_text.clone();
+        let mut parsed_text = response_text.clone();
+        let mut tool_calls = parse_structured_tool_calls(&response.tool_calls);
+
+        if !response.tool_calls.is_empty() {
+            assistant_history_content =
+                build_assistant_history_with_tool_calls(&response_text, &response.tool_calls);
+        }
+
+        if tool_calls.is_empty() {
+            let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
+            parsed_text = fallback_text;
+            tool_calls = fallback_calls;
+        }
 
         if tool_calls.is_empty() {
             // No tool calls — this is the final response
-            history.push(ChatMessage::assistant(&response));
-            return Ok(if text.is_empty() { response } else { text });
+            let final_text = if parsed_text.is_empty() {
+                response_text
+            } else {
+                parsed_text
+            };
+            history.push(ChatMessage::assistant(&final_text));
+            return Ok(final_text);
         }
 
         // Print any text the LLM produced alongside tool calls
-        if !text.is_empty() {
-            print!("{text}");
+        if !parsed_text.is_empty() {
+            print!("{parsed_text}");
             let _ = std::io::stdout().flush();
         }
 
@@ -438,7 +513,7 @@ pub(crate) async fn agent_turn(
         }
 
         // Add assistant message with tool calls + tool results to history
-        history.push(ChatMessage::assistant(&response));
+        history.push(ChatMessage::assistant(&assistant_history_content));
         history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
     }
 
@@ -639,7 +714,7 @@ pub async fn run(
             ChatMessage::user(&enriched),
         ];
 
-        let response = agent_turn(
+        let response = run_tool_call_loop(
             provider.as_ref(),
             &mut history,
             &tools_registry,
@@ -694,7 +769,7 @@ pub async fn run(
 
             history.push(ChatMessage::user(&enriched));
 
-            let response = match agent_turn(
+            let response = match run_tool_call_loop(
                 provider.as_ref(),
                 &mut history,
                 &tools_registry,

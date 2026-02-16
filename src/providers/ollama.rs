@@ -1,4 +1,4 @@
-use crate::providers::traits::Provider;
+use crate::providers::traits::{ChatResponse as ProviderChatResponse, Provider};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -28,7 +28,7 @@ struct Options {
 }
 
 #[derive(Debug, Deserialize)]
-struct ChatResponse {
+struct ApiChatResponse {
     message: ResponseMessage,
 }
 
@@ -61,7 +61,7 @@ impl Provider for OllamaProvider {
         message: &str,
         model: &str,
         temperature: f64,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<ProviderChatResponse> {
         let mut messages = Vec::new();
 
         if let Some(sys) = system_prompt {
@@ -92,8 +92,10 @@ impl Provider for OllamaProvider {
             anyhow::bail!("{err}. Is Ollama running? (brew install ollama && ollama serve)");
         }
 
-        let chat_response: ChatResponse = response.json().await?;
-        Ok(chat_response.message.content)
+        let chat_response: ApiChatResponse = response.json().await?;
+        Ok(ProviderChatResponse::with_text(
+            chat_response.message.content,
+        ))
     }
 }
 
@@ -168,21 +170,21 @@ mod tests {
     #[test]
     fn response_deserializes() {
         let json = r#"{"message":{"role":"assistant","content":"Hello from Ollama!"}}"#;
-        let resp: ChatResponse = serde_json::from_str(json).unwrap();
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.message.content, "Hello from Ollama!");
     }
 
     #[test]
     fn response_with_empty_content() {
         let json = r#"{"message":{"role":"assistant","content":""}}"#;
-        let resp: ChatResponse = serde_json::from_str(json).unwrap();
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         assert!(resp.message.content.is_empty());
     }
 
     #[test]
     fn response_with_multiline() {
         let json = r#"{"message":{"role":"assistant","content":"line1\nline2\nline3"}}"#;
-        let resp: ChatResponse = serde_json::from_str(json).unwrap();
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         assert!(resp.message.content.contains("line1"));
     }
 }

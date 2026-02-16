@@ -1,4 +1,4 @@
-use crate::providers::traits::{ChatMessage, Provider};
+use crate::providers::traits::{ChatMessage, ChatResponse, Provider};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -71,7 +71,7 @@ impl Provider for OpenRouterProvider {
         message: &str,
         model: &str,
         temperature: f64,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<ChatResponse> {
         let api_key = self.api_key.as_ref()
             .ok_or_else(|| anyhow::anyhow!("OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var."))?;
 
@@ -118,7 +118,7 @@ impl Provider for OpenRouterProvider {
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message.content)
+            .map(|c| ChatResponse::with_text(c.message.content))
             .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))
     }
 
@@ -127,7 +127,7 @@ impl Provider for OpenRouterProvider {
         messages: &[ChatMessage],
         model: &str,
         temperature: f64,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<ChatResponse> {
         let api_key = self.api_key.as_ref()
             .ok_or_else(|| anyhow::anyhow!("OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var."))?;
 
@@ -168,7 +168,7 @@ impl Provider for OpenRouterProvider {
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message.content)
+            .map(|c| ChatResponse::with_text(c.message.content))
             .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))
     }
 }

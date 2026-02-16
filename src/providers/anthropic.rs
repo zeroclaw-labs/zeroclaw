@@ -1,4 +1,4 @@
-use crate::providers::traits::Provider;
+use crate::providers::traits::{ChatResponse as ProviderChatResponse, Provider};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -26,7 +26,7 @@ struct Message {
 }
 
 #[derive(Debug, Deserialize)]
-struct ChatResponse {
+struct ApiChatResponse {
     content: Vec<ContentBlock>,
 }
 
@@ -72,7 +72,7 @@ impl Provider for AnthropicProvider {
         message: &str,
         model: &str,
         temperature: f64,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<ProviderChatResponse> {
         let credential = self.credential.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token)."
@@ -109,13 +109,13 @@ impl Provider for AnthropicProvider {
             return Err(super::api_error("Anthropic", response).await);
         }
 
-        let chat_response: ChatResponse = response.json().await?;
+        let chat_response: ApiChatResponse = response.json().await?;
 
         chat_response
             .content
             .into_iter()
             .next()
-            .map(|c| c.text)
+            .map(|c| ProviderChatResponse::with_text(c.text))
             .ok_or_else(|| anyhow::anyhow!("No response from Anthropic"))
     }
 }
@@ -241,7 +241,7 @@ mod tests {
     #[test]
     fn chat_response_deserializes() {
         let json = r#"{"content":[{"type":"text","text":"Hello there!"}]}"#;
-        let resp: ChatResponse = serde_json::from_str(json).unwrap();
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.content.len(), 1);
         assert_eq!(resp.content[0].text, "Hello there!");
     }
@@ -249,7 +249,7 @@ mod tests {
     #[test]
     fn chat_response_empty_content() {
         let json = r#"{"content":[]}"#;
-        let resp: ChatResponse = serde_json::from_str(json).unwrap();
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         assert!(resp.content.is_empty());
     }
 
@@ -257,7 +257,7 @@ mod tests {
     fn chat_response_multiple_blocks() {
         let json =
             r#"{"content":[{"type":"text","text":"First"},{"type":"text","text":"Second"}]}"#;
-        let resp: ChatResponse = serde_json::from_str(json).unwrap();
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.content.len(), 2);
         assert_eq!(resp.content[0].text, "First");
         assert_eq!(resp.content[1].text, "Second");

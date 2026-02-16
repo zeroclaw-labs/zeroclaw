@@ -1,4 +1,4 @@
-use crate::providers::traits::Provider;
+use crate::providers::traits::{ChatResponse, Provider};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -22,7 +22,7 @@ struct Message {
 }
 
 #[derive(Debug, Deserialize)]
-struct ChatResponse {
+struct ApiChatResponse {
     choices: Vec<Choice>,
 }
 
@@ -57,7 +57,7 @@ impl Provider for OpenAiProvider {
         message: &str,
         model: &str,
         temperature: f64,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<ChatResponse> {
         let api_key = self.api_key.as_ref().ok_or_else(|| {
             anyhow::anyhow!("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
         })?;
@@ -94,13 +94,13 @@ impl Provider for OpenAiProvider {
             return Err(super::api_error("OpenAI", response).await);
         }
 
-        let chat_response: ChatResponse = response.json().await?;
+        let chat_response: ApiChatResponse = response.json().await?;
 
         chat_response
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message.content)
+            .map(|c| ChatResponse::with_text(c.message.content))
             .ok_or_else(|| anyhow::anyhow!("No response from OpenAI"))
     }
 }
@@ -184,7 +184,7 @@ mod tests {
     #[test]
     fn response_deserializes_single_choice() {
         let json = r#"{"choices":[{"message":{"content":"Hi!"}}]}"#;
-        let resp: ChatResponse = serde_json::from_str(json).unwrap();
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.choices.len(), 1);
         assert_eq!(resp.choices[0].message.content, "Hi!");
     }
@@ -192,14 +192,14 @@ mod tests {
     #[test]
     fn response_deserializes_empty_choices() {
         let json = r#"{"choices":[]}"#;
-        let resp: ChatResponse = serde_json::from_str(json).unwrap();
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         assert!(resp.choices.is_empty());
     }
 
     #[test]
     fn response_deserializes_multiple_choices() {
         let json = r#"{"choices":[{"message":{"content":"A"}},{"message":{"content":"B"}}]}"#;
-        let resp: ChatResponse = serde_json::from_str(json).unwrap();
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.choices.len(), 2);
         assert_eq!(resp.choices[0].message.content, "A");
     }
@@ -207,7 +207,7 @@ mod tests {
     #[test]
     fn response_with_unicode() {
         let json = r#"{"choices":[{"message":{"content":"こんにちは 🦀"}}]}"#;
-        let resp: ChatResponse = serde_json::from_str(json).unwrap();
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.choices[0].message.content, "こんにちは 🦀");
     }
 
@@ -215,7 +215,7 @@ mod tests {
     fn response_with_long_content() {
         let long = "x".repeat(100_000);
         let json = format!(r#"{{"choices":[{{"message":{{"content":"{long}"}}}}]}}"#);
-        let resp: ChatResponse = serde_json::from_str(&json).unwrap();
+        let resp: ApiChatResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(resp.choices[0].message.content.len(), 100_000);
     }
 }
