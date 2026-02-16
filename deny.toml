@@ -2,10 +2,11 @@
 # https://embarkstudios.github.io/cargo-deny/
 
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
-yanked = "warn"
-notice = "warn"
+# In v2, vulnerability advisories always emit errors (not configurable).
+# unmaintained: scope of unmaintained-crate checks (all | workspace | transitive | none)
+unmaintained = "all"
+# yanked: deny | warn | allow
+yanked = "deny"
 
 [licenses]
 # All licenses are denied unless explicitly allowed
