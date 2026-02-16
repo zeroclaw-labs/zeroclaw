@@ -95,7 +95,9 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                         .to_string();
 
                     // Arguments in OpenAI format are a JSON string that needs parsing
-                    let arguments = if let Some(args_str) = function.get("arguments").and_then(|v| v.as_str()) {
+                    let arguments = if let Some(args_str) =
+                        function.get("arguments").and_then(|v| v.as_str())
+                    {
                         serde_json::from_str::<serde_json::Value>(args_str)
                             .unwrap_or(serde_json::Value::Object(serde_json::Map::new()))
                     } else {
@@ -187,11 +189,7 @@ async fn agent_turn(
         if tool_calls.is_empty() {
             // No tool calls — this is the final response
             history.push(ChatMessage::assistant(&response));
-            return Ok(if text.is_empty() {
-                response
-            } else {
-                text
-            });
+            return Ok(if text.is_empty() { response } else { text });
         }
 
         // Print any text the LLM produced alongside tool calls
@@ -240,9 +238,7 @@ async fn agent_turn(
 
         // Add assistant message with tool calls + tool results to history
         history.push(ChatMessage::assistant(&response));
-        history.push(ChatMessage::user(format!(
-            "[Tool results]\n{tool_results}"
-        )));
+        history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
     }
 
     anyhow::bail!("Agent exceeded maximum tool iterations ({MAX_TOOL_ITERATIONS})")
@@ -257,7 +253,8 @@ fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> String {
     instructions.push_str("```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n```\n\n");
     instructions.push_str("You may use multiple tool calls in a single response. ");
     instructions.push_str("After tool execution, results appear in <tool_result> tags. ");
-    instructions.push_str("Continue reasoning with the results until you can give a final answer.\n\n");
+    instructions
+        .push_str("Continue reasoning with the results until you can give a final answer.\n\n");
     instructions.push_str("### Available Tools\n\n");
 
     for tool in tools_registry {
@@ -657,12 +654,9 @@ After text."#;
         assert_eq!(history[0].content, "system prompt");
         // Trimmed to limit
         assert_eq!(history.len(), MAX_HISTORY_MESSAGES + 1); // +1 for system
-        // Most recent messages preserved
+                                                             // Most recent messages preserved
         let last = &history[history.len() - 1];
-        assert_eq!(
-            last.content,
-            format!("msg {}", MAX_HISTORY_MESSAGES + 19)
-        );
+        assert_eq!(last.content, format!("msg {}", MAX_HISTORY_MESSAGES + 19));
     }
 
     #[test]

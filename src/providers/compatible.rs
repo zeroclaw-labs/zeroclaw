@@ -306,7 +306,12 @@ impl Provider for OpenAiCompatibleProvider {
             .map(|c| {
                 // If tool_calls are present, serialize the full message as JSON
                 // so parse_tool_calls can handle the OpenAI-style format
-                if c.message.tool_calls.is_some() && c.message.tool_calls.as_ref().map_or(false, |t| !t.is_empty()) {
+                if c.message.tool_calls.is_some()
+                    && c.message
+                        .tool_calls
+                        .as_ref()
+                        .map_or(false, |t| !t.is_empty())
+                {
                     serde_json::to_string(&c.message)
                         .unwrap_or_else(|_| c.message.content.unwrap_or_default())
                 } else {
@@ -388,7 +393,12 @@ impl Provider for OpenAiCompatibleProvider {
             .map(|c| {
                 // If tool_calls are present, serialize the full message as JSON
                 // so parse_tool_calls can handle the OpenAI-style format
-                if c.message.tool_calls.is_some() && c.message.tool_calls.as_ref().map_or(false, |t| !t.is_empty()) {
+                if c.message.tool_calls.is_some()
+                    && c.message
+                        .tool_calls
+                        .as_ref()
+                        .map_or(false, |t| !t.is_empty())
+                {
                     serde_json::to_string(&c.message)
                         .unwrap_or_else(|_| c.message.content.unwrap_or_default())
                 } else {
@@ -467,7 +477,10 @@ mod tests {
     fn response_deserializes() {
         let json = r#"{"choices":[{"message":{"content":"Hello from Venice!"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.choices[0].message.content, Some("Hello from Venice!".to_string()));
+        assert_eq!(
+            resp.choices[0].message.content,
+            Some("Hello from Venice!".to_string())
+        );
     }
 
     #[test]

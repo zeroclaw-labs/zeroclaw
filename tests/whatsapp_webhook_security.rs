@@ -72,7 +72,9 @@ fn whatsapp_signature_rejects_tampered_body() {
 
     // Tampered body should be rejected even with valid-looking signature
     assert!(!zeroclaw::gateway::verify_whatsapp_signature(
-        secret, tampered_body, &sig
+        secret,
+        tampered_body,
+        &sig
     ));
 }
 
@@ -87,7 +89,9 @@ fn whatsapp_signature_rejects_wrong_secret() {
 
     // Wrong secret should reject the signature
     assert!(!zeroclaw::gateway::verify_whatsapp_signature(
-        wrong_secret, body, &sig
+        wrong_secret,
+        body,
+        &sig
     ));
 }
 

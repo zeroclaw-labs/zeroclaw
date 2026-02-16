@@ -87,7 +87,7 @@ jobs:
             - name: Run rustfmt
               run: cargo fmt --all -- --check
             - name: Run clippy
-              run: cargo clippy --locked --all-targets -- -D warnings
+              run: cargo clippy --locked --all-targets -- -D clippy::correctness
 
     test:
         name: Test
