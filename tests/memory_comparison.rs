@@ -2,6 +2,8 @@
 //!
 //! Run with: cargo test --test memory_comparison -- --nocapture
 
+
+/// בלה בלה בלה !@!@!@!
 use std::time::Instant;
 use tempfile::TempDir;
 
