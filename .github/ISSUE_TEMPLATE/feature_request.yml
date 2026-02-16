@@ -9,6 +9,7 @@ body:
       value: |
         Thanks for sharing your idea.
         Please focus on user value, constraints, and rollout safety.
+        Do not include personal/sensitive data; use neutral project-scoped placeholders.
 
   - type: input
     id: summary
@@ -94,3 +95,13 @@ body:
         - Yes
     validations:
       required: true
+
+  - type: checkboxes
+    id: hygiene
+    attributes:
+      label: Data hygiene checks
+      options:
+        - label: I removed personal/sensitive data from examples, payloads, and logs.
+          required: true
+        - label: I used neutral, project-focused wording and placeholders.
+          required: true

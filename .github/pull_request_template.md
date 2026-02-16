@@ -66,6 +66,12 @@ If any command is intentionally skipped, explain why.
 - File system access scope changed? (`Yes/No`)
 - If any `Yes`, describe risk and mitigation:
 
+## Privacy and Data Hygiene (required)
+
+- [ ] No personal/sensitive data in code/docs/tests/fixtures/logs/examples/commit messages.
+- [ ] Logs, payloads, screenshots, and reproductions are redacted/anonymized.
+- [ ] Test names/messages/fixtures/examples use neutral project-scoped wording (no identity-specific phrasing).
+
 ## Compatibility / Migration
 
 - Backward compatible? (`Yes/No`)

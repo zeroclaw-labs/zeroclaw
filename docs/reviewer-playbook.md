@@ -17,6 +17,7 @@ For every new PR, do a fast intake pass:
 2. Confirm labels (`size:*`, `risk:*`, `area:*`) are present and plausible.
 3. Confirm CI signal status (`CI Required Gate`).
 4. Confirm scope is one concern (reject mixed mega-PRs unless justified).
+5. Confirm privacy/data-hygiene and neutral test wording requirements are satisfied.
 
 If any intake requirement fails, leave one actionable checklist comment instead of deep review.
 
@@ -40,6 +41,7 @@ If automated risk labeling is contextually wrong, maintainers can apply `risk: m
 - Author demonstrates understanding of behavior and blast radius (especially for agent-assisted PRs).
 - Rollback path is concrete (not just “revert”).
 - Compatibility/migration impacts are clear.
+- No personal/sensitive data leakage in diff artifacts; examples/tests remain neutral and project-scoped.
 
 ## 5) Deep Review Checklist (High Risk)
 
@@ -59,6 +61,7 @@ Use labels to keep backlog actionable:
 - `r:support` for usage/support questions better routed outside bug backlog.
 - `duplicate` / `invalid` for non-actionable duplicates/noise.
 - `no-stale` for accepted work waiting on external blockers.
+- Request redaction if logs/payloads include personal identifiers or sensitive data.
 
 ## 7) Review Comment Style
 

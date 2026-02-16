@@ -76,6 +76,8 @@ Before requesting review, ensure all of the following are true:
 - `.github/pull_request_template.md` is fully completed.
 - Relevant local validation has been run (`fmt`, `clippy`, `test`, scenario checks).
 - Security impact and rollback path are explicitly described.
+- No personal/sensitive data is introduced in code/docs/tests/fixtures/logs/examples/commit messages.
+- Tests/fixtures/examples use neutral project-scoped wording (no identity-specific or first-person phrasing).
 - Linked issue (or rationale for no issue) is included.
 
 ## PR Definition of Done (DoD)
@@ -98,6 +100,7 @@ When PR traffic is high (especially with AI-assisted contributions), these rules
 - **Explicit rollback**: every PR must include a fast rollback path.
 - **Security-first review**: changes in `src/security/`, runtime, gateway, and CI need stricter validation.
 - **Risk-first triage**: use labels (`risk: high`, `risk: medium`, `risk: low`) to route review depth.
+- **Privacy-first hygiene**: redact/anonymize sensitive payloads and keep tests/examples neutral and project-scoped.
 - **Supersede hygiene**: if your PR replaces an older open PR, add `Supersedes #...` and request maintainers close the outdated one.
 
 Full maintainer workflow: [`docs/pr-workflow.md`](docs/pr-workflow.md).
@@ -275,6 +278,8 @@ impl Tool for YourTool {
 - [ ] No new dependencies unless absolutely necessary (we optimize for binary size)
 - [ ] README updated if adding user-facing features
 - [ ] Follows existing code patterns and conventions
+- [ ] No personal/sensitive data in code/docs/tests/fixtures/logs/examples/commit messages
+- [ ] Test names/messages/fixtures/examples are neutral and project-focused
 
 ## Commit Convention
 
@@ -307,6 +312,7 @@ Recommended scope keys in commit titles:
 - **Bugs**: Include OS, Rust version, steps to reproduce, expected vs actual
 - **Features**: Describe the use case, propose which trait to extend
 - **Security**: See [SECURITY.md](SECURITY.md) for responsible disclosure
+- **Privacy**: Redact/anonymize all personal data and sensitive identifiers before posting logs/payloads
 
 ## Maintainer Merge Policy
 

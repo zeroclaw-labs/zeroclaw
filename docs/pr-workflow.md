@@ -20,6 +20,7 @@ Related references:
 2. Keep CI signal quality high (fast feedback, low false positives).
 3. Keep security review explicit for risky surfaces.
 4. Keep changes easy to reason about and easy to revert.
+5. Keep repository artifacts free of personal/sensitive data leakage.
 
 ### Governance Design Logic (Control Loop)
 
@@ -77,6 +78,7 @@ Maintain these branch protection rules on `main`:
 - Scope boundary is explicit (what changed / what did not).
 - Validation evidence attached (not just "CI will check").
 - Security and rollback fields completed for risky paths.
+- Privacy/data-hygiene checks are completed and test language is neutral/project-scoped.
 
 ### Definition of Done (merge-ready)
 
@@ -196,6 +198,7 @@ Prefer fast restore of service quality over delayed perfect fixes.
 - CI gate is green.
 - Docs-quality checks are green when docs changed.
 - Security impact fields are complete.
+- Privacy/data-hygiene fields are complete and evidence is redacted/anonymized.
 - Agent workflow notes are sufficient for reproducibility (if automation was used).
 - Rollback plan is explicit.
 - Commit title follows Conventional Commits.
@@ -210,6 +213,7 @@ To keep review quality stable under high PR volume, we use a two-lane review mod
 - Confirm CI gate signal (`CI Required Gate`).
 - Confirm risk class via labels and touched paths.
 - Confirm rollback statement exists.
+- Confirm privacy/data-hygiene checklist and neutral wording requirements are satisfied.
 
 ### Lane B: Deep review (risk-based)
 

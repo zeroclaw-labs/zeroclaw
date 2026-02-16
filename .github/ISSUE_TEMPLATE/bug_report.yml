@@ -9,6 +9,7 @@ body:
       value: |
         Thanks for taking the time to report a bug.
         Please provide a minimal reproducible case so maintainers can triage quickly.
+        Do not include personal/sensitive data; redact and anonymize all logs/payloads.
 
   - type: input
     id: summary
@@ -94,7 +95,7 @@ body:
     id: logs
     attributes:
       label: Logs / stack traces
-      description: Paste relevant logs (redact secrets).
+      description: Paste relevant logs (redact secrets, personal identifiers, and sensitive data).
       render: text
     validations:
       required: false
@@ -142,4 +143,6 @@ body:
         - label: I reproduced this on the latest main branch or latest release.
           required: true
         - label: I redacted secrets/tokens from logs.
+          required: true
+        - label: I removed personal identifiers and replaced identity-specific data with neutral placeholders.
           required: true
