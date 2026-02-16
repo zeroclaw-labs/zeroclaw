@@ -80,8 +80,13 @@ jobs:
                       || [[ "$file" == ".markdownlint-cli2.yaml" ]] \
                       || [[ "$file" == .github/ISSUE_TEMPLATE/* ]] \
                       || [[ "$file" == .github/pull_request_template.md ]]; then
-                      docs_changed=true
-                      docs_files+=("$file")
+                      if [[ "$file" == *.md ]] \
+                        || [[ "$file" == *.mdx ]] \
+                        || [[ "$file" == "LICENSE" ]] \
+                        || [[ "$file" == .github/pull_request_template.md ]]; then
+                        docs_changed=true
+                        docs_files+=("$file")
+                      fi
                       continue
                     fi
 
@@ -217,8 +222,8 @@ jobs:
 
                   if [ "${{ needs.changes.outputs.docs_only }}" = "true" ]; then
                     echo "docs=${docs_result}"
-                    if [ "$docs_result" != "success" ]; then
-                      echo "Docs-only change requires docs-quality to pass."
+                    if [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
+                      echo "Docs-only change touched markdown docs, but docs-quality did not pass."
                       exit 1
                     fi
                     echo "Docs-only fast path passed."
