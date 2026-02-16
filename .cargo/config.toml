@@ -1,0 +1,5 @@
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "link-arg=-static"]
+
+[target.aarch64-unknown-linux-musl]
+rustflags = ["-C", "link-arg=-static"]

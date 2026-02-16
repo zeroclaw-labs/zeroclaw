@@ -1126,6 +1126,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
         whatsapp: None,
         email: None,
         irc: None,
+        lark: None,
     };
 
     loop {

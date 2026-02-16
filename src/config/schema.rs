@@ -741,6 +741,7 @@ pub struct ChannelsConfig {
     pub whatsapp: Option<WhatsAppConfig>,
     pub email: Option<crate::channels::email_channel::EmailConfig>,
     pub irc: Option<IrcConfig>,
+    pub lark: Option<LarkConfig>,
 }
 
 impl Default for ChannelsConfig {
@@ -756,6 +757,7 @@ impl Default for ChannelsConfig {
             whatsapp: None,
             email: None,
             irc: None,
+            lark: None,
         }
     }
 }
@@ -848,6 +850,28 @@ pub struct IrcConfig {
 
 fn default_irc_port() -> u16 {
     6697
+}
+
+/// Lark/Feishu configuration for messaging integration
+/// Lark is the international version, Feishu is the Chinese version
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LarkConfig {
+    /// App ID from Lark/Feishu developer console
+    pub app_id: String,
+    /// App Secret from Lark/Feishu developer console
+    pub app_secret: String,
+    /// Encrypt key for webhook message decryption (optional)
+    #[serde(default)]
+    pub encrypt_key: Option<String>,
+    /// Verification token for webhook validation (optional)
+    #[serde(default)]
+    pub verification_token: Option<String>,
+    /// Allowed user IDs or union IDs (empty = deny all, "*" = allow all)
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// Whether to use the Feishu (Chinese) endpoint instead of Lark (International)
+    #[serde(default)]
+    pub use_feishu: bool,
 }
 
 // ── Config impl ──────────────────────────────────────────────────
@@ -1216,6 +1240,7 @@ mod tests {
                 whatsapp: None,
                 email: None,
                 irc: None,
+                lark: None,
             },
             memory: MemoryConfig::default(),
             tunnel: TunnelConfig::default(),
@@ -1464,6 +1489,7 @@ default_temperature = 0.7
             whatsapp: None,
             email: None,
             irc: None,
+            lark: None,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -1622,6 +1648,7 @@ channel_id = "C123"
             }),
             email: None,
             irc: None,
+            lark: None,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -2050,6 +2077,72 @@ default_temperature = 0.7
         assert!(g.require_pairing);
         assert!(!g.allow_public_bind);
         assert!(g.paired_tokens.is_empty());
+    }
+
+    // ── Lark config ───────────────────────────────────────────────
+
+    #[test]
+    fn lark_config_serde() {
+        let lc = LarkConfig {
+            app_id: "cli_123456".into(),
+            app_secret: "secret_abc".into(),
+            encrypt_key: Some("encrypt_key".into()),
+            verification_token: Some("verify_token".into()),
+            allowed_users: vec!["user_123".into(), "user_456".into()],
+            use_feishu: true,
+        };
+        let json = serde_json::to_string(&lc).unwrap();
+        let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.app_id, "cli_123456");
+        assert_eq!(parsed.app_secret, "secret_abc");
+        assert_eq!(parsed.encrypt_key.as_deref(), Some("encrypt_key"));
+        assert_eq!(parsed.verification_token.as_deref(), Some("verify_token"));
+        assert_eq!(parsed.allowed_users.len(), 2);
+        assert!(parsed.use_feishu);
+    }
+
+    #[test]
+    fn lark_config_toml_roundtrip() {
+        let lc = LarkConfig {
+            app_id: "cli_123456".into(),
+            app_secret: "secret_abc".into(),
+            encrypt_key: Some("encrypt_key".into()),
+            verification_token: Some("verify_token".into()),
+            allowed_users: vec!["*".into()],
+            use_feishu: false,
+        };
+        let toml_str = toml::to_string(&lc).unwrap();
+        let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.app_id, "cli_123456");
+        assert_eq!(parsed.app_secret, "secret_abc");
+        assert!(!parsed.use_feishu);
+    }
+
+    #[test]
+    fn lark_config_deserializes_without_optional_fields() {
+        let json = r#"{"app_id":"cli_123","app_secret":"secret"}"#;
+        let parsed: LarkConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.encrypt_key.is_none());
+        assert!(parsed.verification_token.is_none());
+        assert!(parsed.allowed_users.is_empty());
+        assert!(!parsed.use_feishu);
+    }
+
+    #[test]
+    fn lark_config_defaults_to_lark_endpoint() {
+        let json = r#"{"app_id":"cli_123","app_secret":"secret"}"#;
+        let parsed: LarkConfig = serde_json::from_str(json).unwrap();
+        assert!(
+            !parsed.use_feishu,
+            "use_feishu should default to false (Lark)"
+        );
+    }
+
+    #[test]
+    fn lark_config_with_wildcard_allowed_users() {
+        let json = r#"{"app_id":"cli_123","app_secret":"secret","allowed_users":["*"]}"#;
+        let parsed: LarkConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.allowed_users, vec!["*"]);
     }
 
     // ══════════════════════════════════════════════════════════
