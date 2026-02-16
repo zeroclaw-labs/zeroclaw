@@ -1795,17 +1795,38 @@ async fn api_get_metrics(State(state): State<AppState>, headers: HeaderMap) -> i
     }
 }
 
-async fn api_get_status(State(_state): State<AppState>, _headers: HeaderMap) -> impl IntoResponse {
+async fn api_get_status(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let runtime = crate::health::snapshot_json();
     let uptime = runtime
         .get("uptime_seconds")
         .and_then(serde_json::Value::as_i64)
         .unwrap_or(0);
+    let counts = state.registry_db.with_conn(|conn| {
+        let active_sessions: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE tenant_id=?1 AND status='active'",
+            rusqlite::params![tenant],
+            |row| row.get(0),
+        )?;
+        let alerts: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE tenant_id=?1 AND type IN ('error','warning')",
+            rusqlite::params![tenant],
+            |row| row.get(0),
+        )?;
+        Ok((active_sessions, alerts))
+    });
+    let (active_sessions, alerts) = match counts {
+        Ok(v) => v,
+        Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
     api_ok(serde_json::json!({
         "isConnected": true,
         "uptime": format!("{uptime}s"),
-        "activeSessions": 0,
-        "alerts": 0
+        "activeSessions": active_sessions,
+        "alerts": alerts
     }))
 }
 
@@ -3394,7 +3415,7 @@ async fn handle_events_ws_status(
         query.get("token").cloned().unwrap_or_default()
     };
     let tenant = resolve_tenant_from_token(&state, &token);
-    ws.on_upgrade(move |socket| handle_status_socket(socket, tenant))
+    ws.on_upgrade(move |socket| handle_status_socket(socket, tenant, state))
 }
 
 async fn handle_events_ws_logs(
@@ -3903,24 +3924,35 @@ async fn handle_chat_socket(mut socket: ws::WebSocket, state: AppState, tenant: 
     tracing::info!("Dashboard chat WebSocket disconnected");
 }
 
-fn status_event_visible_to_tenant(json: &str, tenant: &str) -> bool {
+fn status_event_visible_to_tenant(json: &str, tenant: &str, state: &AppState) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
         return true;
     };
+    let resolved_socket = crate::tenant::resolve_tenant_from_token(&state.registry_db, tenant);
     if let Some(evt_tenant) = value.get("tenantId").and_then(serde_json::Value::as_str) {
-        return evt_tenant == tenant;
+        let resolved_event =
+            crate::tenant::resolve_tenant_from_token(&state.registry_db, evt_tenant);
+        return evt_tenant == tenant
+            || evt_tenant == resolved_socket
+            || resolved_event == tenant
+            || resolved_event == resolved_socket;
     }
     if let Some(evt_tenant) = value
         .get("data")
         .and_then(|v| v.get("tenantId"))
         .and_then(serde_json::Value::as_str)
     {
-        return evt_tenant == tenant;
+        let resolved_event =
+            crate::tenant::resolve_tenant_from_token(&state.registry_db, evt_tenant);
+        return evt_tenant == tenant
+            || evt_tenant == resolved_socket
+            || resolved_event == tenant
+            || resolved_event == resolved_socket;
     }
     true
 }
 
-async fn handle_status_socket(mut socket: ws::WebSocket, tenant: String) {
+async fn handle_status_socket(mut socket: ws::WebSocket, tenant: String, state: AppState) {
     let (subscriber_id, mut rx) = status_events::subscribe();
     tracing::info!("Dashboard status WebSocket connected");
 
@@ -3929,7 +3961,7 @@ async fn handle_status_socket(mut socket: ws::WebSocket, tenant: String) {
             maybe_json = rx.recv() => {
                 match maybe_json {
                     Some(json) => {
-                        if !status_event_visible_to_tenant(&json, &tenant) {
+                        if !status_event_visible_to_tenant(&json, &tenant, &state) {
                             continue;
                         }
                         if socket.send(ws::Message::Text(json.into())).await.is_err() {

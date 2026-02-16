@@ -790,8 +790,26 @@ impl Config {
         if config_path.exists() {
             let contents =
                 fs::read_to_string(&config_path).context("Failed to read config file")?;
-            let config: Config =
+            let mut config: Config =
                 toml::from_str(&contents).context("Failed to parse config file")?;
+            let mut changed = false;
+
+            // Normalize legacy path values unless explicit env overrides were provided.
+            if std::env::var("ARIA_WORKSPACE_DIR").is_err()
+                && (config.workspace_dir.starts_with(&legacy_afw_dir)
+                    || config.workspace_dir.starts_with(&legacy_desktop_aria_dir))
+            {
+                config.workspace_dir = default_workspace_dir();
+                changed = true;
+            }
+            if std::env::var("ARIA_CONFIG_PATH").is_err()
+                && (config.config_path.starts_with(&legacy_afw_dir)
+                    || config.config_path.starts_with(&legacy_desktop_aria_dir))
+            {
+                config.config_path = default_config_path();
+                changed = true;
+            }
+
             ensure_aria_structure(
                 &config
                     .workspace_dir
@@ -799,6 +817,9 @@ impl Config {
                     .unwrap_or(&aria_dir)
                     .to_path_buf(),
             )?;
+            if changed {
+                config.save()?;
+            }
             Ok(config)
         } else {
             let config = Config::default();

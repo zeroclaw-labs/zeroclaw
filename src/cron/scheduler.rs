@@ -51,7 +51,10 @@ pub async fn run(config: Config) -> Result<()> {
         for job in jobs {
             crate::health::mark_component_ok("scheduler");
             let outcome = execute_job_with_retry(&config, &security, &job).await;
-            let tenant = outcome.tenant_id.clone();
+            let tenant = outcome
+                .tenant_id
+                .clone()
+                .unwrap_or_else(|| "dev-tenant".to_string());
             let full_output = outcome.output.clone();
             if outcome.success {
                 status_events::emit(

@@ -468,6 +468,92 @@ fn preview_for_event(event_type: &str, data: &Value) -> String {
 }
 
 #[derive(Debug, Clone)]
+pub struct StatusInboxCreated {
+    pub id: String,
+    pub tenant_id: String,
+    pub title: String,
+}
+
+pub fn maybe_create_inbox_for_status_event(
+    db: &AriaDb,
+    default_tenant_id: &str,
+    event_type: &str,
+    data: &Value,
+) -> Result<Option<StatusInboxCreated>> {
+    let tenant = data["tenantId"]
+        .as_str()
+        .unwrap_or(default_tenant_id)
+        .to_string();
+
+    let source_type = if event_type.starts_with("cron.") {
+        "cron"
+    } else if event_type.starts_with("feed.") {
+        "feed"
+    } else if event_type.starts_with("task.") || event_type.starts_with("heartbeat.") {
+        "task"
+    } else {
+        return Ok(None);
+    };
+
+    // Production signal/noise policy:
+    // - create inbox for failures
+    // - create inbox for cron completions (often intentional background work)
+    // - ignore low-signal high-frequency completions (e.g. most feed/task success)
+    let create = match event_type {
+        "cron.failed" | "feed.run.failed" | "task.failed" | "heartbeat.task.failed" => true,
+        "cron.completed" => true,
+        _ => false,
+    };
+    if !create {
+        return Ok(None);
+    }
+
+    let title = title_for_event(event_type, data);
+    let preview = preview_for_event(event_type, data);
+    let run_id = data["runId"].as_str().map(ToString::to_string);
+    let chat_id = data["chatId"].as_str().map(ToString::to_string);
+    let source_id = data["jobId"]
+        .as_str()
+        .or_else(|| data["feedId"].as_str())
+        .or_else(|| data["id"].as_str())
+        .map(ToString::to_string);
+    let status = if event_type.ends_with(".failed") {
+        "unread"
+    } else {
+        "read"
+    };
+
+    let item = NewInboxItem {
+        source_type: source_type.to_string(),
+        source_id,
+        run_id,
+        chat_id,
+        title: title.clone(),
+        preview: if preview.is_empty() {
+            None
+        } else {
+            Some(preview.clone())
+        },
+        body: if preview.is_empty() {
+            None
+        } else {
+            Some(preview)
+        },
+        metadata: serde_json::json!({
+            "eventType": event_type,
+            "event": data,
+        }),
+        status: Some(status.to_string()),
+    };
+    let id = create_inbox_item(db, &tenant, &item)?;
+    Ok(Some(StatusInboxCreated {
+        id,
+        tenant_id: tenant,
+        title,
+    }))
+}
+
+#[derive(Debug, Clone)]
 pub struct NewInboxItem {
     pub source_type: String,
     pub source_id: Option<String>,

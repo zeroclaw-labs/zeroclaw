@@ -34,6 +34,14 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
             ) {
                 tracing::warn!("Failed to persist status event '{event_type}': {e}");
             }
+            if let Err(e) = crate::dashboard::maybe_create_inbox_for_status_event(
+                &event_db,
+                &tenant_fallback,
+                event_type,
+                data,
+            ) {
+                tracing::warn!("Failed to persist inbox item for status event '{event_type}': {e}");
+            }
         }));
     }
 
