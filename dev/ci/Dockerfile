@@ -14,7 +14,7 @@ RUN rustup toolchain install 1.92 --profile minimal --component rustfmt --compon
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    cargo install --locked cargo-audit && \
+    cargo install --locked cargo-audit --version 0.22.1 && \
     cargo install --locked cargo-deny --version 0.18.5
 
 WORKDIR /workspace
