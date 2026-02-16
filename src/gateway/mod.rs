@@ -70,6 +70,7 @@ async fn gateway_agent_reply(state: &AppState, message: &str) -> Result<String> 
         &mut history,
         state.tools_registry.as_ref(),
         state.observer.as_ref(),
+        "gateway",
         &state.model,
         state.temperature,
     )
@@ -262,6 +263,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         Arc::clone(&mem),
         composio_key,
         &config.browser,
+        &config.http_request,
+        &config.workspace_dir,
         &config.agents,
         config.api_key.as_deref(),
     ));

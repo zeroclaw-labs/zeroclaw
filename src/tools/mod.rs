@@ -101,7 +101,10 @@ pub fn all_tools_with_runtime(
         Box::new(MemoryStoreTool::new(memory.clone())),
         Box::new(MemoryRecallTool::new(memory.clone())),
         Box::new(MemoryForgetTool::new(memory)),
-        Box::new(GitOperationsTool::new(security.clone(), workspace_dir.to_path_buf())),
+        Box::new(GitOperationsTool::new(
+            security.clone(),
+            workspace_dir.to_path_buf(),
+        )),
     ];
 
     if browser_config.enabled {
@@ -184,7 +187,16 @@ mod tests {
         };
         let http = crate::config::HttpRequestConfig::default();
 
-        let tools = all_tools(&security, mem, None, &browser, &http, tmp.path(), &HashMap::new(), None);
+        let tools = all_tools(
+            &security,
+            mem,
+            None,
+            &browser,
+            &http,
+            tmp.path(),
+            &HashMap::new(),
+            None,
+        );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"browser_open"));
     }
@@ -208,7 +220,16 @@ mod tests {
         };
         let http = crate::config::HttpRequestConfig::default();
 
-        let tools = all_tools(&security, mem, None, &browser, &http, tmp.path(), &HashMap::new(), None);
+        let tools = all_tools(
+            &security,
+            mem,
+            None,
+            &browser,
+            &http,
+            tmp.path(),
+            &HashMap::new(),
+            None,
+        );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"browser_open"));
     }
@@ -334,7 +355,16 @@ mod tests {
             },
         );
 
-        let tools = all_tools(&security, mem, None, &browser, &http, tmp.path(), &agents, Some("sk-test"));
+        let tools = all_tools(
+            &security,
+            mem,
+            None,
+            &browser,
+            &http,
+            tmp.path(),
+            &agents,
+            Some("sk-test"),
+        );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"delegate"));
     }
@@ -353,7 +383,16 @@ mod tests {
         let browser = BrowserConfig::default();
         let http = crate::config::HttpRequestConfig::default();
 
-        let tools = all_tools(&security, mem, None, &browser, &http, tmp.path(), &HashMap::new(), None);
+        let tools = all_tools(
+            &security,
+            mem,
+            None,
+            &browser,
+            &http,
+            tmp.path(),
+            &HashMap::new(),
+            None,
+        );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"delegate"));
     }

@@ -721,6 +721,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         composio_key,
         &config.browser,
         &config.http_request,
+        &config.workspace_dir,
         &config.agents,
         config.api_key.as_deref(),
     ));
@@ -951,7 +952,7 @@ mod tests {
     use super::*;
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;
-    use crate::providers::{ChatMessage, Provider};
+    use crate::providers::{ChatMessage, ChatResponse, Provider, ToolCall};
     use crate::tools::{Tool, ToolResult};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1018,27 +1019,23 @@ mod tests {
             message: &str,
             _model: &str,
             _temperature: f64,
-        ) -> anyhow::Result<String> {
+        ) -> anyhow::Result<ChatResponse> {
             tokio::time::sleep(self.delay).await;
-            Ok(format!("echo: {message}"))
+            Ok(ChatResponse::with_text(format!("echo: {message}")))
         }
     }
 
     struct ToolCallingProvider;
 
-    fn tool_call_payload() -> String {
-        serde_json::json!({
-            "content": "",
-            "tool_calls": [{
-                "id": "call_1",
-                "type": "function",
-                "function": {
-                    "name": "mock_price",
-                    "arguments": "{\"symbol\":\"BTC\"}"
-                }
-            }]
-        })
-        .to_string()
+    fn tool_call_payload() -> ChatResponse {
+        ChatResponse {
+            text: Some(String::new()),
+            tool_calls: vec![ToolCall {
+                id: "call_1".into(),
+                name: "mock_price".into(),
+                arguments: r#"{"symbol":"BTC"}"#.into(),
+            }],
+        }
     }
 
     #[async_trait::async_trait]
@@ -1049,7 +1046,7 @@ mod tests {
             _message: &str,
             _model: &str,
             _temperature: f64,
-        ) -> anyhow::Result<String> {
+        ) -> anyhow::Result<ChatResponse> {
             Ok(tool_call_payload())
         }
 
@@ -1058,12 +1055,14 @@ mod tests {
             messages: &[ChatMessage],
             _model: &str,
             _temperature: f64,
-        ) -> anyhow::Result<String> {
+        ) -> anyhow::Result<ChatResponse> {
             let has_tool_results = messages
                 .iter()
                 .any(|msg| msg.role == "user" && msg.content.contains("[Tool results]"));
             if has_tool_results {
-                Ok("BTC is currently around $65,000 based on latest tool output.".to_string())
+                Ok(ChatResponse::with_text(
+                    "BTC is currently around $65,000 based on latest tool output.",
+                ))
             } else {
                 Ok(tool_call_payload())
             }

@@ -113,6 +113,7 @@ async fn auto_compact_history(
     let summary_raw = provider
         .chat_with_system(Some(summarizer_system), &summarizer_user, model, 0.2)
         .await
+        .map(|resp| resp.text_or_empty().to_string())
         .unwrap_or_else(|_| {
             // Fallback to deterministic local truncation when summarization fails.
             truncate_with_ellipsis(&transcript, COMPACTION_MAX_SUMMARY_CHARS)

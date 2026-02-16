@@ -14,7 +14,10 @@ pub struct GitOperationsTool {
 
 impl GitOperationsTool {
     pub fn new(security: Arc<SecurityPolicy>, workspace_dir: std::path::PathBuf) -> Self {
-        Self { security, workspace_dir }
+        Self {
+            security,
+            workspace_dir,
+        }
     }
 
     /// Sanitize git arguments to prevent injection attacks
@@ -48,7 +51,10 @@ impl GitOperationsTool {
 
     /// Check if an operation is read-only
     fn is_read_only(&self, operation: &str) -> bool {
-        matches!(operation, "status" | "diff" | "log" | "show" | "branch" | "rev-parse")
+        matches!(
+            operation,
+            "status" | "diff" | "log" | "show" | "branch" | "rev-parse"
+        )
     }
 
     async fn run_git_command(&self, args: &[&str]) -> anyhow::Result<String> {
@@ -67,7 +73,9 @@ impl GitOperationsTool {
     }
 
     async fn git_status(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let output = self.run_git_command(&["status", "--porcelain=2", "--branch"]).await?;
+        let output = self
+            .run_git_command(&["status", "--porcelain=2", "--branch"])
+            .await?;
 
         // Parse git status output into structured format
         let mut result = serde_json::Map::new();
@@ -105,7 +113,10 @@ impl GitOperationsTool {
         result.insert("staged".to_string(), json!(staged));
         result.insert("unstaged".to_string(), json!(unstaged));
         result.insert("untracked".to_string(), json!(untracked));
-        result.insert("clean".to_string(), json!(staged.is_empty() && unstaged.is_empty() && untracked.is_empty()));
+        result.insert(
+            "clean".to_string(),
+            json!(staged.is_empty() && unstaged.is_empty() && untracked.is_empty()),
+        );
 
         Ok(ToolResult {
             success: true,
@@ -116,7 +127,10 @@ impl GitOperationsTool {
 
     async fn git_diff(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let files = args.get("files").and_then(|v| v.as_str()).unwrap_or(".");
-        let cached = args.get("cached").and_then(|v| v.as_bool()).unwrap_or(false);
+        let cached = args
+            .get("cached")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         let mut git_args = vec!["diff", "--unified=3"];
         if cached {
@@ -191,12 +205,14 @@ impl GitOperationsTool {
         let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
         let limit_str = limit.to_string();
 
-        let output = self.run_git_command(&[
-            "log",
-            &format!("-{limit_str}"),
-            "--pretty=format:%H|%an|%ae|%ad|%s",
-            "--date=iso",
-        ]).await?;
+        let output = self
+            .run_git_command(&[
+                "log",
+                &format!("-{limit_str}"),
+                "--pretty=format:%H|%an|%ae|%ad|%s",
+                "--date=iso",
+            ])
+            .await?;
 
         let mut commits = Vec::new();
 
@@ -215,13 +231,16 @@ impl GitOperationsTool {
 
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&json!({ "commits": commits })).unwrap_or_default(),
+            output: serde_json::to_string_pretty(&json!({ "commits": commits }))
+                .unwrap_or_default(),
             error: None,
         })
     }
 
     async fn git_branch(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let output = self.run_git_command(&["branch", "--format=%(refname:short)|%(HEAD)"]).await?;
+        let output = self
+            .run_git_command(&["branch", "--format=%(refname:short)|%(HEAD)"])
+            .await?;
 
         let mut branches = Vec::new();
         let mut current = String::new();
@@ -244,18 +263,21 @@ impl GitOperationsTool {
             output: serde_json::to_string_pretty(&json!({
                 "current": current,
                 "branches": branches
-            })).unwrap_or_default(),
+            }))
+            .unwrap_or_default(),
             error: None,
         })
     }
 
     async fn git_commit(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let message = args.get("message")
+        let message = args
+            .get("message")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'message' parameter"))?;
 
         // Sanitize commit message
-        let sanitized = message.lines()
+        let sanitized = message
+            .lines()
             .map(|l| l.trim())
             .filter(|l| !l.is_empty())
             .collect::<Vec<_>>()
@@ -289,7 +311,8 @@ impl GitOperationsTool {
     }
 
     async fn git_add(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let paths = args.get("paths")
+        let paths = args
+            .get("paths")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'paths' parameter"))?;
 
@@ -310,7 +333,8 @@ impl GitOperationsTool {
     }
 
     async fn git_checkout(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let branch = args.get("branch")
+        let branch = args
+            .get("branch")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'branch' parameter"))?;
 
@@ -345,15 +369,22 @@ impl GitOperationsTool {
     }
 
     async fn git_stash(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("push");
+        let action = args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("push");
 
         let output = match action {
-            "push" | "save" => self.run_git_command(&["stash", "push", "-m", "auto-stash"]).await,
+            "push" | "save" => {
+                self.run_git_command(&["stash", "push", "-m", "auto-stash"])
+                    .await
+            }
             "pop" => self.run_git_command(&["stash", "pop"]).await,
             "list" => self.run_git_command(&["stash", "list"]).await,
             "drop" => {
                 let index = args.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as i32;
-                self.run_git_command(&["stash", "drop", &format!("stash@{{{index}}}")]).await
+                self.run_git_command(&["stash", "drop", &format!("stash@{{{index}}}")])
+                    .await
             }
             _ => anyhow::bail!("Unknown stash action: {action}. Use: push, pop, list, drop"),
         };
@@ -470,7 +501,9 @@ impl Tool for GitOperationsTool {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some("Action blocked: git write operations require higher autonomy level".into()),
+                    error: Some(
+                        "Action blocked: git write operations require higher autonomy level".into(),
+                    ),
                 });
             }
 
@@ -606,7 +639,11 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         // can_act() returns false for ReadOnly, so we get the "higher autonomy level" message
-        assert!(result.error.as_deref().unwrap_or("").contains("higher autonomy"));
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("higher autonomy"));
     }
 
     #[tokio::test]
@@ -632,7 +669,11 @@ mod tests {
 
         let result = tool.execute(json!({})).await.unwrap();
         assert!(!result.success);
-        assert!(result.error.as_deref().unwrap_or("").contains("Missing 'operation'"));
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Missing 'operation'"));
     }
 
     #[tokio::test]
@@ -649,6 +690,10 @@ mod tests {
 
         let result = tool.execute(json!({"operation": "push"})).await.unwrap();
         assert!(!result.success);
-        assert!(result.error.as_deref().unwrap_or("").contains("Unknown operation"));
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Unknown operation"));
     }
 }

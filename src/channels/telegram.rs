@@ -32,7 +32,10 @@ fn split_message_for_telegram(message: &str) -> Vec<String> {
                     pos + 1
                 } else {
                     // Try space as fallback
-                    search_area.rfind(' ').unwrap_or(TELEGRAM_MAX_MESSAGE_LENGTH) + 1
+                    search_area
+                        .rfind(' ')
+                        .unwrap_or(TELEGRAM_MAX_MESSAGE_LENGTH)
+                        + 1
                 }
             } else if let Some(pos) = search_area.rfind(' ') {
                 pos + 1
