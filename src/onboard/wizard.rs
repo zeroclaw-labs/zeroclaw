@@ -8,8 +8,12 @@ use crate::hardware::{self, HardwareConfig};
 use anyhow::{Context, Result};
 use console::style;
 use dialoguer::{Confirm, Input, Select};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 // ── Project context collected during wizard ──────────────────────
 
@@ -39,6 +43,12 @@ const BANNER: &str = r"
     ⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡
 ";
 
+const LIVE_MODEL_MAX_OPTIONS: usize = 120;
+const MODEL_PREVIEW_LIMIT: usize = 20;
+const MODEL_CACHE_FILE: &str = "models_cache.json";
+const MODEL_CACHE_TTL_SECS: u64 = 12 * 60 * 60;
+const CUSTOM_MODEL_SENTINEL: &str = "__custom_model__";
+
 // ── Main wizard entry point ──────────────────────────────────────
 
 pub fn run_wizard() -> Result<Config> {
@@ -60,7 +70,7 @@ pub fn run_wizard() -> Result<Config> {
     let (workspace_dir, config_path) = setup_workspace()?;
 
     print_step(2, 9, "AI Provider & API Key");
-    let (provider, api_key, model) = setup_provider()?;
+    let (provider, api_key, model) = setup_provider(&workspace_dir)?;
 
     print_step(3, 9, "Channels (How You Talk to ZeroClaw)");
     let channels_config = setup_channels()?;
@@ -410,13 +420,702 @@ pub fn run_quick_setup(
 fn default_model_for_provider(provider: &str) -> String {
     match provider {
         "anthropic" => "claude-sonnet-4-20250514".into(),
-        "openai" => "gpt-4o".into(),
+        "openai" => "gpt-5.1".into(),
         "glm" | "zhipu" | "zai" | "z.ai" => "glm-5".into(),
         "ollama" => "llama3.2".into(),
         "groq" => "llama-3.3-70b-versatile".into(),
         "deepseek" => "deepseek-chat".into(),
-        "gemini" | "google" | "google-gemini" => "gemini-2.0-flash".into(),
+        "gemini" | "google" | "google-gemini" => "gemini-2.5-pro".into(),
         _ => "anthropic/claude-sonnet-4".into(),
+    }
+}
+
+fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
+    match provider_name {
+        "openrouter" => vec![
+            (
+                "anthropic/claude-sonnet-4".to_string(),
+                "Claude Sonnet 4 (balanced, recommended)".to_string(),
+            ),
+            (
+                "openai/gpt-5.1".to_string(),
+                "GPT-5.1 (latest OpenAI flagship)".to_string(),
+            ),
+            (
+                "openai/gpt-5-mini".to_string(),
+                "GPT-5 mini (fast, cost-efficient)".to_string(),
+            ),
+            (
+                "google/gemini-2.5-pro".to_string(),
+                "Gemini 2.5 Pro (reasoning)".to_string(),
+            ),
+            (
+                "google/gemini-2.5-flash".to_string(),
+                "Gemini 2.5 Flash (speed/price)".to_string(),
+            ),
+            (
+                "meta-llama/llama-3.3-70b-instruct".to_string(),
+                "Llama 3.3 70B (open source)".to_string(),
+            ),
+            (
+                "deepseek/deepseek-chat".to_string(),
+                "DeepSeek Chat (affordable)".to_string(),
+            ),
+        ],
+        "anthropic" => vec![
+            (
+                "claude-sonnet-4-20250514".to_string(),
+                "Claude Sonnet 4 (balanced, recommended)".to_string(),
+            ),
+            (
+                "claude-opus-4-20250514".to_string(),
+                "Claude Opus 4 (best quality)".to_string(),
+            ),
+            (
+                "claude-3-5-haiku-20241022".to_string(),
+                "Claude 3.5 Haiku (fastest, cheapest)".to_string(),
+            ),
+        ],
+        "openai" => vec![
+            (
+                "gpt-5.1".to_string(),
+                "GPT-5.1 (latest coding/agentic flagship)".to_string(),
+            ),
+            (
+                "gpt-5-mini".to_string(),
+                "GPT-5 mini (faster, cheaper)".to_string(),
+            ),
+            ("gpt-5".to_string(), "GPT-5 (previous flagship)".to_string()),
+            ("gpt-4o".to_string(), "GPT-4o (multimodal)".to_string()),
+        ],
+        "venice" => vec![
+            (
+                "llama-3.3-70b".to_string(),
+                "Llama 3.3 70B (default, fast)".to_string(),
+            ),
+            (
+                "claude-opus-45".to_string(),
+                "Claude Opus 4.5 via Venice (strongest)".to_string(),
+            ),
+            (
+                "llama-3.1-405b".to_string(),
+                "Llama 3.1 405B (largest open source)".to_string(),
+            ),
+        ],
+        "groq" => vec![
+            (
+                "llama-3.3-70b-versatile".to_string(),
+                "Llama 3.3 70B (fast, recommended)".to_string(),
+            ),
+            (
+                "moonshotai/kimi-k2-instruct-0905".to_string(),
+                "Kimi K2 0905 (high reasoning)".to_string(),
+            ),
+            (
+                "qwen/qwen3-32b".to_string(),
+                "Qwen3-32B (balanced)".to_string(),
+            ),
+        ],
+        "mistral" => vec![
+            (
+                "mistral-medium-latest".to_string(),
+                "Mistral Medium (frontier generalist)".to_string(),
+            ),
+            (
+                "mistral-large-latest".to_string(),
+                "Mistral Large (high quality)".to_string(),
+            ),
+            (
+                "codestral-latest".to_string(),
+                "Codestral (code-focused)".to_string(),
+            ),
+        ],
+        "deepseek" => vec![
+            (
+                "deepseek-chat".to_string(),
+                "DeepSeek Chat (V3, recommended)".to_string(),
+            ),
+            (
+                "deepseek-reasoner".to_string(),
+                "DeepSeek Reasoner (R1)".to_string(),
+            ),
+        ],
+        "xai" => vec![
+            ("grok-4".to_string(), "Grok 4 (latest)".to_string()),
+            (
+                "grok-3".to_string(),
+                "Grok 3 (broad compatibility)".to_string(),
+            ),
+            ("grok-3-mini".to_string(), "Grok 3 Mini (fast)".to_string()),
+        ],
+        "perplexity" => vec![
+            (
+                "sonar-pro".to_string(),
+                "Sonar Pro (search + reasoning)".to_string(),
+            ),
+            ("sonar".to_string(), "Sonar (search, fast)".to_string()),
+        ],
+        "fireworks" => vec![
+            (
+                "accounts/fireworks/models/llama-v3p3-70b-instruct".to_string(),
+                "Llama 3.3 70B".to_string(),
+            ),
+            (
+                "accounts/fireworks/models/mixtral-8x22b-instruct".to_string(),
+                "Mixtral 8x22B".to_string(),
+            ),
+        ],
+        "together" => vec![
+            (
+                "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo".to_string(),
+                "Llama 3.1 70B Turbo".to_string(),
+            ),
+            (
+                "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo".to_string(),
+                "Llama 3.1 8B Turbo".to_string(),
+            ),
+            (
+                "mistralai/Mixtral-8x22B-Instruct-v0.1".to_string(),
+                "Mixtral 8x22B".to_string(),
+            ),
+        ],
+        "cohere" => vec![
+            (
+                "command-r-plus".to_string(),
+                "Command R+ (flagship)".to_string(),
+            ),
+            ("command-r".to_string(), "Command R (fast)".to_string()),
+        ],
+        "moonshot" => vec![
+            (
+                "moonshot-v1-128k".to_string(),
+                "Moonshot V1 128K".to_string(),
+            ),
+            ("moonshot-v1-32k".to_string(), "Moonshot V1 32K".to_string()),
+        ],
+        "glm" | "zhipu" | "zai" | "z.ai" => vec![
+            ("glm-5".to_string(), "GLM-5 (latest)".to_string()),
+            (
+                "glm-4-plus".to_string(),
+                "GLM-4 Plus (flagship)".to_string(),
+            ),
+            ("glm-4-flash".to_string(), "GLM-4 Flash (fast)".to_string()),
+        ],
+        "minimax" => vec![
+            ("abab6.5s-chat".to_string(), "ABAB 6.5s Chat".to_string()),
+            ("abab6.5-chat".to_string(), "ABAB 6.5 Chat".to_string()),
+        ],
+        "ollama" => vec![
+            (
+                "llama3.2".to_string(),
+                "Llama 3.2 (recommended local)".to_string(),
+            ),
+            ("mistral".to_string(), "Mistral 7B".to_string()),
+            ("codellama".to_string(), "Code Llama".to_string()),
+            ("phi3".to_string(), "Phi-3 (small, fast)".to_string()),
+        ],
+        "gemini" | "google" | "google-gemini" => vec![
+            (
+                "gemini-2.5-pro".to_string(),
+                "Gemini 2.5 Pro (state-of-the-art reasoning)".to_string(),
+            ),
+            (
+                "gemini-2.5-flash".to_string(),
+                "Gemini 2.5 Flash (best price/performance)".to_string(),
+            ),
+            (
+                "gemini-2.5-flash-lite-preview-09-2025".to_string(),
+                "Gemini 2.5 Flash Lite (preview, lowest cost)".to_string(),
+            ),
+        ],
+        _ => vec![("default".to_string(), "Default model".to_string())],
+    }
+}
+
+fn supports_live_model_fetch(provider_name: &str) -> bool {
+    matches!(
+        provider_name,
+        "openrouter"
+            | "openai"
+            | "anthropic"
+            | "groq"
+            | "mistral"
+            | "deepseek"
+            | "xai"
+            | "grok"
+            | "together"
+            | "together-ai"
+            | "gemini"
+            | "google"
+            | "google-gemini"
+            | "ollama"
+    )
+}
+
+fn build_model_fetch_client() -> Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .connect_timeout(Duration::from_secs(4))
+        .build()
+        .context("failed to build model-fetch HTTP client")
+}
+
+fn normalize_model_ids(ids: Vec<String>) -> Vec<String> {
+    let mut unique = BTreeSet::new();
+    for id in ids {
+        let trimmed = id.trim();
+        if !trimmed.is_empty() {
+            unique.insert(trimmed.to_string());
+        }
+    }
+    unique.into_iter().collect()
+}
+
+fn parse_openai_compatible_model_ids(payload: &Value) -> Vec<String> {
+    let mut models = Vec::new();
+
+    if let Some(data) = payload.get("data").and_then(Value::as_array) {
+        for model in data {
+            if let Some(id) = model.get("id").and_then(Value::as_str) {
+                models.push(id.to_string());
+            }
+        }
+    } else if let Some(data) = payload.as_array() {
+        for model in data {
+            if let Some(id) = model.get("id").and_then(Value::as_str) {
+                models.push(id.to_string());
+            }
+        }
+    }
+
+    normalize_model_ids(models)
+}
+
+fn parse_gemini_model_ids(payload: &Value) -> Vec<String> {
+    let Some(models) = payload.get("models").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let mut ids = Vec::new();
+    for model in models {
+        let supports_generate_content = model
+            .get("supportedGenerationMethods")
+            .and_then(Value::as_array)
+            .is_none_or(|methods| {
+                methods
+                    .iter()
+                    .any(|method| method.as_str() == Some("generateContent"))
+            });
+
+        if !supports_generate_content {
+            continue;
+        }
+
+        if let Some(name) = model.get("name").and_then(Value::as_str) {
+            ids.push(name.trim_start_matches("models/").to_string());
+        }
+    }
+
+    normalize_model_ids(ids)
+}
+
+fn parse_ollama_model_ids(payload: &Value) -> Vec<String> {
+    let Some(models) = payload.get("models").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let mut ids = Vec::new();
+    for model in models {
+        if let Some(name) = model.get("name").and_then(Value::as_str) {
+            ids.push(name.to_string());
+        }
+    }
+
+    normalize_model_ids(ids)
+}
+
+fn fetch_openai_compatible_models(endpoint: &str, api_key: Option<&str>) -> Result<Vec<String>> {
+    let Some(api_key) = api_key else {
+        return Ok(Vec::new());
+    };
+
+    let client = build_model_fetch_client()?;
+    let payload: Value = client
+        .get(endpoint)
+        .bearer_auth(api_key)
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .with_context(|| format!("model fetch failed: GET {endpoint}"))?
+        .json()
+        .context("failed to parse model list response")?;
+
+    Ok(parse_openai_compatible_model_ids(&payload))
+}
+
+fn fetch_openrouter_models(api_key: Option<&str>) -> Result<Vec<String>> {
+    let client = build_model_fetch_client()?;
+    let mut request = client.get("https://openrouter.ai/api/v1/models");
+    if let Some(api_key) = api_key {
+        request = request.bearer_auth(api_key);
+    }
+
+    let payload: Value = request
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .context("model fetch failed: GET https://openrouter.ai/api/v1/models")?
+        .json()
+        .context("failed to parse OpenRouter model list response")?;
+
+    Ok(parse_openai_compatible_model_ids(&payload))
+}
+
+fn fetch_anthropic_models(api_key: Option<&str>) -> Result<Vec<String>> {
+    let Some(api_key) = api_key else {
+        return Ok(Vec::new());
+    };
+
+    let client = build_model_fetch_client()?;
+    let payload: Value = client
+        .get("https://api.anthropic.com/v1/models")
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .context("model fetch failed: GET https://api.anthropic.com/v1/models")?
+        .json()
+        .context("failed to parse Anthropic model list response")?;
+
+    Ok(parse_openai_compatible_model_ids(&payload))
+}
+
+fn fetch_gemini_models(api_key: Option<&str>) -> Result<Vec<String>> {
+    let Some(api_key) = api_key else {
+        return Ok(Vec::new());
+    };
+
+    let client = build_model_fetch_client()?;
+    let payload: Value = client
+        .get("https://generativelanguage.googleapis.com/v1beta/models")
+        .query(&[("key", api_key), ("pageSize", "200")])
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .context("model fetch failed: GET Gemini models")?
+        .json()
+        .context("failed to parse Gemini model list response")?;
+
+    Ok(parse_gemini_model_ids(&payload))
+}
+
+fn fetch_ollama_models() -> Result<Vec<String>> {
+    let client = build_model_fetch_client()?;
+    let payload: Value = client
+        .get("http://localhost:11434/api/tags")
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .context("model fetch failed: GET http://localhost:11434/api/tags")?
+        .json()
+        .context("failed to parse Ollama model list response")?;
+
+    Ok(parse_ollama_model_ids(&payload))
+}
+
+fn fetch_live_models_for_provider(provider_name: &str, api_key: &str) -> Result<Vec<String>> {
+    let api_key = if api_key.trim().is_empty() {
+        std::env::var(provider_env_var(provider_name))
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    } else {
+        Some(api_key.trim().to_string())
+    };
+
+    let models = match provider_name {
+        "openrouter" => fetch_openrouter_models(api_key.as_deref())?,
+        "openai" => {
+            fetch_openai_compatible_models("https://api.openai.com/v1/models", api_key.as_deref())?
+        }
+        "groq" => fetch_openai_compatible_models(
+            "https://api.groq.com/openai/v1/models",
+            api_key.as_deref(),
+        )?,
+        "mistral" => {
+            fetch_openai_compatible_models("https://api.mistral.ai/v1/models", api_key.as_deref())?
+        }
+        "deepseek" => fetch_openai_compatible_models(
+            "https://api.deepseek.com/v1/models",
+            api_key.as_deref(),
+        )?,
+        "xai" | "grok" => {
+            fetch_openai_compatible_models("https://api.x.ai/v1/models", api_key.as_deref())?
+        }
+        "together" | "together-ai" => fetch_openai_compatible_models(
+            "https://api.together.xyz/v1/models",
+            api_key.as_deref(),
+        )?,
+        "anthropic" => fetch_anthropic_models(api_key.as_deref())?,
+        "gemini" | "google" | "google-gemini" => fetch_gemini_models(api_key.as_deref())?,
+        "ollama" => fetch_ollama_models()?,
+        _ => Vec::new(),
+    };
+
+    Ok(models)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ModelCacheEntry {
+    provider: String,
+    fetched_at_unix: u64,
+    models: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ModelCacheState {
+    entries: Vec<ModelCacheEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedModels {
+    models: Vec<String>,
+    age_secs: u64,
+}
+
+fn model_cache_path(workspace_dir: &Path) -> PathBuf {
+    workspace_dir.join("state").join(MODEL_CACHE_FILE)
+}
+
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+fn load_model_cache_state(workspace_dir: &Path) -> Result<ModelCacheState> {
+    let path = model_cache_path(workspace_dir);
+    if !path.exists() {
+        return Ok(ModelCacheState::default());
+    }
+
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read model cache at {}", path.display()))?;
+
+    match serde_json::from_str::<ModelCacheState>(&raw) {
+        Ok(state) => Ok(state),
+        Err(_) => Ok(ModelCacheState::default()),
+    }
+}
+
+fn save_model_cache_state(workspace_dir: &Path, state: &ModelCacheState) -> Result<()> {
+    let path = model_cache_path(workspace_dir);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create model cache directory {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let json = serde_json::to_vec_pretty(state).context("failed to serialize model cache")?;
+    fs::write(&path, json)
+        .with_context(|| format!("failed to write model cache at {}", path.display()))?;
+
+    Ok(())
+}
+
+fn cache_live_models_for_provider(
+    workspace_dir: &Path,
+    provider_name: &str,
+    models: &[String],
+) -> Result<()> {
+    let normalized_models = normalize_model_ids(models.to_vec());
+    if normalized_models.is_empty() {
+        return Ok(());
+    }
+
+    let mut state = load_model_cache_state(workspace_dir)?;
+    let now = now_unix_secs();
+
+    if let Some(entry) = state
+        .entries
+        .iter_mut()
+        .find(|entry| entry.provider == provider_name)
+    {
+        entry.fetched_at_unix = now;
+        entry.models = normalized_models;
+    } else {
+        state.entries.push(ModelCacheEntry {
+            provider: provider_name.to_string(),
+            fetched_at_unix: now,
+            models: normalized_models,
+        });
+    }
+
+    save_model_cache_state(workspace_dir, &state)
+}
+
+fn load_cached_models_for_provider_internal(
+    workspace_dir: &Path,
+    provider_name: &str,
+    ttl_secs: Option<u64>,
+) -> Result<Option<CachedModels>> {
+    let state = load_model_cache_state(workspace_dir)?;
+    let now = now_unix_secs();
+
+    let Some(entry) = state
+        .entries
+        .into_iter()
+        .find(|entry| entry.provider == provider_name)
+    else {
+        return Ok(None);
+    };
+
+    if entry.models.is_empty() {
+        return Ok(None);
+    }
+
+    let age_secs = now.saturating_sub(entry.fetched_at_unix);
+    if ttl_secs.is_some_and(|ttl| age_secs > ttl) {
+        return Ok(None);
+    }
+
+    Ok(Some(CachedModels {
+        models: entry.models,
+        age_secs,
+    }))
+}
+
+fn load_cached_models_for_provider(
+    workspace_dir: &Path,
+    provider_name: &str,
+    ttl_secs: u64,
+) -> Result<Option<CachedModels>> {
+    load_cached_models_for_provider_internal(workspace_dir, provider_name, Some(ttl_secs))
+}
+
+fn load_any_cached_models_for_provider(
+    workspace_dir: &Path,
+    provider_name: &str,
+) -> Result<Option<CachedModels>> {
+    load_cached_models_for_provider_internal(workspace_dir, provider_name, None)
+}
+
+fn humanize_age(age_secs: u64) -> String {
+    if age_secs < 60 {
+        format!("{age_secs}s")
+    } else if age_secs < 60 * 60 {
+        format!("{}m", age_secs / 60)
+    } else {
+        format!("{}h", age_secs / (60 * 60))
+    }
+}
+
+fn build_model_options(model_ids: Vec<String>, source: &str) -> Vec<(String, String)> {
+    model_ids
+        .into_iter()
+        .map(|model_id| {
+            let label = format!("{model_id} ({source})");
+            (model_id, label)
+        })
+        .collect()
+}
+
+fn print_model_preview(models: &[String]) {
+    for model in models.iter().take(MODEL_PREVIEW_LIMIT) {
+        println!("  {} {model}", style("-"));
+    }
+
+    if models.len() > MODEL_PREVIEW_LIMIT {
+        println!(
+            "  {} ... and {} more",
+            style("-"),
+            models.len() - MODEL_PREVIEW_LIMIT
+        );
+    }
+}
+
+pub fn run_models_refresh(
+    config: &Config,
+    provider_override: Option<&str>,
+    force: bool,
+) -> Result<()> {
+    let provider_name = provider_override
+        .or(config.default_provider.as_deref())
+        .unwrap_or("openrouter")
+        .trim()
+        .to_string();
+
+    if provider_name.is_empty() {
+        anyhow::bail!("Provider name cannot be empty");
+    }
+
+    if !supports_live_model_fetch(&provider_name) {
+        anyhow::bail!("Provider '{provider_name}' does not support live model discovery yet");
+    }
+
+    if !force {
+        if let Some(cached) = load_cached_models_for_provider(
+            &config.workspace_dir,
+            &provider_name,
+            MODEL_CACHE_TTL_SECS,
+        )? {
+            println!(
+                "Using cached model list for '{}' (updated {} ago):",
+                provider_name,
+                humanize_age(cached.age_secs)
+            );
+            print_model_preview(&cached.models);
+            println!();
+            println!(
+                "Tip: run `zeroclaw models refresh --force --provider {}` to fetch latest now.",
+                provider_name
+            );
+            return Ok(());
+        }
+    }
+
+    let api_key = config.api_key.clone().unwrap_or_default();
+
+    match fetch_live_models_for_provider(&provider_name, &api_key) {
+        Ok(models) if !models.is_empty() => {
+            cache_live_models_for_provider(&config.workspace_dir, &provider_name, &models)?;
+            println!(
+                "Refreshed '{}' model cache with {} models.",
+                provider_name,
+                models.len()
+            );
+            print_model_preview(&models);
+            Ok(())
+        }
+        Ok(_) => {
+            if let Some(stale_cache) =
+                load_any_cached_models_for_provider(&config.workspace_dir, &provider_name)?
+            {
+                println!(
+                    "Provider returned no models; using stale cache (updated {} ago):",
+                    humanize_age(stale_cache.age_secs)
+                );
+                print_model_preview(&stale_cache.models);
+                return Ok(());
+            }
+
+            anyhow::bail!("Provider '{}' returned an empty model list", provider_name)
+        }
+        Err(error) => {
+            if let Some(stale_cache) =
+                load_any_cached_models_for_provider(&config.workspace_dir, &provider_name)?
+            {
+                println!(
+                    "Live refresh failed ({}). Falling back to stale cache (updated {} ago):",
+                    error,
+                    humanize_age(stale_cache.age_secs)
+                );
+                print_model_preview(&stale_cache.models);
+                return Ok(());
+            }
+
+            Err(error)
+                .with_context(|| format!("failed to refresh models for provider '{provider_name}'"))
+        }
     }
 }
 
@@ -481,7 +1180,7 @@ fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
 // ── Step 2: Provider & API Key ───────────────────────────────────
 
 #[allow(clippy::too_many_lines)]
-fn setup_provider() -> Result<(String, String, String)> {
+fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
     // ── Tier selection ──
     let tiers = vec![
         "⭐ Recommended (OpenRouter, Venice, Anthropic, OpenAI, Gemini)",
@@ -696,132 +1395,141 @@ fn setup_provider() -> Result<(String, String, String)> {
     };
 
     // ── Model selection ──
-    let models: Vec<(&str, &str)> = match provider_name {
-        "openrouter" => vec![
-            (
-                "anthropic/claude-sonnet-4",
-                "Claude Sonnet 4 (balanced, recommended)",
-            ),
-            (
-                "anthropic/claude-3.5-sonnet",
-                "Claude 3.5 Sonnet (fast, affordable)",
-            ),
-            ("openai/gpt-4o", "GPT-4o (OpenAI flagship)"),
-            ("openai/gpt-4o-mini", "GPT-4o Mini (fast, cheap)"),
-            (
-                "google/gemini-2.0-flash-001",
-                "Gemini 2.0 Flash (Google, fast)",
-            ),
-            (
-                "meta-llama/llama-3.3-70b-instruct",
-                "Llama 3.3 70B (open source)",
-            ),
-            ("deepseek/deepseek-chat", "DeepSeek Chat (affordable)"),
-        ],
-        "anthropic" => vec![
-            (
-                "claude-sonnet-4-20250514",
-                "Claude Sonnet 4 (balanced, recommended)",
-            ),
-            ("claude-3-5-sonnet-20241022", "Claude 3.5 Sonnet (fast)"),
-            (
-                "claude-3-5-haiku-20241022",
-                "Claude 3.5 Haiku (fastest, cheapest)",
-            ),
-        ],
-        "openai" => vec![
-            ("gpt-4o", "GPT-4o (flagship)"),
-            ("gpt-4o-mini", "GPT-4o Mini (fast, cheap)"),
-            ("o1-mini", "o1-mini (reasoning)"),
-        ],
-        "venice" => vec![
-            ("llama-3.3-70b", "Llama 3.3 70B (default, fast)"),
-            ("claude-opus-45", "Claude Opus 4.5 via Venice (strongest)"),
-            ("llama-3.1-405b", "Llama 3.1 405B (largest open source)"),
-        ],
-        "groq" => vec![
-            (
-                "llama-3.3-70b-versatile",
-                "Llama 3.3 70B (fast, recommended)",
-            ),
-            ("llama-3.1-8b-instant", "Llama 3.1 8B (instant)"),
-            ("mixtral-8x7b-32768", "Mixtral 8x7B (32K context)"),
-        ],
-        "mistral" => vec![
-            ("mistral-large-latest", "Mistral Large (flagship)"),
-            ("codestral-latest", "Codestral (code-focused)"),
-            ("mistral-small-latest", "Mistral Small (fast, cheap)"),
-        ],
-        "deepseek" => vec![
-            ("deepseek-chat", "DeepSeek Chat (V3, recommended)"),
-            ("deepseek-reasoner", "DeepSeek Reasoner (R1)"),
-        ],
-        "xai" => vec![
-            ("grok-3", "Grok 3 (flagship)"),
-            ("grok-3-mini", "Grok 3 Mini (fast)"),
-        ],
-        "perplexity" => vec![
-            ("sonar-pro", "Sonar Pro (search + reasoning)"),
-            ("sonar", "Sonar (search, fast)"),
-        ],
-        "fireworks" => vec![
-            (
-                "accounts/fireworks/models/llama-v3p3-70b-instruct",
-                "Llama 3.3 70B",
-            ),
-            (
-                "accounts/fireworks/models/mixtral-8x22b-instruct",
-                "Mixtral 8x22B",
-            ),
-        ],
-        "together" => vec![
-            (
-                "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
-                "Llama 3.1 70B Turbo",
-            ),
-            (
-                "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
-                "Llama 3.1 8B Turbo",
-            ),
-            ("mistralai/Mixtral-8x22B-Instruct-v0.1", "Mixtral 8x22B"),
-        ],
-        "cohere" => vec![
-            ("command-r-plus", "Command R+ (flagship)"),
-            ("command-r", "Command R (fast)"),
-        ],
-        "moonshot" => vec![
-            ("moonshot-v1-128k", "Moonshot V1 128K"),
-            ("moonshot-v1-32k", "Moonshot V1 32K"),
-        ],
-        "glm" | "zhipu" | "zai" | "z.ai" => vec![
-            ("glm-5", "GLM-5 (latest)"),
-            ("glm-4-plus", "GLM-4 Plus (flagship)"),
-            ("glm-4-flash", "GLM-4 Flash (fast)"),
-        ],
-        "minimax" => vec![
-            ("MiniMax-M2.5", "MiniMax M2.5 (latest flagship)"),
-            ("MiniMax-M2.5-highspeed", "MiniMax M2.5 Highspeed (faster)"),
-            ("MiniMax-M2.1", "MiniMax M2.1 (previous gen)"),
-        ],
-        "ollama" => vec![
-            ("llama3.2", "Llama 3.2 (recommended local)"),
-            ("mistral", "Mistral 7B"),
-            ("codellama", "Code Llama"),
-            ("phi3", "Phi-3 (small, fast)"),
-        ],
-        "gemini" | "google" | "google-gemini" => vec![
-            ("gemini-2.0-flash", "Gemini 2.0 Flash (fast, recommended)"),
-            (
-                "gemini-2.0-flash-lite",
-                "Gemini 2.0 Flash Lite (fastest, cheapest)",
-            ),
-            ("gemini-1.5-pro", "Gemini 1.5 Pro (best quality)"),
-            ("gemini-1.5-flash", "Gemini 1.5 Flash (balanced)"),
-        ],
-        _ => vec![("default", "Default model")],
-    };
+    let mut model_options = curated_models_for_provider(provider_name);
+    let mut live_options: Option<Vec<(String, String)>> = None;
 
-    let model_labels: Vec<&str> = models.iter().map(|(_, label)| *label).collect();
+    if supports_live_model_fetch(provider_name) {
+        let can_fetch_without_key = matches!(provider_name, "openrouter" | "ollama");
+        let has_api_key = !api_key.trim().is_empty()
+            || std::env::var(provider_env_var(provider_name))
+                .ok()
+                .is_some_and(|value| !value.trim().is_empty());
+
+        if can_fetch_without_key || has_api_key {
+            if let Some(cached) =
+                load_cached_models_for_provider(workspace_dir, provider_name, MODEL_CACHE_TTL_SECS)?
+            {
+                let shown_count = cached.models.len().min(LIVE_MODEL_MAX_OPTIONS);
+                print_bullet(&format!(
+                    "Found cached models ({shown_count}) updated {} ago.",
+                    humanize_age(cached.age_secs)
+                ));
+
+                live_options = Some(build_model_options(
+                    cached
+                        .models
+                        .into_iter()
+                        .take(LIVE_MODEL_MAX_OPTIONS)
+                        .collect(),
+                    "cached",
+                ));
+            }
+
+            let should_fetch_now = Confirm::new()
+                .with_prompt(if live_options.is_some() {
+                    "  Refresh models from provider now?"
+                } else {
+                    "  Fetch latest models from provider now?"
+                })
+                .default(live_options.is_none())
+                .interact()?;
+
+            if should_fetch_now {
+                match fetch_live_models_for_provider(provider_name, &api_key) {
+                    Ok(live_model_ids) if !live_model_ids.is_empty() => {
+                        cache_live_models_for_provider(
+                            workspace_dir,
+                            provider_name,
+                            &live_model_ids,
+                        )?;
+
+                        let fetched_count = live_model_ids.len();
+                        let shown_count = fetched_count.min(LIVE_MODEL_MAX_OPTIONS);
+                        let shown_models: Vec<String> = live_model_ids
+                            .into_iter()
+                            .take(LIVE_MODEL_MAX_OPTIONS)
+                            .collect();
+
+                        if shown_count < fetched_count {
+                            print_bullet(&format!(
+                                "Fetched {fetched_count} models. Showing first {shown_count}."
+                            ));
+                        } else {
+                            print_bullet(&format!("Fetched {shown_count} live models."));
+                        }
+
+                        live_options = Some(build_model_options(shown_models, "live"));
+                    }
+                    Ok(_) => {
+                        print_bullet("Provider returned no models; using curated list.");
+                    }
+                    Err(error) => {
+                        print_bullet(&format!(
+                            "Live fetch failed ({}); using cached/curated list.",
+                            style(error.to_string()).yellow()
+                        ));
+
+                        if live_options.is_none() {
+                            if let Some(stale) =
+                                load_any_cached_models_for_provider(workspace_dir, provider_name)?
+                            {
+                                print_bullet(&format!(
+                                    "Loaded stale cache from {} ago.",
+                                    humanize_age(stale.age_secs)
+                                ));
+
+                                live_options = Some(build_model_options(
+                                    stale
+                                        .models
+                                        .into_iter()
+                                        .take(LIVE_MODEL_MAX_OPTIONS)
+                                        .collect(),
+                                    "stale-cache",
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            print_bullet("No API key detected, so using curated model list.");
+            print_bullet("Tip: add an API key and rerun onboarding to fetch live models.");
+        }
+    }
+
+    if let Some(live_model_options) = live_options {
+        let source_options = vec![
+            format!("Provider model list ({})", live_model_options.len()),
+            format!("Curated starter list ({})", model_options.len()),
+        ];
+
+        let source_idx = Select::new()
+            .with_prompt("  Model source")
+            .items(&source_options)
+            .default(0)
+            .interact()?;
+
+        if source_idx == 0 {
+            model_options = live_model_options;
+        }
+    }
+
+    if model_options.is_empty() {
+        model_options.push((
+            default_model_for_provider(provider_name),
+            "Provider default model".to_string(),
+        ));
+    }
+
+    model_options.push((
+        CUSTOM_MODEL_SENTINEL.to_string(),
+        "Custom model ID (type manually)".to_string(),
+    ));
+
+    let model_labels: Vec<String> = model_options
+        .iter()
+        .map(|(model_id, label)| format!("{label} — {}", style(model_id).dim()))
+        .collect();
 
     let model_idx = Select::new()
         .with_prompt("  Select your default model")
@@ -829,7 +1537,15 @@ fn setup_provider() -> Result<(String, String, String)> {
         .default(0)
         .interact()?;
 
-    let model = models[model_idx].0.to_string();
+    let selected_model = model_options[model_idx].0.clone();
+    let model = if selected_model == CUSTOM_MODEL_SENTINEL {
+        Input::new()
+            .with_prompt("  Enter custom model ID")
+            .default(default_model_for_provider(provider_name))
+            .interact_text()?
+    } else {
+        selected_model
+    };
 
     println!(
         "  {} Provider: {} | Model: {}",
@@ -2796,6 +3512,7 @@ fn print_summary(config: &Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use tempfile::TempDir;
 
     // ── ProjectContext defaults ──────────────────────────────────
@@ -3209,6 +3926,176 @@ mod tests {
 
         let heartbeat = fs::read_to_string(tmp.path().join("HEARTBEAT.md")).unwrap();
         assert!(heartbeat.contains("Claw"));
+    }
+
+    // ── model helper coverage ───────────────────────────────────
+
+    #[test]
+    fn default_model_for_provider_uses_latest_defaults() {
+        assert_eq!(default_model_for_provider("openai"), "gpt-5.1");
+        assert_eq!(
+            default_model_for_provider("anthropic"),
+            "claude-sonnet-4-20250514"
+        );
+        assert_eq!(default_model_for_provider("gemini"), "gemini-2.5-pro");
+    }
+
+    #[test]
+    fn curated_models_for_openai_include_latest_choices() {
+        let ids: Vec<String> = curated_models_for_provider("openai")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+
+        assert!(ids.contains(&"gpt-5.1".to_string()));
+        assert!(ids.contains(&"gpt-5-mini".to_string()));
+    }
+
+    #[test]
+    fn supports_live_model_fetch_for_supported_and_unsupported_providers() {
+        assert!(supports_live_model_fetch("openai"));
+        assert!(supports_live_model_fetch("anthropic"));
+        assert!(supports_live_model_fetch("gemini"));
+        assert!(supports_live_model_fetch("ollama"));
+        assert!(!supports_live_model_fetch("venice"));
+    }
+
+    #[test]
+    fn parse_openai_model_ids_supports_data_array_payload() {
+        let payload = json!({
+            "data": [
+                {"id": "  gpt-5.1  "},
+                {"id": "gpt-5-mini"},
+                {"id": "gpt-5.1"},
+                {"id": ""}
+            ]
+        });
+
+        let ids = parse_openai_compatible_model_ids(&payload);
+        assert_eq!(ids, vec!["gpt-5-mini".to_string(), "gpt-5.1".to_string()]);
+    }
+
+    #[test]
+    fn parse_openai_model_ids_supports_root_array_payload() {
+        let payload = json!([
+            {"id": "alpha"},
+            {"id": "beta"},
+            {"id": "alpha"}
+        ]);
+
+        let ids = parse_openai_compatible_model_ids(&payload);
+        assert_eq!(ids, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    #[test]
+    fn parse_gemini_model_ids_filters_for_generate_content() {
+        let payload = json!({
+            "models": [
+                {
+                    "name": "models/gemini-2.5-pro",
+                    "supportedGenerationMethods": ["generateContent", "countTokens"]
+                },
+                {
+                    "name": "models/text-embedding-004",
+                    "supportedGenerationMethods": ["embedContent"]
+                },
+                {
+                    "name": "models/gemini-2.5-flash",
+                    "supportedGenerationMethods": ["generateContent"]
+                }
+            ]
+        });
+
+        let ids = parse_gemini_model_ids(&payload);
+        assert_eq!(
+            ids,
+            vec!["gemini-2.5-flash".to_string(), "gemini-2.5-pro".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_ollama_model_ids_extracts_and_deduplicates_names() {
+        let payload = json!({
+            "models": [
+                {"name": "llama3.2:latest"},
+                {"name": "mistral:latest"},
+                {"name": "llama3.2:latest"}
+            ]
+        });
+
+        let ids = parse_ollama_model_ids(&payload);
+        assert_eq!(
+            ids,
+            vec!["llama3.2:latest".to_string(), "mistral:latest".to_string()]
+        );
+    }
+
+    #[test]
+    fn model_cache_round_trip_returns_fresh_entry() {
+        let tmp = TempDir::new().unwrap();
+        let models = vec!["gpt-5.1".to_string(), "gpt-5-mini".to_string()];
+
+        cache_live_models_for_provider(tmp.path(), "openai", &models).unwrap();
+
+        let cached =
+            load_cached_models_for_provider(tmp.path(), "openai", MODEL_CACHE_TTL_SECS).unwrap();
+        let cached = cached.expect("expected fresh cached models");
+
+        assert_eq!(cached.models.len(), 2);
+        assert!(cached.models.contains(&"gpt-5.1".to_string()));
+        assert!(cached.models.contains(&"gpt-5-mini".to_string()));
+    }
+
+    #[test]
+    fn model_cache_ttl_filters_stale_entries() {
+        let tmp = TempDir::new().unwrap();
+        let stale = ModelCacheState {
+            entries: vec![ModelCacheEntry {
+                provider: "openai".to_string(),
+                fetched_at_unix: now_unix_secs().saturating_sub(MODEL_CACHE_TTL_SECS + 120),
+                models: vec!["gpt-5.1".to_string()],
+            }],
+        };
+
+        save_model_cache_state(tmp.path(), &stale).unwrap();
+
+        let fresh =
+            load_cached_models_for_provider(tmp.path(), "openai", MODEL_CACHE_TTL_SECS).unwrap();
+        assert!(fresh.is_none());
+
+        let stale_any = load_any_cached_models_for_provider(tmp.path(), "openai").unwrap();
+        assert!(stale_any.is_some());
+    }
+
+    #[test]
+    fn run_models_refresh_uses_fresh_cache_without_network() {
+        let tmp = TempDir::new().unwrap();
+
+        cache_live_models_for_provider(tmp.path(), "openai", &["gpt-5.1".to_string()]).unwrap();
+
+        let config = Config {
+            workspace_dir: tmp.path().to_path_buf(),
+            default_provider: Some("openai".to_string()),
+            ..Config::default()
+        };
+
+        run_models_refresh(&config, None, false).unwrap();
+    }
+
+    #[test]
+    fn run_models_refresh_rejects_unsupported_provider() {
+        let tmp = TempDir::new().unwrap();
+
+        let config = Config {
+            workspace_dir: tmp.path().to_path_buf(),
+            default_provider: Some("venice".to_string()),
+            ..Config::default()
+        };
+
+        let err = run_models_refresh(&config, None, true).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("does not support live model discovery"));
     }
 
     // ── provider_env_var ────────────────────────────────────────
