@@ -90,9 +90,25 @@ struct Choice {
     message: ResponseMessage,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct ResponseMessage {
-    content: String,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCall>>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ToolCall {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    function: Option<Function>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct Function {
+    name: Option<String>,
+    arguments: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -287,7 +303,17 @@ impl Provider for OpenAiCompatibleProvider {
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message.content)
+            .map(|c| {
+                // If tool_calls are present, serialize the full message as JSON
+                // so parse_tool_calls can handle the OpenAI-style format
+                if c.message.tool_calls.is_some() && c.message.tool_calls.as_ref().map_or(false, |t| !t.is_empty()) {
+                    serde_json::to_string(&c.message)
+                        .unwrap_or_else(|_| c.message.content.unwrap_or_default())
+                } else {
+                    // No tool calls, return content as-is
+                    c.message.content.unwrap_or_default()
+                }
+            })
             .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))
     }
 
@@ -359,7 +385,17 @@ impl Provider for OpenAiCompatibleProvider {
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message.content)
+            .map(|c| {
+                // If tool_calls are present, serialize the full message as JSON
+                // so parse_tool_calls can handle the OpenAI-style format
+                if c.message.tool_calls.is_some() && c.message.tool_calls.as_ref().map_or(false, |t| !t.is_empty()) {
+                    serde_json::to_string(&c.message)
+                        .unwrap_or_else(|_| c.message.content.unwrap_or_default())
+                } else {
+                    // No tool calls, return content as-is
+                    c.message.content.unwrap_or_default()
+                }
+            })
             .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))
     }
 }
@@ -431,7 +467,7 @@ mod tests {
     fn response_deserializes() {
         let json = r#"{"choices":[{"message":{"content":"Hello from Venice!"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.choices[0].message.content, "Hello from Venice!");
+        assert_eq!(resp.choices[0].message.content, Some("Hello from Venice!".to_string()));
     }
 
     #[test]
