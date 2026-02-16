@@ -1,0 +1,22 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Redirecting...</title>
+    <script>
+      var lang = navigator.language || navigator.userLanguage;
+      if (lang.startsWith("zh")) {
+        window.location.replace("zh/index.html");
+      } else {
+        window.location.replace("en/index.html");
+      }
+    </script>
+  </head>
+  <body>
+    <p>
+      If you are not redirected automatically, follow this
+      <a href="en/index.html">link to English documentation</a> or
+      <a href="zh/index.html">中文文档</a>.
+    </p>
+  </body>
+</html>

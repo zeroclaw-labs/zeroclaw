@@ -1,0 +1,10 @@
+[book]
+authors = ["ZeroClaw Team"]
+language = "en"
+multilingual = false
+src = "docs"
+title = "ZeroClaw Documentation"
+
+[output.html]
+git-repository-url = "https://github.com/zeroclaw-labs/zeroclaw"
+edit-url-template = "https://github.com/zeroclaw-labs/zeroclaw/edit/main/docs/{path}"

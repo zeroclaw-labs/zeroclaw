@@ -5,6 +5,10 @@
 <h1 align="center">ZeroClaw 🦀</h1>
 
 <p align="center">
+  English | <a href="./README_zh-CN.md">中文</a>
+</p>
+
+<p align="center">
   <strong>Zero overhead. Zero compromise. 100% Rust. 100% Agnostic.</strong><br>
   ⚡️ <strong>Runs on $10 hardware with <5MB RAM: That's 99% less memory than OpenClaw and 98% cheaper than a Mac mini!</strong>
 </p>
@@ -38,13 +42,13 @@ Fast, small, and fully autonomous AI assistant infrastructure — deploy anywher
 
 Local machine quick benchmark (macOS arm64, Feb 2026) normalized for 0.8GHz edge hardware.
 
-| | OpenClaw | NanoBot | PicoClaw | ZeroClaw 🦀 |
-|---|---|---|---|---|
-| **Language** | TypeScript | Python | Go | **Rust** |
-| **RAM** | > 1GB | > 100MB | < 10MB | **< 5MB** |
-| **Startup (0.8GHz core)** | > 500s | > 30s | < 1s | **< 10ms** |
-| **Binary Size** | ~28MB (dist) | N/A (Scripts) | ~8MB | **3.4 MB** |
-| **Cost** | Mac Mini $599 | Linux SBC ~$50 | Linux Board $10 | **Any hardware $10** |
+|                           | OpenClaw      | NanoBot        | PicoClaw        | ZeroClaw 🦀          |
+| ------------------------- | ------------- | -------------- | --------------- | -------------------- |
+| **Language**              | TypeScript    | Python         | Go              | **Rust**             |
+| **RAM**                   | > 1GB         | > 100MB        | < 10MB          | **< 5MB**            |
+| **Startup (0.8GHz core)** | > 500s        | > 30s          | < 1s            | **< 10ms**           |
+| **Binary Size**           | ~28MB (dist)  | N/A (Scripts)  | ~8MB            | **3.4 MB**           |
+| **Cost**                  | Mac Mini $599 | Linux SBC ~$50 | Linux Board $10 | **Any hardware $10** |
 
 > Notes: ZeroClaw results measured with `/usr/bin/time -l` on release builds. OpenClaw requires Node.js runtime (~390MB overhead). PicoClaw and ZeroClaw are static binaries.
 
@@ -124,20 +128,20 @@ Every subsystem is a **trait** — swap implementations with a config change, ze
   <img src="docs/architecture.svg" alt="ZeroClaw Architecture" width="900" />
 </p>
 
-| Subsystem | Trait | Ships with | Extend |
-|-----------|-------|------------|--------|
-| **AI Models** | `Provider` | 22+ providers (OpenRouter, Anthropic, OpenAI, Ollama, Venice, Groq, Mistral, xAI, DeepSeek, Together, Fireworks, Perplexity, Cohere, Bedrock, etc.) | `custom:https://your-api.com` — any OpenAI-compatible API |
-| **Channels** | `Channel` | CLI, Telegram, Discord, Slack, iMessage, Matrix, WhatsApp, Webhook | Any messaging API |
-| **Memory** | `Memory` | SQLite with hybrid search (FTS5 + vector cosine similarity), Lucid bridge (CLI sync + SQLite fallback), Markdown | Any persistence backend |
-| **Tools** | `Tool` | shell, file_read, file_write, memory_store, memory_recall, memory_forget, browser_open (Brave + allowlist), browser (agent-browser / rust-native), composio (optional) | Any capability |
-| **Observability** | `Observer` | Noop, Log, Multi | Prometheus, OTel |
-| **Runtime** | `RuntimeAdapter` | Native, Docker (sandboxed) | WASM (planned; unsupported kinds fail fast) |
-| **Security** | `SecurityPolicy` | Gateway pairing, sandbox, allowlists, rate limits, filesystem scoping, encrypted secrets | — |
-| **Identity** | `IdentityConfig` | OpenClaw (markdown), AIEOS v1.1 (JSON) | Any identity format |
-| **Tunnel** | `Tunnel` | None, Cloudflare, Tailscale, ngrok, Custom | Any tunnel binary |
-| **Heartbeat** | Engine | HEARTBEAT.md periodic tasks | — |
-| **Skills** | Loader | TOML manifests + SKILL.md instructions | Community skill packs |
-| **Integrations** | Registry | 50+ integrations across 9 categories | Plugin system |
+| Subsystem         | Trait            | Ships with                                                                                                                                                             | Extend                                                    |
+| ----------------- | ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
+| **AI Models**     | `Provider`       | 22+ providers (OpenRouter, Anthropic, OpenAI, Ollama, Venice, Groq, Mistral, xAI, DeepSeek, Together, Fireworks, Perplexity, Cohere, Bedrock, etc.)                    | `custom:https://your-api.com` — any OpenAI-compatible API |
+| **Channels**      | `Channel`        | CLI, Telegram, Discord, Slack, iMessage, Matrix, WhatsApp, Webhook                                                                                                     | Any messaging API                                         |
+| **Memory**        | `Memory`         | SQLite with hybrid search (FTS5 + vector cosine similarity), Lucid bridge (CLI sync + SQLite fallback), Markdown                                                       | Any persistence backend                                   |
+| **Tools**         | `Tool`           | shell, file_read, file_write, memory_store, memory_recall, memory_forget, browser_open (Brave + allowlist), browser (agent-browser / rust-native), composio (optional) | Any capability                                            |
+| **Observability** | `Observer`       | Noop, Log, Multi                                                                                                                                                       | Prometheus, OTel                                          |
+| **Runtime**       | `RuntimeAdapter` | Native, Docker (sandboxed)                                                                                                                                             | WASM (planned; unsupported kinds fail fast)               |
+| **Security**      | `SecurityPolicy` | Gateway pairing, sandbox, allowlists, rate limits, filesystem scoping, encrypted secrets                                                                               | —                                                         |
+| **Identity**      | `IdentityConfig` | OpenClaw (markdown), AIEOS v1.1 (JSON)                                                                                                                                 | Any identity format                                       |
+| **Tunnel**        | `Tunnel`         | None, Cloudflare, Tailscale, ngrok, Custom                                                                                                                             | Any tunnel binary                                         |
+| **Heartbeat**     | Engine           | HEARTBEAT.md periodic tasks                                                                                                                                            | —                                                         |
+| **Skills**        | Loader           | TOML manifests + SKILL.md instructions                                                                                                                                 | Community skill packs                                     |
+| **Integrations**  | Registry         | 50+ integrations across 9 categories                                                                                                                                   | Plugin system                                             |
 
 ### Runtime support (current)
 
@@ -150,15 +154,15 @@ When an unsupported `runtime.kind` is configured, ZeroClaw now exits with a clea
 
 All custom, zero external dependencies — no Pinecone, no Elasticsearch, no LangChain:
 
-| Layer | Implementation |
-|-------|---------------|
-| **Vector DB** | Embeddings stored as BLOB in SQLite, cosine similarity search |
-| **Keyword Search** | FTS5 virtual tables with BM25 scoring |
-| **Hybrid Merge** | Custom weighted merge function (`vector.rs`) |
-| **Embeddings** | `EmbeddingProvider` trait — OpenAI, custom URL, or noop |
-| **Chunking** | Line-based markdown chunker with heading preservation |
-| **Caching** | SQLite `embedding_cache` table with LRU eviction |
-| **Safe Reindex** | Rebuild FTS5 + re-embed missing vectors atomically |
+| Layer              | Implementation                                                |
+| ------------------ | ------------------------------------------------------------- |
+| **Vector DB**      | Embeddings stored as BLOB in SQLite, cosine similarity search |
+| **Keyword Search** | FTS5 virtual tables with BM25 scoring                         |
+| **Hybrid Merge**   | Custom weighted merge function (`vector.rs`)                  |
+| **Embeddings**     | `EmbeddingProvider` trait — OpenAI, custom URL, or noop       |
+| **Chunking**       | Line-based markdown chunker with heading preservation         |
+| **Caching**        | SQLite `embedding_cache` table with LRU eviction              |
+| **Safe Reindex**   | Rebuild FTS5 + re-embed missing vectors atomically            |
 
 The agent automatically recalls, saves, and manages memory via tools.
 
@@ -187,12 +191,12 @@ ZeroClaw enforces security at **every layer** — not just the sandbox. It passe
 
 ### Security Checklist
 
-| # | Item | Status | How |
-|---|------|--------|-----|
-| 1 | **Gateway not publicly exposed** | ✅ | Binds `127.0.0.1` by default. Refuses `0.0.0.0` without tunnel or explicit `allow_public_bind = true`. |
-| 2 | **Pairing required** | ✅ | 6-digit one-time code on startup. Exchange via `POST /pair` for bearer token. All `/webhook` requests require `Authorization: Bearer <token>`. |
-| 3 | **Filesystem scoped (no /)** | ✅ | `workspace_only = true` by default. 14 system dirs + 4 sensitive dotfiles blocked. Null byte injection blocked. Symlink escape detection via canonicalization + resolved-path workspace checks in file read/write tools. |
-| 4 | **Access via tunnel only** | ✅ | Gateway refuses public bind without active tunnel. Supports Tailscale, Cloudflare, ngrok, or any custom tunnel. |
+| #   | Item                             | Status | How                                                                                                                                                                                                                      |
+| --- | -------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 1   | **Gateway not publicly exposed** | ✅     | Binds `127.0.0.1` by default. Refuses `0.0.0.0` without tunnel or explicit `allow_public_bind = true`.                                                                                                                   |
+| 2   | **Pairing required**             | ✅     | 6-digit one-time code on startup. Exchange via `POST /pair` for bearer token. All `/webhook` requests require `Authorization: Bearer <token>`.                                                                           |
+| 3   | **Filesystem scoped (no /)**     | ✅     | `workspace_only = true` by default. 14 system dirs + 4 sensitive dotfiles blocked. Null byte injection blocked. Symlink escape detection via canonicalization + resolved-path workspace checks in file read/write tools. |
+| 4   | **Access via tunnel only**       | ✅     | Gateway refuses public bind without active tunnel. Supports Tailscale, Cloudflare, ngrok, or any custom tunnel.                                                                                                          |
 
 > **Run your own nmap:** `nmap -p 1-65535 <your-host>` — ZeroClaw binds to localhost only, so nothing is exposed unless you explicitly configure a tunnel.
 
@@ -241,6 +245,7 @@ WhatsApp uses Meta's Cloud API with webhooks (push-based, not polling):
    - **Verify Token:** You define this (any random string) — Meta will send it back during webhook verification
 
 3. **Configure ZeroClaw:**
+
    ```toml
    [channels_config.whatsapp]
    access_token = "EAABx..."
@@ -250,9 +255,11 @@ WhatsApp uses Meta's Cloud API with webhooks (push-based, not polling):
    ```
 
 4. **Start the gateway with a tunnel:**
+
    ```bash
    zeroclaw gateway --port 8080
    ```
+
    WhatsApp requires HTTPS, so use a tunnel (ngrok, Cloudflare, Tailscale Funnel).
 
 5. **Configure Meta webhook:**
@@ -363,6 +370,7 @@ ZeroClaw supports **identity-agnostic** AI personas through two formats:
 ### OpenClaw (Default)
 
 Traditional markdown files in your workspace:
+
 - `IDENTITY.md` — Who the agent is
 - `SOUL.md` — Core personality and values
 - `USER.md` — Who the agent is helping
@@ -411,46 +419,46 @@ aieos_inline = '''
 
 #### AIEOS Schema Sections
 
-| Section | Description |
-|---------|-------------|
-| `identity` | Names, bio, origin, residence |
-| `psychology` | Neural matrix (cognitive weights), MBTI, OCEAN, moral compass |
-| `linguistics` | Text style, formality, catchphrases, forbidden words |
-| `motivations` | Core drive, short/long-term goals, fears |
-| `capabilities` | Skills and tools the agent can access |
-| `physicality` | Visual descriptors for image generation |
-| `history` | Origin story, education, occupation |
-| `interests` | Hobbies, favorites, lifestyle |
+| Section        | Description                                                   |
+| -------------- | ------------------------------------------------------------- |
+| `identity`     | Names, bio, origin, residence                                 |
+| `psychology`   | Neural matrix (cognitive weights), MBTI, OCEAN, moral compass |
+| `linguistics`  | Text style, formality, catchphrases, forbidden words          |
+| `motivations`  | Core drive, short/long-term goals, fears                      |
+| `capabilities` | Skills and tools the agent can access                         |
+| `physicality`  | Visual descriptors for image generation                       |
+| `history`      | Origin story, education, occupation                           |
+| `interests`    | Hobbies, favorites, lifestyle                                 |
 
 See [aieos.org](https://aieos.org) for the full schema and live examples.
 
 ## Gateway API
 
-| Endpoint | Method | Auth | Description |
-|----------|--------|------|-------------|
-| `/health` | GET | None | Health check (always public, no secrets leaked) |
-| `/pair` | POST | `X-Pairing-Code` header | Exchange one-time code for bearer token |
-| `/webhook` | POST | `Authorization: Bearer <token>` | Send message: `{"message": "your prompt"}` |
-| `/whatsapp` | GET | Query params | Meta webhook verification (hub.mode, hub.verify_token, hub.challenge) |
-| `/whatsapp` | POST | None (Meta signature) | WhatsApp incoming message webhook |
+| Endpoint    | Method | Auth                            | Description                                                           |
+| ----------- | ------ | ------------------------------- | --------------------------------------------------------------------- |
+| `/health`   | GET    | None                            | Health check (always public, no secrets leaked)                       |
+| `/pair`     | POST   | `X-Pairing-Code` header         | Exchange one-time code for bearer token                               |
+| `/webhook`  | POST   | `Authorization: Bearer <token>` | Send message: `{"message": "your prompt"}`                            |
+| `/whatsapp` | GET    | Query params                    | Meta webhook verification (hub.mode, hub.verify_token, hub.challenge) |
+| `/whatsapp` | POST   | None (Meta signature)           | WhatsApp incoming message webhook                                     |
 
 ## Commands
 
-| Command | Description |
-|---------|-------------|
-| `onboard` | Quick setup (default) |
-| `onboard --interactive` | Full interactive 7-step wizard |
-| `onboard --channels-only` | Reconfigure channels/allowlists only (fast repair flow) |
-| `agent -m "..."` | Single message mode |
-| `agent` | Interactive chat mode |
-| `gateway` | Start webhook server (default: `127.0.0.1:8080`) |
-| `gateway --port 0` | Random port mode |
-| `daemon` | Start long-running autonomous runtime |
-| `service install/start/stop/status/uninstall` | Manage user-level background service |
-| `doctor` | Diagnose daemon/scheduler/channel freshness |
-| `status` | Show full system status |
-| `channel doctor` | Run health checks for configured channels |
-| `integrations info <name>` | Show setup/status details for one integration |
+| Command                                       | Description                                             |
+| --------------------------------------------- | ------------------------------------------------------- |
+| `onboard`                                     | Quick setup (default)                                   |
+| `onboard --interactive`                       | Full interactive 7-step wizard                          |
+| `onboard --channels-only`                     | Reconfigure channels/allowlists only (fast repair flow) |
+| `agent -m "..."`                              | Single message mode                                     |
+| `agent`                                       | Interactive chat mode                                   |
+| `gateway`                                     | Start webhook server (default: `127.0.0.1:8080`)        |
+| `gateway --port 0`                            | Random port mode                                        |
+| `daemon`                                      | Start long-running autonomous runtime                   |
+| `service install/start/stop/status/uninstall` | Manage user-level background service                    |
+| `doctor`                                      | Diagnose daemon/scheduler/channel freshness             |
+| `status`                                      | Show full system status                                 |
+| `channel doctor`                              | Run health checks for configured channels               |
+| `integrations info <name>`                    | Show setup/status details for one integration           |
 
 ## Development
 
@@ -526,6 +534,7 @@ MIT — see [LICENSE](LICENSE)
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Implement a trait, submit a PR:
+
 - CI workflow guide: [docs/ci-map.md](docs/ci-map.md)
 - New `Provider` → `src/providers/`
 - New `Channel` → `src/channels/`
@@ -534,7 +543,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Implement a trait, submit a PR:
 - New `Memory` → `src/memory/`
 - New `Tunnel` → `src/tunnel/`
 - New `Skill` → `~/.zeroclaw/workspace/skills/<name>/`
-
 
 ---
 

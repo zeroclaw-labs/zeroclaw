@@ -1,0 +1,52 @@
+name: Deploy Documentation
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "docs/**"
+      - "book.toml"
+      - "README.md"
+      - ".github/workflows/deploy-docs.yml"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup mdBook
+        uses: peaceiris/actions-mdbook@v2
+        with:
+          mdbook-version: "latest"
+
+      - name: Preparing Source
+        run: |
+          # Copy root READMEs to docs folder so mdBook can include them
+          cp README.md docs/README.md
+          cp README_zh-CN.md docs/README_zh-CN.md
+
+      - name: Build Book (English)
+        run: mdbook build -d book/en
+
+      - name: Build Book (Chinese)
+        run: |
+          # Swap SUMMARY for Chinese build
+          cp docs/SUMMARY_zh.md docs/SUMMARY.md
+          # Build using Chinese config
+          mdbook build -d book/zh -c book_zh.toml
+
+      - name: Finalize Deployment Structure
+        run: |
+          # Add root redirect
+          cp docs/index.html book/index.html
+
+      - name: Deploy
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./book
