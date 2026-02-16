@@ -68,7 +68,7 @@ impl OpenAiProvider {
                 messages.push(serde_json::json!({
                     "role": "system",
                     "content": [
-                        { "type": "text", "text": system }
+                        { "type": "input_text", "text": system }
                     ]
                 }));
             }
@@ -77,7 +77,7 @@ impl OpenAiProvider {
         messages.push(serde_json::json!({
             "role": "user",
             "content": [
-                { "type": "text", "text": message }
+                { "type": "input_text", "text": message }
             ]
         }));
 
@@ -187,7 +187,7 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"role\":\"system\""));
         assert!(json.contains("\"role\":\"user\""));
-        assert!(json.contains("\"type\":\"text\""));
+        assert!(json.contains("\"type\":\"input_text\""));
         assert!(json.contains("You are ZeroClaw"));
         assert!(json.contains("\"text\":\"hello\""));
         assert!(json.contains("gpt-4o"));
