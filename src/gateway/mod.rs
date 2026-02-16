@@ -4640,6 +4640,7 @@ async fn handle_chat_socket(mut socket: ws::WebSocket, state: AppState, tenant: 
                             "runId": run_id,
                             "chatId": chat_id,
                             "status": "complete",
+                            "message": assistant_text,
                             "durationMs": response.duration_ms,
                             "tokenCount": 0
                         })
@@ -4696,6 +4697,7 @@ async fn handle_chat_socket(mut socket: ws::WebSocket, state: AppState, tenant: 
                             "runId": run_id,
                             "chatId": chat_id,
                             "status": "error",
+                            "message": format!("LLM error: {e}"),
                             "durationMs": (now - started).max(0),
                             "tokenCount": 0
                         })
