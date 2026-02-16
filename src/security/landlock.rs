@@ -26,8 +26,7 @@ impl LandlockSandbox {
     /// Create a Landlock sandbox with a specific workspace directory
     pub fn with_workspace(workspace_dir: Option<std::path::PathBuf>) -> std::io::Result<Self> {
         // Test if Landlock is available by trying to create a minimal ruleset
-        let test_ruleset = Ruleset::new()
-            .set_access_fs(AccessFS::read_file | AccessFS::write_file);
+        let test_ruleset = Ruleset::new().set_access_fs(AccessFS::read_file | AccessFS::write_file);
 
         match test_ruleset.create() {
             Ok(_) => Ok(Self { workspace_dir }),
@@ -48,30 +47,35 @@ impl LandlockSandbox {
 
     /// Apply Landlock restrictions to the current process
     fn apply_restrictions(&self) -> std::io::Result<()> {
-        let mut ruleset = Ruleset::new()
-            .set_access_fs(
-                AccessFS::read_file
-                    | AccessFS::write_file
-                    | AccessFS::read_dir
-                    | AccessFS::remove_dir
-                    | AccessFS::remove_file
-                    | AccessFS::make_char
-                    | AccessFS::make_sock
-                    | AccessFS::make_fifo
-                    | AccessFS::make_block
-                    | AccessFS::make_reg
-                    | AccessFS::make_sym
-            );
+        let mut ruleset = Ruleset::new().set_access_fs(
+            AccessFS::read_file
+                | AccessFS::write_file
+                | AccessFS::read_dir
+                | AccessFS::remove_dir
+                | AccessFS::remove_file
+                | AccessFS::make_char
+                | AccessFS::make_sock
+                | AccessFS::make_fifo
+                | AccessFS::make_block
+                | AccessFS::make_reg
+                | AccessFS::make_sym,
+        );
 
         // Allow workspace directory (read/write)
         if let Some(ref workspace) = self.workspace_dir {
             if workspace.exists() {
-                ruleset = ruleset.add_path(workspace, AccessFS::read_file | AccessFS::write_file | AccessFS::read_dir)?;
+                ruleset = ruleset.add_path(
+                    workspace,
+                    AccessFS::read_file | AccessFS::write_file | AccessFS::read_dir,
+                )?;
             }
         }
 
         // Allow /tmp for general operations
-        ruleset = ruleset.add_path(Path::new("/tmp"), AccessFS::read_file | AccessFS::write_file)?;
+        ruleset = ruleset.add_path(
+            Path::new("/tmp"),
+            AccessFS::read_file | AccessFS::write_file,
+        )?;
 
         // Allow /usr and /bin for executing commands
         ruleset = ruleset.add_path(Path::new("/usr"), AccessFS::read_file | AccessFS::read_dir)?;
@@ -193,7 +197,10 @@ mod tests {
         // Result depends on platform and feature flag
         match result {
             Ok(sandbox) => assert!(sandbox.is_available()),
-            Err(_) => assert!(!cfg!(all(feature = "sandbox-landlock", target_os = "linux"))),
+            Err(_) => assert!(!cfg!(all(
+                feature = "sandbox-landlock",
+                target_os = "linux"
+            ))),
         }
     }
 }

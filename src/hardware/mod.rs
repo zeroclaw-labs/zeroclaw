@@ -168,7 +168,10 @@ impl HardwareConfig {
             bail!("hardware.baud_rate must be greater than 0.");
         }
         if self.baud_rate > 4_000_000 {
-            bail!("hardware.baud_rate of {} exceeds the 4 MHz safety limit.", self.baud_rate);
+            bail!(
+                "hardware.baud_rate of {} exceeds the 4 MHz safety limit.",
+                self.baud_rate
+            );
         }
 
         // PWM frequency sanity
@@ -228,20 +231,16 @@ fn discover_native_gpio(devices: &mut Vec<DiscoveredDevice>) {
     if gpiomem.exists() || gpiochip.exists() {
         // Try to read model from device tree
         let model = read_board_model();
-        let name = model
-            .as_deref()
-            .unwrap_or("Linux SBC with GPIO");
+        let name = model.as_deref().unwrap_or("Linux SBC with GPIO");
 
         devices.push(DiscoveredDevice {
             name: format!("{name} (Native GPIO)"),
             transport: HardwareTransport::Native,
-            device_path: Some(
-                if gpiomem.exists() {
-                    "/dev/gpiomem".into()
-                } else {
-                    "/dev/gpiochip0".into()
-                },
-            ),
+            device_path: Some(if gpiomem.exists() {
+                "/dev/gpiomem".into()
+            } else {
+                "/dev/gpiochip0".into()
+            }),
             detail: model,
         });
     }
@@ -287,10 +286,7 @@ fn serial_device_paths() -> Vec<String> {
             "/dev/tty.wchusbserial*".into(), // CH340 clones
         ]
     } else if cfg!(target_os = "linux") {
-        vec![
-            "/dev/ttyUSB*".into(),
-            "/dev/ttyACM*".into(),
-        ]
+        vec!["/dev/ttyUSB*".into(), "/dev/ttyACM*".into()]
     } else {
         // Windows / other — not yet supported for auto-discovery
         vec![]
@@ -452,10 +448,7 @@ pub fn create_hal(config: &HardwareConfig) -> Result<Box<dyn HardwareHal>> {
             );
         }
         HardwareTransport::Probe => {
-            let target = config
-                .probe_target
-                .as_deref()
-                .unwrap_or("unknown");
+            let target = config.probe_target.as_deref().unwrap_or("unknown");
             bail!(
                 "Probe transport targeting '{}' is configured but the probe-rs HAL \
                  backend is not yet compiled in. This will be available in a future release.",
@@ -471,15 +464,24 @@ pub fn create_hal(config: &HardwareConfig) -> Result<Box<dyn HardwareHal>> {
 /// based on discovery results.
 pub fn recommended_wizard_default(devices: &[DiscoveredDevice]) -> usize {
     // If we found native GPIO → recommend Native (index 0)
-    if devices.iter().any(|d| d.transport == HardwareTransport::Native) {
+    if devices
+        .iter()
+        .any(|d| d.transport == HardwareTransport::Native)
+    {
         return 0;
     }
     // If we found serial devices → recommend Tethered (index 1)
-    if devices.iter().any(|d| d.transport == HardwareTransport::Serial) {
+    if devices
+        .iter()
+        .any(|d| d.transport == HardwareTransport::Serial)
+    {
         return 1;
     }
     // If we found debug probes → recommend Probe (index 2)
-    if devices.iter().any(|d| d.transport == HardwareTransport::Probe) {
+    if devices
+        .iter()
+        .any(|d| d.transport == HardwareTransport::Probe)
+    {
         return 2;
     }
     // Default: Software Only (index 3)
@@ -487,10 +489,7 @@ pub fn recommended_wizard_default(devices: &[DiscoveredDevice]) -> usize {
 }
 
 /// Build a `HardwareConfig` from a wizard selection and discovered devices.
-pub fn config_from_wizard_choice(
-    choice: usize,
-    devices: &[DiscoveredDevice],
-) -> HardwareConfig {
+pub fn config_from_wizard_choice(choice: usize, devices: &[DiscoveredDevice]) -> HardwareConfig {
     match choice {
         // Native
         0 => {
@@ -548,39 +547,102 @@ mod tests {
 
     #[test]
     fn transport_parse_native_variants() {
-        assert_eq!(HardwareTransport::from_str_loose("native"), HardwareTransport::Native);
-        assert_eq!(HardwareTransport::from_str_loose("gpio"), HardwareTransport::Native);
-        assert_eq!(HardwareTransport::from_str_loose("rppal"), HardwareTransport::Native);
-        assert_eq!(HardwareTransport::from_str_loose("sysfs"), HardwareTransport::Native);
-        assert_eq!(HardwareTransport::from_str_loose("NATIVE"), HardwareTransport::Native);
-        assert_eq!(HardwareTransport::from_str_loose("  Native  "), HardwareTransport::Native);
+        assert_eq!(
+            HardwareTransport::from_str_loose("native"),
+            HardwareTransport::Native
+        );
+        assert_eq!(
+            HardwareTransport::from_str_loose("gpio"),
+            HardwareTransport::Native
+        );
+        assert_eq!(
+            HardwareTransport::from_str_loose("rppal"),
+            HardwareTransport::Native
+        );
+        assert_eq!(
+            HardwareTransport::from_str_loose("sysfs"),
+            HardwareTransport::Native
+        );
+        assert_eq!(
+            HardwareTransport::from_str_loose("NATIVE"),
+            HardwareTransport::Native
+        );
+        assert_eq!(
+            HardwareTransport::from_str_loose("  Native  "),
+            HardwareTransport::Native
+        );
     }
 
     #[test]
     fn transport_parse_serial_variants() {
-        assert_eq!(HardwareTransport::from_str_loose("serial"), HardwareTransport::Serial);
-        assert_eq!(HardwareTransport::from_str_loose("uart"), HardwareTransport::Serial);
-        assert_eq!(HardwareTransport::from_str_loose("usb"), HardwareTransport::Serial);
-        assert_eq!(HardwareTransport::from_str_loose("tethered"), HardwareTransport::Serial);
-        assert_eq!(HardwareTransport::from_str_loose("SERIAL"), HardwareTransport::Serial);
+        assert_eq!(
+            HardwareTransport::from_str_loose("serial"),
+            HardwareTransport::Serial
+        );
+        assert_eq!(
+            HardwareTransport::from_str_loose("uart"),
+            HardwareTransport::Serial
+        );
+        assert_eq!(
+            HardwareTransport::from_str_loose("usb"),
+            HardwareTransport::Serial
+        );
+        assert_eq!(
+            HardwareTransport::from_str_loose("tethered"),
+            HardwareTransport::Serial
+        );
+        assert_eq!(
+            HardwareTransport::from_str_loose("SERIAL"),
+            HardwareTransport::Serial
+        );
     }
 
     #[test]
     fn transport_parse_probe_variants() {
-        assert_eq!(HardwareTransport::from_str_loose("probe"), HardwareTransport::Probe);
-        assert_eq!(HardwareTransport::from_str_loose("probe-rs"), HardwareTransport::Probe);
-        assert_eq!(HardwareTransport::from_str_loose("swd"), HardwareTransport::Probe);
-        assert_eq!(HardwareTransport::from_str_loose("jtag"), HardwareTransport::Probe);
-        assert_eq!(HardwareTransport::from_str_loose("jlink"), HardwareTransport::Probe);
-        assert_eq!(HardwareTransport::from_str_loose("j-link"), HardwareTransport::Probe);
+        assert_eq!(
+            HardwareTransport::from_str_loose("probe"),
+            HardwareTransport::Probe
+        );
+        assert_eq!(
+            HardwareTransport::from_str_loose("probe-rs"),
+            HardwareTransport::Probe
+        );
+        assert_eq!(
+            HardwareTransport::from_str_loose("swd"),
+            HardwareTransport::Probe
+        );
+        assert_eq!(
+            HardwareTransport::from_str_loose("jtag"),
+            HardwareTransport::Probe
+        );
+        assert_eq!(
+            HardwareTransport::from_str_loose("jlink"),
+            HardwareTransport::Probe
+        );
+        assert_eq!(
+            HardwareTransport::from_str_loose("j-link"),
+            HardwareTransport::Probe
+        );
     }
 
     #[test]
     fn transport_parse_none_and_unknown() {
-        assert_eq!(HardwareTransport::from_str_loose("none"), HardwareTransport::None);
-        assert_eq!(HardwareTransport::from_str_loose(""), HardwareTransport::None);
-        assert_eq!(HardwareTransport::from_str_loose("foobar"), HardwareTransport::None);
-        assert_eq!(HardwareTransport::from_str_loose("bluetooth"), HardwareTransport::None);
+        assert_eq!(
+            HardwareTransport::from_str_loose("none"),
+            HardwareTransport::None
+        );
+        assert_eq!(
+            HardwareTransport::from_str_loose(""),
+            HardwareTransport::None
+        );
+        assert_eq!(
+            HardwareTransport::from_str_loose("foobar"),
+            HardwareTransport::None
+        );
+        assert_eq!(
+            HardwareTransport::from_str_loose("bluetooth"),
+            HardwareTransport::None
+        );
     }
 
     #[test]
@@ -918,7 +980,9 @@ mod tests {
     #[test]
     fn noop_hal_firmware_upload_fails() {
         let hal = NoopHal;
-        let err = hal.firmware_upload(Path::new("/tmp/firmware.bin")).unwrap_err();
+        let err = hal
+            .firmware_upload(Path::new("/tmp/firmware.bin"))
+            .unwrap_err();
         assert!(err.to_string().contains("not enabled"));
         assert!(err.to_string().contains("firmware.bin"));
     }

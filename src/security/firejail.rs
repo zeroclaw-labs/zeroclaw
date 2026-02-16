@@ -41,20 +41,23 @@ impl Sandbox for FirejailSandbox {
     fn wrap_command(&self, cmd: &mut Command) -> std::io::Result<()> {
         // Prepend firejail to the command
         let program = cmd.get_program().to_string_lossy().to_string();
-        let args: Vec<String> = cmd.get_args().map(|s| s.to_string_lossy().to_string()).collect();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
 
         // Build firejail wrapper with security flags
         let mut firejail_cmd = Command::new("firejail");
         firejail_cmd.args([
-            "--private=home",     // New home directory
-            "--private-dev",     // Minimal /dev
-            "--nosound",         // No audio
-            "--no3d",            // No 3D acceleration
-            "--novideo",         // No video devices
-            "--nowheel",         // No input devices
-            "--notv",            // No TV devices
-            "--noprofile",       // Skip profile loading
-            "--quiet",           // Suppress warnings
+            "--private=home", // New home directory
+            "--private-dev",  // Minimal /dev
+            "--nosound",      // No audio
+            "--no3d",         // No 3D acceleration
+            "--novideo",      // No video devices
+            "--nowheel",      // No input devices
+            "--notv",         // No TV devices
+            "--noprofile",    // Skip profile loading
+            "--quiet",        // Suppress warnings
         ]);
 
         // Add the original command
@@ -100,7 +103,10 @@ mod tests {
         let result = FirejailSandbox::new();
         match result {
             Ok(_) => println!("Firejail is installed"),
-            Err(e) => assert!(e.kind() == std::io::ErrorKind::NotFound || e.kind() == std::io::ErrorKind::Unsupported),
+            Err(e) => assert!(
+                e.kind() == std::io::ErrorKind::NotFound
+                    || e.kind() == std::io::ErrorKind::Unsupported
+            ),
         }
     }
 

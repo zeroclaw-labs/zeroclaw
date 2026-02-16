@@ -56,14 +56,21 @@ impl DockerSandbox {
 impl Sandbox for DockerSandbox {
     fn wrap_command(&self, cmd: &mut Command) -> std::io::Result<()> {
         let program = cmd.get_program().to_string_lossy().to_string();
-        let args: Vec<String> = cmd.get_args().map(|s| s.to_string_lossy().to_string()).collect();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
 
         let mut docker_cmd = Command::new("docker");
         docker_cmd.args([
-            "run", "--rm",
-            "--memory", "512m",
-            "--cpus", "1.0",
-            "--network", "none",
+            "run",
+            "--rm",
+            "--memory",
+            "512m",
+            "--cpus",
+            "1.0",
+            "--network",
+            "none",
         ]);
         docker_cmd.arg(&self.image);
         docker_cmd.arg(&program);

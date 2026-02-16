@@ -25,7 +25,9 @@ pub fn create_sandbox(config: &SecurityConfig) -> Arc<dyn Sandbox> {
                     }
                 }
             }
-            tracing::warn!("Landlock requested but not available, falling back to application-layer");
+            tracing::warn!(
+                "Landlock requested but not available, falling back to application-layer"
+            );
             Arc::new(super::traits::NoopSandbox)
         }
         SandboxBackend::Firejail => {
@@ -35,7 +37,9 @@ pub fn create_sandbox(config: &SecurityConfig) -> Arc<dyn Sandbox> {
                     return Arc::new(sandbox);
                 }
             }
-            tracing::warn!("Firejail requested but not available, falling back to application-layer");
+            tracing::warn!(
+                "Firejail requested but not available, falling back to application-layer"
+            );
             Arc::new(super::traits::NoopSandbox)
         }
         SandboxBackend::Bubblewrap => {
@@ -48,7 +52,9 @@ pub fn create_sandbox(config: &SecurityConfig) -> Arc<dyn Sandbox> {
                     }
                 }
             }
-            tracing::warn!("Bubblewrap requested but not available, falling back to application-layer");
+            tracing::warn!(
+                "Bubblewrap requested but not available, falling back to application-layer"
+            );
             Arc::new(super::traits::NoopSandbox)
         }
         SandboxBackend::Docker => {
@@ -138,7 +144,7 @@ mod tests {
     fn auto_mode_detects_something() {
         let config = SecurityConfig {
             sandbox: SandboxConfig {
-                enabled: None,  // Auto-detect
+                enabled: None, // Auto-detect
                 backend: SandboxBackend::Auto,
                 firejail_args: Vec::new(),
             },
