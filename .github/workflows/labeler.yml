@@ -297,7 +297,7 @@ jobs:
                 .toLowerCase()
                 .replace(/\.rs$/g, "")
                 .replace(/[^a-z0-9_-]+/g, "-")
-                .replace(/^-+|-+$/g, "")
+                .replace(/^[-_]+|[-_]+$/g, "")
                 .slice(0, 40);
             }
 
@@ -378,44 +378,36 @@ jobs:
               return refined;
             }
 
-            function compactNoisyModuleLabels(labels) {
-              const noisyPrefixes = new Set(["tool", "provider", "channel"]);
+            function compactModuleLabels(labels) {
               const groupedSegments = new Map();
-              const compacted = new Set();
+              const compactedModuleLabels = new Set();
               const forcePathPrefixes = new Set();
 
               for (const label of labels) {
                 const parsed = parseModuleLabel(label);
-                if (!parsed) continue;
+                if (!parsed) {
+                  compactedModuleLabels.add(label);
+                  continue;
+                }
                 if (!groupedSegments.has(parsed.prefix)) {
                   groupedSegments.set(parsed.prefix, new Set());
                 }
                 groupedSegments.get(parsed.prefix).add(parsed.segment);
               }
 
-              for (const label of labels) {
-                const parsed = parseModuleLabel(label);
-                if (!parsed) continue;
-                if (!noisyPrefixes.has(parsed.prefix)) {
-                  compacted.add(label);
-                }
-              }
-
               for (const [prefix, segments] of groupedSegments) {
-                if (!noisyPrefixes.has(prefix)) continue;
+                const uniqueSegments = [...new Set([...segments].filter(Boolean))];
+                if (uniqueSegments.length === 0) continue;
 
-                const specificSegments = [...segments].filter((segment) => segment !== "core");
-                const uniqueSpecificSegments = [...new Set(specificSegments)];
-
-                if (uniqueSpecificSegments.length === 1) {
-                  compacted.add(`${prefix}:${uniqueSpecificSegments[0]}`);
+                if (uniqueSegments.length === 1) {
+                  compactedModuleLabels.add(`${prefix}:${uniqueSegments[0]}`);
                 } else {
                   forcePathPrefixes.add(prefix);
                 }
               }
 
               return {
-                moduleLabels: compacted,
+                moduleLabels: compactedModuleLabels,
                 forcePathPrefixes,
               };
             }
@@ -560,7 +552,7 @@ jobs:
             }
 
             const refinedModuleLabels = refineModuleLabels(detectedModuleLabels);
-            const compactedModuleState = compactNoisyModuleLabels(refinedModuleLabels);
+            const compactedModuleState = compactModuleLabels(refinedModuleLabels);
             const selectedModuleLabels = compactedModuleState.moduleLabels;
             const forcePathPrefixes = compactedModuleState.forcePathPrefixes;
             const modulePrefixesWithLabels = new Set(
