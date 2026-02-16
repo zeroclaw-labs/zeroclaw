@@ -32,7 +32,7 @@
     dead_code
 )]
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use tracing::info;
 use tracing_subscriber::{fmt, EnvFilter};
