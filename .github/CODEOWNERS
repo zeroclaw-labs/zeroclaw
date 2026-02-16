@@ -8,3 +8,14 @@
 /.github/** @theonlyhennygod
 /Cargo.toml @theonlyhennygod
 /Cargo.lock @theonlyhennygod
+
+# CI
+/.github/workflows/**  @chumyin
+
+# Docs & governance
+/docs/**                @chumyin
+/AGENTS.md              @chumyin
+/CONTRIBUTING.md        @chumyin
+/docs/pr-workflow.md    @chumyin
+/docs/reviewer-playbook.md @chumyin
+/docs/ci-map.md         @chumyin
