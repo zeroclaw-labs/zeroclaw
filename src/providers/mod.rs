@@ -338,11 +338,15 @@ pub fn create_resilient_provider(
         }
     }
 
-    Ok(Box::new(ReliableProvider::new(
+    let reliable = ReliableProvider::new(
         providers,
         reliability.provider_retries,
         reliability.provider_backoff_ms,
-    )))
+    )
+    .with_api_keys(reliability.api_keys.clone())
+    .with_model_fallbacks(reliability.model_fallbacks.clone());
+
+    Ok(Box::new(reliable))
 }
 
 /// Create a RouterProvider if model routes are configured, otherwise return a
@@ -704,6 +708,8 @@ mod tests {
                 "openai".into(),
                 "openai".into(),
             ],
+            api_keys: Vec::new(),
+            model_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: 2,
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
