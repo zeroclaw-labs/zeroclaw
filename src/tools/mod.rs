@@ -197,6 +197,7 @@ mod tests {
             None,
             &browser,
             &http,
+            tmp.path(),
             &HashMap::new(),
             None,
         );
@@ -230,6 +231,7 @@ mod tests {
             None,
             &browser,
             &http,
+            tmp.path(),
             &HashMap::new(),
             None,
         );
@@ -394,6 +396,7 @@ mod tests {
             None,
             &browser,
             &http,
+            tmp.path(),
             &HashMap::new(),
             None,
         );
