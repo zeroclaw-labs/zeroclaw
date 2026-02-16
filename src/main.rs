@@ -178,6 +178,12 @@ enum Commands {
         cron_command: CronCommands,
     },
 
+    /// Manage provider model catalogs
+    Models {
+        #[command(subcommand)]
+        model_command: ModelCommands,
+    },
+
     /// Manage channels (telegram, discord, slack)
     Channel {
         #[command(subcommand)]
@@ -232,6 +238,20 @@ enum CronCommands {
     Remove {
         /// Task ID
         id: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ModelCommands {
+    /// Refresh and cache provider models
+    Refresh {
+        /// Provider name (defaults to configured default provider)
+        #[arg(long)]
+        provider: Option<String>,
+
+        /// Force live refresh and ignore fresh cache
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -434,6 +454,12 @@ async fn main() -> Result<()> {
         }
 
         Commands::Cron { cron_command } => cron::handle_command(cron_command, &config),
+
+        Commands::Models { model_command } => match model_command {
+            ModelCommands::Refresh { provider, force } => {
+                onboard::run_models_refresh(&config, provider.as_deref(), force)
+            }
+        },
 
         Commands::Service { service_command } => service::handle_command(&service_command, &config),
 

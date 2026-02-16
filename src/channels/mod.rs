@@ -20,7 +20,7 @@ pub use telegram::TelegramChannel;
 pub use traits::Channel;
 pub use whatsapp::WhatsAppChannel;
 
-use crate::agent::loop_::{agent_turn, build_tool_instructions};
+use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
 use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
@@ -181,7 +181,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
 
     let llm_result = tokio::time::timeout(
         Duration::from_secs(CHANNEL_MESSAGE_TIMEOUT_SECS),
-        agent_turn(
+        run_tool_call_loop(
             ctx.provider.as_ref(),
             &mut history,
             ctx.tools_registry.as_ref(),
