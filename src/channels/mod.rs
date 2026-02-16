@@ -682,7 +682,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
     let provider_name = config
         .default_provider
         .clone()
-        .unwrap_or_else(|| "openrouter".to_string());
+        .unwrap_or_else(|| "openrouter".into());
+
     let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider(
         provider_name.as_str(),
         config.api_key.as_deref(),
