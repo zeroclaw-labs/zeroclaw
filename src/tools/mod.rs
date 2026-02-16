@@ -57,11 +57,12 @@ pub fn default_tools_with_runtime(
 }
 
 /// Create full tool registry including memory tools and optional Composio
-#[allow(clippy::implicit_hasher)]
+#[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
 pub fn all_tools(
     security: &Arc<SecurityPolicy>,
     memory: Arc<dyn Memory>,
     composio_key: Option<&str>,
+    composio_entity_id: Option<&str>,
     browser_config: &crate::config::BrowserConfig,
     http_config: &crate::config::HttpRequestConfig,
     workspace_dir: &std::path::Path,
@@ -73,6 +74,7 @@ pub fn all_tools(
         Arc::new(NativeRuntime::new()),
         memory,
         composio_key,
+        composio_entity_id,
         browser_config,
         http_config,
         workspace_dir,
@@ -82,12 +84,13 @@ pub fn all_tools(
 }
 
 /// Create full tool registry including memory tools and optional Composio.
-#[allow(clippy::implicit_hasher)]
+#[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
 pub fn all_tools_with_runtime(
     security: &Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
     memory: Arc<dyn Memory>,
     composio_key: Option<&str>,
+    composio_entity_id: Option<&str>,
     browser_config: &crate::config::BrowserConfig,
     http_config: &crate::config::HttpRequestConfig,
     workspace_dir: &std::path::Path,
@@ -140,7 +143,7 @@ pub fn all_tools_with_runtime(
 
     if let Some(key) = composio_key {
         if !key.is_empty() {
-            tools.push(Box::new(ComposioTool::new(key)));
+            tools.push(Box::new(ComposioTool::new(key, composio_entity_id)));
         }
     }
 
@@ -191,9 +194,9 @@ mod tests {
             &security,
             mem,
             None,
+            None,
             &browser,
             &http,
-            tmp.path(),
             &HashMap::new(),
             None,
         );
@@ -224,9 +227,9 @@ mod tests {
             &security,
             mem,
             None,
+            None,
             &browser,
             &http,
-            tmp.path(),
             &HashMap::new(),
             None,
         );
@@ -359,6 +362,7 @@ mod tests {
             &security,
             mem,
             None,
+            None,
             &browser,
             &http,
             tmp.path(),
@@ -387,9 +391,9 @@ mod tests {
             &security,
             mem,
             None,
+            None,
             &browser,
             &http,
-            tmp.path(),
             &HashMap::new(),
             None,
         );
