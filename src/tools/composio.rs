@@ -19,13 +19,15 @@ const COMPOSIO_API_BASE_V3: &str = "https://backend.composio.dev/api/v3";
 /// A tool that proxies actions to the Composio managed tool platform.
 pub struct ComposioTool {
     api_key: String,
+    default_entity_id: String,
     client: Client,
 }
 
 impl ComposioTool {
-    pub fn new(api_key: &str) -> Self {
+    pub fn new(api_key: &str, default_entity_id: Option<&str>) -> Self {
         Self {
             api_key: api_key.to_string(),
+            default_entity_id: normalize_entity_id(default_entity_id.unwrap_or("default")),
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(60))
                 .connect_timeout(std::time::Duration::from_secs(10))
@@ -59,9 +61,9 @@ impl ComposioTool {
         let url = format!("{COMPOSIO_API_BASE_V3}/tools");
         let mut req = self.client.get(&url).header("x-api-key", &self.api_key);
 
-        req = req.query(&[("limit", 200_u16)]);
-        if let Some(app) = app_name {
-            req = req.query(&[("toolkit_slug", app)]);
+        req = req.query(&[("limit", "200")]);
+        if let Some(app) = app_name.map(str::trim).filter(|app| !app.is_empty()) {
+            req = req.query(&[("toolkits", app), ("toolkit_slug", app)]);
         }
 
         let resp = req.send().await?;
@@ -110,11 +112,12 @@ impl ComposioTool {
         action_name: &str,
         params: serde_json::Value,
         entity_id: Option<&str>,
+        connected_account_id: Option<&str>,
     ) -> anyhow::Result<serde_json::Value> {
         let tool_slug = normalize_tool_slug(action_name);
 
         match self
-            .execute_action_v3(&tool_slug, params.clone(), entity_id)
+            .execute_action_v3(&tool_slug, params.clone(), entity_id, connected_account_id)
             .await
         {
             Ok(result) => Ok(result),
@@ -132,8 +135,16 @@ impl ComposioTool {
         tool_slug: &str,
         params: serde_json::Value,
         entity_id: Option<&str>,
+        connected_account_id: Option<&str>,
     ) -> anyhow::Result<serde_json::Value> {
-        let url = format!("{COMPOSIO_API_BASE_V3}/tools/execute/{tool_slug}");
+        let url = if let Some(connected_account_id) = connected_account_id
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            format!("{COMPOSIO_API_BASE_V3}/tools/{tool_slug}/execute/{connected_account_id}")
+        } else {
+            format!("{COMPOSIO_API_BASE_V3}/tools/{tool_slug}/execute")
+        };
 
         let mut body = json!({
             "arguments": params,
@@ -355,7 +366,7 @@ impl Tool for ComposioTool {
 
     fn description(&self) -> &str {
         "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). \
-         Use action='list' to see available actions, action='execute' with action_name/tool_slug and params, \
+         Use action='list' to see available actions, action='execute' with action_name/tool_slug, params, and optional connected_account_id, \
          or action='connect' with app/auth_config_id to get OAuth URL."
     }
 
@@ -386,11 +397,15 @@ impl Tool for ComposioTool {
                 },
                 "entity_id": {
                     "type": "string",
-                    "description": "Entity/user ID for multi-user setups (defaults to 'default')"
+                    "description": "Entity/user ID for multi-user setups (defaults to composio.entity_id from config)"
                 },
                 "auth_config_id": {
                     "type": "string",
                     "description": "Optional Composio v3 auth config id for connect flow"
+                },
+                "connected_account_id": {
+                    "type": "string",
+                    "description": "Optional connected account ID for execute flow when a specific account is required"
                 }
             },
             "required": ["action"]
@@ -406,7 +421,7 @@ impl Tool for ComposioTool {
         let entity_id = args
             .get("entity_id")
             .and_then(|v| v.as_str())
-            .unwrap_or("default");
+            .unwrap_or(self.default_entity_id.as_str());
 
         match action {
             "list" => {
@@ -459,9 +474,11 @@ impl Tool for ComposioTool {
                     })?;
 
                 let params = args.get("params").cloned().unwrap_or(json!({}));
+                let connected_account_id =
+                    args.get("connected_account_id").and_then(|v| v.as_str());
 
                 match self
-                    .execute_action(action_name, params, Some(entity_id))
+                    .execute_action(action_name, params, Some(entity_id), connected_account_id)
                     .await
                 {
                     Ok(result) => {
@@ -518,6 +535,15 @@ impl Tool for ComposioTool {
                 )),
             }),
         }
+    }
+}
+
+fn normalize_entity_id(entity_id: &str) -> String {
+    let trimmed = entity_id.trim();
+    if trimmed.is_empty() {
+        "default".to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -668,20 +694,20 @@ mod tests {
 
     #[test]
     fn composio_tool_has_correct_name() {
-        let tool = ComposioTool::new("test-key");
+        let tool = ComposioTool::new("test-key", None);
         assert_eq!(tool.name(), "composio");
     }
 
     #[test]
     fn composio_tool_has_description() {
-        let tool = ComposioTool::new("test-key");
+        let tool = ComposioTool::new("test-key", None);
         assert!(!tool.description().is_empty());
         assert!(tool.description().contains("1000+"));
     }
 
     #[test]
     fn composio_tool_schema_has_required_fields() {
-        let tool = ComposioTool::new("test-key");
+        let tool = ComposioTool::new("test-key", None);
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["action"].is_object());
         assert!(schema["properties"]["action_name"].is_object());
@@ -689,13 +715,14 @@ mod tests {
         assert!(schema["properties"]["params"].is_object());
         assert!(schema["properties"]["app"].is_object());
         assert!(schema["properties"]["auth_config_id"].is_object());
+        assert!(schema["properties"]["connected_account_id"].is_object());
         let required = schema["required"].as_array().unwrap();
         assert!(required.contains(&json!("action")));
     }
 
     #[test]
     fn composio_tool_spec_roundtrip() {
-        let tool = ComposioTool::new("test-key");
+        let tool = ComposioTool::new("test-key", None);
         let spec = tool.spec();
         assert_eq!(spec.name, "composio");
         assert!(spec.parameters.is_object());
@@ -705,14 +732,14 @@ mod tests {
 
     #[tokio::test]
     async fn execute_missing_action_returns_error() {
-        let tool = ComposioTool::new("test-key");
+        let tool = ComposioTool::new("test-key", None);
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn execute_unknown_action_returns_error() {
-        let tool = ComposioTool::new("test-key");
+        let tool = ComposioTool::new("test-key", None);
         let result = tool.execute(json!({"action": "unknown"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("Unknown action"));
@@ -720,14 +747,14 @@ mod tests {
 
     #[tokio::test]
     async fn execute_without_action_name_returns_error() {
-        let tool = ComposioTool::new("test-key");
+        let tool = ComposioTool::new("test-key", None);
         let result = tool.execute(json!({"action": "execute"})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn connect_without_target_returns_error() {
-        let tool = ComposioTool::new("test-key");
+        let tool = ComposioTool::new("test-key", None);
         let result = tool.execute(json!({"action": "connect"})).await;
         assert!(result.is_err());
     }
@@ -786,6 +813,12 @@ mod tests {
             actions[0].description.as_deref(),
             Some("Fetch inbox emails")
         );
+    }
+
+    #[test]
+    fn normalize_entity_id_falls_back_to_default_when_blank() {
+        assert_eq!(normalize_entity_id("   "), "default");
+        assert_eq!(normalize_entity_id("workspace-user"), "workspace-user");
     }
 
     #[test]

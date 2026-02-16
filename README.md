@@ -315,6 +315,8 @@ native_webdriver_url = "http://127.0.0.1:9515" # WebDriver endpoint (chromedrive
 
 [composio]
 enabled = false                 # opt-in: 1000+ OAuth apps via composio.dev
+# api_key = "cmp_..."          # optional: stored encrypted when [secrets].encrypt = true
+entity_id = "default"         # default user_id for Composio tool calls
 
 [identity]
 format = "openclaw"             # "openclaw" (default, markdown files) or "aieos" (JSON)
