@@ -5,7 +5,7 @@ pub use schema::{
     AgentConfig, AuditConfig, AutonomyConfig, BrowserComputerUseConfig, BrowserConfig,
     ChannelsConfig, ComposioConfig, Config, CostConfig, DelegateAgentConfig, DiscordConfig,
     DockerRuntimeConfig, GatewayConfig, HardwareConfig, HardwareTransport, HeartbeatConfig,
-    HttpRequestConfig, IMessageConfig, IdentityConfig, LarkConfig, MatrixConfig, MemoryConfig,
+    HttpRequestConfig, IMessageConfig, IdentityConfig, MatrixConfig, MemoryConfig,
     ModelRouteConfig, ObservabilityConfig, PeripheralBoardConfig, PeripheralsConfig,
     ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig,
     SchedulerConfig, SecretsConfig, SecurityConfig, SlackConfig, TelegramConfig, TunnelConfig,
@@ -39,17 +39,7 @@ mod tests {
             listen_to_bots: false,
         };
 
-        let lark = LarkConfig {
-            app_id: "app-id".into(),
-            app_secret: "app-secret".into(),
-            encrypt_key: None,
-            verification_token: None,
-            allowed_users: vec![],
-            use_feishu: false,
-        };
-
         assert_eq!(telegram.allowed_users.len(), 1);
         assert_eq!(discord.guild_id.as_deref(), Some("123"));
-        assert_eq!(lark.app_id, "app-id");
     }
 }
