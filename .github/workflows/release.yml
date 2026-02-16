@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write  # Required for cosign keyless signing via OIDC
 
 env:
   CARGO_TERM_COLOR: always
@@ -33,13 +34,13 @@ jobs:
             artifact: zeroclaw.exe
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
 
       - name: Build release
         run: cargo build --release --locked --target ${{ matrix.target }}
@@ -66,7 +67,7 @@ jobs:
           7z a ../../../zeroclaw-${{ matrix.target }}.zip ${{ matrix.artifact }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: zeroclaw-${{ matrix.target }}
           path: zeroclaw-${{ matrix.target }}.*
@@ -77,10 +78,10 @@ jobs:
     runs-on: [self-hosted, Linux, X64, lxc-ci]
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
 
@@ -91,8 +92,22 @@ jobs:
           echo "Generated checksums:"
           cat SHA256SUMS
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@3454372f43399081ed03b604cb2d021dabca52bb # v3.8.2
+
+      - name: Sign artifacts with cosign (keyless)
+        run: |
+          for file in artifacts/**/*; do
+            [ -f "$file" ] || continue
+            cosign sign-blob --yes \
+              --oidc-issuer=https://token.actions.githubusercontent.com \
+              --output-signature="${file}.sig" \
+              --output-certificate="${file}.pem" \
+              "$file"
+          done
+
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2
         with:
           generate_release_notes: true
           files: |

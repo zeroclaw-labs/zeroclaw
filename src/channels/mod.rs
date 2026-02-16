@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod dingtalk;
 pub mod discord;
 pub mod email_channel;
 pub mod imessage;
@@ -11,6 +12,7 @@ pub mod traits;
 pub mod whatsapp;
 
 pub use cli::CliChannel;
+pub use dingtalk::DingTalkChannel;
 pub use discord::DiscordChannel;
 pub use email_channel::EmailChannel;
 pub use imessage::IMessageChannel;
@@ -555,6 +557,7 @@ pub fn handle_command(command: crate::ChannelCommands, config: &Config) -> Resul
                 ("Email", config.channels_config.email.is_some()),
                 ("IRC", config.channels_config.irc.is_some()),
                 ("Lark", config.channels_config.lark.is_some()),
+                ("DingTalk", config.channels_config.dingtalk.is_some()),
             ] {
                 println!("  {} {name}", if configured { "✅" } else { "❌" });
             }
@@ -693,6 +696,17 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 lk.verification_token.clone().unwrap_or_default(),
                 9898,
                 lk.allowed_users.clone(),
+            )),
+        ));
+    }
+
+    if let Some(ref dt) = config.channels_config.dingtalk {
+        channels.push((
+            "DingTalk",
+            Arc::new(DingTalkChannel::new(
+                dt.client_id.clone(),
+                dt.client_secret.clone(),
+                dt.allowed_users.clone(),
             )),
         ));
     }
@@ -953,6 +967,14 @@ pub async fn start_channels(config: Config) -> Result<()> {
             lk.verification_token.clone().unwrap_or_default(),
             9898,
             lk.allowed_users.clone(),
+        )));
+    }
+
+    if let Some(ref dt) = config.channels_config.dingtalk {
+        channels.push(Arc::new(DingTalkChannel::new(
+            dt.client_id.clone(),
+            dt.client_secret.clone(),
+            dt.allowed_users.clone(),
         )));
     }
 
