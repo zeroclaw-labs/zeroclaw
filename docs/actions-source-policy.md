@@ -22,6 +22,7 @@ Selected allowlist patterns:
 - `rhysd/actionlint@*`
 - `softprops/action-gh-release@*`
 - `sigstore/cosign-installer@*`
+- `useblacksmith/*` (Blacksmith self-hosted runner infrastructure)
 
 ## Change Control Export
 
@@ -71,10 +72,13 @@ Failure mode to watch for:
 
 If encountered, add only the specific trusted missing action, rerun, and document why.
 
-Latest sweep note (2026-02-16):
+Latest sweep notes:
 
-- Hidden dependency discovered in `release.yml`: `sigstore/cosign-installer@...`
-- Added allowlist pattern: `sigstore/cosign-installer@*`
+- 2026-02-16: Hidden dependency discovered in `release.yml`: `sigstore/cosign-installer@...`
+    - Added allowlist pattern: `sigstore/cosign-installer@*`
+- 2026-02-16: Blacksmith migration blocked workflow execution
+    - Added allowlist pattern: `useblacksmith/*` for self-hosted runner infrastructure
+    - Actions: `useblacksmith/setup-docker-builder@v1`, `useblacksmith/build-push-action@v2`
 
 ## Rollback
 
