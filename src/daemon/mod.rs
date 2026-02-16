@@ -13,6 +13,46 @@ use tokio::time::Duration;
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
 
+fn install_status_persist_hook(event_db: crate::aria::db::AriaDb, tenant_fallback: String) {
+    crate::status_events::set_persist_hook(std::sync::Arc::new(
+        move |event_type, data, timestamp| {
+            if let Err(e) = crate::dashboard::persist_status_event(
+                &event_db,
+                &tenant_fallback,
+                event_type,
+                data,
+                timestamp,
+            ) {
+                tracing::warn!("Failed to persist status event '{event_type}': {e}");
+            }
+            match crate::dashboard::maybe_create_inbox_for_status_event(
+                &event_db,
+                &tenant_fallback,
+                event_type,
+                data,
+            ) {
+                Ok(Some(created)) => {
+                    crate::status_events::emit(
+                        "inbox.item.created",
+                        serde_json::json!({
+                            "tenantId": created.tenant_id,
+                            "id": created.id,
+                            "title": created.title,
+                            "sourceType": created.source_type,
+                        }),
+                    );
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to persist inbox item for status event '{event_type}': {e}"
+                    );
+                }
+            }
+        },
+    ));
+}
+
 pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config
@@ -23,26 +63,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     crate::health::mark_component_ok("daemon");
 
     if let Ok(event_db) = crate::aria::db::AriaDb::open(&config.registry_db_path()) {
-        let tenant_fallback = "dev-tenant".to_string();
-        crate::status_events::set_persist_hook(Box::new(move |event_type, data, timestamp| {
-            if let Err(e) = crate::dashboard::persist_status_event(
-                &event_db,
-                &tenant_fallback,
-                event_type,
-                data,
-                timestamp,
-            ) {
-                tracing::warn!("Failed to persist status event '{event_type}': {e}");
-            }
-            if let Err(e) = crate::dashboard::maybe_create_inbox_for_status_event(
-                &event_db,
-                &tenant_fallback,
-                event_type,
-                data,
-            ) {
-                tracing::warn!("Failed to persist inbox item for status event '{event_type}': {e}");
-            }
-        }));
+        install_status_persist_hook(event_db, "dev-tenant".to_string());
     }
 
     if let Err(e) = crate::cron::jobs_file::import_jobs_file(&config.workspace_dir) {
@@ -599,6 +620,59 @@ mod tests {
             allowed_users: vec![],
         });
         assert!(has_supervised_channels(&config));
+    }
+
+    #[test]
+    fn subagent_failed_persists_event_and_creates_inbox_with_broadcast() {
+        let db = crate::aria::db::AriaDb::open_in_memory().unwrap();
+        crate::dashboard::ensure_schema(&db).unwrap();
+        install_status_persist_hook(db.clone(), "dev-tenant".to_string());
+
+        let (sub_id, mut rx) = crate::status_events::subscribe();
+        crate::status_events::emit(
+            "subagent.failed",
+            serde_json::json!({
+                "tenantId": "dev-tenant",
+                "taskLabel": "Contract probe",
+                "error": "forced failure",
+                "runId": "run-test",
+                "chatId": "chat-test",
+                "toolId": "tool-test"
+            }),
+        );
+
+        let mut saw_inbox_created = false;
+        for _ in 0..4 {
+            if let Ok(json) = rx.try_recv() {
+                if json.contains("\"type\":\"inbox.item.created\"") {
+                    saw_inbox_created = true;
+                    break;
+                }
+            }
+        }
+
+        let counts = db
+            .with_conn(|conn| {
+                let events_count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM events WHERE type='subagent.failed'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let inbox_count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM inbox_items WHERE source_type='subagent'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                Ok((events_count, inbox_count))
+            })
+            .unwrap();
+
+        crate::status_events::unsubscribe(sub_id);
+        crate::status_events::clear_persist_hook();
+
+        assert_eq!(counts.0, 1);
+        assert_eq!(counts.1, 1);
+        assert!(saw_inbox_created);
     }
 
     #[test]

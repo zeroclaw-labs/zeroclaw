@@ -389,6 +389,8 @@ fn source_for_event(event_type: &str) -> &'static str {
         "cron"
     } else if event_type.starts_with("feed.") {
         "feed"
+    } else if event_type.starts_with("subagent.") {
+        "subagent"
     } else if event_type.starts_with("task.") || event_type.starts_with("heartbeat.") {
         "task"
     } else {
@@ -427,6 +429,22 @@ fn title_for_event(event_type: &str, data: &Value) -> String {
         "task.failed" => format!("Task failed: {}", data["name"].as_str().unwrap_or("task")),
         "heartbeat.task.completed" => "Heartbeat task completed".to_string(),
         "heartbeat.task.failed" => "Heartbeat task failed".to_string(),
+        "subagent.started" => format!(
+            "Subagent started: {}",
+            data["taskLabel"].as_str().unwrap_or("task")
+        ),
+        "subagent.completed" => format!(
+            "Subagent completed: {}",
+            data["taskLabel"].as_str().unwrap_or("task")
+        ),
+        "subagent.failed" => format!(
+            "Subagent failed: {}",
+            data["taskLabel"].as_str().unwrap_or("task")
+        ),
+        "subagent.timeout" => format!(
+            "Subagent timed out: {}",
+            data["taskLabel"].as_str().unwrap_or("task")
+        ),
         _ => event_type.to_string(),
     }
 }
@@ -463,6 +481,29 @@ fn preview_for_event(event_type: &str, data: &Value) -> String {
             .as_str()
             .unwrap_or("Heartbeat task")
             .to_string(),
+        "subagent.started" => data["subagentType"]
+            .as_str()
+            .or_else(|| data["toolName"].as_str())
+            .unwrap_or("Subagent task started")
+            .to_string(),
+        "subagent.completed" => data["result"]
+            .as_str()
+            .unwrap_or("Subagent task completed")
+            .chars()
+            .take(240)
+            .collect(),
+        "subagent.failed" => data["error"]
+            .as_str()
+            .unwrap_or("Subagent task failed")
+            .chars()
+            .take(240)
+            .collect(),
+        "subagent.timeout" => data["error"]
+            .as_str()
+            .unwrap_or("Subagent task timed out")
+            .chars()
+            .take(240)
+            .collect(),
         _ => String::new(),
     }
 }
@@ -471,6 +512,7 @@ fn preview_for_event(event_type: &str, data: &Value) -> String {
 pub struct StatusInboxCreated {
     pub id: String,
     pub tenant_id: String,
+    pub source_type: String,
     pub title: String,
 }
 
@@ -489,6 +531,8 @@ pub fn maybe_create_inbox_for_status_event(
         "cron"
     } else if event_type.starts_with("feed.") {
         "feed"
+    } else if event_type.starts_with("subagent.") {
+        "subagent"
     } else if event_type.starts_with("task.") || event_type.starts_with("heartbeat.") {
         "task"
     } else {
@@ -500,7 +544,13 @@ pub fn maybe_create_inbox_for_status_event(
     // - create inbox for cron completions (often intentional background work)
     // - ignore low-signal high-frequency completions (e.g. most feed/task success)
     let create = match event_type {
-        "cron.failed" | "feed.run.failed" | "task.failed" | "heartbeat.task.failed" => true,
+        "cron.failed"
+        | "feed.run.failed"
+        | "task.failed"
+        | "heartbeat.task.failed"
+        | "subagent.failed"
+        | "subagent.timeout"
+        | "subagent.completed" => true,
         "cron.completed" => true,
         _ => false,
     };
@@ -517,7 +567,7 @@ pub fn maybe_create_inbox_for_status_event(
         .or_else(|| data["feedId"].as_str())
         .or_else(|| data["id"].as_str())
         .map(ToString::to_string);
-    let status = if event_type.ends_with(".failed") {
+    let status = if event_type.ends_with(".failed") || event_type.ends_with(".timeout") {
         "unread"
     } else {
         "read"
@@ -549,6 +599,7 @@ pub fn maybe_create_inbox_for_status_event(
     Ok(Some(StatusInboxCreated {
         id,
         tenant_id: tenant,
+        source_type: source_type.to_string(),
         title,
     }))
 }
@@ -789,5 +840,84 @@ mod tests {
 
         assert_eq!(events_count, 1);
         assert_eq!(inbox_count, 0);
+    }
+
+    #[test]
+    fn maybe_create_inbox_for_subagent_completed_creates_read_item() {
+        let db = AriaDb::open_in_memory().unwrap();
+        ensure_schema(&db).unwrap();
+
+        let created = maybe_create_inbox_for_status_event(
+            &db,
+            "dev-tenant",
+            "subagent.completed",
+            &serde_json::json!({
+                "tenantId": "dev-tenant",
+                "taskLabel": "Research trend",
+                "result": "Summary output",
+                "runId": "run-1",
+                "chatId": "chat-1",
+                "toolId": "tool-1"
+            }),
+        )
+        .unwrap()
+        .expect("should create inbox row");
+
+        assert_eq!(created.source_type, "subagent");
+
+        let row = db
+            .with_conn(|conn| {
+                Ok(conn.query_row(
+                    "SELECT source_type, status, title FROM inbox_items WHERE id=?1",
+                    params![created.id],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    },
+                )?)
+            })
+            .unwrap();
+
+        assert_eq!(row.0, "subagent");
+        assert_eq!(row.1, "read");
+        assert!(row.2.contains("Subagent completed"));
+    }
+
+    #[test]
+    fn maybe_create_inbox_for_subagent_timeout_creates_unread_item() {
+        let db = AriaDb::open_in_memory().unwrap();
+        ensure_schema(&db).unwrap();
+
+        let created = maybe_create_inbox_for_status_event(
+            &db,
+            "dev-tenant",
+            "subagent.timeout",
+            &serde_json::json!({
+                "tenantId": "dev-tenant",
+                "taskLabel": "Long running step",
+                "error": "timed out waiting for response",
+                "runId": "run-2",
+                "chatId": "chat-2",
+                "toolId": "tool-2"
+            }),
+        )
+        .unwrap()
+        .expect("should create inbox row");
+
+        let row = db
+            .with_conn(|conn| {
+                Ok(conn.query_row(
+                    "SELECT status, preview FROM inbox_items WHERE id=?1",
+                    params![created.id],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+                )?)
+            })
+            .unwrap();
+
+        assert_eq!(row.0, "unread");
+        assert!(row.1.unwrap_or_default().contains("timed out"));
     }
 }

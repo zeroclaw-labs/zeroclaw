@@ -2,11 +2,11 @@ use chrono::Utc;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 type SubscriberMap = HashMap<u64, UnboundedSender<String>>;
-type PersistHook = Box<dyn Fn(&str, &Value, &str) + Send + Sync>;
+type PersistHook = Arc<dyn Fn(&str, &Value, &str) + Send + Sync>;
 
 static SUBSCRIBERS: OnceLock<Mutex<SubscriberMap>> = OnceLock::new();
 static PERSIST_HOOK: OnceLock<Mutex<Option<PersistHook>>> = OnceLock::new();
@@ -41,7 +41,8 @@ pub fn clear_persist_hook() {
 
 pub fn emit(event_type: &str, data: Value) {
     let timestamp = Utc::now().to_rfc3339();
-    if let Some(hook) = persist_hook().lock().unwrap().as_ref() {
+    let hook = persist_hook().lock().unwrap().as_ref().cloned();
+    if let Some(hook) = hook {
         hook(event_type, &data, &timestamp);
     }
 
