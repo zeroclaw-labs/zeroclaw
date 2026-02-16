@@ -194,7 +194,7 @@ pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<
             "Z.AI", "https://api.z.ai/api/coding/paas/v4", key, AuthStyle::Bearer,
         ))),
         "glm" | "zhipu" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "GLM", "https://open.bigmodel.cn/api/paas", key, AuthStyle::Bearer,
+            "GLM", "https://open.bigmodel.cn/api/paas/v4", key, AuthStyle::Bearer,
         ))),
         "minimax" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "MiniMax", "https://api.minimax.chat", key, AuthStyle::Bearer,

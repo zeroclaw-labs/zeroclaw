@@ -77,6 +77,45 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     let mut calls = Vec::new();
     let mut remaining = response;
 
+    // First, try to parse as OpenAI-style JSON response with tool_calls array
+    // This handles providers like Minimax that return tool_calls in native JSON format
+    if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(response.trim()) {
+        if let Some(tool_calls) = json_value.get("tool_calls").and_then(|v| v.as_array()) {
+            for tc in tool_calls {
+                if let Some(function) = tc.get("function") {
+                    let name = function
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+
+                    // Arguments in OpenAI format are a JSON string that needs parsing
+                    let arguments = if let Some(args_str) = function.get("arguments").and_then(|v| v.as_str()) {
+                        serde_json::from_str::<serde_json::Value>(args_str)
+                            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()))
+                    } else {
+                        serde_json::Value::Object(serde_json::Map::new())
+                    };
+
+                    if !name.is_empty() {
+                        calls.push(ParsedToolCall { name, arguments });
+                    }
+                }
+            }
+
+            // If we found tool_calls, extract any content field as text
+            if !calls.is_empty() {
+                if let Some(content) = json_value.get("content").and_then(|v| v.as_str()) {
+                    if !content.trim().is_empty() {
+                        text_parts.push(content.trim().to_string());
+                    }
+                }
+                return (text_parts.join("\n"), calls);
+            }
+        }
+    }
+
+    // Fall back to XML-style <invoke> tag parsing (ZeroClaw's original format)
     while let Some(start) = remaining.find("<tool_call>") {
         // Everything before the tag is text
         let before = &remaining[..start];
@@ -536,6 +575,42 @@ After text."#;
         assert!(text.contains("Before text."));
         assert!(text.contains("After text."));
         assert_eq!(calls.len(), 1);
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_openai_format() {
+        // OpenAI-style response with tool_calls array
+        let response = r#"{"content": "Let me check that for you.", "tool_calls": [{"type": "function", "function": {"name": "shell", "arguments": "{\"command\": \"ls -la\"}"}}]}"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(text, "Let me check that for you.");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "ls -la"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_openai_format_multiple_calls() {
+        let response = r#"{"tool_calls": [{"type": "function", "function": {"name": "file_read", "arguments": "{\"path\": \"a.txt\"}"}}, {"type": "function", "function": {"name": "file_read", "arguments": "{\"path\": \"b.txt\"}"}}]}"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "file_read");
+        assert_eq!(calls[1].name, "file_read");
+    }
+
+    #[test]
+    fn parse_tool_calls_openai_format_without_content() {
+        // Some providers don't include content field with tool_calls
+        let response = r#"{"tool_calls": [{"type": "function", "function": {"name": "memory_recall", "arguments": "{}"}}]}"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty()); // No content field
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "memory_recall");
     }
 
     #[test]
