@@ -53,6 +53,7 @@ Maintain these branch protection rules on `main`:
 - For `tool` / `provider` / `channel`, module labels are compacted to reduce noise: one specific module keeps `prefix:component`, but multiple specifics collapse to the base scope label.
 - Label ordering is priority-first: `risk:*` -> `size:*` -> contributor tier -> module/path labels.
 - Hovering a label in GitHub shows its auto-managed description (rule/threshold summary).
+- Managed label colors are arranged by display order to create a smooth gradient across long label rows.
 - `Auto Response` posts first-time guidance and handles label-driven routing for low-signal items.
 
 ### Step B: Validation

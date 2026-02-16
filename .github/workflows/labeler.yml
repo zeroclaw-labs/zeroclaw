@@ -108,39 +108,39 @@ jobs:
               { root: "src/tunnel/", prefix: "tunnel", coreEntries: new Set(["mod.rs"]) },
             ];
             const managedModulePrefixes = [...new Set(moduleNamespaceRules.map((rule) => `${rule.prefix}:`))];
-            const modulePrefixPriority = [
-              "security",
-              "runtime",
-              "gateway",
+            const otherLabelDisplayOrder = [
+              "health",
               "tool",
-              "provider",
-              "channel",
-              "config",
-              "memory",
               "agent",
-              "integration",
-              "observability",
-              "onboard",
+              "memory",
+              "channel",
               "service",
+              "integration",
               "tunnel",
-              "cron",
+              "config",
+              "observability",
+              "docs",
+              "dev",
+              "tests",
+              "skills",
+              "skillforge",
+              "provider",
+              "runtime",
+              "heartbeat",
               "daemon",
               "doctor",
-              "health",
-              "heartbeat",
-              "skillforge",
-              "skills",
-            ];
-            const pathLabelPriority = [
-              ...modulePrefixPriority,
-              "core",
+              "onboard",
+              "cron",
               "ci",
               "dependencies",
-              "tests",
+              "gateway",
+              "security",
+              "core",
               "scripts",
-              "dev",
-              "docs",
             ];
+            const modulePrefixSet = new Set(moduleNamespaceRules.map((rule) => rule.prefix));
+            const modulePrefixPriority = otherLabelDisplayOrder.filter((label) => modulePrefixSet.has(label));
+            const pathLabelPriority = [...otherLabelDisplayOrder];
             const riskDisplayOrder = ["risk: high", "risk: medium", "risk: low", "risk: manual"];
             const sizeDisplayOrder = ["size: XS", "size: S", "size: M", "size: L", "size: XL"];
             const contributorDisplayOrder = [
@@ -164,44 +164,72 @@ jobs:
               contributorDisplayOrder.map((label, index) => [label, index])
             );
 
+            function hslToHex(h, s, l) {
+              const saturation = s / 100;
+              const lightness = l / 100;
+              const chroma = (1 - Math.abs(2 * lightness - 1)) * saturation;
+              const huePrime = ((h % 360) + 360) % 360 / 60;
+              const x = chroma * (1 - Math.abs((huePrime % 2) - 1));
+              let red = 0;
+              let green = 0;
+              let blue = 0;
+
+              if (huePrime >= 0 && huePrime < 1) {
+                red = chroma;
+                green = x;
+              } else if (huePrime < 2) {
+                red = x;
+                green = chroma;
+              } else if (huePrime < 3) {
+                green = chroma;
+                blue = x;
+              } else if (huePrime < 4) {
+                green = x;
+                blue = chroma;
+              } else if (huePrime < 5) {
+                red = x;
+                blue = chroma;
+              } else {
+                red = chroma;
+                blue = x;
+              }
+
+              const match = lightness - chroma / 2;
+              const toHex = (value) =>
+                Math.round((value + match) * 255)
+                  .toString(16)
+                  .padStart(2, "0");
+
+              return `${toHex(red)}${toHex(green)}${toHex(blue)}`.toUpperCase();
+            }
+
+            function buildGradientColorMap(labels) {
+              const colorMap = {};
+              const lastIndex = Math.max(labels.length - 1, 1);
+
+              for (let index = 0; index < labels.length; index += 1) {
+                const ratio = index / lastIndex;
+                const hue = 155 - ratio * 147;
+                const saturation = 34 + ratio * 8;
+                const lightness = 74 - ratio * 8;
+                colorMap[labels[index]] = hslToHex(hue, saturation, lightness);
+              }
+
+              return colorMap;
+            }
+
+            const otherLabelColors = buildGradientColorMap(otherLabelDisplayOrder);
             const staticLabelColors = {
-              "size: XS": "E9F0F3",
-              "size: S": "DDE8EE",
-              "size: M": "CEDBE4",
-              "size: L": "BDCEDB",
-              "size: XL": "AEBFCD",
-              "risk: low": "B8D8B0",
-              "risk: medium": "E2D391",
-              "risk: high": "E0A090",
-              "risk: manual": "B7AFCF",
-              docs: "B7CAD6",
-              dependencies: "D8C99A",
-              ci: "AFA2CF",
-              core: "4A4F4A",
-              agent: "9FC4B8",
-              channel: "AFC4D6",
-              config: "C3BCD8",
-              cron: "C7D6A5",
-              daemon: "7C7F95",
-              doctor: "A8D6CD",
-              gateway: "D8A58F",
-              health: "A7DCCB",
-              heartbeat: "B7ACE0",
-              integration: "8CAFC4",
-              memory: "7F96B2",
-              observability: "6D7482",
-              onboard: "E6E0C8",
-              provider: "8A7896",
-              runtime: "8E88AF",
-              security: "D99084",
-              service: "B3C7D6",
-              skillforge: "B9B2DA",
-              skills: "C8C2E0",
-              tool: "9BCFBF",
-              tunnel: "8DAEC0",
-              tests: "DCE9EE",
-              scripts: "E7DFC6",
-              dev: "C4D3DE",
+              "size: XS": "EAF1F4",
+              "size: S": "DEE9EF",
+              "size: M": "D0DDE6",
+              "size: L": "C1D0DC",
+              "size: XL": "B2C3D1",
+              "risk: low": "BFD8B5",
+              "risk: medium": "E4D39B",
+              "risk: high": "E1A39A",
+              "risk: manual": "B9B1D2",
+              ...otherLabelColors,
             };
             const staticLabelDescriptions = {
               "size: XS": "Auto size: <=80 non-doc changed lines.",
@@ -250,29 +278,12 @@ jobs:
               }
             }
 
-            const modulePrefixColors = {
-              "agent:": "9FC4B8",
-              "channel:": "AFC4D6",
-              "config:": "C3BCD8",
-              "cron:": "C7D6A5",
-              "daemon:": "7C7F95",
-              "doctor:": "A8D6CD",
-              "gateway:": "D8A58F",
-              "health:": "A7DCCB",
-              "heartbeat:": "B7ACE0",
-              "integration:": "8CAFC4",
-              "memory:": "7F96B2",
-              "observability:": "6D7482",
-              "onboard:": "E6E0C8",
-              "provider:": "8A7896",
-              "runtime:": "8E88AF",
-              "security:": "D99084",
-              "service:": "B3C7D6",
-              "skillforge:": "B9B2DA",
-              "skills:": "C8C2E0",
-              "tool:": "9BCFBF",
-              "tunnel:": "8DAEC0",
-            };
+            const modulePrefixColors = Object.fromEntries(
+              modulePrefixPriority.map((prefix) => [
+                `${prefix}:`,
+                otherLabelColors[prefix] || "BFDADC",
+              ])
+            );
 
             const providerKeywordHints = [
               "deepseek",
