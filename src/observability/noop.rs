@@ -33,6 +33,18 @@ mod tests {
             provider: "test".into(),
             model: "test".into(),
         });
+        obs.record_event(&ObserverEvent::LlmRequest {
+            provider: "test".into(),
+            model: "test".into(),
+            messages_count: 2,
+        });
+        obs.record_event(&ObserverEvent::LlmResponse {
+            provider: "test".into(),
+            model: "test".into(),
+            duration: Duration::from_millis(1),
+            success: true,
+            error_message: None,
+        });
         obs.record_event(&ObserverEvent::AgentEnd {
             duration: Duration::from_millis(100),
             tokens_used: Some(42),
@@ -41,11 +53,15 @@ mod tests {
             duration: Duration::ZERO,
             tokens_used: None,
         });
+        obs.record_event(&ObserverEvent::ToolCallStart {
+            tool: "shell".into(),
+        });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
             duration: Duration::from_secs(1),
             success: true,
         });
+        obs.record_event(&ObserverEvent::TurnComplete);
         obs.record_event(&ObserverEvent::ChannelMessage {
             channel: "cli".into(),
             direction: "inbound".into(),

@@ -15,6 +15,8 @@ pub struct OtelObserver {
     // Metrics instruments
     agent_starts: Counter<u64>,
     agent_duration: Histogram<f64>,
+    llm_calls: Counter<u64>,
+    llm_duration: Histogram<f64>,
     tool_calls: Counter<u64>,
     tool_duration: Histogram<f64>,
     channel_messages: Counter<u64>,
@@ -89,6 +91,17 @@ impl OtelObserver {
             .with_unit("s")
             .build();
 
+        let llm_calls = meter
+            .u64_counter("zeroclaw.llm.calls")
+            .with_description("Total LLM provider calls")
+            .build();
+
+        let llm_duration = meter
+            .f64_histogram("zeroclaw.llm.duration")
+            .with_description("LLM provider call duration in seconds")
+            .with_unit("s")
+            .build();
+
         let tool_calls = meter
             .u64_counter("zeroclaw.tool.calls")
             .with_description("Total tool calls")
@@ -141,6 +154,8 @@ impl OtelObserver {
             meter_provider: meter_provider_clone,
             agent_starts,
             agent_duration,
+            llm_calls,
+            llm_duration,
             tool_calls,
             tool_duration,
             channel_messages,
@@ -168,6 +183,45 @@ impl Observer for OtelObserver {
                     ],
                 );
             }
+            ObserverEvent::LlmRequest { .. } => {}
+            ObserverEvent::LlmResponse {
+                provider,
+                model,
+                duration,
+                success,
+                error_message: _,
+            } => {
+                let secs = duration.as_secs_f64();
+                let attrs = [
+                    KeyValue::new("provider", provider.clone()),
+                    KeyValue::new("model", model.clone()),
+                    KeyValue::new("success", success.to_string()),
+                ];
+                self.llm_calls.add(1, &attrs);
+                self.llm_duration.record(secs, &attrs);
+
+                // Create a completed span for visibility in trace backends.
+                let start_time = SystemTime::now()
+                    .checked_sub(*duration)
+                    .unwrap_or(SystemTime::now());
+                let mut span = tracer.build(
+                    opentelemetry::trace::SpanBuilder::from_name("llm.call")
+                        .with_kind(SpanKind::Internal)
+                        .with_start_time(start_time)
+                        .with_attributes(vec![
+                            KeyValue::new("provider", provider.clone()),
+                            KeyValue::new("model", model.clone()),
+                            KeyValue::new("success", *success),
+                            KeyValue::new("duration_s", secs),
+                        ]),
+                );
+                if *success {
+                    span.set_status(Status::Ok);
+                } else {
+                    span.set_status(Status::error(""));
+                }
+                span.end();
+            }
             ObserverEvent::AgentEnd {
                 duration,
                 tokens_used,
@@ -193,6 +247,7 @@ impl Observer for OtelObserver {
                 // Note: tokens are recorded via record_metric(TokensUsed) to avoid
                 // double-counting. AgentEnd only records duration.
             }
+            ObserverEvent::ToolCallStart { .. } => {}
             ObserverEvent::ToolCall {
                 tool,
                 duration,
@@ -230,6 +285,7 @@ impl Observer for OtelObserver {
                 self.tool_duration
                     .record(secs, &[KeyValue::new("tool", tool.clone())]);
             }
+            ObserverEvent::TurnComplete => {}
             ObserverEvent::ChannelMessage { channel, direction } => {
                 self.channel_messages.add(
                     1,
@@ -323,6 +379,18 @@ mod tests {
             provider: "openrouter".into(),
             model: "claude-sonnet".into(),
         });
+        obs.record_event(&ObserverEvent::LlmRequest {
+            provider: "openrouter".into(),
+            model: "claude-sonnet".into(),
+            messages_count: 2,
+        });
+        obs.record_event(&ObserverEvent::LlmResponse {
+            provider: "openrouter".into(),
+            model: "claude-sonnet".into(),
+            duration: Duration::from_millis(250),
+            success: true,
+            error_message: None,
+        });
         obs.record_event(&ObserverEvent::AgentEnd {
             duration: Duration::from_millis(500),
             tokens_used: Some(100),
@@ -330,6 +398,9 @@ mod tests {
         obs.record_event(&ObserverEvent::AgentEnd {
             duration: Duration::ZERO,
             tokens_used: None,
+        });
+        obs.record_event(&ObserverEvent::ToolCallStart {
+            tool: "shell".into(),
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
@@ -341,6 +412,7 @@ mod tests {
             duration: Duration::from_millis(5),
             success: false,
         });
+        obs.record_event(&ObserverEvent::TurnComplete);
         obs.record_event(&ObserverEvent::ChannelMessage {
             channel: "telegram".into(),
             direction: "inbound".into(),

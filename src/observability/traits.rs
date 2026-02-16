@@ -7,15 +7,38 @@ pub enum ObserverEvent {
         provider: String,
         model: String,
     },
+    /// A request is about to be sent to an LLM provider.
+    ///
+    /// This is emitted immediately before a provider call so observers can print
+    /// user-facing progress without leaking prompt contents.
+    LlmRequest {
+        provider: String,
+        model: String,
+        messages_count: usize,
+    },
+    /// Result of a single LLM provider call.
+    LlmResponse {
+        provider: String,
+        model: String,
+        duration: Duration,
+        success: bool,
+        error_message: Option<String>,
+    },
     AgentEnd {
         duration: Duration,
         tokens_used: Option<u64>,
+    },
+    /// A tool call is about to be executed.
+    ToolCallStart {
+        tool: String,
     },
     ToolCall {
         tool: String,
         duration: Duration,
         success: bool,
     },
+    /// The agent produced a final answer for the current user message.
+    TurnComplete,
     ChannelMessage {
         channel: String,
         direction: String,

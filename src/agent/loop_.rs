@@ -344,13 +344,43 @@ pub(crate) async fn agent_turn(
     history: &mut Vec<ChatMessage>,
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
+    provider_name: &str,
     model: &str,
     temperature: f64,
 ) -> Result<String> {
     for _iteration in 0..MAX_TOOL_ITERATIONS {
-        let response = provider
+        observer.record_event(&ObserverEvent::LlmRequest {
+            provider: provider_name.to_string(),
+            model: model.to_string(),
+            messages_count: history.len(),
+        });
+
+        let llm_started_at = Instant::now();
+        let response = match provider
             .chat_with_history(history, model, temperature)
-            .await?;
+            .await
+        {
+            Ok(resp) => {
+                observer.record_event(&ObserverEvent::LlmResponse {
+                    provider: provider_name.to_string(),
+                    model: model.to_string(),
+                    duration: llm_started_at.elapsed(),
+                    success: true,
+                    error_message: None,
+                });
+                resp
+            }
+            Err(e) => {
+                observer.record_event(&ObserverEvent::LlmResponse {
+                    provider: provider_name.to_string(),
+                    model: model.to_string(),
+                    duration: llm_started_at.elapsed(),
+                    success: false,
+                    error_message: Some(crate::providers::sanitize_api_error(&e.to_string())),
+                });
+                return Err(e);
+            }
+        };
 
         let (text, tool_calls) = parse_tool_calls(&response);
 
@@ -369,6 +399,9 @@ pub(crate) async fn agent_turn(
         // Execute each tool call and build results
         let mut tool_results = String::new();
         for call in &tool_calls {
+            observer.record_event(&ObserverEvent::ToolCallStart {
+                tool: call.name.clone(),
+            });
             let start = Instant::now();
             let result = if let Some(tool) = find_tool(tools_registry, &call.name) {
                 match tool.execute(call.arguments.clone()).await {
@@ -445,10 +478,18 @@ pub async fn run(
     provider_override: Option<String>,
     model_override: Option<String>,
     temperature: f64,
+    verbose: bool,
 ) -> Result<()> {
     // ── Wire up agnostic subsystems ──────────────────────────────
-    let observer: Arc<dyn Observer> =
-        Arc::from(observability::create_observer(&config.observability));
+    let base_observer = observability::create_observer(&config.observability);
+    let observer: Arc<dyn Observer> = if verbose {
+        Arc::from(Box::new(observability::MultiObserver::new(vec![
+            base_observer,
+            Box::new(observability::VerboseObserver::new()),
+        ])) as Box<dyn Observer>)
+    } else {
+        Arc::from(base_observer)
+    };
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(
@@ -603,11 +644,13 @@ pub async fn run(
             &mut history,
             &tools_registry,
             observer.as_ref(),
+            provider_name,
             model_name,
             temperature,
         )
         .await?;
         println!("{response}");
+        observer.record_event(&ObserverEvent::TurnComplete);
 
         // Auto-save assistant response to daily log
         if config.memory.auto_save {
@@ -656,6 +699,7 @@ pub async fn run(
                 &mut history,
                 &tools_registry,
                 observer.as_ref(),
+                provider_name,
                 model_name,
                 temperature,
             )
@@ -668,6 +712,7 @@ pub async fn run(
                 }
             };
             println!("\n{response}\n");
+            observer.record_event(&ObserverEvent::TurnComplete);
 
             // Auto-compaction before hard trimming to preserve long-context signal.
             if let Ok(compacted) =
