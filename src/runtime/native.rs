@@ -24,8 +24,7 @@ impl RuntimeAdapter for NativeRuntime {
     }
 
     fn storage_path(&self) -> PathBuf {
-        directories::UserDirs::new()
-            .map_or_else(|| PathBuf::from("aria"), |u| u.home_dir().join("aria"))
+        crate::config::schema::aria_home_dir()
     }
 
     fn supports_long_running(&self) -> bool {

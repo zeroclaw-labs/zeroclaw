@@ -2,7 +2,6 @@ use crate::aria::db::AriaDb;
 use crate::config::schema::registry_db_path_for_workspace;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use directories::UserDirs;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -22,9 +21,13 @@ fn parse_rfc3339_ms(raw: Option<&str>) -> Option<i64> {
 }
 
 pub fn jobs_file_path() -> PathBuf {
-    UserDirs::new()
-        .map(|u| u.home_dir().join("aria").join("jobs.json"))
-        .unwrap_or_else(|| PathBuf::from("jobs.json"))
+    if let Ok(raw) = std::env::var("ARIA_JOBS_FILE_PATH") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    crate::config::schema::aria_home_dir().join("jobs.json")
 }
 
 fn read_runtime_states(workspace_dir: &Path) -> Result<HashMap<String, RuntimeCronState>> {

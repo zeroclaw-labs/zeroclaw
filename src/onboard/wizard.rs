@@ -223,10 +223,7 @@ pub fn run_quick_setup(api_key: Option<&str>, provider: Option<&str>) -> Result<
     );
     println!();
 
-    let home = directories::UserDirs::new()
-        .map(|u| u.home_dir().to_path_buf())
-        .context("Could not find home directory")?;
-    let aria_dir = home.join("aria");
+    let aria_dir = crate::config::schema::aria_home_dir();
     let workspace_dir = aria_dir.join("workspace");
     let config_path = aria_dir.join("config.toml");
 
@@ -378,10 +375,7 @@ fn print_bullet(text: &str) {
 // ── Step 1: Workspace ────────────────────────────────────────────
 
 fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
-    let home = directories::UserDirs::new()
-        .map(|u| u.home_dir().to_path_buf())
-        .context("Could not find home directory")?;
-    let default_dir = home.join("aria");
+    let default_dir = crate::config::schema::aria_home_dir();
 
     print_bullet(&format!(
         "Default location: {}",

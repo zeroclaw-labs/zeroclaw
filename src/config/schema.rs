@@ -596,13 +596,9 @@ pub struct WhatsAppConfig {
 
 impl Default for Config {
     fn default() -> Self {
-        let home =
-            UserDirs::new().map_or_else(|| PathBuf::from("."), |u| u.home_dir().to_path_buf());
-        let aria_dir = home.join("aria");
-
         Self {
-            workspace_dir: aria_dir.join("workspace"),
-            config_path: aria_dir.join("config.toml"),
+            workspace_dir: default_workspace_dir(),
+            config_path: default_config_path(),
             api_key: None,
             default_provider: Some("openrouter".to_string()),
             default_model: Some("anthropic/claude-sonnet-4-20250514".to_string()),
@@ -675,6 +671,38 @@ fn ensure_aria_structure(aria_dir: &PathBuf) -> Result<()> {
     Ok(())
 }
 
+pub fn aria_home_dir() -> PathBuf {
+    if let Ok(raw) = std::env::var("ARIA_HOME_DIR") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    UserDirs::new()
+        .map(|u| u.home_dir().join("aria"))
+        .unwrap_or_else(|| PathBuf::from("aria"))
+}
+
+pub fn default_workspace_dir() -> PathBuf {
+    if let Ok(raw) = std::env::var("ARIA_WORKSPACE_DIR") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    aria_home_dir().join("workspace")
+}
+
+pub fn default_config_path() -> PathBuf {
+    if let Ok(raw) = std::env::var("ARIA_CONFIG_PATH") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    aria_home_dir().join("config.toml")
+}
+
 pub fn aria_root_dir_for_workspace(workspace_dir: &Path) -> PathBuf {
     if workspace_dir
         .file_name()
@@ -690,6 +718,12 @@ pub fn aria_root_dir_for_workspace(workspace_dir: &Path) -> PathBuf {
 }
 
 pub fn registry_db_path_for_workspace(workspace_dir: &Path) -> PathBuf {
+    if let Ok(raw) = std::env::var("ARIA_REGISTRY_DB_PATH") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
     aria_root_dir_for_workspace(workspace_dir).join("aria.db")
 }
 
@@ -699,15 +733,15 @@ impl Config {
     }
 
     pub fn registry_db_path(&self) -> PathBuf {
-        self.aria_root_dir().join("aria.db")
+        registry_db_path_for_workspace(&self.workspace_dir)
     }
 
     pub fn load_or_init() -> Result<Self> {
         let home = UserDirs::new()
             .map(|u| u.home_dir().to_path_buf())
             .context("Could not find home directory")?;
-        let aria_dir = home.join("aria");
-        let config_path = aria_dir.join("config.toml");
+        let aria_dir = aria_home_dir();
+        let config_path = default_config_path();
         let legacy_afw_dir = home.join(".afw");
         let legacy_desktop_aria_dir = home.join("Desktop").join("ARIA");
 
@@ -732,7 +766,11 @@ impl Config {
             legacy_desktop_aria_dir.join("workspace").join("aria.db"),
             aria_dir.join("workspace").join("aria.db"),
         ];
-        let root_db = aria_dir.join("aria.db");
+        let root_db = registry_db_path_for_workspace(&default_workspace_dir());
+        if let Some(parent) = root_db.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create {}", parent.display()))?;
+        }
         if !root_db.exists() {
             for candidate in db_candidates {
                 if !candidate.exists() {
@@ -771,6 +809,10 @@ impl Config {
 
     pub fn save(&self) -> Result<()> {
         let toml_str = toml::to_string_pretty(self).context("Failed to serialize config")?;
+        if let Some(parent) = self.config_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create {}", parent.display()))?;
+        }
         fs::write(&self.config_path, toml_str).context("Failed to write config file")?;
         Ok(())
     }
