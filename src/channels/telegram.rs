@@ -505,7 +505,8 @@ Allowlist Telegram @username or numeric user ID, then run `zeroclaw onboard --ch
                         "chat_id": &chat_id,
                         "action": "typing"
                     });
-                    let _ = self.client
+                    let _ = self
+                        .client
                         .post(self.api_url("sendChatAction"))
                         .json(&typing_body)
                         .send()

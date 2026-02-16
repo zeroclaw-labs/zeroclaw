@@ -44,9 +44,11 @@ impl OtelObserver {
 
         let tracer_provider = SdkTracerProvider::builder()
             .with_batch_exporter(span_exporter)
-            .with_resource(opentelemetry_sdk::Resource::builder()
-                .with_service_name(service_name.to_string())
-                .build())
+            .with_resource(
+                opentelemetry_sdk::Resource::builder()
+                    .with_service_name(service_name.to_string())
+                    .build(),
+            )
             .build();
 
         global::set_tracer_provider(tracer_provider.clone());
@@ -58,14 +60,16 @@ impl OtelObserver {
             .build()
             .map_err(|e| format!("Failed to create OTLP metric exporter: {e}"))?;
 
-        let metric_reader = opentelemetry_sdk::metrics::PeriodicReader::builder(metric_exporter)
-            .build();
+        let metric_reader =
+            opentelemetry_sdk::metrics::PeriodicReader::builder(metric_exporter).build();
 
         let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
             .with_reader(metric_reader)
-            .with_resource(opentelemetry_sdk::Resource::builder()
-                .with_service_name(service_name.to_string())
-                .build())
+            .with_resource(
+                opentelemetry_sdk::Resource::builder()
+                    .with_service_name(service_name.to_string())
+                    .build(),
+            )
             .build();
 
         let meter_provider_clone = meter_provider.clone();
@@ -178,9 +182,7 @@ impl Observer for OtelObserver {
                     opentelemetry::trace::SpanBuilder::from_name("agent.invocation")
                         .with_kind(SpanKind::Internal)
                         .with_start_time(start_time)
-                        .with_attributes(vec![
-                            KeyValue::new("duration_s", secs),
-                        ]),
+                        .with_attributes(vec![KeyValue::new("duration_s", secs)]),
                 );
                 if let Some(t) = tokens_used {
                     span.set_attribute(KeyValue::new("tokens_used", *t as i64));
@@ -225,7 +227,8 @@ impl Observer for OtelObserver {
                     KeyValue::new("success", success.to_string()),
                 ];
                 self.tool_calls.add(1, &attrs);
-                self.tool_duration.record(secs, &[KeyValue::new("tool", tool.clone())]);
+                self.tool_duration
+                    .record(secs, &[KeyValue::new("tool", tool.clone())]);
             }
             ObserverEvent::ChannelMessage { channel, direction } => {
                 self.channel_messages.add(
@@ -252,7 +255,8 @@ impl Observer for OtelObserver {
                 span.set_status(Status::error(message.clone()));
                 span.end();
 
-                self.errors.add(1, &[KeyValue::new("component", component.clone())]);
+                self.errors
+                    .add(1, &[KeyValue::new("component", component.clone())]);
             }
         }
     }
@@ -302,11 +306,8 @@ mod tests {
     fn test_observer() -> OtelObserver {
         // Create with a dummy endpoint — exports will silently fail
         // but the observer itself works fine for recording
-        OtelObserver::new(
-            Some("http://127.0.0.1:19999"),
-            Some("zeroclaw-test"),
-        )
-        .expect("observer creation should not fail with valid endpoint format")
+        OtelObserver::new(Some("http://127.0.0.1:19999"), Some("zeroclaw-test"))
+            .expect("observer creation should not fail with valid endpoint format")
     }
 
     #[test]
@@ -367,5 +368,4 @@ mod tests {
         obs.record_event(&ObserverEvent::HeartbeatTick);
         obs.flush();
     }
-
 }
