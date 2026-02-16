@@ -18,14 +18,54 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Apply size label
+      - name: Apply size and risk labels
         uses: actions/github-script@v7
         with:
           script: |
             const pr = context.payload.pull_request;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
             const sizeLabels = ["size: XS", "size: S", "size: M", "size: L", "size: XL"];
-            const labelColor = "BFDADC";
-            const changedLines = (pr.additions || 0) + (pr.deletions || 0);
+            const riskLabels = ["risk: low", "risk: medium", "risk: high"];
+            const labelColors = {
+              "size: XS": "BFDADC",
+              "size: S": "BFDADC",
+              "size: M": "BFDADC",
+              "size: L": "BFDADC",
+              "size: XL": "BFDADC",
+              "risk: low": "2EA043",
+              "risk: medium": "FBCA04",
+              "risk: high": "D73A49",
+            };
+
+            function isDocsLike(path) {
+              return (
+                path.startsWith("docs/") ||
+                path.endsWith(".md") ||
+                path.endsWith(".mdx") ||
+                path === "LICENSE" ||
+                path === ".markdownlint-cli2.yaml" ||
+                path === ".github/pull_request_template.md" ||
+                path.startsWith(".github/ISSUE_TEMPLATE/")
+              );
+            }
+
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner,
+              repo,
+              pull_number: pr.number,
+              per_page: 100,
+            });
+
+            const excludedLockfiles = new Set(["Cargo.lock"]);
+            const changedLines = files.reduce((total, file) => {
+              const path = file.filename || "";
+              if (isDocsLike(path) || excludedLockfiles.has(path)) {
+                return total;
+              }
+              return total + (file.additions || 0) + (file.deletions || 0);
+            }, 0);
 
             let sizeLabel = "size: XL";
             if (changedLines <= 80) sizeLabel = "size: XS";
@@ -33,38 +73,66 @@ jobs:
             else if (changedLines <= 500) sizeLabel = "size: M";
             else if (changedLines <= 1000) sizeLabel = "size: L";
 
-            for (const label of sizeLabels) {
+            const hasHighRiskPath = files.some((file) => {
+              const path = file.filename || "";
+              return (
+                path.startsWith("src/security/") ||
+                path.startsWith("src/runtime/") ||
+                path.startsWith("src/tools/") ||
+                path.startsWith(".github/workflows/")
+              );
+            });
+
+            const hasMediumRiskPath = files.some((file) => {
+              const path = file.filename || "";
+              return (
+                path.startsWith("src/") ||
+                path === "Cargo.toml" ||
+                path === "Cargo.lock" ||
+                path === "deny.toml" ||
+                path.startsWith(".githooks/")
+              );
+            });
+
+            let riskLabel = "risk: low";
+            if (hasHighRiskPath) {
+              riskLabel = "risk: high";
+            } else if (hasMediumRiskPath) {
+              riskLabel = "risk: medium";
+            }
+
+            for (const label of [...sizeLabels, ...riskLabels]) {
               try {
                 await github.rest.issues.getLabel({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
+                  owner,
+                  repo,
                   name: label,
                 });
               } catch (error) {
                 if (error.status !== 404) throw error;
                 await github.rest.issues.createLabel({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
+                  owner,
+                  repo,
                   name: label,
-                  color: labelColor,
+                  color: labelColors[label],
                 });
               }
             }
 
             const { data: currentLabels } = await github.rest.issues.listLabelsOnIssue({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
+              owner,
+              repo,
               issue_number: pr.number,
             });
 
             const keepLabels = currentLabels
               .map((label) => label.name)
-              .filter((label) => !sizeLabels.includes(label));
+              .filter((label) => !sizeLabels.includes(label) && !riskLabels.includes(label));
 
-            const nextLabels = [...new Set([...keepLabels, sizeLabel])];
+            const nextLabels = [...new Set([...keepLabels, sizeLabel, riskLabel])];
             await github.rest.issues.setLabels({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
+              owner,
+              repo,
               issue_number: pr.number,
               labels: nextLabels,
             });

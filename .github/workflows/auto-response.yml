@@ -2,14 +2,15 @@ name: Auto Response
 
 on:
   issues:
-    types: [opened]
+    types: [opened, labeled]
   pull_request_target:
-    types: [opened]
+    types: [opened, labeled]
 
 permissions: {}
 
 jobs:
   first-interaction:
+    if: github.event.action == 'opened'
     runs-on: ubuntu-latest
     permissions:
       issues: write
@@ -38,3 +39,86 @@ jobs:
             - Scope is focused (prefer one concern per PR)
 
             See `CONTRIBUTING.md` and `docs/pr-workflow.md` for full collaboration rules.
+
+  labeled-routes:
+    if: github.event.action == 'labeled'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Handle label-driven responses
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const label = context.payload.label?.name;
+            if (!label) return;
+
+            const issue = context.payload.issue;
+            const pullRequest = context.payload.pull_request;
+            const target = issue ?? pullRequest;
+            if (!target) return;
+
+            const isIssue = Boolean(issue);
+            const issueNumber = target.number;
+
+            const rules = [
+              {
+                label: "r:support",
+                close: true,
+                closeIssuesOnly: true,
+                closeReason: "not_planned",
+                message:
+                  "This looks like a usage/support request. Please use README + docs first, then open a focused bug with repro details if behavior is incorrect.",
+              },
+              {
+                label: "r:needs-repro",
+                close: false,
+                message:
+                  "Thanks for the report. Please add deterministic repro steps, exact environment, and redacted logs so maintainers can triage quickly.",
+              },
+              {
+                label: "invalid",
+                close: true,
+                closeReason: "not_planned",
+                message:
+                  "Closing as invalid based on current information. If this is still relevant, open a new issue with updated evidence and reproducible steps.",
+              },
+              {
+                label: "duplicate",
+                close: true,
+                closeReason: "not_planned",
+                message:
+                  "Closing as duplicate. Please continue discussion in the canonical linked issue/PR.",
+              },
+            ];
+
+            const rule = rules.find((entry) => entry.label === label);
+            if (!rule) return;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: rule.message,
+            });
+
+            if (!rule.close) return;
+            if (rule.closeIssuesOnly && !isIssue) return;
+
+            if (isIssue) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                state: "closed",
+                state_reason: rule.closeReason || "not_planned",
+              });
+            } else {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                state: "closed",
+              });
+            }

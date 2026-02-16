@@ -3,7 +3,9 @@
       - any-glob-to-any-file:
           - "docs/**"
           - "**/*.md"
+          - "**/*.mdx"
           - "LICENSE"
+          - ".markdownlint-cli2.yaml"
 
 "type: dependencies":
   - changed-files:
@@ -11,12 +13,33 @@
           - "Cargo.toml"
           - "Cargo.lock"
           - "deny.toml"
+          - ".github/dependabot.yml"
 
 "type: ci":
   - changed-files:
       - any-glob-to-any-file:
           - ".github/**"
           - ".githooks/**"
+
+"area: agent":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/agent/**"
+
+"area: gateway":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/gateway/**"
+
+"area: config":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/config/**"
+
+"area: integrations":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/integrations/**"
 
 "area: providers":
   - changed-files:
@@ -57,3 +80,13 @@
   - changed-files:
       - any-glob-to-any-file:
           - "tests/**"
+
+"area: scripts":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "scripts/**"
+
+"area: dev":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "dev/**"
