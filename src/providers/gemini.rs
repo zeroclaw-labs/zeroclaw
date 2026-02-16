@@ -3,7 +3,7 @@
 //! - Gemini CLI OAuth tokens (reuse existing ~/.gemini/ authentication)
 //! - Google Cloud ADC (`GOOGLE_APPLICATION_CREDENTIALS`)
 
-use crate::providers::traits::{ChatResponse, Provider};
+use crate::providers::traits::Provider;
 use async_trait::async_trait;
 use directories::UserDirs;
 use reqwest::Client;
@@ -260,7 +260,7 @@ impl Provider for GeminiProvider {
         message: &str,
         model: &str,
         temperature: f64,
-    ) -> anyhow::Result<ChatResponse> {
+    ) -> anyhow::Result<String> {
         let auth = self.auth.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "Gemini API key not found. Options:\n\
@@ -319,7 +319,6 @@ impl Provider for GeminiProvider {
             .and_then(|c| c.into_iter().next())
             .and_then(|c| c.content.parts.into_iter().next())
             .and_then(|p| p.text)
-            .map(ChatResponse::with_text)
             .ok_or_else(|| anyhow::anyhow!("No response from Gemini"))
     }
 }

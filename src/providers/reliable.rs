@@ -1,4 +1,4 @@
-use super::traits::{ChatMessage, ChatResponse};
+use super::traits::ChatMessage;
 use super::Provider;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -57,7 +57,12 @@ fn parse_retry_after_ms(err: &anyhow::Error) -> Option<u64> {
                 .take_while(|c| c.is_ascii_digit() || *c == '.')
                 .collect();
             if let Ok(secs) = num_str.parse::<f64>() {
-                return Some((secs * 1000.0) as u64);
+                if secs.is_finite() && secs >= 0.0 {
+                    let millis = Duration::from_secs_f64(secs).as_millis();
+                    if let Ok(value) = u64::try_from(millis) {
+                        return Some(value);
+                    }
+                }
             }
         }
     }
@@ -151,7 +156,7 @@ impl Provider for ReliableProvider {
         message: &str,
         model: &str,
         temperature: f64,
-    ) -> anyhow::Result<ChatResponse> {
+    ) -> anyhow::Result<String> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
@@ -249,7 +254,7 @@ impl Provider for ReliableProvider {
         messages: &[ChatMessage],
         model: &str,
         temperature: f64,
-    ) -> anyhow::Result<ChatResponse> {
+    ) -> anyhow::Result<String> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
@@ -354,12 +359,12 @@ mod tests {
             _message: &str,
             _model: &str,
             _temperature: f64,
-        ) -> anyhow::Result<ChatResponse> {
+        ) -> anyhow::Result<String> {
             let attempt = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
             if attempt <= self.fail_until_attempt {
                 anyhow::bail!(self.error);
             }
-            Ok(ChatResponse::with_text(self.response))
+            Ok(self.response.to_string())
         }
 
         async fn chat_with_history(
@@ -367,12 +372,12 @@ mod tests {
             _messages: &[ChatMessage],
             _model: &str,
             _temperature: f64,
-        ) -> anyhow::Result<ChatResponse> {
+        ) -> anyhow::Result<String> {
             let attempt = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
             if attempt <= self.fail_until_attempt {
                 anyhow::bail!(self.error);
             }
-            Ok(ChatResponse::with_text(self.response))
+            Ok(self.response.to_string())
         }
     }
 
@@ -392,13 +397,13 @@ mod tests {
             _message: &str,
             model: &str,
             _temperature: f64,
-        ) -> anyhow::Result<ChatResponse> {
+        ) -> anyhow::Result<String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.models_seen.lock().unwrap().push(model.to_string());
             if self.fail_models.contains(&model) {
                 anyhow::bail!("500 model {} unavailable", model);
             }
-            Ok(ChatResponse::with_text(self.response))
+            Ok(self.response.to_string())
         }
     }
 
@@ -421,8 +426,8 @@ mod tests {
             1,
         );
 
-        let result = provider.chat("hello", "test", 0.0).await.unwrap();
-        assert_eq!(result.text_or_empty(), "ok");
+        let result = provider.simple_chat("hello", "test", 0.0).await.unwrap();
+        assert_eq!(result, "ok");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
@@ -443,8 +448,8 @@ mod tests {
             1,
         );
 
-        let result = provider.chat("hello", "test", 0.0).await.unwrap();
-        assert_eq!(result.text_or_empty(), "recovered");
+        let result = provider.simple_chat("hello", "test", 0.0).await.unwrap();
+        assert_eq!(result, "recovered");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -478,8 +483,8 @@ mod tests {
             1,
         );
 
-        let result = provider.chat("hello", "test", 0.0).await.unwrap();
-        assert_eq!(result.text_or_empty(), "from fallback");
+        let result = provider.simple_chat("hello", "test", 0.0).await.unwrap();
+        assert_eq!(result, "from fallback");
         assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
     }
@@ -512,7 +517,7 @@ mod tests {
         );
 
         let err = provider
-            .chat("hello", "test", 0.0)
+            .simple_chat("hello", "test", 0.0)
             .await
             .expect_err("all providers should fail");
         let msg = err.to_string();
@@ -567,8 +572,8 @@ mod tests {
             1,
         );
 
-        let result = provider.chat("hello", "test", 0.0).await.unwrap();
-        assert_eq!(result.text_or_empty(), "from fallback");
+        let result = provider.simple_chat("hello", "test", 0.0).await.unwrap();
+        assert_eq!(result, "from fallback");
         // Primary should have been called only once (no retries)
         assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
@@ -596,7 +601,7 @@ mod tests {
             .chat_with_history(&messages, "test", 0.0)
             .await
             .unwrap();
-        assert_eq!(result.text_or_empty(), "history ok");
+        assert_eq!(result, "history ok");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -635,7 +640,7 @@ mod tests {
             .chat_with_history(&messages, "test", 0.0)
             .await
             .unwrap();
-        assert_eq!(result.text_or_empty(), "fallback ok");
+        assert_eq!(result, "fallback ok");
         assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
     }
@@ -665,8 +670,11 @@ mod tests {
         )
         .with_model_fallbacks(fallbacks);
 
-        let result = provider.chat("hello", "claude-opus", 0.0).await.unwrap();
-        assert_eq!(result.text_or_empty(), "ok from sonnet");
+        let result = provider
+            .simple_chat("hello", "claude-opus", 0.0)
+            .await
+            .unwrap();
+        assert_eq!(result, "ok from sonnet");
 
         let seen = mock.models_seen.lock().unwrap();
         assert_eq!(seen.len(), 2);
@@ -698,7 +706,7 @@ mod tests {
         .with_model_fallbacks(fallbacks);
 
         let err = provider
-            .chat("hello", "model-a", 0.0)
+            .simple_chat("hello", "model-a", 0.0)
             .await
             .expect_err("all models should fail");
         assert!(err.to_string().contains("All providers/models failed"));
@@ -724,8 +732,8 @@ mod tests {
             1,
         );
         // No model_fallbacks set — should work exactly as before
-        let result = provider.chat("hello", "test", 0.0).await.unwrap();
-        assert_eq!(result.text_or_empty(), "ok");
+        let result = provider.simple_chat("hello", "test", 0.0).await.unwrap();
+        assert_eq!(result, "ok");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
@@ -822,7 +830,7 @@ mod tests {
             message: &str,
             model: &str,
             temperature: f64,
-        ) -> anyhow::Result<ChatResponse> {
+        ) -> anyhow::Result<String> {
             self.as_ref()
                 .chat_with_system(system_prompt, message, model, temperature)
                 .await
