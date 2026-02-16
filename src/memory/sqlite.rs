@@ -3,9 +3,9 @@ use super::traits::{Memory, MemoryCategory, MemoryEntry};
 use super::vector;
 use async_trait::async_trait;
 use chrono::Local;
+use parking_lot::Mutex;
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
-use parking_lot::Mutex;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -173,9 +173,7 @@ impl SqliteMemory {
 
         // Check cache
         {
-            let conn = self
-                .conn
-                .lock();
+            let conn = self.conn.lock();
 
             let mut stmt =
                 conn.prepare("SELECT embedding FROM embedding_cache WHERE content_hash = ?1")?;
@@ -197,9 +195,7 @@ impl SqliteMemory {
 
         // Store in cache + LRU eviction
         {
-            let conn = self
-                .conn
-                .lock();
+            let conn = self.conn.lock();
 
             conn.execute(
                 "INSERT OR REPLACE INTO embedding_cache (content_hash, embedding, created_at, accessed_at)
@@ -301,9 +297,7 @@ impl SqliteMemory {
     pub async fn reindex(&self) -> anyhow::Result<usize> {
         // Step 1: Rebuild FTS5
         {
-            let conn = self
-                .conn
-                .lock();
+            let conn = self.conn.lock();
 
             conn.execute_batch("INSERT INTO memories_fts(memories_fts) VALUES('rebuild');")?;
         }
@@ -314,9 +308,7 @@ impl SqliteMemory {
         }
 
         let entries: Vec<(String, String)> = {
-            let conn = self
-                .conn
-                .lock();
+            let conn = self.conn.lock();
 
             let mut stmt =
                 conn.prepare("SELECT id, content FROM memories WHERE embedding IS NULL")?;
@@ -361,9 +353,7 @@ impl Memory for SqliteMemory {
             .await?
             .map(|emb| vector::vec_to_bytes(&emb));
 
-        let conn = self
-            .conn
-            .lock();
+        let conn = self.conn.lock();
         let now = Local::now().to_rfc3339();
         let cat = Self::category_to_str(&category);
         let id = Uuid::new_v4().to_string();
@@ -390,9 +380,7 @@ impl Memory for SqliteMemory {
         // Compute query embedding (async, before lock)
         let query_embedding = self.get_or_compute_embedding(query).await?;
 
-        let conn = self
-            .conn
-            .lock();
+        let conn = self.conn.lock();
 
         // FTS5 BM25 keyword search
         let keyword_results = Self::fts5_search(&conn, query, limit * 2).unwrap_or_default();
@@ -499,9 +487,7 @@ impl Memory for SqliteMemory {
     }
 
     async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
-        let conn = self
-            .conn
-            .lock();
+        let conn = self.conn.lock();
 
         let mut stmt = conn.prepare(
             "SELECT id, key, content, category, created_at FROM memories WHERE key = ?1",
@@ -526,9 +512,7 @@ impl Memory for SqliteMemory {
     }
 
     async fn list(&self, category: Option<&MemoryCategory>) -> anyhow::Result<Vec<MemoryEntry>> {
-        let conn = self
-            .conn
-            .lock();
+        let conn = self.conn.lock();
 
         let mut results = Vec::new();
 
@@ -569,17 +553,13 @@ impl Memory for SqliteMemory {
     }
 
     async fn forget(&self, key: &str) -> anyhow::Result<bool> {
-        let conn = self
-            .conn
-            .lock();
+        let conn = self.conn.lock();
         let affected = conn.execute("DELETE FROM memories WHERE key = ?1", params![key])?;
         Ok(affected > 0)
     }
 
     async fn count(&self) -> anyhow::Result<usize> {
-        let conn = self
-            .conn
-            .lock();
+        let conn = self.conn.lock();
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))?;
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         Ok(count as usize)

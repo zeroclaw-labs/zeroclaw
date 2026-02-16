@@ -8,9 +8,9 @@
 // Already-paired tokens are persisted in config so restarts don't require
 // re-pairing.
 
+use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use parking_lot::Mutex;
 use std::time::Instant;
 
 /// Maximum failed pairing attempts before lockout.
