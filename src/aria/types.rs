@@ -367,6 +367,7 @@ pub struct FeedConfig {
     pub name: String,
     pub description: Option<String>,
     pub schedule: String,
+    pub interval: Option<String>,
     pub refresh_seconds: Option<u64>,
     pub category: Option<FeedCategory>,
     pub retention: Option<FeedRetention>,

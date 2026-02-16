@@ -125,6 +125,178 @@ fn normalize_json_string(value: &serde_json::Value) -> String {
     serde_json::to_string(&parse_json_value_or_string(value)).unwrap_or_default()
 }
 
+fn parse_feed_interval_to_schedule(interval_raw: &str) -> Option<(&'static str, u64)> {
+    match interval_raw.trim().to_lowercase().as_str() {
+        "hourly" | "1h" => Some(("0 * * * *", 3600)),
+        "6h" | "6hr" | "6hrs" | "6hour" | "6hours" => Some(("0 */6 * * *", 21_600)),
+        "12h" | "12hr" | "12hrs" | "12hour" | "12hours" => Some(("0 */12 * * *", 43_200)),
+        "daily" | "1d" => Some(("0 8 * * *", 86_400)),
+        "weekly" | "1w" => Some(("0 8 * * 1", 604_800)),
+        "monthly" | "1mo" => Some(("0 8 1 * *", 2_592_000)),
+        _ => None,
+    }
+}
+
+fn resolve_feed_schedule_and_refresh(
+    schedule: Option<&str>,
+    interval: Option<&str>,
+    refresh_seconds: Option<u64>,
+) -> Result<(String, Option<u64>)> {
+    if let Some(interval_raw) = interval {
+        let (expr, derived_refresh) = parse_feed_interval_to_schedule(interval_raw)
+            .ok_or_else(|| anyhow::anyhow!("Unsupported feed interval: {interval_raw}"))?;
+        let normalized = crate::aria::feed_registry::normalize_feed_schedule(expr);
+        return Ok((normalized, refresh_seconds.or(Some(derived_refresh))));
+    }
+
+    let normalized =
+        crate::aria::feed_registry::normalize_feed_schedule(schedule.unwrap_or_default());
+    Ok((normalized, refresh_seconds))
+}
+
+fn cron_weekday_token(value: &serde_json::Value) -> Option<&'static str> {
+    if let Some(num) = value.as_i64() {
+        return match num {
+            0 => Some("0"),
+            1 => Some("1"),
+            2 => Some("2"),
+            3 => Some("3"),
+            4 => Some("4"),
+            5 => Some("5"),
+            6 => Some("6"),
+            _ => None,
+        };
+    }
+    let lower = value.as_str()?.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "sun" | "sunday" => Some("0"),
+        "mon" | "monday" => Some("1"),
+        "tue" | "tues" | "tuesday" => Some("2"),
+        "wed" | "wednesday" => Some("3"),
+        "thu" | "thur" | "thurs" | "thursday" => Some("4"),
+        "fri" | "friday" => Some("5"),
+        "sat" | "saturday" => Some("6"),
+        _ => None,
+    }
+}
+
+fn cron_u64_in_range(
+    schedule: &serde_json::Value,
+    key: &str,
+    min: u64,
+    max: u64,
+    default: Option<u64>,
+) -> Result<u64> {
+    let value = schedule
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .or(default);
+    let value = value.ok_or_else(|| anyhow::anyhow!("Missing cron schedule field: {key}"))?;
+    if value < min || value > max {
+        anyhow::bail!("Cron schedule field '{key}' out of range ({min}..={max})");
+    }
+    Ok(value)
+}
+
+fn resolve_cron_schedule_fields(
+    schedule: Option<&serde_json::Value>,
+    legacy_kind: Option<&str>,
+    legacy_data: Option<&serde_json::Value>,
+) -> Result<(String, String)> {
+    if let Some(raw_schedule) = schedule {
+        let schedule = parse_json_value_or_string(raw_schedule);
+        let kind = schedule
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Cron schedule.kind is required"))?;
+        match kind {
+            "cron" => {
+                let expr = schedule
+                    .get("expr")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("Cron schedule.expr is required"))?;
+                let tz = schedule
+                    .get("tz")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                return Ok((
+                    "cron".to_string(),
+                    serde_json::to_string(&serde_json::json!({ "expr": expr, "tz": tz }))?,
+                ));
+            }
+            "every" => {
+                let every_ms = cron_u64_in_range(&schedule, "everyMs", 1, u64::MAX, None)?;
+                let anchor_ms = schedule.get("anchorMs").and_then(serde_json::Value::as_i64);
+                return Ok((
+                    "every".to_string(),
+                    serde_json::to_string(
+                        &serde_json::json!({ "every_ms": every_ms, "anchor_ms": anchor_ms }),
+                    )?,
+                ));
+            }
+            "at" => {
+                let at_ms = schedule
+                    .get("atMs")
+                    .and_then(serde_json::Value::as_i64)
+                    .ok_or_else(|| anyhow::anyhow!("Cron schedule.atMs is required"))?;
+                return Ok((
+                    "at".to_string(),
+                    serde_json::to_string(&serde_json::json!({ "at_ms": at_ms }))?,
+                ));
+            }
+            "daily" => {
+                let hour = cron_u64_in_range(&schedule, "hour", 0, 23, Some(8))?;
+                let minute = cron_u64_in_range(&schedule, "minute", 0, 59, Some(0))?;
+                let tz = schedule
+                    .get("tz")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                let expr = format!("{minute} {hour} * * *");
+                return Ok((
+                    "cron".to_string(),
+                    serde_json::to_string(&serde_json::json!({ "expr": expr, "tz": tz }))?,
+                ));
+            }
+            "weekly" => {
+                let hour = cron_u64_in_range(&schedule, "hour", 0, 23, Some(8))?;
+                let minute = cron_u64_in_range(&schedule, "minute", 0, 59, Some(0))?;
+                let weekday = schedule
+                    .get("weekday")
+                    .and_then(cron_weekday_token)
+                    .ok_or_else(|| anyhow::anyhow!("Cron schedule.weekday is required"))?;
+                let tz = schedule
+                    .get("tz")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                let expr = format!("{minute} {hour} * * {weekday}");
+                return Ok((
+                    "cron".to_string(),
+                    serde_json::to_string(&serde_json::json!({ "expr": expr, "tz": tz }))?,
+                ));
+            }
+            "monthly" => {
+                let day = cron_u64_in_range(&schedule, "day", 1, 31, Some(1))?;
+                let hour = cron_u64_in_range(&schedule, "hour", 0, 23, Some(8))?;
+                let minute = cron_u64_in_range(&schedule, "minute", 0, 59, Some(0))?;
+                let tz = schedule
+                    .get("tz")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                let expr = format!("{minute} {hour} {day} * *");
+                return Ok((
+                    "cron".to_string(),
+                    serde_json::to_string(&serde_json::json!({ "expr": expr, "tz": tz }))?,
+                ));
+            }
+            _ => anyhow::bail!("Unsupported cron schedule kind: {kind}"),
+        }
+    }
+
+    let kind = legacy_kind.ok_or_else(|| anyhow::anyhow!("schedule_kind is required"))?;
+    let data = legacy_data.ok_or_else(|| anyhow::anyhow!("schedule_data is required"))?;
+    Ok((kind.to_string(), normalize_json_string(data)))
+}
+
 /// Build the full registry API router with all 48+ endpoints
 pub fn registry_router(db: AriaDb) -> Router {
     let state = RegistryApiState { db };
@@ -1007,7 +1179,8 @@ struct FeedUploadBody {
     name: String,
     description: Option<String>,
     handler_code: Option<String>,
-    schedule: String,
+    schedule: Option<String>,
+    interval: Option<String>,
     refresh_seconds: Option<u64>,
     category: Option<String>,
     retention: Option<serde_json::Value>,
@@ -1027,7 +1200,16 @@ async fn feeds_upload(
     let now = chrono::Utc::now().to_rfc3339();
     let id = uuid::Uuid::new_v4().to_string();
     let handler_hash = hash_code(body.handler_code.as_deref().unwrap_or(""));
-    let normalized_schedule = crate::aria::feed_registry::normalize_feed_schedule(&body.schedule);
+    let (normalized_schedule, refresh_seconds) = match resolve_feed_schedule_and_refresh(
+        body.schedule.as_deref(),
+        body.interval.as_deref(),
+        body.refresh_seconds,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            return ApiResponse::<()>::err(StatusCode::BAD_REQUEST, e.to_string()).into_response()
+        }
+    };
 
     let result = state.db.with_conn(|conn| {
         let existing: Option<String> = conn
@@ -1048,7 +1230,7 @@ async fn feeds_upload(
                     body.description.as_deref().unwrap_or(""),
                     body.handler_code.as_deref().unwrap_or(""),
                     handler_hash, normalized_schedule,
-                    body.refresh_seconds.map(|v| v as i64),
+                    refresh_seconds.map(|v| v as i64),
                     body.category,
                     body.retention.as_ref().map(|v| serde_json::to_string(v).unwrap_or_default()),
                     body.display.as_ref().map(|v| serde_json::to_string(v).unwrap_or_default()),
@@ -1068,7 +1250,7 @@ async fn feeds_upload(
                     body.description.as_deref().unwrap_or(""),
                     body.handler_code.as_deref().unwrap_or(""),
                     handler_hash, normalized_schedule,
-                    body.refresh_seconds.map(|v| v as i64),
+                    refresh_seconds.map(|v| v as i64),
                     body.category,
                     body.retention.as_ref().map(|v| serde_json::to_string(v).unwrap_or_default()),
                     body.display.as_ref().map(|v| serde_json::to_string(v).unwrap_or_default()),
@@ -1141,8 +1323,9 @@ async fn feeds_delete(
 struct CronUploadBody {
     name: String,
     description: Option<String>,
-    schedule_kind: String,
-    schedule_data: serde_json::Value,
+    schedule_kind: Option<String>,
+    schedule_data: Option<serde_json::Value>,
+    schedule: Option<serde_json::Value>,
     session_target: Option<String>,
     wake_mode: Option<String>,
     payload_kind: String,
@@ -1163,7 +1346,16 @@ async fn crons_upload(
     };
     let now = chrono::Utc::now().to_rfc3339();
     let id = uuid::Uuid::new_v4().to_string();
-    let schedule_data_json = normalize_json_string(&body.schedule_data);
+    let (schedule_kind, schedule_data_json) = match resolve_cron_schedule_fields(
+        body.schedule.as_ref(),
+        body.schedule_kind.as_deref(),
+        body.schedule_data.as_ref(),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            return ApiResponse::<()>::err(StatusCode::BAD_REQUEST, e.to_string()).into_response()
+        }
+    };
     let payload_data_json = normalize_json_string(&body.payload_data);
 
     let result = state.db.with_conn(|conn| {
@@ -1184,7 +1376,7 @@ async fn crons_upload(
                  WHERE id = ?12",
                 rusqlite::params![
                     body.description.as_deref().unwrap_or(""),
-                    body.schedule_kind,
+                    schedule_kind,
                     schedule_data_json,
                     body.session_target.as_deref().unwrap_or("main"),
                     body.wake_mode.as_deref().unwrap_or("now"),
@@ -1206,7 +1398,7 @@ async fn crons_upload(
                 rusqlite::params![
                     id, ctx.tenant_id, body.name,
                     body.description.as_deref().unwrap_or(""),
-                    body.schedule_kind,
+                    schedule_kind,
                     schedule_data_json,
                     body.session_target.as_deref().unwrap_or("main"),
                     body.wake_mode.as_deref().unwrap_or("now"),
@@ -2035,24 +2227,31 @@ async fn bulk_upload(
                             .sandbox_config
                             .as_ref()
                             .map(|j| serde_json::to_string(j).unwrap_or_default());
-                        let normalized_schedule =
-                            crate::aria::feed_registry::normalize_feed_schedule(&v.schedule);
-                        crate::aria::feed_registry::AriaFeedRegistry::new(state.db.clone())
-                            .upload(crate::aria::feed_registry::FeedUploadRequest {
-                                tenant_id: &ctx.tenant_id,
-                                name: &v.name,
-                                description: v.description.as_deref().unwrap_or(""),
-                                handler_code: v.handler_code.as_deref().unwrap_or(""),
-                                schedule: &normalized_schedule,
-                                refresh_seconds: v.refresh_seconds.map(|n| n as i64),
-                                category: v.category.as_deref(),
-                                retention: retention.as_deref(),
-                                display: display.as_deref(),
-                                sandbox_config: sandbox.as_deref(),
-                            })
-                            .map(|entry| {
-                                crate::aria::hooks::notify_feed_uploaded(&entry.id);
-                            })
+                        match resolve_feed_schedule_and_refresh(
+                            v.schedule.as_deref(),
+                            v.interval.as_deref(),
+                            v.refresh_seconds,
+                        ) {
+                            Ok((normalized_schedule, refresh_seconds)) => {
+                                crate::aria::feed_registry::AriaFeedRegistry::new(state.db.clone())
+                                    .upload(crate::aria::feed_registry::FeedUploadRequest {
+                                        tenant_id: &ctx.tenant_id,
+                                        name: &v.name,
+                                        description: v.description.as_deref().unwrap_or(""),
+                                        handler_code: v.handler_code.as_deref().unwrap_or(""),
+                                        schedule: &normalized_schedule,
+                                        refresh_seconds: refresh_seconds.map(|n| n as i64),
+                                        category: v.category.as_deref(),
+                                        retention: retention.as_deref(),
+                                        display: display.as_deref(),
+                                        sandbox_config: sandbox.as_deref(),
+                                    })
+                                    .map(|entry| {
+                                        crate::aria::hooks::notify_feed_uploaded(&entry.id);
+                                    })
+                            }
+                            Err(e) => Err(anyhow::anyhow!("Invalid feed schedule: {e}")),
+                        }
                     }
                     Err(e) => Err(anyhow::anyhow!("Invalid feed payload: {e}")),
                 }
@@ -2061,30 +2260,40 @@ async fn bulk_upload(
                 let body: Result<CronUploadBody, _> = serde_json::from_value(item.data.clone());
                 match body {
                     Ok(v) => {
-                        let schedule = normalize_json_string(&v.schedule_data);
-                        let payload = normalize_json_string(&v.payload_data);
-                        let isolation = v
-                            .isolation
-                            .as_ref()
-                            .map(|j| serde_json::to_string(j).unwrap_or_default());
-                        crate::aria::cron_registry::AriaCronFunctionRegistry::new(state.db.clone())
-                            .create(
-                                &ctx.tenant_id,
-                                &v.name,
-                                v.description.as_deref().unwrap_or(""),
-                                &v.schedule_kind,
-                                &schedule,
-                                v.session_target.as_deref().unwrap_or("main"),
-                                v.wake_mode.as_deref().unwrap_or("now"),
-                                &v.payload_kind,
-                                &payload,
-                                isolation.as_deref(),
-                                v.enabled.unwrap_or(true),
-                                v.delete_after_run.unwrap_or(false),
-                            )
-                            .map(|entry| {
-                                crate::aria::hooks::notify_cron_uploaded(&entry.id);
-                            })
+                        match resolve_cron_schedule_fields(
+                            v.schedule.as_ref(),
+                            v.schedule_kind.as_deref(),
+                            v.schedule_data.as_ref(),
+                        ) {
+                            Ok((schedule_kind, schedule)) => {
+                                let payload = normalize_json_string(&v.payload_data);
+                                let isolation = v
+                                    .isolation
+                                    .as_ref()
+                                    .map(|j| serde_json::to_string(j).unwrap_or_default());
+                                crate::aria::cron_registry::AriaCronFunctionRegistry::new(
+                                    state.db.clone(),
+                                )
+                                .create(
+                                    &ctx.tenant_id,
+                                    &v.name,
+                                    v.description.as_deref().unwrap_or(""),
+                                    &schedule_kind,
+                                    &schedule,
+                                    v.session_target.as_deref().unwrap_or("main"),
+                                    v.wake_mode.as_deref().unwrap_or("now"),
+                                    &v.payload_kind,
+                                    &payload,
+                                    isolation.as_deref(),
+                                    v.enabled.unwrap_or(true),
+                                    v.delete_after_run.unwrap_or(false),
+                                )
+                                .map(|entry| {
+                                    crate::aria::hooks::notify_cron_uploaded(&entry.id);
+                                })
+                            }
+                            Err(e) => Err(anyhow::anyhow!("Invalid cron schedule: {e}")),
+                        }
                     }
                     Err(e) => Err(anyhow::anyhow!("Invalid cron payload: {e}")),
                 }
@@ -2557,5 +2766,49 @@ mod tests {
         let q: PaginationQuery = serde_json::from_str("{}").unwrap();
         assert_eq!(q.limit, None);
         assert_eq!(q.offset, None);
+    }
+
+    #[test]
+    fn feed_interval_resolves_to_schedule_defaults() {
+        let (schedule, refresh) =
+            resolve_feed_schedule_and_refresh(None, Some("6h"), None).unwrap();
+        assert_eq!(schedule, "0 */6 * * *");
+        assert_eq!(refresh, Some(21_600));
+    }
+
+    #[test]
+    fn feed_interval_rejects_unknown_values() {
+        let err = resolve_feed_schedule_and_refresh(None, Some("every-13-hours"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Unsupported feed interval"));
+    }
+
+    #[test]
+    fn cron_structured_daily_schedule_converts_to_cron_expression() {
+        let schedule = serde_json::json!({
+            "kind": "daily",
+            "hour": 9,
+            "minute": 30,
+            "tz": "America/New_York"
+        });
+        let (kind, data) = resolve_cron_schedule_fields(Some(&schedule), None, None).unwrap();
+        assert_eq!(kind, "cron");
+        let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(parsed["expr"], "30 9 * * *");
+        assert_eq!(parsed["tz"], "America/New_York");
+    }
+
+    #[test]
+    fn cron_structured_weekly_schedule_requires_weekday() {
+        let schedule = serde_json::json!({
+            "kind": "weekly",
+            "hour": 9,
+            "minute": 0
+        });
+        let err = resolve_cron_schedule_fields(Some(&schedule), None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("weekday"));
     }
 }

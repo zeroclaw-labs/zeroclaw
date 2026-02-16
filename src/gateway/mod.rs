@@ -3440,6 +3440,18 @@ async fn api_get_billing_methods(
     api_ok(Vec::<serde_json::Value>::new())
 }
 
+fn infer_feed_interval(schedule: &str) -> Option<&'static str> {
+    match schedule.trim() {
+        "0 * * * *" => Some("hourly"),
+        "0 */6 * * *" => Some("6h"),
+        "0 */12 * * *" => Some("12h"),
+        "0 8 * * *" => Some("daily"),
+        "0 8 * * 1" => Some("weekly"),
+        "0 8 1 * *" => Some("monthly"),
+        _ => None,
+    }
+}
+
 async fn api_list_feeds(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let tenant = match api_tenant(&state, &headers) {
         Ok(t) => t,
@@ -3454,12 +3466,14 @@ async fn api_list_feeds(State(state): State<AppState>, headers: HeaderMap) -> im
              ORDER BY f.created_at DESC",
         )?;
         let rows = stmt.query_map(rusqlite::params![tenant], |row| {
+            let schedule: String = row.get(3)?;
             Ok(serde_json::json!({
                 "id": row.get::<_, String>(0)?,
                 "name": row.get::<_, String>(1)?,
                 "description": row.get::<_, String>(2)?,
                 "type": serde_json::Value::Null,
-                "schedule": row.get::<_, String>(3)?,
+                "schedule": schedule.clone(),
+                "interval": infer_feed_interval(&schedule),
                 "timezone": serde_json::Value::Null,
                 "refreshSeconds": row.get::<_, Option<i64>>(4)?,
                 "agent": "feed-agent",
@@ -3496,12 +3510,14 @@ async fn api_get_feed(
              WHERE f.tenant_id=?1 AND f.id=?2 AND f.status!='deleted'",
             rusqlite::params![tenant, id],
             |row| {
+                let schedule: String = row.get(3)?;
                 Ok(serde_json::json!({
                     "id": row.get::<_, String>(0)?,
                     "name": row.get::<_, String>(1)?,
                     "description": row.get::<_, String>(2)?,
                     "type": serde_json::Value::Null,
-                    "schedule": row.get::<_, String>(3)?,
+                    "schedule": schedule.clone(),
+                    "interval": infer_feed_interval(&schedule),
                     "timezone": serde_json::Value::Null,
                     "refreshSeconds": row.get::<_, Option<i64>>(4)?,
                     "agent": "feed-agent",
