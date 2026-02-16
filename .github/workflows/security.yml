@@ -21,7 +21,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install cargo-audit
-        run: cargo install cargo-audit
+        run: cargo install --locked cargo-audit --version 0.22.1
 
       - name: Run cargo-audit
         run: cargo audit
