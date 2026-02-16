@@ -1066,7 +1066,7 @@ mod tests {
     #[test]
     fn whatsapp_signature_valid() {
         // Test with known values
-        let app_secret = "test_secret_key";
+        let app_secret = "test_secret_key_12345";
         let body = b"test body content";
 
         let signature_header = compute_whatsapp_signature_header(app_secret, body);
@@ -1080,8 +1080,8 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_invalid_wrong_secret() {
-        let app_secret = "correct_secret";
-        let wrong_secret = "wrong_secret";
+        let app_secret = "correct_secret_key_abc";
+        let wrong_secret = "wrong_secret_key_xyz";
         let body = b"test body content";
 
         let signature_header = compute_whatsapp_signature_header(wrong_secret, body);
@@ -1095,7 +1095,7 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_invalid_wrong_body() {
-        let app_secret = "test_secret";
+        let app_secret = "test_secret_key_12345";
         let original_body = b"original body";
         let tampered_body = b"tampered body";
 
@@ -1111,7 +1111,7 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_missing_prefix() {
-        let app_secret = "test_secret";
+        let app_secret = "test_secret_key_12345";
         let body = b"test body";
 
         // Signature without "sha256=" prefix
@@ -1126,7 +1126,7 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_empty_header() {
-        let app_secret = "test_secret";
+        let app_secret = "test_secret_key_12345";
         let body = b"test body";
 
         assert!(!verify_whatsapp_signature(app_secret, body, ""));
@@ -1134,7 +1134,7 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_invalid_hex() {
-        let app_secret = "test_secret";
+        let app_secret = "test_secret_key_12345";
         let body = b"test body";
 
         // Invalid hex characters
@@ -1149,7 +1149,7 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_empty_body() {
-        let app_secret = "test_secret";
+        let app_secret = "test_secret_key_12345";
         let body = b"";
 
         let signature_header = compute_whatsapp_signature_header(app_secret, body);
@@ -1163,7 +1163,7 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_unicode_body() {
-        let app_secret = "test_secret";
+        let app_secret = "test_secret_key_12345";
         let body = "Hello 🦀 世界".as_bytes();
 
         let signature_header = compute_whatsapp_signature_header(app_secret, body);
@@ -1177,7 +1177,7 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_json_payload() {
-        let app_secret = "my_app_secret_from_meta";
+        let app_secret = "test_app_secret_key_xyz";
         let body = br#"{"entry":[{"changes":[{"value":{"messages":[{"from":"1234567890","text":{"body":"Hello"}}]}}]}]}"#;
 
         let signature_header = compute_whatsapp_signature_header(app_secret, body);
@@ -1191,7 +1191,7 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_case_sensitive_prefix() {
-        let app_secret = "test_secret";
+        let app_secret = "test_secret_key_12345";
         let body = b"test body";
 
         let hex_sig = compute_whatsapp_signature_hex(app_secret, body);
@@ -1207,7 +1207,7 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_truncated_hex() {
-        let app_secret = "test_secret";
+        let app_secret = "test_secret_key_12345";
         let body = b"test body";
 
         let hex_sig = compute_whatsapp_signature_hex(app_secret, body);
@@ -1223,7 +1223,7 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_extra_bytes() {
-        let app_secret = "test_secret";
+        let app_secret = "test_secret_key_12345";
         let body = b"test body";
 
         let hex_sig = compute_whatsapp_signature_hex(app_secret, body);
