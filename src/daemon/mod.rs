@@ -229,7 +229,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             }),
         );
 
-        let tasks = engine.collect_tasks().await?;
+        let tasks = engine.collect_tasks_for_tick().await?;
         if tasks.is_empty() {
             continue;
         }
@@ -335,8 +335,64 @@ fn persist_heartbeat_response_to_inbox(config: &Config, task: &str, output: &str
     let ts = chrono::Utc::now().timestamp_millis();
     let normalized_task = task.trim().to_lowercase();
     let source_id = format!("heartbeat:{normalized_task}");
-    let dedup_cutoff =
-        ts - (HEARTBEAT_INBOX_DEDUP_WINDOW_MINUTES * 60_i64 * 1_000_i64);
+    let dedup_cutoff = ts - (HEARTBEAT_INBOX_DEDUP_WINDOW_MINUTES * 60_i64 * 1_000_i64);
+    let preview = output.lines().next().unwrap_or("Heartbeat task completed");
+    let preview_limited = preview.chars().take(160).collect::<String>();
+    let metadata = serde_json::json!({
+        "kind": "heartbeat-response",
+        "task": task,
+        "dedupWindowMinutes": HEARTBEAT_INBOX_DEDUP_WINDOW_MINUTES,
+        "createdAtMs": ts,
+    });
+    let metadata_json = serde_json::to_string(&metadata)?;
+
+    let existing_id = db.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id FROM inbox_items
+             WHERE tenant_id=?1
+               AND source_type='system'
+               AND source_id=?2
+               AND status!='archived'
+             ORDER BY created_at DESC
+             LIMIT 1",
+        )?;
+        let row = stmt.query_row(rusqlite::params![tenant, source_id], |r| {
+            r.get::<_, String>(0)
+        });
+        match row {
+            Ok(id) => Ok(Some(id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    })?;
+
+    if let Some(existing_id) = existing_id {
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE inbox_items
+                 SET title=?1,
+                     preview=?2,
+                     body=?3,
+                     metadata_json=?4,
+                     status='unread',
+                     read_at=NULL,
+                     created_at=?5
+                 WHERE tenant_id=?6
+                   AND id=?7",
+                rusqlite::params![
+                    format!("Heartbeat: {}", task.trim()),
+                    preview_limited,
+                    output.trim(),
+                    metadata_json,
+                    ts,
+                    tenant,
+                    existing_id
+                ],
+            )?;
+            Ok(())
+        })?;
+        return Ok(false);
+    }
 
     let recent_count = db.with_conn(|conn| {
         let count: i64 = conn.query_row(
@@ -344,7 +400,6 @@ fn persist_heartbeat_response_to_inbox(config: &Config, task: &str, output: &str
              WHERE tenant_id=?1
                AND source_type='system'
                AND source_id=?2
-               AND status!='archived'
                AND created_at>=?3",
             rusqlite::params![tenant, source_id, dedup_cutoff],
             |row| row.get(0),
@@ -355,21 +410,15 @@ fn persist_heartbeat_response_to_inbox(config: &Config, task: &str, output: &str
         return Ok(false);
     }
 
-    let preview = output.lines().next().unwrap_or("Heartbeat task completed");
     let item = crate::dashboard::NewInboxItem {
         source_type: "system".to_string(),
         source_id: Some(source_id),
         run_id: None,
         chat_id: None,
         title: format!("Heartbeat: {}", task.trim()),
-        preview: Some(preview.chars().take(160).collect::<String>()),
+        preview: Some(preview_limited),
         body: Some(output.trim().to_string()),
-        metadata: serde_json::json!({
-            "kind": "heartbeat-response",
-            "task": task,
-            "dedupWindowMinutes": HEARTBEAT_INBOX_DEDUP_WINDOW_MINUTES,
-            "createdAtMs": ts,
-        }),
+        metadata,
         status: Some("unread".to_string()),
     };
     crate::dashboard::create_inbox_item(&db, &tenant, &item)?;
@@ -542,5 +591,47 @@ mod tests {
             allowed_users: vec![],
         });
         assert!(has_supervised_channels(&config));
+    }
+
+    #[test]
+    fn heartbeat_inbox_persistence_upserts_existing_item() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let created =
+            persist_heartbeat_response_to_inbox(&config, "Check weather", "First output").unwrap();
+        assert!(created);
+
+        let db = crate::aria::db::AriaDb::open(&config.workspace_dir.join("aria.db")).unwrap();
+        let (count_after_first, first_body): (i64, String) = db
+            .with_conn(|conn| {
+                let count: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM inbox_items", [], |r| r.get(0))?;
+                let body: String =
+                    conn.query_row("SELECT body FROM inbox_items LIMIT 1", [], |r| r.get(0))?;
+                Ok((count, body))
+            })
+            .unwrap();
+        assert_eq!(count_after_first, 1);
+        assert_eq!(first_body, "First output");
+
+        let created_second =
+            persist_heartbeat_response_to_inbox(&config, "Check weather", "Second output").unwrap();
+        assert!(!created_second);
+
+        let (count_after_second, second_body, status): (i64, String, String) = db
+            .with_conn(|conn| {
+                let count: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM inbox_items", [], |r| r.get(0))?;
+                let row =
+                    conn.query_row("SELECT body, status FROM inbox_items LIMIT 1", [], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                    })?;
+                Ok((count, row.0, row.1))
+            })
+            .unwrap();
+        assert_eq!(count_after_second, 1);
+        assert_eq!(second_body, "Second output");
+        assert_eq!(status, "unread");
     }
 }

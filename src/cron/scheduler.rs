@@ -15,6 +15,7 @@ use tokio::time::{self, Duration};
 use uuid::Uuid;
 
 const MIN_POLL_SECONDS: u64 = 5;
+const HEARTBEAT_QUEUE_PREFIX: &str = "[[AFW_QUEUE]] ";
 
 #[derive(Debug, Clone)]
 struct JobRunOutcome {
@@ -285,6 +286,19 @@ fn payload_message(payload_kind: &str, payload_data: &str, name: &str) -> (Strin
     }
 }
 
+fn format_heartbeat_summary(name: &str, message: &str) -> String {
+    let trimmed = message.trim();
+    if trimmed.starts_with("[Cron:") {
+        trimmed.to_string()
+    } else {
+        format!("[Cron:{name}] {trimmed}")
+    }
+}
+
+fn heartbeat_bullet_line(task: &str) -> String {
+    format!("- {HEARTBEAT_QUEUE_PREFIX}{task}")
+}
+
 fn append_heartbeat_task(workspace_dir: &std::path::Path, task: &str) -> Result<()> {
     let heartbeat_path = workspace_dir.join("HEARTBEAT.md");
     if !heartbeat_path.exists() {
@@ -294,11 +308,14 @@ fn append_heartbeat_task(workspace_dir: &std::path::Path, task: &str) -> Result<
         )?;
     }
     let mut content = std::fs::read_to_string(&heartbeat_path).unwrap_or_default();
+    let queued_line = heartbeat_bullet_line(task);
+    if content.lines().any(|line| line.trim_end() == queued_line) {
+        return Ok(());
+    }
     if !content.ends_with('\n') {
         content.push('\n');
     }
-    content.push_str("- ");
-    content.push_str(task);
+    content.push_str(&queued_line);
     content.push('\n');
     std::fs::write(&heartbeat_path, content)?;
     Ok(())
@@ -391,7 +408,7 @@ async fn run_aria_cron_function(config: &Config, cron_func_id: &str) -> JobRunOu
     let run_id = Uuid::new_v4().to_string();
 
     if wake_mode == "next-heartbeat" {
-        let summary = format!("[Cron:{name}] {message}");
+        let summary = format_heartbeat_summary(&name, &message);
         match append_heartbeat_task(&config.workspace_dir, &summary) {
             Ok(()) => {
                 if delete_after_run {
@@ -611,5 +628,29 @@ mod tests {
         let outcome = execute_job_with_retry(&config, &security, &job).await;
         assert!(!outcome.success);
         assert!(outcome.output.contains("always_missing_for_retry_test"));
+    }
+
+    #[test]
+    fn format_heartbeat_summary_avoids_double_cron_prefix() {
+        let prefixed = format_heartbeat_summary("daily-job", "[Cron:daily-job] hello");
+        assert_eq!(prefixed, "[Cron:daily-job] hello");
+
+        let plain = format_heartbeat_summary("daily-job", "hello");
+        assert_eq!(plain, "[Cron:daily-job] hello");
+    }
+
+    #[test]
+    fn append_heartbeat_task_deduplicates_queue_line() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+        append_heartbeat_task(workspace, "[Cron:test] once").unwrap();
+        append_heartbeat_task(workspace, "[Cron:test] once").unwrap();
+
+        let content = std::fs::read_to_string(workspace.join("HEARTBEAT.md")).unwrap();
+        let count = content
+            .lines()
+            .filter(|line| line.contains("[[AFW_QUEUE]] [Cron:test] once"))
+            .count();
+        assert_eq!(count, 1);
     }
 }

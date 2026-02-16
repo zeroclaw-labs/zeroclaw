@@ -1,6 +1,7 @@
 use crate::config::HeartbeatConfig;
 use crate::observability::{Observer, ObserverEvent};
 use anyhow::Result;
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::time::{self, Duration};
@@ -14,6 +15,8 @@ pub struct HeartbeatEngine {
 }
 
 impl HeartbeatEngine {
+    const QUEUE_PREFIX: &'static str = "[[AFW_QUEUE]] ";
+
     pub fn new(
         config: HeartbeatConfig,
         workspace_dir: std::path::PathBuf,
@@ -61,7 +64,7 @@ impl HeartbeatEngine {
 
     /// Single heartbeat tick — read HEARTBEAT.md and return task count
     async fn tick(&self) -> Result<usize> {
-        Ok(self.collect_tasks().await?.len())
+        Ok(self.collect_tasks_for_tick().await?.len())
     }
 
     /// Read HEARTBEAT.md and return all parsed tasks.
@@ -74,14 +77,70 @@ impl HeartbeatEngine {
         Ok(Self::parse_tasks(&content))
     }
 
+    /// Read HEARTBEAT.md and return tasks for this tick.
+    ///
+    /// One-shot queued tasks (cron queue marker and legacy `[Cron:*]`) are consumed
+    /// from file after they are collected. Other tasks remain in place.
+    pub async fn collect_tasks_for_tick(&self) -> Result<Vec<String>> {
+        let heartbeat_path = self.workspace_dir.join("HEARTBEAT.md");
+        if !heartbeat_path.exists() {
+            return Ok(Vec::new());
+        }
+        let content = tokio::fs::read_to_string(&heartbeat_path).await?;
+
+        let mut tasks = Vec::new();
+        let mut dedup = HashSet::new();
+        let mut kept_lines = Vec::new();
+        let mut consumed_any = false;
+
+        for line in content.lines() {
+            if let Some((task, one_shot)) = Self::parse_task_entry(line) {
+                let dedup_key = task.trim().to_lowercase();
+                if dedup.insert(dedup_key) {
+                    tasks.push(task);
+                }
+                if one_shot {
+                    consumed_any = true;
+                } else {
+                    kept_lines.push(line.to_string());
+                }
+            } else {
+                kept_lines.push(line.to_string());
+            }
+        }
+
+        if consumed_any {
+            let mut next = kept_lines.join("\n");
+            if !next.ends_with('\n') {
+                next.push('\n');
+            }
+            tokio::fs::write(&heartbeat_path, next).await?;
+        }
+
+        Ok(tasks)
+    }
+
+    fn parse_task_entry(line: &str) -> Option<(String, bool)> {
+        let trimmed = line.trim();
+        let task = trimmed.strip_prefix("- ")?;
+        let task = task.trim();
+        if task.is_empty() {
+            return None;
+        }
+        if let Some(stripped) = task.strip_prefix(Self::QUEUE_PREFIX) {
+            return Some((stripped.trim().to_string(), true));
+        }
+        if task.starts_with("[Cron:") {
+            return Some((task.to_string(), true));
+        }
+        Some((task.to_string(), false))
+    }
+
     /// Parse tasks from HEARTBEAT.md (lines starting with `- `)
     fn parse_tasks(content: &str) -> Vec<String> {
         content
             .lines()
-            .filter_map(|line| {
-                let trimmed = line.trim();
-                trimmed.strip_prefix("- ").map(ToString::to_string)
-            })
+            .filter_map(|line| Self::parse_task_entry(line).map(|(task, _)| task))
             .collect()
     }
 
@@ -193,6 +252,12 @@ mod tests {
     }
 
     #[test]
+    fn parse_tasks_queue_prefix_is_stripped() {
+        let tasks = HeartbeatEngine::parse_tasks("- [[AFW_QUEUE]] [Cron:test] once");
+        assert_eq!(tasks, vec!["[Cron:test] once"]);
+    }
+
+    #[test]
     fn parse_tasks_many_tasks() {
         let content: String = (0..100).fold(String::new(), |mut s, i| {
             use std::fmt::Write;
@@ -279,6 +344,49 @@ mod tests {
         );
         let count = engine.tick().await.unwrap();
         assert_eq!(count, 3);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn collect_tasks_for_tick_consumes_queue_and_legacy_cron_lines() {
+        let dir = std::env::temp_dir().join("afw_test_tick_consume_queue");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        tokio::fs::write(
+            dir.join("HEARTBEAT.md"),
+            "# Tasks\n- Keep me\n- [[AFW_QUEUE]] [Cron:test] once\n- [Cron:legacy] old queue\n- [[AFW_QUEUE]] [Cron:test] once\n",
+        )
+        .await
+        .unwrap();
+
+        let observer: Arc<dyn Observer> = Arc::new(crate::observability::NoopObserver);
+        let engine = HeartbeatEngine::new(
+            HeartbeatConfig {
+                enabled: true,
+                interval_minutes: 30,
+            },
+            dir.clone(),
+            observer,
+        );
+
+        let tasks = engine.collect_tasks_for_tick().await.unwrap();
+        assert_eq!(
+            tasks,
+            vec![
+                "Keep me".to_string(),
+                "[Cron:test] once".to_string(),
+                "[Cron:legacy] old queue".to_string()
+            ]
+        );
+
+        let rewritten = tokio::fs::read_to_string(dir.join("HEARTBEAT.md"))
+            .await
+            .unwrap();
+        assert!(rewritten.contains("- Keep me"));
+        assert!(!rewritten.contains("[[AFW_QUEUE]]"));
+        assert!(!rewritten.contains("[Cron:legacy] old queue"));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
