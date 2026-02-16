@@ -74,7 +74,7 @@ jobs:
   publish:
     name: Publish Release
     needs: build-release
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, lxc-ci]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
