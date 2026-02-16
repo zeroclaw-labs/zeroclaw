@@ -1,4 +1,8 @@
-use crate::providers::traits::{ChatMessage, ChatResponse, Provider};
+use crate::providers::traits::{
+    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
+    Provider, ToolCall as ProviderToolCall,
+};
+use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -36,6 +40,75 @@ struct ResponseMessage {
     content: String,
 }
 
+#[derive(Debug, Serialize)]
+struct NativeChatRequest {
+    model: String,
+    messages: Vec<NativeMessage>,
+    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<NativeToolSpec>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeMessage {
+    role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<NativeToolCall>>,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeToolSpec {
+    #[serde(rename = "type")]
+    kind: String,
+    function: NativeToolFunctionSpec,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeToolFunctionSpec {
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct NativeToolCall {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
+    function: NativeFunctionCall,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct NativeFunctionCall {
+    name: String,
+    arguments: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct NativeChatResponse {
+    choices: Vec<NativeChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NativeChoice {
+    message: NativeResponseMessage,
+}
+
+#[derive(Debug, Deserialize)]
+struct NativeResponseMessage {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<NativeToolCall>>,
+}
+
 impl OpenRouterProvider {
     pub fn new(api_key: Option<&str>) -> Self {
         Self {
@@ -45,6 +118,111 @@ impl OpenRouterProvider {
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
+        }
+    }
+
+    fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
+        let items = tools?;
+        if items.is_empty() {
+            return None;
+        }
+        Some(
+            items
+                .iter()
+                .map(|tool| NativeToolSpec {
+                    kind: "function".to_string(),
+                    function: NativeToolFunctionSpec {
+                        name: tool.name.clone(),
+                        description: tool.description.clone(),
+                        parameters: tool.parameters.clone(),
+                    },
+                })
+                .collect(),
+        )
+    }
+
+    fn convert_messages(messages: &[ChatMessage]) -> Vec<NativeMessage> {
+        messages
+            .iter()
+            .map(|m| {
+                if m.role == "assistant" {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&m.content) {
+                        if let Some(tool_calls_value) = value.get("tool_calls") {
+                            if let Ok(parsed_calls) =
+                                serde_json::from_value::<Vec<ProviderToolCall>>(
+                                    tool_calls_value.clone(),
+                                )
+                            {
+                                let tool_calls = parsed_calls
+                                    .into_iter()
+                                    .map(|tc| NativeToolCall {
+                                        id: Some(tc.id),
+                                        kind: Some("function".to_string()),
+                                        function: NativeFunctionCall {
+                                            name: tc.name,
+                                            arguments: tc.arguments,
+                                        },
+                                    })
+                                    .collect::<Vec<_>>();
+                                let content = value
+                                    .get("content")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(ToString::to_string);
+                                return NativeMessage {
+                                    role: "assistant".to_string(),
+                                    content,
+                                    tool_call_id: None,
+                                    tool_calls: Some(tool_calls),
+                                };
+                            }
+                        }
+                    }
+                }
+
+                if m.role == "tool" {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&m.content) {
+                        let tool_call_id = value
+                            .get("tool_call_id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(ToString::to_string);
+                        let content = value
+                            .get("content")
+                            .and_then(serde_json::Value::as_str)
+                            .map(ToString::to_string);
+                        return NativeMessage {
+                            role: "tool".to_string(),
+                            content,
+                            tool_call_id,
+                            tool_calls: None,
+                        };
+                    }
+                }
+
+                NativeMessage {
+                    role: m.role.clone(),
+                    content: Some(m.content.clone()),
+                    tool_call_id: None,
+                    tool_calls: None,
+                }
+            })
+            .collect()
+    }
+
+    fn parse_native_response(message: NativeResponseMessage) -> ProviderChatResponse {
+        let tool_calls = message
+            .tool_calls
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tc| ProviderToolCall {
+                id: tc.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                name: tc.function.name,
+                arguments: tc.function.arguments,
+            })
+            .collect::<Vec<_>>();
+
+        ProviderChatResponse {
+            text: message.content,
+            tool_calls,
         }
     }
 }
@@ -71,7 +249,7 @@ impl Provider for OpenRouterProvider {
         message: &str,
         model: &str,
         temperature: f64,
-    ) -> anyhow::Result<ChatResponse> {
+    ) -> anyhow::Result<String> {
         let api_key = self.api_key.as_ref()
             .ok_or_else(|| anyhow::anyhow!("OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var."))?;
 
@@ -118,7 +296,7 @@ impl Provider for OpenRouterProvider {
             .choices
             .into_iter()
             .next()
-            .map(|c| ChatResponse::with_text(c.message.content))
+            .map(|c| c.message.content)
             .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))
     }
 
@@ -127,7 +305,7 @@ impl Provider for OpenRouterProvider {
         messages: &[ChatMessage],
         model: &str,
         temperature: f64,
-    ) -> anyhow::Result<ChatResponse> {
+    ) -> anyhow::Result<String> {
         let api_key = self.api_key.as_ref()
             .ok_or_else(|| anyhow::anyhow!("OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var."))?;
 
@@ -168,8 +346,60 @@ impl Provider for OpenRouterProvider {
             .choices
             .into_iter()
             .next()
-            .map(|c| ChatResponse::with_text(c.message.content))
+            .map(|c| c.message.content)
             .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))
+    }
+
+    async fn chat(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        let api_key = self.api_key.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+            "OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var."
+        )
+        })?;
+
+        let tools = Self::convert_tools(request.tools);
+        let native_request = NativeChatRequest {
+            model: model.to_string(),
+            messages: Self::convert_messages(request.messages),
+            temperature,
+            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+            tools,
+        };
+
+        let response = self
+            .client
+            .post("https://openrouter.ai/api/v1/chat/completions")
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header(
+                "HTTP-Referer",
+                "https://github.com/theonlyhennygod/zeroclaw",
+            )
+            .header("X-Title", "ZeroClaw")
+            .json(&native_request)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(super::api_error("OpenRouter", response).await);
+        }
+
+        let native_response: NativeChatResponse = response.json().await?;
+        let message = native_response
+            .choices
+            .into_iter()
+            .next()
+            .map(|c| c.message)
+            .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))?;
+        Ok(Self::parse_native_response(message))
+    }
+
+    fn supports_native_tools(&self) -> bool {
+        true
     }
 }
 

@@ -8,11 +8,10 @@ use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use std::fmt::Write;
-use std::io::Write as IoWrite;
+use std::io::Write as _;
 use std::sync::Arc;
 use std::time::Instant;
 use uuid::Uuid;
-
 /// Maximum agentic tool-use iterations per user message to prevent runaway loops.
 const MAX_TOOL_ITERATIONS: usize = 10;
 
@@ -113,7 +112,6 @@ async fn auto_compact_history(
     let summary_raw = provider
         .chat_with_system(Some(summarizer_system), &summarizer_user, model, 0.2)
         .await
-        .map(|resp| resp.text_or_empty().to_string())
         .unwrap_or_else(|_| {
             // Fallback to deterministic local truncation when summarization fails.
             truncate_with_ellipsis(&transcript, COMPACTION_MAX_SUMMARY_CHARS)
@@ -482,21 +480,11 @@ pub(crate) async fn run_tool_call_loop(
             }
         };
 
-        let response_text = response.text.unwrap_or_default();
+        let response_text = response;
         let mut assistant_history_content = response_text.clone();
-        let mut parsed_text = response_text.clone();
-        let mut tool_calls = parse_structured_tool_calls(&response.tool_calls);
-
-        if !response.tool_calls.is_empty() {
-            assistant_history_content =
-                build_assistant_history_with_tool_calls(&response_text, &response.tool_calls);
-        }
-
-        if tool_calls.is_empty() {
-            let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
-            parsed_text = fallback_text;
-            tool_calls = fallback_calls;
-        }
+        let (parsed_text, tool_calls) = parse_tool_calls(&response_text);
+        let mut parsed_text = parsed_text;
+        let mut tool_calls = tool_calls;
 
         if tool_calls.is_empty() {
             // No tool calls — this is the final response

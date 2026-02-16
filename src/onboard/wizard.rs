@@ -114,6 +114,7 @@ pub fn run_wizard() -> Result<Config> {
         runtime: RuntimeConfig::default(),
         reliability: crate::config::ReliabilityConfig::default(),
         scheduler: crate::config::schema::SchedulerConfig::default(),
+        agent: crate::config::schema::AgentConfig::default(),
         model_routes: Vec::new(),
         heartbeat: HeartbeatConfig::default(),
         channels_config,
@@ -127,7 +128,6 @@ pub fn run_wizard() -> Result<Config> {
         identity: crate::config::IdentityConfig::default(),
         cost: crate::config::CostConfig::default(),
         peripherals: crate::config::PeripheralsConfig::default(),
-        agent: crate::config::AgentConfig::default(),
         agents: std::collections::HashMap::new(),
         hardware: hardware_config,
     };
@@ -318,6 +318,7 @@ pub fn run_quick_setup(
         runtime: RuntimeConfig::default(),
         reliability: crate::config::ReliabilityConfig::default(),
         scheduler: crate::config::schema::SchedulerConfig::default(),
+        agent: crate::config::schema::AgentConfig::default(),
         model_routes: Vec::new(),
         heartbeat: HeartbeatConfig::default(),
         channels_config: ChannelsConfig::default(),
@@ -331,7 +332,6 @@ pub fn run_quick_setup(
         identity: crate::config::IdentityConfig::default(),
         cost: crate::config::CostConfig::default(),
         peripherals: crate::config::PeripheralsConfig::default(),
-        agent: crate::config::AgentConfig::default(),
         agents: std::collections::HashMap::new(),
         hardware: crate::config::HardwareConfig::default(),
     };
