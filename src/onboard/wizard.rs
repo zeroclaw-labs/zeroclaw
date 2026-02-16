@@ -1582,6 +1582,12 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
         _ => vec![("default", "Default model")],
     };
 
+    let mut model_options: Vec<(String, String)> = models
+        .into_iter()
+        .map(|(model_id, label)| (model_id.to_string(), label.to_string()))
+        .collect();
+    let mut live_options: Option<Vec<(String, String)>> = None;
+
     if supports_live_model_fetch(provider_name) {
         let can_fetch_without_key = matches!(provider_name, "openrouter" | "ollama");
         let has_api_key = !api_key.trim().is_empty()
