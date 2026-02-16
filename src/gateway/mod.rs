@@ -7,6 +7,7 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
+use crate::agent::executor::ToolExecutionEnvironment;
 use crate::channels::{Channel, WhatsAppChannel};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
@@ -14,7 +15,6 @@ use crate::providers::{self, Provider};
 use crate::security::pairing::{constant_time_eq, is_public_bind};
 use crate::security::SecurityPolicy;
 use crate::status_events;
-use crate::agent::executor::ToolExecutionEnvironment;
 use anyhow::Result;
 use async_trait::async_trait;
 use axum::{
@@ -266,6 +266,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/api-keys/:id", delete(api_revoke_api_key))
         .route("/api/v1/auth/magic-number", post(api_create_magic_number))
         .route("/api/v1/auth/magic-numbers", get(api_list_magic_numbers))
+        .route("/api/v1/auth/me", get(api_get_current_user))
         .route(
             "/api/v1/auth/magic-number/:id",
             delete(api_revoke_magic_number),
@@ -463,7 +464,10 @@ fn auth_token_from_headers(headers: &HeaderMap) -> String {
     auth.strip_prefix("Bearer ").unwrap_or("").to_string()
 }
 
-fn auth_token_from_headers_or_query(headers: &HeaderMap, query: &HashMap<String, String>) -> String {
+fn auth_token_from_headers_or_query(
+    headers: &HeaderMap,
+    query: &HashMap<String, String>,
+) -> String {
     let bearer = auth_token_from_headers(headers);
     if !bearer.is_empty() {
         bearer
@@ -494,6 +498,194 @@ fn iso_from_millis(ms: i64) -> String {
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+#[derive(Debug, Clone)]
+struct CurrentUser {
+    user_id: String,
+    first_name: Option<String>,
+    last_name: Option<String>,
+    display_name: Option<String>,
+    email: Option<String>,
+}
+
+fn normalize_user_id(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .collect();
+    let trimmed = cleaned.trim_matches(['-', '_', '.']);
+    if trimmed.is_empty() {
+        "dev-user".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn default_user_id() -> String {
+    if let Ok(id) = std::env::var("ARIA_DEFAULT_USER_ID") {
+        let normalized = normalize_user_id(&id);
+        if !normalized.is_empty() {
+            return normalized;
+        }
+    }
+    if let Ok(os_user) = std::env::var("USER") {
+        let normalized = normalize_user_id(&os_user);
+        if !normalized.is_empty() {
+            return normalized;
+        }
+    }
+    "dev-user".to_string()
+}
+
+fn title_case_ascii(raw: &str) -> String {
+    let mut chars = raw.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    let mut out = String::new();
+    out.push(first.to_ascii_uppercase());
+    out.push_str(chars.as_str());
+    out
+}
+
+fn infer_first_name(user_id: &str, email: Option<&str>) -> String {
+    let candidate = email
+        .and_then(|value| value.split('@').next())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(user_id);
+    let lowered = candidate.to_ascii_lowercase();
+    if lowered.ends_with("saint") {
+        return "Saint".to_string();
+    }
+    let token = candidate
+        .split(['.', '_', '-', ' '])
+        .find(|part| !part.trim().is_empty())
+        .unwrap_or(candidate)
+        .trim();
+    let normalized = token
+        .chars()
+        .filter(|c| c.is_ascii_alphabetic())
+        .collect::<String>();
+    if normalized.is_empty() {
+        "Operator".to_string()
+    } else {
+        title_case_ascii(&normalized.to_ascii_lowercase())
+    }
+}
+
+fn resolve_or_create_user(
+    state: &AppState,
+    tenant: &str,
+    token: &str,
+    explicit_user_id: Option<&str>,
+    explicit_email: Option<&str>,
+    explicit_first_name: Option<&str>,
+    explicit_last_name: Option<&str>,
+    explicit_display_name: Option<&str>,
+) -> CurrentUser {
+    let from_magic = state
+        .registry_db
+        .with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT user_id, email FROM magic_numbers
+                 WHERE tenant_id=?1 AND key_hash=?2 AND status='active'
+                 ORDER BY created_at DESC LIMIT 1",
+            )?;
+            let row = stmt
+                .query_row(rusqlite::params![tenant, token], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })
+                .ok();
+            Ok(row)
+        })
+        .ok()
+        .flatten();
+
+    let resolved_user_id = explicit_user_id
+        .map(normalize_user_id)
+        .or_else(|| {
+            from_magic
+                .as_ref()
+                .map(|(user_id, _)| normalize_user_id(user_id))
+        })
+        .unwrap_or_else(default_user_id);
+    let resolved_email = explicit_email
+        .map(str::to_string)
+        .or_else(|| from_magic.as_ref().and_then(|(_, email)| email.clone()));
+    let resolved_first_name = explicit_first_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            Some(infer_first_name(
+                &resolved_user_id,
+                resolved_email.as_deref(),
+            ))
+        });
+    let resolved_last_name = explicit_last_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let resolved_display_name = explicit_display_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            resolved_first_name
+                .as_ref()
+                .map(|first| match resolved_last_name.as_ref() {
+                    Some(last) => format!("{first} {last}"),
+                    None => first.clone(),
+                })
+        });
+
+    let upsert_res = state.registry_db.with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO users (id, tenant_id, first_name, last_name, display_name, email, auth_provider, auth_subject, metadata_json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, ?7, ?7)
+             ON CONFLICT(tenant_id, id) DO UPDATE SET
+               first_name=COALESCE(excluded.first_name, users.first_name),
+               last_name=COALESCE(excluded.last_name, users.last_name),
+               display_name=COALESCE(excluded.display_name, users.display_name),
+               email=COALESCE(excluded.email, users.email),
+               updated_at=excluded.updated_at",
+            rusqlite::params![
+                resolved_user_id,
+                tenant,
+                resolved_first_name,
+                resolved_last_name,
+                resolved_display_name,
+                resolved_email,
+                now_ms()
+            ],
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT id, first_name, last_name, display_name, email
+             FROM users WHERE tenant_id=?1 AND id=?2 LIMIT 1",
+        )?;
+        let current = stmt.query_row(rusqlite::params![tenant, resolved_user_id], |row| {
+            Ok(CurrentUser {
+                user_id: row.get::<_, String>(0)?,
+                first_name: row.get::<_, Option<String>>(1)?,
+                last_name: row.get::<_, Option<String>>(2)?,
+                display_name: row.get::<_, Option<String>>(3)?,
+                email: row.get::<_, Option<String>>(4)?,
+            })
+        })?;
+        Ok(current)
+    });
+
+    match upsert_res {
+        Ok(user) => user,
+        Err(_) => CurrentUser {
+            user_id: resolved_user_id,
+            first_name: resolved_first_name,
+            last_name: resolved_last_name,
+            display_name: resolved_display_name,
+            email: resolved_email,
+        },
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -622,6 +814,18 @@ struct ApiUpdateFeedBody {
 struct ApiCreateKeyBody {
     name: Option<String>,
     scopes: Option<Vec<String>>,
+}
+
+#[derive(serde::Deserialize)]
+struct ApiCreateMagicNumberBody {
+    name: Option<String>,
+    #[serde(rename = "userId")]
+    user_id: Option<String>,
+    email: Option<String>,
+    #[serde(rename = "firstName")]
+    first_name: Option<String>,
+    #[serde(rename = "lastName")]
+    last_name: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -847,6 +1051,7 @@ fn ensure_session_row(
     tenant: &str,
     session_id: &str,
     ts: i64,
+    user_id: Option<&str>,
     source: &str,
     platform: &str,
     device_name: &str,
@@ -854,15 +1059,15 @@ fn ensure_session_row(
     let _ = state.registry_db.with_conn(|conn| {
         let updated = conn.execute(
             "UPDATE sessions
-             SET status='active', last_activity=?1, source=?2, platform=?3, device_name=?4
-             WHERE tenant_id=?5 AND id=?6",
-            rusqlite::params![ts, source, platform, device_name, tenant, session_id],
+             SET status='active', last_activity=?1, source=?2, platform=?3, device_name=?4, user_id=COALESCE(?5, user_id)
+             WHERE tenant_id=?6 AND id=?7",
+            rusqlite::params![ts, source, platform, device_name, user_id, tenant, session_id],
         )?;
         if updated == 0 {
             conn.execute(
                 "INSERT INTO sessions (id, tenant_id, name, status, last_activity, run_count, created_at, user_id, source, platform, device_name, location)
-                 VALUES (?1, ?2, ?3, 'active', ?4, 0, ?4, NULL, ?5, ?6, ?7, NULL)",
-                rusqlite::params![session_id, tenant, device_name, ts, source, platform, device_name],
+                 VALUES (?1, ?2, ?3, 'active', ?4, 0, ?4, ?5, ?6, ?7, ?8, NULL)",
+                rusqlite::params![session_id, tenant, device_name, ts, user_id, source, platform, device_name],
             )?;
         }
         Ok(())
@@ -1288,10 +1493,13 @@ async fn api_create_chat(
     headers: HeaderMap,
     Json(body): Json<ApiCreateChatBody>,
 ) -> impl IntoResponse {
+    let token = auth_token_from_headers(&headers);
     let tenant = match api_tenant(&state, &headers) {
         Ok(t) => t,
         Err(e) => return e,
     };
+    let current_user =
+        resolve_or_create_user(&state, &tenant, &token, None, None, None, None, None);
     let chat_id = uuid::Uuid::new_v4().to_string();
     let now = now_ms();
     let title = body.title.unwrap_or_else(|| "New Chat".to_string());
@@ -1313,6 +1521,7 @@ async fn api_create_chat(
         &tenant,
         &session_id,
         now,
+        Some(&current_user.user_id),
         &source,
         &platform,
         &device_name,
@@ -1332,10 +1541,13 @@ async fn api_send_message(
     headers: HeaderMap,
     Json(body): Json<ApiSendMessageBody>,
 ) -> impl IntoResponse {
+    let token = auth_token_from_headers(&headers);
     let tenant = match api_tenant(&state, &headers) {
         Ok(t) => t,
         Err(e) => return e,
     };
+    let current_user =
+        resolve_or_create_user(&state, &tenant, &token, None, None, None, None, None);
     let content = body
         .content
         .or(body.message)
@@ -1359,6 +1571,7 @@ async fn api_send_message(
         &tenant,
         &session_id,
         now,
+        Some(&current_user.user_id),
         &source,
         &platform,
         &device_name,
@@ -3372,20 +3585,54 @@ async fn api_revoke_api_key(
 async fn api_create_magic_number(
     State(state): State<AppState>,
     headers: HeaderMap,
+    body: Option<Json<ApiCreateMagicNumberBody>>,
 ) -> impl IntoResponse {
+    let body = body.map(|Json(v)| v).unwrap_or(ApiCreateMagicNumberBody {
+        name: None,
+        user_id: None,
+        email: None,
+        first_name: None,
+        last_name: None,
+    });
+    let token = auth_token_from_headers(&headers);
     let tenant = match api_tenant(&state, &headers) {
         Ok(t) => t,
         Err(e) => return e,
     };
+    let current_user = resolve_or_create_user(
+        &state,
+        &tenant,
+        &token,
+        body.user_id.as_deref(),
+        body.email.as_deref(),
+        body.first_name.as_deref(),
+        body.last_name.as_deref(),
+        body.name.as_deref(),
+    );
     let id = uuid::Uuid::new_v4().to_string();
     let raw = format!("mn_{}", uuid::Uuid::new_v4().as_simple());
     let preview = format!("{}...{}", &raw[..7], &raw[raw.len() - 4..]);
     let now = now_ms();
+    let key_name = body.name.clone().unwrap_or_else(|| {
+        current_user
+            .display_name
+            .clone()
+            .unwrap_or_else(|| "default".to_string())
+    });
     let _ = state.registry_db.with_conn(|conn| {
         conn.execute(
             "INSERT INTO magic_numbers (id, tenant_id, user_id, email, key_hash, key_preview, name, status, created_at)
-             VALUES (?1, ?2, 'dev-user', NULL, ?3, ?4, 'default', 'active', ?5)",
-            rusqlite::params![id, tenant, raw, preview, now],
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8)",
+            rusqlite::params![
+                id,
+                tenant,
+                current_user.user_id,
+                current_user.email,
+                raw,
+                preview,
+                key_name,
+                now
+            ],
         )?;
         Ok(())
     });
@@ -3394,7 +3641,84 @@ async fn api_create_magic_number(
         "magicNumber": raw,
         "keyPreview": preview,
         "tenantId": tenant,
-        "userId": "dev-user",
+        "userId": current_user.user_id,
+        "firstName": current_user.first_name,
+        "lastName": current_user.last_name,
+        "displayName": current_user.display_name,
+        "email": current_user.email,
+    }))
+}
+
+async fn api_get_current_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let token = auth_token_from_headers(&headers);
+    if token.is_empty() {
+        return api_err(StatusCode::UNAUTHORIZED, "Missing bearer token");
+    }
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let lookup = state.registry_db.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT u.id, u.first_name, u.last_name, u.display_name, u.email
+             FROM magic_numbers m
+             JOIN users u ON u.tenant_id = m.tenant_id AND u.id = m.user_id
+             WHERE m.tenant_id=?1 AND m.key_hash=?2 AND m.status='active'
+             LIMIT 1",
+        )?;
+        let row = stmt.query_row(rusqlite::params![tenant, token], |row| {
+            Ok(CurrentUser {
+                user_id: row.get::<_, String>(0)?,
+                first_name: row.get::<_, Option<String>>(1)?,
+                last_name: row.get::<_, Option<String>>(2)?,
+                display_name: row.get::<_, Option<String>>(3)?,
+                email: row.get::<_, Option<String>>(4)?,
+            })
+        });
+        match row {
+            Ok(user) => {
+                let _ = conn.execute(
+                    "UPDATE magic_numbers SET last_used_at=?1 WHERE tenant_id=?2 AND key_hash=?3",
+                    rusqlite::params![now_ms(), tenant, token],
+                );
+                Ok(Some(user))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    });
+    let current_user = match lookup {
+        Ok(Some(user)) => user,
+        Ok(None) => {
+            return api_err(
+                StatusCode::NOT_FOUND,
+                "No user profile found for this magic number",
+            );
+        }
+        Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    let first_name = current_user
+        .first_name
+        .as_ref()
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string);
+    if first_name.is_none() {
+        return api_err(
+            StatusCode::CONFLICT,
+            "User profile is missing first_name",
+        );
+    }
+    api_ok(serde_json::json!({
+        "tenantId": tenant,
+        "userId": current_user.user_id,
+        "firstName": first_name,
+        "lastName": current_user.last_name,
+        "displayName": current_user.display_name,
+        "email": current_user.email,
     }))
 }
 
@@ -4042,7 +4366,9 @@ async fn handle_events_ws_chat(
         return (StatusCode::UNAUTHORIZED, "missing auth token").into_response();
     }
     let tenant = resolve_tenant_from_token(&state, &token);
-    ws.on_upgrade(move |socket| handle_chat_socket(socket, state, tenant))
+    let current_user =
+        resolve_or_create_user(&state, &tenant, &token, None, None, None, None, None);
+    ws.on_upgrade(move |socket| handle_chat_socket(socket, state, tenant, current_user.user_id))
         .into_response()
 }
 
@@ -4451,7 +4777,12 @@ impl crate::agent::executor::AgentExecutionSink for WsChatSink<'_> {
     }
 }
 
-async fn handle_chat_socket(mut socket: ws::WebSocket, state: AppState, tenant: String) {
+async fn handle_chat_socket(
+    mut socket: ws::WebSocket,
+    state: AppState,
+    tenant: String,
+    current_user_id: String,
+) {
     tracing::info!("Dashboard chat WebSocket connected");
     let mut seen_request_ids: HashSet<String> = HashSet::new();
 
@@ -4569,6 +4900,7 @@ async fn handle_chat_socket(mut socket: ws::WebSocket, state: AppState, tenant: 
             &tenant,
             &chat_id,
             started,
+            Some(&current_user_id),
             "macos-app",
             "desktop",
             "macOS App",

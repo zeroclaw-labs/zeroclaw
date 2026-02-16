@@ -5,7 +5,7 @@ use rusqlite::params;
 use serde_json::Value;
 use std::path::Path;
 
-const DASHBOARD_SCHEMA_VERSION: i64 = 12;
+const DASHBOARD_SCHEMA_VERSION: i64 = 13;
 
 pub fn ensure_schema(db: &AriaDb) -> Result<()> {
     db.with_conn(|conn| {
@@ -285,6 +285,23 @@ pub fn ensure_schema(db: &AriaDb) -> Result<()> {
               updated_at INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS users (
+              id TEXT PRIMARY KEY,
+              tenant_id TEXT NOT NULL,
+              first_name TEXT,
+              last_name TEXT,
+              display_name TEXT,
+              email TEXT,
+              auth_provider TEXT,
+              auth_subject TEXT,
+              metadata_json TEXT,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL,
+              UNIQUE (tenant_id, id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_users_tenant ON users(tenant_id);
+            CREATE INDEX IF NOT EXISTS idx_users_email ON users(tenant_id, email);
+
             CREATE TABLE IF NOT EXISTS magic_numbers (
               id TEXT PRIMARY KEY,
               tenant_id TEXT NOT NULL,
@@ -344,6 +361,7 @@ pub fn import_from_cloud_db(db: &AriaDb, source_path: &Path) -> Result<usize> {
         "feed_items",
         "feed_files",
         "tenant_config",
+        "users",
         "magic_numbers",
     ];
 
