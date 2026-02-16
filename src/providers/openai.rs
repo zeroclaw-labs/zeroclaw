@@ -25,6 +25,14 @@ struct CompletionRequest {
 }
 
 #[derive(Debug, Serialize)]
+struct ResponsesRequest {
+    model: String,
+    input: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
 struct Message {
     role: String,
     content: String,
@@ -41,6 +49,14 @@ struct CompletionResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct ResponsesResponse {
+    #[serde(default)]
+    output_text: Option<String>,
+    #[serde(default)]
+    output: Vec<ResponsesOutputItem>,
+}
+
+#[derive(Debug, Deserialize)]
 struct Choice {
     message: ResponseMessage,
 }
@@ -48,6 +64,17 @@ struct Choice {
 #[derive(Debug, Deserialize)]
 struct CompletionChoice {
     text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesOutputItem {
+    #[serde(default)]
+    content: Vec<ResponsesContentItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesContentItem {
+    text: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -68,7 +95,11 @@ impl OpenAiProvider {
     }
 
     fn uses_text_completion_endpoint(model: &str) -> bool {
-        model.contains("search-api") || model.contains("codex")
+        model.contains("search-api")
+    }
+
+    fn uses_responses_endpoint(model: &str) -> bool {
+        model.contains("codex")
     }
 
     fn supports_custom_temperature(model: &str) -> bool {
@@ -106,6 +137,46 @@ impl Provider for OpenAiProvider {
         let api_key = self.api_key.as_ref().ok_or_else(|| {
             anyhow::anyhow!("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
         })?;
+
+        if Self::uses_responses_endpoint(model) {
+            let request = ResponsesRequest {
+                model: model.to_string(),
+                input: Self::compose_prompt(system_prompt, message),
+                temperature: Self::request_temperature(model, temperature),
+            };
+
+            let response = self
+                .client
+                .post("https://api.openai.com/v1/responses")
+                .header("Authorization", format!("Bearer {api_key}"))
+                .json(&request)
+                .send()
+                .await?;
+
+            if !response.status().is_success() {
+                return Err(super::api_error("OpenAI", response).await);
+            }
+
+            let responses_response: ResponsesResponse = response.json().await?;
+
+            if let Some(output_text) = responses_response.output_text {
+                if !output_text.trim().is_empty() {
+                    return Ok(output_text);
+                }
+            }
+
+            for output_item in responses_response.output {
+                for content_item in output_item.content {
+                    if let Some(text) = content_item.text {
+                        if !text.trim().is_empty() {
+                            return Ok(text);
+                        }
+                    }
+                }
+            }
+
+            return Err(anyhow::anyhow!("No response from OpenAI"));
+        }
 
         if Self::uses_text_completion_endpoint(model) {
             let request = CompletionRequest {
@@ -300,13 +371,21 @@ mod tests {
         assert!(OpenAiProvider::uses_text_completion_endpoint(
             "gpt-5-search-api-2025-10-14"
         ));
-        assert!(OpenAiProvider::uses_text_completion_endpoint(
+        assert!(!OpenAiProvider::uses_text_completion_endpoint(
             "gpt-5.2-codex"
         ));
-        assert!(OpenAiProvider::uses_text_completion_endpoint(
+        assert!(!OpenAiProvider::uses_text_completion_endpoint(
             "gpt-5.1-codex-max"
         ));
         assert!(!OpenAiProvider::uses_text_completion_endpoint("gpt-5"));
+    }
+
+    #[test]
+    fn codex_models_use_responses_endpoint() {
+        assert!(OpenAiProvider::uses_responses_endpoint("gpt-5.2-codex"));
+        assert!(OpenAiProvider::uses_responses_endpoint("gpt-5.1-codex-max"));
+        assert!(!OpenAiProvider::uses_responses_endpoint("gpt-5"));
+        assert!(!OpenAiProvider::uses_responses_endpoint("gpt-5-search-api"));
     }
 
     #[test]
