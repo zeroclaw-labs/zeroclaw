@@ -457,13 +457,133 @@ fn preview_for_event(event_type: &str, data: &Value) -> String {
     }
 }
 
-fn should_create_inbox(event_type: &str, data: &Value) -> bool {
-    match event_type {
-        "cron.completed" | "cron.failed" | "task.failed" | "heartbeat.task.failed" => true,
-        "feed.run.failed" => true,
-        "feed.run.completed" => data["inserted"].as_i64().unwrap_or(0) > 0,
-        _ => false,
+#[derive(Debug, Clone)]
+pub struct NewInboxItem {
+    pub source_type: String,
+    pub source_id: Option<String>,
+    pub run_id: Option<String>,
+    pub chat_id: Option<String>,
+    pub title: String,
+    pub preview: Option<String>,
+    pub body: Option<String>,
+    pub metadata: Value,
+    pub status: Option<String>,
+}
+
+fn normalized_inbox_status(raw: Option<&str>) -> &'static str {
+    match raw.unwrap_or("unread") {
+        "read" => "read",
+        "archived" => "archived",
+        _ => "unread",
     }
+}
+
+pub fn create_inbox_item(db: &AriaDb, tenant_id: &str, item: &NewInboxItem) -> Result<String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let ts_ms = Utc::now().timestamp_millis();
+    let metadata = serde_json::to_string(&item.metadata).unwrap_or_else(|_| "{}".to_string());
+    let status = normalized_inbox_status(item.status.as_deref());
+    db.with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO inbox_items
+             (id, tenant_id, source_type, source_id, run_id, chat_id, title, preview, body, metadata_json, status, created_at, read_at, archived_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+               CASE WHEN ?11='read' THEN ?12 ELSE NULL END,
+               CASE WHEN ?11='archived' THEN ?12 ELSE NULL END)",
+            params![
+                id,
+                tenant_id,
+                item.source_type,
+                item.source_id,
+                item.run_id,
+                item.chat_id,
+                item.title,
+                item.preview,
+                item.body,
+                metadata,
+                status,
+                ts_ms
+            ]
+        )?;
+        Ok(())
+    })?;
+    Ok(id)
+}
+
+pub fn seed_inbox_examples(db: &AriaDb, tenant_id: &str) -> Result<Vec<String>> {
+    let examples = [
+        NewInboxItem {
+            source_type: "system".to_string(),
+            source_id: Some("ops-announce".to_string()),
+            run_id: None,
+            chat_id: None,
+            title: "Welcome to Inbox".to_string(),
+            preview: Some("Inbox stores intentional agent-to-user updates.".to_string()),
+            body: Some("This is a seeded example message with full body content so you can validate expansion behavior and metadata rendering.".to_string()),
+            metadata: serde_json::json!({
+                "kind": "onboarding",
+                "priority": "low",
+                "tags": ["inbox", "seed", "ux"]
+            }),
+            status: Some("unread".to_string()),
+        },
+        NewInboxItem {
+            source_type: "agent".to_string(),
+            source_id: Some("agent:planner".to_string()),
+            run_id: Some(uuid::Uuid::new_v4().to_string()),
+            chat_id: None,
+            title: "Action Recommended: Refresh API key".to_string(),
+            preview: Some("Gateway requests to external provider are nearing quota limits.".to_string()),
+            body: Some("I detected repeated near-limit responses from the upstream provider. Rotate the key and confirm gateway health after rotation.".to_string()),
+            metadata: serde_json::json!({
+                "priority": "high",
+                "category": "operations",
+                "confidence": 0.92,
+                "suggestedActions": [
+                    "Rotate provider key",
+                    "Verify /health",
+                    "Run quick smoke test"
+                ]
+            }),
+            status: Some("unread".to_string()),
+        },
+        NewInboxItem {
+            source_type: "subagent".to_string(),
+            source_id: Some("subagent:research".to_string()),
+            run_id: Some(uuid::Uuid::new_v4().to_string()),
+            chat_id: None,
+            title: "Research Summary Ready".to_string(),
+            preview: Some("3 source docs indexed with follow-up questions.".to_string()),
+            body: Some("Completed research pass. The metadata includes document IDs and extracted entities for quick review.".to_string()),
+            metadata: serde_json::json!({
+                "priority": "medium",
+                "documents": ["doc-17", "doc-44", "doc-99"],
+                "entities": ["Cron", "Heartbeat", "Gateway"],
+                "followups": ["validate schedule", "review alerting"]
+            }),
+            status: Some("read".to_string()),
+        },
+        NewInboxItem {
+            source_type: "system".to_string(),
+            source_id: Some("audit-log".to_string()),
+            run_id: None,
+            chat_id: None,
+            title: "Archived Example".to_string(),
+            preview: Some("Demonstrates archived inbox state.".to_string()),
+            body: Some("This seeded row exists so archive filtering can be verified end-to-end.".to_string()),
+            metadata: serde_json::json!({
+                "priority": "low",
+                "category": "demo"
+            }),
+            status: Some("archived".to_string()),
+        },
+    ];
+
+    let mut ids = Vec::new();
+    for item in &examples {
+        ids.push(create_inbox_item(db, tenant_id, item)?);
+    }
+    Ok(ids)
 }
 
 pub fn persist_status_event(
@@ -490,48 +610,88 @@ pub fn persist_status_event(
                 tenant,
                 event_type,
                 title,
-                if description.is_empty() { None::<String> } else { Some(description.clone()) },
+                if description.is_empty() {
+                    None::<String>
+                } else {
+                    Some(description)
+                },
                 source,
                 metadata,
                 ts_ms
             ],
         )?;
-
-        if should_create_inbox(event_type, data) {
-            let inbox_id = uuid::Uuid::new_v4().to_string();
-            let source_id = data
-                .get("jobId")
-                .and_then(Value::as_str)
-                .or_else(|| data.get("feedId").and_then(Value::as_str))
-                .or_else(|| data.get("id").and_then(Value::as_str))
-                .map(str::to_string);
-            let run_id = data.get("runId").and_then(Value::as_str).map(str::to_string);
-            let body = data
-                .get("fullOutput")
-                .and_then(Value::as_str)
-                .or_else(|| data.get("error").and_then(Value::as_str))
-                .or_else(|| data.get("summary").and_then(Value::as_str))
-                .unwrap_or("")
-                .to_string();
-
-            conn.execute(
-                "INSERT INTO inbox_items
-                 (id, tenant_id, source_type, source_id, run_id, chat_id, title, preview, body, metadata_json, status, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, 'unread', ?10)",
-                params![
-                    inbox_id,
-                    tenant,
-                    source,
-                    source_id,
-                    run_id,
-                    title,
-                    if description.is_empty() { None::<String> } else { Some(description) },
-                    if body.is_empty() { None::<String> } else { Some(body) },
-                    serde_json::to_string(data).unwrap_or_else(|_| "{}".to_string()),
-                    ts_ms
-                ],
-            )?;
-        }
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_inbox_item_persists_row() {
+        let db = AriaDb::open_in_memory().unwrap();
+        ensure_schema(&db).unwrap();
+
+        let item = NewInboxItem {
+            source_type: "agent".to_string(),
+            source_id: Some("agent:test".to_string()),
+            run_id: None,
+            chat_id: None,
+            title: "Hello".to_string(),
+            preview: Some("Preview".to_string()),
+            body: Some("Body".to_string()),
+            metadata: serde_json::json!({"priority":"low"}),
+            status: Some("unread".to_string()),
+        };
+        let id = create_inbox_item(&db, "dev-tenant", &item).unwrap();
+
+        let row = db
+            .with_conn(|conn| {
+                Ok(conn.query_row(
+                    "SELECT title, source_type, status FROM inbox_items WHERE id=?1",
+                    params![id],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    },
+                )?)
+            })
+            .unwrap();
+
+        assert_eq!(row.0, "Hello");
+        assert_eq!(row.1, "agent");
+        assert_eq!(row.2, "unread");
+    }
+
+    #[test]
+    fn persist_status_event_only_writes_events_table() {
+        let db = AriaDb::open_in_memory().unwrap();
+        ensure_schema(&db).unwrap();
+
+        persist_status_event(
+            &db,
+            "dev-tenant",
+            "cron.completed",
+            &serde_json::json!({"jobId":"j1","summary":"done"}),
+            "2026-02-16T00:00:00Z",
+        )
+        .unwrap();
+
+        let (events_count, inbox_count) = db
+            .with_conn(|conn| {
+                let events_count: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))?;
+                let inbox_count: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM inbox_items", [], |r| r.get(0))?;
+                Ok((events_count, inbox_count))
+            })
+            .unwrap();
+
+        assert_eq!(events_count, 1);
+        assert_eq!(inbox_count, 0);
+    }
 }

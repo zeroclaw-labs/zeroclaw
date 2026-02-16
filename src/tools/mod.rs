@@ -2,6 +2,7 @@ pub mod browser_open;
 pub mod composio;
 pub mod file_read;
 pub mod file_write;
+pub mod inbox_notify;
 pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
@@ -13,6 +14,7 @@ pub use browser_open::BrowserOpenTool;
 pub use composio::ComposioTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
+pub use inbox_notify::InboxNotifyTool;
 pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
@@ -76,6 +78,10 @@ pub fn all_tools_for_tenant(
     tenant_id: &str,
 ) -> Vec<Box<dyn Tool>> {
     let mut tools = all_tools(security, memory, composio_key, browser_config);
+    tools.push(Box::new(InboxNotifyTool::new(
+        registry_db.clone(),
+        tenant_id.to_string(),
+    )));
     let mut existing: std::collections::HashSet<String> =
         tools.iter().map(|t| t.name().to_string()).collect();
 

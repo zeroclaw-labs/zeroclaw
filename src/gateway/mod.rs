@@ -218,7 +218,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/sessions/:key/reset", post(api_reset_session))
         .route("/api/sessions/:key", delete(api_delete_session))
         .route("/api/events", get(api_list_events))
-        .route("/api/inbox", get(api_list_inbox))
+        .route("/api/inbox", get(api_list_inbox).post(api_create_inbox))
         .route("/api/inbox/:id/read", post(api_mark_inbox_read))
         .route("/api/inbox/:id/archive", post(api_archive_inbox))
         .route("/api/inbox/:id/open-chat", post(api_open_inbox_chat))
@@ -513,6 +513,23 @@ struct InboxListQuery {
     source: Option<String>,
     limit: Option<u32>,
     cursor: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
+struct ApiCreateInboxBody {
+    #[serde(rename = "sourceType")]
+    source_type: Option<String>,
+    #[serde(rename = "sourceId")]
+    source_id: Option<String>,
+    #[serde(rename = "runId")]
+    run_id: Option<String>,
+    #[serde(rename = "chatId")]
+    chat_id: Option<String>,
+    title: Option<String>,
+    preview: Option<String>,
+    body: Option<String>,
+    metadata: Option<serde_json::Value>,
+    status: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1417,6 +1434,63 @@ async fn api_list_inbox(
     });
     match res {
         Ok(v) => api_ok(v),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn api_create_inbox(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ApiCreateInboxBody>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let title = body
+        .title
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    let item_body = body
+        .body
+        .map(|b| b.trim().to_string())
+        .filter(|b| !b.is_empty());
+    let Some(title) = title else {
+        return api_err(StatusCode::BAD_REQUEST, "title is required");
+    };
+    let Some(full_body) = item_body else {
+        return api_err(StatusCode::BAD_REQUEST, "body is required");
+    };
+
+    let source_type = body.source_type.unwrap_or_else(|| "agent".to_string());
+    let item = crate::dashboard::NewInboxItem {
+        source_type: source_type.clone(),
+        source_id: body.source_id,
+        run_id: body.run_id,
+        chat_id: body.chat_id,
+        title: title.clone(),
+        preview: body
+            .preview
+            .or_else(|| Some(full_body.chars().take(160).collect())),
+        body: Some(full_body),
+        metadata: body.metadata.unwrap_or_else(|| serde_json::json!({})),
+        status: body.status,
+    };
+
+    let created = crate::dashboard::create_inbox_item(&state.registry_db, &tenant, &item);
+    match created {
+        Ok(id) => {
+            status_events::emit(
+                "inbox.item.created",
+                serde_json::json!({
+                    "tenantId": tenant,
+                    "id": id,
+                    "title": title,
+                    "sourceType": source_type,
+                }),
+            );
+            api_ok(serde_json::json!({ "id": id, "status": "unread" }))
+        }
         Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
