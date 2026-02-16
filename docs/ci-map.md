@@ -32,6 +32,8 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
     - Purpose: first-time contributor onboarding messages
 - `.github/workflows/stale.yml` (`Stale`)
     - Purpose: stale issue/PR lifecycle automation
+- `.github/workflows/pr-hygiene.yml` (`PR Hygiene`)
+    - Purpose: nudge stale-but-active PRs to rebase/re-run required checks before queue starvation
 
 ## Trigger Map
 
@@ -43,6 +45,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 - `PR Labeler`: `pull_request_target` lifecycle events
 - `Auto Response`: issue opened, `pull_request_target` opened
 - `Stale`: daily schedule, manual dispatch
+- `PR Hygiene`: every 12 hours schedule, manual dispatch
 
 ## Fast Triage Guide
 

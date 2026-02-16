@@ -98,6 +98,7 @@ Review emphasis for AI-heavy PRs:
 - First maintainer triage target: within 48 hours.
 - If PR is blocked, maintainer leaves one actionable checklist.
 - `stale` automation is used to keep queue healthy; maintainers can apply `no-stale` when needed.
+- `pr-hygiene` automation checks open PRs every 12 hours and posts a nudge when a PR has no new commits for 48+ hours and is either behind `main` or missing/failing `CI Required Gate` on the head commit.
 
 ## 7) Security and Stability Rules
 
