@@ -57,6 +57,52 @@ impl ClaudeCliProvider {
         })
     }
 
+    fn parse_add_dirs_env(raw: &str) -> Vec<PathBuf> {
+        raw.split(|c| c == ',' || c == ':' || c == ';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .filter(|p| p.exists())
+            .collect()
+    }
+
+    fn resolve_add_dirs(exec_cwd: Option<&PathBuf>) -> Vec<PathBuf> {
+        if let Ok(raw) = std::env::var("ARIA_CLAUDE_ADD_DIRS")
+            .or_else(|_| std::env::var("AFW_CLAUDE_ADD_DIRS"))
+        {
+            let parsed = Self::parse_add_dirs_env(&raw);
+            if !parsed.is_empty() {
+                return parsed;
+            }
+        }
+
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        if let Some(cwd) = exec_cwd {
+            dirs.push(cwd.clone());
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            let p = PathBuf::from(home);
+            if p.exists() && !dirs.iter().any(|d| d == &p) {
+                dirs.push(p);
+            }
+        }
+        dirs
+    }
+
+    fn apply_common_cli_flags(cmd: &mut Command, exec_cwd: Option<&PathBuf>) {
+        // Non-interactive automation should not block on permission prompts.
+        // Default to don't-ask; override with ARIA_CLAUDE_PERMISSION_MODE if needed.
+        let permission_mode = std::env::var("ARIA_CLAUDE_PERMISSION_MODE")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "dontAsk".to_string());
+        cmd.arg("--permission-mode").arg(permission_mode);
+
+        for dir in Self::resolve_add_dirs(exec_cwd) {
+            cmd.arg("--add-dir").arg(dir);
+        }
+    }
+
     fn parse_output(stdout: &str) -> anyhow::Result<String> {
         let trimmed = stdout.trim();
         if trimmed.is_empty() {
@@ -219,6 +265,7 @@ impl ClaudeCliProvider {
     ) -> anyhow::Result<ChatCompletionResponse> {
         let resolved_model = Self::normalize_model(model);
         let mut cmd = Command::new("claude");
+        let exec_cwd = Self::resolve_exec_cwd();
         cmd.arg("-p")
             .arg("--output-format")
             .arg("stream-json")
@@ -229,7 +276,8 @@ impl ClaudeCliProvider {
             .env_remove("ANTHROPIC_API_KEY_OLD")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if let Some(cwd) = Self::resolve_exec_cwd() {
+        Self::apply_common_cli_flags(&mut cmd, exec_cwd.as_ref());
+        if let Some(cwd) = exec_cwd {
             cmd.current_dir(cwd);
         }
 
@@ -442,6 +490,7 @@ impl Provider for ClaudeCliProvider {
         let resolved_model = Self::normalize_model(model);
 
         let mut cmd = Command::new("claude");
+        let exec_cwd = Self::resolve_exec_cwd();
         cmd.arg("-p")
             .arg("--output-format")
             .arg("json")
@@ -450,7 +499,8 @@ impl Provider for ClaudeCliProvider {
             .arg(message)
             .env_remove("ANTHROPIC_API_KEY")
             .env_remove("ANTHROPIC_API_KEY_OLD");
-        if let Some(cwd) = Self::resolve_exec_cwd() {
+        Self::apply_common_cli_flags(&mut cmd, exec_cwd.as_ref());
+        if let Some(cwd) = exec_cwd {
             cmd.current_dir(cwd);
         }
 
@@ -533,6 +583,7 @@ impl Provider for ClaudeCliProvider {
 #[cfg(test)]
 mod tests {
     use super::ClaudeCliProvider;
+    use std::path::PathBuf;
 
     #[test]
     fn normalize_model_aliases() {
@@ -553,5 +604,19 @@ mod tests {
         let out = r#"{"type":"result","result":"Hello"}"#;
         let parsed = ClaudeCliProvider::parse_output(out).unwrap();
         assert_eq!(parsed, "Hello");
+    }
+
+    #[test]
+    fn parse_add_dirs_env_supports_multiple_separators() {
+        let dirs = ClaudeCliProvider::parse_add_dirs_env("/tmp,/var:/usr; /bin");
+        assert_eq!(
+            dirs,
+            vec![
+                PathBuf::from("/tmp"),
+                PathBuf::from("/var"),
+                PathBuf::from("/usr"),
+                PathBuf::from("/bin")
+            ]
+        );
     }
 }
