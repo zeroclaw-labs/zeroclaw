@@ -201,9 +201,17 @@ fn generate_code() -> String {
     }
 }
 
-/// Generate a cryptographically-adequate bearer token (hex-encoded).
+/// Generate a cryptographically-adequate bearer token with 256-bit entropy.
+///
+/// Uses `rand::thread_rng()` which is backed by the OS CSPRNG
+/// (/dev/urandom on Linux, BCryptGenRandom on Windows, SecRandomCopyBytes
+/// on macOS). The 32 random bytes (256 bits) are hex-encoded for a
+/// 64-character token, providing 256 bits of entropy.
 fn generate_token() -> String {
-    format!("zc_{}", uuid::Uuid::new_v4().as_simple())
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    format!("zc_{}", hex::encode(&bytes))
 }
 
 /// SHA-256 hash a bearer token for storage. Returns lowercase hex.
