@@ -76,26 +76,35 @@ impl HttpRequestTool {
         }
     }
 
-    fn sanitize_headers(&self, headers: &serde_json::Value) -> Vec<(String, String)> {
+    fn parse_headers(&self, headers: &serde_json::Value) -> Vec<(String, String)> {
         let mut result = Vec::new();
         if let Some(obj) = headers.as_object() {
             for (key, value) in obj {
                 if let Some(str_val) = value.as_str() {
-                    // Redact sensitive headers from logs (we don't log headers, but this is defense-in-depth)
-                    let is_sensitive = key.to_lowercase().contains("authorization")
-                        || key.to_lowercase().contains("api-key")
-                        || key.to_lowercase().contains("apikey")
-                        || key.to_lowercase().contains("token")
-                        || key.to_lowercase().contains("secret");
-                    if is_sensitive {
-                        result.push((key.clone(), "***REDACTED***".into()));
-                    } else {
-                        result.push((key.clone(), str_val.to_string()));
-                    }
+                    result.push((key.clone(), str_val.to_string()));
                 }
             }
         }
         result
+    }
+
+    fn redact_headers_for_display(headers: &[(String, String)]) -> Vec<(String, String)> {
+        headers
+            .iter()
+            .map(|(key, value)| {
+                let lower = key.to_lowercase();
+                let is_sensitive = lower.contains("authorization")
+                    || lower.contains("api-key")
+                    || lower.contains("apikey")
+                    || lower.contains("token")
+                    || lower.contains("secret");
+                if is_sensitive {
+                    (key.clone(), "***REDACTED***".into())
+                } else {
+                    (key.clone(), value.clone())
+                }
+            })
+            .collect()
     }
 
     async fn execute_request(
@@ -222,10 +231,10 @@ impl Tool for HttpRequestTool {
             }
         };
 
-        let sanitized_headers = self.sanitize_headers(&headers_val);
+        let request_headers = self.parse_headers(&headers_val);
 
         match self
-            .execute_request(&url, method, sanitized_headers, body)
+            .execute_request(&url, method, request_headers, body)
             .await
         {
             Ok(response) => {
@@ -600,23 +609,54 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_headers_redacts_sensitive() {
+    fn parse_headers_preserves_original_values() {
         let tool = test_tool(vec!["example.com"]);
         let headers = json!({
             "Authorization": "Bearer secret",
             "Content-Type": "application/json",
             "X-API-Key": "my-key"
         });
-        let sanitized = tool.sanitize_headers(&headers);
-        assert_eq!(sanitized.len(), 3);
-        assert!(sanitized
+        let parsed = tool.parse_headers(&headers);
+        assert_eq!(parsed.len(), 3);
+        assert!(parsed
             .iter()
-            .any(|(k, v)| k == "Authorization" && v == "***REDACTED***"));
-        assert!(sanitized
+            .any(|(k, v)| k == "Authorization" && v == "Bearer secret"));
+        assert!(parsed
             .iter()
-            .any(|(k, v)| k == "X-API-Key" && v == "***REDACTED***"));
-        assert!(sanitized
+            .any(|(k, v)| k == "X-API-Key" && v == "my-key"));
+        assert!(parsed
             .iter()
             .any(|(k, v)| k == "Content-Type" && v == "application/json"));
+    }
+
+    #[test]
+    fn redact_headers_for_display_redacts_sensitive() {
+        let headers = vec![
+            ("Authorization".into(), "Bearer secret".into()),
+            ("Content-Type".into(), "application/json".into()),
+            ("X-API-Key".into(), "my-key".into()),
+            ("X-Secret-Token".into(), "tok-123".into()),
+        ];
+        let redacted = HttpRequestTool::redact_headers_for_display(&headers);
+        assert_eq!(redacted.len(), 4);
+        assert!(redacted
+            .iter()
+            .any(|(k, v)| k == "Authorization" && v == "***REDACTED***"));
+        assert!(redacted
+            .iter()
+            .any(|(k, v)| k == "X-API-Key" && v == "***REDACTED***"));
+        assert!(redacted
+            .iter()
+            .any(|(k, v)| k == "X-Secret-Token" && v == "***REDACTED***"));
+        assert!(redacted
+            .iter()
+            .any(|(k, v)| k == "Content-Type" && v == "application/json"));
+    }
+
+    #[test]
+    fn redact_headers_does_not_alter_original() {
+        let headers = vec![("Authorization".into(), "Bearer real-token".into())];
+        let _ = HttpRequestTool::redact_headers_for_display(&headers);
+        assert_eq!(headers[0].1, "Bearer real-token");
     }
 }
