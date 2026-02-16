@@ -20,7 +20,7 @@ jobs:
       issues: write
     steps:
       - name: Apply contributor tier label for issue author
-        uses: actions/github-script@v8
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
           script: |
             const owner = context.repo.owner;
@@ -125,7 +125,7 @@ jobs:
       pull-requests: write
     steps:
       - name: Greet first-time contributors
-        uses: actions/first-interaction@v1
+        uses: actions/first-interaction@2ec0f0fd78838633cd1c1342e4536d49ef72be54 # v1
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
           issue-message: |
@@ -156,7 +156,7 @@ jobs:
       pull-requests: write
     steps:
       - name: Handle label-driven responses
-        uses: actions/github-script@v8
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
           script: |
             const label = context.payload.label?.name;
