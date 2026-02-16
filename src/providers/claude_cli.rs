@@ -90,13 +90,9 @@ impl ClaudeCliProvider {
     }
 
     fn apply_common_cli_flags(cmd: &mut Command, exec_cwd: Option<&PathBuf>) {
-        // Non-interactive automation should not block on permission prompts.
-        // Default to don't-ask; override with ARIA_CLAUDE_PERMISSION_MODE if needed.
-        let permission_mode = std::env::var("ARIA_CLAUDE_PERMISSION_MODE")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| "dontAsk".to_string());
-        cmd.arg("--permission-mode").arg(permission_mode);
+        // Heartbeat/automation runs must be non-interactive and never block on
+        // permission prompts.
+        cmd.arg("--dangerously-skip-permissions");
 
         for dir in Self::resolve_add_dirs(exec_cwd) {
             cmd.arg("--add-dir").arg(dir);
