@@ -4843,6 +4843,7 @@ dependencies = [
  "pdf-extract",
  "probe-rs",
  "prometheus",
+ "rand 0.8.5",
  "reqwest",
  "rppal",
  "rusqlite",
