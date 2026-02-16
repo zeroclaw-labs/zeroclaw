@@ -435,6 +435,7 @@ mod tests {
         CronJob {
             id: "test-job".into(),
             expression: "* * * * *".into(),
+            timezone: None,
             command: command.into(),
             next_run: Utc::now(),
             last_run: None,

@@ -19,6 +19,10 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
 
     crate::health::mark_component_ok("daemon");
 
+    if let Err(e) = crate::cron::jobs_file::import_jobs_file(&config.workspace_dir) {
+        tracing::warn!("Failed to import ~/aria/jobs.json before daemon start: {e}");
+    }
+
     wire_cron_bridge_hooks(&config)?;
 
     if config.heartbeat.enabled {
@@ -244,9 +248,10 @@ fn wire_cron_bridge_hooks(config: &Config) -> Result<()> {
     let aria_db = crate::aria::db::AriaDb::open(&config.workspace_dir.join("aria.db"))?;
     let add_cfg = config.clone();
     let remove_cfg = config.clone();
+    let export_cfg = config.clone();
 
-    let add_job: crate::aria::cron_bridge::AddJobFn = Arc::new(move |expr, command| {
-        let job = crate::cron::add_job(&add_cfg, expr, command)?;
+    let add_job: crate::aria::cron_bridge::AddJobFn = Arc::new(move |expr, timezone, command| {
+        let job = crate::cron::add_job(&add_cfg, expr, timezone, command)?;
         Ok(crate::aria::cron_bridge::CronJobHandle { id: job.id })
     });
     let remove_job: crate::aria::cron_bridge::RemoveJobFn =
@@ -256,18 +261,27 @@ fn wire_cron_bridge_hooks(config: &Config) -> Result<()> {
         aria_db, add_job, remove_job,
     ));
     bridge.sync_all()?;
+    if let Err(e) = crate::cron::jobs_file::export_jobs_file(&export_cfg.workspace_dir) {
+        tracing::warn!("Failed to export cron jobs to ~/aria/jobs.json after startup sync: {e}");
+    }
 
     let on_uploaded = bridge.clone();
     let on_deleted = bridge.clone();
+    let export_on_upload = config.workspace_dir.clone();
+    let export_on_delete = config.workspace_dir.clone();
     crate::aria::hooks::set_cron_hooks(crate::aria::hooks::CronHooks {
         on_cron_uploaded: Some(Box::new(move |cron_id| {
             if let Err(e) = on_uploaded.sync_cron(cron_id) {
                 tracing::warn!("Failed to sync cron '{cron_id}' after upload: {e}");
+            } else if let Err(e) = crate::cron::jobs_file::export_jobs_file(&export_on_upload) {
+                tracing::warn!("Failed to export cron jobs after upload hook: {e}");
             }
         })),
         on_cron_deleted: Some(Box::new(move |cron_id| {
             if let Err(e) = on_deleted.remove_cron(cron_id) {
                 tracing::warn!("Failed to remove cron '{cron_id}' after delete: {e}");
+            } else if let Err(e) = crate::cron::jobs_file::export_jobs_file(&export_on_delete) {
+                tracing::warn!("Failed to export cron jobs after delete hook: {e}");
             }
         })),
     });

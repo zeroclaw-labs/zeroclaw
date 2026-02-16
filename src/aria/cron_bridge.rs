@@ -42,8 +42,8 @@ pub struct CronJobHandle {
 pub const ARIA_CRON_COMMAND_PREFIX: &str = "__ARIA_CRON__:";
 
 /// Callback type for adding a cron job to the runtime system.
-/// Takes (cron_expression, command) and returns the created job handle.
-pub type AddJobFn = Arc<dyn Fn(&str, &str) -> Result<CronJobHandle> + Send + Sync>;
+/// Takes (cron_expression, timezone, command) and returns the created job handle.
+pub type AddJobFn = Arc<dyn Fn(&str, Option<&str>, &str) -> Result<CronJobHandle> + Send + Sync>;
 
 /// Callback type for removing a cron job from the runtime system.
 pub type RemoveJobFn = Arc<dyn Fn(&str) -> Result<()> + Send + Sync>;
@@ -92,8 +92,8 @@ impl CronBridge {
             return Ok(());
         }
 
-        // Convert schedule to cron expression
-        let cron_expr = schedule_to_cron_expression(&entry.schedule_kind, &entry.schedule_data)?;
+        // Convert schedule to cron expression + timezone
+        let cron_spec = schedule_to_cron_spec(&entry.schedule_kind, &entry.schedule_data)?;
 
         // Build the command for the cron system
         let command = build_cron_command(&entry);
@@ -104,7 +104,11 @@ impl CronBridge {
         }
 
         // Add job to runtime cron
-        let job = (self.add_job)(&cron_expr, &command)?;
+        let job = (self.add_job)(
+            &cron_spec.expression,
+            cron_spec.timezone.as_deref(),
+            &command,
+        )?;
 
         // Store cron_job_id back in registry
         self.set_cron_job_id(cron_func_id, &job.id)?;
@@ -112,7 +116,8 @@ impl CronBridge {
         tracing::info!(
             cron_func_id = cron_func_id,
             cron_job_id = job.id.as_str(),
-            expression = cron_expr.as_str(),
+            expression = cron_spec.expression.as_str(),
+            timezone = cron_spec.timezone.as_deref().unwrap_or("UTC"),
             "Synced cron function to runtime"
         );
 
@@ -246,25 +251,39 @@ impl CronBridge {
 }
 
 /// Convert schedule_kind + schedule_data into a standard 5-field cron expression.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CronSpec {
+    pub expression: String,
+    pub timezone: Option<String>,
+}
 ///
 /// Supported kinds:
 /// - "cron": schedule_data is already a cron expression
 /// - "every": schedule_data is JSON `{"every_ms": N}` — converted to nearest minute interval
 /// - "at": schedule_data is JSON `{"at_ms": N}` — one-shot, uses a far-future cron as placeholder
-pub fn schedule_to_cron_expression(kind: &str, data: &str) -> Result<String> {
+pub fn schedule_to_cron_spec(kind: &str, data: &str) -> Result<CronSpec> {
     match kind {
         "cron" => {
             // schedule_data contains the cron expression itself (possibly wrapped in JSON)
-            let expr = if data.starts_with('"') {
-                serde_json::from_str::<String>(data).unwrap_or_else(|_| data.to_string())
+            let (expr, timezone) = if data.starts_with('"') {
+                (
+                    serde_json::from_str::<String>(data).unwrap_or_else(|_| data.to_string()),
+                    None,
+                )
             } else if data.starts_with('{') {
                 let parsed: serde_json::Value =
                     serde_json::from_str(data).context("Invalid cron schedule JSON")?;
-                parsed["expr"].as_str().unwrap_or(data).to_string()
+                (
+                    parsed["expr"].as_str().unwrap_or(data).to_string(),
+                    parsed["tz"].as_str().map(str::to_owned),
+                )
             } else {
-                data.to_string()
+                (data.to_string(), None)
             };
-            Ok(expr)
+            Ok(CronSpec {
+                expression: expr,
+                timezone,
+            })
         }
         "every" => {
             let parsed: serde_json::Value =
@@ -277,13 +296,22 @@ pub fn schedule_to_cron_expression(kind: &str, data: &str) -> Result<String> {
             let minutes = (every_ms / 60_000).max(1);
 
             if minutes < 60 {
-                Ok(format!("*/{minutes} * * * *"))
+                Ok(CronSpec {
+                    expression: format!("*/{minutes} * * * *"),
+                    timezone: None,
+                })
             } else if minutes < 1440 {
                 let hours = minutes / 60;
-                Ok(format!("0 */{hours} * * *"))
+                Ok(CronSpec {
+                    expression: format!("0 */{hours} * * *"),
+                    timezone: None,
+                })
             } else {
                 // Daily or longer
-                Ok("0 0 * * *".to_string())
+                Ok(CronSpec {
+                    expression: "0 0 * * *".to_string(),
+                    timezone: None,
+                })
             }
         }
         "at" => {
@@ -303,7 +331,10 @@ pub fn schedule_to_cron_expression(kind: &str, data: &str) -> Result<String> {
             let day = chrono::Datelike::day(&dt);
             let month = chrono::Datelike::month(&dt);
 
-            Ok(format!("{minute} {hour} {day} {month} *"))
+            Ok(CronSpec {
+                expression: format!("{minute} {hour} {day} {month} *"),
+                timezone: None,
+            })
         }
         _ => {
             anyhow::bail!("Unknown schedule kind: {kind}")
@@ -332,7 +363,7 @@ mod tests {
         let counter = Arc::new(AtomicU32::new(0));
 
         let add_counter = counter.clone();
-        let add_fn: AddJobFn = Arc::new(move |_expr, _cmd| {
+        let add_fn: AddJobFn = Arc::new(move |_expr, _tz, _cmd| {
             let n = add_counter.fetch_add(1, AtomicOrdering::Relaxed);
             Ok(CronJobHandle {
                 id: format!("job-{n}"),
@@ -380,57 +411,68 @@ mod tests {
 
     #[test]
     fn cron_expression_passthrough() {
-        let expr = schedule_to_cron_expression("cron", "*/5 * * * *").unwrap();
-        assert_eq!(expr, "*/5 * * * *");
+        let spec = schedule_to_cron_spec("cron", "*/5 * * * *").unwrap();
+        assert_eq!(spec.expression, "*/5 * * * *");
+        assert_eq!(spec.timezone, None);
     }
 
     #[test]
     fn cron_expression_from_json_object() {
         let data = r#"{"expr":"0 9 * * 1"}"#;
-        let expr = schedule_to_cron_expression("cron", data).unwrap();
-        assert_eq!(expr, "0 9 * * 1");
+        let spec = schedule_to_cron_spec("cron", data).unwrap();
+        assert_eq!(spec.expression, "0 9 * * 1");
+        assert_eq!(spec.timezone, None);
     }
 
     #[test]
     fn cron_expression_from_json_string() {
         let data = r#""*/10 * * * *""#;
-        let expr = schedule_to_cron_expression("cron", data).unwrap();
-        assert_eq!(expr, "*/10 * * * *");
+        let spec = schedule_to_cron_spec("cron", data).unwrap();
+        assert_eq!(spec.expression, "*/10 * * * *");
+    }
+
+    #[test]
+    fn cron_expression_extracts_timezone() {
+        let data = r#"{"expr":"0 8 * * *","tz":"America/New_York"}"#;
+        let spec = schedule_to_cron_spec("cron", data).unwrap();
+        assert_eq!(spec.expression, "0 8 * * *");
+        assert_eq!(spec.timezone.as_deref(), Some("America/New_York"));
     }
 
     #[test]
     fn every_minutes_conversion() {
         let data = r#"{"every_ms":300000}"#; // 5 minutes
-        let expr = schedule_to_cron_expression("every", data).unwrap();
-        assert_eq!(expr, "*/5 * * * *");
+        let spec = schedule_to_cron_spec("every", data).unwrap();
+        assert_eq!(spec.expression, "*/5 * * * *");
     }
 
     #[test]
     fn every_hours_conversion() {
         let data = r#"{"every_ms":7200000}"#; // 2 hours
-        let expr = schedule_to_cron_expression("every", data).unwrap();
-        assert_eq!(expr, "0 */2 * * *");
+        let spec = schedule_to_cron_spec("every", data).unwrap();
+        assert_eq!(spec.expression, "0 */2 * * *");
     }
 
     #[test]
     fn every_daily_conversion() {
         let data = r#"{"every_ms":86400000}"#; // 24 hours
-        let expr = schedule_to_cron_expression("every", data).unwrap();
-        assert_eq!(expr, "0 0 * * *");
+        let spec = schedule_to_cron_spec("every", data).unwrap();
+        assert_eq!(spec.expression, "0 0 * * *");
     }
 
     #[test]
     fn every_sub_minute_floors_to_1_min() {
         let data = r#"{"every_ms":30000}"#; // 30 seconds
-        let expr = schedule_to_cron_expression("every", data).unwrap();
-        assert_eq!(expr, "*/1 * * * *");
+        let spec = schedule_to_cron_spec("every", data).unwrap();
+        assert_eq!(spec.expression, "*/1 * * * *");
     }
 
     #[test]
     fn at_timestamp_conversion() {
         // 2025-06-15T14:30:00 UTC = 1750000200000 ms
         let data = r#"{"at_ms":1750000200000}"#;
-        let expr = schedule_to_cron_expression("at", data).unwrap();
+        let spec = schedule_to_cron_spec("at", data).unwrap();
+        let expr = spec.expression;
         // Should produce specific minute/hour/day/month
         assert!(!expr.contains('*') || expr.ends_with("*")); // weekday is always *
         let parts: Vec<&str> = expr.split_whitespace().collect();
@@ -439,7 +481,7 @@ mod tests {
 
     #[test]
     fn unknown_schedule_kind_errors() {
-        let result = schedule_to_cron_expression("unknown", "{}");
+        let result = schedule_to_cron_spec("unknown", "{}");
         assert!(result.is_err());
     }
 

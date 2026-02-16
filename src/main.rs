@@ -115,7 +115,7 @@ enum Commands {
         temperature: f64,
     },
 
-    /// Start the gateway server (webhooks, websockets)
+    /// Start full runtime (daemon + gateway + schedulers)
     Gateway {
         /// Port to listen on (use 0 for random available port)
         #[arg(short, long, default_value = "8080")]
@@ -328,11 +328,11 @@ async fn main() -> Result<()> {
 
         Commands::Gateway { port, host } => {
             if port == 0 {
-                info!("🚀 Starting Aria Gateway on {host} (random port)");
+                info!("🧠 Starting Aria runtime on {host} (random port)");
             } else {
-                info!("🚀 Starting Aria Gateway on {host}:{port}");
+                info!("🧠 Starting Aria runtime on {host}:{port}");
             }
-            gateway::run_gateway(&host, port, config).await
+            daemon::run(config, host, port).await
         }
 
         Commands::Daemon { port, host } => {
