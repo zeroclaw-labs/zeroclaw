@@ -11,6 +11,7 @@ use std::fmt::Write;
 use std::io::Write as IoWrite;
 use std::sync::Arc;
 use std::time::Instant;
+use uuid::Uuid;
 
 /// Maximum agentic tool-use iterations per user message to prevent runaway loops.
 const MAX_TOOL_ITERATIONS: usize = 10;
@@ -18,6 +19,10 @@ const MAX_TOOL_ITERATIONS: usize = 10;
 /// Maximum number of non-system messages to keep in history.
 /// When exceeded, the oldest messages are dropped (system prompt is always preserved).
 const MAX_HISTORY_MESSAGES: usize = 50;
+
+fn autosave_memory_key(prefix: &str) -> String {
+    format!("{prefix}_{}", Uuid::new_v4())
+}
 
 /// Trim conversation history to prevent unbounded growth.
 /// Preserves the system prompt (first message if role=system) and the most recent messages.
@@ -397,8 +402,9 @@ pub async fn run(
     if let Some(msg) = message {
         // Auto-save user message to memory
         if config.memory.auto_save {
+            let user_key = autosave_memory_key("user_msg");
             let _ = mem
-                .store("user_msg", &msg, MemoryCategory::Conversation)
+                .store(&user_key, &msg, MemoryCategory::Conversation)
                 .await;
         }
 
@@ -429,8 +435,9 @@ pub async fn run(
         // Auto-save assistant response to daily log
         if config.memory.auto_save {
             let summary = truncate_with_ellipsis(&response, 100);
+            let response_key = autosave_memory_key("assistant_resp");
             let _ = mem
-                .store("assistant_resp", &summary, MemoryCategory::Daily)
+                .store(&response_key, &summary, MemoryCategory::Daily)
                 .await;
         }
     } else {
@@ -451,8 +458,9 @@ pub async fn run(
         while let Some(msg) = rx.recv().await {
             // Auto-save conversation turns
             if config.memory.auto_save {
+                let user_key = autosave_memory_key("user_msg");
                 let _ = mem
-                    .store("user_msg", &msg.content, MemoryCategory::Conversation)
+                    .store(&user_key, &msg.content, MemoryCategory::Conversation)
                     .await;
             }
 
@@ -489,8 +497,9 @@ pub async fn run(
 
             if config.memory.auto_save {
                 let summary = truncate_with_ellipsis(&response, 100);
+                let response_key = autosave_memory_key("assistant_resp");
                 let _ = mem
-                    .store("assistant_resp", &summary, MemoryCategory::Daily)
+                    .store(&response_key, &summary, MemoryCategory::Daily)
                     .await;
             }
         }
@@ -510,6 +519,8 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::{Memory, MemoryCategory, SqliteMemory};
+    use tempfile::TempDir;
 
     #[test]
     fn parse_tool_calls_extracts_single_call() {
@@ -663,5 +674,36 @@ After text."#;
         ];
         trim_history(&mut history);
         assert_eq!(history.len(), 3);
+    }
+
+    #[test]
+    fn autosave_memory_key_has_prefix_and_uniqueness() {
+        let key1 = autosave_memory_key("user_msg");
+        let key2 = autosave_memory_key("user_msg");
+
+        assert!(key1.starts_with("user_msg_"));
+        assert!(key2.starts_with("user_msg_"));
+        assert_ne!(key1, key2);
+    }
+
+    #[tokio::test]
+    async fn autosave_memory_keys_preserve_multiple_turns() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+
+        let key1 = autosave_memory_key("user_msg");
+        let key2 = autosave_memory_key("user_msg");
+
+        mem.store(&key1, "I'm Paul", MemoryCategory::Conversation)
+            .await
+            .unwrap();
+        mem.store(&key2, "I'm 45", MemoryCategory::Conversation)
+            .await
+            .unwrap();
+
+        assert_eq!(mem.count().await.unwrap(), 2);
+
+        let recalled = mem.recall("45", 5).await.unwrap();
+        assert!(recalled.iter().any(|entry| entry.content.contains("45")));
     }
 }

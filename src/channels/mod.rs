@@ -26,6 +26,7 @@ use crate::memory::{self, Memory};
 use crate::providers::{self, Provider};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
+use std::fmt::Write;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -35,6 +36,26 @@ const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 const DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS: u64 = 2;
 const DEFAULT_CHANNEL_MAX_BACKOFF_SECS: u64 = 60;
 const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 90;
+
+fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
+    format!("{}_{}_{}", msg.channel, msg.sender, msg.id)
+}
+
+async fn build_memory_context(mem: &dyn Memory, user_msg: &str) -> String {
+    let mut context = String::new();
+
+    if let Ok(entries) = mem.recall(user_msg, 5).await {
+        if !entries.is_empty() {
+            context.push_str("[Memory context]\n");
+            for entry in &entries {
+                let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
+            }
+            context.push('\n');
+        }
+    }
+
+    context
+}
 
 fn spawn_supervised_listener(
     ch: Arc<dyn Channel>,
@@ -681,16 +702,25 @@ pub async fn start_channels(config: Config) -> Result<()> {
             truncate_with_ellipsis(&msg.content, 80)
         );
 
+        let memory_context = build_memory_context(mem.as_ref(), &msg.content).await;
+
         // Auto-save to memory
         if config.memory.auto_save {
+            let autosave_key = conversation_memory_key(&msg);
             let _ = mem
                 .store(
-                    &format!("{}_{}", msg.channel, msg.sender),
+                    &autosave_key,
                     &msg.content,
                     crate::memory::MemoryCategory::Conversation,
                 )
                 .await;
         }
+
+        let enriched_message = if memory_context.is_empty() {
+            msg.content.clone()
+        } else {
+            format!("{memory_context}{}", msg.content)
+        };
 
         let target_channel = channels.iter().find(|ch| ch.name() == msg.channel);
 
@@ -707,7 +737,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
         let llm_result = tokio::time::timeout(
             Duration::from_secs(CHANNEL_MESSAGE_TIMEOUT_SECS),
-            provider.chat_with_system(Some(&system_prompt), &msg.content, &model, temperature),
+            provider.chat_with_system(
+                Some(&system_prompt),
+                &enriched_message,
+                &model,
+                temperature,
+            ),
         )
         .await;
 
@@ -773,6 +808,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -996,6 +1032,93 @@ mod tests {
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], None);
 
         assert!(prompt.contains(&format!("Working directory: `{}`", ws.path().display())));
+    }
+
+    #[test]
+    fn conversation_memory_key_uses_message_id() {
+        let msg = traits::ChannelMessage {
+            id: "msg_abc123".into(),
+            sender: "U123".into(),
+            content: "hello".into(),
+            channel: "slack".into(),
+            timestamp: 1,
+        };
+
+        assert_eq!(conversation_memory_key(&msg), "slack_U123_msg_abc123");
+    }
+
+    #[test]
+    fn conversation_memory_key_is_unique_per_message() {
+        let msg1 = traits::ChannelMessage {
+            id: "msg_1".into(),
+            sender: "U123".into(),
+            content: "first".into(),
+            channel: "slack".into(),
+            timestamp: 1,
+        };
+        let msg2 = traits::ChannelMessage {
+            id: "msg_2".into(),
+            sender: "U123".into(),
+            content: "second".into(),
+            channel: "slack".into(),
+            timestamp: 2,
+        };
+
+        assert_ne!(conversation_memory_key(&msg1), conversation_memory_key(&msg2));
+    }
+
+    #[tokio::test]
+    async fn autosave_keys_preserve_multiple_conversation_facts() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+
+        let msg1 = traits::ChannelMessage {
+            id: "msg_1".into(),
+            sender: "U123".into(),
+            content: "I'm Paul".into(),
+            channel: "slack".into(),
+            timestamp: 1,
+        };
+        let msg2 = traits::ChannelMessage {
+            id: "msg_2".into(),
+            sender: "U123".into(),
+            content: "I'm 45".into(),
+            channel: "slack".into(),
+            timestamp: 2,
+        };
+
+        mem.store(
+            &conversation_memory_key(&msg1),
+            &msg1.content,
+            MemoryCategory::Conversation,
+        )
+        .await
+        .unwrap();
+        mem.store(
+            &conversation_memory_key(&msg2),
+            &msg2.content,
+            MemoryCategory::Conversation,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(mem.count().await.unwrap(), 2);
+
+        let recalled = mem.recall("45", 5).await.unwrap();
+        assert!(recalled.iter().any(|entry| entry.content.contains("45")));
+    }
+
+    #[tokio::test]
+    async fn build_memory_context_includes_recalled_entries() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        mem.store("age_fact", "Age is 45", MemoryCategory::Conversation)
+            .await
+            .unwrap();
+
+        let context = build_memory_context(&mem, "age").await;
+        assert!(context.contains("[Memory context]"));
+        assert!(context.contains("Age is 45"));
     }
 
     // ── AIEOS Identity Tests (Issue #168) ─────────────────────────
