@@ -2,6 +2,8 @@ use super::traits::{Tool, ToolResult};
 use crate::security::{AutonomyLevel, SecurityPolicy};
 use async_trait::async_trait;
 use serde_json::json;
+#[cfg(test)]
+use std::path::Path;
 use std::sync::Arc;
 
 /// Git operations tool for structured repository management.
@@ -29,7 +31,7 @@ impl GitOperationsTool {
                 || arg_lower.starts_with("--upload-pack=")
                 || arg_lower.starts_with("--receive-pack=")
                 || arg_lower.contains("$(")
-                || arg_lower.contains("`")
+                || arg_lower.contains('`')
                 || arg.contains('|')
                 || arg.contains(';')
             {
@@ -88,10 +90,8 @@ impl GitOperationsTool {
                 branch = line.trim_start_matches("# branch.head ").to_string();
             } else if let Some(rest) = line.strip_prefix("1 ") {
                 // Ordinary changed entry
-                let parts: Vec<&str> = rest.split(' ').collect();
-                if parts.len() >= 2 {
-                    let path = parts.get(1).unwrap_or(&"");
-                    let staging = parts.get(0).unwrap_or(&"");
+                let mut parts = rest.splitn(3, ' ');
+                if let (Some(staging), Some(path)) = (parts.next(), parts.next()) {
                     if !staging.is_empty() {
                         let status_char = staging.chars().next().unwrap_or(' ');
                         if status_char != '.' && status_char != ' ' {
@@ -201,7 +201,8 @@ impl GitOperationsTool {
     }
 
     async fn git_log(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+        let limit_raw = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10);
+        let limit = usize::try_from(limit_raw).unwrap_or(usize::MAX).min(1000);
         let limit_str = limit.to_string();
 
         let output = self
@@ -381,7 +382,9 @@ impl GitOperationsTool {
             "pop" => self.run_git_command(&["stash", "pop"]).await,
             "list" => self.run_git_command(&["stash", "list"]).await,
             "drop" => {
-                let index = args.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as i32;
+                let index_raw = args.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                let index = i32::try_from(index_raw)
+                    .map_err(|_| anyhow::anyhow!("stash index too large: {index_raw}"))?;
                 self.run_git_command(&["stash", "drop", &format!("stash@{{{index}}}")])
                     .await
             }
@@ -514,12 +517,7 @@ impl Tool for GitOperationsTool {
                         error: Some("Action blocked: read-only mode".into()),
                     });
                 }
-                AutonomyLevel::Supervised => {
-                    // Allow but require tracking
-                }
-                AutonomyLevel::Full => {
-                    // Allow freely
-                }
+                AutonomyLevel::Supervised | AutonomyLevel::Full => {}
             }
         }
 

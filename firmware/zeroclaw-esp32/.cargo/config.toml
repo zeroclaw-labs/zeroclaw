@@ -1,0 +1,5 @@
+[build]
+target = "riscv32imc-esp-espidf"
+
+[target.riscv32imc-esp-espidf]
+runner = "espflash flash --monitor"

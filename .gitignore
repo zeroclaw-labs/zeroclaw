@@ -1,6 +1,7 @@
 /target
+firmware/*/target
 *.db
 *.db-journal
 .DS_Store
 .wt-pr37/
-docker-compose.override.yml
+.env

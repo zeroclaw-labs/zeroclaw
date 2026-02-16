@@ -150,6 +150,18 @@ pub struct AuditLogger {
     buffer: Mutex<Vec<AuditEvent>>,
 }
 
+/// Structured command execution details for audit logging.
+#[derive(Debug, Clone)]
+pub struct CommandExecutionLog<'a> {
+    pub channel: &'a str,
+    pub command: &'a str,
+    pub risk_level: &'a str,
+    pub approved: bool,
+    pub allowed: bool,
+    pub success: bool,
+    pub duration_ms: u64,
+}
+
 impl AuditLogger {
     /// Create a new audit logger
     pub fn new(config: AuditConfig, zeroclaw_dir: PathBuf) -> Result<Self> {
@@ -183,7 +195,23 @@ impl AuditLogger {
         Ok(())
     }
 
-    /// Log a command execution event
+    /// Log a command execution event.
+    pub fn log_command_event(&self, entry: CommandExecutionLog<'_>) -> Result<()> {
+        let event = AuditEvent::new(AuditEventType::CommandExecution)
+            .with_actor(entry.channel.to_string(), None, None)
+            .with_action(
+                entry.command.to_string(),
+                entry.risk_level.to_string(),
+                entry.approved,
+                entry.allowed,
+            )
+            .with_result(entry.success, None, entry.duration_ms, None);
+
+        self.log(&event)
+    }
+
+    /// Backward-compatible helper to log a command execution event.
+    #[allow(clippy::too_many_arguments)]
     pub fn log_command(
         &self,
         channel: &str,
@@ -194,24 +222,22 @@ impl AuditLogger {
         success: bool,
         duration_ms: u64,
     ) -> Result<()> {
-        let event = AuditEvent::new(AuditEventType::CommandExecution)
-            .with_actor(channel.to_string(), None, None)
-            .with_action(
-                command.to_string(),
-                risk_level.to_string(),
-                approved,
-                allowed,
-            )
-            .with_result(success, None, duration_ms, None);
-
-        self.log(&event)
+        self.log_command_event(CommandExecutionLog {
+            channel,
+            command,
+            risk_level,
+            approved,
+            allowed,
+            success,
+            duration_ms,
+        })
     }
 
     /// Rotate log if it exceeds max size
     fn rotate_if_needed(&self) -> Result<()> {
         if let Ok(metadata) = std::fs::metadata(&self.log_path) {
             let current_size_mb = metadata.len() / (1024 * 1024);
-            if current_size_mb >= self.config.max_size_mb as u64 {
+            if current_size_mb >= u64::from(self.config.max_size_mb) {
                 self.rotate()?;
             }
         }
@@ -283,7 +309,8 @@ mod tests {
 
         let json = serde_json::to_string(&event);
         assert!(json.is_ok());
-        let parsed: AuditEvent = serde_json::from_str(&json.unwrap().as_str()).expect("parse");
+        let json = json.expect("serialize");
+        let parsed: AuditEvent = serde_json::from_str(json.as_str()).expect("parse");
         assert!(parsed.actor.is_some());
         assert!(parsed.action.is_some());
         assert!(parsed.result.is_some());

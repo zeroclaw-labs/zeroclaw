@@ -26,7 +26,8 @@ Usage: ./dev/ci.sh <command>
 Commands:
   build-image   Build/update the local CI image
   shell         Open an interactive shell inside the CI container
-  lint          Run rustfmt + clippy (container only)
+  lint          Run rustfmt + clippy correctness gate (container only)
+  lint-strict   Run rustfmt + full clippy warnings gate (container only)
   test          Run cargo test (container only)
   build         Run release build smoke check (container only)
   audit         Run cargo audit (container only)
@@ -54,6 +55,10 @@ case "$1" in
 
   lint)
     run_in_ci "cargo fmt --all -- --check && cargo clippy --locked --all-targets -- -D clippy::correctness"
+    ;;
+
+  lint-strict)
+    run_in_ci "cargo fmt --all -- --check && cargo clippy --locked --all-targets -- -D warnings"
     ;;
 
   test)

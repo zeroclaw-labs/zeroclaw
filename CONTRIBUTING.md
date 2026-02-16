@@ -18,8 +18,12 @@ cargo build
 # Run tests (all must pass)
 cargo test
 
-# Format & lint (must pass before PR)
-cargo fmt && cargo clippy -- -D warnings
+# Format & lint (required before PR)
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D clippy::correctness
+
+# Optional strict lint audit (recommended periodically)
+cargo clippy --all-targets -- -D warnings
 
 # Release build (~3.4MB)
 cargo build --release
@@ -27,7 +31,19 @@ cargo build --release
 
 ### Pre-push hook
 
-The repo includes a pre-push hook in `.githooks/` that enforces `cargo fmt --check`, `cargo clippy -- -D warnings`, and `cargo test` before every push. Enable it with `git config core.hooksPath .githooks`.
+The repo includes a pre-push hook in `.githooks/` that enforces `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D clippy::correctness`, and `cargo test` before every push. Enable it with `git config core.hooksPath .githooks`.
+
+For an opt-in strict lint pass during pre-push, set:
+
+```bash
+ZEROCLAW_STRICT_LINT=1 git push
+```
+
+For full CI parity in Docker, run:
+
+```bash
+./dev/ci.sh all
+```
 
 To skip it during rapid iteration:
 
@@ -325,8 +341,9 @@ impl Tool for YourTool {
 
 - [ ] PR template sections are completed (including security + rollback)
 - [ ] `cargo fmt --all -- --check` — code is formatted
-- [ ] `cargo clippy --all-targets -- -D warnings` — no warnings
+- [ ] `cargo clippy --all-targets -- -D clippy::correctness` — merge gate lint baseline passes
 - [ ] `cargo test` — all tests pass locally or skipped tests are explained
+- [ ] Optional strict audit: `cargo clippy --all-targets -- -D warnings` (run when doing lint cleanup or before release-hardening work)
 - [ ] New code has inline `#[cfg(test)]` tests
 - [ ] No new dependencies unless absolutely necessary (we optimize for binary size)
 - [ ] README updated if adding user-facing features
