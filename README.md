@@ -133,6 +133,9 @@ cd zeroclaw
 cargo build --release --locked
 cargo install --path . --force --locked
 
+# Ensure ~/.cargo/bin is in your PATH
+export PATH="$HOME/.cargo/bin:$PATH"
+
 # Quick setup (no prompts)
 zeroclaw onboard --api-key sk-... --provider openrouter
 
