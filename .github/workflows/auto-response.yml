@@ -20,7 +20,7 @@ jobs:
       issues: write
     steps:
       - name: Apply contributor tier label for issue author
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const owner = context.repo.owner;
@@ -156,7 +156,7 @@ jobs:
       pull-requests: write
     steps:
       - name: Handle label-driven responses
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const label = context.payload.label?.name;
