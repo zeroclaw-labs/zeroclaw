@@ -1,4 +1,7 @@
 use crate::config::Config;
+use crate::memory;
+use crate::providers;
+use crate::security::SecurityPolicy;
 use crate::status_events;
 use anyhow::Result;
 use chrono::Utc;
@@ -233,31 +236,144 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
 
         for task in tasks {
             let prompt = format!("[Heartbeat Task] {task}");
-            let temp = config.default_temperature;
-            if let Err(e) = crate::agent::run(config.clone(), Some(prompt), None, None, temp).await
-            {
-                crate::health::mark_component_error("heartbeat", e.to_string());
-                tracing::warn!("Heartbeat task failed: {e}");
-                status_events::emit(
-                    "heartbeat.task.failed",
-                    serde_json::json!({
-                        "tenantId": "dev-tenant",
-                        "task": task,
-                        "error": e.to_string(),
-                    }),
-                );
-            } else {
-                crate::health::mark_component_ok("heartbeat");
-                status_events::emit(
-                    "heartbeat.task.completed",
-                    serde_json::json!({
-                        "tenantId": "dev-tenant",
-                        "task": task,
-                    }),
-                );
+            match execute_heartbeat_task(&config, &prompt).await {
+                Ok(output) => {
+                    crate::health::mark_component_ok("heartbeat");
+                    let mut deduped = false;
+                    if let Err(e) = persist_heartbeat_response_to_inbox(&config, &task, &output)
+                        .map(|created| {
+                            deduped = !created;
+                        })
+                    {
+                        tracing::warn!("Failed to persist heartbeat response: {e}");
+                    }
+                    status_events::emit(
+                        "heartbeat.task.completed",
+                        serde_json::json!({
+                            "tenantId": "dev-tenant",
+                            "task": task,
+                            "summary": output.lines().next().unwrap_or("completed"),
+                            "deduped": deduped,
+                        }),
+                    );
+                }
+                Err(e) => {
+                    crate::health::mark_component_error("heartbeat", e.to_string());
+                    tracing::warn!("Heartbeat task failed: {e}");
+                    status_events::emit(
+                        "heartbeat.task.failed",
+                        serde_json::json!({
+                            "tenantId": "dev-tenant",
+                            "task": task,
+                            "error": e.to_string(),
+                        }),
+                    );
+                }
             }
         }
     }
+}
+
+async fn execute_heartbeat_task(config: &Config, prompt: &str) -> Result<String> {
+    let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
+    let model_name = config
+        .default_model
+        .as_deref()
+        .unwrap_or("anthropic/claude-sonnet-4-20250514");
+
+    let provider = providers::create_resilient_provider(
+        provider_name,
+        config.api_key.as_deref(),
+        &config.reliability,
+    )?;
+    let mem = memory::create_memory(
+        &config.memory,
+        &config.workspace_dir,
+        config.api_key.as_deref(),
+    )?;
+    let security = Arc::new(SecurityPolicy::from_config(
+        &config.autonomy,
+        &config.workspace_dir,
+    ));
+    let registry_db = crate::aria::db::AriaDb::open(&config.workspace_dir.join("aria.db"))?;
+    let tenant = crate::tenant::resolve_tenant_from_token(&registry_db, "");
+
+    let result = crate::agent::orchestrator::run_live_turn(
+        crate::agent::orchestrator::LiveTurnConfig {
+            provider: provider.as_ref(),
+            security: &security,
+            memory: Arc::from(mem),
+            composio_api_key: if config.composio.enabled {
+                config.composio.api_key.as_deref()
+            } else {
+                None
+            },
+            browser_config: &config.browser,
+            registry_db: &registry_db,
+            workspace_dir: &config.workspace_dir,
+            tenant_id: &tenant,
+            model: model_name,
+            temperature: config.default_temperature,
+            mode_hint: "heartbeat",
+            max_turns: Some(25),
+            external_tool_context: None,
+        },
+        prompt,
+        None,
+    )
+    .await?;
+
+    Ok(result.output)
+}
+
+const HEARTBEAT_INBOX_DEDUP_WINDOW_MINUTES: i64 = 120;
+
+fn persist_heartbeat_response_to_inbox(config: &Config, task: &str, output: &str) -> Result<bool> {
+    let db = crate::aria::db::AriaDb::open(&config.workspace_dir.join("aria.db"))?;
+    crate::dashboard::ensure_schema(&db)?;
+    let tenant = crate::tenant::resolve_tenant_from_token(&db, "");
+    let ts = chrono::Utc::now().timestamp_millis();
+    let normalized_task = task.trim().to_lowercase();
+    let source_id = format!("heartbeat:{normalized_task}");
+    let dedup_cutoff =
+        ts - (HEARTBEAT_INBOX_DEDUP_WINDOW_MINUTES * 60_i64 * 1_000_i64);
+
+    let recent_count = db.with_conn(|conn| {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM inbox_items
+             WHERE tenant_id=?1
+               AND source_type='system'
+               AND source_id=?2
+               AND status!='archived'
+               AND created_at>=?3",
+            rusqlite::params![tenant, source_id, dedup_cutoff],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    })?;
+    if recent_count > 0 {
+        return Ok(false);
+    }
+
+    let preview = output.lines().next().unwrap_or("Heartbeat task completed");
+    let item = crate::dashboard::NewInboxItem {
+        source_type: "system".to_string(),
+        source_id: Some(source_id),
+        run_id: None,
+        chat_id: None,
+        title: format!("Heartbeat: {}", task.trim()),
+        preview: Some(preview.chars().take(160).collect::<String>()),
+        body: Some(output.trim().to_string()),
+        metadata: serde_json::json!({
+            "kind": "heartbeat-response",
+            "task": task,
+            "dedupWindowMinutes": HEARTBEAT_INBOX_DEDUP_WINDOW_MINUTES,
+            "createdAtMs": ts,
+        }),
+        status: Some("unread".to_string()),
+    };
+    crate::dashboard::create_inbox_item(&db, &tenant, &item)?;
+    Ok(true)
 }
 
 fn wire_cron_bridge_hooks(config: &Config) -> Result<()> {
