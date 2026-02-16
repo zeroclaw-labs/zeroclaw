@@ -22,7 +22,7 @@ impl Tool for FileReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read the contents of a file in the workspace"
+        "Read file contents"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -31,7 +31,7 @@ impl Tool for FileReadTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Relative path to the file within the workspace"
+                    "description": "Path to the file (absolute or relative)"
                 }
             },
             "required": ["path"]

@@ -22,7 +22,7 @@ impl Tool for FileWriteTool {
     }
 
     fn description(&self) -> &str {
-        "Write contents to a file in the workspace"
+        "Write contents to a file"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -31,7 +31,7 @@ impl Tool for FileWriteTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Relative path to the file within the workspace"
+                    "description": "Path to the file (absolute or relative)"
                 },
                 "content": {
                     "type": "string",

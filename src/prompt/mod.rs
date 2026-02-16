@@ -91,7 +91,7 @@ impl SystemPromptBuilder {
             skills: Vec::new(),
             model_name: String::new(),
             autonomy: AutonomyLevel::Supervised,
-            workspace_only: true,
+            workspace_only: false,
             allowed_commands: Vec::new(),
             registry_tools_section: None,
             registry_agents_section: None,

@@ -113,6 +113,7 @@ fn load_registry_agents_prompt_section(db: &AriaDb, tenant_id: &str) -> anyhow::
 fn build_live_system_prompt(
     workspace_dir: &Path,
     model: &str,
+    security: &SecurityPolicy,
     tools: &[Box<dyn Tool>],
     registry_db: &AriaDb,
     tenant_id: &str,
@@ -161,6 +162,9 @@ fn build_live_system_prompt(
     let prompt = SystemPromptBuilder::new(workspace_dir)
         .tools(&tool_descs)
         .skills(&skill_descriptors)
+        .autonomy(security.autonomy)
+        .workspace_only(security.workspace_only)
+        .allowed_commands(&security.allowed_commands)
         .model(model)
         .registry_tools_section(registry_tools_section)
         .registry_agents_section(registry_agents_section)
@@ -190,6 +194,7 @@ pub async fn run_live_turn(
     let system_prompt = build_live_system_prompt(
         config.workspace_dir,
         config.model,
+        config.security.as_ref(),
         &tools,
         config.registry_db,
         config.tenant_id,

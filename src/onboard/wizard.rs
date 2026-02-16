@@ -77,7 +77,7 @@ pub fn run_wizard() -> Result<Config> {
     scaffold_workspace(&workspace_dir, &project_ctx)?;
 
     // ── Build config ──
-    // Defaults: SQLite memory, supervised autonomy, workspace-scoped, native runtime
+    // Defaults: SQLite memory, supervised autonomy, unrestricted filesystem, native runtime
     let config = Config {
         workspace_dir: workspace_dir.clone(),
         config_path: config_path.clone(),
@@ -105,7 +105,7 @@ pub fn run_wizard() -> Result<Config> {
     };
 
     println!(
-        "  {} Security: {} | workspace-scoped",
+        "  {} Security: {} | unrestricted filesystem",
         style("✓").green().bold(),
         style("Supervised").green()
     );
@@ -294,7 +294,7 @@ pub fn run_quick_setup(api_key: Option<&str>, provider: Option<&str>) -> Result<
     println!(
         "  {} Security:   {}",
         style("✓").green().bold(),
-        style("Supervised (workspace-scoped)").green()
+        style("Supervised (unrestricted filesystem)").green()
     );
     println!(
         "  {} Memory:     {}",

@@ -28,7 +28,7 @@ impl Tool for ShellTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command in the workspace directory"
+        "Execute a shell command"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

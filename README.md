@@ -167,7 +167,7 @@ Aria enforces security at **every layer** — not just the sandbox. It passes al
 |---|------|--------|-----|
 | 1 | **Gateway not publicly exposed** | ✅ | Binds `127.0.0.1` by default. Refuses `0.0.0.0` without tunnel or explicit `allow_public_bind = true`. |
 | 2 | **Pairing required** | ✅ | 6-digit one-time code on startup. Exchange via `POST /pair` for bearer token. All `/webhook` requests require `Authorization: Bearer <token>`. |
-| 3 | **Filesystem scoped (no /)** | ✅ | `workspace_only = true` by default. 14 system dirs + 4 sensitive dotfiles blocked. Null byte injection blocked. Symlink escape detection via canonicalization + resolved-path workspace checks in file read/write tools. |
+| 3 | **Filesystem policy enforced** | ✅ | Default autonomy is unrestricted (`workspace_only = false`, empty allow/deny lists). Optional policy mode supports workspace scoping, command allowlists, forbidden path blocks, null-byte checks, and symlink escape detection via canonicalization + resolved-path checks. |
 | 4 | **Access via tunnel only** | ✅ | Gateway refuses public bind without active tunnel. Supports Tailscale, Cloudflare, ngrok, or any custom tunnel. |
 
 > **Run your own nmap:** `nmap -p 1-65535 <your-host>` — Aria binds to localhost only, so nothing is exposed unless you explicitly configure a tunnel.
@@ -262,9 +262,9 @@ allow_public_bind = false       # refuse 0.0.0.0 without tunnel
 
 [autonomy]
 level = "supervised"            # "readonly", "supervised", "full" (default: supervised)
-workspace_only = true           # default: true — scoped to workspace
-allowed_commands = ["git", "npm", "cargo", "ls", "cat", "grep"]
-forbidden_paths = ["/etc", "/root", "/proc", "/sys", "~/.ssh", "~/.gnupg", "~/.aws"]
+workspace_only = false          # default: false — unrestricted filesystem
+allowed_commands = []           # empty = unrestricted
+forbidden_paths = []            # empty = unrestricted
 
 [runtime]
 kind = "native"                # only supported value right now; unsupported kinds fail fast
