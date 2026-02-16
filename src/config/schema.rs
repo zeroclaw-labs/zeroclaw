@@ -80,10 +80,6 @@ pub struct Config {
     #[serde(default)]
     pub peripherals: PeripheralsConfig,
 
-    /// Agent context limits — use compact for smaller models (e.g. 13B with 4k–8k context).
-    #[serde(default)]
-    pub agent: AgentConfig,
-
     /// Delegate agent configurations for multi-agent workflows.
     #[serde(default)]
     pub agents: HashMap<String, DelegateAgentConfig>,
@@ -91,23 +87,6 @@ pub struct Config {
     /// Hardware configuration (wizard-driven physical world setup).
     #[serde(default)]
     pub hardware: HardwareConfig,
-}
-
-// ── Agent (context limits for smaller models) ────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentConfig {
-    /// When true: bootstrap_max_chars=6000, rag_chunk_limit=2. Use for 13B or smaller models.
-    #[serde(default)]
-    pub compact_context: bool,
-}
-
-impl Default for AgentConfig {
-    fn default() -> Self {
-        Self {
-            compact_context: false,
-        }
-    }
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -214,6 +193,9 @@ impl Default for HardwareConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
+    /// When true: bootstrap_max_chars=6000, rag_chunk_limit=2. Use for 13B or smaller models.
+    #[serde(default)]
+    pub compact_context: bool,
     #[serde(default = "default_agent_max_tool_iterations")]
     pub max_tool_iterations: usize,
     #[serde(default = "default_agent_max_history_messages")]
@@ -239,6 +221,7 @@ fn default_agent_tool_dispatcher() -> String {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
+            compact_context: false,
             max_tool_iterations: default_agent_max_tool_iterations(),
             max_history_messages: default_agent_max_history_messages(),
             parallel_tools: false,
@@ -1559,7 +1542,6 @@ impl Default for Config {
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
-            agent: AgentConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
         }
@@ -1916,7 +1898,6 @@ mod tests {
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
-            agent: AgentConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
         };
@@ -1965,6 +1946,7 @@ default_temperature = 0.7
     #[test]
     fn agent_config_defaults() {
         let cfg = AgentConfig::default();
+        assert!(!cfg.compact_context);
         assert_eq!(cfg.max_tool_iterations, 10);
         assert_eq!(cfg.max_history_messages, 50);
         assert!(!cfg.parallel_tools);
@@ -1976,12 +1958,14 @@ default_temperature = 0.7
         let raw = r#"
 default_temperature = 0.7
 [agent]
+compact_context = true
 max_tool_iterations = 20
 max_history_messages = 80
 parallel_tools = true
 tool_dispatcher = "xml"
 "#;
         let parsed: Config = toml::from_str(raw).unwrap();
+        assert!(parsed.agent.compact_context);
         assert_eq!(parsed.agent.max_tool_iterations, 20);
         assert_eq!(parsed.agent.max_history_messages, 80);
         assert!(parsed.agent.parallel_tools);
@@ -2021,7 +2005,6 @@ tool_dispatcher = "xml"
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
-            agent: AgentConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
         };
