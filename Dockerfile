@@ -1,9 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # ── Stage 1: Build ────────────────────────────────────────────
-# Keep builder and release on Debian 12 to avoid GLIBC ABI drift
-# (`rust:1.93-slim` now tracks Debian 13 and can require newer glibc than distroless Debian 12).
-FROM rust:1.93-slim-bookworm AS builder
+FROM rust:1.93-slim-trixie AS builder
 
 WORKDIR /app
 
