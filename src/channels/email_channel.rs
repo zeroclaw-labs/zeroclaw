@@ -14,14 +14,11 @@ use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
 use mail_parser::{MessageParser, MimeHeaders};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::io::Write as IoWrite;
 use std::net::TcpStream;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-/// Maximum number of seen message IDs to retain before evicting the oldest.
-const SEEN_MESSAGES_CAPACITY: usize = 100_000;
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep};
 use tracing::{error, info, warn};
@@ -96,56 +93,17 @@ impl Default for EmailConfig {
     }
 }
 
-/// Bounded dedup set that evicts oldest entries when capacity is reached.
-struct BoundedSeenSet {
-    set: HashSet<String>,
-    order: VecDeque<String>,
-    capacity: usize,
-}
-
-impl BoundedSeenSet {
-    fn new(capacity: usize) -> Self {
-        Self {
-            set: HashSet::with_capacity(capacity.min(1024)),
-            order: VecDeque::with_capacity(capacity.min(1024)),
-            capacity,
-        }
-    }
-
-    fn contains(&self, id: &str) -> bool {
-        self.set.contains(id)
-    }
-
-    fn insert(&mut self, id: String) -> bool {
-        if self.set.contains(&id) {
-            return false;
-        }
-        if self.order.len() >= self.capacity {
-            if let Some(oldest) = self.order.pop_front() {
-                self.set.remove(&oldest);
-            }
-        }
-        self.order.push_back(id.clone());
-        self.set.insert(id);
-        true
-    }
-
-    fn len(&self) -> usize {
-        self.set.len()
-    }
-}
-
 /// Email channel — IMAP polling for inbound, SMTP for outbound
 pub struct EmailChannel {
     pub config: EmailConfig,
-    seen_messages: Mutex<BoundedSeenSet>,
+    seen_messages: Mutex<HashSet<String>>,
 }
 
 impl EmailChannel {
     pub fn new(config: EmailConfig) -> Self {
         Self {
             config,
-            seen_messages: Mutex::new(BoundedSeenSet::new(SEEN_MESSAGES_CAPACITY)),
+            seen_messages: Mutex::new(HashSet::new()),
         }
     }
 
@@ -454,7 +412,7 @@ impl Channel for EmailChannel {
                 Ok(Ok(messages)) => {
                     for (id, sender, content, ts) in messages {
                         {
-                            let mut seen = self.seen_messages.lock().unwrap();
+                            let mut seen = self.seen_messages.lock().expect("seen_messages mutex should not be poisoned");
                             if seen.contains(&id) {
                                 continue;
                             }
@@ -501,7 +459,7 @@ impl Channel for EmailChannel {
 
 #[cfg(test)]
 mod tests {
-    use super::{BoundedSeenSet, EmailChannel};
+    use super::*;
 
     #[test]
     fn build_imap_tls_config_succeeds() {
@@ -534,7 +492,6 @@ mod tests {
         set.insert("c".into());
         assert_eq!(set.len(), 3);
 
-        // Inserting a 4th should evict "a"
         set.insert("d".into());
         assert_eq!(set.len(), 3);
         assert!(!set.contains("a"), "oldest entry should be evicted");
@@ -569,5 +526,344 @@ mod tests {
         assert!(!set.contains("a"));
         assert!(set.contains("b"));
         assert_eq!(set.len(), 1);
+    }
+
+    // EmailConfig tests
+
+    #[test]
+    fn email_config_default() {
+        let config = EmailConfig::default();
+        assert_eq!(config.imap_host, "");
+        assert_eq!(config.imap_port, 993);
+        assert_eq!(config.imap_folder, "INBOX");
+        assert_eq!(config.smtp_host, "");
+        assert_eq!(config.smtp_port, 587);
+        assert!(config.smtp_tls);
+        assert_eq!(config.username, "");
+        assert_eq!(config.password, "");
+        assert_eq!(config.from_address, "");
+        assert_eq!(config.poll_interval_secs, 60);
+        assert!(config.allowed_senders.is_empty());
+    }
+
+    #[test]
+    fn email_config_custom() {
+        let config = EmailConfig {
+            imap_host: "imap.example.com".to_string(),
+            imap_port: 993,
+            imap_folder: "Archive".to_string(),
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 465,
+            smtp_tls: true,
+            username: "user@example.com".to_string(),
+            password: "pass123".to_string(),
+            from_address: "bot@example.com".to_string(),
+            poll_interval_secs: 30,
+            allowed_senders: vec!["allowed@example.com".to_string()],
+        };
+        assert_eq!(config.imap_host, "imap.example.com");
+        assert_eq!(config.imap_folder, "Archive");
+        assert_eq!(config.poll_interval_secs, 30);
+    }
+
+    #[test]
+    fn email_config_clone() {
+        let config = EmailConfig {
+            imap_host: "imap.test.com".to_string(),
+            imap_port: 993,
+            imap_folder: "INBOX".to_string(),
+            smtp_host: "smtp.test.com".to_string(),
+            smtp_port: 587,
+            smtp_tls: true,
+            username: "user@test.com".to_string(),
+            password: "secret".to_string(),
+            from_address: "bot@test.com".to_string(),
+            poll_interval_secs: 120,
+            allowed_senders: vec!["*".to_string()],
+        };
+        let cloned = config.clone();
+        assert_eq!(cloned.imap_host, config.imap_host);
+        assert_eq!(cloned.smtp_port, config.smtp_port);
+        assert_eq!(cloned.allowed_senders, config.allowed_senders);
+    }
+
+    // EmailChannel tests
+
+    #[test]
+    fn email_channel_new() {
+        let config = EmailConfig::default();
+        let channel = EmailChannel::new(config.clone());
+        assert_eq!(channel.config.imap_host, config.imap_host);
+
+        let seen_guard = channel
+            .seen_messages
+            .lock()
+            .expect("seen_messages mutex should not be poisoned");
+        assert_eq!(seen_guard.len(), 0);
+    }
+
+    #[test]
+    fn email_channel_name() {
+        let channel = EmailChannel::new(EmailConfig::default());
+        assert_eq!(channel.name(), "email");
+    }
+
+    // is_sender_allowed tests
+
+    #[test]
+    fn is_sender_allowed_empty_list_denies_all() {
+        let config = EmailConfig {
+            allowed_senders: vec![],
+            ..Default::default()
+        };
+        let channel = EmailChannel::new(config);
+        assert!(!channel.is_sender_allowed("anyone@example.com"));
+        assert!(!channel.is_sender_allowed("user@test.com"));
+    }
+
+    #[test]
+    fn is_sender_allowed_wildcard_allows_all() {
+        let config = EmailConfig {
+            allowed_senders: vec!["*".to_string()],
+            ..Default::default()
+        };
+        let channel = EmailChannel::new(config);
+        assert!(channel.is_sender_allowed("anyone@example.com"));
+        assert!(channel.is_sender_allowed("user@test.com"));
+        assert!(channel.is_sender_allowed("random@domain.org"));
+    }
+
+    #[test]
+    fn is_sender_allowed_specific_email() {
+        let config = EmailConfig {
+            allowed_senders: vec!["allowed@example.com".to_string()],
+            ..Default::default()
+        };
+        let channel = EmailChannel::new(config);
+        assert!(channel.is_sender_allowed("allowed@example.com"));
+        assert!(!channel.is_sender_allowed("other@example.com"));
+        assert!(!channel.is_sender_allowed("allowed@other.com"));
+    }
+
+    #[test]
+    fn is_sender_allowed_domain_with_at_prefix() {
+        let config = EmailConfig {
+            allowed_senders: vec!["@example.com".to_string()],
+            ..Default::default()
+        };
+        let channel = EmailChannel::new(config);
+        assert!(channel.is_sender_allowed("user@example.com"));
+        assert!(channel.is_sender_allowed("admin@example.com"));
+        assert!(!channel.is_sender_allowed("user@other.com"));
+    }
+
+    #[test]
+    fn is_sender_allowed_domain_without_at_prefix() {
+        let config = EmailConfig {
+            allowed_senders: vec!["example.com".to_string()],
+            ..Default::default()
+        };
+        let channel = EmailChannel::new(config);
+        assert!(channel.is_sender_allowed("user@example.com"));
+        assert!(channel.is_sender_allowed("admin@example.com"));
+        assert!(!channel.is_sender_allowed("user@other.com"));
+    }
+
+    #[test]
+    fn is_sender_allowed_case_insensitive() {
+        let config = EmailConfig {
+            allowed_senders: vec!["Allowed@Example.COM".to_string()],
+            ..Default::default()
+        };
+        let channel = EmailChannel::new(config);
+        assert!(channel.is_sender_allowed("allowed@example.com"));
+        assert!(channel.is_sender_allowed("ALLOWED@EXAMPLE.COM"));
+        assert!(channel.is_sender_allowed("AlLoWeD@eXaMpLe.cOm"));
+    }
+
+    #[test]
+    fn is_sender_allowed_multiple_senders() {
+        let config = EmailConfig {
+            allowed_senders: vec![
+                "user1@example.com".to_string(),
+                "user2@test.com".to_string(),
+                "@allowed.com".to_string(),
+            ],
+            ..Default::default()
+        };
+        let channel = EmailChannel::new(config);
+        assert!(channel.is_sender_allowed("user1@example.com"));
+        assert!(channel.is_sender_allowed("user2@test.com"));
+        assert!(channel.is_sender_allowed("anyone@allowed.com"));
+        assert!(!channel.is_sender_allowed("user3@example.com"));
+    }
+
+    #[test]
+    fn is_sender_allowed_wildcard_with_specific() {
+        let config = EmailConfig {
+            allowed_senders: vec!["*".to_string(), "specific@example.com".to_string()],
+            ..Default::default()
+        };
+        let channel = EmailChannel::new(config);
+        assert!(channel.is_sender_allowed("anyone@example.com"));
+        assert!(channel.is_sender_allowed("specific@example.com"));
+    }
+
+    #[test]
+    fn is_sender_allowed_empty_sender() {
+        let config = EmailConfig {
+            allowed_senders: vec!["@example.com".to_string()],
+            ..Default::default()
+        };
+        let channel = EmailChannel::new(config);
+        assert!(!channel.is_sender_allowed(""));
+        // "@example.com" ends with "@example.com" so it's allowed
+        assert!(channel.is_sender_allowed("@example.com"));
+    }
+
+    // strip_html tests
+
+    #[test]
+    fn strip_html_basic() {
+        assert_eq!(EmailChannel::strip_html("<p>Hello</p>"), "Hello");
+        assert_eq!(EmailChannel::strip_html("<div>World</div>"), "World");
+    }
+
+    #[test]
+    fn strip_html_nested_tags() {
+        assert_eq!(
+            EmailChannel::strip_html("<div><p>Hello <strong>World</strong></p></div>"),
+            "Hello World"
+        );
+    }
+
+    #[test]
+    fn strip_html_multiple_lines() {
+        let html = "<div>\n  <p>Line 1</p>\n  <p>Line 2</p>\n</div>";
+        assert_eq!(EmailChannel::strip_html(html), "Line 1 Line 2");
+    }
+
+    #[test]
+    fn strip_html_preserves_text() {
+        assert_eq!(EmailChannel::strip_html("No tags here"), "No tags here");
+        assert_eq!(EmailChannel::strip_html(""), "");
+    }
+
+    #[test]
+    fn strip_html_handles_malformed() {
+        assert_eq!(EmailChannel::strip_html("<p>Unclosed"), "Unclosed");
+        // The function removes everything between < and >, so "Text>with>brackets" becomes "Textwithbrackets"
+        assert_eq!(EmailChannel::strip_html("Text>with>brackets"), "Textwithbrackets");
+    }
+
+    #[test]
+    fn strip_html_self_closing_tags() {
+        // Self-closing tags are removed but don't add spaces
+        assert_eq!(EmailChannel::strip_html("Hello<br/>World"), "HelloWorld");
+        assert_eq!(EmailChannel::strip_html("Text<hr/>More"), "TextMore");
+    }
+
+    #[test]
+    fn strip_html_attributes_preserved() {
+        assert_eq!(
+            EmailChannel::strip_html("<a href=\"http://example.com\">Link</a>"),
+            "Link"
+        );
+    }
+
+    #[test]
+    fn strip_html_multiple_spaces_collapsed() {
+        assert_eq!(
+            EmailChannel::strip_html("<p>Word</p>  <p>Word</p>"),
+            "Word Word"
+        );
+    }
+
+    #[test]
+    fn strip_html_special_characters() {
+        assert_eq!(
+            EmailChannel::strip_html("<span>&lt;tag&gt;</span>"),
+            "&lt;tag&gt;"
+        );
+    }
+
+    // Default function tests
+
+    #[test]
+    fn default_imap_port_returns_993() {
+        assert_eq!(default_imap_port(), 993);
+    }
+
+    #[test]
+    fn default_smtp_port_returns_587() {
+        assert_eq!(default_smtp_port(), 587);
+    }
+
+    #[test]
+    fn default_imap_folder_returns_inbox() {
+        assert_eq!(default_imap_folder(), "INBOX");
+    }
+
+    #[test]
+    fn default_poll_interval_returns_60() {
+        assert_eq!(default_poll_interval(), 60);
+    }
+
+    #[test]
+    fn default_true_returns_true() {
+        assert!(default_true());
+    }
+
+    // EmailConfig serialization tests
+
+    #[test]
+    fn email_config_serialize_deserialize() {
+        let config = EmailConfig {
+            imap_host: "imap.example.com".to_string(),
+            imap_port: 993,
+            imap_folder: "INBOX".to_string(),
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 587,
+            smtp_tls: true,
+            username: "user@example.com".to_string(),
+            password: "password123".to_string(),
+            from_address: "bot@example.com".to_string(),
+            poll_interval_secs: 30,
+            allowed_senders: vec!["allowed@example.com".to_string()],
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: EmailConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.imap_host, config.imap_host);
+        assert_eq!(deserialized.smtp_port, config.smtp_port);
+        assert_eq!(deserialized.allowed_senders, config.allowed_senders);
+    }
+
+    #[test]
+    fn email_config_deserialize_with_defaults() {
+        let json = r#"{
+            "imap_host": "imap.test.com",
+            "smtp_host": "smtp.test.com",
+            "username": "user",
+            "password": "pass",
+            "from_address": "bot@test.com"
+        }"#;
+
+        let config: EmailConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.imap_port, 993); // default
+        assert_eq!(config.smtp_port, 587); // default
+        assert!(config.smtp_tls); // default
+        assert_eq!(config.poll_interval_secs, 60); // default
+    }
+
+    #[test]
+    fn email_config_debug_output() {
+        let config = EmailConfig {
+            imap_host: "imap.debug.com".to_string(),
+            ..Default::default()
+        };
+        let debug_str = format!("{:?}", config);
+        assert!(debug_str.contains("imap.debug.com"));
     }
 }
