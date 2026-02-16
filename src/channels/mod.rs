@@ -692,6 +692,15 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 .await;
         }
 
+        let target_channel = channels.iter().find(|ch| ch.name() == msg.channel);
+
+        // Show typing indicator while processing
+        if let Some(ch) = target_channel {
+            if let Err(e) = ch.start_typing(&msg.sender).await {
+                tracing::debug!("Failed to start typing on {}: {e}", ch.name());
+            }
+        }
+
         // Call the LLM with system prompt (identity + soul + tools)
         println!("  ⏳ Processing message...");
         let started_at = Instant::now();
@@ -702,6 +711,13 @@ pub async fn start_channels(config: Config) -> Result<()> {
         )
         .await;
 
+        // Stop typing before sending the response
+        if let Some(ch) = target_channel {
+            if let Err(e) = ch.stop_typing(&msg.sender).await {
+                tracing::debug!("Failed to stop typing on {}: {e}", ch.name());
+            }
+        }
+
         match llm_result {
             Ok(Ok(response)) => {
                 println!(
@@ -709,13 +725,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
                     started_at.elapsed().as_millis(),
                     truncate_with_ellipsis(&response, 80)
                 );
-                // Find the channel that sent this message and reply
-                for ch in &channels {
-                    if ch.name() == msg.channel {
-                        if let Err(e) = ch.send(&response, &msg.sender).await {
-                            eprintln!("  ❌ Failed to reply on {}: {e}", ch.name());
-                        }
-                        break;
+                if let Some(ch) = target_channel {
+                    if let Err(e) = ch.send(&response, &msg.sender).await {
+                        eprintln!("  ❌ Failed to reply on {}: {e}", ch.name());
                     }
                 }
             }
@@ -724,11 +736,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
                     "  ❌ LLM error after {}ms: {e}",
                     started_at.elapsed().as_millis()
                 );
-                for ch in &channels {
-                    if ch.name() == msg.channel {
-                        let _ = ch.send(&format!("⚠️ Error: {e}"), &msg.sender).await;
-                        break;
-                    }
+                if let Some(ch) = target_channel {
+                    let _ = ch.send(&format!("⚠️ Error: {e}"), &msg.sender).await;
                 }
             }
             Err(_) => {
@@ -741,16 +750,13 @@ pub async fn start_channels(config: Config) -> Result<()> {
                     timeout_msg,
                     started_at.elapsed().as_millis()
                 );
-                for ch in &channels {
-                    if ch.name() == msg.channel {
-                        let _ = ch
-                            .send(
-                                "⚠️ Request timed out while waiting for the model. Please try again.",
-                                &msg.sender,
-                            )
-                            .await;
-                        break;
-                    }
+                if let Some(ch) = target_channel {
+                    let _ = ch
+                        .send(
+                            "⚠️ Request timed out while waiting for the model. Please try again.",
+                            &msg.sender,
+                        )
+                        .await;
                 }
             }
         }
