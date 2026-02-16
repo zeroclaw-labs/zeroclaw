@@ -130,7 +130,7 @@ Every subsystem is a **trait** — swap implementations with a config change, ze
 | **Memory** | `Memory` | SQLite with hybrid search (FTS5 + vector cosine similarity), Markdown | Any persistence backend |
 | **Tools** | `Tool` | shell, file_read, file_write, memory_store, memory_recall, memory_forget, browser_open (Brave + allowlist), composio (optional) | Any capability |
 | **Observability** | `Observer` | Noop, Log, Multi | Prometheus, OTel |
-| **Runtime** | `RuntimeAdapter` | Native (Mac/Linux/Pi) | Docker, WASM (planned; unsupported kinds fail fast) |
+| **Runtime** | `RuntimeAdapter` | Native, Docker (sandboxed) | WASM (planned; unsupported kinds fail fast) |
 | **Security** | `SecurityPolicy` | Gateway pairing, sandbox, allowlists, rate limits, filesystem scoping, encrypted secrets | — |
 | **Identity** | `IdentityConfig` | OpenClaw (markdown), AIEOS v1.1 (JSON) | Any identity format |
 | **Tunnel** | `Tunnel` | None, Cloudflare, Tailscale, ngrok, Custom | Any tunnel binary |
@@ -140,8 +140,8 @@ Every subsystem is a **trait** — swap implementations with a config change, ze
 
 ### Runtime support (current)
 
-- ✅ Supported today: `runtime.kind = "native"`
-- 🚧 Planned, not implemented yet: Docker / WASM / edge runtimes
+- ✅ Supported today: `runtime.kind = "native"` or `runtime.kind = "docker"`
+- 🚧 Planned, not implemented yet: WASM / edge runtimes
 
 When an unsupported `runtime.kind` is configured, ZeroClaw now exits with a clear error instead of silently falling back to native.
 
@@ -280,7 +280,16 @@ allowed_commands = ["git", "npm", "cargo", "ls", "cat", "grep"]
 forbidden_paths = ["/etc", "/root", "/proc", "/sys", "~/.ssh", "~/.gnupg", "~/.aws"]
 
 [runtime]
-kind = "native"                # only supported value right now; unsupported kinds fail fast
+kind = "native"                # "native" or "docker"
+
+[runtime.docker]
+image = "alpine:3.20"          # container image for shell execution
+network = "none"               # docker network mode ("none", "bridge", etc.)
+memory_limit_mb = 512          # optional memory limit in MB
+cpu_limit = 1.0                # optional CPU limit
+read_only_rootfs = true        # mount root filesystem as read-only
+mount_workspace = true         # mount workspace into /workspace
+allowed_workspace_roots = []   # optional allowlist for workspace mount validation
 
 [heartbeat]
 enabled = false
