@@ -252,6 +252,10 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
 
     loop {
         interval.tick().await;
+        if !claim_heartbeat_window(&config, interval_mins)? {
+            tracing::debug!("Skipping heartbeat tick: interval window not elapsed");
+            continue;
+        }
         status_events::emit(
             "heartbeat.tick",
             serde_json::json!({
@@ -265,45 +269,67 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             continue;
         }
 
+        let mut task_results: Vec<serde_json::Value> = Vec::with_capacity(tasks.len());
+        let mut failed_count = 0usize;
+        let mut first_error: Option<String> = None;
+
         for task in tasks {
             let prompt = format!("[Heartbeat Task] {task}");
             match execute_heartbeat_task(&config, &prompt).await {
                 Ok(output) => {
-                    crate::health::mark_component_ok("heartbeat");
-                    let mut deduped = false;
-                    if let Err(e) = persist_heartbeat_response_to_inbox(&config, &task, &output)
-                        .map(|created| {
-                            deduped = !created;
-                        })
-                    {
-                        tracing::warn!("Failed to persist heartbeat response: {e}");
-                    }
-                    status_events::emit(
-                        "heartbeat.task.completed",
-                        serde_json::json!({
-                            "tenantId": "dev-tenant",
-                            "task": task,
-                            "summary": output.lines().next().unwrap_or("completed"),
-                            "deduped": deduped,
-                        }),
-                    );
+                    let summary = output.lines().next().unwrap_or("completed").to_string();
+                    task_results.push(serde_json::json!({
+                        "task": task,
+                        "status": "completed",
+                        "summary": summary,
+                    }));
                 }
                 Err(e) => {
-                    crate::health::mark_component_error("heartbeat", e.to_string());
                     tracing::warn!("Heartbeat task failed: {e}");
                     let full_error = e.to_string();
                     let summarized = summarize_heartbeat_error(&full_error);
-                    status_events::emit(
-                        "heartbeat.task.failed",
-                        serde_json::json!({
-                            "tenantId": "dev-tenant",
-                            "task": task,
-                            "error": summarized,
-                            "rawError": full_error,
-                        }),
-                    );
+                    if first_error.is_none() {
+                        first_error = Some(summarized.clone());
+                    }
+                    failed_count += 1;
+                    task_results.push(serde_json::json!({
+                        "task": task,
+                        "status": "failed",
+                        "error": summarized,
+                        "rawError": full_error,
+                    }));
                 }
             }
+        }
+
+        let total = task_results.len();
+        let succeeded = total.saturating_sub(failed_count);
+        if failed_count == 0 {
+            crate::health::mark_component_ok("heartbeat");
+            status_events::emit(
+                "heartbeat.run.completed",
+                serde_json::json!({
+                    "tenantId": "dev-tenant",
+                    "taskCount": total,
+                    "successCount": succeeded,
+                    "failedCount": failed_count,
+                    "tasks": task_results,
+                }),
+            );
+        } else {
+            let summary_error = first_error.unwrap_or_else(|| "Heartbeat run failed".to_string());
+            crate::health::mark_component_error("heartbeat", summary_error.clone());
+            status_events::emit(
+                "heartbeat.run.failed",
+                serde_json::json!({
+                    "tenantId": "dev-tenant",
+                    "taskCount": total,
+                    "successCount": succeeded,
+                    "failedCount": failed_count,
+                    "error": summary_error,
+                    "tasks": task_results,
+                }),
+            );
         }
     }
 }
@@ -361,6 +387,40 @@ async fn execute_heartbeat_task(config: &Config, prompt: &str) -> Result<String>
 }
 
 const HEARTBEAT_INBOX_DEDUP_WINDOW_MINUTES: i64 = 120;
+
+fn claim_heartbeat_window(config: &Config, interval_mins: u32) -> Result<bool> {
+    let db = crate::aria::db::AriaDb::open(&config.registry_db_path())?;
+    crate::dashboard::ensure_schema(&db)?;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let interval_ms = i64::from(interval_mins.max(1)) * 60_i64 * 1_000_i64;
+    let cutoff_ms = now_ms - interval_ms;
+
+    db.with_conn(|conn| {
+        conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+
+        let last_run: Option<i64> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key='heartbeat.last_run_ms'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok());
+
+        if last_run.is_some_and(|ts| ts > cutoff_ms) {
+            conn.execute_batch("ROLLBACK TRANSACTION")?;
+            return Ok(false);
+        }
+
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES('heartbeat.last_run_ms', ?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            rusqlite::params![now_ms.to_string()],
+        )?;
+        conn.execute_batch("COMMIT TRANSACTION")?;
+        Ok(true)
+    })
+}
 
 fn summarize_heartbeat_error(err: &str) -> String {
     let trimmed = err.trim();

@@ -432,6 +432,16 @@ fn title_for_event(event_type: &str, data: &Value) -> String {
             "Heartbeat task failed: {}",
             data["task"].as_str().unwrap_or("task")
         ),
+        "heartbeat.run.completed" => format!(
+            "Heartbeat run completed ({}/{})",
+            data["successCount"].as_i64().unwrap_or(0),
+            data["taskCount"].as_i64().unwrap_or(0)
+        ),
+        "heartbeat.run.failed" => format!(
+            "Heartbeat run failed ({}/{})",
+            data["failedCount"].as_i64().unwrap_or(0),
+            data["taskCount"].as_i64().unwrap_or(0)
+        ),
         "subagent.started" => format!(
             "Subagent started: {}",
             data["taskLabel"].as_str().unwrap_or("task")
@@ -497,6 +507,14 @@ fn preview_for_event(event_type: &str, data: &Value) -> String {
             .as_str()
             .unwrap_or("Heartbeat task")
             .to_string(),
+        "heartbeat.run.completed" => format!(
+            "{} task(s), {} failed",
+            data["taskCount"].as_i64().unwrap_or(0),
+            data["failedCount"].as_i64().unwrap_or(0)
+        ),
+        "heartbeat.run.failed" => summarize_status_error_for_inbox(
+            data["error"].as_str().unwrap_or("Heartbeat run failed"),
+        ),
         "subagent.started" => data["subagentType"]
             .as_str()
             .or_else(|| data["toolName"].as_str())
@@ -525,6 +543,10 @@ fn preview_for_event(event_type: &str, data: &Value) -> String {
 }
 
 fn source_id_for_status_event(event_type: &str, data: &Value) -> Option<String> {
+    if event_type == "heartbeat.run.failed" || event_type == "heartbeat.run.completed" {
+        return Some("heartbeat:run".to_string());
+    }
+
     if event_type == "heartbeat.task.failed" || event_type == "heartbeat.task.completed" {
         if let Some(task) = data["task"].as_str() {
             let normalized = task.trim().to_lowercase();
@@ -580,7 +602,7 @@ pub fn maybe_create_inbox_for_status_event(
         "cron.failed"
         | "feed.run.failed"
         | "task.failed"
-        | "heartbeat.task.failed"
+        | "heartbeat.run.failed"
         | "subagent.failed"
         | "subagent.timeout"
         | "subagent.completed" => true,
@@ -625,7 +647,7 @@ pub fn maybe_create_inbox_for_status_event(
         status: Some(status.to_string()),
     };
 
-    if event_type == "heartbeat.task.failed" {
+    if event_type == "heartbeat.run.failed" {
         if let Some(ref existing_source_id) = source_id {
             let metadata_json =
                 serde_json::to_string(&item.metadata).unwrap_or_else(|_| "{}".to_string());
@@ -1014,17 +1036,19 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_task_failed_upserts_existing_inbox_item() {
+    fn heartbeat_run_failed_upserts_existing_inbox_item() {
         let db = AriaDb::open_in_memory().unwrap();
         ensure_schema(&db).unwrap();
 
         let first = maybe_create_inbox_for_status_event(
             &db,
             "dev-tenant",
-            "heartbeat.task.failed",
+            "heartbeat.run.failed",
             &serde_json::json!({
                 "tenantId": "dev-tenant",
-                "task": "Check reports",
+                "taskCount": 3,
+                "successCount": 0,
+                "failedCount": 3,
                 "error": "All providers failed. Attempts: claude-cli attempt 1/3: Your organization does not have access to Claude.",
             }),
         )
@@ -1034,10 +1058,12 @@ mod tests {
         let second = maybe_create_inbox_for_status_event(
             &db,
             "dev-tenant",
-            "heartbeat.task.failed",
+            "heartbeat.run.failed",
             &serde_json::json!({
                 "tenantId": "dev-tenant",
-                "task": "Check reports",
+                "taskCount": 3,
+                "successCount": 0,
+                "failedCount": 3,
                 "error": "All providers failed. Attempts: claude-cli attempt 1/3: Your organization does not have access to Claude.",
             }),
         )
@@ -1065,7 +1091,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(row.0, 1);
-        assert!(row.1.contains("Heartbeat task failed: Check reports"));
+        assert!(row.1.contains("Heartbeat run failed"));
         assert!(row.2.contains("Claude access denied"));
         assert_eq!(row.3, "unread");
     }
