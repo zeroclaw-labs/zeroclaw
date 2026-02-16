@@ -97,8 +97,39 @@ pub enum ConversationMessage {
     ToolResults(Vec<ToolResultMessage>),
 }
 
+/// Provider-specific tool payload formats.
+///
+/// Different LLM providers require different formats for tool definitions.
+/// This enum encapsulates those variations, enabling providers to convert
+/// from the unified `ToolSpec` format to their native API requirements.
+#[derive(Debug, Clone)]
+pub enum ToolsPayload {
+    /// Gemini API format (functionDeclarations).
+    Gemini {
+        function_declarations: Vec<serde_json::Value>,
+    },
+    /// Anthropic Messages API format (tools with input_schema).
+    Anthropic { tools: Vec<serde_json::Value> },
+    /// OpenAI Chat Completions API format (tools with function).
+    OpenAI { tools: Vec<serde_json::Value> },
+    /// Prompt-guided fallback (tools injected as text in system prompt).
+    PromptGuided { instructions: String },
+}
+
 #[async_trait]
 pub trait Provider: Send + Sync {
+    /// Convert tool specifications to provider-native format.
+    ///
+    /// Default implementation returns `PromptGuided` payload, which injects
+    /// tool documentation into the system prompt as text. Providers with
+    /// native tool calling support should override this to return their
+    /// specific format (Gemini, Anthropic, OpenAI).
+    fn convert_tools(&self, tools: &[ToolSpec]) -> ToolsPayload {
+        ToolsPayload::PromptGuided {
+            instructions: build_tool_instructions_text(tools),
+        }
+    }
+
     /// Simple one-shot chat (single user message, no explicit system prompt).
     ///
     /// This is the preferred API for non-agentic direct interactions.
@@ -145,12 +176,53 @@ pub trait Provider: Send + Sync {
     }
 
     /// Structured chat API for agent loop callers.
+    ///
+    /// This method intelligently handles tools based on provider capabilities:
+    /// - If `supports_native_tools()` returns `true` and tools are provided,
+    ///   the provider should use its native API for tool calling.
+    /// - Otherwise, tools are automatically injected into the system prompt
+    ///   as text instructions (prompt-guided fallback).
+    ///
+    /// Default implementation provides the fallback behavior. Providers with
+    /// native tool calling support should override this method.
     async fn chat(
         &self,
         request: ChatRequest<'_>,
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ChatResponse> {
+        // If tools are provided but provider doesn't support native tools,
+        // inject tool instructions into system prompt as fallback
+        if let Some(tools) = request.tools {
+            if !tools.is_empty() && !self.supports_native_tools() {
+                let tool_instructions = build_tool_instructions_text(tools);
+                let mut modified_messages = request.messages.to_vec();
+
+                // Inject tool instructions into system message
+                if let Some(first) = modified_messages.first_mut() {
+                    if first.role == "system" {
+                        first.content.push_str("\n\n");
+                        first.content.push_str(&tool_instructions);
+                    } else {
+                        // No system message exists, prepend one
+                        modified_messages.insert(0, ChatMessage::system(tool_instructions));
+                    }
+                } else {
+                    // Empty message list, add system message
+                    modified_messages.push(ChatMessage::system(tool_instructions));
+                }
+
+                let text = self
+                    .chat_with_history(&modified_messages, model, temperature)
+                    .await?;
+                return Ok(ChatResponse {
+                    text: Some(text),
+                    tool_calls: Vec::new(),
+                });
+            }
+        }
+
+        // Default: no tools or already handled by native implementation
         let text = self
             .chat_with_history(request.messages, model, temperature)
             .await?;
@@ -170,6 +242,53 @@ pub trait Provider: Send + Sync {
     async fn warmup(&self) -> anyhow::Result<()> {
         Ok(())
     }
+}
+
+/// Build tool instructions text for prompt-guided tool calling.
+///
+/// Generates a formatted text block describing available tools and how to
+/// invoke them using XML-style tags. This is used as a fallback when the
+/// provider doesn't support native tool calling.
+///
+/// # Format
+///
+/// ```text
+/// ## Tool Use Protocol
+///
+/// To use a tool, wrap a JSON object in <tool_call></tool_call> tags:
+///
+/// <tool_call>
+/// {"name": "tool_name", "arguments": {"param": "value"}}
+/// </tool_call>
+///
+/// ### Available Tools
+///
+/// **tool_name**: Tool description
+/// Parameters: {"type": "object", ...}
+/// ```
+pub fn build_tool_instructions_text(tools: &[ToolSpec]) -> String {
+    let mut instructions = String::new();
+
+    instructions.push_str("## Tool Use Protocol\n\n");
+    instructions.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
+    instructions.push_str("<tool_call>\n");
+    instructions.push_str(r#"{"name": "tool_name", "arguments": {"param": "value"}}"#);
+    instructions.push_str("\n</tool_call>\n\n");
+    instructions.push_str("You may use multiple tool calls in a single response. ");
+    instructions.push_str("After tool execution, results appear in <tool_result> tags. ");
+    instructions
+        .push_str("Continue reasoning with the results until you can give a final answer.\n\n");
+    instructions.push_str("### Available Tools\n\n");
+
+    for tool in tools {
+        instructions.push_str(&format!("**{}**: {}\n", tool.name, tool.description));
+        instructions.push_str(&format!(
+            "Parameters: `{}`\n\n",
+            serde_json::to_string(&tool.parameters).unwrap_or_else(|_| "{}".to_string())
+        ));
+    }
+
+    instructions
 }
 
 #[cfg(test)]
@@ -237,5 +356,171 @@ mod tests {
         }]);
         let json = serde_json::to_string(&tool_result).unwrap();
         assert!(json.contains("\"type\":\"ToolResults\""));
+    }
+
+    #[test]
+    fn tools_payload_variants() {
+        // Test Gemini variant
+        let gemini = ToolsPayload::Gemini {
+            function_declarations: vec![serde_json::json!({"name": "test"})],
+        };
+        assert!(matches!(gemini, ToolsPayload::Gemini { .. }));
+
+        // Test Anthropic variant
+        let anthropic = ToolsPayload::Anthropic {
+            tools: vec![serde_json::json!({"name": "test"})],
+        };
+        assert!(matches!(anthropic, ToolsPayload::Anthropic { .. }));
+
+        // Test OpenAI variant
+        let openai = ToolsPayload::OpenAI {
+            tools: vec![serde_json::json!({"type": "function"})],
+        };
+        assert!(matches!(openai, ToolsPayload::OpenAI { .. }));
+
+        // Test PromptGuided variant
+        let prompt_guided = ToolsPayload::PromptGuided {
+            instructions: "Use tools...".to_string(),
+        };
+        assert!(matches!(prompt_guided, ToolsPayload::PromptGuided { .. }));
+    }
+
+    #[test]
+    fn build_tool_instructions_text_format() {
+        let tools = vec![
+            ToolSpec {
+                name: "shell".to_string(),
+                description: "Execute commands".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"}
+                    }
+                }),
+            },
+            ToolSpec {
+                name: "file_read".to_string(),
+                description: "Read files".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"}
+                    }
+                }),
+            },
+        ];
+
+        let instructions = build_tool_instructions_text(&tools);
+
+        // Check for protocol description
+        assert!(instructions.contains("Tool Use Protocol"));
+        assert!(instructions.contains("<tool_call>"));
+        assert!(instructions.contains("</tool_call>"));
+
+        // Check for tool listings
+        assert!(instructions.contains("**shell**"));
+        assert!(instructions.contains("Execute commands"));
+        assert!(instructions.contains("**file_read**"));
+        assert!(instructions.contains("Read files"));
+
+        // Check for parameters
+        assert!(instructions.contains("Parameters:"));
+        assert!(instructions.contains(r#""type":"object""#));
+    }
+
+    #[test]
+    fn build_tool_instructions_text_empty() {
+        let instructions = build_tool_instructions_text(&[]);
+
+        // Should still have protocol description
+        assert!(instructions.contains("Tool Use Protocol"));
+
+        // Should have empty tools section
+        assert!(instructions.contains("Available Tools"));
+    }
+
+    // Mock provider for testing
+    struct MockProvider {
+        supports_native: bool,
+    }
+
+    #[async_trait]
+    impl Provider for MockProvider {
+        fn supports_native_tools(&self) -> bool {
+            self.supports_native
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("response".to_string())
+        }
+    }
+
+    #[test]
+    fn provider_convert_tools_default() {
+        let provider = MockProvider {
+            supports_native: false,
+        };
+
+        let tools = vec![ToolSpec {
+            name: "test_tool".to_string(),
+            description: "A test tool".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+
+        let payload = provider.convert_tools(&tools);
+
+        // Default implementation should return PromptGuided
+        assert!(matches!(payload, ToolsPayload::PromptGuided { .. }));
+
+        if let ToolsPayload::PromptGuided { instructions } = payload {
+            assert!(instructions.contains("test_tool"));
+            assert!(instructions.contains("A test tool"));
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_chat_prompt_guided_fallback() {
+        let provider = MockProvider {
+            supports_native: false,
+        };
+
+        let tools = vec![ToolSpec {
+            name: "shell".to_string(),
+            description: "Run commands".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+
+        let request = ChatRequest {
+            messages: &[ChatMessage::user("Hello")],
+            tools: Some(&tools),
+        };
+
+        let response = provider.chat(request, "model", 0.7).await.unwrap();
+
+        // Should return a response (default impl calls chat_with_history)
+        assert!(response.text.is_some());
+    }
+
+    #[tokio::test]
+    async fn provider_chat_without_tools() {
+        let provider = MockProvider {
+            supports_native: true,
+        };
+
+        let request = ChatRequest {
+            messages: &[ChatMessage::user("Hello")],
+            tools: None,
+        };
+
+        let response = provider.chat(request, "model", 0.7).await.unwrap();
+
+        // Should work normally without tools
+        assert!(response.text.is_some());
     }
 }
