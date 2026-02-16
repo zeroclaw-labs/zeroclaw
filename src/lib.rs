@@ -163,3 +163,75 @@ pub enum IntegrationCommands {
         name: String,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn service_commands_serde_roundtrip() {
+        let command = ServiceCommands::Status;
+        let json = serde_json::to_string(&command).unwrap();
+        let parsed: ServiceCommands = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, ServiceCommands::Status);
+    }
+
+    #[test]
+    fn channel_commands_struct_variants_roundtrip() {
+        let add = ChannelCommands::Add {
+            channel_type: "telegram".into(),
+            config: "{}".into(),
+        };
+        let remove = ChannelCommands::Remove {
+            name: "main".into(),
+        };
+
+        let add_json = serde_json::to_string(&add).unwrap();
+        let remove_json = serde_json::to_string(&remove).unwrap();
+
+        let parsed_add: ChannelCommands = serde_json::from_str(&add_json).unwrap();
+        let parsed_remove: ChannelCommands = serde_json::from_str(&remove_json).unwrap();
+
+        assert_eq!(parsed_add, add);
+        assert_eq!(parsed_remove, remove);
+    }
+
+    #[test]
+    fn commands_with_payloads_roundtrip() {
+        let skill = SkillCommands::Install {
+            source: "https://example.com/skill".into(),
+        };
+        let migrate = MigrateCommands::Openclaw {
+            source: Some(std::path::PathBuf::from("/tmp/openclaw")),
+            dry_run: true,
+        };
+        let cron = CronCommands::Add {
+            expression: "*/5 * * * *".into(),
+            command: "echo hi".into(),
+        };
+        let integration = IntegrationCommands::Info {
+            name: "Telegram".into(),
+        };
+
+        assert_eq!(
+            serde_json::from_str::<SkillCommands>(&serde_json::to_string(&skill).unwrap()).unwrap(),
+            skill
+        );
+        assert_eq!(
+            serde_json::from_str::<MigrateCommands>(&serde_json::to_string(&migrate).unwrap())
+                .unwrap(),
+            migrate
+        );
+        assert_eq!(
+            serde_json::from_str::<CronCommands>(&serde_json::to_string(&cron).unwrap()).unwrap(),
+            cron
+        );
+        assert_eq!(
+            serde_json::from_str::<IntegrationCommands>(
+                &serde_json::to_string(&integration).unwrap()
+            )
+            .unwrap(),
+            integration
+        );
+    }
+}
