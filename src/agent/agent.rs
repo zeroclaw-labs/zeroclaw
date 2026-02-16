@@ -219,17 +219,24 @@ impl Agent {
         } else {
             None
         };
+        let composio_entity_id = if config.composio.enabled {
+            Some(config.composio.entity_id.as_str())
+        } else {
+            None
+        };
 
         let tools = tools::all_tools_with_runtime(
             &security,
             runtime,
             memory.clone(),
             composio_key,
+            composio_entity_id,
             &config.browser,
             &config.http_request,
             &config.workspace_dir,
             &config.agents,
             config.api_key.as_deref(),
+            config,
         );
 
         let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");

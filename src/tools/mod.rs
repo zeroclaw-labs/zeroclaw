@@ -74,7 +74,7 @@ pub fn all_tools(
     browser_config: &crate::config::BrowserConfig,
     http_config: &crate::config::HttpRequestConfig,
     workspace_dir: &std::path::Path,
-    agents: &HashMap<String, DelegateAgentConfig, S>,
+    agents: &HashMap<String, DelegateAgentConfig>,
     fallback_api_key: Option<&str>,
     config: &crate::config::Config,
 ) -> Vec<Box<dyn Tool>> {
@@ -104,7 +104,7 @@ pub fn all_tools_with_runtime(
     browser_config: &crate::config::BrowserConfig,
     http_config: &crate::config::HttpRequestConfig,
     workspace_dir: &std::path::Path,
-    agents: &HashMap<String, DelegateAgentConfig, S>,
+    agents: &HashMap<String, DelegateAgentConfig>,
     fallback_api_key: Option<&str>,
     config: &crate::config::Config,
 ) -> Vec<Box<dyn Tool>> {
