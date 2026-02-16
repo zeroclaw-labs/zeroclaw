@@ -3597,6 +3597,7 @@ dependencies = [
  "directories",
  "fantoccini",
  "futures-util",
+ "getrandom 0.4.1",
  "glob",
  "hex",
  "hmac",

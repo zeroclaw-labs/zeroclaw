@@ -201,9 +201,12 @@ fn generate_code() -> String {
     }
 }
 
-/// Generate a cryptographically-adequate bearer token (hex-encoded).
+/// Generate a 256-bit bearer token from a CSPRNG, hex-encoded.
 fn generate_token() -> String {
-    format!("zc_{}", uuid::Uuid::new_v4().as_simple())
+    let mut buf = [0u8; 32];
+    getrandom::fill(&mut buf).expect("CSPRNG failure");
+    let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
+    format!("zc_{hex}")
 }
 
 /// SHA-256 hash a bearer token for storage. Returns lowercase hex.
@@ -435,10 +438,19 @@ mod tests {
     }
 
     #[test]
-    fn generate_token_has_prefix() {
+    fn generate_token_has_prefix_and_256_bit_entropy() {
         let token = generate_token();
         assert!(token.starts_with("zc_"));
-        assert!(token.len() > 10);
+        // zc_ prefix (3) + 64 hex chars (32 bytes = 256 bits)
+        assert_eq!(token.len(), 67);
+        assert!(token[3..].chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn generate_token_is_not_deterministic() {
+        let a = generate_token();
+        let b = generate_token();
+        assert_ne!(a, b, "Two tokens should differ");
     }
 
     // ── Brute force protection ───────────────────────────────
