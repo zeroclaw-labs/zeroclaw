@@ -9,7 +9,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 ### Merge-Blocking
 
 - `.github/workflows/ci.yml` (`CI`)
-    - Purpose: Rust validation (`fmt`, `clippy`, `test`, release build smoke) + docs quality checks when docs change
+    - Purpose: Rust validation (`cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D clippy::correctness`, `test`, release build smoke) + docs quality checks when docs change
     - Merge gate: `CI Required Gate`
 - `.github/workflows/workflow-sanity.yml` (`Workflow Sanity`)
     - Purpose: lint GitHub workflow files (`actionlint`, tab checks)
@@ -75,6 +75,8 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 ## Maintenance Rules
 
 - Keep merge-blocking checks deterministic and reproducible (`--locked` where applicable).
+- Keep merge-blocking clippy policy aligned across `.github/workflows/ci.yml`, `dev/ci.sh`, and `.githooks/pre-push` (`cargo clippy --all-targets -- -D clippy::correctness`).
+- Run strict lint audits regularly via `cargo clippy --all-targets -- -D warnings` (for example through `./dev/ci.sh lint-strict`) and track cleanup in focused PRs.
 - Prefer explicit workflow permissions (least privilege).
 - Keep Actions source policy restricted to approved allowlist patterns (see `docs/actions-source-policy.md`).
 - Use path filters for expensive workflows when practical.

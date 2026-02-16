@@ -110,6 +110,12 @@ This runs inside a container:
 - `cargo audit`
 - Docker smoke build (`docker build --target dev ...` + `--version` check)
 
+To run an opt-in strict lint audit locally:
+
+```bash
+./dev/ci.sh lint-strict
+```
+
 ### 3. Run targeted stages
 
 ```bash

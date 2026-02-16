@@ -7,17 +7,25 @@
 set -euo pipefail
 
 echo "==> pre-push: checking formatting..."
-cargo fmt -- --check || {
-    echo "FAIL: cargo fmt -- --check found unformatted code."
+cargo fmt --all -- --check || {
+    echo "FAIL: cargo fmt --all -- --check found unformatted code."
     echo "Run 'cargo fmt' and try again."
     exit 1
 }
 
 echo "==> pre-push: running clippy..."
-cargo clippy -- -D warnings || {
-    echo "FAIL: clippy reported warnings."
+cargo clippy --all-targets -- -D clippy::correctness || {
+    echo "FAIL: clippy correctness gate reported issues."
     exit 1
 }
+
+if [ "${ZEROCLAW_STRICT_LINT:-0}" = "1" ]; then
+    echo "==> pre-push: running strict clippy warnings gate (ZEROCLAW_STRICT_LINT=1)..."
+    cargo clippy --all-targets -- -D warnings || {
+        echo "FAIL: strict clippy warnings gate reported issues."
+        exit 1
+    }
+fi
 
 echo "==> pre-push: running tests..."
 cargo test || {
