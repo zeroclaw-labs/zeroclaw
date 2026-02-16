@@ -417,6 +417,40 @@ format = "openclaw"             # "openclaw" (default, markdown files) or "aieos
 # aieos_inline = '{"identity":{"names":{"first":"Nova"}}}'  # inline AIEOS JSON
 ```
 
+## Python Companion Package (`zeroclaw-tools`)
+
+For LLM providers with inconsistent native tool calling (e.g., GLM-5/Zhipu), ZeroClaw ships a Python companion package with **LangGraph-based tool calling** for guaranteed consistency:
+
+```bash
+pip install zeroclaw-tools
+```
+
+```python
+from zeroclaw_tools import create_agent, shell, file_read
+from langchain_core.messages import HumanMessage
+
+# Works with any OpenAI-compatible provider
+agent = create_agent(
+    tools=[shell, file_read],
+    model="glm-5",
+    api_key="your-key",
+    base_url="https://api.z.ai/api/coding/paas/v4"
+)
+
+result = await agent.ainvoke({
+    "messages": [HumanMessage(content="List files in /tmp")]
+})
+print(result["messages"][-1].content)
+```
+
+**Why use it:**
+- **Consistent tool calling** across all providers (even those with poor native support)
+- **Automatic tool loop** — keeps calling tools until the task is complete
+- **Easy extensibility** — add custom tools with `@tool` decorator
+- **Discord/Telegram bots** included
+
+See [`python/README.md`](python/README.md) for full documentation.
+
 ## Identity System (AIEOS Support)
 
 ZeroClaw supports **identity-agnostic** AI personas through two formats:
