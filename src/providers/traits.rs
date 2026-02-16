@@ -108,7 +108,8 @@ pub trait Provider: Send + Sync {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        self.chat_with_system(None, message, model, temperature).await
+        self.chat_with_system(None, message, model, temperature)
+            .await
     }
 
     /// One-shot chat with optional system prompt.

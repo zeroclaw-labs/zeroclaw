@@ -286,7 +286,7 @@ impl Agent {
         for msg in self.history.drain(..) {
             match &msg {
                 ConversationMessage::Chat(chat) if chat.role == "system" => {
-                    system_messages.push(msg)
+                    system_messages.push(msg);
                 }
                 _ => other_messages.push(msg),
             }
@@ -655,7 +655,7 @@ mod tests {
         let provider = Box::new(MockProvider {
             responses: Mutex::new(vec![
                 crate::providers::ChatResponse {
-                    text: Some("".into()),
+                    text: Some(String::new()),
                     tool_calls: vec![crate::providers::ToolCall {
                         id: "tc1".into(),
                         name: "echo".into(),
@@ -690,12 +690,9 @@ mod tests {
 
         let response = agent.turn("hi").await.unwrap();
         assert_eq!(response, "done");
-        assert!(matches!(
-            agent
-                .history()
-                .iter()
-                .find(|msg| matches!(msg, ConversationMessage::ToolResults(_))),
-            Some(_)
-        ));
+        assert!(agent
+            .history()
+            .iter()
+            .any(|msg| matches!(msg, ConversationMessage::ToolResults(_))));
     }
 }

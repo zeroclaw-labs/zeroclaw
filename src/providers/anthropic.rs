@@ -72,7 +72,10 @@ enum NativeContentOut {
         input: serde_json::Value,
     },
     #[serde(rename = "tool_result")]
-    ToolResult { tool_use_id: String, content: String },
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+    },
 }
 
 #[derive(Debug, Serialize)]
