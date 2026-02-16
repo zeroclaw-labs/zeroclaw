@@ -273,6 +273,20 @@ enum ModelCommands {
 }
 
 #[derive(Subcommand, Debug)]
+enum ModelCommands {
+    /// Refresh and cache provider models
+    Refresh {
+        /// Provider name (defaults to configured default provider)
+        #[arg(long)]
+        provider: Option<String>,
+
+        /// Force live refresh and ignore fresh cache
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum ChannelCommands {
     /// List configured channels
     List,
