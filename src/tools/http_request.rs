@@ -582,9 +582,9 @@ mod tests {
 
     #[test]
     fn blocks_documentation_ranges() {
-        assert!(is_private_or_local_host("192.0.2.1"));    // TEST-NET-1
+        assert!(is_private_or_local_host("192.0.2.1")); // TEST-NET-1
         assert!(is_private_or_local_host("198.51.100.1")); // TEST-NET-2
-        assert!(is_private_or_local_host("203.0.113.1"));  // TEST-NET-3
+        assert!(is_private_or_local_host("203.0.113.1")); // TEST-NET-3
     }
 
     #[test]
@@ -630,7 +630,12 @@ mod tests {
 
     #[test]
     fn allows_public_ipv6() {
-        assert!(!is_private_or_local_host("2001:db8::1").to_string().is_empty() || true);
+        assert!(
+            !is_private_or_local_host("2001:db8::1")
+                .to_string()
+                .is_empty()
+                || true
+        );
         // 2001:db8::/32 is documentation range for IPv6 but not currently blocked
         // since it's not practically exploitable. Public IPv6 addresses pass:
         assert!(!is_private_or_local_host("2607:f8b0:4004:800::200e"));
