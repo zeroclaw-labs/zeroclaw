@@ -63,6 +63,17 @@ impl Tool for FileReadTool {
             });
         }
 
+        // Record action BEFORE canonicalization so that every non-trivially-rejected
+        // request consumes rate limit budget. This prevents attackers from probing
+        // path existence (via canonicalize errors) without rate limit cost.
+        if !self.security.record_action() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Rate limit exceeded: action budget exhausted".into()),
+            });
+        }
+
         let full_path = self.security.workspace_dir.join(path);
 
         // Resolve path before reading to block symlink escapes.
@@ -109,14 +120,6 @@ impl Tool for FileReadTool {
                     error: Some(format!("Failed to read file metadata: {e}")),
                 });
             }
-        }
-
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
-            });
         }
 
         match tokio::fs::read_to_string(&resolved_path).await {
@@ -352,6 +355,40 @@ mod tests {
             .contains("escapes workspace"));
 
         let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn file_read_nonexistent_consumes_rate_limit_budget() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_probe");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // Allow only 2 actions total
+        let tool = FileReadTool::new(test_security_with(
+            dir.clone(),
+            AutonomyLevel::Supervised,
+            2,
+        ));
+
+        // Both reads fail (file doesn't exist) but should consume budget
+        let r1 = tool.execute(json!({"path": "nope1.txt"})).await.unwrap();
+        assert!(!r1.success);
+        assert!(r1.error.as_ref().unwrap().contains("Failed to resolve"));
+
+        let r2 = tool.execute(json!({"path": "nope2.txt"})).await.unwrap();
+        assert!(!r2.success);
+        assert!(r2.error.as_ref().unwrap().contains("Failed to resolve"));
+
+        // Third attempt should be rate limited even though file doesn't exist
+        let r3 = tool.execute(json!({"path": "nope3.txt"})).await.unwrap();
+        assert!(!r3.success);
+        assert!(
+            r3.error.as_ref().unwrap().contains("Rate limit"),
+            "Expected rate limit error, got: {:?}",
+            r3.error
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]

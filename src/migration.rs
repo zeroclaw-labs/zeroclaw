@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::memory::{MarkdownMemory, Memory, MemoryCategory, SqliteMemory};
+use crate::memory::{self, Memory, MemoryCategory};
 use anyhow::{bail, Context, Result};
 use directories::UserDirs;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
@@ -112,16 +112,7 @@ async fn migrate_openclaw_memory(
 }
 
 fn target_memory_backend(config: &Config) -> Result<Box<dyn Memory>> {
-    match config.memory.backend.as_str() {
-        "sqlite" => Ok(Box::new(SqliteMemory::new(&config.workspace_dir)?)),
-        "markdown" | "none" => Ok(Box::new(MarkdownMemory::new(&config.workspace_dir))),
-        other => {
-            tracing::warn!(
-                "Unknown memory backend '{other}' during migration, defaulting to markdown"
-            );
-            Ok(Box::new(MarkdownMemory::new(&config.workspace_dir)))
-        }
-    }
+    memory::create_memory_for_migration(&config.memory.backend, &config.workspace_dir)
 }
 
 fn collect_source_entries(
@@ -431,6 +422,7 @@ fn backup_target_memory(workspace_dir: &Path) -> Result<Option<PathBuf>> {
 mod tests {
     use super::*;
     use crate::config::{Config, MemoryConfig};
+    use crate::memory::SqliteMemory;
     use rusqlite::params;
     use tempfile::TempDir;
 
@@ -549,5 +541,17 @@ mod tests {
 
         let target_mem = SqliteMemory::new(target.path()).unwrap();
         assert_eq!(target_mem.count().await.unwrap(), 0);
+    }
+
+    #[test]
+    fn migration_target_rejects_none_backend() {
+        let target = TempDir::new().unwrap();
+        let mut config = test_config(target.path());
+        config.memory.backend = "none".to_string();
+
+        let err = target_memory_backend(&config)
+            .err()
+            .expect("backend=none should be rejected for migration target");
+        assert!(err.to_string().contains("disables persistence"));
     }
 }

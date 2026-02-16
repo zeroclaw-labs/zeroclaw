@@ -39,6 +39,16 @@ services:
       # Gateway API port (override HOST_PORT if 3000 is taken)
       - "${HOST_PORT:-3000}:3000"
     
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
     # Health check
     healthcheck:
       test: ["CMD", "zeroclaw", "doctor"]

@@ -26,7 +26,7 @@ jobs:
             rust_changed: ${{ steps.scope.outputs.rust_changed }}
             docs_files: ${{ steps.scope.outputs.docs_files }}
         steps:
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
               with:
                   fetch-depth: 0
 
@@ -121,14 +121,14 @@ jobs:
         runs-on: ${{ github.event_name == 'push' && fromJSON('["self-hosted","Linux","X64","lxc-ci"]') || 'ubuntu-latest' }}
         timeout-minutes: 20
         steps:
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
               with:
                   fetch-depth: 0
-            - uses: dtolnay/rust-toolchain@stable
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92
                   components: rustfmt, clippy
-            - uses: Swatinem/rust-cache@v2
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
             - name: Run rustfmt
               run: cargo fmt --all -- --check
             - name: Run clippy
@@ -141,11 +141,11 @@ jobs:
         runs-on: ${{ github.event_name == 'push' && fromJSON('["self-hosted","Linux","X64","lxc-ci"]') || 'ubuntu-latest' }}
         timeout-minutes: 30
         steps:
-            - uses: actions/checkout@v4
-            - uses: dtolnay/rust-toolchain@stable
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92
-            - uses: Swatinem/rust-cache@v2
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
             - name: Run tests
               run: cargo test --locked --verbose
 
@@ -157,11 +157,11 @@ jobs:
         timeout-minutes: 20
 
         steps:
-            - uses: actions/checkout@v4
-            - uses: dtolnay/rust-toolchain@stable
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92
-            - uses: Swatinem/rust-cache@v2
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
             - name: Build release binary
               run: cargo build --release --locked --verbose
 
@@ -190,15 +190,15 @@ jobs:
         runs-on: ${{ github.event_name == 'push' && fromJSON('["self-hosted","Linux","X64","lxc-ci"]') || 'ubuntu-latest' }}
         timeout-minutes: 15
         steps:
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
             - name: Markdown lint
-              uses: DavidAnson/markdownlint-cli2-action@v22
+              uses: DavidAnson/markdownlint-cli2-action@07035fd053f7be764496c0f8d8f9f41f98305101 # v22
               with:
                   globs: ${{ needs.changes.outputs.docs_files }}
 
             - name: Link check (offline)
-              uses: lycheeverse/lychee-action@v2
+              uses: lycheeverse/lychee-action@a8c4c7cb88f0c7386610c35eb25108e448569cb0 # v2
               with:
                   fail: true
                   args: >-

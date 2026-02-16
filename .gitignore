@@ -1,4 +1,5 @@
 /target
+firmware/*/target
 *.db
 *.db-journal
 .DS_Store
