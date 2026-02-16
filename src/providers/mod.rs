@@ -9,7 +9,10 @@ pub mod router;
 pub mod traits;
 
 #[allow(unused_imports)]
-pub use traits::{ChatMessage, ChatResponse, Provider, ToolCall};
+pub use traits::{
+    ChatMessage, ChatRequest, ChatResponse, ConversationMessage, Provider, ToolCall,
+    ToolResultMessage,
+};
 
 use compatible::{AuthStyle, OpenAiCompatibleProvider};
 use reliable::ReliableProvider;

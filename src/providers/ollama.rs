@@ -1,4 +1,4 @@
-use crate::providers::traits::{ChatResponse as ProviderChatResponse, Provider};
+use crate::providers::traits::Provider;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -61,7 +61,7 @@ impl Provider for OllamaProvider {
         message: &str,
         model: &str,
         temperature: f64,
-    ) -> anyhow::Result<ProviderChatResponse> {
+    ) -> anyhow::Result<String> {
         let mut messages = Vec::new();
 
         if let Some(sys) = system_prompt {
@@ -93,9 +93,7 @@ impl Provider for OllamaProvider {
         }
 
         let chat_response: ApiChatResponse = response.json().await?;
-        Ok(ProviderChatResponse::with_text(
-            chat_response.message.content,
-        ))
+        Ok(chat_response.message.content)
     }
 }
 

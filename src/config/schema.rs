@@ -37,6 +37,9 @@ pub struct Config {
     #[serde(default)]
     pub scheduler: SchedulerConfig,
 
+    #[serde(default)]
+    pub agent: AgentConfig,
+
     /// Model routing rules — route `hint:<name>` to specific provider+model combos.
     #[serde(default)]
     pub model_routes: Vec<ModelRouteConfig>,
@@ -77,10 +80,6 @@ pub struct Config {
     #[serde(default)]
     pub peripherals: PeripheralsConfig,
 
-    /// Agent context limits — use compact for smaller models (e.g. 13B with 4k–8k context).
-    #[serde(default)]
-    pub agent: AgentConfig,
-
     /// Delegate agent configurations for multi-agent workflows.
     #[serde(default)]
     pub agents: HashMap<String, DelegateAgentConfig>,
@@ -88,23 +87,6 @@ pub struct Config {
     /// Hardware configuration (wizard-driven physical world setup).
     #[serde(default)]
     pub hardware: HardwareConfig,
-}
-
-// ── Agent (context limits for smaller models) ────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentConfig {
-    /// When true: bootstrap_max_chars=6000, rag_chunk_limit=2. Use for 13B or smaller models.
-    #[serde(default)]
-    pub compact_context: bool,
-}
-
-impl Default for AgentConfig {
-    fn default() -> Self {
-        Self {
-            compact_context: false,
-        }
-    }
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -205,6 +187,45 @@ impl Default for HardwareConfig {
             baud_rate: default_baud_rate(),
             probe_target: None,
             workspace_datasheets: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentConfig {
+    /// When true: bootstrap_max_chars=6000, rag_chunk_limit=2. Use for 13B or smaller models.
+    #[serde(default)]
+    pub compact_context: bool,
+    #[serde(default = "default_agent_max_tool_iterations")]
+    pub max_tool_iterations: usize,
+    #[serde(default = "default_agent_max_history_messages")]
+    pub max_history_messages: usize,
+    #[serde(default)]
+    pub parallel_tools: bool,
+    #[serde(default = "default_agent_tool_dispatcher")]
+    pub tool_dispatcher: String,
+}
+
+fn default_agent_max_tool_iterations() -> usize {
+    10
+}
+
+fn default_agent_max_history_messages() -> usize {
+    50
+}
+
+fn default_agent_tool_dispatcher() -> String {
+    "auto".into()
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            compact_context: false,
+            max_tool_iterations: default_agent_max_tool_iterations(),
+            max_history_messages: default_agent_max_history_messages(),
+            parallel_tools: false,
+            tool_dispatcher: default_agent_tool_dispatcher(),
         }
     }
 }
@@ -1507,6 +1528,7 @@ impl Default for Config {
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
+            agent: AgentConfig::default(),
             model_routes: Vec::new(),
             heartbeat: HeartbeatConfig::default(),
             channels_config: ChannelsConfig::default(),
@@ -1520,7 +1542,6 @@ impl Default for Config {
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
-            agent: AgentConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
         }
@@ -1873,10 +1894,10 @@ mod tests {
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             http_request: HttpRequestConfig::default(),
+            agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
-            agent: AgentConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
         };
@@ -1923,6 +1944,35 @@ default_temperature = 0.7
     }
 
     #[test]
+    fn agent_config_defaults() {
+        let cfg = AgentConfig::default();
+        assert!(!cfg.compact_context);
+        assert_eq!(cfg.max_tool_iterations, 10);
+        assert_eq!(cfg.max_history_messages, 50);
+        assert!(!cfg.parallel_tools);
+        assert_eq!(cfg.tool_dispatcher, "auto");
+    }
+
+    #[test]
+    fn agent_config_deserializes() {
+        let raw = r#"
+default_temperature = 0.7
+[agent]
+compact_context = true
+max_tool_iterations = 20
+max_history_messages = 80
+parallel_tools = true
+tool_dispatcher = "xml"
+"#;
+        let parsed: Config = toml::from_str(raw).unwrap();
+        assert!(parsed.agent.compact_context);
+        assert_eq!(parsed.agent.max_tool_iterations, 20);
+        assert_eq!(parsed.agent.max_history_messages, 80);
+        assert!(parsed.agent.parallel_tools);
+        assert_eq!(parsed.agent.tool_dispatcher, "xml");
+    }
+
+    #[test]
     fn config_save_and_load_tmpdir() {
         let dir = std::env::temp_dir().join("zeroclaw_test_config");
         let _ = fs::remove_dir_all(&dir);
@@ -1951,10 +2001,10 @@ default_temperature = 0.7
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             http_request: HttpRequestConfig::default(),
+            agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
-            agent: AgentConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
         };

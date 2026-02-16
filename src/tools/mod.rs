@@ -170,8 +170,12 @@ pub fn all_tools_with_runtime(
 
     // Add delegation tool when agents are configured
     if !agents.is_empty() {
+        let delegate_agents: HashMap<String, DelegateAgentConfig> = agents
+            .iter()
+            .map(|(name, cfg)| (name.clone(), cfg.clone()))
+            .collect();
         tools.push(Box::new(DelegateTool::new(
-            agents.clone(),
+            delegate_agents,
             fallback_api_key.map(String::from),
         )));
     }
