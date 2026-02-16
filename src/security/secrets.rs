@@ -1,7 +1,7 @@
 // Encrypted secret store — defense-in-depth for API keys and tokens.
 //
 // Secrets are encrypted using ChaCha20-Poly1305 AEAD with a random key stored
-// in `~/aria/.secret_key` with restrictive file permissions (0600). The
+// in `~/.aria/.secret_key` with restrictive file permissions (0600). The
 // config file stores only hex-encoded ciphertext, never plaintext keys.
 //
 // Each encryption generates a fresh random 12-byte nonce, prepended to the
@@ -35,7 +35,7 @@ const NONCE_LEN: usize = 12;
 /// Manages encrypted storage of secrets (API keys, tokens, etc.)
 #[derive(Debug, Clone)]
 pub struct SecretStore {
-    /// Path to the key file (`~/aria/.secret_key`)
+    /// Path to the key file (`~/.aria/.secret_key`)
     key_path: PathBuf,
     /// Whether encryption is enabled
     enabled: bool,

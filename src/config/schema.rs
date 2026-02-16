@@ -673,8 +673,8 @@ pub fn aria_home_dir() -> PathBuf {
         }
     }
     UserDirs::new()
-        .map(|u| u.home_dir().join("aria"))
-        .unwrap_or_else(|| PathBuf::from("aria"))
+        .map(|u| u.home_dir().join(".aria"))
+        .unwrap_or_else(|| PathBuf::from(".aria"))
 }
 
 pub fn default_workspace_dir() -> PathBuf {

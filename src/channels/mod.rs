@@ -125,7 +125,7 @@ pub fn handle_command(command: super::ChannelCommands, config: &Config) -> Resul
             );
         }
         super::ChannelCommands::Remove { name } => {
-            anyhow::bail!("Remove channel '{name}' — edit ~/aria/config.toml directly");
+            anyhow::bail!("Remove channel '{name}' — edit ~/.aria/config.toml directly");
         }
     }
 }

@@ -331,7 +331,7 @@ pub fn run_quick_setup(api_key: Option<&str>, provider: Option<&str>) -> Result<
     println!("  {}", style("Next steps:").white().bold());
     if api_key.is_none() {
         println!("    1. Set your API key:  export OPENROUTER_API_KEY=\"sk-...\"");
-        println!("    2. Or edit:           ~/aria/config.toml");
+        println!("    2. Or edit:           ~/.aria/config.toml");
         println!("    3. Chat:              afw agent -m \"Hello!\"");
         println!("    4. Gateway:           afw gateway");
     } else {

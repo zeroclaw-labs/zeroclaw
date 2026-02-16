@@ -67,7 +67,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     }
 
     if let Err(e) = crate::cron::jobs_file::import_jobs_file(&config.workspace_dir) {
-        tracing::warn!("Failed to import ~/aria/jobs.json before daemon start: {e}");
+        tracing::warn!("Failed to import ~/.aria/jobs.json before daemon start: {e}");
     }
 
     wire_cron_bridge_hooks(&config)?;
@@ -472,7 +472,7 @@ fn wire_cron_bridge_hooks(config: &Config) -> Result<()> {
     ));
     bridge.sync_all()?;
     if let Err(e) = crate::cron::jobs_file::export_jobs_file(&export_cfg.workspace_dir) {
-        tracing::warn!("Failed to export cron jobs to ~/aria/jobs.json after startup sync: {e}");
+        tracing::warn!("Failed to export cron jobs to ~/.aria/jobs.json after startup sync: {e}");
     }
 
     let on_uploaded = bridge.clone();

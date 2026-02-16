@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// A skill is a user-defined or community-built capability.
-/// Skills live in `~/aria/skills/<name>/SKILL.md`
+/// Skills live in `~/.aria/skills/<name>/SKILL.md`
 /// and can include tool definitions, prompts, and automation scripts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Skill {
@@ -256,8 +256,8 @@ pub fn handle_command(command: super::SkillCommands, workspace_dir: &Path) -> Re
             if skills.is_empty() {
                 println!("No skills installed.");
                 println!();
-                println!("  Create one: mkdir -p ~/aria/skills/my-skill");
-                println!("              echo '# My Skill' > ~/aria/skills/my-skill/SKILL.md");
+                println!("  Create one: mkdir -p ~/.aria/skills/my-skill");
+                println!("              echo '# My Skill' > ~/.aria/skills/my-skill/SKILL.md");
                 println!();
                 println!("  Or install: afw skills install <github-url>");
             } else {
@@ -676,9 +676,9 @@ description = "Bare minimum"
 
     #[test]
     fn skills_dir_path() {
-        let workspace = std::path::Path::new("/home/user/aria/workspace");
+        let workspace = std::path::Path::new("/home/user/.aria/workspace");
         let dir = skills_dir(workspace);
-        assert_eq!(dir, PathBuf::from("/home/user/aria/skills"));
+        assert_eq!(dir, PathBuf::from("/home/user/.aria/skills"));
     }
 
     #[test]
