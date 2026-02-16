@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use directories::UserDirs;
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 // ── Top-level config ──────────────────────────────────────────────
@@ -620,37 +621,30 @@ impl Default for Config {
     }
 }
 
-fn merge_dir_recursive(src: &PathBuf, dst: &PathBuf) -> Result<()> {
-    if !src.exists() {
-        return Ok(());
-    }
-    fs::create_dir_all(dst).with_context(|| format!("Failed to create {}", dst.display()))?;
-
-    let entries = fs::read_dir(src).with_context(|| format!("Failed to read {}", src.display()))?;
-    for entry in entries {
-        let entry = entry.with_context(|| format!("Failed to read entry in {}", src.display()))?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-
-        if src_path.is_dir() {
-            merge_dir_recursive(&src_path, &dst_path)?;
-            continue;
+fn ensure_real_directory(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                if meta.is_dir() {
+                    fs::remove_dir_all(path)
+                        .with_context(|| format!("Failed to remove {}", path.display()))?;
+                } else {
+                    fs::remove_file(path)
+                        .with_context(|| format!("Failed to remove {}", path.display()))?;
+                }
+            }
         }
-
-        if !dst_path.exists() {
-            fs::copy(&src_path, &dst_path).with_context(|| {
-                format!(
-                    "Failed to copy {} -> {}",
-                    src_path.display(),
-                    dst_path.display()
-                )
-            })?;
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| format!("Failed to stat {}", path.display()));
         }
     }
+    fs::create_dir_all(path).with_context(|| format!("Failed to create {}", path.display()))?;
     Ok(())
 }
 
-fn ensure_aria_structure(aria_dir: &PathBuf) -> Result<()> {
+fn ensure_aria_structure(aria_dir: &Path) -> Result<()> {
+    ensure_real_directory(aria_dir)?;
     for sub in [
         "workspace",
         "skills",
@@ -666,7 +660,7 @@ fn ensure_aria_structure(aria_dir: &PathBuf) -> Result<()> {
         "crons",
     ] {
         let dir = aria_dir.join(sub);
-        fs::create_dir_all(&dir).with_context(|| format!("Failed to create {}", dir.display()))?;
+        ensure_real_directory(&dir)?;
     }
     Ok(())
 }
@@ -684,22 +678,10 @@ pub fn aria_home_dir() -> PathBuf {
 }
 
 pub fn default_workspace_dir() -> PathBuf {
-    if let Ok(raw) = std::env::var("ARIA_WORKSPACE_DIR") {
-        let trimmed = raw.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed);
-        }
-    }
     aria_home_dir().join("workspace")
 }
 
 pub fn default_config_path() -> PathBuf {
-    if let Ok(raw) = std::env::var("ARIA_CONFIG_PATH") {
-        let trimmed = raw.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed);
-        }
-    }
     aria_home_dir().join("config.toml")
 }
 
@@ -718,12 +700,6 @@ pub fn aria_root_dir_for_workspace(workspace_dir: &Path) -> PathBuf {
 }
 
 pub fn registry_db_path_for_workspace(workspace_dir: &Path) -> PathBuf {
-    if let Ok(raw) = std::env::var("ARIA_REGISTRY_DB_PATH") {
-        let trimmed = raw.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed);
-        }
-    }
     aria_root_dir_for_workspace(workspace_dir).join("aria.db")
 }
 
@@ -737,55 +713,9 @@ impl Config {
     }
 
     pub fn load_or_init() -> Result<Self> {
-        let home = UserDirs::new()
-            .map(|u| u.home_dir().to_path_buf())
-            .context("Could not find home directory")?;
         let aria_dir = aria_home_dir();
         let config_path = default_config_path();
-        let legacy_afw_dir = home.join(".afw");
-        let legacy_desktop_aria_dir = home.join("Desktop").join("ARIA");
-
-        if !aria_dir.exists() {
-            fs::create_dir_all(&aria_dir).context("Failed to create ~/aria directory")?;
-        }
         ensure_aria_structure(&aria_dir)?;
-
-        // Best-effort migration from legacy locations into ~/aria.
-        if legacy_afw_dir.exists() {
-            merge_dir_recursive(&legacy_afw_dir, &aria_dir)
-                .context("Failed to migrate legacy ~/.afw contents into ~/aria")?;
-        }
-        if legacy_desktop_aria_dir.exists() {
-            merge_dir_recursive(&legacy_desktop_aria_dir, &aria_dir)
-                .context("Failed to migrate legacy ~/Desktop/ARIA contents into ~/aria")?;
-        }
-        let db_candidates = [
-            legacy_afw_dir.join("aria.db"),
-            legacy_afw_dir.join("workspace").join("aria.db"),
-            legacy_desktop_aria_dir.join("aria.db"),
-            legacy_desktop_aria_dir.join("workspace").join("aria.db"),
-            aria_dir.join("workspace").join("aria.db"),
-        ];
-        let root_db = registry_db_path_for_workspace(&default_workspace_dir());
-        if let Some(parent) = root_db.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create {}", parent.display()))?;
-        }
-        if !root_db.exists() {
-            for candidate in db_candidates {
-                if !candidate.exists() {
-                    continue;
-                }
-                fs::copy(&candidate, &root_db).with_context(|| {
-                    format!(
-                        "Failed to migrate registry db {} -> {}",
-                        candidate.display(),
-                        root_db.display()
-                    )
-                })?;
-                break;
-            }
-        }
 
         if config_path.exists() {
             let contents =
@@ -793,30 +723,17 @@ impl Config {
             let mut config: Config =
                 toml::from_str(&contents).context("Failed to parse config file")?;
             let mut changed = false;
-
-            // Normalize legacy path values unless explicit env overrides were provided.
-            if std::env::var("ARIA_WORKSPACE_DIR").is_err()
-                && (config.workspace_dir.starts_with(&legacy_afw_dir)
-                    || config.workspace_dir.starts_with(&legacy_desktop_aria_dir))
-            {
-                config.workspace_dir = default_workspace_dir();
+            let canonical_workspace = default_workspace_dir();
+            let canonical_config = default_config_path();
+            if config.workspace_dir != canonical_workspace {
+                config.workspace_dir = canonical_workspace;
                 changed = true;
             }
-            if std::env::var("ARIA_CONFIG_PATH").is_err()
-                && (config.config_path.starts_with(&legacy_afw_dir)
-                    || config.config_path.starts_with(&legacy_desktop_aria_dir))
-            {
-                config.config_path = default_config_path();
+            if config.config_path != canonical_config {
+                config.config_path = canonical_config;
                 changed = true;
             }
-
-            ensure_aria_structure(
-                &config
-                    .workspace_dir
-                    .parent()
-                    .unwrap_or(&aria_dir)
-                    .to_path_buf(),
-            )?;
+            ensure_aria_structure(&aria_dir)?;
             if changed {
                 config.save()?;
             }
