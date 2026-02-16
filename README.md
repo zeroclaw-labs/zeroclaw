@@ -114,7 +114,7 @@ zeroclaw migrate openclaw
 ```
 
 > **Dev fallback (no global install):** prefix commands with `cargo run --release --` (example: `cargo run --release -- status`).
-> **Low-memory boards (e.g., Raspberry Pi 3, 1GB RAM):** run `CARGO_BUILD_JOBS=1 cargo build --release` if the kernel kills rustc during compilation.
+> **Low-memory boards (e.g., Raspberry Pi 3, 1GB RAM):** run `CARGO_BUILD_JOBS=1 cargo build --release` (the default release profile is tuned to avoid LTO OOM on small-memory hosts).
 
 ## Architecture
 
@@ -456,9 +456,10 @@ See [aieos.org](https://aieos.org) for the full schema and live examples.
 
 ```bash
 cargo build              # Dev build
-cargo build --release    # Release build (~3.4MB)
-CARGO_BUILD_JOBS=1 cargo build --release    # Low-memory fallback (Raspberry Pi 3, 1GB RAM)
-cargo test               # 1,017 tests
+cargo build --release    # Release build
+CARGO_BUILD_JOBS=1 cargo build --release    # Low-memory boards (Raspberry Pi 3, 1GB RAM)
+cargo build --profile dist --locked         # Max-optimized distribution build (CI/release)
+cargo test               # test suite
 cargo clippy             # Lint (0 warnings)
 cargo fmt                # Format
 

@@ -124,15 +124,15 @@ rag-pdf = ["dep:pdf-extract"]
 
 [profile.release]
 opt-level = "z"      # Optimize for size
-lto = "thin"         # Lower memory use during release builds
-codegen-units = 8     # Faster, lower-RAM codegen for small devices
+lto = false           # Keep release buildable on low-RAM hosts (e.g., 1GB boards)
+codegen-units = 16    # Reduce peak compiler memory pressure
 strip = true          # Remove debug symbols
 panic = "abort"      # Reduce binary size
 
 [profile.dist]
 inherits = "release"
 opt-level = "z"
-lto = "fat"
+lto = "fat"          # Maximum size/runtime optimization for published artifacts
 codegen-units = 1
 strip = true
 panic = "abort"
