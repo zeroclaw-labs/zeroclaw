@@ -24,6 +24,7 @@ cargo test telegram --lib
 The `test_telegram_integration.sh` script runs:
 
 **Phase 1: Code Quality (5 tests)**
+
 - ✅ Test compilation
 - ✅ Unit tests (24 tests)
 - ✅ Message splitting tests (8 tests)
@@ -31,21 +32,25 @@ The `test_telegram_integration.sh` script runs:
 - ✅ Code formatting
 
 **Phase 2: Build Tests (3 tests)**
+
 - ✅ Debug build
 - ✅ Release build
 - ✅ Binary size verification (<10MB)
 
 **Phase 3: Configuration Tests (4 tests)**
+
 - ✅ Config file exists
 - ✅ Telegram section configured
 - ✅ Bot token set
 - ✅ User allowlist configured
 
 **Phase 4: Health Check Tests (2 tests)**
+
 - ✅ Health check timeout (<5s)
 - ✅ Telegram API connectivity
 
 **Phase 5: Feature Validation (6 tests)**
+
 - ✅ Message splitting function
 - ✅ Message length constant (4096)
 - ✅ Timeout implementation
@@ -58,50 +63,60 @@ The `test_telegram_integration.sh` script runs:
 After running automated tests, perform these manual checks:
 
 1. **Basic messaging**
-   ```bash
-   zeroclaw channel start
-   ```
-   - Send "Hello bot!" in Telegram
-   - Verify response within 3 seconds
+
+    ```bash
+    zeroclaw channel start
+    ```
+
+    - Send "Hello bot!" in Telegram
+    - Verify response within 3 seconds
 
 2. **Long message splitting**
-   ```bash
-   # Generate 5000+ char message
-   python3 -c 'print("test " * 1000)'
-   ```
-   - Paste into Telegram
-   - Verify: Message split into chunks
-   - Verify: Markers show `(continues...)` and `(continued)`
-   - Verify: All chunks arrive in order
+
+    ```bash
+    # Generate 5000+ char message
+    python3 -c 'print("test " * 1000)'
+    ```
+
+    - Paste into Telegram
+    - Verify: Message split into chunks
+    - Verify: Markers show `(continues...)` and `(continued)`
+    - Verify: All chunks arrive in order
 
 3. **Unauthorized user blocking**
-   ```toml
-   # Edit ~/.zeroclaw/config.toml
-   allowed_users = ["999999999"]
-   ```
-   - Send message to bot
-   - Verify: Warning in logs
-   - Verify: Message ignored
-   - Restore correct user ID
+
+    ```toml
+    # Edit ~/.zeroclaw/config.toml
+    allowed_users = ["999999999"]
+    ```
+
+    - Send message to bot
+    - Verify: Warning in logs
+    - Verify: Message ignored
+    - Restore correct user ID
 
 4. **Rate limiting**
-   - Send 10 messages rapidly
-   - Verify: All processed
-   - Verify: No "Too Many Requests" errors
-   - Verify: Responses have delays
+    - Send 10 messages rapidly
+    - Verify: All processed
+    - Verify: No "Too Many Requests" errors
+    - Verify: Responses have delays
 
 5. **Error logging**
-   ```bash
-   RUST_LOG=debug zeroclaw channel start
-   ```
-   - Check for unexpected errors
-   - Verify proper error handling
+
+    ```bash
+    RUST_LOG=debug zeroclaw channel start
+    ```
+
+    - Check for unexpected errors
+    - Verify proper error handling
 
 6. **Health check timeout**
-   ```bash
-   time zeroclaw channel doctor
-   ```
-   - Verify: Completes in <5 seconds
+
+    ```bash
+    time zeroclaw channel doctor
+    ```
+
+    - Verify: Completes in <5 seconds
 
 ## 🔍 Test Results Interpretation
 
@@ -116,12 +131,14 @@ After running automated tests, perform these manual checks:
 ### Common Issues
 
 **Issue: Health check times out**
+
 ```
 Solution: Check bot token is valid
   curl "https://api.telegram.org/bot<TOKEN>/getMe"
 ```
 
 **Issue: Bot doesn't respond**
+
 ```
 Solution: Check user allowlist
   1. Send message to bot
@@ -131,6 +148,7 @@ Solution: Check user allowlist
 ```
 
 **Issue: Message splitting not working**
+
 ```
 Solution: Verify code changes
   grep -n "split_message_for_telegram" src/channels/telegram.rs
@@ -200,14 +218,14 @@ zeroclaw status
 
 Expected values after all fixes:
 
-| Metric | Expected | How to Measure |
-|--------|----------|----------------|
-| Health check time | <5s | `time zeroclaw channel doctor` |
-| First response time | <3s | Time from sending to receiving |
-| Message split overhead | <50ms | Check logs for timing |
-| Memory usage | <10MB | `ps aux \| grep zeroclaw` |
-| Binary size | ~3-4MB | `ls -lh target/release/zeroclaw` |
-| Unit test coverage | 24/24 pass | `cargo test telegram --lib` |
+| Metric                 | Expected   | How to Measure                   |
+| ---------------------- | ---------- | -------------------------------- |
+| Health check time      | <5s        | `time zeroclaw channel doctor`   |
+| First response time    | <3s        | Time from sending to receiving   |
+| Message split overhead | <50ms      | Check logs for timing            |
+| Memory usage           | <10MB      | `ps aux \| grep zeroclaw`        |
+| Binary size            | ~3-4MB     | `ls -lh target/release/zeroclaw` |
+| Unit test coverage     | 24/24 pass | `cargo test telegram --lib`      |
 
 ## 🐛 Debugging Failed Tests
 
@@ -264,7 +282,7 @@ on: [push, pull_request]
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v3
       - uses: actions-rs/toolchain@v1
