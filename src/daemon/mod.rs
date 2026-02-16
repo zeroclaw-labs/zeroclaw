@@ -291,12 +291,15 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 Err(e) => {
                     crate::health::mark_component_error("heartbeat", e.to_string());
                     tracing::warn!("Heartbeat task failed: {e}");
+                    let full_error = e.to_string();
+                    let summarized = summarize_heartbeat_error(&full_error);
                     status_events::emit(
                         "heartbeat.task.failed",
                         serde_json::json!({
                             "tenantId": "dev-tenant",
                             "task": task,
-                            "error": e.to_string(),
+                            "error": summarized,
+                            "rawError": full_error,
                         }),
                     );
                 }
@@ -358,6 +361,21 @@ async fn execute_heartbeat_task(config: &Config, prompt: &str) -> Result<String>
 }
 
 const HEARTBEAT_INBOX_DEDUP_WINDOW_MINUTES: i64 = 120;
+
+fn summarize_heartbeat_error(err: &str) -> String {
+    let trimmed = err.trim();
+    if trimmed.is_empty() {
+        return "Heartbeat task failed".to_string();
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("does not have access to claude") || lower.contains("please login again") {
+        return "Claude access denied. Run `claude login` and verify your organization access."
+            .to_string();
+    }
+
+    trimmed.lines().next().unwrap_or(trimmed).to_string()
+}
 
 fn persist_heartbeat_response_to_inbox(config: &Config, task: &str, output: &str) -> Result<bool> {
     let db = crate::aria::db::AriaDb::open(&config.registry_db_path())?;

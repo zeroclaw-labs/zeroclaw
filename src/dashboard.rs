@@ -428,7 +428,10 @@ fn title_for_event(event_type: &str, data: &Value) -> String {
         ),
         "task.failed" => format!("Task failed: {}", data["name"].as_str().unwrap_or("task")),
         "heartbeat.task.completed" => "Heartbeat task completed".to_string(),
-        "heartbeat.task.failed" => "Heartbeat task failed".to_string(),
+        "heartbeat.task.failed" => format!(
+            "Heartbeat task failed: {}",
+            data["task"].as_str().unwrap_or("task")
+        ),
         "subagent.started" => format!(
             "Subagent started: {}",
             data["taskLabel"].as_str().unwrap_or("task")
@@ -447,6 +450,21 @@ fn title_for_event(event_type: &str, data: &Value) -> String {
         ),
         _ => event_type.to_string(),
     }
+}
+
+fn summarize_status_error_for_inbox(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "Task failed".to_string();
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("does not have access to claude") || lower.contains("please login again") {
+        return "Claude access denied. Run `claude login` and verify your organization access."
+            .to_string();
+    }
+
+    trimmed.lines().next().unwrap_or(trimmed).to_string()
 }
 
 fn preview_for_event(event_type: &str, data: &Value) -> String {
@@ -469,14 +487,12 @@ fn preview_for_event(event_type: &str, data: &Value) -> String {
                 "Completed".to_string()
             }
         }
-        "task.failed" => data["errorMessage"]
-            .as_str()
-            .unwrap_or("Task failed")
-            .to_string(),
-        "heartbeat.task.failed" => data["error"]
-            .as_str()
-            .unwrap_or("Heartbeat task failed")
-            .to_string(),
+        "task.failed" => summarize_status_error_for_inbox(
+            data["errorMessage"].as_str().unwrap_or("Task failed"),
+        ),
+        "heartbeat.task.failed" => summarize_status_error_for_inbox(
+            data["error"].as_str().unwrap_or("Heartbeat task failed"),
+        ),
         "heartbeat.task.completed" => data["task"]
             .as_str()
             .unwrap_or("Heartbeat task")
@@ -506,6 +522,23 @@ fn preview_for_event(event_type: &str, data: &Value) -> String {
             .collect(),
         _ => String::new(),
     }
+}
+
+fn source_id_for_status_event(event_type: &str, data: &Value) -> Option<String> {
+    if event_type == "heartbeat.task.failed" || event_type == "heartbeat.task.completed" {
+        if let Some(task) = data["task"].as_str() {
+            let normalized = task.trim().to_lowercase();
+            if !normalized.is_empty() {
+                return Some(format!("heartbeat:{normalized}"));
+            }
+        }
+    }
+
+    data["jobId"]
+        .as_str()
+        .or_else(|| data["feedId"].as_str())
+        .or_else(|| data["id"].as_str())
+        .map(ToString::to_string)
 }
 
 #[derive(Debug, Clone)]
@@ -562,11 +595,7 @@ pub fn maybe_create_inbox_for_status_event(
     let preview = preview_for_event(event_type, data);
     let run_id = data["runId"].as_str().map(ToString::to_string);
     let chat_id = data["chatId"].as_str().map(ToString::to_string);
-    let source_id = data["jobId"]
-        .as_str()
-        .or_else(|| data["feedId"].as_str())
-        .or_else(|| data["id"].as_str())
-        .map(ToString::to_string);
+    let source_id = source_id_for_status_event(event_type, data);
     let status = if event_type.ends_with(".failed") || event_type.ends_with(".timeout") {
         "unread"
     } else {
@@ -575,7 +604,7 @@ pub fn maybe_create_inbox_for_status_event(
 
     let item = NewInboxItem {
         source_type: source_type.to_string(),
-        source_id,
+        source_id: source_id.clone(),
         run_id,
         chat_id,
         title: title.clone(),
@@ -595,6 +624,69 @@ pub fn maybe_create_inbox_for_status_event(
         }),
         status: Some(status.to_string()),
     };
+
+    if event_type == "heartbeat.task.failed" {
+        if let Some(ref existing_source_id) = source_id {
+            let metadata_json =
+                serde_json::to_string(&item.metadata).unwrap_or_else(|_| "{}".to_string());
+            let now_ms = Utc::now().timestamp_millis();
+            let existing_id = db.with_conn(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT id FROM inbox_items
+                     WHERE tenant_id=?1
+                       AND source_type=?2
+                       AND source_id=?3
+                       AND status!='archived'
+                     ORDER BY created_at DESC
+                     LIMIT 1",
+                )?;
+                let row = stmt.query_row(
+                    params![tenant, source_type, existing_source_id],
+                    |r| r.get::<_, String>(0),
+                );
+                match row {
+                    Ok(id) => Ok(Some(id)),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                    Err(e) => Err(e.into()),
+                }
+            })?;
+
+            if let Some(existing_id) = existing_id {
+                db.with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE inbox_items
+                         SET title=?1,
+                             preview=?2,
+                             body=?3,
+                             metadata_json=?4,
+                             status='unread',
+                             read_at=NULL,
+                             created_at=?5
+                         WHERE tenant_id=?6
+                           AND id=?7",
+                        params![
+                            item.title,
+                            item.preview,
+                            item.body,
+                            metadata_json,
+                            now_ms,
+                            tenant,
+                            existing_id
+                        ],
+                    )?;
+                    Ok(())
+                })?;
+
+                return Ok(Some(StatusInboxCreated {
+                    id: existing_id,
+                    tenant_id: tenant,
+                    source_type: source_type.to_string(),
+                    title,
+                }));
+            }
+        }
+    }
+
     let id = create_inbox_item(db, &tenant, &item)?;
     Ok(Some(StatusInboxCreated {
         id,
@@ -919,5 +1011,62 @@ mod tests {
 
         assert_eq!(row.0, "unread");
         assert!(row.1.unwrap_or_default().contains("timed out"));
+    }
+
+    #[test]
+    fn heartbeat_task_failed_upserts_existing_inbox_item() {
+        let db = AriaDb::open_in_memory().unwrap();
+        ensure_schema(&db).unwrap();
+
+        let first = maybe_create_inbox_for_status_event(
+            &db,
+            "dev-tenant",
+            "heartbeat.task.failed",
+            &serde_json::json!({
+                "tenantId": "dev-tenant",
+                "task": "Check reports",
+                "error": "All providers failed. Attempts: claude-cli attempt 1/3: Your organization does not have access to Claude.",
+            }),
+        )
+        .unwrap()
+        .expect("first insert");
+
+        let second = maybe_create_inbox_for_status_event(
+            &db,
+            "dev-tenant",
+            "heartbeat.task.failed",
+            &serde_json::json!({
+                "tenantId": "dev-tenant",
+                "task": "Check reports",
+                "error": "All providers failed. Attempts: claude-cli attempt 1/3: Your organization does not have access to Claude.",
+            }),
+        )
+        .unwrap()
+        .expect("second upsert");
+
+        assert_eq!(first.id, second.id);
+
+        let row = db
+            .with_conn(|conn| {
+                let count: i64 = conn.query_row("SELECT COUNT(*) FROM inbox_items", [], |r| r.get(0))?;
+                let tuple = conn.query_row(
+                    "SELECT title, preview, status FROM inbox_items WHERE id=?1",
+                    params![first.id],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, Option<String>>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    },
+                )?;
+                Ok((count, tuple.0, tuple.1.unwrap_or_default(), tuple.2))
+            })
+            .unwrap();
+
+        assert_eq!(row.0, 1);
+        assert!(row.1.contains("Heartbeat task failed: Check reports"));
+        assert!(row.2.contains("Claude access denied"));
+        assert_eq!(row.3, "unread");
     }
 }

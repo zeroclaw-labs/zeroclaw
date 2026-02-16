@@ -3,6 +3,31 @@ use super::Provider;
 use async_trait::async_trait;
 use std::time::Duration;
 
+fn is_non_retryable_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("does not have access to claude")
+        || msg.contains("please login again")
+        || msg.contains("invalid api key")
+        || msg.contains("authentication failed")
+        || msg.contains("unauthorized")
+        || msg.contains("forbidden")
+}
+
+fn summarize_provider_error(provider_name: &str, err: &anyhow::Error) -> String {
+    let msg = err.to_string();
+    let lower = msg.to_ascii_lowercase();
+
+    if provider_name.contains("claude")
+        && (lower.contains("does not have access to claude")
+            || lower.contains("please login again"))
+    {
+        return "Claude CLI auth/org access denied. Run `claude login` and verify org access."
+            .to_string();
+    }
+
+    msg
+}
+
 /// Provider wrapper with retry + fallback behavior.
 pub struct ReliableProvider {
     providers: Vec<(String, Box<dyn Provider>)>,
@@ -54,11 +79,22 @@ impl Provider for ReliableProvider {
                         return Ok(resp);
                     }
                     Err(e) => {
+                        let summarized = summarize_provider_error(provider_name, &e);
                         failures.push(format!(
                             "{provider_name} attempt {}/{}: {e}",
                             attempt + 1,
-                            self.max_retries + 1
+                            self.max_retries + 1,
+                            e = summarized
                         ));
+
+                        if is_non_retryable_error(&e) {
+                            tracing::warn!(
+                                provider = provider_name,
+                                attempt = attempt + 1,
+                                "Provider returned non-retriable error"
+                            );
+                            break;
+                        }
 
                         if attempt < self.max_retries {
                             tracing::warn!(
@@ -117,11 +153,22 @@ impl Provider for ReliableProvider {
                         return Ok(resp);
                     }
                     Err(e) => {
+                        let summarized = summarize_provider_error(provider_name, &e);
                         failures.push(format!(
                             "{provider_name} attempt {}/{}: {e}",
                             attempt + 1,
-                            self.max_retries + 1
+                            self.max_retries + 1,
+                            e = summarized
                         ));
+
+                        if is_non_retryable_error(&e) {
+                            tracing::warn!(
+                                provider = provider_name,
+                                attempt = attempt + 1,
+                                "Provider returned non-retriable error (chat_completion)"
+                            );
+                            break;
+                        }
 
                         if attempt < self.max_retries {
                             tracing::warn!(
@@ -289,5 +336,32 @@ mod tests {
         assert!(msg.contains("All providers failed"));
         assert!(msg.contains("p1 attempt 1/1"));
         assert!(msg.contains("p2 attempt 1/1"));
+    }
+
+    #[tokio::test]
+    async fn non_retryable_error_does_not_retry() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![(
+                "claude-cli".into(),
+                Box::new(MockProvider {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: usize::MAX,
+                    response: "never",
+                    error: "Your organization does not have access to Claude. Please login again or contact your administrator.",
+                }),
+            )],
+            3,
+            1,
+        );
+
+        let err = provider
+            .chat("hello", "test", 0.0)
+            .await
+            .expect_err("provider should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("All providers failed"));
+        assert!(msg.contains("attempt 1/4"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }
