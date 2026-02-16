@@ -422,6 +422,16 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
     let conn = Connection::open(&db_path)
         .with_context(|| format!("Failed to open cron DB: {}", db_path.display()))?;
 
+    // ── Production-grade PRAGMA tuning ──────────────────────
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA synchronous  = NORMAL;
+         PRAGMA mmap_size    = 8388608;
+         PRAGMA cache_size   = -2000;
+         PRAGMA temp_store   = MEMORY;",
+    )
+    .context("Failed to set cron DB PRAGMAs")?;
+
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
          PRAGMA synchronous  = NORMAL;

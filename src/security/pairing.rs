@@ -9,8 +9,8 @@
 // re-pairing.
 
 use sha2::{Digest, Sha256};
+use parking_lot::Mutex;
 use std::collections::HashSet;
-use std::sync::Mutex;
 use std::time::Instant;
 
 /// Maximum failed pairing attempts before lockout.
@@ -72,7 +72,6 @@ impl PairingGuard {
     pub fn pairing_code(&self) -> Option<String> {
         self.pairing_code
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 
@@ -89,7 +88,7 @@ impl PairingGuard {
             let attempts = self
                 .failed_attempts
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                ;
             if let (count, Some(locked_at)) = &*attempts {
                 if *count >= MAX_PAIR_ATTEMPTS {
                     let elapsed = locked_at.elapsed().as_secs();
@@ -104,7 +103,7 @@ impl PairingGuard {
             let mut pairing_code = self
                 .pairing_code
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                ;
             if let Some(ref expected) = *pairing_code {
                 if constant_time_eq(code.trim(), expected.trim()) {
                     // Reset failed attempts on success
@@ -112,14 +111,14 @@ impl PairingGuard {
                         let mut attempts = self
                             .failed_attempts
                             .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            ;
                         *attempts = (0, None);
                     }
                     let token = generate_token();
                     let mut tokens = self
                         .paired_tokens
                         .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        ;
                     tokens.insert(hash_token(&token));
 
                     // Consume the pairing code so it cannot be reused
@@ -135,7 +134,7 @@ impl PairingGuard {
             let mut attempts = self
                 .failed_attempts
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                ;
             attempts.0 += 1;
             if attempts.0 >= MAX_PAIR_ATTEMPTS {
                 attempts.1 = Some(Instant::now());
@@ -154,7 +153,7 @@ impl PairingGuard {
         let tokens = self
             .paired_tokens
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ;
         tokens.contains(&hashed)
     }
 
@@ -163,7 +162,7 @@ impl PairingGuard {
         let tokens = self
             .paired_tokens
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ;
         !tokens.is_empty()
     }
 
@@ -172,7 +171,7 @@ impl PairingGuard {
         let tokens = self
             .paired_tokens
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ;
         tokens.iter().cloned().collect()
     }
 }

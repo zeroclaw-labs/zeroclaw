@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
+use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::time::Instant;
 
 /// How much autonomy the agent has
@@ -42,8 +42,7 @@ impl ActionTracker {
     pub fn record(&self) -> usize {
         let mut actions = self
             .actions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock();
         let cutoff = Instant::now()
             .checked_sub(std::time::Duration::from_secs(3600))
             .unwrap_or_else(Instant::now);
@@ -56,8 +55,7 @@ impl ActionTracker {
     pub fn count(&self) -> usize {
         let mut actions = self
             .actions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock();
         let cutoff = Instant::now()
             .checked_sub(std::time::Duration::from_secs(3600))
             .unwrap_or_else(Instant::now);
@@ -70,8 +68,7 @@ impl Clone for ActionTracker {
     fn clone(&self) -> Self {
         let actions = self
             .actions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock();
         Self {
             actions: Mutex::new(actions.clone()),
         }

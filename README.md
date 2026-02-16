@@ -508,6 +508,17 @@ ZeroClaw is an open-source project maintained with passion. If you find it usefu
 
 <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=for-the-badge&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
 
+### 🙏 Special Thanks
+
+A heartfelt thank you to the communities and institutions that inspire and fuel this open-source work:
+
+- **Harvard University** — for fostering intellectual curiosity and pushing the boundaries of what's possible.
+- **MIT** — for championing open knowledge, open source, and the belief that technology should be accessible to everyone.
+- **Sundai Club** — for the community, the energy, and the relentless drive to build things that matter.
+- **The World & Beyond** 🌍✨ — to every contributor, dreamer, and builder out there making open source a force for good. This is for you.
+
+We're building in the open because the best ideas come from everywhere. If you're reading this, you're part of it. Welcome. 🦀❤️
+
 ## License
 
 MIT — see [LICENSE](LICENSE)
@@ -523,6 +534,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Implement a trait, submit a PR:
 - New `Memory` → `src/memory/`
 - New `Tunnel` → `src/tunnel/`
 - New `Skill` → `~/.zeroclaw/workspace/skills/<name>/`
+
 
 ---
 

@@ -5,6 +5,8 @@ pub mod hygiene;
 pub mod lucid;
 pub mod markdown;
 pub mod none;
+pub mod response_cache;
+pub mod snapshot;
 pub mod sqlite;
 pub mod traits;
 pub mod vector;
@@ -17,6 +19,7 @@ pub use backend::{
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
+pub use response_cache::ResponseCache;
 pub use sqlite::SqliteMemory;
 pub use traits::Memory;
 #[allow(unused_imports)]
@@ -61,6 +64,32 @@ pub fn create_memory(
     // Best-effort memory hygiene/retention pass (throttled by state file).
     if let Err(e) = hygiene::run_if_due(config, workspace_dir) {
         tracing::warn!("memory hygiene skipped: {e}");
+    }
+
+    // If snapshot_on_hygiene is enabled, export core memories during hygiene.
+    if config.snapshot_enabled && config.snapshot_on_hygiene {
+        if let Err(e) = snapshot::export_snapshot(workspace_dir) {
+            tracing::warn!("memory snapshot skipped: {e}");
+        }
+    }
+
+    // Auto-hydration: if brain.db is missing but MEMORY_SNAPSHOT.md exists,
+    // restore the "soul" from the snapshot before creating the backend.
+    if config.auto_hydrate
+        && matches!(classify_memory_backend(&config.backend), MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid)
+        && snapshot::should_hydrate(workspace_dir)
+    {
+        tracing::info!("🧬 Cold boot detected — hydrating from MEMORY_SNAPSHOT.md");
+        match snapshot::hydrate_from_snapshot(workspace_dir) {
+            Ok(count) => {
+                if count > 0 {
+                    tracing::info!("🧬 Hydrated {count} core memories from snapshot");
+                }
+            }
+            Err(e) => {
+                tracing::warn!("memory hydration failed: {e}");
+            }
+        }
     }
 
     fn build_sqlite_memory(
@@ -111,6 +140,35 @@ pub fn create_memory_for_migration(
         || SqliteMemory::new(workspace_dir),
         " during migration",
     )
+}
+
+/// Factory: create an optional response cache from config.
+pub fn create_response_cache(
+    config: &MemoryConfig,
+    workspace_dir: &Path,
+) -> Option<ResponseCache> {
+    if !config.response_cache_enabled {
+        return None;
+    }
+
+    match ResponseCache::new(
+        workspace_dir,
+        config.response_cache_ttl_minutes,
+        config.response_cache_max_entries,
+    ) {
+        Ok(cache) => {
+            tracing::info!(
+                "💾 Response cache enabled (TTL: {}min, max: {} entries)",
+                config.response_cache_ttl_minutes,
+                config.response_cache_max_entries
+            );
+            Some(cache)
+        }
+        Err(e) => {
+            tracing::warn!("Response cache disabled due to error: {e}");
+            None
+        }
+    }
 }
 
 #[cfg(test)]

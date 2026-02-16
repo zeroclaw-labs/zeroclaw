@@ -4840,6 +4840,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "parking_lot",
  "pdf-extract",
  "probe-rs",
  "prometheus",
