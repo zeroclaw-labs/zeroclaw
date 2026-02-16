@@ -171,3 +171,57 @@ fn show_integration_info(config: &Config, name: &str) -> Result<()> {
     println!();
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn integration_category_all_includes_every_variant_once() {
+        let all = IntegrationCategory::all();
+        assert_eq!(all.len(), 9);
+
+        let labels: Vec<&str> = all.iter().map(|cat| cat.label()).collect();
+        assert!(labels.contains(&"Chat Providers"));
+        assert!(labels.contains(&"AI Models"));
+        assert!(labels.contains(&"Productivity"));
+        assert!(labels.contains(&"Music & Audio"));
+        assert!(labels.contains(&"Smart Home"));
+        assert!(labels.contains(&"Tools & Automation"));
+        assert!(labels.contains(&"Media & Creative"));
+        assert!(labels.contains(&"Social"));
+        assert!(labels.contains(&"Platforms"));
+    }
+
+    #[test]
+    fn handle_command_info_is_case_insensitive_for_known_integrations() {
+        let config = Config::default();
+        let first_name = registry::all_integrations()
+            .first()
+            .expect("registry should define at least one integration")
+            .name
+            .to_lowercase();
+
+        let result = handle_command(
+            crate::IntegrationCommands::Info { name: first_name },
+            &config,
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn handle_command_info_returns_error_for_unknown_integration() {
+        let config = Config::default();
+        let result = handle_command(
+            crate::IntegrationCommands::Info {
+                name: "definitely-not-a-real-integration".into(),
+            },
+            &config,
+        );
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Unknown integration"));
+    }
+}

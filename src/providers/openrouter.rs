@@ -172,3 +172,136 @@ impl Provider for OpenRouterProvider {
             .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::traits::{ChatMessage, Provider};
+
+    #[test]
+    fn creates_with_key() {
+        let provider = OpenRouterProvider::new(Some("sk-or-123"));
+        assert_eq!(provider.api_key.as_deref(), Some("sk-or-123"));
+    }
+
+    #[test]
+    fn creates_without_key() {
+        let provider = OpenRouterProvider::new(None);
+        assert!(provider.api_key.is_none());
+    }
+
+    #[tokio::test]
+    async fn warmup_without_key_is_noop() {
+        let provider = OpenRouterProvider::new(None);
+        let result = provider.warmup().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn chat_with_system_fails_without_key() {
+        let provider = OpenRouterProvider::new(None);
+        let result = provider
+            .chat_with_system(Some("system"), "hello", "openai/gpt-4o", 0.2)
+            .await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("API key not set"));
+    }
+
+    #[tokio::test]
+    async fn chat_with_history_fails_without_key() {
+        let provider = OpenRouterProvider::new(None);
+        let messages = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: "be concise".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "hello".into(),
+            },
+        ];
+
+        let result = provider
+            .chat_with_history(&messages, "anthropic/claude-sonnet-4", 0.7)
+            .await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("API key not set"));
+    }
+
+    #[test]
+    fn chat_request_serializes_with_system_and_user() {
+        let request = ChatRequest {
+            model: "anthropic/claude-sonnet-4".into(),
+            messages: vec![
+                Message {
+                    role: "system".into(),
+                    content: "You are helpful".into(),
+                },
+                Message {
+                    role: "user".into(),
+                    content: "Summarize this".into(),
+                },
+            ],
+            temperature: 0.5,
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+
+        assert!(json.contains("anthropic/claude-sonnet-4"));
+        assert!(json.contains("\"role\":\"system\""));
+        assert!(json.contains("\"role\":\"user\""));
+        assert!(json.contains("\"temperature\":0.5"));
+    }
+
+    #[test]
+    fn chat_request_serializes_history_messages() {
+        let messages = [
+            ChatMessage {
+                role: "assistant".into(),
+                content: "Previous answer".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "Follow-up".into(),
+            },
+        ];
+
+        let request = ChatRequest {
+            model: "google/gemini-2.5-pro".into(),
+            messages: messages
+                .iter()
+                .map(|msg| Message {
+                    role: msg.role.clone(),
+                    content: msg.content.clone(),
+                })
+                .collect(),
+            temperature: 0.0,
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"role\":\"assistant\""));
+        assert!(json.contains("\"role\":\"user\""));
+        assert!(json.contains("google/gemini-2.5-pro"));
+    }
+
+    #[test]
+    fn response_deserializes_single_choice() {
+        let json = r#"{"choices":[{"message":{"content":"Hi from OpenRouter"}}]}"#;
+
+        let response: ApiChatResponse = serde_json::from_str(json).unwrap();
+
+        assert_eq!(response.choices.len(), 1);
+        assert_eq!(response.choices[0].message.content, "Hi from OpenRouter");
+    }
+
+    #[test]
+    fn response_deserializes_empty_choices() {
+        let json = r#"{"choices":[]}"#;
+
+        let response: ApiChatResponse = serde_json::from_str(json).unwrap();
+
+        assert!(response.choices.is_empty());
+    }
+}
