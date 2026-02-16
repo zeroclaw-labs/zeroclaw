@@ -1601,7 +1601,10 @@ impl Config {
         let home = UserDirs::new()
             .map(|u| u.home_dir().to_path_buf())
             .context("Could not find home directory")?;
-        let zeroclaw_dir = home.join(".zeroclaw");
+        let zeroclaw_dir = std::env::var("ZEROCLAW_WORKSPACE")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from).unwrap_or_else(|| home.join(".zeroclaw"));
         let config_path = zeroclaw_dir.join("config.toml");
 
         if !zeroclaw_dir.exists() {
