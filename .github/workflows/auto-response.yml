@@ -2,15 +2,19 @@ name: Auto Response
 
 on:
   issues:
-    types: [opened, reopened, labeled]
+    types: [opened, reopened, labeled, unlabeled]
   pull_request_target:
-    types: [opened, labeled]
+    types: [opened, labeled, unlabeled]
 
 permissions: {}
 
 jobs:
   contributor-tier-issues:
-    if: github.event_name == 'issues' && (github.event.action == 'opened' || github.event.action == 'reopened')
+    if: >-
+      (github.event_name == 'issues' &&
+      (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'labeled' || github.event.action == 'unlabeled')) ||
+      (github.event_name == 'pull_request_target' &&
+      (github.event.action == 'labeled' || github.event.action == 'unlabeled'))
     runs-on: ubuntu-latest
     permissions:
       issues: write
@@ -22,6 +26,8 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const issue = context.payload.issue;
+            const pullRequest = context.payload.pull_request;
+            const target = issue ?? pullRequest;
             const legacyTrustedContributorLabel = "trusted contributor";
             const contributorTierRules = [
               { label: "distinguished contributor", minMergedPRs: 50 },
@@ -30,9 +36,19 @@ jobs:
             ];
             const contributorTierLabels = contributorTierRules.map((rule) => rule.label);
             const contributorTierColor = "39FF14";
+            const managedContributorLabels = new Set([
+              legacyTrustedContributorLabel,
+              ...contributorTierLabels,
+            ]);
+            const action = context.payload.action;
+            const changedLabel = context.payload.label?.name;
 
-            if (!issue) return;
-            const author = issue.user;
+            if (!target) return;
+            if ((action === "labeled" || action === "unlabeled") && !managedContributorLabels.has(changedLabel)) {
+              return;
+            }
+
+            const author = target.user;
             if (!author || author.type === "Bot") return;
 
             async function ensureContributorTierLabels() {
@@ -84,7 +100,7 @@ jobs:
             const { data: currentLabels } = await github.rest.issues.listLabelsOnIssue({
               owner,
               repo,
-              issue_number: issue.number,
+              issue_number: target.number,
             });
             const keepLabels = currentLabels
               .map((label) => label.name)
@@ -97,7 +113,7 @@ jobs:
             await github.rest.issues.setLabels({
               owner,
               repo,
-              issue_number: issue.number,
+              issue_number: target.number,
               labels: [...new Set(keepLabels)],
             });
 
