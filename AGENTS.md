@@ -30,20 +30,20 @@ Key extension points:
 These codebase realities should drive every design decision:
 
 1. **Trait + factory architecture is the stability backbone**
-   - Extension points are intentionally explicit and swappable.
-   - Most features should be added via trait implementation + factory registration, not cross-cutting rewrites.
+    - Extension points are intentionally explicit and swappable.
+    - Most features should be added via trait implementation + factory registration, not cross-cutting rewrites.
 2. **Security-critical surfaces are first-class and internet-adjacent**
-   - `src/gateway/`, `src/security/`, `src/tools/`, `src/runtime/` carry high blast radius.
-   - Defaults already lean secure-by-default (pairing, bind safety, limits, secret handling); keep it that way.
+    - `src/gateway/`, `src/security/`, `src/tools/`, `src/runtime/` carry high blast radius.
+    - Defaults already lean secure-by-default (pairing, bind safety, limits, secret handling); keep it that way.
 3. **Performance and binary size are product goals, not nice-to-have**
-   - `Cargo.toml` release profile and dependency choices optimize for size and determinism.
-   - Convenience dependencies and broad abstractions can silently regress these goals.
+    - `Cargo.toml` release profile and dependency choices optimize for size and determinism.
+    - Convenience dependencies and broad abstractions can silently regress these goals.
 4. **Config and runtime contracts are user-facing API**
-   - `src/config/schema.rs` and CLI commands are effectively public interfaces.
-   - Backward compatibility and explicit migration matter.
+    - `src/config/schema.rs` and CLI commands are effectively public interfaces.
+    - Backward compatibility and explicit migration matter.
 5. **The project now runs in high-concurrency collaboration mode**
-   - CI + docs governance + label routing are part of the product delivery system.
-   - PR throughput is a design constraint; not just a maintainer inconvenience.
+    - CI + docs governance + label routing are part of the product delivery system.
+    - PR throughput is a design constraint; not just a maintainer inconvenience.
 
 ## 3) Engineering Principles (Normative)
 
@@ -158,19 +158,40 @@ When uncertain, classify as higher risk.
 ## 6) Agent Workflow (Required)
 
 1. **Read before write**
-   - Inspect existing module, factory wiring, and adjacent tests before editing.
+    - Inspect existing module, factory wiring, and adjacent tests before editing.
 2. **Define scope boundary**
-   - One concern per PR; avoid mixed feature+refactor+infra patches.
+    - One concern per PR; avoid mixed feature+refactor+infra patches.
 3. **Implement minimal patch**
-   - Apply KISS/YAGNI/DRY rule-of-three explicitly.
+    - Apply KISS/YAGNI/DRY rule-of-three explicitly.
 4. **Validate by risk tier**
-   - Docs-only: lightweight checks.
-   - Code/risky changes: full relevant checks and focused scenarios.
+    - Docs-only: lightweight checks.
+    - Code/risky changes: full relevant checks and focused scenarios.
 5. **Document impact**
-   - Update docs/PR notes for behavior, risk, side effects, and rollback.
+    - Update docs/PR notes for behavior, risk, side effects, and rollback.
 6. **Respect queue hygiene**
-   - If stacked PR: declare `Depends on #...`.
-   - If replacing old PR: declare `Supersedes #...`.
+    - If stacked PR: declare `Depends on #...`.
+    - If replacing old PR: declare `Supersedes #...`.
+
+### 6.3 Branch / Commit / PR Flow (Required)
+
+All contributors (human or agent) must follow the same collaboration flow:
+
+- Create and work from a non-`main` branch.
+- Commit changes to that branch with clear, scoped commit messages.
+- Open a PR to `main`; do not push directly to `main`.
+- Wait for required checks and review outcomes before merging.
+- Merge via PR controls (squash/rebase/merge as repository policy allows).
+- Branch deletion after merge is optional; long-lived branches are allowed when intentionally maintained.
+
+### 6.4 Worktree Workflow (Required for Multi-Track Agent Work)
+
+Use Git worktrees to isolate concurrent agent/human tracks safely and predictably:
+
+- Use one worktree per active branch/PR stream to avoid cross-task contamination.
+- Keep each worktree on a single branch; do not mix unrelated edits in one worktree.
+- Run validation commands inside the corresponding worktree before commit/PR.
+- Name worktrees clearly by scope (for example: `wt/ci-hardening`, `wt/provider-fix`) and remove stale worktrees when no longer needed.
+- PR checkpoint rules from section 6.3 still apply to worktree-based development.
 
 ### 6.1 Code Naming Contract (Required)
 
@@ -237,6 +258,17 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
+Preferred local pre-PR validation path (recommended, not required):
+
+```bash
+./dev/ci.sh all
+```
+
+Notes:
+
+- Local Docker-based CI is strongly recommended when Docker is available.
+- Contributors are not blocked from opening a PR if local Docker CI is unavailable; in that case run the most relevant native checks and document what was run.
+
 Additional expectations by change type:
 
 - **Docs/template-only**: run markdown lint and relevant doc checks.
@@ -263,9 +295,9 @@ Treat privacy and neutrality as merge gates, not best-effort guidelines.
 - Test names/messages/fixtures must be impersonal and system-focused; avoid first-person or identity-specific language.
 - If identity-like context is unavoidable, use ZeroClaw-scoped roles/labels only (for example: `ZeroClawAgent`, `ZeroClawOperator`, `zeroclaw_user`) and avoid real-world personas.
 - Recommended identity-safe naming palette (use when identity-like context is required):
-  - actor labels: `ZeroClawAgent`, `ZeroClawOperator`, `ZeroClawMaintainer`, `zeroclaw_user`
-  - service/runtime labels: `zeroclaw_bot`, `zeroclaw_service`, `zeroclaw_runtime`, `zeroclaw_node`
-  - environment labels: `zeroclaw_project`, `zeroclaw_workspace`, `zeroclaw_channel`
+    - actor labels: `ZeroClawAgent`, `ZeroClawOperator`, `ZeroClawMaintainer`, `zeroclaw_user`
+    - service/runtime labels: `zeroclaw_bot`, `zeroclaw_service`, `zeroclaw_runtime`, `zeroclaw_node`
+    - environment labels: `zeroclaw_project`, `zeroclaw_workspace`, `zeroclaw_channel`
 - If reproducing external incidents, redact and anonymize all payloads before committing.
 - Before push, review `git diff --cached` specifically for accidental sensitive strings and identity leakage.
 
