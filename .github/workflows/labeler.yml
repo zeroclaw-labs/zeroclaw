@@ -57,7 +57,7 @@ jobs:
                         { label: "experienced contributor", minMergedPRs: 10 },
                       ];
                       const contributorTierLabels = contributorTierRules.map((rule) => rule.label);
-                      const contributorTierColor = "C5D7A2";
+                      const contributorTierColor = "2ED9FF";
 
                       const managedPathLabels = [
                         "docs",
@@ -116,34 +116,34 @@ jobs:
                       ];
                       const managedModulePrefixes = [...new Set(moduleNamespaceRules.map((rule) => `${rule.prefix}:`))];
                       const orderedOtherLabelStyles = [
-                        { label: "health", color: "A6D3C0" },
-                        { label: "tool", color: "A5D3BC" },
-                        { label: "agent", color: "A4D3B7" },
-                        { label: "memory", color: "A3D2B1" },
-                        { label: "channel", color: "A1D2AC" },
-                        { label: "service", color: "A0D2A7" },
-                        { label: "integration", color: "9FD2A1" },
-                        { label: "tunnel", color: "A0D19E" },
-                        { label: "config", color: "A4D19C" },
-                        { label: "observability", color: "A8D19B" },
-                        { label: "docs", color: "ACD09A" },
-                        { label: "dev", color: "B0D099" },
-                        { label: "tests", color: "B4D097" },
-                        { label: "skills", color: "B8D096" },
-                        { label: "skillforge", color: "BDCF95" },
-                        { label: "provider", color: "C2CF94" },
-                        { label: "runtime", color: "C7CF92" },
-                        { label: "heartbeat", color: "CCCF91" },
-                        { label: "daemon", color: "CFCB90" },
-                        { label: "doctor", color: "CEC58E" },
-                        { label: "onboard", color: "CEBF8D" },
-                        { label: "cron", color: "CEB98C" },
-                        { label: "ci", color: "CEB28A" },
-                        { label: "dependencies", color: "CDAB89" },
-                        { label: "gateway", color: "CDA488" },
-                        { label: "security", color: "CD9D87" },
-                        { label: "core", color: "CD9585" },
-                        { label: "scripts", color: "CD8E84" },
+                        { label: "health", color: "8EC9B8" },
+                        { label: "tool", color: "7FC4B6" },
+                        { label: "agent", color: "86C4A2" },
+                        { label: "memory", color: "8FCB99" },
+                        { label: "channel", color: "7EB6F2" },
+                        { label: "service", color: "95C7B6" },
+                        { label: "integration", color: "8DC9AE" },
+                        { label: "tunnel", color: "9FC8B3" },
+                        { label: "config", color: "AABCD0" },
+                        { label: "observability", color: "84C9D0" },
+                        { label: "docs", color: "8FBBE0" },
+                        { label: "dev", color: "B9C1CC" },
+                        { label: "tests", color: "9DC8C7" },
+                        { label: "skills", color: "BFC89B" },
+                        { label: "skillforge", color: "C9C39B" },
+                        { label: "provider", color: "958DF0" },
+                        { label: "runtime", color: "A3ADD8" },
+                        { label: "heartbeat", color: "C0C88D" },
+                        { label: "daemon", color: "C8C498" },
+                        { label: "doctor", color: "C1CF9D" },
+                        { label: "onboard", color: "D2BF86" },
+                        { label: "cron", color: "D2B490" },
+                        { label: "ci", color: "AEB4CE" },
+                        { label: "dependencies", color: "9FB1DE" },
+                        { label: "gateway", color: "B5A8E5" },
+                        { label: "security", color: "E58D85" },
+                        { label: "core", color: "C8A99B" },
+                        { label: "scripts", color: "C9B49F" },
                       ];
                       const otherLabelDisplayOrder = orderedOtherLabelStyles.map((entry) => entry.label);
                       const modulePrefixSet = new Set(moduleNamespaceRules.map((rule) => rule.prefix));
@@ -176,15 +176,15 @@ jobs:
                         orderedOtherLabelStyles.map((entry) => [entry.label, entry.color])
                       );
                       const staticLabelColors = {
-                        "size: XS": "EAF1F4",
-                        "size: S": "DEE9EF",
-                        "size: M": "D0DDE6",
-                        "size: L": "C1D0DC",
-                        "size: XL": "B2C3D1",
-                        "risk: low": "BFD8B5",
-                        "risk: medium": "E4D39B",
-                        "risk: high": "E1A39A",
-                        "risk: manual": "B9B1D2",
+                        "size: XS": "E7CDD3",
+                        "size: S": "E1BEC7",
+                        "size: M": "DBB0BB",
+                        "size: L": "D4A2AF",
+                        "size: XL": "CE94A4",
+                        "risk: low": "97D3A6",
+                        "risk: medium": "E4C47B",
+                        "risk: high": "E98E88",
+                        "risk: manual": "B7A4E0",
                         ...otherLabelColors,
                       };
                       const staticLabelDescriptions = {
