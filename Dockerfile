@@ -1,9 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # ── Stage 1: Build ────────────────────────────────────────────
-# Keep builder and release on Debian 12 to avoid GLIBC ABI drift
-# (`rust:1.93-slim` now tracks Debian 13 and can require newer glibc than distroless Debian 12).
-FROM rust:1.93-slim-bookworm AS builder
+FROM rust:1.93-slim-trixie AS builder
 
 WORKDIR /app
 
@@ -51,7 +49,7 @@ EOF
 RUN chown -R 65534:65534 /zeroclaw-data
 
 # ── Stage 3: Development Runtime (Debian) ────────────────────
-FROM debian:bookworm-slim AS dev
+FROM debian:trixie-slim AS dev
 
 # Install runtime dependencies + basic debug tools
 RUN apt-get update && apt-get install -y \
@@ -89,7 +87,7 @@ ENTRYPOINT ["zeroclaw"]
 CMD ["gateway", "--port", "3000", "--host", "[::]"]
 
 # ── Stage 4: Production Runtime (Distroless) ─────────────────
-FROM gcr.io/distroless/cc-debian12:nonroot AS release
+FROM gcr.io/distroless/cc-debian13:nonroot AS release
 
 COPY --from=builder /app/target/release/zeroclaw /usr/local/bin/zeroclaw
 COPY --from=permissions /zeroclaw-data /zeroclaw-data
