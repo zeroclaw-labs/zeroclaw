@@ -108,36 +108,37 @@ jobs:
               { root: "src/tunnel/", prefix: "tunnel", coreEntries: new Set(["mod.rs"]) },
             ];
             const managedModulePrefixes = [...new Set(moduleNamespaceRules.map((rule) => `${rule.prefix}:`))];
-            const otherLabelDisplayOrder = [
-              "health",
-              "tool",
-              "agent",
-              "memory",
-              "channel",
-              "service",
-              "integration",
-              "tunnel",
-              "config",
-              "observability",
-              "docs",
-              "dev",
-              "tests",
-              "skills",
-              "skillforge",
-              "provider",
-              "runtime",
-              "heartbeat",
-              "daemon",
-              "doctor",
-              "onboard",
-              "cron",
-              "ci",
-              "dependencies",
-              "gateway",
-              "security",
-              "core",
-              "scripts",
+            const orderedOtherLabelStyles = [
+              { label: "health", color: "A6D3C0" },
+              { label: "tool", color: "A5D3BC" },
+              { label: "agent", color: "A4D3B7" },
+              { label: "memory", color: "A3D2B1" },
+              { label: "channel", color: "A1D2AC" },
+              { label: "service", color: "A0D2A7" },
+              { label: "integration", color: "9FD2A1" },
+              { label: "tunnel", color: "A0D19E" },
+              { label: "config", color: "A4D19C" },
+              { label: "observability", color: "A8D19B" },
+              { label: "docs", color: "ACD09A" },
+              { label: "dev", color: "B0D099" },
+              { label: "tests", color: "B4D097" },
+              { label: "skills", color: "B8D096" },
+              { label: "skillforge", color: "BDCF95" },
+              { label: "provider", color: "C2CF94" },
+              { label: "runtime", color: "C7CF92" },
+              { label: "heartbeat", color: "CCCF91" },
+              { label: "daemon", color: "CFCB90" },
+              { label: "doctor", color: "CEC58E" },
+              { label: "onboard", color: "CEBF8D" },
+              { label: "cron", color: "CEB98C" },
+              { label: "ci", color: "CEB28A" },
+              { label: "dependencies", color: "CDAB89" },
+              { label: "gateway", color: "CDA488" },
+              { label: "security", color: "CD9D87" },
+              { label: "core", color: "CD9585" },
+              { label: "scripts", color: "CD8E84" },
             ];
+            const otherLabelDisplayOrder = orderedOtherLabelStyles.map((entry) => entry.label);
             const modulePrefixSet = new Set(moduleNamespaceRules.map((rule) => rule.prefix));
             const modulePrefixPriority = otherLabelDisplayOrder.filter((label) => modulePrefixSet.has(label));
             const pathLabelPriority = [...otherLabelDisplayOrder];
@@ -164,61 +165,9 @@ jobs:
               contributorDisplayOrder.map((label, index) => [label, index])
             );
 
-            function hslToHex(h, s, l) {
-              const saturation = s / 100;
-              const lightness = l / 100;
-              const chroma = (1 - Math.abs(2 * lightness - 1)) * saturation;
-              const huePrime = ((h % 360) + 360) % 360 / 60;
-              const x = chroma * (1 - Math.abs((huePrime % 2) - 1));
-              let red = 0;
-              let green = 0;
-              let blue = 0;
-
-              if (huePrime >= 0 && huePrime < 1) {
-                red = chroma;
-                green = x;
-              } else if (huePrime < 2) {
-                red = x;
-                green = chroma;
-              } else if (huePrime < 3) {
-                green = chroma;
-                blue = x;
-              } else if (huePrime < 4) {
-                green = x;
-                blue = chroma;
-              } else if (huePrime < 5) {
-                red = x;
-                blue = chroma;
-              } else {
-                red = chroma;
-                blue = x;
-              }
-
-              const match = lightness - chroma / 2;
-              const toHex = (value) =>
-                Math.round((value + match) * 255)
-                  .toString(16)
-                  .padStart(2, "0");
-
-              return `${toHex(red)}${toHex(green)}${toHex(blue)}`.toUpperCase();
-            }
-
-            function buildGradientColorMap(labels) {
-              const colorMap = {};
-              const lastIndex = Math.max(labels.length - 1, 1);
-
-              for (let index = 0; index < labels.length; index += 1) {
-                const ratio = index / lastIndex;
-                const hue = 155 - ratio * 147;
-                const saturation = 34 + ratio * 8;
-                const lightness = 74 - ratio * 8;
-                colorMap[labels[index]] = hslToHex(hue, saturation, lightness);
-              }
-
-              return colorMap;
-            }
-
-            const otherLabelColors = buildGradientColorMap(otherLabelDisplayOrder);
+            const otherLabelColors = Object.fromEntries(
+              orderedOtherLabelStyles.map((entry) => [entry.label, entry.color])
+            );
             const staticLabelColors = {
               "size: XS": "EAF1F4",
               "size: S": "DEE9EF",
