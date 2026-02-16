@@ -75,7 +75,25 @@ pub fn load_skills(workspace_dir: &Path) -> Vec<Skill> {
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_dir() {
+        if path.is_file() {
+            // Flat-file format: ~/.aria/skills/<name>.md
+            // Ignore housekeeping docs in the skills root.
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.eq_ignore_ascii_case("README.md"))
+            {
+                continue;
+            }
+            if path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("md"))
+            {
+                if let Ok(skill) = load_flat_skill_md(&path) {
+                    skills.push(skill);
+                }
+            }
             continue;
         }
 
@@ -123,6 +141,33 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
         .to_string();
 
     // Extract description from first non-heading line
+    let description = content
+        .lines()
+        .find(|l| !l.starts_with('#') && !l.trim().is_empty())
+        .unwrap_or("No description")
+        .trim()
+        .to_string();
+
+    Ok(Skill {
+        name,
+        description,
+        version: "0.1.0".to_string(),
+        author: None,
+        tags: Vec::new(),
+        tools: Vec::new(),
+        prompts: vec![content],
+    })
+}
+
+/// Load a skill from a flat markdown file in skills root.
+fn load_flat_skill_md(path: &Path) -> Result<Skill> {
+    let content = std::fs::read_to_string(path)?;
+    let name = path
+        .file_stem()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+
     let description = content
         .lines()
         .find(|l| !l.starts_with('#') && !l.trim().is_empty())
@@ -507,12 +552,72 @@ command = "echo hello"
     }
 
     #[test]
-    fn load_ignores_files_in_skills_dir() {
+    fn load_ignores_non_markdown_files_in_skills_dir() {
         let dir = tempfile::tempdir().unwrap();
         let skills_dir = dir.path().join("skills");
         fs::create_dir_all(&skills_dir).unwrap();
         // A file, not a directory — should be ignored
         fs::write(skills_dir.join("not-a-skill.txt"), "hello").unwrap();
+        let skills = load_skills(dir.path());
+        assert!(skills.is_empty());
+    }
+
+    #[test]
+    fn load_skill_from_flat_md_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = dir.path().join("skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+
+        fs::write(
+            skills_dir.join("telegram.md"),
+            "# Telegram\nTelegram automations and helper logic.\n",
+        )
+        .unwrap();
+
+        let skills = load_skills(dir.path());
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "telegram");
+        assert!(skills[0].description.contains("automations"));
+    }
+
+    #[test]
+    fn load_mixed_directory_and_flat_skills() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = dir.path().join("skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+
+        let dir_skill = skills_dir.join("dir-skill");
+        fs::create_dir_all(&dir_skill).unwrap();
+        fs::write(
+            dir_skill.join("SKILL.md"),
+            "# Dir Skill\nDirectory-based skill.\n",
+        )
+        .unwrap();
+
+        fs::write(
+            skills_dir.join("flat-skill.md"),
+            "# Flat Skill\nFlat-file skill.\n",
+        )
+        .unwrap();
+
+        let skills = load_skills(dir.path());
+        assert_eq!(skills.len(), 2);
+        assert!(skills.iter().any(|s| s.name == "dir-skill"));
+        assert!(skills.iter().any(|s| s.name == "flat-skill"));
+    }
+
+    #[test]
+    fn load_ignores_root_readme_md() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = dir.path().join("skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+
+        fs::write(
+            skills_dir.join("README.md"),
+            "# Aria Skills\nThis is the container README.\n",
+        )
+        .unwrap();
+
         let skills = load_skills(dir.path());
         assert!(skills.is_empty());
     }
