@@ -151,6 +151,29 @@ fn resolve_api_key(name: &str, api_key: Option<&str>) -> Option<String> {
     None
 }
 
+fn parse_custom_provider_url(
+    raw_url: &str,
+    provider_label: &str,
+    format_hint: &str,
+) -> anyhow::Result<String> {
+    let base_url = raw_url.trim();
+
+    if base_url.is_empty() {
+        anyhow::bail!("{provider_label} requires a URL. Format: {format_hint}");
+    }
+
+    let parsed = reqwest::Url::parse(base_url).map_err(|_| {
+        anyhow::anyhow!("{provider_label} requires a valid URL. Format: {format_hint}")
+    })?;
+
+    match parsed.scheme() {
+        "http" | "https" => Ok(base_url.to_string()),
+        _ => anyhow::bail!(
+            "{provider_label} requires an http:// or https:// URL. Format: {format_hint}"
+        ),
+    }
+}
+
 /// Factory: create the right provider from config
 #[allow(clippy::too_many_lines)]
 pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<dyn Provider>> {
@@ -241,13 +264,14 @@ pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<
         // ── Bring Your Own Provider (custom URL) ───────────
         // Format: "custom:https://your-api.com" or "custom:http://localhost:1234"
         name if name.starts_with("custom:") => {
-            let base_url = name.strip_prefix("custom:").unwrap_or("");
-            if base_url.is_empty() {
-                anyhow::bail!("Custom provider requires a URL. Format: custom:https://your-api.com");
-            }
+            let base_url = parse_custom_provider_url(
+                name.strip_prefix("custom:").unwrap_or(""),
+                "Custom provider",
+                "custom:https://your-api.com",
+            )?;
             Ok(Box::new(OpenAiCompatibleProvider::new(
                 "Custom",
-                base_url,
+                &base_url,
                 key,
                 AuthStyle::Bearer,
             )))
@@ -256,12 +280,14 @@ pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<
         // ── Anthropic-compatible custom endpoints ───────────
         // Format: "anthropic-custom:https://your-api.com"
         name if name.starts_with("anthropic-custom:") => {
-            let base_url = name.strip_prefix("anthropic-custom:").unwrap_or("");
-            if base_url.is_empty() {
-                anyhow::bail!("Anthropic-custom provider requires a URL. Format: anthropic-custom:https://your-api.com");
-            }
+            let base_url = parse_custom_provider_url(
+                name.strip_prefix("anthropic-custom:").unwrap_or(""),
+                "Anthropic-custom provider",
+                "anthropic-custom:https://your-api.com",
+            )?;
             Ok(Box::new(anthropic::AnthropicProvider::with_base_url(
-                key, Some(base_url),
+                key,
+                Some(&base_url),
             )))
         }
 
@@ -569,6 +595,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn factory_custom_invalid_url_errors() {
+        match create_provider("custom:not-a-url", None) {
+            Err(e) => assert!(
+                e.to_string().contains("requires a valid URL"),
+                "Expected 'requires a valid URL', got: {e}"
+            ),
+            Ok(_) => panic!("Expected error for invalid custom URL"),
+        }
+    }
+
+    #[test]
+    fn factory_custom_unsupported_scheme_errors() {
+        match create_provider("custom:ftp://example.com", None) {
+            Err(e) => assert!(
+                e.to_string().contains("http:// or https://"),
+                "Expected scheme validation error, got: {e}"
+            ),
+            Ok(_) => panic!("Expected error for unsupported custom URL scheme"),
+        }
+    }
+
+    #[test]
+    fn factory_custom_trims_whitespace() {
+        let p = create_provider("custom:  https://my-llm.example.com  ", Some("key"));
+        assert!(p.is_ok());
+    }
+
     // ── Anthropic-compatible custom endpoints ─────────────────
 
     #[test]
@@ -597,6 +651,28 @@ mod tests {
                 "Expected 'requires a URL', got: {e}"
             ),
             Ok(_) => panic!("Expected error for empty anthropic-custom URL"),
+        }
+    }
+
+    #[test]
+    fn factory_anthropic_custom_invalid_url_errors() {
+        match create_provider("anthropic-custom:not-a-url", None) {
+            Err(e) => assert!(
+                e.to_string().contains("requires a valid URL"),
+                "Expected 'requires a valid URL', got: {e}"
+            ),
+            Ok(_) => panic!("Expected error for invalid anthropic-custom URL"),
+        }
+    }
+
+    #[test]
+    fn factory_anthropic_custom_unsupported_scheme_errors() {
+        match create_provider("anthropic-custom:ftp://example.com", None) {
+            Err(e) => assert!(
+                e.to_string().contains("http:// or https://"),
+                "Expected scheme validation error, got: {e}"
+            ),
+            Ok(_) => panic!("Expected error for unsupported anthropic-custom URL scheme"),
         }
     }
 
