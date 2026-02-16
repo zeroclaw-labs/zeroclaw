@@ -37,6 +37,7 @@ mod tests {
             guild_id: Some("123".into()),
             allowed_users: vec![],
             listen_to_bots: false,
+            mention_only: false,
         };
 
         let lark = LarkConfig {

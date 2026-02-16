@@ -619,6 +619,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 dc.guild_id.clone(),
                 dc.allowed_users.clone(),
                 dc.listen_to_bots,
+                dc.mention_only,
             )),
         ));
     }
@@ -905,6 +906,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             dc.guild_id.clone(),
             dc.allowed_users.clone(),
             dc.listen_to_bots,
+            dc.mention_only,
         )));
     }
 
