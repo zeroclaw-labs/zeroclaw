@@ -191,6 +191,7 @@ impl AriaDb {
                     tenant_id       TEXT NOT NULL,
                     feed_id         TEXT NOT NULL,
                     run_id          TEXT NOT NULL,
+                    item_key        TEXT,
                     card_type       TEXT NOT NULL,
                     title           TEXT NOT NULL,
                     body            TEXT,
@@ -198,7 +199,8 @@ impl AriaDb {
                     url             TEXT,
                     metadata        TEXT,
                     timestamp       INTEGER,
-                    created_at      TEXT NOT NULL
+                    created_at      TEXT NOT NULL,
+                    updated_at      TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_aria_feed_items_feed
                     ON aria_feed_items(feed_id, created_at DESC);
@@ -313,6 +315,89 @@ impl AriaDb {
             )
             .context("Failed to initialize Aria registry schema")?;
 
+            let mut has_item_key = false;
+            let mut has_updated_at = false;
+            let mut feed_columns = conn.prepare("PRAGMA table_info(aria_feed_items)")?;
+            let rows = feed_columns.query_map([], |row| row.get::<_, String>(1))?;
+            for col in rows {
+                match col?.as_str() {
+                    "item_key" => has_item_key = true,
+                    "updated_at" => has_updated_at = true,
+                    _ => {}
+                }
+            }
+
+            if !has_item_key {
+                conn.execute("ALTER TABLE aria_feed_items ADD COLUMN item_key TEXT", [])
+                    .context("Failed to add aria_feed_items.item_key column")?;
+            }
+            if !has_updated_at {
+                conn.execute("ALTER TABLE aria_feed_items ADD COLUMN updated_at TEXT", [])
+                    .context("Failed to add aria_feed_items.updated_at column")?;
+            }
+
+            conn.execute(
+                "UPDATE aria_feed_items
+                 SET updated_at = COALESCE(updated_at, created_at)
+                 WHERE updated_at IS NULL OR updated_at = ''",
+                [],
+            )
+            .context("Failed to backfill aria_feed_items.updated_at")?;
+
+            conn.execute_batch(
+                "UPDATE aria_feed_items
+                 SET item_key = card_type || '|' || COALESCE(
+                     CASE WHEN json_extract(metadata, '$.id') IS NOT NULL THEN 'id:' || lower(CAST(json_extract(metadata, '$.id') AS TEXT)) END,
+                     CASE WHEN json_extract(metadata, '$.itemId') IS NOT NULL THEN 'itemid:' || lower(CAST(json_extract(metadata, '$.itemId') AS TEXT)) END,
+                     CASE WHEN json_extract(metadata, '$.uid') IS NOT NULL THEN 'uid:' || lower(CAST(json_extract(metadata, '$.uid') AS TEXT)) END,
+                     CASE WHEN json_extract(metadata, '$.uuid') IS NOT NULL THEN 'uuid:' || lower(CAST(json_extract(metadata, '$.uuid') AS TEXT)) END,
+                     CASE WHEN json_extract(metadata, '$.key') IS NOT NULL THEN 'key:' || lower(CAST(json_extract(metadata, '$.key') AS TEXT)) END,
+                     CASE WHEN json_extract(metadata, '$.ticker') IS NOT NULL THEN 'ticker:' || lower(CAST(json_extract(metadata, '$.ticker') AS TEXT)) END,
+                     CASE WHEN json_extract(metadata, '$.symbol') IS NOT NULL THEN 'symbol:' || lower(CAST(json_extract(metadata, '$.symbol') AS TEXT)) END,
+                     CASE WHEN json_extract(metadata, '$.handle') IS NOT NULL THEN 'handle:' || lower(CAST(json_extract(metadata, '$.handle') AS TEXT)) END,
+                     CASE WHEN json_extract(metadata, '$.flightNumber') IS NOT NULL THEN 'flightnumber:' || lower(CAST(json_extract(metadata, '$.flightNumber') AS TEXT)) END,
+                     CASE WHEN json_extract(metadata, '$.repo') IS NOT NULL THEN 'repo:' || lower(CAST(json_extract(metadata, '$.repo') AS TEXT)) END,
+                     CASE WHEN json_extract(metadata, '$.fileId') IS NOT NULL THEN 'fileid:' || lower(CAST(json_extract(metadata, '$.fileId') AS TEXT)) END,
+                     CASE WHEN json_extract(metadata, '$.url') IS NOT NULL THEN 'url:' || lower(CAST(json_extract(metadata, '$.url') AS TEXT)) END,
+                     CASE WHEN json_extract(metadata, '$.slug') IS NOT NULL THEN 'slug:' || lower(CAST(json_extract(metadata, '$.slug') AS TEXT)) END,
+                     CASE WHEN json_extract(metadata, '$.name') IS NOT NULL THEN 'name:' || lower(CAST(json_extract(metadata, '$.name') AS TEXT)) END,
+                     CASE WHEN json_extract(metadata, '$.title') IS NOT NULL THEN 'title:' || lower(CAST(json_extract(metadata, '$.title') AS TEXT)) END,
+                     CASE WHEN json_extract(metadata, '$.question') IS NOT NULL THEN 'question:' || lower(CAST(json_extract(metadata, '$.question') AS TEXT)) END,
+                     CASE WHEN json_extract(metadata, '$.location') IS NOT NULL THEN 'location:' || lower(CAST(json_extract(metadata, '$.location') AS TEXT)) END,
+                     CASE WHEN url IS NOT NULL AND trim(url) != '' THEN 'url:' || lower(trim(url)) END,
+                     CASE WHEN (source IS NOT NULL AND trim(source) != '') OR (title IS NOT NULL AND trim(title) != '')
+                        THEN 'source-title:' || lower(trim(COALESCE(source, ''))) || '|' || lower(trim(COALESCE(title, '')))
+                     END,
+                     'fallback:unknown'
+                 )
+                 WHERE item_key IS NULL OR item_key = '';
+
+                 DELETE FROM aria_feed_items
+                 WHERE aria_feed_items.item_key IS NOT NULL
+                   AND aria_feed_items.item_key != ''
+                   AND EXISTS (
+                        SELECT 1
+                        FROM aria_feed_items AS newer
+                        WHERE newer.tenant_id = aria_feed_items.tenant_id
+                          AND newer.feed_id = aria_feed_items.feed_id
+                          AND newer.item_key = aria_feed_items.item_key
+                          AND (
+                                newer.updated_at > aria_feed_items.updated_at
+                                OR (newer.updated_at = aria_feed_items.updated_at AND newer.id > aria_feed_items.id)
+                              )
+                   );",
+            )
+            .context("Failed to backfill/dedupe aria_feed_items.item_key")?;
+
+            conn.execute_batch(
+                "DROP INDEX IF EXISTS idx_aria_feed_items_feed;
+                 CREATE INDEX IF NOT EXISTS idx_aria_feed_items_feed
+                     ON aria_feed_items(feed_id, updated_at DESC);
+                 CREATE UNIQUE INDEX IF NOT EXISTS idx_aria_feed_items_identity
+                     ON aria_feed_items(tenant_id, feed_id, item_key);",
+            )
+            .context("Failed to ensure aria_feed_items indexes")?;
+
             Ok(())
         })
     }
@@ -409,6 +494,61 @@ mod tests {
                 rusqlite::params![now],
             )?;
 
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn migrates_legacy_feed_items_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE aria_feed_items (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                feed_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                card_type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                body TEXT,
+                source TEXT,
+                url TEXT,
+                metadata TEXT,
+                timestamp INTEGER,
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO aria_feed_items (id, tenant_id, feed_id, run_id, card_type, title, metadata, created_at)
+            VALUES
+              ('a', 't1', 'f1', 'r1', 'stock', 'AAPL $100', '{\"ticker\":\"AAPL\"}', '2026-02-16T00:00:00Z'),
+              ('b', 't1', 'f1', 'r2', 'stock', 'AAPL $101', '{\"ticker\":\"AAPL\"}', '2026-02-16T01:00:00Z');
+            ",
+        )
+        .unwrap();
+
+        let db = AriaDb {
+            conn: Arc::new(Mutex::new(conn)),
+        };
+        db.initialize_schema().unwrap();
+
+        db.with_conn(|conn| {
+            let mut stmt = conn.prepare("PRAGMA table_info(aria_feed_items)")?;
+            let cols: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .filter_map(|r| r.ok())
+                .collect();
+            assert!(cols.contains(&"item_key".to_string()));
+            assert!(cols.contains(&"updated_at".to_string()));
+
+            let count: i64 = conn.query_row("SELECT COUNT(*) FROM aria_feed_items", [], |r| r.get(0))?;
+            assert_eq!(count, 1, "legacy duplicate rows should be deduped");
+
+            let idx_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_index_list('aria_feed_items') WHERE name='idx_aria_feed_items_identity'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(idx_count, 1);
             Ok(())
         })
         .unwrap();

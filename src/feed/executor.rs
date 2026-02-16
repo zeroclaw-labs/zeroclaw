@@ -10,11 +10,105 @@ use crate::aria::types::{FeedCardType, FeedItem, FeedResult};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rusqlite::params;
+use serde_json::Value;
+use std::hash::{Hash, Hasher};
 use uuid::Uuid;
 
 /// Executes feed handlers and manages feed item storage/retention.
 pub struct FeedExecutor {
     db: AriaDb,
+}
+
+fn card_type_str(card_type: &FeedCardType) -> Result<String> {
+    let card_type = serde_json::to_value(card_type)
+        .context("Failed to serialize FeedItem.card_type")?
+        .as_str()
+        .context("FeedItem.card_type must serialize to a string")?
+        .to_string();
+    Ok(card_type)
+}
+
+fn scalar_identity_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+fn stable_hash(input: &str) -> String {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    input.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+fn compute_item_key(card_type: &str, item: &FeedItem) -> Result<String> {
+    const IDENTITY_KEYS: &[&str] = &[
+        "id",
+        "itemId",
+        "uid",
+        "uuid",
+        "key",
+        "ticker",
+        "symbol",
+        "handle",
+        "flightNumber",
+        "repo",
+        "fileId",
+        "url",
+        "slug",
+        "name",
+        "title",
+        "question",
+        "location",
+    ];
+
+    let mut basis: Option<String> = None;
+    if let Some(meta) = &item.metadata {
+        for key in IDENTITY_KEYS {
+            if let Some(value) = meta.get(*key).and_then(scalar_identity_value) {
+                basis = Some(format!("{key}:{}", value.to_lowercase()));
+                break;
+            }
+        }
+        if basis.is_none() {
+            let metadata_json =
+                serde_json::to_string(meta).context("Failed to serialize FeedItem metadata")?;
+            if !metadata_json.is_empty() {
+                basis = Some(format!("meta:{}", stable_hash(&metadata_json)));
+            }
+        }
+    }
+
+    if basis.is_none() {
+        if let Some(url) = item.url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            basis = Some(format!("url:{}", url.to_lowercase()));
+        }
+    }
+    if basis.is_none() {
+        let source = item.source.as_deref().unwrap_or("").trim().to_lowercase();
+        let title = item.title.trim().to_lowercase();
+        if !source.is_empty() || !title.is_empty() {
+            basis = Some(format!("source-title:{source}|{title}"));
+        }
+    }
+    if basis.is_none() {
+        let body = item.body.as_deref().unwrap_or("").trim().to_lowercase();
+        if !body.is_empty() {
+            basis = Some(format!("body:{}", stable_hash(&body)));
+        }
+    }
+
+    let basis = basis.unwrap_or_else(|| "fallback:unknown".to_string());
+    Ok(format!("{card_type}|{basis}"))
 }
 
 impl FeedExecutor {
@@ -800,17 +894,23 @@ async function __run() {{
         self.db.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "INSERT INTO aria_feed_items
-                 (id, tenant_id, feed_id, run_id, card_type, title, body, source, url, metadata, timestamp, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 (id, tenant_id, feed_id, run_id, item_key, card_type, title, body, source, url, metadata, timestamp, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)
+                 ON CONFLICT(tenant_id, feed_id, item_key) DO UPDATE SET
+                    run_id=excluded.run_id,
+                    title=excluded.title,
+                    body=excluded.body,
+                    source=excluded.source,
+                    url=excluded.url,
+                    metadata=excluded.metadata,
+                    timestamp=excluded.timestamp,
+                    updated_at=excluded.updated_at",
             )?;
 
             for item in items {
                 let id = Uuid::new_v4().to_string();
-                let card_type = serde_json::to_value(&item.card_type)
-                    .context("Failed to serialize FeedItem.card_type")?
-                    .as_str()
-                    .context("FeedItem.card_type must serialize to a string")?
-                    .to_string();
+                let card_type = card_type_str(&item.card_type)?;
+                let item_key = compute_item_key(&card_type, item)?;
                 let meta = item
                     .metadata
                     .as_ref()
@@ -827,6 +927,7 @@ async function __run() {{
                     tenant_id,
                     feed_id,
                     run_id,
+                    item_key,
                     card_type,
                     item.title,
                     item.body,
@@ -863,7 +964,7 @@ async function __run() {{
 
             let pruned = self.db.with_conn(|conn| {
                 let deleted = conn.execute(
-                    "DELETE FROM aria_feed_items WHERE feed_id = ?1 AND created_at < ?2",
+                    "DELETE FROM aria_feed_items WHERE feed_id = ?1 AND updated_at < ?2",
                     params![feed_id, cutoff],
                 )?;
                 Ok(deleted as u64)
@@ -878,7 +979,7 @@ async function __run() {{
                 let deleted = conn.execute(
                     "DELETE FROM aria_feed_items WHERE feed_id = ?1 AND id NOT IN (
                         SELECT id FROM aria_feed_items WHERE feed_id = ?1
-                        ORDER BY created_at DESC LIMIT ?2
+                        ORDER BY updated_at DESC LIMIT ?2
                     )",
                     params![feed_id, max],
                 )?;
@@ -1025,6 +1126,41 @@ mod tests {
     }
 
     #[test]
+    fn store_items_upserts_existing_logical_item() {
+        let (db, executor) = setup();
+        let mut first = sample_items(1);
+        first[0].card_type = FeedCardType::Stock;
+        first[0]
+            .metadata
+            .as_mut()
+            .unwrap()
+            .insert("ticker".to_string(), serde_json::json!("AAPL"));
+        first[0].title = "AAPL $100.00".to_string();
+        first[0].timestamp = Some(1_700_000_000_000);
+
+        executor.store_items("t1", "f1", "run-1", &first).unwrap();
+
+        let mut second = first.clone();
+        second[0].title = "AAPL $110.00".to_string();
+        second[0].timestamp = Some(1_700_100_000_000);
+        executor.store_items("t1", "f1", "run-2", &second).unwrap();
+
+        db.with_conn(|conn| {
+            let row: (i64, String, String, i64) = conn.query_row(
+                "SELECT COUNT(*), title, run_id, timestamp FROM aria_feed_items WHERE feed_id='f1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
+            assert_eq!(row.0, 1);
+            assert_eq!(row.1, "AAPL $110.00");
+            assert_eq!(row.2, "run-2");
+            assert_eq!(row.3, 1_700_100_000_000);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn store_empty_items_is_noop() {
         let (_db, executor) = setup();
         executor.store_items("t1", "f1", "r1", &[]).unwrap();
@@ -1039,9 +1175,9 @@ mod tests {
             let created = format!("2025-01-{:02}T00:00:00+00:00", i + 1);
             db.with_conn(|conn| {
                 conn.execute(
-                    "INSERT INTO aria_feed_items (id, tenant_id, feed_id, run_id, card_type, title, created_at)
-                     VALUES (?1, 't1', 'f1', 'r1', 'news', ?2, ?3)",
-                    params![format!("item-{i}"), format!("Item {i}"), created],
+                    "INSERT INTO aria_feed_items (id, tenant_id, feed_id, run_id, item_key, card_type, title, created_at, updated_at)
+                     VALUES (?1, 't1', 'f1', 'r1', ?2, 'news', ?3, ?4, ?4)",
+                    params![format!("item-{i}"), format!("key-{i}"), format!("Item {i}"), created],
                 )?;
                 Ok(())
             })
@@ -1074,13 +1210,13 @@ mod tests {
 
         db.with_conn(|conn| {
             conn.execute(
-                "INSERT INTO aria_feed_items (id, tenant_id, feed_id, run_id, card_type, title, created_at)
-                 VALUES ('old', 't1', 'f1', 'r1', 'news', 'Old Item', ?1)",
+                "INSERT INTO aria_feed_items (id, tenant_id, feed_id, run_id, item_key, card_type, title, created_at, updated_at)
+                 VALUES ('old', 't1', 'f1', 'r1', 'old', 'news', 'Old Item', ?1, ?1)",
                 params![old_date],
             )?;
             conn.execute(
-                "INSERT INTO aria_feed_items (id, tenant_id, feed_id, run_id, card_type, title, created_at)
-                 VALUES ('new', 't1', 'f1', 'r1', 'news', 'New Item', ?1)",
+                "INSERT INTO aria_feed_items (id, tenant_id, feed_id, run_id, item_key, card_type, title, created_at, updated_at)
+                 VALUES ('new', 't1', 'f1', 'r1', 'new', 'news', 'New Item', ?1, ?1)",
                 params![recent_date],
             )?;
             Ok(())

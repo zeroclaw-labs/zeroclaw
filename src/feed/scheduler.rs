@@ -18,6 +18,9 @@ use tokio::task::JoinHandle;
 use tokio::time::{self, Duration};
 use uuid::Uuid;
 
+const DEFAULT_RETENTION_MAX_ITEMS: u32 = 500;
+const DEFAULT_RETENTION_MAX_AGE_DAYS: u32 = 30;
+
 /// A feed that has been scheduled for periodic execution.
 struct ScheduledFeed {
     handle: JoinHandle<()>,
@@ -143,11 +146,20 @@ impl FeedScheduler {
         let (max_items, max_age_days) = if let Some(ref json) = retention_json {
             let retention: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
             (
-                retention["max_items"].as_u64().map(|v| v as u32),
-                retention["max_age_days"].as_u64().map(|v| v as u32),
+                retention["max_items"]
+                    .as_u64()
+                    .map(|v| v as u32)
+                    .or(Some(DEFAULT_RETENTION_MAX_ITEMS)),
+                retention["max_age_days"]
+                    .as_u64()
+                    .map(|v| v as u32)
+                    .or(Some(DEFAULT_RETENTION_MAX_AGE_DAYS)),
             )
         } else {
-            (None, None)
+            (
+                Some(DEFAULT_RETENTION_MAX_ITEMS),
+                Some(DEFAULT_RETENTION_MAX_AGE_DAYS),
+            )
         };
 
         // Remove existing job if present
@@ -340,12 +352,24 @@ impl FeedScheduler {
         // Apply retention
         if let Some(ref json) = retention_json {
             let retention: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
-            let max_items = retention["max_items"].as_u64().map(|v| v as u32);
-            let max_age_days = retention["max_age_days"].as_u64().map(|v| v as u32);
+            let max_items = retention["max_items"]
+                .as_u64()
+                .map(|v| v as u32)
+                .or(Some(DEFAULT_RETENTION_MAX_ITEMS));
+            let max_age_days = retention["max_age_days"]
+                .as_u64()
+                .map(|v| v as u32)
+                .or(Some(DEFAULT_RETENTION_MAX_AGE_DAYS));
             if max_items.is_some() || max_age_days.is_some() {
                 self.executor
                     .prune_by_retention(&id, max_items, max_age_days)?;
             }
+        } else {
+            self.executor.prune_by_retention(
+                &id,
+                Some(DEFAULT_RETENTION_MAX_ITEMS),
+                Some(DEFAULT_RETENTION_MAX_AGE_DAYS),
+            )?;
         }
 
         Ok(())

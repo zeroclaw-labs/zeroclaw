@@ -2738,8 +2738,8 @@ async fn api_list_feed_items(
     let offset = q.offset.unwrap_or(0) as i64;
     let res = state.registry_db.with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT id,card_type,source,metadata,timestamp,created_at FROM aria_feed_items
-             WHERE tenant_id=?1 AND feed_id=?2 ORDER BY created_at DESC LIMIT ?3 OFFSET ?4",
+            "SELECT id,card_type,source,metadata,timestamp,created_at,updated_at FROM aria_feed_items
+             WHERE tenant_id=?1 AND feed_id=?2 ORDER BY updated_at DESC LIMIT ?3 OFFSET ?4",
         )?;
         let rows = stmt.query_map(rusqlite::params![tenant, id, limit, offset], |row| {
             let card_type = row.get::<_, String>(1)?;
@@ -2756,7 +2756,8 @@ async fn api_list_feed_items(
                 "id": row.get::<_, String>(0)?,
                 "type": card_type,
                 "timestamp": ts,
-                "updatedAt": row.get::<_, String>(5)?,
+                "createdAt": row.get::<_, String>(5)?,
+                "updatedAt": row.get::<_, String>(6)?,
                 "source": row.get::<_, Option<String>>(2)?,
                 "data": data
             }))
