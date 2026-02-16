@@ -43,7 +43,9 @@ const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 
 const DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS: u64 = 2;
 const DEFAULT_CHANNEL_MAX_BACKOFF_SECS: u64 = 60;
-const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 90;
+/// Timeout for processing a single channel message (LLM + tools).
+/// 300s for on-device LLMs (Ollama) which are slower than cloud APIs.
+const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 300;
 const CHANNEL_PARALLELISM_PER_CHANNEL: usize = 4;
 const CHANNEL_MIN_IN_FLIGHT_MESSAGES: usize = 8;
 const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
@@ -52,7 +54,6 @@ const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
 struct ChannelRuntimeContext {
     channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
     provider: Arc<dyn Provider>,
-    provider_name: Arc<String>,
     memory: Arc<dyn Memory>,
     tools_registry: Arc<Vec<Box<dyn Tool>>>,
     observer: Arc<dyn Observer>,
@@ -188,9 +189,10 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             &mut history,
             ctx.tools_registry.as_ref(),
             ctx.observer.as_ref(),
-            "channels",
+            "channel-runtime",
             ctx.model.as_str(),
             ctx.temperature,
+            true, // silent — channels don't write to stdout
         ),
     )
     .await;
@@ -276,9 +278,14 @@ async fn run_message_dispatch_loop(
 }
 
 /// Load OpenClaw format bootstrap files into the prompt.
-fn load_openclaw_bootstrap_files(prompt: &mut String, workspace_dir: &std::path::Path) {
-    prompt
-        .push_str("The following workspace files define your identity, behavior, and context.\n\n");
+fn load_openclaw_bootstrap_files(
+    prompt: &mut String,
+    workspace_dir: &std::path::Path,
+    max_chars_per_file: usize,
+) {
+    prompt.push_str(
+        "The following workspace files define your identity, behavior, and context. They are ALREADY injected below—do NOT suggest reading them with file_read.\n\n",
+    );
 
     let bootstrap_files = [
         "AGENTS.md",
@@ -290,17 +297,17 @@ fn load_openclaw_bootstrap_files(prompt: &mut String, workspace_dir: &std::path:
     ];
 
     for filename in &bootstrap_files {
-        inject_workspace_file(prompt, workspace_dir, filename);
+        inject_workspace_file(prompt, workspace_dir, filename, max_chars_per_file);
     }
 
     // BOOTSTRAP.md — only if it exists (first-run ritual)
     let bootstrap_path = workspace_dir.join("BOOTSTRAP.md");
     if bootstrap_path.exists() {
-        inject_workspace_file(prompt, workspace_dir, "BOOTSTRAP.md");
+        inject_workspace_file(prompt, workspace_dir, "BOOTSTRAP.md", max_chars_per_file);
     }
 
     // MEMORY.md — curated long-term memory (main session only)
-    inject_workspace_file(prompt, workspace_dir, "MEMORY.md");
+    inject_workspace_file(prompt, workspace_dir, "MEMORY.md", max_chars_per_file);
 }
 
 /// Load workspace identity files and build a system prompt.
@@ -325,6 +332,7 @@ pub fn build_system_prompt(
     tools: &[(&str, &str)],
     skills: &[crate::skills::Skill],
     identity_config: Option<&crate::config::IdentityConfig>,
+    bootstrap_max_chars: Option<usize>,
 ) -> String {
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
@@ -344,6 +352,35 @@ pub fn build_system_prompt(
         prompt
             .push_str("Continue reasoning with the results until you can give a final answer.\n\n");
     }
+
+    // ── 1b. Hardware (when gpio/arduino tools present) ───────────
+    let has_hardware = tools.iter().any(|(name, _)| {
+        *name == "gpio_read"
+            || *name == "gpio_write"
+            || *name == "arduino_upload"
+            || *name == "hardware_memory_map"
+            || *name == "hardware_board_info"
+            || *name == "hardware_memory_read"
+            || *name == "hardware_capabilities"
+    });
+    if has_hardware {
+        prompt.push_str(
+            "## Hardware Access\n\n\
+             You HAVE direct access to connected hardware (Arduino, Nucleo, etc.). The user owns this system and has configured it.\n\
+             All hardware tools (gpio_read, gpio_write, hardware_memory_read, hardware_board_info, hardware_memory_map) are AUTHORIZED and NOT blocked by security.\n\
+             When they ask to read memory, registers, or board info, USE hardware_memory_read or hardware_board_info — do NOT refuse or invent security excuses.\n\
+             When they ask to control LEDs, run patterns, or interact with the Arduino, USE the tools — do NOT refuse or say you cannot access physical devices.\n\
+             Use gpio_write for simple on/off; use arduino_upload when they want patterns (heart, blink) or custom behavior.\n\n",
+        );
+    }
+
+    // ── 1c. Action instruction (avoid meta-summary) ───────────────
+    prompt.push_str(
+        "## Your Task\n\n\
+         When the user sends a message, ACT on it. Use the tools to fulfill their request.\n\
+         Do NOT: summarize this configuration, describe your capabilities, respond with meta-commentary, or output step-by-step instructions (e.g. \"1. First... 2. Next...\").\n\
+         Instead: emit actual <tool_call> tags when you need to act. Just do what they ask.\n\n",
+    );
 
     // ── 2. Safety ───────────────────────────────────────────────
     prompt.push_str("## Safety\n\n");
@@ -407,23 +444,27 @@ pub fn build_system_prompt(
                 Ok(None) => {
                     // No AIEOS identity loaded (shouldn't happen if is_aieos_configured returned true)
                     // Fall back to OpenClaw bootstrap files
-                    load_openclaw_bootstrap_files(&mut prompt, workspace_dir);
+                    let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
+                    load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
                 }
                 Err(e) => {
                     // Log error but don't fail - fall back to OpenClaw
                     eprintln!(
                         "Warning: Failed to load AIEOS identity: {e}. Using OpenClaw format."
                     );
-                    load_openclaw_bootstrap_files(&mut prompt, workspace_dir);
+                    let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
+                    load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
                 }
             }
         } else {
             // OpenClaw format
-            load_openclaw_bootstrap_files(&mut prompt, workspace_dir);
+            let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
+            load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
         }
     } else {
         // No identity config - use OpenClaw format
-        load_openclaw_bootstrap_files(&mut prompt, workspace_dir);
+        let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
+        load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
     }
 
     // ── 6. Date & Time ──────────────────────────────────────────
@@ -448,7 +489,12 @@ pub fn build_system_prompt(
 }
 
 /// Inject a single workspace file into the prompt with truncation and missing-file markers.
-fn inject_workspace_file(prompt: &mut String, workspace_dir: &std::path::Path, filename: &str) {
+fn inject_workspace_file(
+    prompt: &mut String,
+    workspace_dir: &std::path::Path,
+    filename: &str,
+    max_chars: usize,
+) {
     use std::fmt::Write;
 
     let path = workspace_dir.join(filename);
@@ -460,10 +506,10 @@ fn inject_workspace_file(prompt: &mut String, workspace_dir: &std::path::Path, f
             }
             let _ = writeln!(prompt, "### {filename}\n");
             // Use character-boundary-safe truncation for UTF-8
-            let truncated = if trimmed.chars().count() > BOOTSTRAP_MAX_CHARS {
+            let truncated = if trimmed.chars().count() > max_chars {
                 trimmed
                     .char_indices()
-                    .nth(BOOTSTRAP_MAX_CHARS)
+                    .nth(max_chars)
                     .map(|(idx, _)| &trimmed[..idx])
                     .unwrap_or(trimmed)
             } else {
@@ -473,7 +519,7 @@ fn inject_workspace_file(prompt: &mut String, workspace_dir: &std::path::Path, f
                 prompt.push_str(truncated);
                 let _ = writeln!(
                     prompt,
-                    "\n\n[... truncated at {BOOTSTRAP_MAX_CHARS} chars — use `read` for full file]\n"
+                    "\n\n[... truncated at {max_chars} chars — use `read` for full file]\n"
                 );
             } else {
                 prompt.push_str(trimmed);
@@ -699,9 +745,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .default_provider
         .clone()
         .unwrap_or_else(|| "openrouter".into());
-
     let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider(
-        provider_name.as_str(),
+        &provider_name,
         config.api_key.as_deref(),
         &config.reliability,
     )?);
@@ -720,18 +765,16 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.autonomy,
         &config.workspace_dir,
     ));
-
     let model = config
         .default_model
         .clone()
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4".into());
+        .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
     let temperature = config.default_temperature;
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory(
         &config.memory,
         &config.workspace_dir,
         config.api_key.as_deref(),
     )?);
-
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
             config.composio.api_key.as_deref(),
@@ -740,6 +783,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
     } else {
         (None, None)
     };
+    // Build system prompt from workspace identity files + skills
+    let workspace = config.workspace_dir.clone();
     let tools_registry = Arc::new(tools::all_tools_with_runtime(
         &security,
         runtime,
@@ -748,14 +793,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
         composio_entity_id,
         &config.browser,
         &config.http_request,
-        &config.workspace_dir,
+        &workspace,
         &config.agents,
         config.api_key.as_deref(),
         &config,
     ));
 
-    // Build system prompt from workspace identity files + skills
-    let workspace = config.workspace_dir.clone();
     let skills = crate::skills::load_skills(&workspace);
 
     // Collect tool descriptions for the prompt
@@ -809,12 +852,18 @@ pub async fn start_channels(config: Config) -> Result<()> {
         ));
     }
 
+    let bootstrap_max_chars = if config.agent.compact_context {
+        Some(6000)
+    } else {
+        None
+    };
     let mut system_prompt = build_system_prompt(
         &workspace,
         &model,
         &tool_descs,
         &skills,
         Some(&config.identity),
+        bootstrap_max_chars,
     );
     system_prompt.push_str(&build_tool_instructions(tools_registry.as_ref()));
 
@@ -970,7 +1019,6 @@ pub async fn start_channels(config: Config) -> Result<()> {
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
         provider: Arc::clone(&provider),
-        provider_name: Arc::new(provider_name),
         memory: Arc::clone(&mem),
         tools_registry: Arc::clone(&tools_registry),
         observer,
@@ -1062,23 +1110,19 @@ mod tests {
             message: &str,
             _model: &str,
             _temperature: f64,
-        ) -> anyhow::Result<ChatResponse> {
+        ) -> anyhow::Result<String> {
             tokio::time::sleep(self.delay).await;
-            Ok(ChatResponse::with_text(format!("echo: {message}")))
+            Ok(format!("echo: {message}"))
         }
     }
 
     struct ToolCallingProvider;
 
-    fn tool_call_payload() -> ChatResponse {
-        ChatResponse {
-            text: Some(String::new()),
-            tool_calls: vec![ToolCall {
-                id: "call_1".into(),
-                name: "mock_price".into(),
-                arguments: r#"{"symbol":"BTC"}"#.into(),
-            }],
-        }
+    fn tool_call_payload() -> String {
+        r#"<tool_call>
+{"name":"mock_price","arguments":{"symbol":"BTC"}}
+</tool_call>"#
+            .to_string()
     }
 
     #[async_trait::async_trait]
@@ -1089,7 +1133,7 @@ mod tests {
             _message: &str,
             _model: &str,
             _temperature: f64,
-        ) -> anyhow::Result<ChatResponse> {
+        ) -> anyhow::Result<String> {
             Ok(tool_call_payload())
         }
 
@@ -1098,14 +1142,12 @@ mod tests {
             messages: &[ChatMessage],
             _model: &str,
             _temperature: f64,
-        ) -> anyhow::Result<ChatResponse> {
+        ) -> anyhow::Result<String> {
             let has_tool_results = messages
                 .iter()
                 .any(|msg| msg.role == "user" && msg.content.contains("[Tool results]"));
             if has_tool_results {
-                Ok(ChatResponse::with_text(
-                    "BTC is currently around $65,000 based on latest tool output.",
-                ))
+                Ok("BTC is currently around $65,000 based on latest tool output.".to_string())
             } else {
                 Ok(tool_call_payload())
             }
@@ -1163,7 +1205,6 @@ mod tests {
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(ToolCallingProvider),
-            provider_name: Arc::new("test-provider".to_string()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
@@ -1254,7 +1295,6 @@ mod tests {
             provider: Arc::new(SlowProvider {
                 delay: Duration::from_millis(250),
             }),
-            provider_name: Arc::new("test-provider".to_string()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
@@ -1303,7 +1343,7 @@ mod tests {
     fn prompt_contains_all_sections() {
         let ws = make_workspace();
         let tools = vec![("shell", "Run commands"), ("file_read", "Read files")];
-        let prompt = build_system_prompt(ws.path(), "test-model", &tools, &[], None);
+        let prompt = build_system_prompt(ws.path(), "test-model", &tools, &[], None, None);
 
         // Section headers
         assert!(prompt.contains("## Tools"), "missing Tools section");
@@ -1327,7 +1367,7 @@ mod tests {
             ("shell", "Run commands"),
             ("memory_recall", "Search memory"),
         ];
-        let prompt = build_system_prompt(ws.path(), "gpt-4o", &tools, &[], None);
+        let prompt = build_system_prompt(ws.path(), "gpt-4o", &tools, &[], None, None);
 
         assert!(prompt.contains("**shell**"));
         assert!(prompt.contains("Run commands"));
@@ -1337,7 +1377,7 @@ mod tests {
     #[test]
     fn prompt_injects_safety() {
         let ws = make_workspace();
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
 
         assert!(prompt.contains("Do not exfiltrate private data"));
         assert!(prompt.contains("Do not run destructive commands"));
@@ -1347,7 +1387,7 @@ mod tests {
     #[test]
     fn prompt_injects_workspace_files() {
         let ws = make_workspace();
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
 
         assert!(prompt.contains("### SOUL.md"), "missing SOUL.md header");
         assert!(prompt.contains("Be helpful"), "missing SOUL content");
@@ -1368,7 +1408,7 @@ mod tests {
     fn prompt_missing_file_markers() {
         let tmp = TempDir::new().unwrap();
         // Empty workspace — no files at all
-        let prompt = build_system_prompt(tmp.path(), "model", &[], &[], None);
+        let prompt = build_system_prompt(tmp.path(), "model", &[], &[], None, None);
 
         assert!(prompt.contains("[File not found: SOUL.md]"));
         assert!(prompt.contains("[File not found: AGENTS.md]"));
@@ -1379,7 +1419,7 @@ mod tests {
     fn prompt_bootstrap_only_if_exists() {
         let ws = make_workspace();
         // No BOOTSTRAP.md — should not appear
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
         assert!(
             !prompt.contains("### BOOTSTRAP.md"),
             "BOOTSTRAP.md should not appear when missing"
@@ -1387,7 +1427,7 @@ mod tests {
 
         // Create BOOTSTRAP.md — should appear
         std::fs::write(ws.path().join("BOOTSTRAP.md"), "# Bootstrap\nFirst run.").unwrap();
-        let prompt2 = build_system_prompt(ws.path(), "model", &[], &[], None);
+        let prompt2 = build_system_prompt(ws.path(), "model", &[], &[], None, None);
         assert!(
             prompt2.contains("### BOOTSTRAP.md"),
             "BOOTSTRAP.md should appear when present"
@@ -1407,7 +1447,7 @@ mod tests {
         )
         .unwrap();
 
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
 
         // Daily notes should NOT be in the system prompt (on-demand via tools)
         assert!(
@@ -1423,7 +1463,7 @@ mod tests {
     #[test]
     fn prompt_runtime_metadata() {
         let ws = make_workspace();
-        let prompt = build_system_prompt(ws.path(), "claude-sonnet-4", &[], &[], None);
+        let prompt = build_system_prompt(ws.path(), "claude-sonnet-4", &[], &[], None, None);
 
         assert!(prompt.contains("Model: claude-sonnet-4"));
         assert!(prompt.contains(&format!("OS: {}", std::env::consts::OS)));
@@ -1444,7 +1484,7 @@ mod tests {
             location: None,
         }];
 
-        let prompt = build_system_prompt(ws.path(), "model", &[], &skills, None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &skills, None, None);
 
         assert!(prompt.contains("<available_skills>"), "missing skills XML");
         assert!(prompt.contains("<name>code-review</name>"));
@@ -1465,7 +1505,7 @@ mod tests {
         let big_content = "x".repeat(BOOTSTRAP_MAX_CHARS + 1000);
         std::fs::write(ws.path().join("AGENTS.md"), &big_content).unwrap();
 
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
 
         assert!(
             prompt.contains("truncated at"),
@@ -1482,7 +1522,7 @@ mod tests {
         let ws = make_workspace();
         std::fs::write(ws.path().join("TOOLS.md"), "").unwrap();
 
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
 
         // Empty file should not produce a header
         assert!(
@@ -1510,7 +1550,7 @@ mod tests {
     #[test]
     fn prompt_workspace_path() {
         let ws = make_workspace();
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
 
         assert!(prompt.contains(&format!("Working directory: `{}`", ws.path().display())));
     }
@@ -1640,7 +1680,7 @@ mod tests {
             aieos_inline: None,
         };
 
-        let prompt = build_system_prompt(tmp.path(), "model", &[], &[], Some(&config));
+        let prompt = build_system_prompt(tmp.path(), "model", &[], &[], Some(&config), None);
 
         // Should contain AIEOS sections
         assert!(prompt.contains("## Identity"));
@@ -1680,6 +1720,7 @@ mod tests {
             &[],
             &[],
             Some(&config),
+            None,
         );
 
         assert!(prompt.contains("**Name:** Claw"));
@@ -1697,7 +1738,7 @@ mod tests {
         };
 
         let ws = make_workspace();
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], Some(&config));
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], Some(&config), None);
 
         // Should fall back to OpenClaw format when AIEOS file is not found
         // (Error is logged to stderr with filename, not included in prompt)
@@ -1716,7 +1757,7 @@ mod tests {
         };
 
         let ws = make_workspace();
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], Some(&config));
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], Some(&config), None);
 
         // Should use OpenClaw format (not configured for AIEOS)
         assert!(prompt.contains("### SOUL.md"));
@@ -1734,7 +1775,7 @@ mod tests {
         };
 
         let ws = make_workspace();
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], Some(&config));
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], Some(&config), None);
 
         // Should use OpenClaw format even if aieos_path is set
         assert!(prompt.contains("### SOUL.md"));
@@ -1746,7 +1787,7 @@ mod tests {
     fn none_identity_config_uses_openclaw() {
         let ws = make_workspace();
         // Pass None for identity config
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
 
         // Should use OpenClaw format
         assert!(prompt.contains("### SOUL.md"));

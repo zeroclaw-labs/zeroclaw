@@ -902,8 +902,8 @@ mod tests {
         let json_str = r#"{"name": "GMAIL_SEND_EMAIL_WITH_ATTACHMENT", "appName": "gmail", "description": "Send email with attachment & special chars: <>'\"\"", "enabled": true}"#;
         let action: ComposioAction = serde_json::from_str(json_str).unwrap();
         assert_eq!(action.name, "GMAIL_SEND_EMAIL_WITH_ATTACHMENT");
-        assert!(action.description.as_ref().unwrap().contains("&"));
-        assert!(action.description.as_ref().unwrap().contains("<"));
+        assert!(action.description.as_ref().unwrap().contains('&'));
+        assert!(action.description.as_ref().unwrap().contains('<'));
     }
 
     #[test]

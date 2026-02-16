@@ -1,0 +1,35 @@
+# ZeroClaw ESP32 firmware — JSON-over-serial peripheral for host-mediated control.
+#
+# Flash to ESP32 and connect via serial. The host ZeroClaw sends gpio_read/gpio_write
+# commands; this firmware executes them and responds.
+#
+# Prerequisites: espup (cargo install espup; espup install; source ~/export-esp.sh)
+# Build: cargo build --release
+# Flash: cargo espflash flash --monitor
+
+[package]
+name = "zeroclaw-esp32"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "ZeroClaw ESP32 peripheral firmware — GPIO over JSON serial"
+
+[dependencies]
+esp-idf-svc = "0.48"
+log = "0.4"
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[build-dependencies]
+embuild = { version = "0.31", features = ["elf"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.dev]
+opt-level = "s"

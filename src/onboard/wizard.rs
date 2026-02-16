@@ -5,6 +5,9 @@ use crate::config::{
     RuntimeConfig, SecretsConfig, SlackConfig, TelegramConfig, WebhookConfig,
 };
 use crate::hardware::{self, HardwareConfig};
+use crate::memory::{
+    default_memory_backend_key, memory_backend_profile, selectable_memory_backends,
+};
 use anyhow::{Context, Result};
 use console::style;
 use dialoguer::{Confirm, Input, Select};
@@ -110,7 +113,8 @@ pub fn run_wizard() -> Result<Config> {
         autonomy: AutonomyConfig::default(),
         runtime: RuntimeConfig::default(),
         reliability: crate::config::ReliabilityConfig::default(),
-        scheduler: crate::config::SchedulerConfig::default(),
+        scheduler: crate::config::schema::SchedulerConfig::default(),
+        agent: crate::config::schema::AgentConfig::default(),
         model_routes: Vec::new(),
         heartbeat: HeartbeatConfig::default(),
         channels_config,
@@ -123,9 +127,9 @@ pub fn run_wizard() -> Result<Config> {
         http_request: crate::config::HttpRequestConfig::default(),
         identity: crate::config::IdentityConfig::default(),
         cost: crate::config::CostConfig::default(),
-        hardware: hardware_config,
+        peripherals: crate::config::PeripheralsConfig::default(),
         agents: std::collections::HashMap::new(),
-        security: crate::config::SecurityConfig::default(),
+        hardware: hardware_config,
     };
 
     println!(
@@ -237,8 +241,38 @@ pub fn run_channels_repair_wizard() -> Result<Config> {
 // ── Quick setup (zero prompts) ───────────────────────────────────
 
 /// Non-interactive setup: generates a sensible default config instantly.
-/// Use `zeroclaw onboard` or `zeroclaw onboard --api-key sk-... --provider openrouter --memory sqlite`.
+/// Use `zeroclaw onboard` or `zeroclaw onboard --api-key sk-... --provider openrouter --memory sqlite|lucid`.
 /// Use `zeroclaw onboard --interactive` for the full wizard.
+fn backend_key_from_choice(choice: usize) -> &'static str {
+    selectable_memory_backends()
+        .get(choice)
+        .map_or(default_memory_backend_key(), |backend| backend.key)
+}
+
+fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
+    let profile = memory_backend_profile(backend);
+
+    MemoryConfig {
+        backend: backend.to_string(),
+        auto_save: profile.auto_save_default,
+        hygiene_enabled: profile.uses_sqlite_hygiene,
+        archive_after_days: if profile.uses_sqlite_hygiene { 7 } else { 0 },
+        purge_after_days: if profile.uses_sqlite_hygiene { 30 } else { 0 },
+        conversation_retention_days: 30,
+        embedding_provider: "none".to_string(),
+        embedding_model: "text-embedding-3-small".to_string(),
+        embedding_dimensions: 1536,
+        vector_weight: 0.7,
+        keyword_weight: 0.3,
+        embedding_cache_size: if profile.uses_sqlite_hygiene {
+            10000
+        } else {
+            0
+        },
+        chunk_max_tokens: 512,
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn run_quick_setup(
     api_key: Option<&str>,
@@ -265,36 +299,12 @@ pub fn run_quick_setup(
 
     let provider_name = provider.unwrap_or("openrouter").to_string();
     let model = default_model_for_provider(&provider_name);
-    let memory_backend_name = memory_backend.unwrap_or("sqlite").to_string();
+    let memory_backend_name = memory_backend
+        .unwrap_or(default_memory_backend_key())
+        .to_string();
 
     // Create memory config based on backend choice
-    let memory_config = MemoryConfig {
-        backend: memory_backend_name.clone(),
-        auto_save: memory_backend_name != "none",
-        hygiene_enabled: memory_backend_name == "sqlite",
-        archive_after_days: if memory_backend_name == "sqlite" {
-            7
-        } else {
-            0
-        },
-        purge_after_days: if memory_backend_name == "sqlite" {
-            30
-        } else {
-            0
-        },
-        conversation_retention_days: 30,
-        embedding_provider: "none".to_string(),
-        embedding_model: "text-embedding-3-small".to_string(),
-        embedding_dimensions: 1536,
-        vector_weight: 0.7,
-        keyword_weight: 0.3,
-        embedding_cache_size: if memory_backend_name == "sqlite" {
-            10000
-        } else {
-            0
-        },
-        chunk_max_tokens: 512,
-    };
+    let memory_config = memory_config_defaults_for_backend(&memory_backend_name);
 
     let config = Config {
         workspace_dir: workspace_dir.clone(),
@@ -307,7 +317,8 @@ pub fn run_quick_setup(
         autonomy: AutonomyConfig::default(),
         runtime: RuntimeConfig::default(),
         reliability: crate::config::ReliabilityConfig::default(),
-        scheduler: crate::config::SchedulerConfig::default(),
+        scheduler: crate::config::schema::SchedulerConfig::default(),
+        agent: crate::config::schema::AgentConfig::default(),
         model_routes: Vec::new(),
         heartbeat: HeartbeatConfig::default(),
         channels_config: ChannelsConfig::default(),
@@ -320,9 +331,9 @@ pub fn run_quick_setup(
         http_request: crate::config::HttpRequestConfig::default(),
         identity: crate::config::IdentityConfig::default(),
         cost: crate::config::CostConfig::default(),
-        hardware: HardwareConfig::default(),
+        peripherals: crate::config::PeripheralsConfig::default(),
         agents: std::collections::HashMap::new(),
-        security: crate::config::SecurityConfig::default(),
+        hardware: crate::config::HardwareConfig::default(),
     };
 
     config.save()?;
@@ -1990,7 +2001,7 @@ fn setup_hardware() -> Result<HardwareConfig> {
         hw_config.baud_rate = match baud_idx {
             1 => 9600,
             2 => 57600,
-            3 => 230400,
+            3 => 230_400,
             4 => {
                 let custom: String = Input::new()
                     .with_prompt("  Custom baud rate")
@@ -2164,11 +2175,10 @@ fn setup_memory() -> Result<MemoryConfig> {
     print_bullet("You can always change this later in config.toml.");
     println!();
 
-    let options = vec![
-        "SQLite with Vector Search (recommended) — fast, hybrid search, embeddings",
-        "Markdown Files — simple, human-readable, no dependencies",
-        "None — disable persistent memory",
-    ];
+    let options: Vec<&str> = selectable_memory_backends()
+        .iter()
+        .map(|backend| backend.label)
+        .collect();
 
     let choice = Select::new()
         .with_prompt("  Select memory backend")
@@ -2176,20 +2186,16 @@ fn setup_memory() -> Result<MemoryConfig> {
         .default(0)
         .interact()?;
 
-    let backend = match choice {
-        1 => "markdown",
-        2 => "none",
-        _ => "sqlite", // 0 and any unexpected value defaults to sqlite
-    };
+    let backend = backend_key_from_choice(choice);
+    let profile = memory_backend_profile(backend);
 
-    let auto_save = if backend == "none" {
+    let auto_save = if !profile.auto_save_default {
         false
     } else {
-        let save = Confirm::new()
+        Confirm::new()
             .with_prompt("  Auto-save conversations to memory?")
             .default(true)
-            .interact()?;
-        save
+            .interact()?
     };
 
     println!(
@@ -2199,21 +2205,9 @@ fn setup_memory() -> Result<MemoryConfig> {
         if auto_save { "on" } else { "off" }
     );
 
-    Ok(MemoryConfig {
-        backend: backend.to_string(),
-        auto_save,
-        hygiene_enabled: backend == "sqlite", // Only enable hygiene for SQLite
-        archive_after_days: if backend == "sqlite" { 7 } else { 0 },
-        purge_after_days: if backend == "sqlite" { 30 } else { 0 },
-        conversation_retention_days: 30,
-        embedding_provider: "none".to_string(),
-        embedding_model: "text-embedding-3-small".to_string(),
-        embedding_dimensions: 1536,
-        vector_weight: 0.7,
-        keyword_weight: 0.3,
-        embedding_cache_size: if backend == "sqlite" { 10000 } else { 0 },
-        chunk_max_tokens: 512,
-    })
+    let mut config = memory_config_defaults_for_backend(backend);
+    config.auto_save = auto_save;
+    Ok(config)
 }
 
 // ── Step 3: Channels ────────────────────────────────────────────
@@ -2336,18 +2330,27 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     continue;
                 }
 
-                // Test connection
+                // Test connection (run entirely in separate thread — reqwest::blocking Response
+                // must be used and dropped there to avoid "Cannot drop a runtime" panic)
                 print!("  {} Testing connection... ", style("⏳").dim());
-                let client = reqwest::blocking::Client::new();
-                let url = format!("https://api.telegram.org/bot{token}/getMe");
-                match client.get(&url).send() {
-                    Ok(resp) if resp.status().is_success() => {
-                        let data: serde_json::Value = resp.json().unwrap_or_default();
-                        let bot_name = data
-                            .get("result")
-                            .and_then(|r| r.get("username"))
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("unknown");
+                let token_clone = token.clone();
+                let thread_result = std::thread::spawn(move || {
+                    let client = reqwest::blocking::Client::new();
+                    let url = format!("https://api.telegram.org/bot{token_clone}/getMe");
+                    let resp = client.get(&url).send()?;
+                    let ok = resp.status().is_success();
+                    let data: serde_json::Value = resp.json().unwrap_or_default();
+                    let bot_name = data
+                        .get("result")
+                        .and_then(|r| r.get("username"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string();
+                    Ok::<_, reqwest::Error>((ok, bot_name))
+                })
+                .join();
+                match thread_result {
+                    Ok(Ok((true, bot_name))) => {
                         println!(
                             "\r  {} Connected as @{bot_name}        ",
                             style("✅").green().bold()
@@ -2420,20 +2423,27 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     continue;
                 }
 
-                // Test connection
+                // Test connection (run entirely in separate thread — Response must be used/dropped there)
                 print!("  {} Testing connection... ", style("⏳").dim());
-                let client = reqwest::blocking::Client::new();
-                match client
-                    .get("https://discord.com/api/v10/users/@me")
-                    .header("Authorization", format!("Bot {token}"))
-                    .send()
-                {
-                    Ok(resp) if resp.status().is_success() => {
-                        let data: serde_json::Value = resp.json().unwrap_or_default();
-                        let bot_name = data
-                            .get("username")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("unknown");
+                let token_clone = token.clone();
+                let thread_result = std::thread::spawn(move || {
+                    let client = reqwest::blocking::Client::new();
+                    let resp = client
+                        .get("https://discord.com/api/v10/users/@me")
+                        .header("Authorization", format!("Bot {token_clone}"))
+                        .send()?;
+                    let ok = resp.status().is_success();
+                    let data: serde_json::Value = resp.json().unwrap_or_default();
+                    let bot_name = data
+                        .get("username")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string();
+                    Ok::<_, reqwest::Error>((ok, bot_name))
+                })
+                .join();
+                match thread_result {
+                    Ok(Ok((true, bot_name))) => {
                         println!(
                             "\r  {} Connected as {bot_name}        ",
                             style("✅").green().bold()
@@ -2512,37 +2522,44 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     continue;
                 }
 
-                // Test connection
+                // Test connection (run entirely in separate thread — Response must be used/dropped there)
                 print!("  {} Testing connection... ", style("⏳").dim());
-                let client = reqwest::blocking::Client::new();
-                match client
-                    .get("https://slack.com/api/auth.test")
-                    .bearer_auth(&token)
-                    .send()
-                {
-                    Ok(resp) if resp.status().is_success() => {
-                        let data: serde_json::Value = resp.json().unwrap_or_default();
-                        let ok = data
-                            .get("ok")
-                            .and_then(serde_json::Value::as_bool)
-                            .unwrap_or(false);
-                        let team = data
-                            .get("team")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("unknown");
-                        if ok {
-                            println!(
-                                "\r  {} Connected to workspace: {team}        ",
-                                style("✅").green().bold()
-                            );
-                        } else {
-                            let err = data
-                                .get("error")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or("unknown error");
-                            println!("\r  {} Slack error: {err}", style("❌").red().bold());
-                            continue;
-                        }
+                let token_clone = token.clone();
+                let thread_result = std::thread::spawn(move || {
+                    let client = reqwest::blocking::Client::new();
+                    let resp = client
+                        .get("https://slack.com/api/auth.test")
+                        .bearer_auth(&token_clone)
+                        .send()?;
+                    let ok = resp.status().is_success();
+                    let data: serde_json::Value = resp.json().unwrap_or_default();
+                    let api_ok = data
+                        .get("ok")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    let team = data
+                        .get("team")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let err = data
+                        .get("error")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown error")
+                        .to_string();
+                    Ok::<_, reqwest::Error>((ok, api_ok, team, err))
+                })
+                .join();
+                match thread_result {
+                    Ok(Ok((true, true, team, _))) => {
+                        println!(
+                            "\r  {} Connected to workspace: {team}        ",
+                            style("✅").green().bold()
+                        );
+                    }
+                    Ok(Ok((true, false, _, err))) => {
+                        println!("\r  {} Slack error: {err}", style("❌").red().bold());
+                        continue;
                     }
                     _ => {
                         println!(
@@ -2681,21 +2698,29 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     continue;
                 }
 
-                // Test connection
+                // Test connection (run entirely in separate thread — Response must be used/dropped there)
                 let hs = homeserver.trim_end_matches('/');
                 print!("  {} Testing connection... ", style("⏳").dim());
-                let client = reqwest::blocking::Client::new();
-                match client
-                    .get(format!("{hs}/_matrix/client/v3/account/whoami"))
-                    .header("Authorization", format!("Bearer {access_token}"))
-                    .send()
-                {
-                    Ok(resp) if resp.status().is_success() => {
-                        let data: serde_json::Value = resp.json().unwrap_or_default();
-                        let user_id = data
-                            .get("user_id")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("unknown");
+                let hs_owned = hs.to_string();
+                let access_token_clone = access_token.clone();
+                let thread_result = std::thread::spawn(move || {
+                    let client = reqwest::blocking::Client::new();
+                    let resp = client
+                        .get(format!("{hs_owned}/_matrix/client/v3/account/whoami"))
+                        .header("Authorization", format!("Bearer {access_token_clone}"))
+                        .send()?;
+                    let ok = resp.status().is_success();
+                    let data: serde_json::Value = resp.json().unwrap_or_default();
+                    let user_id = data
+                        .get("user_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string();
+                    Ok::<_, reqwest::Error>((ok, user_id))
+                })
+                .join();
+                match thread_result {
+                    Ok(Ok((true, user_id))) => {
                         println!(
                             "\r  {} Connected as {user_id}        ",
                             style("✅").green().bold()
@@ -2769,19 +2794,28 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     .default("zeroclaw-whatsapp-verify".into())
                     .interact_text()?;
 
-                // Test connection
+                // Test connection (run entirely in separate thread — Response must be used/dropped there)
                 print!("  {} Testing connection... ", style("⏳").dim());
-                let client = reqwest::blocking::Client::new();
-                let url = format!(
-                    "https://graph.facebook.com/v18.0/{}",
-                    phone_number_id.trim()
-                );
-                match client
-                    .get(&url)
-                    .header("Authorization", format!("Bearer {}", access_token.trim()))
-                    .send()
-                {
-                    Ok(resp) if resp.status().is_success() => {
+                let phone_number_id_clone = phone_number_id.clone();
+                let access_token_clone = access_token.clone();
+                let thread_result = std::thread::spawn(move || {
+                    let client = reqwest::blocking::Client::new();
+                    let url = format!(
+                        "https://graph.facebook.com/v18.0/{}",
+                        phone_number_id_clone.trim()
+                    );
+                    let resp = client
+                        .get(&url)
+                        .header(
+                            "Authorization",
+                            format!("Bearer {}", access_token_clone.trim()),
+                        )
+                        .send()?;
+                    Ok::<_, reqwest::Error>(resp.status().is_success())
+                })
+                .join();
+                match thread_result {
+                    Ok(Ok(true)) => {
                         println!(
                             "\r  {} Connected to WhatsApp API        ",
                             style("✅").green().bold()
@@ -4343,18 +4377,54 @@ mod tests {
     }
 
     #[test]
-    fn default_model_for_minimax_is_m2_5() {
-        assert_eq!(default_model_for_provider("minimax"), "MiniMax-M2.5");
+    fn backend_key_from_choice_maps_supported_backends() {
+        assert_eq!(backend_key_from_choice(0), "sqlite");
+        assert_eq!(backend_key_from_choice(1), "lucid");
+        assert_eq!(backend_key_from_choice(2), "markdown");
+        assert_eq!(backend_key_from_choice(3), "none");
+        assert_eq!(backend_key_from_choice(999), "sqlite");
     }
 
     #[test]
-    fn minimax_onboard_models_include_m2_variants() {
-        let model_names: Vec<&str> = MINIMAX_ONBOARD_MODELS
-            .iter()
-            .map(|(name, _)| *name)
-            .collect();
-        assert_eq!(model_names.first().copied(), Some("MiniMax-M2.5"));
-        assert!(model_names.contains(&"MiniMax-M2.1"));
-        assert!(model_names.contains(&"MiniMax-M2.1-highspeed"));
+    fn memory_backend_profile_marks_lucid_as_optional_sqlite_backed() {
+        let lucid = memory_backend_profile("lucid");
+        assert!(lucid.auto_save_default);
+        assert!(lucid.uses_sqlite_hygiene);
+        assert!(lucid.sqlite_based);
+        assert!(lucid.optional_dependency);
+
+        let markdown = memory_backend_profile("markdown");
+        assert!(markdown.auto_save_default);
+        assert!(!markdown.uses_sqlite_hygiene);
+
+        let none = memory_backend_profile("none");
+        assert!(!none.auto_save_default);
+        assert!(!none.uses_sqlite_hygiene);
+
+        let custom = memory_backend_profile("custom-memory");
+        assert!(custom.auto_save_default);
+        assert!(!custom.uses_sqlite_hygiene);
+    }
+
+    #[test]
+    fn memory_config_defaults_for_lucid_enable_sqlite_hygiene() {
+        let config = memory_config_defaults_for_backend("lucid");
+        assert_eq!(config.backend, "lucid");
+        assert!(config.auto_save);
+        assert!(config.hygiene_enabled);
+        assert_eq!(config.archive_after_days, 7);
+        assert_eq!(config.purge_after_days, 30);
+        assert_eq!(config.embedding_cache_size, 10000);
+    }
+
+    #[test]
+    fn memory_config_defaults_for_none_disable_sqlite_hygiene() {
+        let config = memory_config_defaults_for_backend("none");
+        assert_eq!(config.backend, "none");
+        assert!(!config.auto_save);
+        assert!(!config.hygiene_enabled);
+        assert_eq!(config.archive_after_days, 0);
+        assert_eq!(config.purge_after_days, 0);
+        assert_eq!(config.embedding_cache_size, 0);
     }
 }
