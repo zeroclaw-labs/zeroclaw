@@ -23,3 +23,28 @@ pub use policy::{AutonomyLevel, SecurityPolicy};
 pub use secrets::SecretStore;
 #[allow(unused_imports)]
 pub use traits::{NoopSandbox, Sandbox};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reexported_policy_and_pairing_types_are_usable() {
+        let policy = SecurityPolicy::default();
+        assert_eq!(policy.autonomy, AutonomyLevel::Supervised);
+
+        let guard = PairingGuard::new(false, &[]);
+        assert!(!guard.require_pairing());
+    }
+
+    #[test]
+    fn reexported_secret_store_encrypt_decrypt_roundtrip() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SecretStore::new(temp.path(), false);
+
+        let encrypted = store.encrypt("top-secret").unwrap();
+        let decrypted = store.decrypt(&encrypted).unwrap();
+
+        assert_eq!(decrypted, "top-secret");
+    }
+}
