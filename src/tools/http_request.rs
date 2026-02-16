@@ -404,7 +404,7 @@ fn is_private_or_local_host(host: &str) -> bool {
 
 /// Returns true if the IPv4 address is not globally routable.
 fn is_non_global_v4(v4: std::net::Ipv4Addr) -> bool {
-    let [a, b, _, _] = v4.octets();
+    let [a, b, c, _] = v4.octets();
     v4.is_loopback()                       // 127.0.0.0/8
         || v4.is_private()                 // 10/8, 172.16/12, 192.168/16
         || v4.is_link_local()              // 169.254.0.0/16
@@ -413,7 +413,7 @@ fn is_non_global_v4(v4: std::net::Ipv4Addr) -> bool {
         || v4.is_multicast()              // 224.0.0.0/4
         || (a == 100 && (64..=127).contains(&b)) // Shared address space (RFC 6598)
         || a >= 240                        // Reserved (240.0.0.0/4, except broadcast)
-        || (a == 192 && b == 0)            // Documentation/IETF (192.0.0.0/24, 192.0.2.0/24)
+        || (a == 192 && b == 0 && (c == 0 || c == 2)) // IETF assignments + TEST-NET-1
         || (a == 198 && b == 51)           // Documentation (198.51.100.0/24)
         || (a == 203 && b == 0)            // Documentation (203.0.113.0/24)
         || (a == 198 && (18..=19).contains(&b)) // Benchmarking (198.18.0.0/15)
@@ -427,6 +427,7 @@ fn is_non_global_v6(v6: std::net::Ipv6Addr) -> bool {
         || v6.is_multicast()              // ff00::/8
         || (segs[0] & 0xfe00) == 0xfc00   // Unique-local (fc00::/7)
         || (segs[0] & 0xffc0) == 0xfe80   // Link-local (fe80::/10)
+        || (segs[0] == 0x2001 && segs[1] == 0x0db8) // Documentation (2001:db8::/32)
         || v6.to_ipv4_mapped().is_some_and(|v4| is_non_global_v4(v4))
 }
 
@@ -629,15 +630,12 @@ mod tests {
     }
 
     #[test]
+    fn blocks_ipv6_documentation_range() {
+        assert!(is_private_or_local_host("2001:db8::1"));
+    }
+
+    #[test]
     fn allows_public_ipv6() {
-        assert!(
-            !is_private_or_local_host("2001:db8::1")
-                .to_string()
-                .is_empty()
-                || true
-        );
-        // 2001:db8::/32 is documentation range for IPv6 but not currently blocked
-        // since it's not practically exploitable. Public IPv6 addresses pass:
         assert!(!is_private_or_local_host("2607:f8b0:4004:800::200e"));
     }
 
