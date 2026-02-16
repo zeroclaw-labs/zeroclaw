@@ -54,6 +54,7 @@ struct ChannelRuntimeContext {
     memory: Arc<dyn Memory>,
     tools_registry: Arc<Vec<Box<dyn Tool>>>,
     observer: Arc<dyn Observer>,
+    provider_name: Arc<String>,
     system_prompt: Arc<String>,
     model: Arc<String>,
     temperature: f64,
@@ -682,7 +683,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
     let provider_name = config
         .default_provider
         .clone()
-        .unwrap_or_else(|| "openrouter".to_string());
+        .unwrap_or_else(|| "openrouter".into());
+
     let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider(
         provider_name.as_str(),
         config.api_key.as_deref(),
@@ -938,6 +940,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         memory: Arc::clone(&mem),
         tools_registry: Arc::clone(&tools_registry),
         observer,
+        provider_name: Arc::new(provider_name),
         system_prompt: Arc::new(system_prompt),
         model: Arc::new(model.clone()),
         temperature,
@@ -1131,6 +1134,7 @@ mod tests {
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
+            provider_name: Arc::new("test-provider".to_string()),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
@@ -1222,6 +1226,7 @@ mod tests {
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
+            provider_name: Arc::new("test-provider".to_string()),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
