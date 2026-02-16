@@ -5,6 +5,9 @@ pub mod delegate;
 pub mod file_read;
 pub mod file_write;
 pub mod git_operations;
+pub mod hardware_board_info;
+pub mod hardware_memory_map;
+pub mod hardware_memory_read;
 pub mod http_request;
 pub mod image_info;
 pub mod memory_forget;
@@ -15,13 +18,16 @@ pub mod screenshot;
 pub mod shell;
 pub mod traits;
 
-pub use browser::BrowserTool;
+pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
 pub use composio::ComposioTool;
 pub use delegate::DelegateTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
 pub use git_operations::GitOperationsTool;
+pub use hardware_board_info::HardwareBoardInfoTool;
+pub use hardware_memory_map::HardwareMemoryMapTool;
+pub use hardware_memory_read::HardwareMemoryReadTool;
 pub use http_request::HttpRequestTool;
 pub use image_info::ImageInfoTool;
 pub use memory_forget::MemoryForgetTool;
@@ -131,6 +137,15 @@ pub fn all_tools_with_runtime(
             browser_config.native_headless,
             browser_config.native_webdriver_url.clone(),
             browser_config.native_chrome_path.clone(),
+            ComputerUseConfig {
+                endpoint: browser_config.computer_use.endpoint.clone(),
+                api_key: browser_config.computer_use.api_key.clone(),
+                timeout_ms: browser_config.computer_use.timeout_ms,
+                allow_remote_endpoint: browser_config.computer_use.allow_remote_endpoint,
+                window_allowlist: browser_config.computer_use.window_allowlist.clone(),
+                max_coordinate_x: browser_config.computer_use.max_coordinate_x,
+                max_coordinate_y: browser_config.computer_use.max_coordinate_y,
+            },
         )));
     }
 
@@ -155,8 +170,12 @@ pub fn all_tools_with_runtime(
 
     // Add delegation tool when agents are configured
     if !agents.is_empty() {
+        let delegate_agents: HashMap<String, DelegateAgentConfig> = agents
+            .iter()
+            .map(|(name, cfg)| (name.clone(), cfg.clone()))
+            .collect();
         tools.push(Box::new(DelegateTool::new(
-            agents.clone(),
+            delegate_agents,
             fallback_api_key.map(String::from),
         )));
     }

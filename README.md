@@ -67,8 +67,8 @@ ls -lh target/release/zeroclaw
 ```bash
 git clone https://github.com/zeroclaw-labs/zeroclaw.git
 cd zeroclaw
-cargo build --release
-cargo install --path . --force
+cargo build --release --locked
+cargo install --path . --force --locked
 
 # Quick setup (no prompts)
 zeroclaw onboard --api-key sk-... --provider openrouter
@@ -128,7 +128,7 @@ Every subsystem is a **trait** — swap implementations with a config change, ze
 |-----------|-------|------------|--------|
 | **AI Models** | `Provider` | 22+ providers (OpenRouter, Anthropic, OpenAI, Ollama, Venice, Groq, Mistral, xAI, DeepSeek, Together, Fireworks, Perplexity, Cohere, Bedrock, etc.) | `custom:https://your-api.com` — any OpenAI-compatible API |
 | **Channels** | `Channel` | CLI, Telegram, Discord, Slack, iMessage, Matrix, WhatsApp, Webhook | Any messaging API |
-| **Memory** | `Memory` | SQLite with hybrid search (FTS5 + vector cosine similarity), Markdown | Any persistence backend |
+| **Memory** | `Memory` | SQLite with hybrid search (FTS5 + vector cosine similarity), Lucid bridge (CLI sync + SQLite fallback), Markdown | Any persistence backend |
 | **Tools** | `Tool` | shell, file_read, file_write, memory_store, memory_recall, memory_forget, browser_open (Brave + allowlist), browser (agent-browser / rust-native), composio (optional) | Any capability |
 | **Observability** | `Observer` | Noop, Log, Multi | Prometheus, OTel |
 | **Runtime** | `RuntimeAdapter` | Native, Docker (sandboxed) | WASM (planned; unsupported kinds fail fast) |
@@ -164,11 +164,21 @@ The agent automatically recalls, saves, and manages memory via tools.
 
 ```toml
 [memory]
-backend = "sqlite"          # "sqlite", "markdown", "none"
+backend = "sqlite"          # "sqlite", "lucid", "markdown", "none"
 auto_save = true
 embedding_provider = "openai"
 vector_weight = 0.7
 keyword_weight = 0.3
+
+# backend = "none" uses an explicit no-op memory backend (no persistence)
+
+# Optional for backend = "lucid"
+# ZEROCLAW_LUCID_CMD=/usr/local/bin/lucid   # default: lucid
+# ZEROCLAW_LUCID_BUDGET=200                 # default: 200
+# ZEROCLAW_LUCID_LOCAL_HIT_THRESHOLD=3      # local hit count to skip external recall
+# ZEROCLAW_LUCID_RECALL_TIMEOUT_MS=120      # low-latency budget for lucid context recall
+# ZEROCLAW_LUCID_STORE_TIMEOUT_MS=800        # async sync timeout for lucid store
+# ZEROCLAW_LUCID_FAILURE_COOLDOWN_MS=15000   # cooldown after lucid failure to avoid repeated slow attempts
 ```
 
 ## Security
@@ -264,11 +274,13 @@ default_model = "anthropic/claude-sonnet-4-20250514"
 default_temperature = 0.7
 
 [memory]
-backend = "sqlite"              # "sqlite", "markdown", "none"
+backend = "sqlite"              # "sqlite", "lucid", "markdown", "none"
 auto_save = true
 embedding_provider = "openai"   # "openai", "noop"
 vector_weight = 0.7
 keyword_weight = 0.3
+
+# backend = "none" disables persistent memory via no-op backend
 
 [gateway]
 require_pairing = true          # require pairing code on first connect
@@ -305,14 +317,33 @@ encrypt = true                  # API keys encrypted with local key file
 [browser]
 enabled = false                        # opt-in browser_open + browser tools
 allowed_domains = ["docs.rs"]         # required when browser is enabled
-backend = "agent_browser"             # "agent_browser" (default), "rust_native", "auto"
+backend = "agent_browser"             # "agent_browser" (default), "rust_native", "computer_use", "auto"
 native_headless = true                 # applies when backend uses rust-native
 native_webdriver_url = "http://127.0.0.1:9515" # WebDriver endpoint (chromedriver/selenium)
 # native_chrome_path = "/usr/bin/chromium"  # optional explicit browser binary for driver
 
+[browser.computer_use]
+endpoint = "http://127.0.0.1:8787/v1/actions" # computer-use sidecar HTTP endpoint
+timeout_ms = 15000                    # per-action timeout
+allow_remote_endpoint = false         # secure default: only private/localhost endpoint
+window_allowlist = []                 # optional window title/process allowlist hints
+# api_key = "..."                    # optional bearer token for sidecar
+# max_coordinate_x = 3840             # optional coordinate guardrail
+# max_coordinate_y = 2160             # optional coordinate guardrail
+
 # Rust-native backend build flag:
 # cargo build --release --features browser-native
 # Ensure a WebDriver server is running, e.g. chromedriver --port=9515
+
+# Computer-use sidecar contract (MVP)
+# POST browser.computer_use.endpoint
+# Request: {
+#   "action": "mouse_click",
+#   "params": {"x": 640, "y": 360, "button": "left"},
+#   "policy": {"allowed_domains": [...], "window_allowlist": [...], "max_coordinate_x": 3840, "max_coordinate_y": 2160},
+#   "metadata": {"session_name": "...", "source": "zeroclaw.browser", "version": "..."}
+# }
+# Response: {"success": true, "data": {...}} or {"success": false, "error": "..."}
 
 [composio]
 enabled = false                 # opt-in: 1000+ OAuth apps via composio.dev
@@ -442,6 +473,18 @@ A git hook runs `cargo fmt --check`, `cargo clippy -- -D warnings`, and `cargo t
 ```bash
 git config core.hooksPath .githooks
 ```
+
+### Build troubleshooting (Linux OpenSSL errors)
+
+If you see an `openssl-sys` build error, sync dependencies and rebuild with the repository lockfile:
+
+```bash
+git pull
+cargo build --release --locked
+cargo install --path . --force --locked
+```
+
+ZeroClaw is configured to use `rustls` for HTTP/TLS dependencies; `--locked` keeps the transitive graph deterministic on fresh environments.
 
 To skip the hook when you need a quick push during development:
 

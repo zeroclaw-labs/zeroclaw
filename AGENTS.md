@@ -24,6 +24,7 @@ Key extension points:
 - `src/memory/traits.rs` (`Memory`)
 - `src/observability/traits.rs` (`Observer`)
 - `src/runtime/traits.rs` (`RuntimeAdapter`)
+- `src/peripherals/traits.rs` (`Peripheral`) — hardware boards (STM32, RPi GPIO)
 
 ## 2) Deep Architecture Observations (Why This Protocol Exists)
 
@@ -141,7 +142,8 @@ Required:
 - `src/providers/` — model providers and resilient wrapper
 - `src/channels/` — Telegram/Discord/Slack/etc channels
 - `src/tools/` — tool execution surface (shell, file, memory, browser)
-- `src/runtime/` — runtime adapters (currently native/docker)
+- `src/peripherals/` — hardware peripherals (STM32, RPi GPIO); see `docs/hardware-peripherals-design.md`
+- `src/runtime/` — runtime adapters (currently native)
 - `docs/` — architecture + process docs
 - `.github/` — CI, templates, automation workflows
 
@@ -236,13 +238,14 @@ Use these rules to keep the trait/factory architecture stable under growth.
 - Validate and sanitize all inputs.
 - Return structured `ToolResult`; avoid panics in runtime path.
 
-### 7.4 Memory / Runtime / Config Changes
+### 5.4 Adding a Peripheral
 
-- Keep compatibility explicit (config defaults, migration impact, fallback behavior).
-- Add targeted tests for boundary conditions and unsupported values.
-- Avoid hidden side effects in startup path.
+- Implement `Peripheral` in `src/peripherals/`.
+- Peripherals expose `tools()` — each tool delegates to the hardware (GPIO, sensors, etc.).
+- Register board type in config schema if needed.
+- See `docs/hardware-peripherals-design.md` for protocol and firmware notes.
 
-### 7.5 Security / Gateway / CI Changes
+### 5.5 Security / Runtime / Gateway Changes
 
 - Include threat/risk notes and rollback strategy.
 - Add/update tests or validation evidence for failure modes and boundaries.
@@ -300,6 +303,74 @@ Treat privacy and neutrality as merge gates, not best-effort guidelines.
     - environment labels: `zeroclaw_project`, `zeroclaw_workspace`, `zeroclaw_channel`
 - If reproducing external incidents, redact and anonymize all payloads before committing.
 - Before push, review `git diff --cached` specifically for accidental sensitive strings and identity leakage.
+
+### 9.2 Superseded-PR Attribution (Required)
+
+When a PR supersedes another contributor's PR and carries forward substantive code or design decisions, preserve authorship explicitly.
+
+- In the integrating commit message, add one `Co-authored-by: Name <email>` trailer per superseded contributor whose work is materially incorporated.
+- Use a GitHub-recognized email (`<login@users.noreply.github.com>` or the contributor's verified commit email) so attribution is rendered correctly.
+- Keep trailers on their own lines after a blank line at commit-message end; never encode them as escaped `\\n` text.
+- In the PR body, list superseded PR links and briefly state what was incorporated from each.
+- If no actual code/design was incorporated (only inspiration), do not use `Co-authored-by`; give credit in PR notes instead.
+
+### 9.3 Superseded-PR PR Template (Recommended)
+
+When superseding multiple PRs, use a consistent title/body structure to reduce reviewer ambiguity.
+
+- Recommended title format: `feat(<scope>): unify and supersede #<pr_a>, #<pr_b> [and #<pr_n>]`
+- If this is docs/chore/meta only, keep the same supersede suffix and use the appropriate conventional-commit type.
+- In the PR body, include the following template (fill placeholders, remove non-applicable lines):
+
+```md
+## Supersedes
+- #<pr_a> by @<author_a>
+- #<pr_b> by @<author_b>
+- #<pr_n> by @<author_n>
+
+## Integrated Scope
+- From #<pr_a>: <what was materially incorporated>
+- From #<pr_b>: <what was materially incorporated>
+- From #<pr_n>: <what was materially incorporated>
+
+## Attribution
+- Co-authored-by trailers added for materially incorporated contributors: Yes/No
+- If No, explain why (for example: no direct code/design carry-over)
+
+## Non-goals
+- <explicitly list what was not carried over>
+
+## Risk and Rollback
+- Risk: <summary>
+- Rollback: <revert commit/PR strategy>
+```
+
+### 9.4 Superseded-PR Commit Template (Recommended)
+
+When a commit unifies or supersedes prior PR work, use a deterministic commit message layout so attribution is machine-parsed and reviewer-friendly.
+
+- Keep one blank line between message sections, and exactly one blank line before trailer lines.
+- Keep each trailer on its own line; do not wrap, indent, or encode as escaped `\n` text.
+- Add one `Co-authored-by` trailer per materially incorporated contributor, using GitHub-recognized email.
+- If no direct code/design is carried over, omit `Co-authored-by` and explain attribution in the PR body instead.
+
+```text
+feat(<scope>): unify and supersede #<pr_a>, #<pr_b> [and #<pr_n>]
+
+<one-paragraph summary of integrated outcome>
+
+Supersedes:
+- #<pr_a> by @<author_a>
+- #<pr_b> by @<author_b>
+- #<pr_n> by @<author_n>
+
+Integrated scope:
+- <subsystem_or_feature_a>: from #<pr_x>
+- <subsystem_or_feature_b>: from #<pr_y>
+
+Co-authored-by: <Name A> <login_a@users.noreply.github.com>
+Co-authored-by: <Name B> <login_b@users.noreply.github.com>
+```
 
 Reference docs:
 

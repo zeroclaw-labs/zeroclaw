@@ -1,3 +1,4 @@
+use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +30,13 @@ impl ChatMessage {
             content: content.into(),
         }
     }
+
+    pub fn tool(content: impl Into<String>) -> Self {
+        Self {
+            role: "tool".into(),
+            content: content.into(),
+        }
+    }
 }
 
 /// A tool call requested by the LLM.
@@ -49,14 +57,6 @@ pub struct ChatResponse {
 }
 
 impl ChatResponse {
-    /// Convenience: construct a plain text response with no tool calls.
-    pub fn with_text(text: impl Into<String>) -> Self {
-        Self {
-            text: Some(text.into()),
-            tool_calls: vec![],
-        }
-    }
-
     /// True when the LLM wants to invoke at least one tool.
     pub fn has_tool_calls(&self) -> bool {
         !self.tool_calls.is_empty()
@@ -68,6 +68,13 @@ impl ChatResponse {
     }
 }
 
+/// Request payload for provider chat calls.
+#[derive(Debug, Clone, Copy)]
+pub struct ChatRequest<'a> {
+    pub messages: &'a [ChatMessage],
+    pub tools: Option<&'a [ToolSpec]>,
+}
+
 /// A tool result to feed back to the LLM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResultMessage {
@@ -77,7 +84,7 @@ pub struct ToolResultMessage {
 
 /// A message in a multi-turn conversation, including tool interactions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
+#[serde(tag = "type", content = "data")]
 pub enum ConversationMessage {
     /// Regular chat message (system, user, assistant).
     Chat(ChatMessage),
@@ -86,29 +93,35 @@ pub enum ConversationMessage {
         text: Option<String>,
         tool_calls: Vec<ToolCall>,
     },
-    /// Result of a tool execution, fed back to the LLM.
-    ToolResult(ToolResultMessage),
+    /// Results of tool executions, fed back to the LLM.
+    ToolResults(Vec<ToolResultMessage>),
 }
 
 #[async_trait]
 pub trait Provider: Send + Sync {
-    async fn chat(
+    /// Simple one-shot chat (single user message, no explicit system prompt).
+    ///
+    /// This is the preferred API for non-agentic direct interactions.
+    async fn simple_chat(
         &self,
         message: &str,
         model: &str,
         temperature: f64,
-    ) -> anyhow::Result<ChatResponse> {
+    ) -> anyhow::Result<String> {
         self.chat_with_system(None, message, model, temperature)
             .await
     }
 
+    /// One-shot chat with optional system prompt.
+    ///
+    /// Kept for compatibility and advanced one-shot prompting.
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
         temperature: f64,
-    ) -> anyhow::Result<ChatResponse>;
+    ) -> anyhow::Result<String>;
 
     /// Multi-turn conversation. Default implementation extracts the last user
     /// message and delegates to `chat_with_system`.
@@ -117,7 +130,7 @@ pub trait Provider: Send + Sync {
         messages: &[ChatMessage],
         model: &str,
         temperature: f64,
-    ) -> anyhow::Result<ChatResponse> {
+    ) -> anyhow::Result<String> {
         let system = messages
             .iter()
             .find(|m| m.role == "system")
@@ -129,6 +142,27 @@ pub trait Provider: Send + Sync {
             .unwrap_or("");
         self.chat_with_system(system, last_user, model, temperature)
             .await
+    }
+
+    /// Structured chat API for agent loop callers.
+    async fn chat(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ChatResponse> {
+        let text = self
+            .chat_with_history(request.messages, model, temperature)
+            .await?;
+        Ok(ChatResponse {
+            text: Some(text),
+            tool_calls: Vec::new(),
+        })
+    }
+
+    /// Whether provider supports native tool calls over API.
+    fn supports_native_tools(&self) -> bool {
+        false
     }
 
     /// Warm up the HTTP connection pool (TLS handshake, DNS, HTTP/2 setup).
@@ -153,6 +187,9 @@ mod tests {
 
         let asst = ChatMessage::assistant("Hi there");
         assert_eq!(asst.role, "assistant");
+
+        let tool = ChatMessage::tool("{}");
+        assert_eq!(tool.role, "tool");
     }
 
     #[test]
@@ -194,11 +231,11 @@ mod tests {
         let json = serde_json::to_string(&chat).unwrap();
         assert!(json.contains("\"type\":\"Chat\""));
 
-        let tool_result = ConversationMessage::ToolResult(ToolResultMessage {
+        let tool_result = ConversationMessage::ToolResults(vec![ToolResultMessage {
             tool_call_id: "1".into(),
             content: "done".into(),
-        });
+        }]);
         let json = serde_json::to_string(&tool_result).unwrap();
-        assert!(json.contains("\"type\":\"ToolResult\""));
+        assert!(json.contains("\"type\":\"ToolResults\""));
     }
 }
