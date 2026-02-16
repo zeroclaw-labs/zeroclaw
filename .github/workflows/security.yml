@@ -21,7 +21,7 @@ env:
 jobs:
     audit:
         name: Security Audit
-        runs-on: ${{ github.event_name != 'pull_request' && fromJSON('["self-hosted","Linux","X64","lxc-ci"]') || 'ubuntu-latest' }}
+        runs-on: ${{ github.event_name != 'pull_request' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
         timeout-minutes: 20
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -37,7 +37,7 @@ jobs:
 
     deny:
         name: License & Supply Chain
-        runs-on: ${{ github.event_name != 'pull_request' && fromJSON('["self-hosted","Linux","X64","lxc-ci"]') || 'ubuntu-latest' }}
+        runs-on: ${{ github.event_name != 'pull_request' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
         timeout-minutes: 20
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
