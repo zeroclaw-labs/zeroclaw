@@ -799,8 +799,9 @@ fn setup_provider() -> Result<(String, String, String)> {
             ("glm-4-flash", "GLM-4 Flash (fast)"),
         ],
         "minimax" => vec![
-            ("abab6.5s-chat", "ABAB 6.5s Chat"),
-            ("abab6.5-chat", "ABAB 6.5 Chat"),
+            ("MiniMax-M2.5", "MiniMax M2.5 (latest flagship)"),
+            ("MiniMax-M2.5-highspeed", "MiniMax M2.5 Highspeed (faster)"),
+            ("MiniMax-M2.1", "MiniMax M2.1 (previous gen)"),
         ],
         "ollama" => vec![
             ("llama3.2", "Llama 3.2 (recommended local)"),
