@@ -62,10 +62,7 @@ mod tests {
     async fn none_memory_is_noop() {
         let memory = NoneMemory::new();
 
-        memory
-            .store("k", "v", MemoryCategory::Core)
-            .await
-            .unwrap();
+        memory.store("k", "v", MemoryCategory::Core).await.unwrap();
 
         assert!(memory.get("k").await.unwrap().is_none());
         assert!(memory.recall("k", 10).await.unwrap().is_empty());
