@@ -23,7 +23,11 @@ pub use whatsapp::WhatsAppChannel;
 use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
-use crate::providers::{self, Provider};
+use crate::observability::{self, Observer};
+use crate::providers::{self, ChatMessage, Provider};
+use crate::runtime;
+use crate::security::SecurityPolicy;
+use crate::tools;
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use std::fmt::Write;
@@ -35,7 +39,7 @@ const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 
 const DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS: u64 = 2;
 const DEFAULT_CHANNEL_MAX_BACKOFF_SECS: u64 = 60;
-const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 90;
+const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 300;
 
 fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
     format!("{}_{}_{}", msg.channel, msg.sender, msg.id)
@@ -147,6 +151,7 @@ pub fn build_system_prompt(
     tools: &[(&str, &str)],
     skills: &[crate::skills::Skill],
     identity_config: Option<&crate::config::IdentityConfig>,
+    inline_skill_docs: bool,
 ) -> String {
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
@@ -171,31 +176,57 @@ pub fn build_system_prompt(
          - When in doubt, ask before acting externally.\n\n",
     );
 
-    // ── 3. Skills (compact list — load on-demand) ───────────────
+    // ── 3. Skills ─────────────────────────────────────────────────
     if !skills.is_empty() {
         prompt.push_str("## Available Skills\n\n");
-        prompt.push_str(
-            "Skills are loaded on demand. Use `read` on the skill path to get full instructions.\n\n",
-        );
-        prompt.push_str("<available_skills>\n");
-        for skill in skills {
-            let _ = writeln!(prompt, "  <skill>");
-            let _ = writeln!(prompt, "    <name>{}</name>", skill.name);
-            let _ = writeln!(
-                prompt,
-                "    <description>{}</description>",
-                skill.description
+        if inline_skill_docs {
+            // Channel mode: inline full SKILL.md so weaker models don't need
+            // to discover instructions via an extra file_read round-trip.
+            for skill in skills {
+                let _ = writeln!(prompt, "### Skill: {}\n", skill.name);
+                let _ = writeln!(prompt, "{}\n", skill.description);
+                let location = skill.location.clone().unwrap_or_else(|| {
+                    workspace_dir
+                        .join("skills")
+                        .join(&skill.name)
+                        .join("SKILL.md")
+                });
+                if let Ok(content) = std::fs::read_to_string(&location) {
+                    prompt.push_str(&content);
+                    prompt.push('\n');
+                } else {
+                    let _ = writeln!(
+                        prompt,
+                        "_Instructions at `{}`_\n",
+                        location.display()
+                    );
+                }
+            }
+        } else {
+            // CLI mode: compact list — load on-demand via file_read.
+            prompt.push_str(
+                "Skills are loaded on demand. Use `read` on the skill path to get full instructions.\n\n",
             );
-            let location = skill.location.clone().unwrap_or_else(|| {
-                workspace_dir
-                    .join("skills")
-                    .join(&skill.name)
-                    .join("SKILL.md")
-            });
-            let _ = writeln!(prompt, "    <location>{}</location>", location.display());
-            let _ = writeln!(prompt, "  </skill>");
+            prompt.push_str("<available_skills>\n");
+            for skill in skills {
+                let _ = writeln!(prompt, "  <skill>");
+                let _ = writeln!(prompt, "    <name>{}</name>", skill.name);
+                let _ = writeln!(
+                    prompt,
+                    "    <description>{}</description>",
+                    skill.description
+                );
+                let location = skill.location.clone().unwrap_or_else(|| {
+                    workspace_dir
+                        .join("skills")
+                        .join(&skill.name)
+                        .join("SKILL.md")
+                });
+                let _ = writeln!(prompt, "    <location>{}</location>", location.display());
+                let _ = writeln!(prompt, "  </skill>");
+            }
+            prompt.push_str("</available_skills>\n\n");
         }
-        prompt.push_str("</available_skills>\n\n");
     }
 
     // ── 4. Workspace ────────────────────────────────────────────
@@ -385,6 +416,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 dc.guild_id.clone(),
                 dc.allowed_users.clone(),
                 dc.listen_to_bots,
+                dc.mention_only,
             )),
         ));
     }
@@ -520,6 +552,30 @@ pub async fn start_channels(config: Config) -> Result<()> {
         config.api_key.as_deref(),
     )?);
 
+    // ── Wire up agentic subsystems ──────────────────────────────
+    let observer: Arc<dyn Observer> =
+        Arc::from(observability::create_observer(&config.observability));
+    let runtime_adapter: Arc<dyn runtime::RuntimeAdapter> =
+        Arc::from(runtime::create_runtime(&config.runtime)?);
+    let security = Arc::new(SecurityPolicy::from_config(
+        &config.autonomy,
+        &config.workspace_dir,
+    ));
+
+    // ── Tools registry (same as CLI path) ────────────────────────
+    let composio_key = if config.composio.enabled {
+        config.composio.api_key.as_deref()
+    } else {
+        None
+    };
+    let tools_registry = tools::all_tools_with_runtime(
+        &security,
+        runtime_adapter,
+        mem.clone(),
+        composio_key,
+        &config.browser,
+    );
+
     // Build system prompt from workspace identity files + skills
     let workspace = config.workspace_dir.clone();
     let skills = crate::skills::load_skills(&workspace);
@@ -559,13 +615,19 @@ pub async fn start_channels(config: Config) -> Result<()> {
         ));
     }
 
-    let system_prompt = build_system_prompt(
+    let mut system_prompt = build_system_prompt(
         &workspace,
         &model,
         &tool_descs,
         &skills,
         Some(&config.identity),
+        true, // inline skill docs for channel mode
     );
+
+    // Append structured tool-use instructions with parameter schemas
+    // (this is what makes the agent agentic — without it, the LLM sees tool
+    // names but not the invocation protocol)
+    system_prompt.push_str(&crate::agent::build_tool_instructions(&tools_registry));
 
     if !skills.is_empty() {
         println!(
@@ -594,6 +656,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             dc.guild_id.clone(),
             dc.allowed_users.clone(),
             dc.listen_to_bots,
+            dc.mention_only,
         )));
     }
 
@@ -659,6 +722,14 @@ pub async fn start_channels(config: Config) -> Result<()> {
         if config.memory.auto_save { "on" } else { "off" }
     );
     println!(
+        "  🔧 Tools:    {}",
+        tools_registry
+            .iter()
+            .map(|t| t.name())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!(
         "  📡 Channels: {}",
         channels
             .iter()
@@ -696,7 +767,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
     drop(tx); // Drop our copy so rx closes when all channels stop
 
-    // Process incoming messages — call the LLM and reply
+    // Process incoming messages — run the agentic tool-use loop and reply
     while let Some(msg) = rx.recv().await {
         println!(
             "  💬 [{}] from {}: {}",
@@ -705,25 +776,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
             truncate_with_ellipsis(&msg.content, 80)
         );
 
-        let memory_context = build_memory_context(mem.as_ref(), &msg.content).await;
+        // Auto-save to memory (disabled: auto-recall was injecting noisy context
+        // that confused weaker models.  The agent still has memory_recall /
+        // memory_store tools and can search explicitly when it needs history.)
+        // if config.memory.auto_save { ... }
 
-        // Auto-save to memory
-        if config.memory.auto_save {
-            let autosave_key = conversation_memory_key(&msg);
-            let _ = mem
-                .store(
-                    &autosave_key,
-                    &msg.content,
-                    crate::memory::MemoryCategory::Conversation,
-                )
-                .await;
-        }
-
-        let enriched_message = if memory_context.is_empty() {
-            msg.content.clone()
-        } else {
-            format!("{memory_context}{}", msg.content)
-        };
+        let enriched_message = msg.content.clone();
 
         let target_channel = channels.iter().find(|ch| ch.name() == msg.channel);
 
@@ -734,13 +792,26 @@ pub async fn start_channels(config: Config) -> Result<()> {
             }
         }
 
-        // Call the LLM with system prompt (identity + soul + tools)
-        println!("  ⏳ Processing message...");
+        // Run the agentic tool-use loop (multi-turn: LLM -> parse tools -> execute -> loop)
+        println!("  ⏳ Processing message (agentic mode)...");
         let started_at = Instant::now();
+
+        // Build per-message conversation history for the agent turn
+        let mut history = vec![
+            ChatMessage::system(&system_prompt),
+            ChatMessage::user(&enriched_message),
+        ];
 
         let llm_result = tokio::time::timeout(
             Duration::from_secs(CHANNEL_MESSAGE_TIMEOUT_SECS),
-            provider.chat_with_system(Some(&system_prompt), &enriched_message, &model, temperature),
+            crate::agent::agent_turn(
+                provider.as_ref(),
+                &mut history,
+                &tools_registry,
+                observer.as_ref(),
+                &model,
+                temperature,
+            ),
         )
         .await;
 
@@ -766,7 +837,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             }
             Ok(Err(e)) => {
                 eprintln!(
-                    "  ❌ LLM error after {}ms: {e}",
+                    "  ❌ Agent error after {}ms: {e}",
                     started_at.elapsed().as_millis()
                 );
                 if let Some(ch) = target_channel {
@@ -775,7 +846,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             }
             Err(_) => {
                 let timeout_msg = format!(
-                    "LLM response timed out after {}s",
+                    "Agent response timed out after {}s",
                     CHANNEL_MESSAGE_TIMEOUT_SECS
                 );
                 eprintln!(
@@ -836,7 +907,7 @@ mod tests {
     fn prompt_contains_all_sections() {
         let ws = make_workspace();
         let tools = vec![("shell", "Run commands"), ("file_read", "Read files")];
-        let prompt = build_system_prompt(ws.path(), "test-model", &tools, &[], None);
+        let prompt = build_system_prompt(ws.path(), "test-model", &tools, &[], None, false);
 
         // Section headers
         assert!(prompt.contains("## Tools"), "missing Tools section");
@@ -860,7 +931,7 @@ mod tests {
             ("shell", "Run commands"),
             ("memory_recall", "Search memory"),
         ];
-        let prompt = build_system_prompt(ws.path(), "gpt-4o", &tools, &[], None);
+        let prompt = build_system_prompt(ws.path(), "gpt-4o", &tools, &[], None, false);
 
         assert!(prompt.contains("**shell**"));
         assert!(prompt.contains("Run commands"));
@@ -870,7 +941,7 @@ mod tests {
     #[test]
     fn prompt_injects_safety() {
         let ws = make_workspace();
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, false);
 
         assert!(prompt.contains("Do not exfiltrate private data"));
         assert!(prompt.contains("Do not run destructive commands"));
@@ -880,7 +951,7 @@ mod tests {
     #[test]
     fn prompt_injects_workspace_files() {
         let ws = make_workspace();
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, false);
 
         assert!(prompt.contains("### SOUL.md"), "missing SOUL.md header");
         assert!(prompt.contains("Be helpful"), "missing SOUL content");
@@ -901,7 +972,7 @@ mod tests {
     fn prompt_missing_file_markers() {
         let tmp = TempDir::new().unwrap();
         // Empty workspace — no files at all
-        let prompt = build_system_prompt(tmp.path(), "model", &[], &[], None);
+        let prompt = build_system_prompt(tmp.path(), "model", &[], &[], None, false);
 
         assert!(prompt.contains("[File not found: SOUL.md]"));
         assert!(prompt.contains("[File not found: AGENTS.md]"));
@@ -912,7 +983,7 @@ mod tests {
     fn prompt_bootstrap_only_if_exists() {
         let ws = make_workspace();
         // No BOOTSTRAP.md — should not appear
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, false);
         assert!(
             !prompt.contains("### BOOTSTRAP.md"),
             "BOOTSTRAP.md should not appear when missing"
@@ -920,7 +991,7 @@ mod tests {
 
         // Create BOOTSTRAP.md — should appear
         std::fs::write(ws.path().join("BOOTSTRAP.md"), "# Bootstrap\nFirst run.").unwrap();
-        let prompt2 = build_system_prompt(ws.path(), "model", &[], &[], None);
+        let prompt2 = build_system_prompt(ws.path(), "model", &[], &[], None, false);
         assert!(
             prompt2.contains("### BOOTSTRAP.md"),
             "BOOTSTRAP.md should appear when present"
@@ -940,7 +1011,7 @@ mod tests {
         )
         .unwrap();
 
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, false);
 
         // Daily notes should NOT be in the system prompt (on-demand via tools)
         assert!(
@@ -956,7 +1027,7 @@ mod tests {
     #[test]
     fn prompt_runtime_metadata() {
         let ws = make_workspace();
-        let prompt = build_system_prompt(ws.path(), "claude-sonnet-4", &[], &[], None);
+        let prompt = build_system_prompt(ws.path(), "claude-sonnet-4", &[], &[], None, false);
 
         assert!(prompt.contains("Model: claude-sonnet-4"));
         assert!(prompt.contains(&format!("OS: {}", std::env::consts::OS)));
@@ -977,7 +1048,7 @@ mod tests {
             location: None,
         }];
 
-        let prompt = build_system_prompt(ws.path(), "model", &[], &skills, None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &skills, None, false);
 
         assert!(prompt.contains("<available_skills>"), "missing skills XML");
         assert!(prompt.contains("<name>code-review</name>"));
@@ -998,7 +1069,7 @@ mod tests {
         let big_content = "x".repeat(BOOTSTRAP_MAX_CHARS + 1000);
         std::fs::write(ws.path().join("AGENTS.md"), &big_content).unwrap();
 
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, false);
 
         assert!(
             prompt.contains("truncated at"),
@@ -1015,7 +1086,7 @@ mod tests {
         let ws = make_workspace();
         std::fs::write(ws.path().join("TOOLS.md"), "").unwrap();
 
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, false);
 
         // Empty file should not produce a header
         assert!(
@@ -1027,7 +1098,7 @@ mod tests {
     #[test]
     fn prompt_workspace_path() {
         let ws = make_workspace();
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, false);
 
         assert!(prompt.contains(&format!("Working directory: `{}`", ws.path().display())));
     }
@@ -1157,7 +1228,7 @@ mod tests {
             aieos_inline: None,
         };
 
-        let prompt = build_system_prompt(tmp.path(), "model", &[], &[], Some(&config));
+        let prompt = build_system_prompt(tmp.path(), "model", &[], &[], Some(&config), false);
 
         // Should contain AIEOS sections
         assert!(prompt.contains("## Identity"));
@@ -1197,6 +1268,7 @@ mod tests {
             &[],
             &[],
             Some(&config),
+            false,
         );
 
         assert!(prompt.contains("**Name:** Claw"));
@@ -1214,7 +1286,7 @@ mod tests {
         };
 
         let ws = make_workspace();
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], Some(&config));
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], Some(&config), false);
 
         // Should fall back to OpenClaw format when AIEOS file is not found
         // (Error is logged to stderr with filename, not included in prompt)
@@ -1233,7 +1305,7 @@ mod tests {
         };
 
         let ws = make_workspace();
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], Some(&config));
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], Some(&config), false);
 
         // Should use OpenClaw format (not configured for AIEOS)
         assert!(prompt.contains("### SOUL.md"));
@@ -1251,7 +1323,7 @@ mod tests {
         };
 
         let ws = make_workspace();
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], Some(&config));
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], Some(&config), false);
 
         // Should use OpenClaw format even if aieos_path is set
         assert!(prompt.contains("### SOUL.md"));
@@ -1263,7 +1335,7 @@ mod tests {
     fn none_identity_config_uses_openclaw() {
         let ws = make_workspace();
         // Pass None for identity config
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, false);
 
         // Should use OpenClaw format
         assert!(prompt.contains("### SOUL.md"));

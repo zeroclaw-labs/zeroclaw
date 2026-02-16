@@ -1,4 +1,4 @@
-use crate::providers::traits::{ChatMessage, Provider};
+use crate::providers::traits::{ChatMessage, ChatResponse, Provider, ToolCall};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,8 @@ struct ChatRequest {
     model: String,
     messages: Vec<Message>,
     temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -29,11 +31,29 @@ struct ApiChatResponse {
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: ResponseMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ResponseMessage {
-    content: String,
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<ResponseToolCall>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponseToolCall {
+    id: String,
+    #[serde(rename = "type")]
+    call_type: String,
+    function: ResponseFunction,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponseFunction {
+    name: String,
+    arguments: String,
 }
 
 impl OpenRouterProvider {
@@ -93,6 +113,7 @@ impl Provider for OpenRouterProvider {
             model: model.to_string(),
             messages,
             temperature,
+            tools: None,
         };
 
         let response = self
@@ -118,7 +139,7 @@ impl Provider for OpenRouterProvider {
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message.content)
+            .map(|c| c.message.content.unwrap_or_default())
             .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))
     }
 
@@ -143,6 +164,7 @@ impl Provider for OpenRouterProvider {
             model: model.to_string(),
             messages: api_messages,
             temperature,
+            tools: None,
         };
 
         let response = self
@@ -168,7 +190,81 @@ impl Provider for OpenRouterProvider {
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message.content)
+            .map(|c| c.message.content.unwrap_or_default())
             .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))
+    }
+
+    async fn chat_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ChatResponse> {
+        let api_key = self.api_key.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var."))?;
+
+        let api_messages: Vec<Message> = messages
+            .iter()
+            .map(|m| Message {
+                role: m.role.clone(),
+                content: m.content.clone(),
+            })
+            .collect();
+
+        let tools_to_send = if tools.is_empty() {
+            None
+        } else {
+            Some(tools.to_vec())
+        };
+
+        let request = ChatRequest {
+            model: model.to_string(),
+            messages: api_messages,
+            temperature,
+            tools: tools_to_send,
+        };
+
+        let response = self
+            .client
+            .post("https://openrouter.ai/api/v1/chat/completions")
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header(
+                "HTTP-Referer",
+                "https://github.com/theonlyhennygod/zeroclaw",
+            )
+            .header("X-Title", "ZeroClaw")
+            .json(&request)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(super::api_error("OpenRouter", response).await);
+        }
+
+        let chat_response: ApiChatResponse = response.json().await?;
+
+        let choice = chat_response
+            .choices
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))?;
+
+        let text = choice.message.content.unwrap_or_default();
+        let tool_calls: Vec<ToolCall> = choice
+            .message
+            .tool_calls
+            .into_iter()
+            .map(|tc| ToolCall {
+                id: tc.id,
+                name: tc.function.name,
+                arguments: tc.function.arguments,
+            })
+            .collect();
+
+        Ok(ChatResponse {
+            text: if text.is_empty() { None } else { Some(text) },
+            tool_calls,
+        })
     }
 }

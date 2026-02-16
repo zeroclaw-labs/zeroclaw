@@ -11,17 +11,19 @@ pub struct DiscordChannel {
     guild_id: Option<String>,
     allowed_users: Vec<String>,
     listen_to_bots: bool,
+    mention_only: bool,
     client: reqwest::Client,
     typing_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl DiscordChannel {
-    pub fn new(bot_token: String, guild_id: Option<String>, allowed_users: Vec<String>, listen_to_bots: bool) -> Self {
+    pub fn new(bot_token: String, guild_id: Option<String>, allowed_users: Vec<String>, listen_to_bots: bool, mention_only: bool) -> Self {
         Self {
             bot_token,
             guild_id,
             allowed_users,
             listen_to_bots,
+            mention_only,
             client: reqwest::Client::new(),
             typing_handle: std::sync::Mutex::new(None),
         }
@@ -338,12 +340,28 @@ impl Channel for DiscordChannel {
                         continue;
                     }
 
+                    // Skip messages that don't @-mention the bot (when mention_only is enabled)
+                    if self.mention_only {
+                        let mention_tag = format!("<@{bot_user_id}>");
+                        if !content.contains(&mention_tag) {
+                            continue;
+                        }
+                    }
+
                     let channel_id = d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("").to_string();
+
+                    // Strip the bot mention from content so the agent sees clean text
+                    let clean_content = if self.mention_only {
+                        let mention_tag = format!("<@{bot_user_id}>");
+                        content.replace(&mention_tag, "").trim().to_string()
+                    } else {
+                        content.to_string()
+                    };
 
                     let channel_msg = ChannelMessage {
                         id: Uuid::new_v4().to_string(),
                         sender: channel_id,
-                        content: content.to_string(),
+                        content: clean_content,
                         channel: "discord".to_string(),
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)

@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{self, Observer, ObserverEvent};
-use crate::providers::{self, ChatMessage, Provider};
+use crate::providers::{self, ChatMessage, ChatResponse, Provider};
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
@@ -26,7 +26,7 @@ fn autosave_memory_key(prefix: &str) -> String {
 
 /// Trim conversation history to prevent unbounded growth.
 /// Preserves the system prompt (first message if role=system) and the most recent messages.
-fn trim_history(history: &mut Vec<ChatMessage>) {
+pub fn trim_history(history: &mut Vec<ChatMessage>) {
     // Nothing to trim if within limit
     let has_system = history.first().map_or(false, |m| m.role == "system");
     let non_system_count = if has_system {
@@ -259,7 +259,9 @@ struct ParsedToolCall {
 
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
-async fn agent_turn(
+///
+/// This is the core agentic loop used by both CLI and channel handlers.
+pub async fn agent_turn(
     provider: &dyn Provider,
     history: &mut Vec<ChatMessage>,
     tools_registry: &[Box<dyn Tool>],
@@ -267,17 +269,50 @@ async fn agent_turn(
     model: &str,
     temperature: f64,
 ) -> Result<String> {
+    // Convert tools to OpenAI function-calling format for native tool support
+    let tool_definitions = tools_to_openai_format(tools_registry);
+
     for _iteration in 0..MAX_TOOL_ITERATIONS {
-        let response = provider
-            .chat_with_history(history, model, temperature)
-            .await?;
+        // Use native tool-call API if tools are available
+        let chat_response = if tool_definitions.is_empty() {
+            let response = provider
+                .chat_with_history(history, model, temperature)
+                .await?;
+            ChatResponse {
+                text: Some(response),
+                tool_calls: vec![],
+            }
+        } else {
+            provider
+                .chat_with_tools(history, &tool_definitions, model, temperature)
+                .await?
+        };
 
-        let (text, tool_calls) = parse_tool_calls(&response);
+        let text = chat_response.text.unwrap_or_default();
 
-        if tool_calls.is_empty() {
+        // Parse tool calls from response (works for both native and prompt-based)
+        let parsed_calls = if chat_response.tool_calls.is_empty() {
+            // Fall back to prompt-based parsing if no native tool calls
+            let (txt, calls) = parse_tool_calls(&text);
+            // If we got text from parsing and response had no text, use parsed text
+            let final_text = if text.is_empty() { txt } else { text.clone() };
+            calls
+        } else {
+            // Convert native ToolCall (with String arguments) to ParsedToolCall (with JSON Value)
+            chat_response
+                .tool_calls
+                .iter()
+                .map(|tc| ParsedToolCall {
+                    name: tc.name.clone(),
+                    arguments: serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Object(Default::default())),
+                })
+                .collect()
+        };
+
+        if parsed_calls.is_empty() {
             // No tool calls — this is the final response
-            history.push(ChatMessage::assistant(&response));
-            return Ok(if text.is_empty() { response } else { text });
+            history.push(ChatMessage::assistant(&text));
+            return Ok(text);
         }
 
         // Print any text the LLM produced alongside tool calls
@@ -288,7 +323,7 @@ async fn agent_turn(
 
         // Execute each tool call and build results
         let mut tool_results = String::new();
-        for call in &tool_calls {
+        for call in &parsed_calls {
             let start = Instant::now();
             let result = if let Some(tool) = find_tool(tools_registry, &call.name) {
                 match tool.execute(call.arguments.clone()).await {
@@ -325,24 +360,48 @@ async fn agent_turn(
         }
 
         // Add assistant message with tool calls + tool results to history
-        history.push(ChatMessage::assistant(&response));
+        history.push(ChatMessage::assistant(&text));
         history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
     }
 
     anyhow::bail!("Agent exceeded maximum tool iterations ({MAX_TOOL_ITERATIONS})")
 }
 
+/// Convert a tool registry to OpenAI function-calling format for native tool support.
+pub fn tools_to_openai_format(tools_registry: &[Box<dyn Tool>]) -> Vec<serde_json::Value> {
+    tools_registry
+        .iter()
+        .map(|tool| {
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": tool.name(),
+                    "description": tool.description(),
+                    "parameters": tool.parameters_schema()
+                }
+            })
+        })
+        .collect()
+}
+
 /// Build the tool instruction block for the system prompt so the LLM knows
 /// how to invoke tools.
-fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> String {
+///
+/// This is used by both CLI and channel handlers to append structured
+/// tool-use instructions with parameter schemas to the system prompt.
+pub fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> String {
     let mut instructions = String::new();
     instructions.push_str("\n## Tool Use Protocol\n\n");
-    instructions.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
-    instructions.push_str("```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n```\n\n");
-    instructions.push_str("You may use multiple tool calls in a single response. ");
-    instructions.push_str("After tool execution, results appear in <tool_result> tags. ");
-    instructions
-        .push_str("Continue reasoning with the results until you can give a final answer.\n\n");
+    instructions.push_str("IMPORTANT: You MUST use tools by emitting XML tags. Do NOT describe what you would do — actually do it.\n\n");
+    instructions.push_str("To use a tool, output this EXACT format:\n\n");
+    instructions.push_str("<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n\n");
+    instructions.push_str("Rules:\n");
+    instructions.push_str("- ALWAYS use <tool_call> tags to invoke tools. Never just describe the action.\n");
+    instructions.push_str("- You may use multiple <tool_call> blocks in one response.\n");
+    instructions.push_str("- After tool execution, results appear in <tool_result> tags.\n");
+    instructions.push_str("- Continue reasoning with the results until you can give a final answer.\n");
+    instructions.push_str("- When a skill says to read a file, use file_read immediately — do not ask the user for the contents.\n");
+    instructions.push_str("- When a skill says to run a curl command, use the shell tool immediately.\n\n");
     instructions.push_str("### Available Tools\n\n");
 
     for tool in tools_registry {
@@ -476,6 +535,7 @@ pub async fn run(
         &tool_descs,
         &skills,
         Some(&config.identity),
+        false, // CLI mode: compact skill list, load on-demand
     );
 
     // Append structured tool-use instructions with schemas

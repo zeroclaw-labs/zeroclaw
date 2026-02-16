@@ -118,6 +118,28 @@ pub trait Provider: Send + Sync {
             .await
     }
 
+    /// Chat with tool definitions for native function calling support.
+    /// The default implementation falls back to chat_with_history and returns
+    /// an empty tool_calls vector (prompt-based tool use only).
+    async fn chat_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ChatResponse> {
+        // Default: just call chat_with_history and parse response for tool calls
+        // This maintains backward compatibility for providers without native tool support
+        let response = self.chat_with_history(messages, model, temperature).await?;
+        
+        // The response parsing for tool calls is handled by the agent loop
+        // via parse_tool_calls() which already supports OpenAI-style JSON
+        Ok(ChatResponse {
+            text: Some(response),
+            tool_calls: vec![],
+        })
+    }
+
     /// Warm up the HTTP connection pool (TLS handshake, DNS, HTTP/2 setup).
     /// Default implementation is a no-op; providers with HTTP clients should override.
     async fn warmup(&self) -> anyhow::Result<()> {
