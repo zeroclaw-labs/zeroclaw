@@ -672,18 +672,18 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     if let Some(ref irc) = config.channels_config.irc {
         channels.push((
             "IRC",
-            Arc::new(IrcChannel::new(
-                irc.server.clone(),
-                irc.port,
-                irc.nickname.clone(),
-                irc.username.clone(),
-                irc.channels.clone(),
-                irc.allowed_users.clone(),
-                irc.server_password.clone(),
-                irc.nickserv_password.clone(),
-                irc.sasl_password.clone(),
-                irc.verify_tls.unwrap_or(true),
-            )),
+            Arc::new(IrcChannel::new(irc::IrcChannelConfig {
+                server: irc.server.clone(),
+                port: irc.port,
+                nickname: irc.nickname.clone(),
+                username: irc.username.clone(),
+                channels: irc.channels.clone(),
+                allowed_users: irc.allowed_users.clone(),
+                server_password: irc.server_password.clone(),
+                nickserv_password: irc.nickserv_password.clone(),
+                sasl_password: irc.sasl_password.clone(),
+                verify_tls: irc.verify_tls.unwrap_or(true),
+            })),
         ));
     }
 
@@ -947,18 +947,18 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
 
     if let Some(ref irc) = config.channels_config.irc {
-        channels.push(Arc::new(IrcChannel::new(
-            irc.server.clone(),
-            irc.port,
-            irc.nickname.clone(),
-            irc.username.clone(),
-            irc.channels.clone(),
-            irc.allowed_users.clone(),
-            irc.server_password.clone(),
-            irc.nickserv_password.clone(),
-            irc.sasl_password.clone(),
-            irc.verify_tls.unwrap_or(true),
-        )));
+        channels.push(Arc::new(IrcChannel::new(irc::IrcChannelConfig {
+            server: irc.server.clone(),
+            port: irc.port,
+            nickname: irc.nickname.clone(),
+            username: irc.username.clone(),
+            channels: irc.channels.clone(),
+            allowed_users: irc.allowed_users.clone(),
+            server_password: irc.server_password.clone(),
+            nickserv_password: irc.nickserv_password.clone(),
+            sasl_password: irc.sasl_password.clone(),
+            verify_tls: irc.verify_tls.unwrap_or(true),
+        })));
     }
 
     if let Some(ref lk) = config.channels_config.lark {
