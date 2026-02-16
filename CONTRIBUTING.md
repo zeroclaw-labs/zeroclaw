@@ -6,7 +6,7 @@ Thanks for your interest in contributing to ZeroClaw! This guide will help you g
 
 ```bash
 # Clone the repo
-git clone https://github.com/theonlyhennygod/zeroclaw.git
+git clone https://github.com/zeroclaw-labs/zeroclaw.git
 cd zeroclaw
 
 # Enable the pre-push hook (runs fmt, clippy, tests before every push)
@@ -37,6 +37,38 @@ git push --no-verify
 
 > **Note:** CI runs the same checks, so skipped hooks will be caught on the PR.
 
+## Collaboration Tracks (Risk-Based)
+
+To keep review throughput high without lowering quality, every PR should map to one track:
+
+| Track | Typical scope | Required review depth |
+|---|---|---|
+| **Track A (Low risk)** | docs/tests/chore, isolated refactors, no security/runtime/CI impact | 1 maintainer review + green `CI Required Gate` |
+| **Track B (Medium risk)** | providers/channels/memory/tools behavior changes | 1 subsystem-aware review + explicit validation evidence |
+| **Track C (High risk)** | `src/security/**`, `src/runtime/**`, `.github/workflows/**`, access-control boundaries | 2-pass review (fast triage + deep risk review), rollback plan required |
+
+When in doubt, choose the higher track.
+
+## PR Definition of Ready (DoR)
+
+Before requesting review, ensure all of the following are true:
+
+- Scope is focused to a single concern.
+- `.github/pull_request_template.md` is fully completed.
+- Relevant local validation has been run (`fmt`, `clippy`, `test`, scenario checks).
+- Security impact and rollback path are explicitly described.
+- Linked issue (or rationale for no issue) is included.
+
+## PR Definition of Done (DoD)
+
+A PR is merge-ready when:
+
+- `CI Required Gate` is green.
+- Required reviewers approved (including CODEOWNERS paths).
+- Risk level matches changed paths (`risk: low/medium/high`).
+- User-visible behavior, migration, and rollback notes are complete.
+- Follow-up TODOs are explicit and tracked in issues.
+
 ## High-Volume Collaboration Rules
 
 When PR traffic is high (especially with AI-assisted contributions), these rules keep quality and throughput stable:
@@ -46,9 +78,11 @@ When PR traffic is high (especially with AI-assisted contributions), these rules
 - **Template is mandatory**: complete every section in `.github/pull_request_template.md`.
 - **Explicit rollback**: every PR must include a fast rollback path.
 - **Security-first review**: changes in `src/security/`, runtime, and CI need stricter validation.
+- **Risk-first triage**: use labels (`risk: high`, `risk: medium`, `risk: low`) to route review depth.
 
 Full maintainer workflow: [`docs/pr-workflow.md`](docs/pr-workflow.md).
 CI workflow ownership and triage map: [`docs/ci-map.md`](docs/ci-map.md).
+Reviewer operating checklist: [`docs/reviewer-playbook.md`](docs/reviewer-playbook.md).
 
 ## Agent Collaboration Guidance
 
@@ -215,7 +249,7 @@ impl Tool for YourTool {
 - [ ] PR template sections are completed (including security + rollback)
 - [ ] `cargo fmt --all -- --check` — code is formatted
 - [ ] `cargo clippy --all-targets -- -D warnings` — no warnings
-- [ ] `cargo test` — all 129+ tests pass
+- [ ] `cargo test` — all tests pass locally or skipped tests are explained
 - [ ] New code has inline `#[cfg(test)]` tests
 - [ ] No new dependencies unless absolutely necessary (we optimize for binary size)
 - [ ] README updated if adding user-facing features
@@ -256,8 +290,10 @@ Recommended scope keys in commit titles:
 ## Maintainer Merge Policy
 
 - Require passing `CI Required Gate` before merge.
+- Require docs quality checks when docs are touched.
 - Require review approval for non-trivial changes.
 - Require CODEOWNERS review for protected paths.
+- Use risk labels to determine review depth (Track A/B/C).
 - Prefer squash merge with conventional commit title.
 - Revert fast on regressions; re-land with tests.
 

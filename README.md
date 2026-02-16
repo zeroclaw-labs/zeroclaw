@@ -65,7 +65,7 @@ ls -lh target/release/zeroclaw
 ## Quick Start
 
 ```bash
-git clone https://github.com/theonlyhennygod/zeroclaw.git
+git clone https://github.com/zeroclaw-labs/zeroclaw.git
 cd zeroclaw
 cargo build --release
 cargo install --path . --force
@@ -436,6 +436,16 @@ To skip the hook when you need a quick push during development:
 ```bash
 git push --no-verify
 ```
+
+## Collaboration & Docs
+
+For high-throughput collaboration and consistent reviews:
+
+- Contribution guide: [CONTRIBUTING.md](CONTRIBUTING.md)
+- PR workflow policy: [docs/pr-workflow.md](docs/pr-workflow.md)
+- Reviewer playbook (triage + deep review): [docs/reviewer-playbook.md](docs/reviewer-playbook.md)
+- CI ownership and triage map: [docs/ci-map.md](docs/ci-map.md)
+- Security disclosure policy: [SECURITY.md](SECURITY.md)
 
 ## Support
 

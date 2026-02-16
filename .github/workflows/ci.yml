@@ -2,7 +2,7 @@ name: CI
 
 on:
     push:
-        branches: [main, develop]
+        branches: [main]
     pull_request:
         branches: [main]
 
@@ -22,6 +22,7 @@ jobs:
         runs-on: ubuntu-latest
         outputs:
             docs_only: ${{ steps.scope.outputs.docs_only }}
+            docs_changed: ${{ steps.scope.outputs.docs_changed }}
         steps:
             - uses: actions/checkout@v4
               with:
@@ -41,16 +42,19 @@ jobs:
 
                   if [ -z "$BASE" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
                     echo "docs_only=false" >> "$GITHUB_OUTPUT"
+                    echo "docs_changed=false" >> "$GITHUB_OUTPUT"
                     exit 0
                   fi
 
                   CHANGED="$(git diff --name-only "$BASE" HEAD || true)"
                   if [ -z "$CHANGED" ]; then
                     echo "docs_only=false" >> "$GITHUB_OUTPUT"
+                    echo "docs_changed=false" >> "$GITHUB_OUTPUT"
                     exit 0
                   fi
 
                   docs_only=true
+                  docs_changed=false
                   while IFS= read -r file; do
                     [ -z "$file" ] && continue
 
@@ -58,16 +62,18 @@ jobs:
                       || [[ "$file" == *.md ]] \
                       || [[ "$file" == *.mdx ]] \
                       || [[ "$file" == "LICENSE" ]] \
+                      || [[ "$file" == ".markdownlint-cli2.yaml" ]] \
                       || [[ "$file" == .github/ISSUE_TEMPLATE/* ]] \
                       || [[ "$file" == .github/pull_request_template.md ]]; then
+                      docs_changed=true
                       continue
                     fi
 
                     docs_only=false
-                    break
                   done <<< "$CHANGED"
 
                   echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+                  echo "docs_changed=$docs_changed" >> "$GITHUB_OUTPUT"
 
     lint:
         name: Format & Lint
@@ -129,10 +135,46 @@ jobs:
             - name: Skip heavy jobs for docs-only change
               run: echo "Docs-only change detected. Rust lint/test/build skipped."
 
+    docs-quality:
+        name: Docs Quality
+        needs: [changes]
+        if: needs.changes.outputs.docs_changed == 'true'
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Markdown lint
+              uses: DavidAnson/markdownlint-cli2-action@v20
+              with:
+                  globs: |
+                      README.md
+                      CONTRIBUTING.md
+                      docs/**/*.md
+                      docs/**/*.mdx
+                      .github/pull_request_template.md
+
+            - name: Link check (offline)
+              uses: lycheeverse/lychee-action@v2
+              with:
+                  fail: true
+                  args: >-
+                      --offline
+                      --no-progress
+                      --exclude-mail
+                      --format detailed
+                      README.md
+                      CONTRIBUTING.md
+                      docs/**/*.md
+                      docs/**/*.mdx
+                      .github/pull_request_template.md
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
     ci-required:
         name: CI Required Gate
         if: always()
-        needs: [changes, lint, test, build, docs-only]
+        needs: [changes, lint, test, build, docs-only, docs-quality]
         runs-on: ubuntu-latest
         steps:
             - name: Enforce required status
@@ -140,7 +182,15 @@ jobs:
               run: |
                   set -euo pipefail
 
+                  docs_changed="${{ needs.changes.outputs.docs_changed }}"
+                  docs_result="${{ needs.docs-quality.result }}"
+
                   if [ "${{ needs.changes.outputs.docs_only }}" = "true" ]; then
+                    echo "docs=${docs_result}"
+                    if [ "$docs_result" != "success" ]; then
+                      echo "Docs-only change requires docs-quality to pass."
+                      exit 1
+                    fi
                     echo "Docs-only fast path passed."
                     exit 0
                   fi
@@ -152,9 +202,15 @@ jobs:
                   echo "lint=${lint_result}"
                   echo "test=${test_result}"
                   echo "build=${build_result}"
+                  echo "docs=${docs_result}"
 
                   if [ "$lint_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ]; then
                     echo "Required CI jobs did not pass."
+                    exit 1
+                  fi
+
+                  if [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
+                    echo "Docs changed but docs-quality did not pass."
                     exit 1
                   fi
 
