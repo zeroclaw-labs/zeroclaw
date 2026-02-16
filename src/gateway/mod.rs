@@ -4492,6 +4492,7 @@ async fn handle_chat_socket(mut socket: ws::WebSocket, state: AppState, tenant: 
                         serde_json::json!({
                             "type": "run.completed",
                             "runId": format!("dup-{}", &request_id.chars().take(8).collect::<String>()),
+                            "requestId": request_id,
                             "chatId": req.session_id.clone(),
                             "status": "complete",
                             "durationMs": 0,
@@ -4552,6 +4553,7 @@ async fn handle_chat_socket(mut socket: ws::WebSocket, state: AppState, tenant: 
                 serde_json::json!({
                     "type": "run.started",
                     "runId": run_id,
+                    "requestId": request_id,
                     "chatId": chat_id,
                     "status": "thinking",
                     "message": "Processing..."
@@ -4638,6 +4640,7 @@ async fn handle_chat_socket(mut socket: ws::WebSocket, state: AppState, tenant: 
                         serde_json::json!({
                             "type": "run.completed",
                             "runId": run_id,
+                            "requestId": request_id,
                             "chatId": chat_id,
                             "status": "complete",
                             "message": assistant_text,
@@ -4674,6 +4677,7 @@ async fn handle_chat_socket(mut socket: ws::WebSocket, state: AppState, tenant: 
                         serde_json::json!({
                             "type": "error",
                             "runId": run_id,
+                            "requestId": request_id,
                             "chatId": chat_id,
                             "error": { "type": "server_error", "message": format!("LLM error: {e}") }
                         })
@@ -4695,6 +4699,7 @@ async fn handle_chat_socket(mut socket: ws::WebSocket, state: AppState, tenant: 
                         serde_json::json!({
                             "type": "run.completed",
                             "runId": run_id,
+                            "requestId": request_id,
                             "chatId": chat_id,
                             "status": "error",
                             "message": format!("LLM error: {e}"),
