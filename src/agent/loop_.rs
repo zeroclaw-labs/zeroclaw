@@ -542,6 +542,13 @@ pub async fn run(
         model_name,
     )?;
 
+    tracing::info!(
+        provider = provider_name,
+        model = model_name,
+        temperature,
+        "Agent runtime initialized"
+    );
+
     observer.record_event(&ObserverEvent::AgentStart {
         provider: provider_name.to_string(),
         model: model_name.to_string(),

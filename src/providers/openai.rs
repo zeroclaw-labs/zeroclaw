@@ -12,7 +12,16 @@ pub struct OpenAiProvider {
 struct ChatRequest {
     model: String,
     messages: Vec<Message>,
-    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+struct CompletionRequest {
+    model: String,
+    prompt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -27,8 +36,18 @@ struct ChatResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct CompletionResponse {
+    choices: Vec<CompletionChoice>,
+}
+
+#[derive(Debug, Deserialize)]
 struct Choice {
     message: ResponseMessage,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompletionChoice {
+    text: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,6 +66,32 @@ impl OpenAiProvider {
                 .unwrap_or_else(|_| Client::new()),
         }
     }
+
+    fn uses_text_completion_endpoint(model: &str) -> bool {
+        model.contains("search-api")
+    }
+
+    fn supports_custom_temperature(model: &str) -> bool {
+        // GPT-5 family currently only supports default temperature behavior.
+        !model.starts_with("gpt-5")
+    }
+
+    fn request_temperature(model: &str, temperature: f64) -> Option<f64> {
+        if Self::supports_custom_temperature(model) {
+            Some(temperature)
+        } else {
+            None
+        }
+    }
+
+    fn compose_prompt(system_prompt: Option<&str>, message: &str) -> String {
+        match system_prompt {
+            Some(system) if !system.trim().is_empty() => {
+                format!("System:\n{system}\n\nUser:\n{message}")
+            }
+            _ => message.to_string(),
+        }
+    }
 }
 
 #[async_trait]
@@ -61,6 +106,34 @@ impl Provider for OpenAiProvider {
         let api_key = self.api_key.as_ref().ok_or_else(|| {
             anyhow::anyhow!("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
         })?;
+
+        if Self::uses_text_completion_endpoint(model) {
+            let request = CompletionRequest {
+                model: model.to_string(),
+                prompt: Self::compose_prompt(system_prompt, message),
+                temperature: Self::request_temperature(model, temperature),
+            };
+
+            let response = self
+                .client
+                .post("https://api.openai.com/v1/completions")
+                .header("Authorization", format!("Bearer {api_key}"))
+                .json(&request)
+                .send()
+                .await?;
+
+            if !response.status().is_success() {
+                return Err(super::api_error("OpenAI", response).await);
+            }
+
+            let completion_response: CompletionResponse = response.json().await?;
+            return completion_response
+                .choices
+                .into_iter()
+                .next()
+                .map(|c| c.text)
+                .ok_or_else(|| anyhow::anyhow!("No response from OpenAI"));
+        }
 
         let mut messages = Vec::new();
 
@@ -79,7 +152,7 @@ impl Provider for OpenAiProvider {
         let request = ChatRequest {
             model: model.to_string(),
             messages,
-            temperature,
+            temperature: Self::request_temperature(model, temperature),
         };
 
         let response = self
@@ -158,7 +231,7 @@ mod tests {
                     content: "hello".to_string(),
                 },
             ],
-            temperature: 0.7,
+            temperature: Some(0.7),
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"role\":\"system\""));
@@ -174,7 +247,7 @@ mod tests {
                 role: "user".to_string(),
                 content: "hello".to_string(),
             }],
-            temperature: 0.0,
+            temperature: Some(0.0),
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("system"));
@@ -217,5 +290,36 @@ mod tests {
         let json = format!(r#"{{"choices":[{{"message":{{"content":"{long}"}}}}]}}"#);
         let resp: ChatResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(resp.choices[0].message.content.len(), 100_000);
+    }
+
+    #[test]
+    fn search_api_models_use_completions_endpoint() {
+        assert!(OpenAiProvider::uses_text_completion_endpoint(
+            "gpt-5-search-api"
+        ));
+        assert!(OpenAiProvider::uses_text_completion_endpoint(
+            "gpt-5-search-api-2025-10-14"
+        ));
+        assert!(!OpenAiProvider::uses_text_completion_endpoint("gpt-5"));
+    }
+
+    #[test]
+    fn compose_prompt_includes_system_when_present() {
+        let prompt = OpenAiProvider::compose_prompt(Some("Be concise"), "hello");
+        assert!(prompt.contains("System:\nBe concise"));
+        assert!(prompt.contains("User:\nhello"));
+    }
+
+    #[test]
+    fn gpt5_family_omits_temperature() {
+        assert_eq!(OpenAiProvider::request_temperature("gpt-5", 0.7), None);
+        assert_eq!(
+            OpenAiProvider::request_temperature("gpt-5.2-pro", 0.2),
+            None
+        );
+        assert_eq!(
+            OpenAiProvider::request_temperature("gpt-4o", 0.7),
+            Some(0.7)
+        );
     }
 }

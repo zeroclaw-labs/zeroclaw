@@ -50,6 +50,7 @@ const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
 struct ChannelRuntimeContext {
     channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
     provider: Arc<dyn Provider>,
+    provider_name: Arc<String>,
     memory: Arc<dyn Memory>,
     tools_registry: Arc<Vec<Box<dyn Tool>>>,
     observer: Arc<dyn Observer>,
@@ -185,6 +186,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             &mut history,
             ctx.tools_registry.as_ref(),
             ctx.observer.as_ref(),
+            ctx.provider_name.as_str(),
             ctx.model.as_str(),
             ctx.temperature,
         ),
@@ -677,8 +679,12 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 /// Start all configured channels and route messages to the agent
 #[allow(clippy::too_many_lines)]
 pub async fn start_channels(config: Config) -> Result<()> {
+    let provider_name = config
+        .default_provider
+        .clone()
+        .unwrap_or_else(|| "openrouter".to_string());
     let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider(
-        config.default_provider.as_deref().unwrap_or("openrouter"),
+        provider_name.as_str(),
         config.api_key.as_deref(),
         &config.reliability,
     )?);
@@ -721,6 +727,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         composio_key,
         &config.browser,
         &config.http_request,
+        &config.workspace_dir,
         &config.agents,
         config.api_key.as_deref(),
     ));
@@ -927,6 +934,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
         provider: Arc::clone(&provider),
+        provider_name: Arc::new(provider_name),
         memory: Arc::clone(&mem),
         tools_registry: Arc::clone(&tools_registry),
         observer,
@@ -1121,6 +1129,7 @@ mod tests {
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(ToolCallingProvider),
+            provider_name: Arc::new("test-provider".to_string()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
@@ -1211,6 +1220,7 @@ mod tests {
             provider: Arc::new(SlowProvider {
                 delay: Duration::from_millis(250),
             }),
+            provider_name: Arc::new("test-provider".to_string()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),

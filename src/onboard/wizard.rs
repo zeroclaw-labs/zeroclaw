@@ -410,7 +410,7 @@ pub fn run_quick_setup(
 fn default_model_for_provider(provider: &str) -> String {
     match provider {
         "anthropic" => "claude-sonnet-4-20250514".into(),
-        "openai" => "gpt-4o".into(),
+        "openai" => "gpt-5".into(),
         "glm" | "zhipu" | "zai" | "z.ai" => "glm-5".into(),
         "ollama" => "llama3.2".into(),
         "groq" => "llama-3.3-70b-versatile".into(),
@@ -567,7 +567,7 @@ fn setup_provider() -> Result<(String, String, String)> {
             .interact_text()?;
 
         let model: String = Input::new()
-            .with_prompt("  Model name (e.g. llama3, gpt-4o, mistral)")
+            .with_prompt("  Model name (e.g. llama3, gpt-5, mistral)")
             .default("default".into())
             .interact_text()?;
 
@@ -730,9 +730,36 @@ fn setup_provider() -> Result<(String, String, String)> {
             ),
         ],
         "openai" => vec![
-            ("gpt-4o", "GPT-4o (flagship)"),
-            ("gpt-4o-mini", "GPT-4o Mini (fast, cheap)"),
-            ("o1-mini", "o1-mini (reasoning)"),
+            ("gpt-5", "gpt-5"),
+            ("gpt-5-2025-08-07", "gpt-5-2025-08-07"),
+            ("gpt-5-chat-latest", "gpt-5-chat-latest"),
+            ("gpt-5-codex", "gpt-5-codex"),
+            ("gpt-5-mini", "gpt-5-mini"),
+            ("gpt-5-mini-2025-08-07", "gpt-5-mini-2025-08-07"),
+            ("gpt-5-nano", "gpt-5-nano"),
+            ("gpt-5-nano-2025-08-07", "gpt-5-nano-2025-08-07"),
+            ("gpt-5-pro", "gpt-5-pro"),
+            ("gpt-5-pro-2025-10-06", "gpt-5-pro-2025-10-06"),
+            (
+                "gpt-5-search-api",
+                "gpt-5-search-api (uses /v1/completions)",
+            ),
+            (
+                "gpt-5-search-api-2025-10-14",
+                "gpt-5-search-api-2025-10-14 (uses /v1/completions)",
+            ),
+            ("gpt-5.1", "gpt-5.1"),
+            ("gpt-5.1-2025-11-13", "gpt-5.1-2025-11-13"),
+            ("gpt-5.1-chat-latest", "gpt-5.1-chat-latest"),
+            ("gpt-5.1-codex", "gpt-5.1-codex"),
+            ("gpt-5.1-codex-max", "gpt-5.1-codex-max"),
+            ("gpt-5.1-codex-mini", "gpt-5.1-codex-mini"),
+            ("gpt-5.2", "gpt-5.2"),
+            ("gpt-5.2-2025-12-11", "gpt-5.2-2025-12-11"),
+            ("gpt-5.2-chat-latest", "gpt-5.2-chat-latest"),
+            ("gpt-5.2-codex", "gpt-5.2-codex"),
+            ("gpt-5.2-pro", "gpt-5.2-pro"),
+            ("gpt-5.2-pro-2025-12-11", "gpt-5.2-pro-2025-12-11"),
         ],
         "venice" => vec![
             ("llama-3.3-70b", "Llama 3.3 70B (default, fast)"),
