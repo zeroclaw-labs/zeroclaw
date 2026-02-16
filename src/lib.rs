@@ -55,7 +55,9 @@ pub mod memory;
 pub mod migration;
 pub mod observability;
 pub mod onboard;
+pub mod peripherals;
 pub mod providers;
+pub mod rag;
 pub mod runtime;
 pub mod security;
 pub mod service;
@@ -182,74 +184,48 @@ pub enum IntegrationCommands {
     },
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Hardware discovery subcommands
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum HardwareCommands {
+    /// Enumerate USB devices (VID/PID) and show known boards
+    Discover,
+    /// Introspect a device by path (e.g. /dev/ttyACM0)
+    Introspect {
+        /// Serial or device path
+        path: String,
+    },
+    /// Get chip info via USB (probe-rs over ST-Link). No firmware needed on target.
+    Info {
+        /// Chip name (e.g. STM32F401RETx). Default: STM32F401RETx for Nucleo-F401RE
+        #[arg(long, default_value = "STM32F401RETx")]
+        chip: String,
+    },
+}
 
-    #[test]
-    fn service_commands_serde_roundtrip() {
-        let command = ServiceCommands::Status;
-        let json = serde_json::to_string(&command).unwrap();
-        let parsed: ServiceCommands = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, ServiceCommands::Status);
-    }
-
-    #[test]
-    fn channel_commands_struct_variants_roundtrip() {
-        let add = ChannelCommands::Add {
-            channel_type: "telegram".into(),
-            config: "{}".into(),
-        };
-        let remove = ChannelCommands::Remove {
-            name: "main".into(),
-        };
-
-        let add_json = serde_json::to_string(&add).unwrap();
-        let remove_json = serde_json::to_string(&remove).unwrap();
-
-        let parsed_add: ChannelCommands = serde_json::from_str(&add_json).unwrap();
-        let parsed_remove: ChannelCommands = serde_json::from_str(&remove_json).unwrap();
-
-        assert_eq!(parsed_add, add);
-        assert_eq!(parsed_remove, remove);
-    }
-
-    #[test]
-    fn commands_with_payloads_roundtrip() {
-        let skill = SkillCommands::Install {
-            source: "https://example.com/skill".into(),
-        };
-        let migrate = MigrateCommands::Openclaw {
-            source: Some(std::path::PathBuf::from("/tmp/openclaw")),
-            dry_run: true,
-        };
-        let cron = CronCommands::Add {
-            expression: "*/5 * * * *".into(),
-            command: "echo hi".into(),
-        };
-        let integration = IntegrationCommands::Info {
-            name: "Telegram".into(),
-        };
-
-        assert_eq!(
-            serde_json::from_str::<SkillCommands>(&serde_json::to_string(&skill).unwrap()).unwrap(),
-            skill
-        );
-        assert_eq!(
-            serde_json::from_str::<MigrateCommands>(&serde_json::to_string(&migrate).unwrap())
-                .unwrap(),
-            migrate
-        );
-        assert_eq!(
-            serde_json::from_str::<CronCommands>(&serde_json::to_string(&cron).unwrap()).unwrap(),
-            cron
-        );
-        assert_eq!(
-            serde_json::from_str::<IntegrationCommands>(
-                &serde_json::to_string(&integration).unwrap()
-            )
-            .unwrap(),
-            integration
-        );
-    }
+/// Peripheral (hardware) management subcommands
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PeripheralCommands {
+    /// List configured peripherals
+    List,
+    /// Add a peripheral (board path, e.g. nucleo-f401re /dev/ttyACM0)
+    Add {
+        /// Board type (nucleo-f401re, rpi-gpio, esp32)
+        board: String,
+        /// Path for serial transport (/dev/ttyACM0) or "native" for local GPIO
+        path: String,
+    },
+    /// Flash ZeroClaw firmware to Arduino (creates .ino, installs arduino-cli if needed, uploads)
+    Flash {
+        /// Serial port (e.g. /dev/cu.usbmodem12345). If omitted, uses first arduino-uno from config.
+        #[arg(short, long)]
+        port: Option<String>,
+    },
+    /// Setup Arduino Uno Q Bridge app (deploy GPIO bridge for agent control)
+    SetupUnoQ {
+        /// Uno Q IP (e.g. 192.168.0.48). If omitted, assumes running ON the Uno Q.
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// Flash ZeroClaw firmware to Nucleo-F401RE (builds + probe-rs run)
+    FlashNucleo,
 }

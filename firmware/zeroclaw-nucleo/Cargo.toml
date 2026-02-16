@@ -1,0 +1,39 @@
+# ZeroClaw Nucleo-F401RE firmware — JSON-over-serial peripheral.
+#
+# Listens for newline-delimited JSON on USART2 (PA2/PA3, ST-Link VCP).
+# Protocol: same as Arduino/ESP32 — ping, capabilities, gpio_read, gpio_write.
+#
+# Build: cargo build --release
+# Flash: probe-rs run --chip STM32F401RETx target/thumbv7em-none-eabihf/release/zeroclaw-nucleo
+# Or: zeroclaw peripheral flash-nucleo
+
+[package]
+name = "zeroclaw-nucleo"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "ZeroClaw Nucleo-F401RE peripheral firmware — GPIO over JSON serial"
+
+[dependencies]
+embassy-executor = { version = "0.9", features = ["arch-cortex-m", "executor-thread", "defmt"] }
+embassy-stm32 = { version = "0.5", features = ["defmt", "stm32f401re", "unstable-pac", "memory-x", "time-driver-tim4", "exti"] }
+embassy-time = { version = "0.5", features = ["defmt", "defmt-timestamp-uptime", "tick-hz-32_768"] }
+defmt = "1.0"
+defmt-rtt = "1.0"
+panic-probe = { version = "1.0", features = ["print-defmt"] }
+heapless = { version = "0.9", default-features = false }
+critical-section = "1.1"
+cortex-m-rt = "0.7"
+
+[package.metadata.embassy]
+build = [
+    { target = "thumbv7em-none-eabihf", artifact-dir = "target" }
+]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+debug = 1
