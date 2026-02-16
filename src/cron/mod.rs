@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::{aria, CronCommands};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use cron::Schedule;
@@ -20,7 +21,7 @@ pub struct CronJob {
 
 pub fn handle_command(command: super::CronCommands, config: Config) -> Result<()> {
     match command {
-        super::CronCommands::List => {
+        CronCommands::List => {
             let jobs = list_jobs(&config)?;
             if jobs.is_empty() {
                 println!("No scheduled tasks yet.");
@@ -47,7 +48,12 @@ pub fn handle_command(command: super::CronCommands, config: Config) -> Result<()
             }
             Ok(())
         }
-        super::CronCommands::Add {
+        CronCommands::SyncAria => {
+            sync_from_aria(&config)?;
+            println!("✅ Synced active aria_cron_functions into runtime cron jobs");
+            Ok(())
+        }
+        CronCommands::Add {
             expression,
             command,
         } => {
@@ -58,8 +64,24 @@ pub fn handle_command(command: super::CronCommands, config: Config) -> Result<()
             println!("  Cmd : {}", job.command);
             Ok(())
         }
-        super::CronCommands::Remove { id } => remove_job(&config, &id),
+        CronCommands::Remove { id } => remove_job(&config, &id),
     }
+}
+
+pub fn sync_from_aria(config: &Config) -> Result<()> {
+    let aria_db = aria::db::AriaDb::open(&config.workspace_dir.join("aria.db"))?;
+    let add_cfg = config.clone();
+    let remove_cfg = config.clone();
+
+    let add_job_cb: aria::cron_bridge::AddJobFn = std::sync::Arc::new(move |expr, command| {
+        let job = add_job(&add_cfg, expr, command)?;
+        Ok(aria::cron_bridge::CronJobHandle { id: job.id })
+    });
+    let remove_job_cb: aria::cron_bridge::RemoveJobFn =
+        std::sync::Arc::new(move |job_id| remove_job(&remove_cfg, job_id));
+
+    let bridge = aria::cron_bridge::CronBridge::new(aria_db, add_job_cb, remove_job_cb);
+    bridge.sync_all()
 }
 
 pub fn add_job(config: &Config, expression: &str, command: &str) -> Result<CronJob> {

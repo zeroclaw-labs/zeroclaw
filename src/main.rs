@@ -198,6 +198,8 @@ enum MigrateCommands {
 enum CronCommands {
     /// List all scheduled tasks
     List,
+    /// Sync active Aria cron functions into runtime cron jobs
+    SyncAria,
     /// Add a new scheduled task
     Add {
         /// Cron expression
