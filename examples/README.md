@@ -6,8 +6,8 @@ These examples are intentionally practical and map to real runtime behavior in t
   Registry tool handler patterns (validation, timeout-safe fetch, strict output).
 - `examples/agents/`:
   Agent orchestration patterns using tools + memory.
-- `examples/feeds/`:
-  Live SDK feed examples for the canonical 24 feed card types.
+- `examples/feed/`:
+  Per-card-type feed examples (`examples/feed/<canonical-type>/...`) with strict metadata guidance.
 - `examples/cron/`:
   Scheduler jobs that execute feeds/tools on intervals.
 
