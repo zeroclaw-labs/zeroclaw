@@ -239,24 +239,79 @@ pub fn run_channels_repair_wizard() -> Result<Config> {
 /// Non-interactive setup: generates a sensible default config instantly.
 /// Use `zeroclaw onboard` or `zeroclaw onboard --api-key sk-... --provider openrouter --memory sqlite|lucid`.
 /// Use `zeroclaw onboard --interactive` for the full wizard.
-fn uses_sqlite_hygiene(backend: &str) -> bool {
-    matches!(backend, "sqlite" | "lucid")
+struct MemoryBackendOption {
+    key: &'static str,
+    label: &'static str,
+}
+
+const MEMORY_BACKEND_OPTIONS: [MemoryBackendOption; 4] = [
+    MemoryBackendOption {
+        key: "sqlite",
+        label: "SQLite with Vector Search (recommended) — fast, hybrid search, embeddings",
+    },
+    MemoryBackendOption {
+        key: "lucid",
+        label: "Lucid Memory bridge — sync with local lucid-memory CLI, keep SQLite fallback",
+    },
+    MemoryBackendOption {
+        key: "markdown",
+        label: "Markdown Files — simple, human-readable, no dependencies",
+    },
+    MemoryBackendOption {
+        key: "none",
+        label: "None — disable persistent memory",
+    },
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MemoryBackendProfile {
+    auto_save_default: bool,
+    uses_sqlite_hygiene: bool,
+}
+
+fn memory_backend_profile(backend: &str) -> MemoryBackendProfile {
+    match backend {
+        "sqlite" | "lucid" => MemoryBackendProfile {
+            auto_save_default: true,
+            uses_sqlite_hygiene: true,
+        },
+        "none" => MemoryBackendProfile {
+            auto_save_default: false,
+            uses_sqlite_hygiene: false,
+        },
+        _ => MemoryBackendProfile {
+            auto_save_default: true,
+            uses_sqlite_hygiene: false,
+        },
+    }
+}
+
+fn backend_key_from_choice(choice: usize) -> &'static str {
+    MEMORY_BACKEND_OPTIONS
+        .get(choice)
+        .map_or("sqlite", |backend| backend.key)
 }
 
 fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
+    let profile = memory_backend_profile(backend);
+
     MemoryConfig {
         backend: backend.to_string(),
-        auto_save: backend != "none",
-        hygiene_enabled: uses_sqlite_hygiene(backend),
-        archive_after_days: if uses_sqlite_hygiene(backend) { 7 } else { 0 },
-        purge_after_days: if uses_sqlite_hygiene(backend) { 30 } else { 0 },
+        auto_save: profile.auto_save_default,
+        hygiene_enabled: profile.uses_sqlite_hygiene,
+        archive_after_days: if profile.uses_sqlite_hygiene { 7 } else { 0 },
+        purge_after_days: if profile.uses_sqlite_hygiene { 30 } else { 0 },
         conversation_retention_days: 30,
         embedding_provider: "none".to_string(),
         embedding_model: "text-embedding-3-small".to_string(),
         embedding_dimensions: 1536,
         vector_weight: 0.7,
         keyword_weight: 0.3,
-        embedding_cache_size: if uses_sqlite_hygiene(backend) { 10000 } else { 0 },
+        embedding_cache_size: if profile.uses_sqlite_hygiene {
+            10000
+        } else {
+            0
+        },
         chunk_max_tokens: 512,
     }
 }
@@ -2160,12 +2215,10 @@ fn setup_memory() -> Result<MemoryConfig> {
     print_bullet("You can always change this later in config.toml.");
     println!();
 
-    let options = vec![
-        "SQLite with Vector Search (recommended) — fast, hybrid search, embeddings",
-        "Lucid Memory bridge — sync with local lucid-memory CLI, keep SQLite fallback",
-        "Markdown Files — simple, human-readable, no dependencies",
-        "None — disable persistent memory",
-    ];
+    let options: Vec<&str> = MEMORY_BACKEND_OPTIONS
+        .iter()
+        .map(|backend| backend.label)
+        .collect();
 
     let choice = Select::new()
         .with_prompt("  Select memory backend")
@@ -2173,21 +2226,16 @@ fn setup_memory() -> Result<MemoryConfig> {
         .default(0)
         .interact()?;
 
-    let backend = match choice {
-        1 => "lucid",
-        2 => "markdown",
-        3 => "none",
-        _ => "sqlite", // 0 and any unexpected value defaults to sqlite
-    };
+    let backend = backend_key_from_choice(choice);
+    let profile = memory_backend_profile(backend);
 
-    let auto_save = if backend == "none" {
+    let auto_save = if !profile.auto_save_default {
         false
     } else {
-        let save = Confirm::new()
+        Confirm::new()
             .with_prompt("  Auto-save conversations to memory?")
             .default(true)
-            .interact()?;
-        save
+            .interact()?
     };
 
     println!(
@@ -4329,11 +4377,31 @@ mod tests {
     }
 
     #[test]
-    fn uses_sqlite_hygiene_accepts_lucid_backend() {
-        assert!(uses_sqlite_hygiene("sqlite"));
-        assert!(uses_sqlite_hygiene("lucid"));
-        assert!(!uses_sqlite_hygiene("markdown"));
-        assert!(!uses_sqlite_hygiene("none"));
+    fn backend_key_from_choice_maps_supported_backends() {
+        assert_eq!(backend_key_from_choice(0), "sqlite");
+        assert_eq!(backend_key_from_choice(1), "lucid");
+        assert_eq!(backend_key_from_choice(2), "markdown");
+        assert_eq!(backend_key_from_choice(3), "none");
+        assert_eq!(backend_key_from_choice(999), "sqlite");
+    }
+
+    #[test]
+    fn memory_backend_profile_marks_lucid_as_optional_sqlite_backed() {
+        let lucid = memory_backend_profile("lucid");
+        assert!(lucid.auto_save_default);
+        assert!(lucid.uses_sqlite_hygiene);
+
+        let markdown = memory_backend_profile("markdown");
+        assert!(markdown.auto_save_default);
+        assert!(!markdown.uses_sqlite_hygiene);
+
+        let none = memory_backend_profile("none");
+        assert!(!none.auto_save_default);
+        assert!(!none.uses_sqlite_hygiene);
+
+        let custom = memory_backend_profile("custom-memory");
+        assert!(custom.auto_save_default);
+        assert!(!custom.uses_sqlite_hygiene);
     }
 
     #[test]

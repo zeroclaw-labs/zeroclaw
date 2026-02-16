@@ -286,29 +286,11 @@ impl LucidMemory {
 
     async fn sync_to_lucid_async(&self, key: &str, content: &str, category: &MemoryCategory) {
         let args = self.build_store_args(key, content, category);
-        let lucid_cmd = self.lucid_cmd.clone();
-        let timeout_window = self.store_timeout;
-
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::spawn(async move {
-                if let Err(error) =
-                    Self::run_lucid_command_raw(&lucid_cmd, &args, timeout_window).await
-                {
-                    tracing::debug!(
-                        command = %lucid_cmd,
-                        error = %error,
-                        "Lucid async store failed; sqlite remains authoritative"
-                    );
-                }
-            });
-            return;
-        }
-
-        if let Err(error) = Self::run_lucid_command_raw(&lucid_cmd, &args, timeout_window).await {
+        if let Err(error) = self.run_lucid_command(&args, self.store_timeout).await {
             tracing::debug!(
                 command = %self.lucid_cmd,
                 error = %error,
-                "Lucid sync failed; sqlite remains authoritative"
+                "Lucid store sync failed; sqlite remains authoritative"
             );
         }
     }
