@@ -1,4 +1,4 @@
-use crate::providers::traits::Provider;
+use crate::providers::traits::{ChatMessage, Provider};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -83,6 +83,26 @@ impl OpenAiProvider {
 
         serde_json::json!(messages)
     }
+
+    fn compose_input_from_history(messages: &[ChatMessage]) -> serde_json::Value {
+        let input: Vec<serde_json::Value> = messages
+            .iter()
+            .filter_map(|m| {
+                let text = m.content.trim();
+                if text.is_empty() {
+                    return None;
+                }
+                Some(serde_json::json!({
+                    "role": m.role,
+                    "content": [
+                        { "type": "input_text", "text": text }
+                    ]
+                }))
+            })
+            .collect();
+
+        serde_json::json!(input)
+    }
 }
 
 #[async_trait]
@@ -101,6 +121,55 @@ impl Provider for OpenAiProvider {
         let request = ResponsesRequest {
             model: model.to_string(),
             input: Self::compose_input(system_prompt, message),
+            temperature: Self::request_temperature(model, temperature),
+        };
+
+        let response = self
+            .client
+            .post("https://api.openai.com/v1/responses")
+            .header("Authorization", format!("Bearer {api_key}"))
+            .json(&request)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(super::api_error("OpenAI", response).await);
+        }
+
+        let responses_response: ResponsesResponse = response.json().await?;
+
+        if let Some(output_text) = responses_response.output_text {
+            if !output_text.trim().is_empty() {
+                return Ok(output_text);
+            }
+        }
+
+        for output_item in responses_response.output {
+            for content_item in output_item.content {
+                if let Some(text) = content_item.text {
+                    if !text.trim().is_empty() {
+                        return Ok(text);
+                    }
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!("No response from OpenAI"))
+    }
+
+    async fn chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<String> {
+        let api_key = self.api_key.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
+        })?;
+
+        let request = ResponsesRequest {
+            model: model.to_string(),
+            input: Self::compose_input_from_history(messages),
             temperature: Self::request_temperature(model, temperature),
         };
 
@@ -174,6 +243,19 @@ mod tests {
         let result = p
             .chat_with_system(Some("You are ZeroClaw"), "test", "gpt-4o", 0.5)
             .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn chat_with_history_fails_without_key() {
+        let p = OpenAiProvider::new(None);
+        let history = vec![
+            ChatMessage::system("You are ZeroClaw"),
+            ChatMessage::user("Hello"),
+            ChatMessage::assistant("Hi there"),
+            ChatMessage::user("What did I just say?"),
+        ];
+        let result = p.chat_with_history(&history, "gpt-4o", 0.5).await;
         assert!(result.is_err());
     }
 
@@ -252,6 +334,33 @@ mod tests {
         assert!(json.contains("\"text\":\"Be concise\""));
         assert!(json.contains("\"role\":\"user\""));
         assert!(json.contains("\"text\":\"hello\""));
+    }
+
+    #[test]
+    fn compose_input_from_history_preserves_roles_and_order() {
+        let history = vec![
+            ChatMessage::system("Be concise"),
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("hi"),
+            ChatMessage::user("continue"),
+        ];
+
+        let input = OpenAiProvider::compose_input_from_history(&history);
+        let json = serde_json::to_string(&input).unwrap();
+
+        assert!(json.contains("\"role\":\"system\""));
+        assert!(json.contains("\"role\":\"user\""));
+        assert!(json.contains("\"role\":\"assistant\""));
+        assert!(json.contains("\"text\":\"Be concise\""));
+        assert!(json.contains("\"text\":\"hello\""));
+        assert!(json.contains("\"text\":\"hi\""));
+        assert!(json.contains("\"text\":\"continue\""));
+
+        let parsed = input.as_array().unwrap();
+        assert_eq!(parsed[0]["role"], "system");
+        assert_eq!(parsed[1]["role"], "user");
+        assert_eq!(parsed[2]["role"], "assistant");
+        assert_eq!(parsed[3]["role"], "user");
     }
 
     #[test]
