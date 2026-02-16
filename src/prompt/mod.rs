@@ -228,7 +228,7 @@ impl SystemPromptBuilder {
              - Prefer precision over verbosity.\n\
              - Use tools proactively — don't ask the user to do what you can do yourself.\n\
              - Persist important context to memory for future sessions.\n\
-             - Respect workspace boundaries and security policies.\n\
+             - Respect active runtime security settings from config.\n\
              - When uncertain, explain your reasoning and ask before destructive actions.\n\n",
         );
     }
@@ -274,6 +274,8 @@ impl SystemPromptBuilder {
                 "Scope: workspace only (`{}`)",
                 self.workspace_dir.display()
             );
+        } else {
+            let _ = writeln!(prompt, "Scope: unrestricted filesystem access");
         }
 
         if !self.allowed_commands.is_empty() {
@@ -282,6 +284,8 @@ impl SystemPromptBuilder {
                 "Allowed commands: {}",
                 self.allowed_commands.join(", ")
             );
+        } else {
+            let _ = writeln!(prompt, "Allowed commands: unrestricted");
         }
 
         prompt.push('\n');

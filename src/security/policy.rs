@@ -168,6 +168,16 @@ impl SecurityPolicy {
             return false;
         }
 
+        let trimmed = command.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+
+        // Empty allowlist means unrestricted command execution.
+        if self.allowed_commands.is_empty() {
+            return true;
+        }
+
         // Block subshell/expansion operators — these allow hiding arbitrary
         // commands inside an allowed command (e.g. `echo $(rm -rf /)`)
         if command.contains('`') || command.contains("$(") || command.contains("${") {
@@ -220,12 +230,10 @@ impl SecurityPolicy {
         }
 
         // At least one command must be present
-        let has_cmd = normalized.split('\x00').any(|s| {
+        normalized.split('\x00').any(|s| {
             let s = skip_env_assignments(s.trim());
             s.split_whitespace().next().is_some_and(|w| !w.is_empty())
-        });
-
-        has_cmd
+        })
     }
 
     /// Check if a file path is allowed (no path traversal, within workspace)
@@ -235,8 +243,13 @@ impl SecurityPolicy {
             return false;
         }
 
-        // Block obvious traversal attempts
-        if path.contains("..") {
+        // With unrestricted policy, path checks are disabled.
+        if !self.workspace_only && self.forbidden_paths.is_empty() {
+            return true;
+        }
+
+        // Block obvious traversal attempts when scoped to workspace
+        if self.workspace_only && path.contains("..") {
             return false;
         }
 
@@ -258,6 +271,9 @@ impl SecurityPolicy {
     /// Validate that a resolved path is still inside the workspace.
     /// Call this AFTER joining `workspace_dir` + relative path and canonicalizing.
     pub fn is_resolved_path_allowed(&self, resolved: &Path) -> bool {
+        if !self.workspace_only {
+            return true;
+        }
         // Must be under workspace_dir (prevents symlink escapes).
         // Prefer canonical workspace root so `/a/../b` style config paths don't
         // cause false positives or negatives.
@@ -433,13 +449,13 @@ mod tests {
     }
 
     #[test]
-    fn empty_allowlist_blocks_everything() {
+    fn empty_allowlist_allows_any_command() {
         let p = SecurityPolicy {
             allowed_commands: vec![],
             ..SecurityPolicy::default()
         };
-        assert!(!p.is_command_allowed("ls"));
-        assert!(!p.is_command_allowed("echo hello"));
+        assert!(p.is_command_allowed("ls"));
+        assert!(p.is_command_allowed("echo hello"));
     }
 
     // ── is_path_allowed ─────────────────────────────────────
@@ -526,6 +542,24 @@ mod tests {
         assert_eq!(policy.max_actions_per_hour, 100);
         assert_eq!(policy.max_cost_per_day_cents, 1000);
         assert_eq!(policy.workspace_dir, PathBuf::from("/tmp/test-workspace"));
+    }
+
+    #[test]
+    fn from_config_empty_lists_enable_unrestricted_mode() {
+        let autonomy_config = crate::config::AutonomyConfig {
+            level: AutonomyLevel::Supervised,
+            workspace_only: false,
+            allowed_commands: vec![],
+            forbidden_paths: vec![],
+            max_actions_per_hour: 20,
+            max_cost_per_day_cents: 500,
+        };
+        let workspace = PathBuf::from("/tmp/test-workspace");
+        let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
+
+        assert!(policy
+            .is_command_allowed("find /Users/deepsaint/Desktop/financial-reports -maxdepth 1"));
+        assert!(policy.is_path_allowed("/Users/deepsaint/Desktop/financial-reports"));
     }
 
     // ── Default policy ──────────────────────────────────────

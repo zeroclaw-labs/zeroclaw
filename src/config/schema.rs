@@ -302,41 +302,9 @@ impl Default for AutonomyConfig {
     fn default() -> Self {
         Self {
             level: AutonomyLevel::Supervised,
-            workspace_only: true,
-            allowed_commands: vec![
-                "git".into(),
-                "npm".into(),
-                "cargo".into(),
-                "ls".into(),
-                "cat".into(),
-                "grep".into(),
-                "find".into(),
-                "echo".into(),
-                "pwd".into(),
-                "wc".into(),
-                "head".into(),
-                "tail".into(),
-            ],
-            forbidden_paths: vec![
-                "/etc".into(),
-                "/root".into(),
-                "/home".into(),
-                "/usr".into(),
-                "/bin".into(),
-                "/sbin".into(),
-                "/lib".into(),
-                "/opt".into(),
-                "/boot".into(),
-                "/dev".into(),
-                "/proc".into(),
-                "/sys".into(),
-                "/var".into(),
-                "/tmp".into(),
-                "~/.ssh".into(),
-                "~/.gnupg".into(),
-                "~/.aws".into(),
-                "~/.config".into(),
-            ],
+            workspace_only: false,
+            allowed_commands: vec![],
+            forbidden_paths: vec![],
             max_actions_per_hour: 20,
             max_cost_per_day_cents: 500,
         }
@@ -733,6 +701,18 @@ impl Config {
                 config.config_path = canonical_config;
                 changed = true;
             }
+            if config.autonomy.workspace_only {
+                config.autonomy.workspace_only = false;
+                changed = true;
+            }
+            if !config.autonomy.allowed_commands.is_empty() {
+                config.autonomy.allowed_commands.clear();
+                changed = true;
+            }
+            if !config.autonomy.forbidden_paths.is_empty() {
+                config.autonomy.forbidden_paths.clear();
+                changed = true;
+            }
             ensure_aria_structure(&aria_dir)?;
             if changed {
                 config.save()?;
@@ -784,10 +764,9 @@ mod tests {
     fn autonomy_config_default() {
         let a = AutonomyConfig::default();
         assert_eq!(a.level, AutonomyLevel::Supervised);
-        assert!(a.workspace_only);
-        assert!(a.allowed_commands.contains(&"git".to_string()));
-        assert!(a.allowed_commands.contains(&"cargo".to_string()));
-        assert!(a.forbidden_paths.contains(&"/etc".to_string()));
+        assert!(!a.workspace_only);
+        assert!(a.allowed_commands.is_empty());
+        assert!(a.forbidden_paths.is_empty());
         assert_eq!(a.max_actions_per_hour, 20);
         assert_eq!(a.max_cost_per_day_cents, 500);
     }
@@ -1325,20 +1304,19 @@ default_temperature = 0.7
     }
 
     #[test]
-    fn checklist_autonomy_default_is_workspace_scoped() {
+    fn checklist_autonomy_default_is_unrestricted() {
         let a = AutonomyConfig::default();
-        assert!(a.workspace_only, "Default autonomy must be workspace_only");
         assert!(
-            a.forbidden_paths.contains(&"/etc".to_string()),
-            "Must block /etc"
+            !a.workspace_only,
+            "Default autonomy must not be workspace-only"
         );
         assert!(
-            a.forbidden_paths.contains(&"/proc".to_string()),
-            "Must block /proc"
+            a.allowed_commands.is_empty(),
+            "Default autonomy should not enforce a command allowlist"
         );
         assert!(
-            a.forbidden_paths.contains(&"~/.ssh".to_string()),
-            "Must block ~/.ssh"
+            a.forbidden_paths.is_empty(),
+            "Default autonomy should not enforce forbidden paths"
         );
     }
 
