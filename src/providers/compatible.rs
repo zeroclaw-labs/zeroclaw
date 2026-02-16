@@ -48,8 +48,19 @@ impl OpenAiCompatibleProvider {
     /// This allows custom providers with non-standard endpoints (e.g., VolcEngine ARK uses
     /// `/api/coding/v3/chat/completions` instead of `/v1/chat/completions`).
     fn chat_completions_url(&self) -> String {
-        // If base_url already contains "chat/completions", use it as-is
-        if self.base_url.contains("chat/completions") {
+        let has_full_endpoint = reqwest::Url::parse(&self.base_url)
+            .map(|url| {
+                url.path()
+                    .trim_end_matches('/')
+                    .ends_with("/chat/completions")
+            })
+            .unwrap_or_else(|_| {
+                self.base_url
+                    .trim_end_matches('/')
+                    .ends_with("/chat/completions")
+            });
+
+        if has_full_endpoint {
             self.base_url.clone()
         } else {
             format!("{}/chat/completions", self.base_url)
@@ -615,6 +626,19 @@ mod tests {
         assert_eq!(
             p.chat_completions_url(),
             "https://my-api.example.com/v2/llm/chat/completions"
+        );
+    }
+
+    #[test]
+    fn chat_completions_url_requires_exact_suffix_match() {
+        let p = make_provider(
+            "custom",
+            "https://my-api.example.com/v2/llm/chat/completions-proxy",
+            None,
+        );
+        assert_eq!(
+            p.chat_completions_url(),
+            "https://my-api.example.com/v2/llm/chat/completions-proxy/chat/completions"
         );
     }
 
