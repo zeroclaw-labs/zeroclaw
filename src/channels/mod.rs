@@ -3,6 +3,7 @@ pub mod discord;
 pub mod email_channel;
 pub mod imessage;
 pub mod irc;
+pub mod lark;
 pub mod matrix;
 pub mod slack;
 pub mod telegram;
@@ -14,6 +15,7 @@ pub use discord::DiscordChannel;
 pub use email_channel::EmailChannel;
 pub use imessage::IMessageChannel;
 pub use irc::IrcChannel;
+pub use lark::LarkChannel;
 pub use matrix::MatrixChannel;
 pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
@@ -506,6 +508,7 @@ pub fn handle_command(command: crate::ChannelCommands, config: &Config) -> Resul
                 ("WhatsApp", config.channels_config.whatsapp.is_some()),
                 ("Email", config.channels_config.email.is_some()),
                 ("IRC", config.channels_config.irc.is_some()),
+                ("Lark", config.channels_config.lark.is_some()),
             ] {
                 println!("  {} {name}", if configured { "✅" } else { "❌" });
             }
@@ -631,6 +634,19 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 irc.nickserv_password.clone(),
                 irc.sasl_password.clone(),
                 irc.verify_tls.unwrap_or(true),
+            )),
+        ));
+    }
+
+    if let Some(ref lk) = config.channels_config.lark {
+        channels.push((
+            "Lark",
+            Arc::new(LarkChannel::new(
+                lk.app_id.clone(),
+                lk.app_secret.clone(),
+                lk.verification_token.clone().unwrap_or_default(),
+                9898,
+                lk.allowed_users.clone(),
             )),
         ));
     }
@@ -868,6 +884,16 @@ pub async fn start_channels(config: Config) -> Result<()> {
             irc.nickserv_password.clone(),
             irc.sasl_password.clone(),
             irc.verify_tls.unwrap_or(true),
+        )));
+    }
+
+    if let Some(ref lk) = config.channels_config.lark {
+        channels.push(Arc::new(LarkChannel::new(
+            lk.app_id.clone(),
+            lk.app_secret.clone(),
+            lk.verification_token.clone().unwrap_or_default(),
+            9898,
+            lk.allowed_users.clone(),
         )));
     }
 
