@@ -21,6 +21,24 @@ Selected allowlist patterns:
 - `EmbarkStudios/cargo-deny-action@*`
 - `rhysd/actionlint@*`
 - `softprops/action-gh-release@*`
+- `sigstore/cosign-installer@*`
+
+## Change Control Export
+
+Use these commands to export the current effective policy for audit/change control:
+
+```bash
+gh api repos/zeroclaw-labs/zeroclaw/actions/permissions
+gh api repos/zeroclaw-labs/zeroclaw/actions/permissions/selected-actions
+```
+
+Record each policy change with:
+
+- change date/time (UTC)
+- actor
+- reason
+- allowlist delta (added/removed patterns)
+- rollback note
 
 ## Why This Phase
 
@@ -52,6 +70,11 @@ Failure mode to watch for:
 - `action is not allowed by policy`
 
 If encountered, add only the specific trusted missing action, rerun, and document why.
+
+Latest sweep note (2026-02-16):
+
+- Hidden dependency discovered in `release.yml`: `sigstore/cosign-installer@...`
+- Added allowlist pattern: `sigstore/cosign-installer@*`
 
 ## Rollback
 
