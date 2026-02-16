@@ -78,6 +78,7 @@ Before requesting review, ensure all of the following are true:
 - Security impact and rollback path are explicitly described.
 - No personal/sensitive data is introduced in code/docs/tests/fixtures/logs/examples/commit messages.
 - Tests/fixtures/examples use neutral project-scoped wording (no identity-specific or first-person phrasing).
+- If identity-like wording is required, use ZeroClaw-centric labels only (for example: `ZeroClawAgent`, `ZeroClawOperator`, `zeroclaw_user`).
 - Linked issue (or rationale for no issue) is included.
 
 ## PR Definition of Done (DoD)
@@ -101,6 +102,7 @@ When PR traffic is high (especially with AI-assisted contributions), these rules
 - **Security-first review**: changes in `src/security/`, runtime, gateway, and CI need stricter validation.
 - **Risk-first triage**: use labels (`risk: high`, `risk: medium`, `risk: low`) to route review depth.
 - **Privacy-first hygiene**: redact/anonymize sensitive payloads and keep tests/examples neutral and project-scoped.
+- **Identity normalization**: when identity traits are unavoidable, use ZeroClaw/project-native roles instead of personal or real-world identities.
 - **Supersede hygiene**: if your PR replaces an older open PR, add `Supersedes #...` and request maintainers close the outdated one.
 
 Full maintainer workflow: [`docs/pr-workflow.md`](docs/pr-workflow.md).
@@ -280,6 +282,7 @@ impl Tool for YourTool {
 - [ ] Follows existing code patterns and conventions
 - [ ] No personal/sensitive data in code/docs/tests/fixtures/logs/examples/commit messages
 - [ ] Test names/messages/fixtures/examples are neutral and project-focused
+- [ ] Any required identity-like wording uses ZeroClaw/project-native labels only
 
 ## Commit Convention
 

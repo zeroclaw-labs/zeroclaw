@@ -42,6 +42,7 @@ If automated risk labeling is contextually wrong, maintainers can apply `risk: m
 - Rollback path is concrete (not just “revert”).
 - Compatibility/migration impacts are clear.
 - No personal/sensitive data leakage in diff artifacts; examples/tests remain neutral and project-scoped.
+- If identity-like wording exists, it uses ZeroClaw/project-native roles (not personal or real-world identities).
 
 ## 5) Deep Review Checklist (High Risk)
 

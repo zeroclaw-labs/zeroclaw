@@ -79,6 +79,7 @@ Maintain these branch protection rules on `main`:
 - Validation evidence attached (not just "CI will check").
 - Security and rollback fields completed for risky paths.
 - Privacy/data-hygiene checks are completed and test language is neutral/project-scoped.
+- If identity-like wording appears in tests/examples, it is normalized to ZeroClaw/project-native labels.
 
 ### Definition of Done (merge-ready)
 
@@ -214,6 +215,7 @@ To keep review quality stable under high PR volume, we use a two-lane review mod
 - Confirm risk class via labels and touched paths.
 - Confirm rollback statement exists.
 - Confirm privacy/data-hygiene checklist and neutral wording requirements are satisfied.
+- Confirm any required identity-like wording uses ZeroClaw/project-native terminology.
 
 ### Lane B: Deep review (risk-based)
 

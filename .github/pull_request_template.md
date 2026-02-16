@@ -71,6 +71,7 @@ If any command is intentionally skipped, explain why.
 - [ ] No personal/sensitive data in code/docs/tests/fixtures/logs/examples/commit messages.
 - [ ] Logs, payloads, screenshots, and reproductions are redacted/anonymized.
 - [ ] Test names/messages/fixtures/examples use neutral project-scoped wording (no identity-specific phrasing).
+- [ ] If identity-like wording is unavoidable, it uses ZeroClaw/project-native labels only.
 
 ## Compatibility / Migration
 
