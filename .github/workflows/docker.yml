@@ -61,7 +61,7 @@ jobs:
     publish:
         name: Build and Push Docker Image
         if: github.event_name == 'push'
-        runs-on: [self-hosted, Linux, X64, lxc-ci]
+        runs-on: blacksmith-2vcpu-ubuntu-2404
         timeout-minutes: 25
         permissions:
             contents: read
