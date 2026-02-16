@@ -2132,7 +2132,10 @@ default_temperature = 0.7
     fn lark_config_defaults_to_lark_endpoint() {
         let json = r#"{"app_id":"cli_123","app_secret":"secret"}"#;
         let parsed: LarkConfig = serde_json::from_str(json).unwrap();
-        assert!(!parsed.use_feishu, "use_feishu should default to false (Lark)");
+        assert!(
+            !parsed.use_feishu,
+            "use_feishu should default to false (Lark)"
+        );
     }
 
     #[test]
