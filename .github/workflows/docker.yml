@@ -62,7 +62,7 @@ jobs:
     publish:
         name: Build and Push Docker Image
         if: github.event_name == 'push'
-        runs-on: ubuntu-latest
+        runs-on: [self-hosted, Linux, X64, lxc-ci]
         timeout-minutes: 25
         permissions:
             contents: read
