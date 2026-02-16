@@ -690,6 +690,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
         config.autonomy.allowed_commands = vec!["cat".into()];
+        config.autonomy.forbidden_paths = vec!["/etc".into()];
         let job = test_job("cat /etc/passwd");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 

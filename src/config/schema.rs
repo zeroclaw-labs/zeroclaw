@@ -671,6 +671,28 @@ pub fn registry_db_path_for_workspace(workspace_dir: &Path) -> PathBuf {
     aria_root_dir_for_workspace(workspace_dir).join("aria.db")
 }
 
+fn first_env(keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn csv_env(keys: &[&str]) -> Option<Vec<String>> {
+    first_env(keys).map(|raw| {
+        raw.split(',')
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    })
+}
+
 impl Config {
     pub fn aria_root_dir(&self) -> PathBuf {
         aria_root_dir_for_workspace(&self.workspace_dir)
@@ -678,6 +700,65 @@ impl Config {
 
     pub fn registry_db_path(&self) -> PathBuf {
         registry_db_path_for_workspace(&self.workspace_dir)
+    }
+
+    pub fn apply_env_overrides(&mut self) {
+        if let Some(bot_token) = first_env(&["ARIA_TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_TOKEN"]) {
+            let tg = self
+                .channels_config
+                .telegram
+                .get_or_insert_with(|| TelegramConfig {
+                    bot_token: bot_token.clone(),
+                    allowed_users: vec![],
+                });
+            tg.bot_token = bot_token;
+            if let Some(allowed) =
+                csv_env(&["ARIA_TELEGRAM_ALLOWED_USERS", "TELEGRAM_ALLOWED_USERS"])
+            {
+                tg.allowed_users = allowed;
+            }
+        }
+
+        if let Some(bot_token) = first_env(&["ARIA_DISCORD_BOT_TOKEN", "DISCORD_BOT_TOKEN"]) {
+            let dc = self
+                .channels_config
+                .discord
+                .get_or_insert_with(|| DiscordConfig {
+                    bot_token: bot_token.clone(),
+                    guild_id: None,
+                    allowed_users: vec![],
+                });
+            dc.bot_token = bot_token;
+            if let Some(guild_id) = first_env(&["ARIA_DISCORD_GUILD_ID", "DISCORD_GUILD_ID"]) {
+                dc.guild_id = Some(guild_id);
+            }
+            if let Some(allowed) = csv_env(&["ARIA_DISCORD_ALLOWED_USERS", "DISCORD_ALLOWED_USERS"])
+            {
+                dc.allowed_users = allowed;
+            }
+        }
+
+        if let Some(bot_token) = first_env(&["ARIA_SLACK_BOT_TOKEN", "SLACK_BOT_TOKEN"]) {
+            let sl = self
+                .channels_config
+                .slack
+                .get_or_insert_with(|| SlackConfig {
+                    bot_token: bot_token.clone(),
+                    app_token: None,
+                    channel_id: None,
+                    allowed_users: vec![],
+                });
+            sl.bot_token = bot_token;
+            if let Some(app_token) = first_env(&["ARIA_SLACK_APP_TOKEN", "SLACK_APP_TOKEN"]) {
+                sl.app_token = Some(app_token);
+            }
+            if let Some(channel_id) = first_env(&["ARIA_SLACK_CHANNEL_ID", "SLACK_CHANNEL_ID"]) {
+                sl.channel_id = Some(channel_id);
+            }
+            if let Some(allowed) = csv_env(&["ARIA_SLACK_ALLOWED_USERS", "SLACK_ALLOWED_USERS"]) {
+                sl.allowed_users = allowed;
+            }
+        }
     }
 
     pub fn load_or_init() -> Result<Self> {

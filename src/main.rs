@@ -307,7 +307,7 @@ async fn main() -> Result<()> {
     }
 
     // All other commands need config loaded first
-    let config = Config::load_or_init()?;
+    let mut config = Config::load_or_init()?;
 
     // Also load `.env` from the persistent AFW config/workspace directories.
     // This keeps Quilt/API keys working even when the process isn't started from repo root.
@@ -315,6 +315,7 @@ async fn main() -> Result<()> {
         let _ = dotenvy::from_path(dir.join(".env"));
     }
     let _ = dotenvy::from_path(config.workspace_dir.join(".env"));
+    config.apply_env_overrides();
 
     match cli.command {
         Commands::Onboard { .. } => unreachable!(),
@@ -379,10 +380,12 @@ async fn main() -> Result<()> {
             println!();
             println!("Security:");
             println!("  Workspace only:    {}", config.autonomy.workspace_only);
-            println!(
-                "  Allowed commands:  {}",
+            let allowed_commands = if config.autonomy.allowed_commands.is_empty() {
+                "unrestricted".to_string()
+            } else {
                 config.autonomy.allowed_commands.join(", ")
-            );
+            };
+            println!("  Allowed commands:  {}", allowed_commands);
             println!(
                 "  Max actions/hour:  {}",
                 config.autonomy.max_actions_per_hour

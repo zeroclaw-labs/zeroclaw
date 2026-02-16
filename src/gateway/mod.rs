@@ -228,6 +228,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/channels", get(api_list_channels))
         .route("/api/channels/:id", patch(api_patch_channel))
         .route("/api/channels/:id", delete(api_delete_channel))
+        .route("/api/channels/telegram/connect", post(api_connect_telegram))
+        .route("/api/channels/telegram/bots", get(api_list_telegram_bots))
         .route("/api/cron", get(api_list_cron))
         .route("/api/cron/:id", patch(api_patch_cron))
         .route("/api/cron/:id", delete(api_delete_cron))
@@ -503,6 +505,12 @@ struct ApiPatchChannelBody {
 }
 
 #[derive(serde::Deserialize)]
+struct ApiConnectTelegramBody {
+    #[serde(rename = "allowedUsers")]
+    allowed_users: Option<Vec<String>>,
+}
+
+#[derive(serde::Deserialize)]
 struct ApiPatchSkillBody {
     enabled: Option<bool>,
 }
@@ -703,6 +711,9 @@ fn build_live_system_prompt(
     let prompt = crate::prompt::SystemPromptBuilder::new(&state.workspace_dir)
         .tools(&tool_descs)
         .skills(&descriptors)
+        .autonomy(state.security.autonomy)
+        .workspace_only(state.security.workspace_only)
+        .allowed_commands(&state.security.allowed_commands)
         .model(&state.model)
         .registry_tools_section(registry_tools_section)
         .registry_agents_section(registry_agents_section)
@@ -1830,11 +1841,90 @@ async fn api_get_status(State(state): State<AppState>, headers: HeaderMap) -> im
     }))
 }
 
+fn env_first(keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn provider_channel_defaults(config: &Config) -> [(&'static str, &'static str, bool); 3] {
+    [
+        (
+            "telegram",
+            "Telegram",
+            config.channels_config.telegram.is_some(),
+        ),
+        (
+            "discord",
+            "Discord",
+            config.channels_config.discord.is_some(),
+        ),
+        ("slack", "Slack", config.channels_config.slack.is_some()),
+    ]
+}
+
+fn sync_provider_channels(state: &AppState, tenant: &str) -> anyhow::Result<()> {
+    let mut config = Config::load_or_init()?;
+    config.apply_env_overrides();
+    let providers = provider_channel_defaults(&config);
+    let now = now_ms();
+
+    state.registry_db.with_conn(|conn| {
+        for (id, name, active) in providers {
+            let status = if active { "active" } else { "inactive" };
+            conn.execute(
+                "INSERT INTO channels (id, tenant_id, name, type, status, requests_per_min, endpoint, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, NULL, ?6, ?6)
+                 ON CONFLICT(id) DO UPDATE SET
+                   tenant_id=excluded.tenant_id,
+                   name=excluded.name,
+                   type=excluded.type,
+                   status=excluded.status,
+                   updated_at=excluded.updated_at",
+                rusqlite::params![id, tenant, name, id, status, now],
+            )?;
+        }
+        Ok(())
+    })
+}
+
+async fn telegram_get_me(bot_token: &str) -> std::result::Result<serde_json::Value, String> {
+    let url = format!("https://api.telegram.org/bot{bot_token}/getMe");
+    let resp = reqwest::Client::new()
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("Telegram getMe failed with {}", resp.status()));
+    }
+    let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    if !data
+        .get("ok")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        let msg = data
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown Telegram error");
+        return Err(msg.to_string());
+    }
+    Ok(data)
+}
+
 async fn api_list_channels(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let tenant = match api_tenant(&state, &headers) {
         Ok(t) => t,
         Err(e) => return e,
     };
+    let _ = sync_provider_channels(&state, &tenant);
     let res = state.registry_db.with_conn(|conn| {
         let mut stmt = conn.prepare(
             "SELECT id,name,type,status,requests_per_min,endpoint,created_at,updated_at
@@ -1870,8 +1960,14 @@ async fn api_patch_channel(
         Ok(t) => t,
         Err(e) => return e,
     };
+    let _ = sync_provider_channels(&state, &tenant);
     let status = body.status.unwrap_or_else(|| "active".to_string());
     let name = body.name.unwrap_or_else(|| id.clone());
+    let channel_type = if id == "telegram" || id == "discord" || id == "slack" {
+        id.clone()
+    } else {
+        "custom".to_string()
+    };
     let now = now_ms();
     let res = state.registry_db.with_conn(|conn| {
         let updated = conn.execute(
@@ -1881,8 +1977,8 @@ async fn api_patch_channel(
         if updated == 0 {
             conn.execute(
                 "INSERT INTO channels (id, tenant_id, name, type, status, requests_per_min, endpoint, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, 'custom', ?4, 0, NULL, ?5, ?5)",
-                rusqlite::params![id, tenant, name, status, now],
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, NULL, ?6, ?6)",
+                rusqlite::params![id, tenant, name, channel_type, status, now],
             )?;
         }
         Ok(())
@@ -1913,6 +2009,161 @@ async fn api_delete_channel(
         Ok(()) => api_ok(serde_json::json!({"id": id, "deleted": true})),
         Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
+}
+
+async fn api_connect_telegram(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ApiConnectTelegramBody>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+
+    let bot_token = match env_first(&["ARIA_TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_TOKEN"]) {
+        Some(token) => token,
+        None => {
+            return api_err(
+                StatusCode::BAD_REQUEST,
+                "Missing Telegram token in env. Set ARIA_TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN.",
+            );
+        }
+    };
+
+    let data = match telegram_get_me(&bot_token).await {
+        Ok(v) => v,
+        Err(e) => return api_err(StatusCode::BAD_REQUEST, e),
+    };
+
+    let username = data
+        .get("result")
+        .and_then(|r| r.get("username"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+
+    let mut config = match Config::load_or_init() {
+        Ok(cfg) => cfg,
+        Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    let allowed_users = body.allowed_users.unwrap_or_else(|| {
+        config
+            .channels_config
+            .telegram
+            .as_ref()
+            .map(|c| c.allowed_users.clone())
+            .unwrap_or_default()
+    });
+    config.channels_config.telegram = Some(crate::config::TelegramConfig {
+        bot_token,
+        allowed_users: allowed_users.clone(),
+    });
+    if let Err(e) = config.save() {
+        return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    }
+
+    let now = now_ms();
+    let upsert = state.registry_db.with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO channels (id, tenant_id, name, type, status, requests_per_min, endpoint, created_at, updated_at)
+             VALUES ('telegram', ?1, 'Telegram', 'telegram', 'active', 0, NULL, ?2, ?2)
+             ON CONFLICT(id) DO UPDATE SET
+               tenant_id=excluded.tenant_id,
+               name=excluded.name,
+               type=excluded.type,
+               status=excluded.status,
+               updated_at=excluded.updated_at",
+            rusqlite::params![tenant, now],
+        )?;
+        Ok(())
+    });
+    if let Err(e) = upsert {
+        return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    }
+
+    api_ok(serde_json::json!({
+      "connected": true,
+      "provider": "telegram",
+      "username": username,
+      "allowedUsers": allowed_users,
+      "source": "env"
+    }))
+}
+
+async fn api_list_telegram_bots(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let mut config = match Config::load_or_init() {
+        Ok(cfg) => cfg,
+        Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    config.apply_env_overrides();
+
+    let Some(tg) = config.channels_config.telegram.as_ref() else {
+        let _ = state.registry_db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO channels (id, tenant_id, name, type, status, requests_per_min, endpoint, created_at, updated_at)
+                 VALUES ('telegram', ?1, 'Telegram', 'telegram', 'inactive', 0, NULL, ?2, ?2)
+                 ON CONFLICT(id) DO UPDATE SET
+                   tenant_id=excluded.tenant_id,
+                   name=excluded.name,
+                   type=excluded.type,
+                   status=excluded.status,
+                   updated_at=excluded.updated_at",
+                rusqlite::params![tenant, now_ms()],
+            )?;
+            Ok(())
+        });
+        return api_ok(Vec::<serde_json::Value>::new());
+    };
+
+    let token_source = if env_first(&["ARIA_TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_TOKEN"]).is_some() {
+        "env"
+    } else {
+        "config"
+    };
+
+    let (username, status) = match telegram_get_me(&tg.bot_token).await {
+        Ok(v) => (
+            v.get("result")
+                .and_then(|r| r.get("username"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            "active",
+        ),
+        Err(_) => ("unknown".to_string(), "error"),
+    };
+
+    let _ = state.registry_db.with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO channels (id, tenant_id, name, type, status, requests_per_min, endpoint, created_at, updated_at)
+             VALUES ('telegram', ?1, 'Telegram', 'telegram', ?2, 0, NULL, ?3, ?3)
+             ON CONFLICT(id) DO UPDATE SET
+               tenant_id=excluded.tenant_id,
+               name=excluded.name,
+               type=excluded.type,
+               status=excluded.status,
+               updated_at=excluded.updated_at",
+            rusqlite::params![tenant, status, now_ms()],
+        )?;
+        Ok(())
+    });
+
+    api_ok(vec![serde_json::json!({
+      "id": "telegram-default",
+      "provider": "telegram",
+      "name": format!("@{username}"),
+      "username": username,
+      "status": status,
+      "allowedUsers": tg.allowed_users,
+      "source": token_source
+    })])
 }
 
 async fn api_list_cron(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {

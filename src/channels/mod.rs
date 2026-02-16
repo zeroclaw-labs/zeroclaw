@@ -148,7 +148,9 @@ fn classify_health_result(
 }
 
 /// Run health checks for configured channels.
-pub async fn doctor_channels(config: Config) -> Result<()> {
+pub async fn doctor_channels(mut config: Config) -> Result<()> {
+    config.apply_env_overrides();
+
     let mut channels: Vec<(&'static str, Arc<dyn Channel>)> = Vec::new();
 
     if let Some(ref tg) = config.channels_config.telegram {
@@ -258,6 +260,9 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 /// Start all configured channels and route messages to the agent
 #[allow(clippy::too_many_lines)]
 pub async fn start_channels(config: Config) -> Result<()> {
+    let mut config = config;
+    config.apply_env_overrides();
+
     let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider(
         config.default_provider.as_deref().unwrap_or("openrouter"),
         config.api_key.as_deref(),

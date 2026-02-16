@@ -53,7 +53,9 @@ fn install_status_persist_hook(event_db: crate::aria::db::AriaDb, tenant_fallbac
     ));
 }
 
-pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
+pub async fn run(mut config: Config, host: String, port: u16) -> Result<()> {
+    config.apply_env_overrides();
+
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config
         .reliability
