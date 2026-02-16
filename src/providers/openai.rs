@@ -9,43 +9,11 @@ pub struct OpenAiProvider {
 }
 
 #[derive(Debug, Serialize)]
-struct ChatRequest {
-    model: String,
-    messages: Vec<Message>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f64>,
-}
-
-#[derive(Debug, Serialize)]
-struct CompletionRequest {
-    model: String,
-    prompt: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f64>,
-}
-
-#[derive(Debug, Serialize)]
 struct ResponsesRequest {
     model: String,
-    input: String,
+    input: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
-}
-
-#[derive(Debug, Serialize)]
-struct Message {
-    role: String,
-    content: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChatResponse {
-    choices: Vec<Choice>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CompletionResponse {
-    choices: Vec<CompletionChoice>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,16 +22,6 @@ struct ResponsesResponse {
     output_text: Option<String>,
     #[serde(default)]
     output: Vec<ResponsesOutputItem>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Choice {
-    message: ResponseMessage,
-}
-
-#[derive(Debug, Deserialize)]
-struct CompletionChoice {
-    text: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,11 +35,6 @@ struct ResponsesContentItem {
     text: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ResponseMessage {
-    content: String,
-}
-
 impl OpenAiProvider {
     pub fn new(api_key: Option<&str>) -> Self {
         Self {
@@ -92,14 +45,6 @@ impl OpenAiProvider {
                 .build()
                 .unwrap_or_else(|_| Client::new()),
         }
-    }
-
-    fn uses_text_completion_endpoint(model: &str) -> bool {
-        model.contains("search-api")
-    }
-
-    fn uses_responses_endpoint(model: &str) -> bool {
-        model.contains("codex")
     }
 
     fn supports_custom_temperature(model: &str) -> bool {
@@ -115,13 +60,28 @@ impl OpenAiProvider {
         }
     }
 
-    fn compose_prompt(system_prompt: Option<&str>, message: &str) -> String {
-        match system_prompt {
-            Some(system) if !system.trim().is_empty() => {
-                format!("System:\n{system}\n\nUser:\n{message}")
+    fn compose_input(system_prompt: Option<&str>, message: &str) -> serde_json::Value {
+        let mut messages = vec![];
+
+        if let Some(system) = system_prompt {
+            if !system.trim().is_empty() {
+                messages.push(serde_json::json!({
+                    "role": "system",
+                    "content": [
+                        { "type": "text", "text": system }
+                    ]
+                }));
             }
-            _ => message.to_string(),
         }
+
+        messages.push(serde_json::json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": message }
+            ]
+        }));
+
+        serde_json::json!(messages)
     }
 }
 
@@ -138,97 +98,15 @@ impl Provider for OpenAiProvider {
             anyhow::anyhow!("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
         })?;
 
-        if Self::uses_responses_endpoint(model) {
-            let request = ResponsesRequest {
-                model: model.to_string(),
-                input: Self::compose_prompt(system_prompt, message),
-                temperature: Self::request_temperature(model, temperature),
-            };
-
-            let response = self
-                .client
-                .post("https://api.openai.com/v1/responses")
-                .header("Authorization", format!("Bearer {api_key}"))
-                .json(&request)
-                .send()
-                .await?;
-
-            if !response.status().is_success() {
-                return Err(super::api_error("OpenAI", response).await);
-            }
-
-            let responses_response: ResponsesResponse = response.json().await?;
-
-            if let Some(output_text) = responses_response.output_text {
-                if !output_text.trim().is_empty() {
-                    return Ok(output_text);
-                }
-            }
-
-            for output_item in responses_response.output {
-                for content_item in output_item.content {
-                    if let Some(text) = content_item.text {
-                        if !text.trim().is_empty() {
-                            return Ok(text);
-                        }
-                    }
-                }
-            }
-
-            return Err(anyhow::anyhow!("No response from OpenAI"));
-        }
-
-        if Self::uses_text_completion_endpoint(model) {
-            let request = CompletionRequest {
-                model: model.to_string(),
-                prompt: Self::compose_prompt(system_prompt, message),
-                temperature: Self::request_temperature(model, temperature),
-            };
-
-            let response = self
-                .client
-                .post("https://api.openai.com/v1/completions")
-                .header("Authorization", format!("Bearer {api_key}"))
-                .json(&request)
-                .send()
-                .await?;
-
-            if !response.status().is_success() {
-                return Err(super::api_error("OpenAI", response).await);
-            }
-
-            let completion_response: CompletionResponse = response.json().await?;
-            return completion_response
-                .choices
-                .into_iter()
-                .next()
-                .map(|c| c.text)
-                .ok_or_else(|| anyhow::anyhow!("No response from OpenAI"));
-        }
-
-        let mut messages = Vec::new();
-
-        if let Some(sys) = system_prompt {
-            messages.push(Message {
-                role: "system".to_string(),
-                content: sys.to_string(),
-            });
-        }
-
-        messages.push(Message {
-            role: "user".to_string(),
-            content: message.to_string(),
-        });
-
-        let request = ChatRequest {
+        let request = ResponsesRequest {
             model: model.to_string(),
-            messages,
+            input: Self::compose_input(system_prompt, message),
             temperature: Self::request_temperature(model, temperature),
         };
 
         let response = self
             .client
-            .post("https://api.openai.com/v1/chat/completions")
+            .post("https://api.openai.com/v1/responses")
             .header("Authorization", format!("Bearer {api_key}"))
             .json(&request)
             .send()
@@ -238,14 +116,25 @@ impl Provider for OpenAiProvider {
             return Err(super::api_error("OpenAI", response).await);
         }
 
-        let chat_response: ChatResponse = response.json().await?;
+        let responses_response: ResponsesResponse = response.json().await?;
 
-        chat_response
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| c.message.content)
-            .ok_or_else(|| anyhow::anyhow!("No response from OpenAI"))
+        if let Some(output_text) = responses_response.output_text {
+            if !output_text.trim().is_empty() {
+                return Ok(output_text);
+            }
+        }
+
+        for output_item in responses_response.output {
+            for content_item in output_item.content {
+                if let Some(text) = content_item.text {
+                    if !text.trim().is_empty() {
+                        return Ok(text);
+                    }
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!("No response from OpenAI"))
     }
 }
 
@@ -290,109 +179,79 @@ mod tests {
 
     #[test]
     fn request_serializes_with_system_message() {
-        let req = ChatRequest {
+        let req = ResponsesRequest {
             model: "gpt-4o".to_string(),
-            messages: vec![
-                Message {
-                    role: "system".to_string(),
-                    content: "You are ZeroClaw".to_string(),
-                },
-                Message {
-                    role: "user".to_string(),
-                    content: "hello".to_string(),
-                },
-            ],
+            input: OpenAiProvider::compose_input(Some("You are ZeroClaw"), "hello"),
             temperature: Some(0.7),
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"role\":\"system\""));
         assert!(json.contains("\"role\":\"user\""));
+        assert!(json.contains("\"type\":\"text\""));
+        assert!(json.contains("You are ZeroClaw"));
+        assert!(json.contains("\"text\":\"hello\""));
         assert!(json.contains("gpt-4o"));
     }
 
     #[test]
     fn request_serializes_without_system() {
-        let req = ChatRequest {
+        let req = ResponsesRequest {
             model: "gpt-4o".to_string(),
-            messages: vec![Message {
-                role: "user".to_string(),
-                content: "hello".to_string(),
-            }],
+            input: OpenAiProvider::compose_input(None, "hello"),
             temperature: Some(0.0),
         };
         let json = serde_json::to_string(&req).unwrap();
-        assert!(!json.contains("system"));
+        assert!(!json.contains("\"role\":\"system\""));
+        assert!(json.contains("\"role\":\"user\""));
+        assert!(json.contains("\"text\":\"hello\""));
         assert!(json.contains("\"temperature\":0.0"));
     }
 
     #[test]
-    fn response_deserializes_single_choice() {
-        let json = r#"{"choices":[{"message":{"content":"Hi!"}}]}"#;
-        let resp: ChatResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.choices.len(), 1);
-        assert_eq!(resp.choices[0].message.content, "Hi!");
+    fn response_deserializes_output_text() {
+        let json = r#"{"output_text":"Hi!"}"#;
+        let resp: ResponsesResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.output_text.as_deref(), Some("Hi!"));
     }
 
     #[test]
-    fn response_deserializes_empty_choices() {
-        let json = r#"{"choices":[]}"#;
-        let resp: ChatResponse = serde_json::from_str(json).unwrap();
-        assert!(resp.choices.is_empty());
+    fn response_deserializes_empty_output() {
+        let json = r#"{"output":[]}"#;
+        let resp: ResponsesResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.output.is_empty());
     }
 
     #[test]
-    fn response_deserializes_multiple_choices() {
-        let json = r#"{"choices":[{"message":{"content":"A"}},{"message":{"content":"B"}}]}"#;
-        let resp: ChatResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.choices.len(), 2);
-        assert_eq!(resp.choices[0].message.content, "A");
+    fn response_deserializes_output_content_text() {
+        let json = r#"{"output":[{"content":[{"text":"A"},{"text":"B"}]}]}"#;
+        let resp: ResponsesResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.output.len(), 1);
+        assert_eq!(resp.output[0].content[0].text.as_deref(), Some("A"));
     }
 
     #[test]
     fn response_with_unicode() {
-        let json = r#"{"choices":[{"message":{"content":"こんにちは 🦀"}}]}"#;
-        let resp: ChatResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.choices[0].message.content, "こんにちは 🦀");
+        let json = r#"{"output_text":"こんにちは 🦀"}"#;
+        let resp: ResponsesResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.output_text.as_deref(), Some("こんにちは 🦀"));
     }
 
     #[test]
     fn response_with_long_content() {
         let long = "x".repeat(100_000);
-        let json = format!(r#"{{"choices":[{{"message":{{"content":"{long}"}}}}]}}"#);
-        let resp: ChatResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(resp.choices[0].message.content.len(), 100_000);
+        let json = format!(r#"{{"output_text":"{long}"}}"#);
+        let resp: ResponsesResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp.output_text.unwrap().len(), 100_000);
     }
 
     #[test]
-    fn search_api_models_use_completions_endpoint() {
-        assert!(OpenAiProvider::uses_text_completion_endpoint(
-            "gpt-5-search-api"
-        ));
-        assert!(OpenAiProvider::uses_text_completion_endpoint(
-            "gpt-5-search-api-2025-10-14"
-        ));
-        assert!(!OpenAiProvider::uses_text_completion_endpoint(
-            "gpt-5.2-codex"
-        ));
-        assert!(!OpenAiProvider::uses_text_completion_endpoint(
-            "gpt-5.1-codex-max"
-        ));
-        assert!(!OpenAiProvider::uses_text_completion_endpoint("gpt-5"));
-    }
-
-    #[test]
-    fn codex_models_use_responses_endpoint() {
-        assert!(OpenAiProvider::uses_responses_endpoint("gpt-5.2-codex"));
-        assert!(OpenAiProvider::uses_responses_endpoint("gpt-5.1-codex-max"));
-        assert!(!OpenAiProvider::uses_responses_endpoint("gpt-5"));
-        assert!(!OpenAiProvider::uses_responses_endpoint("gpt-5-search-api"));
-    }
-
-    #[test]
-    fn compose_prompt_includes_system_when_present() {
-        let prompt = OpenAiProvider::compose_prompt(Some("Be concise"), "hello");
-        assert!(prompt.contains("System:\nBe concise"));
-        assert!(prompt.contains("User:\nhello"));
+    fn compose_input_includes_system_when_present() {
+        let input = OpenAiProvider::compose_input(Some("Be concise"), "hello");
+        let json = serde_json::to_string(&input).unwrap();
+        assert!(json.contains("\"role\":\"system\""));
+        assert!(json.contains("\"text\":\"Be concise\""));
+        assert!(json.contains("\"role\":\"user\""));
+        assert!(json.contains("\"text\":\"hello\""));
     }
 
     #[test]
