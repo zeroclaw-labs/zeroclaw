@@ -428,11 +428,20 @@ fn canonical_provider_name(provider_name: &str) -> &str {
 }
 
 /// Pick a sensible default model for the given provider.
+const MINIMAX_ONBOARD_MODELS: [(&str, &str); 5] = [
+    ("MiniMax-M2.5", "MiniMax M2.5 (latest, recommended)"),
+    ("MiniMax-M2.5-highspeed", "MiniMax M2.5 High-Speed (faster)"),
+    ("MiniMax-M2.1", "MiniMax M2.1 (stable)"),
+    ("MiniMax-M2.1-highspeed", "MiniMax M2.1 High-Speed (faster)"),
+    ("MiniMax-M2", "MiniMax M2 (legacy)"),
+];
+
 fn default_model_for_provider(provider: &str) -> String {
     match canonical_provider_name(provider) {
         "anthropic" => "claude-sonnet-4-20250514".into(),
         "openai" => "gpt-5.2".into(),
         "glm" | "zhipu" | "zai" | "z.ai" => "glm-5".into(),
+        "minimax" => "MiniMax-M2.5".into(),
         "ollama" => "llama3.2".into(),
         "groq" => "llama-3.3-70b-versatile".into(),
         "deepseek" => "deepseek-chat".into(),
@@ -1454,7 +1463,131 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
     };
 
     // ── Model selection ──
-    let mut model_options = curated_models_for_provider(provider_name);
+    let models: Vec<(&str, &str)> = match provider_name {
+        "openrouter" => vec![
+            (
+                "anthropic/claude-sonnet-4",
+                "Claude Sonnet 4 (balanced, recommended)",
+            ),
+            (
+                "anthropic/claude-3.5-sonnet",
+                "Claude 3.5 Sonnet (fast, affordable)",
+            ),
+            ("openai/gpt-4o", "GPT-4o (OpenAI flagship)"),
+            ("openai/gpt-4o-mini", "GPT-4o Mini (fast, cheap)"),
+            (
+                "google/gemini-2.0-flash-001",
+                "Gemini 2.0 Flash (Google, fast)",
+            ),
+            (
+                "meta-llama/llama-3.3-70b-instruct",
+                "Llama 3.3 70B (open source)",
+            ),
+            ("deepseek/deepseek-chat", "DeepSeek Chat (affordable)"),
+        ],
+        "anthropic" => vec![
+            (
+                "claude-sonnet-4-20250514",
+                "Claude Sonnet 4 (balanced, recommended)",
+            ),
+            ("claude-3-5-sonnet-20241022", "Claude 3.5 Sonnet (fast)"),
+            (
+                "claude-3-5-haiku-20241022",
+                "Claude 3.5 Haiku (fastest, cheapest)",
+            ),
+        ],
+        "openai" => vec![
+            ("gpt-4o", "GPT-4o (flagship)"),
+            ("gpt-4o-mini", "GPT-4o Mini (fast, cheap)"),
+            ("o1-mini", "o1-mini (reasoning)"),
+        ],
+        "venice" => vec![
+            ("llama-3.3-70b", "Llama 3.3 70B (default, fast)"),
+            ("claude-opus-45", "Claude Opus 4.5 via Venice (strongest)"),
+            ("llama-3.1-405b", "Llama 3.1 405B (largest open source)"),
+        ],
+        "groq" => vec![
+            (
+                "llama-3.3-70b-versatile",
+                "Llama 3.3 70B (fast, recommended)",
+            ),
+            ("llama-3.1-8b-instant", "Llama 3.1 8B (instant)"),
+            ("mixtral-8x7b-32768", "Mixtral 8x7B (32K context)"),
+        ],
+        "mistral" => vec![
+            ("mistral-large-latest", "Mistral Large (flagship)"),
+            ("codestral-latest", "Codestral (code-focused)"),
+            ("mistral-small-latest", "Mistral Small (fast, cheap)"),
+        ],
+        "deepseek" => vec![
+            ("deepseek-chat", "DeepSeek Chat (V3, recommended)"),
+            ("deepseek-reasoner", "DeepSeek Reasoner (R1)"),
+        ],
+        "xai" => vec![
+            ("grok-3", "Grok 3 (flagship)"),
+            ("grok-3-mini", "Grok 3 Mini (fast)"),
+        ],
+        "perplexity" => vec![
+            ("sonar-pro", "Sonar Pro (search + reasoning)"),
+            ("sonar", "Sonar (search, fast)"),
+        ],
+        "fireworks" => vec![
+            (
+                "accounts/fireworks/models/llama-v3p3-70b-instruct",
+                "Llama 3.3 70B",
+            ),
+            (
+                "accounts/fireworks/models/mixtral-8x22b-instruct",
+                "Mixtral 8x22B",
+            ),
+        ],
+        "together" => vec![
+            (
+                "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
+                "Llama 3.1 70B Turbo",
+            ),
+            (
+                "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+                "Llama 3.1 8B Turbo",
+            ),
+            ("mistralai/Mixtral-8x22B-Instruct-v0.1", "Mixtral 8x22B"),
+        ],
+        "cohere" => vec![
+            ("command-r-plus", "Command R+ (flagship)"),
+            ("command-r", "Command R (fast)"),
+        ],
+        "moonshot" => vec![
+            ("moonshot-v1-128k", "Moonshot V1 128K"),
+            ("moonshot-v1-32k", "Moonshot V1 32K"),
+        ],
+        "glm" | "zhipu" | "zai" | "z.ai" => vec![
+            ("glm-5", "GLM-5 (latest)"),
+            ("glm-4-plus", "GLM-4 Plus (flagship)"),
+            ("glm-4-flash", "GLM-4 Flash (fast)"),
+        ],
+        "minimax" => MINIMAX_ONBOARD_MODELS.to_vec(),
+        "ollama" => vec![
+            ("llama3.2", "Llama 3.2 (recommended local)"),
+            ("mistral", "Mistral 7B"),
+            ("codellama", "Code Llama"),
+            ("phi3", "Phi-3 (small, fast)"),
+        ],
+        "gemini" | "google" | "google-gemini" => vec![
+            ("gemini-2.0-flash", "Gemini 2.0 Flash (fast, recommended)"),
+            (
+                "gemini-2.0-flash-lite",
+                "Gemini 2.0 Flash Lite (fastest, cheapest)",
+            ),
+            ("gemini-1.5-pro", "Gemini 1.5 Pro (best quality)"),
+            ("gemini-1.5-flash", "Gemini 1.5 Flash (balanced)"),
+        ],
+        _ => vec![("default", "Default model")],
+    };
+
+    let mut model_options: Vec<(String, String)> = models
+        .into_iter()
+        .map(|(model_id, label)| (model_id.to_string(), label.to_string()))
+        .collect();
     let mut live_options: Option<Vec<(String, String)>> = None;
 
     if supports_live_model_fetch(provider_name) {
@@ -4205,5 +4338,21 @@ mod tests {
     #[test]
     fn provider_env_var_unknown_falls_back() {
         assert_eq!(provider_env_var("some-new-provider"), "API_KEY");
+    }
+
+    #[test]
+    fn default_model_for_minimax_is_m2_5() {
+        assert_eq!(default_model_for_provider("minimax"), "MiniMax-M2.5");
+    }
+
+    #[test]
+    fn minimax_onboard_models_include_m2_variants() {
+        let model_names: Vec<&str> = MINIMAX_ONBOARD_MODELS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(model_names.first().copied(), Some("MiniMax-M2.5"));
+        assert!(model_names.contains(&"MiniMax-M2.1"));
+        assert!(model_names.contains(&"MiniMax-M2.1-highspeed"));
     }
 }
