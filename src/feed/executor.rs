@@ -10,6 +10,7 @@ use crate::aria::types::{FeedCardType, FeedItem, FeedResult};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rusqlite::params;
+use serde::Deserialize;
 use serde_json::Value;
 use std::hash::{Hash, Hasher};
 use uuid::Uuid;
@@ -111,6 +112,28 @@ fn compute_item_key(card_type: &str, item: &FeedItem) -> Result<String> {
     Ok(format!("{card_type}|{basis}"))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+enum FeedRunSpec {
+    Tool {
+        tool: String,
+        prompt: String,
+    },
+    Agent {
+        agent: String,
+        prompt: String,
+    },
+    Team {
+        team: String,
+        objective: String,
+    },
+    Pipeline {
+        pipeline: String,
+        #[serde(default)]
+        variables: serde_json::Map<String, Value>,
+    },
+}
+
 impl FeedExecutor {
     pub fn new(db: AriaDb) -> Self {
         Self { db }
@@ -135,90 +158,67 @@ impl FeedExecutor {
     }
 
     async fn execute_feed_run_action(run: &Value) -> Value {
-        let run_obj = match run.as_object() {
-            Some(v) => v,
-            None => {
+        let spec = match serde_json::from_value::<FeedRunSpec>(run.clone()) {
+            Ok(spec) => spec,
+            Err(e) => {
                 return serde_json::json!({
                     "ok": false,
-                    "error": "metadata.run must be an object"
+                    "error": format!("invalid metadata.run contract: {e}")
                 });
             }
         };
-        let kind = run_obj
-            .get("kind")
-            .or_else(|| run_obj.get("type"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
 
-        let (path, payload) = match kind {
-            "tool" | "toolRun" => {
-                let tool = run_obj
-                    .get("tool")
-                    .or_else(|| run_obj.get("name"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let prompt = run_obj
-                    .get("prompt")
-                    .or_else(|| run_obj.get("input"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
+        let (path, payload) = match spec {
+            FeedRunSpec::Tool { tool, prompt } => {
+                if tool.trim().is_empty() || prompt.trim().is_empty() {
+                    return serde_json::json!({
+                        "ok": false,
+                        "error": "metadata.run(kind=tool) requires non-empty tool and prompt"
+                    });
+                }
                 (
                     "/api/v1/run/tool",
                     serde_json::json!({ "tool": tool, "prompt": prompt }),
                 )
             }
-            "agent" | "agentRun" => {
-                let agent = run_obj
-                    .get("agent")
-                    .or_else(|| run_obj.get("name"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let prompt = run_obj
-                    .get("prompt")
-                    .or_else(|| run_obj.get("input"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
+            FeedRunSpec::Agent { agent, prompt } => {
+                if agent.trim().is_empty() || prompt.trim().is_empty() {
+                    return serde_json::json!({
+                        "ok": false,
+                        "error": "metadata.run(kind=agent) requires non-empty agent and prompt"
+                    });
+                }
                 (
                     "/api/v1/run/agent",
                     serde_json::json!({ "agent": agent, "prompt": prompt }),
                 )
             }
-            "team" | "teamRun" => {
-                let team = run_obj
-                    .get("team")
-                    .or_else(|| run_obj.get("name"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let objective = run_obj
-                    .get("objective")
-                    .or_else(|| run_obj.get("input"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
+            FeedRunSpec::Team { team, objective } => {
+                if team.trim().is_empty() || objective.trim().is_empty() {
+                    return serde_json::json!({
+                        "ok": false,
+                        "error": "metadata.run(kind=team) requires non-empty team and objective"
+                    });
+                }
                 (
                     "/api/v1/run/team",
                     serde_json::json!({ "team": team, "objective": objective }),
                 )
             }
-            "pipeline" | "pipelineRun" => {
-                let pipeline = run_obj
-                    .get("pipeline")
-                    .or_else(|| run_obj.get("name"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let variables = run_obj
-                    .get("variables")
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!({}));
+            FeedRunSpec::Pipeline {
+                pipeline,
+                variables,
+            } => {
+                if pipeline.trim().is_empty() {
+                    return serde_json::json!({
+                        "ok": false,
+                        "error": "metadata.run(kind=pipeline) requires non-empty pipeline"
+                    });
+                }
                 (
                     "/api/v1/run/pipeline",
                     serde_json::json!({ "pipeline": pipeline, "variables": variables }),
                 )
-            }
-            _ => {
-                return serde_json::json!({
-                    "ok": false,
-                    "error": format!("unsupported metadata.run kind: {}", kind)
-                });
             }
         };
 
@@ -1323,6 +1323,74 @@ mod tests {
             error.contains("Quilt container runtime"),
             "Expected Quilt error message, got: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn run_action_rejects_legacy_alias_fields() {
+        let out = FeedExecutor::execute_feed_run_action(&serde_json::json!({
+            "kind": "tool",
+            "name": "shell",
+            "input": "echo hi"
+        }))
+        .await;
+        assert_eq!(out.get("ok").and_then(Value::as_bool), Some(false));
+        let err = out
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_lowercase();
+        assert!(err.contains("invalid metadata.run contract"));
+    }
+
+    #[tokio::test]
+    async fn run_action_rejects_unknown_kind_aliases() {
+        let out = FeedExecutor::execute_feed_run_action(&serde_json::json!({
+            "kind": "toolRun",
+            "tool": "shell",
+            "prompt": "echo hi"
+        }))
+        .await;
+        assert_eq!(out.get("ok").and_then(Value::as_bool), Some(false));
+        let err = out
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_lowercase();
+        assert!(err.contains("invalid metadata.run contract"));
+    }
+
+    #[tokio::test]
+    async fn run_action_rejects_empty_required_fields() {
+        let out = FeedExecutor::execute_feed_run_action(&serde_json::json!({
+            "kind": "agent",
+            "agent": "",
+            "prompt": "  "
+        }))
+        .await;
+        assert_eq!(out.get("ok").and_then(Value::as_bool), Some(false));
+        assert!(
+            out.get("error")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("requires non-empty agent and prompt")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_action_rejects_non_object_variables_for_pipeline() {
+        let out = FeedExecutor::execute_feed_run_action(&serde_json::json!({
+            "kind": "pipeline",
+            "pipeline": "p1",
+            "variables": 42
+        }))
+        .await;
+        assert_eq!(out.get("ok").and_then(Value::as_bool), Some(false));
+        let err = out
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_lowercase();
+        assert!(err.contains("invalid metadata.run contract"));
     }
 
     #[test]
