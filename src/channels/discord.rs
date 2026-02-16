@@ -41,13 +41,15 @@ impl DiscordChannel {
 
 const BASE64_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-/// Discord's maximum message length for regular messages
-const DISCORD_MAX_MESSAGE_LENGTH: usize = 4000;
+/// Discord's maximum message length for regular messages.
+///
+/// Discord rejects longer payloads with `50035 Invalid Form Body`.
+const DISCORD_MAX_MESSAGE_LENGTH: usize = 2000;
 
-/// Split a message into chunks that respect Discord's 4000 character limit.
-/// Tries to split at word boundaries when possible, and adds continuation markers.
+/// Split a message into chunks that respect Discord's 2000-character limit.
+/// Tries to split at word boundaries when possible.
 fn split_message_for_discord(message: &str) -> Vec<String> {
-    if message.len() <= DISCORD_MAX_MESSAGE_LENGTH {
+    if message.chars().count() <= DISCORD_MAX_MESSAGE_LENGTH {
         return vec![message.to_string()];
     }
 
@@ -55,26 +57,33 @@ fn split_message_for_discord(message: &str) -> Vec<String> {
     let mut remaining = message;
 
     while !remaining.is_empty() {
-        let chunk_end = if remaining.len() <= DISCORD_MAX_MESSAGE_LENGTH {
-            remaining.len()
+        // Find the byte offset for the 2000th character boundary.
+        // If there are fewer than 2000 chars left, we can emit the tail directly.
+        let hard_split = remaining
+            .char_indices()
+            .nth(DISCORD_MAX_MESSAGE_LENGTH)
+            .map_or(remaining.len(), |(idx, _)| idx);
+
+        let chunk_end = if hard_split == remaining.len() {
+            hard_split
         } else {
             // Try to find a good break point (newline, then space)
-            let search_area = &remaining[..DISCORD_MAX_MESSAGE_LENGTH];
+            let search_area = &remaining[..hard_split];
 
             // Prefer splitting at newline
             if let Some(pos) = search_area.rfind('\n') {
                 // Don't split if the newline is too close to the end
-                if pos >= DISCORD_MAX_MESSAGE_LENGTH / 2 {
+                if search_area[..pos].chars().count() >= DISCORD_MAX_MESSAGE_LENGTH / 2 {
                     pos + 1
                 } else {
                     // Try space as fallback
-                    search_area.rfind(' ').unwrap_or(DISCORD_MAX_MESSAGE_LENGTH) + 1
+                    search_area.rfind(' ').map_or(hard_split, |space| space + 1)
                 }
             } else if let Some(pos) = search_area.rfind(' ') {
                 pos + 1
             } else {
                 // Hard split at the limit
-                DISCORD_MAX_MESSAGE_LENGTH
+                hard_split
             }
         };
 
@@ -507,31 +516,31 @@ mod tests {
     }
 
     #[test]
-    fn split_message_exactly_4000_chars() {
-        let msg = "a".repeat(4000);
+    fn split_message_exactly_2000_chars() {
+        let msg = "a".repeat(DISCORD_MAX_MESSAGE_LENGTH);
         let chunks = split_message_for_discord(&msg);
         assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].len(), 4000);
+        assert_eq!(chunks[0].chars().count(), DISCORD_MAX_MESSAGE_LENGTH);
     }
 
     #[test]
     fn split_message_just_over_limit() {
-        let msg = "a".repeat(4001);
+        let msg = "a".repeat(DISCORD_MAX_MESSAGE_LENGTH + 1);
         let chunks = split_message_for_discord(&msg);
         assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].len(), 4000);
-        assert_eq!(chunks[1].len(), 1);
+        assert_eq!(chunks[0].chars().count(), DISCORD_MAX_MESSAGE_LENGTH);
+        assert_eq!(chunks[1].chars().count(), 1);
     }
 
     #[test]
     fn split_very_long_message() {
         let msg = "word ".repeat(2000); // 10000 characters (5 chars per "word ")
         let chunks = split_message_for_discord(&msg);
-        // Should split into 3 chunks: ~4000, ~4000, ~2000
-        assert_eq!(chunks.len(), 3);
-        assert!(chunks[0].len() <= 4000);
-        assert!(chunks[1].len() <= 4000);
-        assert!(chunks[2].len() <= 4000);
+        // Should split into 5 chunks of <= 2000 chars
+        assert_eq!(chunks.len(), 5);
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.chars().count() <= DISCORD_MAX_MESSAGE_LENGTH));
         // Verify total content is preserved
         let reconstructed = chunks.concat();
         assert_eq!(reconstructed, msg);
@@ -539,7 +548,7 @@ mod tests {
 
     #[test]
     fn split_prefer_newline_break() {
-        let msg = format!("{}\n{}", "a".repeat(3000), "b".repeat(2000));
+        let msg = format!("{}\n{}", "a".repeat(1500), "b".repeat(500));
         let chunks = split_message_for_discord(&msg);
         // Should split at the newline
         assert_eq!(chunks.len(), 2);
@@ -549,33 +558,34 @@ mod tests {
 
     #[test]
     fn split_prefer_space_break() {
-        let msg = format!("{} {}", "a".repeat(3000), "b".repeat(2000));
+        let msg = format!("{} {}", "a".repeat(1500), "b".repeat(600));
         let chunks = split_message_for_discord(&msg);
         assert_eq!(chunks.len(), 2);
     }
 
     #[test]
     fn split_without_good_break_points_hard_split() {
-        // No spaces or newlines - should hard split at 4000
+        // No spaces or newlines - should hard split at 2000
         let msg = "a".repeat(5000);
         let chunks = split_message_for_discord(&msg);
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].len(), 4000);
-        assert_eq!(chunks[1].len(), 1000);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].chars().count(), DISCORD_MAX_MESSAGE_LENGTH);
+        assert_eq!(chunks[1].chars().count(), DISCORD_MAX_MESSAGE_LENGTH);
+        assert_eq!(chunks[2].chars().count(), 1000);
     }
 
     #[test]
     fn split_multiple_breaks() {
         // Create a message with multiple newlines
-        let part1 = "a".repeat(1500);
-        let part2 = "b".repeat(1500);
-        let part3 = "c".repeat(1500);
+        let part1 = "a".repeat(900);
+        let part2 = "b".repeat(900);
+        let part3 = "c".repeat(900);
         let msg = format!("{part1}\n{part2}\n{part3}");
         let chunks = split_message_for_discord(&msg);
         // Should split into 2 chunks (first two parts + third part)
         assert_eq!(chunks.len(), 2);
-        assert!(chunks[0].len() <= 4000);
-        assert!(chunks[1].len() <= 4000);
+        assert!(chunks[0].chars().count() <= DISCORD_MAX_MESSAGE_LENGTH);
+        assert!(chunks[1].chars().count() <= DISCORD_MAX_MESSAGE_LENGTH);
     }
 
     #[test]
@@ -594,7 +604,7 @@ mod tests {
         // All chunks should be valid UTF-8
         for chunk in &chunks {
             assert!(std::str::from_utf8(chunk.as_bytes()).is_ok());
-            assert!(chunk.len() <= 4000);
+            assert!(chunk.chars().count() <= DISCORD_MAX_MESSAGE_LENGTH);
         }
         // Reconstruct and verify
         let reconstructed = chunks.concat();
@@ -604,10 +614,30 @@ mod tests {
     #[test]
     fn split_newline_too_close_to_end() {
         // If newline is in the first half, don't use it - use space instead or hard split
-        let msg = format!("{}\n{}", "a".repeat(3900), "b".repeat(2000));
+        let msg = format!("{}\n{}", "a".repeat(1900), "b".repeat(500));
         let chunks = split_message_for_discord(&msg);
-        // Should split at newline since it's > 2000 chars (half of 4000)
+        // Should split at newline since it's in the second half of the window
         assert_eq!(chunks.len(), 2);
+    }
+
+    #[test]
+    fn split_multibyte_only_content_without_panics() {
+        let msg = "你".repeat(2500);
+        let chunks = split_message_for_discord(&msg);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].chars().count(), DISCORD_MAX_MESSAGE_LENGTH);
+        assert_eq!(chunks[1].chars().count(), 500);
+        let reconstructed = chunks.concat();
+        assert_eq!(reconstructed, msg);
+    }
+
+    #[test]
+    fn split_chunks_always_within_discord_limit() {
+        let msg = "x".repeat(12_345);
+        let chunks = split_message_for_discord(&msg);
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.chars().count() <= DISCORD_MAX_MESSAGE_LENGTH));
     }
 
     #[test]
