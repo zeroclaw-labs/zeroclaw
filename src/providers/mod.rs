@@ -8,6 +8,7 @@ pub mod reliable;
 pub mod router;
 pub mod traits;
 
+#[allow(unused_imports)]
 pub use traits::{ChatMessage, ChatResponse, Provider, ToolCall};
 
 use compatible::{AuthStyle, OpenAiCompatibleProvider};
