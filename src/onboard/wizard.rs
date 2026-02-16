@@ -416,50 +416,59 @@ pub fn run_quick_setup(
     Ok(config)
 }
 
+fn canonical_provider_name(provider_name: &str) -> &str {
+    match provider_name {
+        "grok" => "xai",
+        "together" => "together-ai",
+        "google" | "google-gemini" => "gemini",
+        _ => provider_name,
+    }
+}
+
 /// Pick a sensible default model for the given provider.
 fn default_model_for_provider(provider: &str) -> String {
-    match provider {
+    match canonical_provider_name(provider) {
         "anthropic" => "claude-sonnet-4-20250514".into(),
-        "openai" => "gpt-5.1".into(),
+        "openai" => "gpt-5.2".into(),
         "glm" | "zhipu" | "zai" | "z.ai" => "glm-5".into(),
         "ollama" => "llama3.2".into(),
         "groq" => "llama-3.3-70b-versatile".into(),
         "deepseek" => "deepseek-chat".into(),
-        "gemini" | "google" | "google-gemini" => "gemini-2.5-pro".into(),
-        _ => "anthropic/claude-sonnet-4".into(),
+        "gemini" => "gemini-2.5-pro".into(),
+        _ => "anthropic/claude-sonnet-4.5".into(),
     }
 }
 
 fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
-    match provider_name {
+    match canonical_provider_name(provider_name) {
         "openrouter" => vec![
             (
-                "anthropic/claude-sonnet-4".to_string(),
-                "Claude Sonnet 4 (balanced, recommended)".to_string(),
+                "anthropic/claude-sonnet-4.5".to_string(),
+                "Claude Sonnet 4.5 (balanced, recommended)".to_string(),
             ),
             (
-                "openai/gpt-5.1".to_string(),
-                "GPT-5.1 (latest OpenAI flagship)".to_string(),
+                "openai/gpt-5.2".to_string(),
+                "GPT-5.2 (latest flagship)".to_string(),
             ),
             (
                 "openai/gpt-5-mini".to_string(),
                 "GPT-5 mini (fast, cost-efficient)".to_string(),
             ),
             (
-                "google/gemini-2.5-pro".to_string(),
-                "Gemini 2.5 Pro (reasoning)".to_string(),
+                "google/gemini-3-pro-preview".to_string(),
+                "Gemini 3 Pro Preview (frontier reasoning)".to_string(),
             ),
             (
-                "google/gemini-2.5-flash".to_string(),
-                "Gemini 2.5 Flash (speed/price)".to_string(),
+                "x-ai/grok-4.1-fast".to_string(),
+                "Grok 4.1 Fast (reasoning + speed)".to_string(),
             ),
             (
-                "meta-llama/llama-3.3-70b-instruct".to_string(),
-                "Llama 3.3 70B (open source)".to_string(),
+                "deepseek/deepseek-v3.2".to_string(),
+                "DeepSeek V3.2 (agentic + affordable)".to_string(),
             ),
             (
-                "deepseek/deepseek-chat".to_string(),
-                "DeepSeek Chat (affordable)".to_string(),
+                "meta-llama/llama-4-maverick".to_string(),
+                "Llama 4 Maverick (open model)".to_string(),
             ),
         ],
         "anthropic" => vec![
@@ -468,8 +477,8 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "Claude Sonnet 4 (balanced, recommended)".to_string(),
             ),
             (
-                "claude-opus-4-20250514".to_string(),
-                "Claude Opus 4 (best quality)".to_string(),
+                "claude-opus-4-1-20250805".to_string(),
+                "Claude Opus 4.1 (best quality)".to_string(),
             ),
             (
                 "claude-3-5-haiku-20241022".to_string(),
@@ -478,15 +487,21 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
         ],
         "openai" => vec![
             (
-                "gpt-5.1".to_string(),
-                "GPT-5.1 (latest coding/agentic flagship)".to_string(),
+                "gpt-5.2".to_string(),
+                "GPT-5.2 (latest coding/agentic flagship)".to_string(),
             ),
             (
                 "gpt-5-mini".to_string(),
                 "GPT-5 mini (faster, cheaper)".to_string(),
             ),
-            ("gpt-5".to_string(), "GPT-5 (previous flagship)".to_string()),
-            ("gpt-4o".to_string(), "GPT-4o (multimodal)".to_string()),
+            (
+                "gpt-5-nano".to_string(),
+                "GPT-5 nano (lowest latency/cost)".to_string(),
+            ),
+            (
+                "gpt-5.2-codex".to_string(),
+                "GPT-5.2 Codex (agentic coding)".to_string(),
+            ),
         ],
         "venice" => vec![
             (
@@ -508,50 +523,69 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "Llama 3.3 70B (fast, recommended)".to_string(),
             ),
             (
-                "moonshotai/kimi-k2-instruct-0905".to_string(),
-                "Kimi K2 0905 (high reasoning)".to_string(),
+                "openai/gpt-oss-120b".to_string(),
+                "GPT-OSS 120B (strong open-weight)".to_string(),
             ),
             (
-                "qwen/qwen3-32b".to_string(),
-                "Qwen3-32B (balanced)".to_string(),
+                "openai/gpt-oss-20b".to_string(),
+                "GPT-OSS 20B (cost-efficient open-weight)".to_string(),
             ),
         ],
         "mistral" => vec![
             (
-                "mistral-medium-latest".to_string(),
-                "Mistral Medium (frontier generalist)".to_string(),
+                "mistral-large-latest".to_string(),
+                "Mistral Large (latest flagship)".to_string(),
             ),
             (
-                "mistral-large-latest".to_string(),
-                "Mistral Large (high quality)".to_string(),
+                "mistral-medium-latest".to_string(),
+                "Mistral Medium (balanced)".to_string(),
             ),
             (
                 "codestral-latest".to_string(),
                 "Codestral (code-focused)".to_string(),
             ),
+            (
+                "devstral-latest".to_string(),
+                "Devstral (software engineering specialist)".to_string(),
+            ),
         ],
         "deepseek" => vec![
             (
                 "deepseek-chat".to_string(),
-                "DeepSeek Chat (V3, recommended)".to_string(),
+                "DeepSeek Chat (mapped to V3.2 non-thinking)".to_string(),
             ),
             (
                 "deepseek-reasoner".to_string(),
-                "DeepSeek Reasoner (R1)".to_string(),
+                "DeepSeek Reasoner (mapped to V3.2 thinking)".to_string(),
             ),
         ],
         "xai" => vec![
-            ("grok-4".to_string(), "Grok 4 (latest)".to_string()),
             (
-                "grok-3".to_string(),
-                "Grok 3 (broad compatibility)".to_string(),
+                "grok-4-1-fast-reasoning".to_string(),
+                "Grok 4.1 Fast Reasoning (recommended)".to_string(),
             ),
-            ("grok-3-mini".to_string(), "Grok 3 Mini (fast)".to_string()),
+            (
+                "grok-4-1-fast-non-reasoning".to_string(),
+                "Grok 4.1 Fast Non-Reasoning (low latency)".to_string(),
+            ),
+            (
+                "grok-code-fast-1".to_string(),
+                "Grok Code Fast 1 (coding specialist)".to_string(),
+            ),
+            ("grok-4".to_string(), "Grok 4 (max quality)".to_string()),
         ],
         "perplexity" => vec![
             (
                 "sonar-pro".to_string(),
-                "Sonar Pro (search + reasoning)".to_string(),
+                "Sonar Pro (flagship web-grounded model)".to_string(),
+            ),
+            (
+                "sonar-reasoning-pro".to_string(),
+                "Sonar Reasoning Pro (complex multi-step reasoning)".to_string(),
+            ),
+            (
+                "sonar-deep-research".to_string(),
+                "Sonar Deep Research (long-form research)".to_string(),
             ),
             ("sonar".to_string(), "Sonar (search, fast)".to_string()),
         ],
@@ -565,45 +599,72 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "Mixtral 8x22B".to_string(),
             ),
         ],
-        "together" => vec![
+        "together-ai" => vec![
             (
-                "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo".to_string(),
-                "Llama 3.1 70B Turbo".to_string(),
+                "meta-llama/Llama-3.3-70B-Instruct-Turbo".to_string(),
+                "Llama 3.3 70B Instruct Turbo (recommended)".to_string(),
             ),
             (
-                "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo".to_string(),
-                "Llama 3.1 8B Turbo".to_string(),
+                "moonshotai/Kimi-K2.5".to_string(),
+                "Kimi K2.5 (reasoning + coding)".to_string(),
             ),
             (
-                "mistralai/Mixtral-8x22B-Instruct-v0.1".to_string(),
-                "Mixtral 8x22B".to_string(),
+                "deepseek-ai/DeepSeek-V3.1".to_string(),
+                "DeepSeek V3.1 (strong value)".to_string(),
             ),
         ],
         "cohere" => vec![
             (
-                "command-r-plus".to_string(),
-                "Command R+ (flagship)".to_string(),
+                "command-a-03-2025".to_string(),
+                "Command A (flagship enterprise model)".to_string(),
             ),
-            ("command-r".to_string(), "Command R (fast)".to_string()),
+            (
+                "command-a-reasoning-08-2025".to_string(),
+                "Command A Reasoning (agentic reasoning)".to_string(),
+            ),
+            (
+                "command-r-08-2024".to_string(),
+                "Command R (stable fast baseline)".to_string(),
+            ),
         ],
         "moonshot" => vec![
             (
-                "moonshot-v1-128k".to_string(),
-                "Moonshot V1 128K".to_string(),
+                "kimi-latest".to_string(),
+                "Kimi Latest (rolling latest assistant model)".to_string(),
             ),
-            ("moonshot-v1-32k".to_string(), "Moonshot V1 32K".to_string()),
+            (
+                "kimi-k2-0905-preview".to_string(),
+                "Kimi K2 0905 Preview (strong coding)".to_string(),
+            ),
+            (
+                "kimi-thinking-preview".to_string(),
+                "Kimi Thinking Preview (deep reasoning)".to_string(),
+            ),
         ],
         "glm" | "zhipu" | "zai" | "z.ai" => vec![
-            ("glm-5".to_string(), "GLM-5 (latest)".to_string()),
+            (
+                "glm-4.7".to_string(),
+                "GLM-4.7 (latest flagship)".to_string(),
+            ),
+            ("glm-5".to_string(), "GLM-5 (high reasoning)".to_string()),
             (
                 "glm-4-plus".to_string(),
-                "GLM-4 Plus (flagship)".to_string(),
+                "GLM-4 Plus (stable baseline)".to_string(),
             ),
-            ("glm-4-flash".to_string(), "GLM-4 Flash (fast)".to_string()),
         ],
         "minimax" => vec![
-            ("abab6.5s-chat".to_string(), "ABAB 6.5s Chat".to_string()),
-            ("abab6.5-chat".to_string(), "ABAB 6.5 Chat".to_string()),
+            (
+                "MiniMax-M2.5".to_string(),
+                "MiniMax M2.5 (latest flagship)".to_string(),
+            ),
+            (
+                "MiniMax-M2.1".to_string(),
+                "MiniMax M2.1 (strong coding/reasoning)".to_string(),
+            ),
+            (
+                "MiniMax-M2.1-lightning".to_string(),
+                "MiniMax M2.1 Lightning (fast)".to_string(),
+            ),
         ],
         "ollama" => vec![
             (
@@ -614,18 +675,22 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
             ("codellama".to_string(), "Code Llama".to_string()),
             ("phi3".to_string(), "Phi-3 (small, fast)".to_string()),
         ],
-        "gemini" | "google" | "google-gemini" => vec![
+        "gemini" => vec![
+            (
+                "gemini-3-pro-preview".to_string(),
+                "Gemini 3 Pro Preview (latest frontier reasoning)".to_string(),
+            ),
             (
                 "gemini-2.5-pro".to_string(),
-                "Gemini 2.5 Pro (state-of-the-art reasoning)".to_string(),
+                "Gemini 2.5 Pro (stable reasoning)".to_string(),
             ),
             (
                 "gemini-2.5-flash".to_string(),
                 "Gemini 2.5 Flash (best price/performance)".to_string(),
             ),
             (
-                "gemini-2.5-flash-lite-preview-09-2025".to_string(),
-                "Gemini 2.5 Flash Lite (preview, lowest cost)".to_string(),
+                "gemini-2.5-flash-lite".to_string(),
+                "Gemini 2.5 Flash-Lite (lowest cost)".to_string(),
             ),
         ],
         _ => vec![("default".to_string(), "Default model".to_string())],
@@ -634,7 +699,7 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
 
 fn supports_live_model_fetch(provider_name: &str) -> bool {
     matches!(
-        provider_name,
+        canonical_provider_name(provider_name),
         "openrouter"
             | "openai"
             | "anthropic"
@@ -642,12 +707,8 @@ fn supports_live_model_fetch(provider_name: &str) -> bool {
             | "mistral"
             | "deepseek"
             | "xai"
-            | "grok"
-            | "together"
             | "together-ai"
             | "gemini"
-            | "google"
-            | "google-gemini"
             | "ollama"
     )
 }
@@ -820,6 +881,7 @@ fn fetch_ollama_models() -> Result<Vec<String>> {
 }
 
 fn fetch_live_models_for_provider(provider_name: &str, api_key: &str) -> Result<Vec<String>> {
+    let provider_name = canonical_provider_name(provider_name);
     let api_key = if api_key.trim().is_empty() {
         std::env::var(provider_env_var(provider_name))
             .ok()
@@ -845,15 +907,13 @@ fn fetch_live_models_for_provider(provider_name: &str, api_key: &str) -> Result<
             "https://api.deepseek.com/v1/models",
             api_key.as_deref(),
         )?,
-        "xai" | "grok" => {
-            fetch_openai_compatible_models("https://api.x.ai/v1/models", api_key.as_deref())?
-        }
-        "together" | "together-ai" => fetch_openai_compatible_models(
+        "xai" => fetch_openai_compatible_models("https://api.x.ai/v1/models", api_key.as_deref())?,
+        "together-ai" => fetch_openai_compatible_models(
             "https://api.together.xyz/v1/models",
             api_key.as_deref(),
         )?,
         "anthropic" => fetch_anthropic_models(api_key.as_deref())?,
-        "gemini" | "google" | "google-gemini" => fetch_gemini_models(api_key.as_deref())?,
+        "gemini" => fetch_gemini_models(api_key.as_deref())?,
         "ollama" => fetch_ollama_models()?,
         _ => Vec::new(),
     };
@@ -1218,7 +1278,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
         1 => vec![
             ("groq", "Groq — ultra-fast LPU inference"),
             ("fireworks", "Fireworks AI — fast open-source inference"),
-            ("together", "Together AI — open-source model hosting"),
+            ("together-ai", "Together AI — open-source model hosting"),
         ],
         2 => vec![
             ("vercel", "Vercel AI Gateway"),
@@ -1296,10 +1356,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
     let api_key = if provider_name == "ollama" {
         print_bullet("Ollama runs locally — no API key needed!");
         String::new()
-    } else if provider_name == "gemini"
-        || provider_name == "google"
-        || provider_name == "google-gemini"
-    {
+    } else if canonical_provider_name(provider_name) == "gemini" {
         // Special handling for Gemini: check for CLI auth first
         if crate::providers::gemini::GeminiProvider::has_cli_credentials() {
             print_bullet(&format!(
@@ -1352,7 +1409,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
             "groq" => "https://console.groq.com/keys",
             "mistral" => "https://console.mistral.ai/api-keys",
             "deepseek" => "https://platform.deepseek.com/api_keys",
-            "together" => "https://api.together.xyz/settings/api-keys",
+            "together-ai" => "https://api.together.xyz/settings/api-keys",
             "fireworks" => "https://fireworks.ai/account/api-keys",
             "perplexity" => "https://www.perplexity.ai/settings/api",
             "xai" => "https://console.x.ai",
@@ -1364,7 +1421,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
             "vercel" => "https://vercel.com/account/tokens",
             "cloudflare" => "https://dash.cloudflare.com/profile/api-tokens",
             "bedrock" => "https://console.aws.amazon.com/iam",
-            "gemini" | "google" | "google-gemini" => "https://aistudio.google.com/app/apikey",
+            "gemini" => "https://aistudio.google.com/app/apikey",
             _ => "",
         };
 
@@ -1559,7 +1616,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
 
 /// Map provider name to its conventional env var
 fn provider_env_var(name: &str) -> &'static str {
-    match name {
+    match canonical_provider_name(name) {
         "openrouter" => "OPENROUTER_API_KEY",
         "anthropic" => "ANTHROPIC_API_KEY",
         "openai" => "OPENAI_API_KEY",
@@ -1567,8 +1624,8 @@ fn provider_env_var(name: &str) -> &'static str {
         "groq" => "GROQ_API_KEY",
         "mistral" => "MISTRAL_API_KEY",
         "deepseek" => "DEEPSEEK_API_KEY",
-        "xai" | "grok" => "XAI_API_KEY",
-        "together" | "together-ai" => "TOGETHER_API_KEY",
+        "xai" => "XAI_API_KEY",
+        "together-ai" => "TOGETHER_API_KEY",
         "fireworks" | "fireworks-ai" => "FIREWORKS_API_KEY",
         "perplexity" => "PERPLEXITY_API_KEY",
         "cohere" => "COHERE_API_KEY",
@@ -1582,7 +1639,7 @@ fn provider_env_var(name: &str) -> &'static str {
         "vercel" | "vercel-ai" => "VERCEL_API_KEY",
         "cloudflare" | "cloudflare-ai" => "CLOUDFLARE_API_KEY",
         "bedrock" | "aws-bedrock" => "AWS_ACCESS_KEY_ID",
-        "gemini" | "google" | "google-gemini" => "GEMINI_API_KEY",
+        "gemini" => "GEMINI_API_KEY",
         _ => "API_KEY",
     }
 }
@@ -3932,12 +3989,17 @@ mod tests {
 
     #[test]
     fn default_model_for_provider_uses_latest_defaults() {
-        assert_eq!(default_model_for_provider("openai"), "gpt-5.1");
+        assert_eq!(default_model_for_provider("openai"), "gpt-5.2");
         assert_eq!(
             default_model_for_provider("anthropic"),
             "claude-sonnet-4-20250514"
         );
         assert_eq!(default_model_for_provider("gemini"), "gemini-2.5-pro");
+        assert_eq!(default_model_for_provider("google"), "gemini-2.5-pro");
+        assert_eq!(
+            default_model_for_provider("google-gemini"),
+            "gemini-2.5-pro"
+        );
     }
 
     #[test]
@@ -3947,7 +4009,7 @@ mod tests {
             .map(|(id, _)| id)
             .collect();
 
-        assert!(ids.contains(&"gpt-5.1".to_string()));
+        assert!(ids.contains(&"gpt-5.2".to_string()));
         assert!(ids.contains(&"gpt-5-mini".to_string()));
     }
 
@@ -3956,8 +4018,31 @@ mod tests {
         assert!(supports_live_model_fetch("openai"));
         assert!(supports_live_model_fetch("anthropic"));
         assert!(supports_live_model_fetch("gemini"));
+        assert!(supports_live_model_fetch("google"));
+        assert!(supports_live_model_fetch("grok"));
+        assert!(supports_live_model_fetch("together"));
         assert!(supports_live_model_fetch("ollama"));
         assert!(!supports_live_model_fetch("venice"));
+    }
+
+    #[test]
+    fn curated_models_provider_aliases_share_same_catalog() {
+        assert_eq!(
+            curated_models_for_provider("xai"),
+            curated_models_for_provider("grok")
+        );
+        assert_eq!(
+            curated_models_for_provider("together-ai"),
+            curated_models_for_provider("together")
+        );
+        assert_eq!(
+            curated_models_for_provider("gemini"),
+            curated_models_for_provider("google")
+        );
+        assert_eq!(
+            curated_models_for_provider("gemini"),
+            curated_models_for_provider("google-gemini")
+        );
     }
 
     #[test]
@@ -4108,8 +4193,11 @@ mod tests {
         assert_eq!(provider_env_var("ollama"), "API_KEY"); // fallback
         assert_eq!(provider_env_var("xai"), "XAI_API_KEY");
         assert_eq!(provider_env_var("grok"), "XAI_API_KEY"); // alias
-        assert_eq!(provider_env_var("together"), "TOGETHER_API_KEY");
-        assert_eq!(provider_env_var("together-ai"), "TOGETHER_API_KEY"); // alias
+        assert_eq!(provider_env_var("together"), "TOGETHER_API_KEY"); // alias
+        assert_eq!(provider_env_var("together-ai"), "TOGETHER_API_KEY");
+        assert_eq!(provider_env_var("google"), "GEMINI_API_KEY"); // alias
+        assert_eq!(provider_env_var("google-gemini"), "GEMINI_API_KEY"); // alias
+        assert_eq!(provider_env_var("gemini"), "GEMINI_API_KEY");
     }
 
     #[test]
