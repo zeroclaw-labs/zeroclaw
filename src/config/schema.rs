@@ -18,6 +18,8 @@ pub struct Config {
     #[serde(skip)]
     pub config_path: PathBuf,
     pub api_key: Option<String>,
+    /// Base URL override for provider API (e.g. "http://10.0.0.1:11434" for remote Ollama)
+    pub api_url: Option<String>,
     pub default_provider: Option<String>,
     pub default_model: Option<String>,
     pub default_temperature: f64,
@@ -1594,6 +1596,7 @@ impl Default for Config {
             workspace_dir: zeroclaw_dir.join("workspace"),
             config_path: zeroclaw_dir.join("config.toml"),
             api_key: None,
+            api_url: None,
             default_provider: Some("openrouter".to_string()),
             default_model: Some("anthropic/claude-sonnet-4".to_string()),
             default_temperature: 0.7,
@@ -1984,6 +1987,7 @@ default_temperature = 0.7
             workspace_dir: PathBuf::from("/tmp/test/workspace"),
             config_path: PathBuf::from("/tmp/test/config.toml"),
             api_key: Some("sk-test-key".into()),
+            api_url: None,
             default_provider: Some("openrouter".into()),
             default_model: Some("gpt-4o".into()),
             default_temperature: 0.5,
@@ -2126,6 +2130,7 @@ tool_dispatcher = "xml"
             workspace_dir: dir.join("workspace"),
             config_path: config_path.clone(),
             api_key: Some("sk-roundtrip".into()),
+            api_url: None,
             default_provider: Some("openrouter".into()),
             default_model: Some("test-model".into()),
             default_temperature: 0.9,

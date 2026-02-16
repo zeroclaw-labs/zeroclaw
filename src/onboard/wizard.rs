@@ -106,6 +106,7 @@ pub fn run_wizard() -> Result<Config> {
         } else {
             Some(api_key)
         },
+        api_url: None,
         default_provider: Some(provider),
         default_model: Some(model),
         default_temperature: 0.7,
@@ -319,6 +320,7 @@ pub fn run_quick_setup(
         workspace_dir: workspace_dir.clone(),
         config_path: config_path.clone(),
         api_key: api_key.map(String::from),
+        api_url: None,
         default_provider: Some(provider_name.clone()),
         default_model: Some(model.clone()),
         default_temperature: 0.7,

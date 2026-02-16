@@ -209,6 +209,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider(
         config.default_provider.as_deref().unwrap_or("openrouter"),
         config.api_key.as_deref(),
+        config.api_url.as_deref(),
         &config.reliability,
     )?);
     let model = config
