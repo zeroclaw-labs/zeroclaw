@@ -147,8 +147,25 @@ pub enum CronCommands {
         /// Command to run
         command: String,
     },
+    /// Add a one-shot delayed task (e.g. "30m", "2h", "1d")
+    Once {
+        /// Delay duration
+        delay: String,
+        /// Command to run
+        command: String,
+    },
     /// Remove a scheduled task
     Remove {
+        /// Task ID
+        id: String,
+    },
+    /// Pause a scheduled task
+    Pause {
+        /// Task ID
+        id: String,
+    },
+    /// Resume a paused task
+    Resume {
         /// Task ID
         id: String,
     },

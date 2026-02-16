@@ -34,6 +34,9 @@ pub struct Config {
     #[serde(default)]
     pub reliability: ReliabilityConfig,
 
+    #[serde(default)]
+    pub scheduler: SchedulerConfig,
+
     /// Model routing rules — route `hint:<name>` to specific provider+model combos.
     #[serde(default)]
     pub model_routes: Vec<ModelRouteConfig>,
@@ -697,6 +700,43 @@ impl Default for ReliabilityConfig {
     }
 }
 
+// ── Scheduler ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulerConfig {
+    /// Enable the built-in scheduler loop.
+    #[serde(default = "default_scheduler_enabled")]
+    pub enabled: bool,
+    /// Maximum number of persisted scheduled tasks.
+    #[serde(default = "default_scheduler_max_tasks")]
+    pub max_tasks: usize,
+    /// Maximum tasks executed per scheduler polling cycle.
+    #[serde(default = "default_scheduler_max_concurrent")]
+    pub max_concurrent: usize,
+}
+
+fn default_scheduler_enabled() -> bool {
+    true
+}
+
+fn default_scheduler_max_tasks() -> usize {
+    64
+}
+
+fn default_scheduler_max_concurrent() -> usize {
+    4
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_scheduler_enabled(),
+            max_tasks: default_scheduler_max_tasks(),
+            max_concurrent: default_scheduler_max_concurrent(),
+        }
+    }
+}
+
 // ── Model routing ────────────────────────────────────────────────
 
 /// Route a task hint to a specific provider + model.
@@ -1148,6 +1188,7 @@ impl Default for Config {
             autonomy: AutonomyConfig::default(),
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
+            scheduler: SchedulerConfig::default(),
             model_routes: Vec::new(),
             heartbeat: HeartbeatConfig::default(),
             channels_config: ChannelsConfig::default(),
@@ -1485,6 +1526,7 @@ mod tests {
                 ..RuntimeConfig::default()
             },
             reliability: ReliabilityConfig::default(),
+            scheduler: SchedulerConfig::default(),
             model_routes: Vec::new(),
             heartbeat: HeartbeatConfig {
                 enabled: true,
@@ -1578,6 +1620,7 @@ default_temperature = 0.7
             autonomy: AutonomyConfig::default(),
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
+            scheduler: SchedulerConfig::default(),
             model_routes: Vec::new(),
             heartbeat: HeartbeatConfig::default(),
             channels_config: ChannelsConfig::default(),

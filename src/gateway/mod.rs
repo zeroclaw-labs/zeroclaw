@@ -267,6 +267,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         &config.workspace_dir,
         &config.agents,
         config.api_key.as_deref(),
+        &config,
     ));
     let skills = crate::skills::load_skills(&config.workspace_dir);
     let tool_descs: Vec<(&str, &str)> = tools_registry

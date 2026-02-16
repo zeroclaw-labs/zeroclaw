@@ -9,9 +9,18 @@ use tokio::time::{self, Duration};
 const MIN_POLL_SECONDS: u64 = 5;
 
 pub async fn run(config: Config) -> Result<()> {
+    if !config.scheduler.enabled {
+        tracing::info!("Scheduler disabled by config");
+        crate::health::mark_component_ok("scheduler");
+        loop {
+            time::sleep(Duration::from_secs(3600)).await;
+        }
+    }
+
     let poll_secs = config.reliability.scheduler_poll_secs.max(MIN_POLL_SECONDS);
     let mut interval = time::interval(Duration::from_secs(poll_secs));
     let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+    let max_concurrent = config.scheduler.max_concurrent.max(1);
 
     crate::health::mark_component_ok("scheduler");
 
@@ -27,7 +36,7 @@ pub async fn run(config: Config) -> Result<()> {
             }
         };
 
-        for job in jobs {
+        for job in jobs.into_iter().take(max_concurrent) {
             crate::health::mark_component_ok("scheduler");
             let (success, output) = execute_job_with_retry(&config, &security, &job).await;
 
@@ -224,6 +233,8 @@ mod tests {
             next_run: Utc::now(),
             last_run: None,
             last_status: None,
+            paused: false,
+            one_shot: false,
         }
     }
 
