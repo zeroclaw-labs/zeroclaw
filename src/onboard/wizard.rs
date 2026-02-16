@@ -105,6 +105,7 @@ pub fn run_wizard() -> Result<Config> {
         composio: composio_config,
         secrets: secrets_config,
         browser: BrowserConfig::default(),
+        http_request: crate::config::HttpRequestConfig::default(),
         identity: crate::config::IdentityConfig::default(),
         agents: std::collections::HashMap::new(),
     };
@@ -297,6 +298,7 @@ pub fn run_quick_setup(
         composio: ComposioConfig::default(),
         secrets: SecretsConfig::default(),
         browser: BrowserConfig::default(),
+        http_request: crate::config::HttpRequestConfig::default(),
         identity: crate::config::IdentityConfig::default(),
         agents: std::collections::HashMap::new(),
     };

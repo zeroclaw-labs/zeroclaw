@@ -476,6 +476,7 @@ pub async fn run(
         mem.clone(),
         composio_key,
         &config.browser,
+        &config.http_request,
         &config.agents,
         config.api_key.as_deref(),
     );
@@ -965,5 +966,214 @@ I will now call the tool with this payload:
 
         let recalled = mem.recall("45", 5).await.unwrap();
         assert!(recalled.iter().any(|entry| entry.content.contains("45")));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Recovery Tests - Tool Call Parsing Edge Cases
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn parse_tool_calls_handles_empty_tool_result() {
+        // Recovery: Empty tool_result tag should be handled gracefully
+        let response = r#"I'll run that command.
+<tool_result name="shell">
+
+</tool_result>
+Done."#;
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.contains("Done."));
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn parse_arguments_value_handles_null() {
+        // Recovery: null arguments are returned as-is (Value::Null)
+        let value = serde_json::json!(null);
+        let result = parse_arguments_value(Some(&value));
+        assert!(result.is_null());
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_empty_tool_calls_array() {
+        // Recovery: Empty tool_calls array returns original response (no tool parsing)
+        let response = r#"{"content": "Hello", "tool_calls": []}"#;
+        let (text, calls) = parse_tool_calls(response);
+        // When tool_calls is empty, the entire JSON is returned as text
+        assert!(text.contains("Hello"));
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_whitespace_only_name() {
+        // Recovery: Whitespace-only tool name should return None
+        let value = serde_json::json!({"function": {"name": "   ", "arguments": {}}});
+        let result = parse_tool_call_value(&value);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_empty_string_arguments() {
+        // Recovery: Empty string arguments should be handled
+        let value = serde_json::json!({"name": "test", "arguments": ""});
+        let result = parse_tool_call_value(&value);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "test");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Recovery Tests - History Management
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn trim_history_with_no_system_prompt() {
+        // Recovery: History without system prompt should trim correctly
+        let mut history = vec![];
+        for i in 0..MAX_HISTORY_MESSAGES + 20 {
+            history.push(ChatMessage::user(format!("msg {i}")));
+        }
+        trim_history(&mut history);
+        assert_eq!(history.len(), MAX_HISTORY_MESSAGES);
+    }
+
+    #[test]
+    fn trim_history_preserves_role_ordering() {
+        // Recovery: After trimming, role ordering should remain consistent
+        let mut history = vec![ChatMessage::system("system")];
+        for i in 0..MAX_HISTORY_MESSAGES + 10 {
+            history.push(ChatMessage::user(format!("user {i}")));
+            history.push(ChatMessage::assistant(format!("assistant {i}")));
+        }
+        trim_history(&mut history);
+        assert_eq!(history[0].role, "system");
+        assert_eq!(history[history.len() - 1].role, "assistant");
+    }
+
+    #[test]
+    fn trim_history_with_only_system_prompt() {
+        // Recovery: Only system prompt should not be trimmed
+        let mut history = vec![ChatMessage::system("system prompt")];
+        trim_history(&mut history);
+        assert_eq!(history.len(), 1);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Recovery Tests - Arguments Parsing
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn parse_arguments_value_handles_invalid_json_string() {
+        // Recovery: Invalid JSON string should return empty object
+        let value = serde_json::Value::String("not valid json".to_string());
+        let result = parse_arguments_value(Some(&value));
+        assert!(result.is_object());
+        assert!(result.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_arguments_value_handles_none() {
+        // Recovery: None arguments should return empty object
+        let result = parse_arguments_value(None);
+        assert!(result.is_object());
+        assert!(result.as_object().unwrap().is_empty());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Recovery Tests - JSON Extraction
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn extract_json_values_handles_empty_string() {
+        // Recovery: Empty input should return empty vec
+        let result = extract_json_values("");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn extract_json_values_handles_whitespace_only() {
+        // Recovery: Whitespace only should return empty vec
+        let result = extract_json_values("   \n\t  ");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn extract_json_values_handles_multiple_objects() {
+        // Recovery: Multiple JSON objects should all be extracted
+        let input = r#"{"a": 1}{"b": 2}{"c": 3}"#;
+        let result = extract_json_values(input);
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn extract_json_values_handles_arrays() {
+        // Recovery: JSON arrays should be extracted
+        let input = r#"[1, 2, 3]{"key": "value"}"#;
+        let result = extract_json_values(input);
+        assert_eq!(result.len(), 2);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Recovery Tests - Constants Validation
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn max_tool_iterations_is_reasonable() {
+        // Recovery: MAX_TOOL_ITERATIONS should be set to prevent runaway loops
+        assert!(MAX_TOOL_ITERATIONS > 0);
+        assert!(MAX_TOOL_ITERATIONS <= 100);
+    }
+
+    #[test]
+    fn max_history_messages_is_reasonable() {
+        // Recovery: MAX_HISTORY_MESSAGES should be set to prevent memory bloat
+        assert!(MAX_HISTORY_MESSAGES > 0);
+        assert!(MAX_HISTORY_MESSAGES <= 1000);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Recovery Tests - Tool Call Value Parsing
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn parse_tool_call_value_handles_missing_name_field() {
+        // Recovery: Missing name field should return None
+        let value = serde_json::json!({"function": {"arguments": {}}});
+        let result = parse_tool_call_value(&value);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_tool_call_value_handles_top_level_name() {
+        // Recovery: Tool call with name at top level (non-OpenAI format)
+        let value = serde_json::json!({"name": "test_tool", "arguments": {}});
+        let result = parse_tool_call_value(&value);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "test_tool");
+    }
+
+    #[test]
+    fn parse_tool_calls_from_json_value_handles_empty_array() {
+        // Recovery: Empty tool_calls array should return empty vec
+        let value = serde_json::json!({"tool_calls": []});
+        let result = parse_tool_calls_from_json_value(&value);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_from_json_value_handles_missing_tool_calls() {
+        // Recovery: Missing tool_calls field should fall through
+        let value = serde_json::json!({"name": "test", "arguments": {}});
+        let result = parse_tool_calls_from_json_value(&value);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn parse_tool_calls_from_json_value_handles_top_level_array() {
+        // Recovery: Top-level array of tool calls
+        let value = serde_json::json!([
+            {"name": "tool_a", "arguments": {}},
+            {"name": "tool_b", "arguments": {}}
+        ]);
+        let result = parse_tool_calls_from_json_value(&value);
+        assert_eq!(result.len(), 2);
     }
 }

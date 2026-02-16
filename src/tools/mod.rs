@@ -4,6 +4,7 @@ pub mod composio;
 pub mod delegate;
 pub mod file_read;
 pub mod file_write;
+pub mod http_request;
 pub mod image_info;
 pub mod memory_forget;
 pub mod memory_recall;
@@ -18,6 +19,7 @@ pub use composio::ComposioTool;
 pub use delegate::DelegateTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
+pub use http_request::HttpRequestTool;
 pub use image_info::ImageInfoTool;
 pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
@@ -58,6 +60,7 @@ pub fn all_tools(
     memory: Arc<dyn Memory>,
     composio_key: Option<&str>,
     browser_config: &crate::config::BrowserConfig,
+    http_config: &crate::config::HttpRequestConfig,
     agents: &HashMap<String, DelegateAgentConfig>,
     fallback_api_key: Option<&str>,
 ) -> Vec<Box<dyn Tool>> {
@@ -67,6 +70,7 @@ pub fn all_tools(
         memory,
         composio_key,
         browser_config,
+        http_config,
         agents,
         fallback_api_key,
     )
@@ -79,6 +83,7 @@ pub fn all_tools_with_runtime(
     memory: Arc<dyn Memory>,
     composio_key: Option<&str>,
     browser_config: &crate::config::BrowserConfig,
+    http_config: &crate::config::HttpRequestConfig,
     agents: &HashMap<String, DelegateAgentConfig>,
     fallback_api_key: Option<&str>,
 ) -> Vec<Box<dyn Tool>> {
@@ -102,6 +107,15 @@ pub fn all_tools_with_runtime(
             security.clone(),
             browser_config.allowed_domains.clone(),
             browser_config.session_name.clone(),
+        )));
+    }
+
+    if http_config.enabled {
+        tools.push(Box::new(HttpRequestTool::new(
+            security.clone(),
+            http_config.allowed_domains.clone(),
+            http_config.max_response_size,
+            http_config.timeout_secs,
         )));
     }
 
@@ -155,8 +169,9 @@ mod tests {
             allowed_domains: vec!["example.com".into()],
             session_name: None,
         };
+        let http = crate::config::HttpRequestConfig::default();
 
-        let tools = all_tools(&security, mem, None, &browser, &HashMap::new(), None);
+        let tools = all_tools(&security, mem, None, &browser, &http, &HashMap::new(), None);
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"browser_open"));
     }
@@ -177,8 +192,9 @@ mod tests {
             allowed_domains: vec!["example.com".into()],
             session_name: None,
         };
+        let http = crate::config::HttpRequestConfig::default();
 
-        let tools = all_tools(&security, mem, None, &browser, &HashMap::new(), None);
+        let tools = all_tools(&security, mem, None, &browser, &http, &HashMap::new(), None);
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"browser_open"));
     }
@@ -289,6 +305,7 @@ mod tests {
             Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
 
         let browser = BrowserConfig::default();
+        let http = crate::config::HttpRequestConfig::default();
 
         let mut agents = HashMap::new();
         agents.insert(
@@ -303,7 +320,7 @@ mod tests {
             },
         );
 
-        let tools = all_tools(&security, mem, None, &browser, &agents, Some("sk-test"));
+        let tools = all_tools(&security, mem, None, &browser, &http, &agents, Some("sk-test"));
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"delegate"));
     }
@@ -320,8 +337,9 @@ mod tests {
             Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
 
         let browser = BrowserConfig::default();
+        let http = crate::config::HttpRequestConfig::default();
 
-        let tools = all_tools(&security, mem, None, &browser, &HashMap::new(), None);
+        let tools = all_tools(&security, mem, None, &browser, &http, &HashMap::new(), None);
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"delegate"));
     }
