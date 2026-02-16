@@ -272,7 +272,7 @@ impl Default for SecretsConfig {
 
 // ── Browser (friendly-service browsing only) ───────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrowserConfig {
     /// Enable `browser_open` tool (opens URLs in Brave without scraping)
     #[serde(default)]
@@ -283,6 +283,40 @@ pub struct BrowserConfig {
     /// Browser session name (for agent-browser automation)
     #[serde(default)]
     pub session_name: Option<String>,
+    /// Browser automation backend: "agent_browser" | "rust_native" | "auto"
+    #[serde(default = "default_browser_backend")]
+    pub backend: String,
+    /// Headless mode for rust-native backend
+    #[serde(default = "default_true")]
+    pub native_headless: bool,
+    /// WebDriver endpoint URL for rust-native backend (e.g. http://127.0.0.1:9515)
+    #[serde(default = "default_browser_webdriver_url")]
+    pub native_webdriver_url: String,
+    /// Optional Chrome/Chromium executable path for rust-native backend
+    #[serde(default)]
+    pub native_chrome_path: Option<String>,
+}
+
+fn default_browser_backend() -> String {
+    "agent_browser".into()
+}
+
+fn default_browser_webdriver_url() -> String {
+    "http://127.0.0.1:9515".into()
+}
+
+impl Default for BrowserConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_domains: Vec::new(),
+            session_name: None,
+            backend: default_browser_backend(),
+            native_headless: default_true(),
+            native_webdriver_url: default_browser_webdriver_url(),
+            native_chrome_path: None,
+        }
+    }
 }
 
 // ── HTTP request tool ───────────────────────────────────────────
@@ -1337,6 +1371,7 @@ fn sync_directory(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
 
     // ── Defaults ─────────────────────────────────────────────
@@ -2095,6 +2130,10 @@ default_temperature = 0.7
         let b = BrowserConfig::default();
         assert!(!b.enabled);
         assert!(b.allowed_domains.is_empty());
+        assert_eq!(b.backend, "agent_browser");
+        assert!(b.native_headless);
+        assert_eq!(b.native_webdriver_url, "http://127.0.0.1:9515");
+        assert!(b.native_chrome_path.is_none());
     }
 
     #[test]
@@ -2103,12 +2142,23 @@ default_temperature = 0.7
             enabled: true,
             allowed_domains: vec!["example.com".into(), "docs.example.com".into()],
             session_name: None,
+            backend: "auto".into(),
+            native_headless: false,
+            native_webdriver_url: "http://localhost:4444".into(),
+            native_chrome_path: Some("/usr/bin/chromium".into()),
         };
         let toml_str = toml::to_string(&b).unwrap();
         let parsed: BrowserConfig = toml::from_str(&toml_str).unwrap();
         assert!(parsed.enabled);
         assert_eq!(parsed.allowed_domains.len(), 2);
         assert_eq!(parsed.allowed_domains[0], "example.com");
+        assert_eq!(parsed.backend, "auto");
+        assert!(!parsed.native_headless);
+        assert_eq!(parsed.native_webdriver_url, "http://localhost:4444");
+        assert_eq!(
+            parsed.native_chrome_path.as_deref(),
+            Some("/usr/bin/chromium")
+        );
     }
 
     #[test]
@@ -2123,10 +2173,19 @@ default_temperature = 0.7
         assert!(parsed.browser.allowed_domains.is_empty());
     }
 
+    fn env_override_lock() -> std::sync::MutexGuard<'static, ()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env override test lock poisoned")
+    }
+
     // ── Environment variable overrides (Docker support) ─────────
 
     #[test]
     fn env_override_api_key() {
+        let _guard = env_override_lock();
         let mut config = Config::default();
         assert!(config.api_key.is_none());
 
@@ -2139,6 +2198,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_api_key_fallback() {
+        let _guard = env_override_lock();
         let mut config = Config::default();
 
         std::env::remove_var("ZEROCLAW_API_KEY");
@@ -2151,6 +2211,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_provider() {
+        let _guard = env_override_lock();
         let mut config = Config::default();
 
         std::env::set_var("ZEROCLAW_PROVIDER", "anthropic");
@@ -2162,6 +2223,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_provider_fallback() {
+        let _guard = env_override_lock();
         let mut config = Config::default();
 
         std::env::remove_var("ZEROCLAW_PROVIDER");
@@ -2174,6 +2236,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_model() {
+        let _guard = env_override_lock();
         let mut config = Config::default();
 
         std::env::set_var("ZEROCLAW_MODEL", "gpt-4o");
@@ -2185,6 +2248,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_workspace() {
+        let _guard = env_override_lock();
         let mut config = Config::default();
 
         std::env::set_var("ZEROCLAW_WORKSPACE", "/custom/workspace");
@@ -2196,6 +2260,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_empty_values_ignored() {
+        let _guard = env_override_lock();
         let mut config = Config::default();
         let original_provider = config.default_provider.clone();
 
@@ -2208,6 +2273,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_gateway_port() {
+        let _guard = env_override_lock();
         let mut config = Config::default();
         assert_eq!(config.gateway.port, 3000);
 
@@ -2220,6 +2286,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_port_fallback() {
+        let _guard = env_override_lock();
         let mut config = Config::default();
 
         std::env::remove_var("ZEROCLAW_GATEWAY_PORT");
@@ -2232,6 +2299,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_gateway_host() {
+        let _guard = env_override_lock();
         let mut config = Config::default();
         assert_eq!(config.gateway.host, "127.0.0.1");
 
@@ -2244,6 +2312,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_host_fallback() {
+        let _guard = env_override_lock();
         let mut config = Config::default();
 
         std::env::remove_var("ZEROCLAW_GATEWAY_HOST");
@@ -2256,6 +2325,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_temperature() {
+        let _guard = env_override_lock();
         let mut config = Config::default();
 
         std::env::set_var("ZEROCLAW_TEMPERATURE", "0.5");
@@ -2267,6 +2337,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_temperature_out_of_range_ignored() {
+        let _guard = env_override_lock();
         // Clean up any leftover env vars from other tests
         std::env::remove_var("ZEROCLAW_TEMPERATURE");
 
@@ -2286,6 +2357,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_invalid_port_ignored() {
+        let _guard = env_override_lock();
         let mut config = Config::default();
         let original_port = config.gateway.port;
 
@@ -2467,7 +2539,7 @@ temperature = 0.3
                 max_depth: 3,
             },
         );
-        let mut config = Config {
+        let config = Config {
             config_path: config_path.clone(),
             workspace_dir: zeroclaw_dir.join("workspace"),
             secrets: SecretsConfig { encrypt: true },

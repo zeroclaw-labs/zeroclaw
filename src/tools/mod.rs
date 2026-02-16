@@ -55,6 +55,7 @@ pub fn default_tools_with_runtime(
 }
 
 /// Create full tool registry including memory tools and optional Composio
+#[allow(clippy::implicit_hasher)]
 pub fn all_tools(
     security: &Arc<SecurityPolicy>,
     memory: Arc<dyn Memory>,
@@ -77,6 +78,7 @@ pub fn all_tools(
 }
 
 /// Create full tool registry including memory tools and optional Composio.
+#[allow(clippy::implicit_hasher)]
 pub fn all_tools_with_runtime(
     security: &Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
@@ -102,11 +104,15 @@ pub fn all_tools_with_runtime(
             security.clone(),
             browser_config.allowed_domains.clone(),
         )));
-        // Add full browser automation tool (agent-browser)
-        tools.push(Box::new(BrowserTool::new(
+        // Add full browser automation tool (pluggable backend)
+        tools.push(Box::new(BrowserTool::new_with_backend(
             security.clone(),
             browser_config.allowed_domains.clone(),
             browser_config.session_name.clone(),
+            browser_config.backend.clone(),
+            browser_config.native_headless,
+            browser_config.native_webdriver_url.clone(),
+            browser_config.native_chrome_path.clone(),
         )));
     }
 
@@ -168,6 +174,7 @@ mod tests {
             enabled: false,
             allowed_domains: vec!["example.com".into()],
             session_name: None,
+            ..BrowserConfig::default()
         };
         let http = crate::config::HttpRequestConfig::default();
 
@@ -191,6 +198,7 @@ mod tests {
             enabled: true,
             allowed_domains: vec!["example.com".into()],
             session_name: None,
+            ..BrowserConfig::default()
         };
         let http = crate::config::HttpRequestConfig::default();
 

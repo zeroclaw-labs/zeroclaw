@@ -39,6 +39,9 @@ prometheus = { version = "0.13", default-features = false }
 # Base64 encoding (screenshots, image data)
 base64 = "0.22"
 
+# Optional Rust-native browser automation backend
+fantoccini = { version = "0.22.0", optional = true, default-features = false, features = ["rustls-tls"] }
+
 # Error handling
 anyhow = "1.0"
 thiserror = "2.0"
@@ -96,6 +99,7 @@ opentelemetry-otlp = { version = "0.31", default-features = false, features = ["
 
 [features]
 default = []
+browser-native = ["dep:fantoccini"]
 
 # Sandbox backends (platform-specific, opt-in)
 sandbox-landlock = ["landlock"]  # Linux kernel LSM
