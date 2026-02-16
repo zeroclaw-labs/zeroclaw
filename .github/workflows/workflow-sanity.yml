@@ -22,7 +22,7 @@ permissions:
 
 jobs:
   no-tabs:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'push' && fromJSON('["self-hosted","Linux","X64","lxc-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -55,7 +55,7 @@ jobs:
           PY
 
   actionlint:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'push' && fromJSON('["self-hosted","Linux","X64","lxc-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
       - name: Checkout
