@@ -15,7 +15,7 @@ jobs:
       (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'labeled' || github.event.action == 'unlabeled')) ||
       (github.event_name == 'pull_request_target' &&
       (github.event.action == 'labeled' || github.event.action == 'unlabeled'))
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
       issues: write
     steps:
@@ -119,7 +119,7 @@ jobs:
 
   first-interaction:
     if: github.event.action == 'opened'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
       issues: write
       pull-requests: write
@@ -150,7 +150,7 @@ jobs:
 
   labeled-routes:
     if: github.event.action == 'labeled'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
       issues: write
       pull-requests: write
