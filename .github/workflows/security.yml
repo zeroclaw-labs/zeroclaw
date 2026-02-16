@@ -21,7 +21,7 @@ env:
 jobs:
     audit:
         name: Security Audit
-        runs-on: ubuntu-latest
+        runs-on: ${{ github.event_name != 'pull_request' && fromJSON('["self-hosted","Linux","X64","lxc-ci"]') || 'ubuntu-latest' }}
         timeout-minutes: 20
         steps:
             - uses: actions/checkout@v4
@@ -37,7 +37,7 @@ jobs:
 
     deny:
         name: License & Supply Chain
-        runs-on: ubuntu-latest
+        runs-on: ${{ github.event_name != 'pull_request' && fromJSON('["self-hosted","Linux","X64","lxc-ci"]') || 'ubuntu-latest' }}
         timeout-minutes: 20
         steps:
             - uses: actions/checkout@v4
