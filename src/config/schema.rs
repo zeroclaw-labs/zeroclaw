@@ -882,6 +882,22 @@ pub struct AutonomyConfig {
     /// Block high-risk shell commands even if allowlisted.
     #[serde(default = "default_true")]
     pub block_high_risk_commands: bool,
+
+    /// Tools that never require approval (e.g. read-only tools).
+    #[serde(default = "default_auto_approve")]
+    pub auto_approve: Vec<String>,
+
+    /// Tools that always require interactive approval, even after "Always".
+    #[serde(default = "default_always_ask")]
+    pub always_ask: Vec<String>,
+}
+
+fn default_auto_approve() -> Vec<String> {
+    vec!["file_read".into(), "memory_recall".into()]
+}
+
+fn default_always_ask() -> Vec<String> {
+    vec![]
 }
 
 impl Default for AutonomyConfig {
@@ -927,6 +943,8 @@ impl Default for AutonomyConfig {
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
+            auto_approve: default_auto_approve(),
+            always_ask: default_always_ask(),
         }
     }
 }
@@ -2157,6 +2175,8 @@ default_temperature = 0.7
                 max_cost_per_day_cents: 1000,
                 require_approval_for_medium_risk: false,
                 block_high_risk_commands: true,
+                auto_approve: vec!["file_read".into()],
+                always_ask: vec![],
             },
             runtime: RuntimeConfig {
                 kind: "docker".into(),

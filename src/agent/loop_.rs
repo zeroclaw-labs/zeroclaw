@@ -1,3 +1,4 @@
+use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{self, Observer, ObserverEvent};
@@ -512,6 +513,8 @@ pub(crate) async fn agent_turn(
         model,
         temperature,
         silent,
+        None,
+        "channel",
     )
     .await
 }
@@ -528,6 +531,8 @@ pub(crate) async fn run_tool_call_loop(
     model: &str,
     temperature: f64,
     silent: bool,
+    approval: Option<&ApprovalManager>,
+    channel_name: &str,
 ) -> Result<String> {
     // Build native tool definitions once if the provider supports them.
     let use_native_tools = provider.supports_native_tools() && !tools_registry.is_empty();
@@ -651,6 +656,34 @@ pub(crate) async fn run_tool_call_loop(
         // Execute each tool call and build results
         let mut tool_results = String::new();
         for call in &tool_calls {
+            // ── Approval hook ────────────────────────────────
+            if let Some(mgr) = approval {
+                if mgr.needs_approval(&call.name) {
+                    let request = ApprovalRequest {
+                        tool_name: call.name.clone(),
+                        arguments: call.arguments.clone(),
+                    };
+
+                    // Only prompt interactively on CLI; auto-approve on other channels.
+                    let decision = if channel_name == "cli" {
+                        mgr.prompt_cli(&request)
+                    } else {
+                        ApprovalResponse::Yes
+                    };
+
+                    mgr.record_decision(&call.name, &call.arguments, decision, channel_name);
+
+                    if decision == ApprovalResponse::No {
+                        let _ = writeln!(
+                            tool_results,
+                            "<tool_result name=\"{}\">\nDenied by user.\n</tool_result>",
+                            call.name
+                        );
+                        continue;
+                    }
+                }
+            }
+
             observer.record_event(&ObserverEvent::ToolCallStart {
                 tool: call.name.clone(),
             });
@@ -961,6 +994,9 @@ pub async fn run(
     // Append structured tool-use instructions with schemas
     system_prompt.push_str(&build_tool_instructions(&tools_registry));
 
+    // ── Approval manager (supervised mode) ───────────────────────
+    let approval_manager = ApprovalManager::from_config(&config.autonomy);
+
     // ── Execute ──────────────────────────────────────────────────
     let start = Instant::now();
 
@@ -1003,6 +1039,8 @@ pub async fn run(
             model_name,
             temperature,
             false,
+            Some(&approval_manager),
+            "cli",
         )
         .await?;
         final_output = response.clone();
@@ -1066,6 +1104,8 @@ pub async fn run(
                 model_name,
                 temperature,
                 false,
+                Some(&approval_manager),
+                "cli",
             )
             .await
             {
