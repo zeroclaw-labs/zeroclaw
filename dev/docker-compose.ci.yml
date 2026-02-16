@@ -1,0 +1,23 @@
+name: zeroclaw-local-ci
+
+services:
+    local-ci:
+        build:
+            context: ..
+            dockerfile: dev/ci/Dockerfile
+        container_name: zeroclaw-local-ci
+        working_dir: /workspace
+        environment:
+            - CARGO_TERM_COLOR=always
+            - PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+            - CARGO_TARGET_DIR=/ci-target
+        volumes:
+            - ..:/workspace
+            - cargo-registry:/usr/local/cargo/registry
+            - cargo-git:/usr/local/cargo/git
+            - ci-target:/ci-target
+
+volumes:
+    cargo-registry:
+    cargo-git:
+    ci-target:
