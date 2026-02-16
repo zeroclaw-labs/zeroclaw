@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 // ── Hardware transport enum ──────────────────────────────────────
 
 /// Transport protocol used to communicate with physical hardware.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum HardwareTransport {
     /// Direct GPIO access on a Linux SBC (Raspberry Pi, Orange Pi, etc.)
@@ -30,13 +30,8 @@ pub enum HardwareTransport {
     /// SWD/JTAG debug probe (probe-rs) for bare-metal MCUs
     Probe,
     /// No hardware — software-only mode
+    #[default]
     None,
-}
-
-impl Default for HardwareTransport {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 impl std::fmt::Display for HardwareTransport {
@@ -869,7 +864,9 @@ mod tests {
 
     #[test]
     fn validate_baud_rate_common_values_ok() {
-        for baud in [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600] {
+        for baud in [
+            9600, 19200, 38400, 57600, 115_200, 230_400, 460_800, 921_600,
+        ] {
             let cfg = HardwareConfig {
                 enabled: true,
                 transport: "serial".into(),
@@ -938,7 +935,7 @@ mod tests {
             enabled: true,
             transport: "probe".into(),
             serial_port: None,
-            baud_rate: 115200,
+            baud_rate: 115_200,
             workspace_datasheets: false,
             discovered_board: None,
             probe_target: Some("nRF52840_xxAA".into()),

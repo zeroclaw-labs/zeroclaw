@@ -57,7 +57,12 @@ fn parse_retry_after_ms(err: &anyhow::Error) -> Option<u64> {
                 .take_while(|c| c.is_ascii_digit() || *c == '.')
                 .collect();
             if let Ok(secs) = num_str.parse::<f64>() {
-                return Some((secs * 1000.0) as u64);
+                if secs.is_finite() && secs >= 0.0 {
+                    let millis = Duration::from_secs_f64(secs).as_millis();
+                    if let Ok(value) = u64::try_from(millis) {
+                        return Some(value);
+                    }
+                }
             }
         }
     }

@@ -1247,18 +1247,16 @@ Done."#;
     // Recovery Tests - Constants Validation
     // ═══════════════════════════════════════════════════════════════════════
 
-    #[test]
-    fn max_tool_iterations_is_reasonable() {
-        // Recovery: MAX_TOOL_ITERATIONS should be set to prevent runaway loops
+    const _: () = {
         assert!(MAX_TOOL_ITERATIONS > 0);
         assert!(MAX_TOOL_ITERATIONS <= 100);
-    }
-
-    #[test]
-    fn max_history_messages_is_reasonable() {
-        // Recovery: MAX_HISTORY_MESSAGES should be set to prevent memory bloat
         assert!(MAX_HISTORY_MESSAGES > 0);
         assert!(MAX_HISTORY_MESSAGES <= 1000);
+    };
+
+    #[test]
+    fn constants_bounds_are_compile_time_checked() {
+        // Bounds are enforced by the const assertions above.
     }
 
     // ═══════════════════════════════════════════════════════════════════════

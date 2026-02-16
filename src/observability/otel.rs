@@ -183,7 +183,9 @@ impl Observer for OtelObserver {
                     ],
                 );
             }
-            ObserverEvent::LlmRequest { .. } => {}
+            ObserverEvent::LlmRequest { .. }
+            | ObserverEvent::ToolCallStart { .. }
+            | ObserverEvent::TurnComplete => {}
             ObserverEvent::LlmResponse {
                 provider,
                 model,
@@ -247,7 +249,6 @@ impl Observer for OtelObserver {
                 // Note: tokens are recorded via record_metric(TokensUsed) to avoid
                 // double-counting. AgentEnd only records duration.
             }
-            ObserverEvent::ToolCallStart { .. } => {}
             ObserverEvent::ToolCall {
                 tool,
                 duration,
@@ -285,7 +286,6 @@ impl Observer for OtelObserver {
                 self.tool_duration
                     .record(secs, &[KeyValue::new("tool", tool.clone())]);
             }
-            ObserverEvent::TurnComplete => {}
             ObserverEvent::ChannelMessage { channel, direction } => {
                 self.channel_messages.add(
                     1,

@@ -1999,7 +1999,7 @@ fn setup_hardware() -> Result<HardwareConfig> {
         hw_config.baud_rate = match baud_idx {
             1 => 9600,
             2 => 57600,
-            3 => 230400,
+            3 => 230_400,
             4 => {
                 let custom: String = Input::new()
                     .with_prompt("  Custom baud rate")
