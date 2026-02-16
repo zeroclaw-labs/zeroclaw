@@ -1002,6 +1002,11 @@ impl Config {
             }
         }
 
+        // Allow public bind: ZEROCLAW_ALLOW_PUBLIC_BIND
+        if let Ok(val) = std::env::var("ZEROCLAW_ALLOW_PUBLIC_BIND") {
+            self.gateway.allow_public_bind = val == "1" || val.eq_ignore_ascii_case("true");
+        }
+
         // Temperature: ZEROCLAW_TEMPERATURE
         if let Ok(temp_str) = std::env::var("ZEROCLAW_TEMPERATURE") {
             if let Ok(temp) = temp_str.parse::<f64>() {

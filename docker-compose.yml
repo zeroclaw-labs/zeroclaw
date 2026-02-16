@@ -25,16 +25,19 @@ services:
       # Options: openrouter, openai, anthropic, ollama
       - PROVIDER=${PROVIDER:-openrouter}
       
+      # Allow public bind inside Docker (required for container networking)
+      - ZEROCLAW_ALLOW_PUBLIC_BIND=true
+      
       # Optional: Model override
       # - ZEROCLAW_MODEL=anthropic/claude-sonnet-4-20250514
       
     volumes:
-      # Persist workspace and config
-      - zeroclaw-data:/data
+      # Persist workspace and config (must match WORKDIR/HOME in Dockerfile)
+      - zeroclaw-data:/zeroclaw-data
       
     ports:
-      # Gateway API port
-      - "3000:3000"
+      # Gateway API port (override HOST_PORT if 3000 is taken)
+      - "${HOST_PORT:-3000}:3000"
     
     # Health check
     healthcheck:
