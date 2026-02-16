@@ -670,8 +670,11 @@ mod tests {
         )
         .with_model_fallbacks(fallbacks);
 
-        let result = provider.chat("hello", "claude-opus", 0.0).await.unwrap();
-        assert_eq!(result.text_or_empty(), "ok from sonnet");
+        let result = provider
+            .simple_chat("hello", "claude-opus", 0.0)
+            .await
+            .unwrap();
+        assert_eq!(result, "ok from sonnet");
 
         let seen = mock.models_seen.lock().unwrap();
         assert_eq!(seen.len(), 2);
@@ -703,7 +706,7 @@ mod tests {
         .with_model_fallbacks(fallbacks);
 
         let err = provider
-            .chat("hello", "model-a", 0.0)
+            .simple_chat("hello", "model-a", 0.0)
             .await
             .expect_err("all models should fail");
         assert!(err.to_string().contains("All providers/models failed"));
@@ -729,8 +732,8 @@ mod tests {
             1,
         );
         // No model_fallbacks set — should work exactly as before
-        let result = provider.chat("hello", "test", 0.0).await.unwrap();
-        assert_eq!(result.text_or_empty(), "ok");
+        let result = provider.simple_chat("hello", "test", 0.0).await.unwrap();
+        assert_eq!(result, "ok");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
