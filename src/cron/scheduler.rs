@@ -1,5 +1,7 @@
 use crate::config::Config;
 use crate::cron::{due_jobs, reschedule_after_run, CronJob};
+use crate::feed::executor::FeedExecutor;
+use crate::feed::scheduler::FeedScheduler;
 use crate::memory;
 use crate::providers;
 use crate::security::SecurityPolicy;
@@ -16,6 +18,7 @@ use uuid::Uuid;
 
 const MIN_POLL_SECONDS: u64 = 5;
 const HEARTBEAT_QUEUE_PREFIX: &str = "[[AFW_QUEUE]] ";
+const INTERNAL_FEED_COMMAND_PREFIX: &str = "__ARIA_FEED_EXEC__:";
 
 #[derive(Debug, Clone)]
 struct JobRunOutcome {
@@ -200,6 +203,9 @@ async fn run_job_command(
     {
         return run_aria_cron_function(config, cron_func_id.trim()).await;
     }
+    if let Some(feed_id) = parse_feed_execution_command(&job.command) {
+        return run_internal_feed_execution(config, &feed_id).await;
+    }
 
     if !security.is_command_allowed(&job.command) {
         return JobRunOutcome {
@@ -252,6 +258,86 @@ async fn run_job_command(
         Err(e) => JobRunOutcome {
             success: false,
             output: format!("spawn error: {e}"),
+            tenant_id: None,
+            remove_after_run: false,
+            run_id: None,
+        },
+    }
+}
+
+fn normalize_feed_id(raw: &str) -> Option<String> {
+    let trimmed = strip_wrapping_quotes(raw)
+        .trim()
+        .trim_end_matches(|c: char| c == ',' || c == ';');
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn extract_feed_id_from_registry_execute_path(command: &str) -> Option<String> {
+    for marker in ["/api/v1/registry/feeds/", "/registry/feeds/"] {
+        if let Some(start) = command.find(marker) {
+            let remainder = &command[start + marker.len()..];
+            if let Some(end) = remainder.find("/execute") {
+                return normalize_feed_id(&remainder[..end]);
+            }
+        }
+    }
+    None
+}
+
+fn parse_feed_execution_command(command: &str) -> Option<String> {
+    let command = command.trim();
+
+    if let Some(raw_id) = command.strip_prefix(INTERNAL_FEED_COMMAND_PREFIX) {
+        return normalize_feed_id(raw_id);
+    }
+
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    if tokens.len() >= 4
+        && tokens[0] == "afw"
+        && tokens[1] == "feed"
+        && matches!(tokens[2], "run" | "execute")
+    {
+        return normalize_feed_id(tokens[3]);
+    }
+
+    if tokens.first() == Some(&"curl") {
+        return extract_feed_id_from_registry_execute_path(command);
+    }
+
+    None
+}
+
+async fn run_internal_feed_execution(config: &Config, feed_id: &str) -> JobRunOutcome {
+    let db_path = config.workspace_dir.join("aria.db");
+    let db = match aria::db::AriaDb::open(&db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            return JobRunOutcome {
+                success: false,
+                output: format!("failed to open aria db: {e}"),
+                tenant_id: None,
+                remove_after_run: false,
+                run_id: None,
+            }
+        }
+    };
+
+    let scheduler = FeedScheduler::new(db.clone(), FeedExecutor::new(db));
+    match scheduler.execute_feed(feed_id).await {
+        Ok(()) => JobRunOutcome {
+            success: true,
+            output: format!("feed executed: {feed_id}"),
+            tenant_id: None,
+            remove_after_run: false,
+            run_id: None,
+        },
+        Err(e) => JobRunOutcome {
+            success: false,
+            output: format!("feed execution failed: {e}"),
             tenant_id: None,
             remove_after_run: false,
             run_id: None,
@@ -513,8 +599,11 @@ async fn execute_agent_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aria::db::AriaDb;
     use crate::config::Config;
     use crate::security::SecurityPolicy;
+    use chrono::Utc;
+    use rusqlite::params;
     use tempfile::TempDir;
 
     fn test_config(tmp: &TempDir) -> Config {
@@ -535,6 +624,20 @@ mod tests {
             last_run: None,
             last_status: None,
         }
+    }
+
+    fn insert_active_feed(config: &Config, feed_id: &str) {
+        let db = AriaDb::open(&config.workspace_dir.join("aria.db")).unwrap();
+        let now = Utc::now().to_rfc3339();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO aria_feeds (id, tenant_id, name, schedule, handler_code, status, created_at, updated_at)
+                 VALUES (?1, 'test-tenant', ?2, '*/5 * * * *', 'console.log(\"ok\")', 'active', ?3, ?3)",
+                params![feed_id, format!("feed-{feed_id}"), now],
+            )?;
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[tokio::test]
@@ -592,6 +695,45 @@ mod tests {
         assert!(outcome.output.contains("blocked by security policy"));
         assert!(outcome.output.contains("forbidden path argument"));
         assert!(outcome.output.contains("/etc/passwd"));
+    }
+
+    #[test]
+    fn parse_feed_execution_command_supports_expected_shapes() {
+        assert_eq!(
+            parse_feed_execution_command("__ARIA_FEED_EXEC__:abc123").as_deref(),
+            Some("abc123")
+        );
+        assert_eq!(
+            parse_feed_execution_command("afw feed run abc123").as_deref(),
+            Some("abc123")
+        );
+        assert_eq!(
+            parse_feed_execution_command("afw feed execute abc123").as_deref(),
+            Some("abc123")
+        );
+        assert_eq!(
+            parse_feed_execution_command(
+                "curl -X POST http://127.0.0.1:8080/api/v1/registry/feeds/abc123/execute",
+            )
+            .as_deref(),
+            Some("abc123")
+        );
+        assert_eq!(parse_feed_execution_command("echo hello"), None);
+    }
+
+    #[tokio::test]
+    async fn run_job_command_executes_feed_without_shell_policy_allowlist() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.autonomy.allowed_commands = vec!["echo".into()];
+        insert_active_feed(&config, "feed-cron-test");
+
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+        let job = test_job("afw feed run feed-cron-test");
+
+        let outcome = run_job_command(&config, &security, &job).await;
+        assert!(outcome.success);
+        assert_eq!(outcome.output, "feed executed: feed-cron-test");
     }
 
     #[tokio::test]
