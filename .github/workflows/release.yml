@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write  # Required for cosign keyless signing via OIDC
 
 env:
   CARGO_TERM_COLOR: always
@@ -83,6 +84,20 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@3454372f43399081ed03b604cb2d021dabca52bb # v3.8.2
+
+      - name: Sign artifacts with cosign (keyless)
+        run: |
+          for file in artifacts/**/*; do
+            [ -f "$file" ] || continue
+            cosign sign-blob --yes \
+              --oidc-issuer=https://token.actions.githubusercontent.com \
+              --output-signature="${file}.sig" \
+              --output-certificate="${file}.pem" \
+              "$file"
+          done
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
