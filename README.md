@@ -67,8 +67,8 @@ ls -lh target/release/zeroclaw
 ```bash
 git clone https://github.com/zeroclaw-labs/zeroclaw.git
 cd zeroclaw
-cargo build --release
-cargo install --path . --force
+cargo build --release --locked
+cargo install --path . --force --locked
 
 # Quick setup (no prompts)
 zeroclaw onboard --api-key sk-... --provider openrouter
@@ -473,6 +473,18 @@ A git hook runs `cargo fmt --check`, `cargo clippy -- -D warnings`, and `cargo t
 ```bash
 git config core.hooksPath .githooks
 ```
+
+### Build troubleshooting (Linux OpenSSL errors)
+
+If you see an `openssl-sys` build error, sync dependencies and rebuild with the repository lockfile:
+
+```bash
+git pull
+cargo build --release --locked
+cargo install --path . --force --locked
+```
+
+ZeroClaw is configured to use `rustls` for HTTP/TLS dependencies; `--locked` keeps the transitive graph deterministic on fresh environments.
 
 To skip the hook when you need a quick push during development:
 
