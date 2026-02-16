@@ -218,7 +218,7 @@ pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<
             "Synthetic", "https://api.synthetic.com", key, AuthStyle::Bearer,
         ))),
         "opencode" | "opencode-zen" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "OpenCode Zen", "https://api.opencode.ai", key, AuthStyle::Bearer,
+            "OpenCode Zen", "https://opencode.ai/zen/v1", key, AuthStyle::Bearer,
         ))),
         "zai" | "z.ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Z.AI", "https://api.z.ai/api/coding/paas/v4", key, AuthStyle::Bearer,
