@@ -62,6 +62,68 @@ ls -lh target/release/zeroclaw
 /usr/bin/time -l target/release/zeroclaw status
 ```
 
+## Prerequesites
+
+<details>
+<summary><strong>Windows</strong></summary>
+
+#### Required
+
+1. **Visual Studio Build Tools** (provides the MSVC linker and Windows SDK):
+   ```powershell
+   winget install Microsoft.VisualStudio.2022.BuildTools
+   ```
+   During installation (or via the Visual Studio Installer), select the **"Desktop development with C++"** workload.
+
+2. **Rust toolchain:**
+   ```powershell
+   winget install Rustlang.Rustup
+   ```
+   After installation, open a new terminal and run `rustup default stable` to ensure the stable toolchain is active.
+
+3. **Verify** both are working:
+   ```powershell
+   rustc --version
+   cargo --version
+   ```
+
+#### Optional
+
+- **Docker Desktop** — required only if using the [Docker sandboxed runtime](#runtime-support-current) (`runtime.kind = "docker"`). Install via `winget install Docker.DockerDesktop`.
+
+</details>
+
+<details>
+<summary><strong>Linux / macOS</strong></summary>
+
+#### Required
+
+1. **Build essentials:**
+   - **Linux (Debian/Ubuntu):** `sudo apt install build-essential pkg-config`
+   - **Linux (Fedora/RHEL):** `sudo dnf groupinstall "Development Tools" && sudo dnf install pkg-config`
+   - **macOS:** Install Xcode Command Line Tools: `xcode-select --install`
+
+2. **Rust toolchain:**
+   ```bash
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+   ```
+   See [rustup.rs](https://rustup.rs) for details.
+
+3. **Verify** both are working:
+   ```bash
+   rustc --version
+   cargo --version
+   ```
+
+#### Optional
+
+- **Docker** — required only if using the [Docker sandboxed runtime](#runtime-support-current) (`runtime.kind = "docker"`). Install via your package manager or [docker.com](https://docs.docker.com/engine/install/).
+
+> **Low-memory boards (e.g., Raspberry Pi 3, 1GB RAM):** see [Build troubleshooting](#build-troubleshooting-linux-openssl-errors) and use `CARGO_BUILD_JOBS=1 cargo build --release` if the kernel kills rustc during compilation.
+
+</details>
+
+
 ## Quick Start
 
 ```bash
@@ -114,7 +176,6 @@ zeroclaw migrate openclaw
 ```
 
 > **Dev fallback (no global install):** prefix commands with `cargo run --release --` (example: `cargo run --release -- status`).
-> **Low-memory boards (e.g., Raspberry Pi 3, 1GB RAM):** run `CARGO_BUILD_JOBS=1 cargo build --release` if the kernel kills rustc during compilation.
 
 ## Architecture
 
