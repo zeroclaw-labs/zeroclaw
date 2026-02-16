@@ -10,6 +10,7 @@
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use lettre::message::SinglePart;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
 use mail_parser::{MessageParser, MimeHeaders};
@@ -389,7 +390,7 @@ impl Channel for EmailChannel {
             .from(self.config.from_address.parse()?)
             .to(recipient.parse()?)
             .subject(subject)
-            .body(body.to_string())?;
+            .singlepart(SinglePart::plain(body.to_string()))?;
 
         let transport = self.create_smtp_transport()?;
         transport.send(&email)?;
