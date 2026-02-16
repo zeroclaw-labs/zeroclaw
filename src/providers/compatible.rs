@@ -2,7 +2,7 @@
 //! Most LLM APIs follow the same `/v1/chat/completions` format.
 //! This module provides a single implementation that works for all of them.
 
-use crate::providers::traits::{ChatMessage, Provider};
+use crate::providers::traits::{ChatMessage, ChatResponse, Provider, ToolCall};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -135,11 +135,12 @@ struct ResponseMessage {
     #[serde(default)]
     content: Option<String>,
     #[serde(default)]
-    tool_calls: Option<Vec<ToolCall>>,
+    tool_calls: Option<Vec<ApiToolCall>>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct ToolCall {
+struct ApiToolCall {
+    id: Option<String>,
     #[serde(rename = "type")]
     kind: Option<String>,
     function: Option<Function>,
@@ -225,6 +226,44 @@ fn extract_responses_text(response: ResponsesResponse) -> Option<String> {
     None
 }
 
+fn map_response_message(message: ResponseMessage) -> ChatResponse {
+    let text = first_nonempty(message.content.as_deref());
+    let tool_calls = message
+        .tool_calls
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, call)| map_api_tool_call(call, index))
+        .collect();
+
+    ChatResponse { text, tool_calls }
+}
+
+fn map_api_tool_call(call: ApiToolCall, index: usize) -> Option<ToolCall> {
+    if call.kind.as_deref().is_some_and(|kind| kind != "function") {
+        return None;
+    }
+
+    let function = call.function?;
+    let name = function
+        .name
+        .and_then(|value| first_nonempty(Some(value.as_str())))?;
+    let arguments = function
+        .arguments
+        .and_then(|value| first_nonempty(Some(value.as_str())))
+        .unwrap_or_else(|| "{}".to_string());
+    let id = call
+        .id
+        .and_then(|value| first_nonempty(Some(value.as_str())))
+        .unwrap_or_else(|| format!("call_{}", index + 1));
+
+    Some(ToolCall {
+        id,
+        name,
+        arguments,
+    })
+}
+
 impl OpenAiCompatibleProvider {
     fn apply_auth_header(
         &self,
@@ -244,7 +283,7 @@ impl OpenAiCompatibleProvider {
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<ChatResponse> {
         let request = ResponsesRequest {
             model: model.to_string(),
             input: vec![ResponsesInput {
@@ -270,6 +309,7 @@ impl OpenAiCompatibleProvider {
         let responses: ResponsesResponse = response.json().await?;
 
         extract_responses_text(responses)
+            .map(ChatResponse::with_text)
             .ok_or_else(|| anyhow::anyhow!("No response from {} Responses API", self.name))
     }
 }
@@ -282,7 +322,7 @@ impl Provider for OpenAiCompatibleProvider {
         message: &str,
         model: &str,
         temperature: f64,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<ChatResponse> {
         let api_key = self.api_key.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "{} API key not set. Run `zeroclaw onboard` or set the appropriate env var.",
@@ -339,27 +379,13 @@ impl Provider for OpenAiCompatibleProvider {
 
         let chat_response: ApiChatResponse = response.json().await?;
 
-        chat_response
+        let choice = chat_response
             .choices
             .into_iter()
             .next()
-            .map(|c| {
-                // If tool_calls are present, serialize the full message as JSON
-                // so parse_tool_calls can handle the OpenAI-style format
-                if c.message.tool_calls.is_some()
-                    && c.message
-                        .tool_calls
-                        .as_ref()
-                        .map_or(false, |t| !t.is_empty())
-                {
-                    serde_json::to_string(&c.message)
-                        .unwrap_or_else(|_| c.message.content.unwrap_or_default())
-                } else {
-                    // No tool calls, return content as-is
-                    c.message.content.unwrap_or_default()
-                }
-            })
-            .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))
+            .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))?;
+
+        Ok(map_response_message(choice.message))
     }
 
     async fn chat_with_history(
@@ -367,7 +393,7 @@ impl Provider for OpenAiCompatibleProvider {
         messages: &[ChatMessage],
         model: &str,
         temperature: f64,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<ChatResponse> {
         let api_key = self.api_key.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "{} API key not set. Run `zeroclaw onboard` or set the appropriate env var.",
@@ -426,27 +452,13 @@ impl Provider for OpenAiCompatibleProvider {
 
         let chat_response: ApiChatResponse = response.json().await?;
 
-        chat_response
+        let choice = chat_response
             .choices
             .into_iter()
             .next()
-            .map(|c| {
-                // If tool_calls are present, serialize the full message as JSON
-                // so parse_tool_calls can handle the OpenAI-style format
-                if c.message.tool_calls.is_some()
-                    && c.message
-                        .tool_calls
-                        .as_ref()
-                        .map_or(false, |t| !t.is_empty())
-                {
-                    serde_json::to_string(&c.message)
-                        .unwrap_or_else(|_| c.message.content.unwrap_or_default())
-                } else {
-                    // No tool calls, return content as-is
-                    c.message.content.unwrap_or_default()
-                }
-            })
-            .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))
+            .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))?;
+
+        Ok(map_response_message(choice.message))
     }
 }
 
@@ -528,6 +540,20 @@ mod tests {
         let json = r#"{"choices":[]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         assert!(resp.choices.is_empty());
+    }
+
+    #[test]
+    fn response_with_tool_calls_maps_structured_data() {
+        let json = r#"{"choices":[{"message":{"content":"Running checks","tool_calls":[{"id":"call_1","type":"function","function":{"name":"shell","arguments":"{\"command\":\"pwd\"}"}}]}}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let choice = resp.choices.into_iter().next().unwrap();
+
+        let mapped = map_response_message(choice.message);
+        assert_eq!(mapped.text.as_deref(), Some("Running checks"));
+        assert_eq!(mapped.tool_calls.len(), 1);
+        assert_eq!(mapped.tool_calls[0].id, "call_1");
+        assert_eq!(mapped.tool_calls[0].name, "shell");
+        assert_eq!(mapped.tool_calls[0].arguments, r#"{"command":"pwd"}"#);
     }
 
     #[test]

@@ -49,6 +49,14 @@ pub struct ChatResponse {
 }
 
 impl ChatResponse {
+    /// Convenience: construct a plain text response with no tool calls.
+    pub fn with_text(text: impl Into<String>) -> Self {
+        Self {
+            text: Some(text.into()),
+            tool_calls: vec![],
+        }
+    }
+
     /// True when the LLM wants to invoke at least one tool.
     pub fn has_tool_calls(&self) -> bool {
         !self.tool_calls.is_empty()
@@ -84,7 +92,12 @@ pub enum ConversationMessage {
 
 #[async_trait]
 pub trait Provider: Send + Sync {
-    async fn chat(&self, message: &str, model: &str, temperature: f64) -> anyhow::Result<String> {
+    async fn chat(
+        &self,
+        message: &str,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ChatResponse> {
         self.chat_with_system(None, message, model, temperature)
             .await
     }
@@ -95,7 +108,7 @@ pub trait Provider: Send + Sync {
         message: &str,
         model: &str,
         temperature: f64,
-    ) -> anyhow::Result<String>;
+    ) -> anyhow::Result<ChatResponse>;
 
     /// Multi-turn conversation. Default implementation extracts the last user
     /// message and delegates to `chat_with_system`.
@@ -104,7 +117,7 @@ pub trait Provider: Send + Sync {
         messages: &[ChatMessage],
         model: &str,
         temperature: f64,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<ChatResponse> {
         let system = messages
             .iter()
             .find(|m| m.role == "system")

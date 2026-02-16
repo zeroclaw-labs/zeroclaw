@@ -1,4 +1,4 @@
-use super::traits::ChatMessage;
+use super::traits::{ChatMessage, ChatResponse};
 use super::Provider;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -98,7 +98,7 @@ impl Provider for RouterProvider {
         message: &str,
         model: &str,
         temperature: f64,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<ChatResponse> {
         let (provider_idx, resolved_model) = self.resolve(model);
 
         let (provider_name, provider) = &self.providers[provider_idx];
@@ -118,7 +118,7 @@ impl Provider for RouterProvider {
         messages: &[ChatMessage],
         model: &str,
         temperature: f64,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<ChatResponse> {
         let (provider_idx, resolved_model) = self.resolve(model);
         let (_, provider) = &self.providers[provider_idx];
         provider
@@ -175,10 +175,10 @@ mod tests {
             _message: &str,
             model: &str,
             _temperature: f64,
-        ) -> anyhow::Result<String> {
+        ) -> anyhow::Result<ChatResponse> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             *self.last_model.lock().unwrap() = model.to_string();
-            Ok(self.response.to_string())
+            Ok(ChatResponse::with_text(self.response))
         }
     }
 
@@ -229,7 +229,7 @@ mod tests {
             message: &str,
             model: &str,
             temperature: f64,
-        ) -> anyhow::Result<String> {
+        ) -> anyhow::Result<ChatResponse> {
             self.as_ref()
                 .chat_with_system(system_prompt, message, model, temperature)
                 .await
@@ -247,7 +247,7 @@ mod tests {
         );
 
         let result = router.chat("hello", "hint:reasoning", 0.5).await.unwrap();
-        assert_eq!(result, "smart-response");
+        assert_eq!(result.text_or_empty(), "smart-response");
         assert_eq!(mocks[1].call_count(), 1);
         assert_eq!(mocks[1].last_model(), "claude-opus");
         assert_eq!(mocks[0].call_count(), 0);
@@ -261,7 +261,7 @@ mod tests {
         );
 
         let result = router.chat("hello", "hint:fast", 0.5).await.unwrap();
-        assert_eq!(result, "fast-response");
+        assert_eq!(result.text_or_empty(), "fast-response");
         assert_eq!(mocks[0].call_count(), 1);
         assert_eq!(mocks[0].last_model(), "llama-3-70b");
     }
@@ -274,7 +274,7 @@ mod tests {
         );
 
         let result = router.chat("hello", "hint:nonexistent", 0.5).await.unwrap();
-        assert_eq!(result, "default-response");
+        assert_eq!(result.text_or_empty(), "default-response");
         assert_eq!(mocks[0].call_count(), 1);
         // Falls back to default with the hint as model name
         assert_eq!(mocks[0].last_model(), "hint:nonexistent");
@@ -294,7 +294,7 @@ mod tests {
             .chat("hello", "anthropic/claude-sonnet-4-20250514", 0.5)
             .await
             .unwrap();
-        assert_eq!(result, "primary-response");
+        assert_eq!(result.text_or_empty(), "primary-response");
         assert_eq!(mocks[0].call_count(), 1);
         assert_eq!(mocks[0].last_model(), "anthropic/claude-sonnet-4-20250514");
     }
@@ -355,7 +355,7 @@ mod tests {
             .chat_with_system(Some("system"), "hello", "model", 0.5)
             .await
             .unwrap();
-        assert_eq!(result, "response");
+        assert_eq!(result.text_or_empty(), "response");
         assert_eq!(mock.call_count(), 1);
     }
 }

@@ -32,7 +32,10 @@ fn split_message_for_telegram(message: &str) -> Vec<String> {
                     pos + 1
                 } else {
                     // Try space as fallback
-                    search_area.rfind(' ').unwrap_or(TELEGRAM_MAX_MESSAGE_LENGTH) + 1
+                    search_area
+                        .rfind(' ')
+                        .unwrap_or(TELEGRAM_MAX_MESSAGE_LENGTH)
+                        + 1
                 }
             } else if let Some(pos) = search_area.rfind(' ') {
                 pos + 1
@@ -916,7 +919,8 @@ mod tests {
 
     #[test]
     fn telegram_split_at_newline() {
-        let text_block = "Line of text\n".repeat(TELEGRAM_MAX_MESSAGE_LENGTH / 13);
+        let line = "Line of text\n";
+        let text_block = line.repeat(TELEGRAM_MAX_MESSAGE_LENGTH / line.len() + 1);
         let chunks = split_message_for_telegram(&text_block);
         assert!(chunks.len() >= 2);
         for chunk in chunks {
