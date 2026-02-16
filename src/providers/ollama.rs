@@ -34,6 +34,7 @@ struct ApiChatResponse {
 
 #[derive(Debug, Deserialize)]
 struct ResponseMessage {
+    #[serde(default)]
     content: String,
 }
 
@@ -85,15 +86,75 @@ impl Provider for OllamaProvider {
 
         let url = format!("{}/api/chat", self.base_url);
 
-        let response = self.client.post(&url).json(&request).send().await?;
-
-        if !response.status().is_success() {
-            let err = super::api_error("Ollama", response).await;
-            anyhow::bail!("{err}. Is Ollama running? (brew install ollama && ollama serve)");
+        tracing::debug!(
+            "Ollama request: url={} model={} message_count={} temperature={}",
+            url,
+            model,
+            request.messages.len(),
+            temperature
+        );
+        if tracing::enabled!(tracing::Level::TRACE) {
+            if let Ok(req_json) = serde_json::to_string(&request) {
+                tracing::trace!("Ollama request body: {}", req_json);
+            }
         }
 
-        let chat_response: ApiChatResponse = response.json().await?;
-        Ok(chat_response.message.content)
+        let response = self.client.post(&url).json(&request).send().await?;
+        let status = response.status();
+        tracing::debug!("Ollama response status: {}", status);
+
+        // Read raw body first to enable debugging if deserialization fails
+        let body = response.bytes().await?;
+        let body_len = body.len();
+
+        tracing::debug!("Ollama response body length: {} bytes", body_len);
+        if tracing::enabled!(tracing::Level::TRACE) {
+            let raw = String::from_utf8_lossy(&body);
+            tracing::trace!(
+                "Ollama raw response: {}",
+                if raw.len() > 2000 { &raw[..2000] } else { &raw }
+            );
+        }
+
+        if !status.is_success() {
+            let raw = String::from_utf8_lossy(&body);
+            tracing::error!("Ollama error response: status={} body={}", status, raw);
+            anyhow::bail!(
+                "Ollama API error ({}): {}. Is Ollama running? (brew install ollama && ollama serve)",
+                status,
+                if raw.len() > 200 { &raw[..200] } else { &raw }
+            );
+        }
+
+        let chat_response: ApiChatResponse = match serde_json::from_slice(&body) {
+            Ok(r) => r,
+            Err(e) => {
+                let raw = String::from_utf8_lossy(&body);
+                tracing::error!(
+                    "Ollama response deserialization failed: {e}. Raw body: {}",
+                    if raw.len() > 500 { &raw[..500] } else { &raw }
+                );
+                anyhow::bail!("Failed to parse Ollama response: {e}");
+            }
+        };
+
+        let content = chat_response.message.content;
+        tracing::debug!(
+            "Ollama response parsed: content_length={} content_preview='{}'",
+            content.len(),
+            if content.len() > 100 {
+                format!("{}...", &content[..100])
+            } else {
+                content.clone()
+            }
+        );
+
+        if content.is_empty() {
+            let raw = String::from_utf8_lossy(&body);
+            tracing::warn!("Ollama returned empty content. Raw response: {}", raw);
+        }
+
+        Ok(content)
     }
 }
 
@@ -177,6 +238,22 @@ mod tests {
         let json = r#"{"message":{"role":"assistant","content":""}}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         assert!(resp.message.content.is_empty());
+    }
+
+    #[test]
+    fn response_with_missing_content_defaults_to_empty() {
+        // Some models/versions may omit content field entirely
+        let json = r#"{"message":{"role":"assistant"}}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.message.content.is_empty());
+    }
+
+    #[test]
+    fn response_with_thinking_field_extracts_content() {
+        // Models with thinking capability return additional fields
+        let json = r#"{"message":{"role":"assistant","content":"hello","thinking":"internal reasoning"}}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.message.content, "hello");
     }
 
     #[test]
