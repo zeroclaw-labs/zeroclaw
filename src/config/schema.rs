@@ -2,6 +2,7 @@ use crate::security::AutonomyLevel;
 use anyhow::{Context, Result};
 use directories::UserDirs;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -63,6 +64,22 @@ pub struct Config {
 
     #[serde(default)]
     pub identity: IdentityConfig,
+
+    /// Named delegate agents for agent-to-agent handoff.
+    ///
+    /// ```toml
+    /// [agents.researcher]
+    /// provider = "gemini"
+    /// model = "gemini-2.0-flash"
+    /// system_prompt = "You are a research assistant..."
+    ///
+    /// [agents.coder]
+    /// provider = "openrouter"
+    /// model = "anthropic/claude-sonnet-4-20250514"
+    /// system_prompt = "You are a coding assistant..."
+    /// ```
+    #[serde(default)]
+    pub agents: HashMap<String, DelegateAgentConfig>,
 }
 
 // ── Identity (AIEOS / OpenClaw format) ──────────────────────────
@@ -92,6 +109,36 @@ impl Default for IdentityConfig {
             aieos_inline: None,
         }
     }
+}
+
+// ── Agent delegation ─────────────────────────────────────────────
+
+/// Configuration for a named delegate agent that can be invoked via the
+/// `delegate` tool. Each agent uses its own provider/model combination
+/// and system prompt, enabling multi-agent workflows with specialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DelegateAgentConfig {
+    /// Provider name (e.g. "gemini", "openrouter", "ollama")
+    pub provider: String,
+    /// Model identifier for the provider
+    pub model: String,
+    /// System prompt defining the agent's role and capabilities
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    /// Optional API key override (uses default if not set).
+    /// Stored encrypted when `secrets.encrypt = true`.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Temperature override (uses 0.7 if not set)
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    /// Maximum delegation depth to prevent infinite recursion (default: 3)
+    #[serde(default = "default_max_delegation_depth")]
+    pub max_depth: u32,
+}
+
+fn default_max_delegation_depth() -> u32 {
+    3
 }
 
 // ── Gateway security ─────────────────────────────────────────────
@@ -832,6 +879,7 @@ impl Default for Config {
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             identity: IdentityConfig::default(),
+            agents: HashMap::new(),
         }
     }
 }
@@ -858,6 +906,19 @@ impl Config {
             // Set computed paths that are skipped during serialization
             config.config_path = config_path.clone();
             config.workspace_dir = zeroclaw_dir.join("workspace");
+
+            // Decrypt agent API keys if encryption is enabled
+            let store = crate::security::SecretStore::new(&zeroclaw_dir, config.secrets.encrypt);
+            for agent in config.agents.values_mut() {
+                if let Some(ref encrypted_key) = agent.api_key {
+                    agent.api_key = Some(
+                        store
+                            .decrypt(encrypted_key)
+                            .context("Failed to decrypt agent API key")?,
+                    );
+                }
+            }
+
             Ok(config)
         } else {
             let mut config = Config::default();
@@ -928,7 +989,27 @@ impl Config {
     }
 
     pub fn save(&self) -> Result<()> {
-        let toml_str = toml::to_string_pretty(self).context("Failed to serialize config")?;
+        // Encrypt agent API keys before serialization
+        let mut config_to_save = self.clone();
+        let zeroclaw_dir = self
+            .config_path
+            .parent()
+            .context("Config path must have a parent directory")?;
+        let store = crate::security::SecretStore::new(zeroclaw_dir, self.secrets.encrypt);
+        for agent in config_to_save.agents.values_mut() {
+            if let Some(ref plaintext_key) = agent.api_key {
+                if !crate::security::SecretStore::is_encrypted(plaintext_key) {
+                    agent.api_key = Some(
+                        store
+                            .encrypt(plaintext_key)
+                            .context("Failed to encrypt agent API key")?,
+                    );
+                }
+            }
+        }
+
+        let toml_str =
+            toml::to_string_pretty(&config_to_save).context("Failed to serialize config")?;
 
         let parent_dir = self
             .config_path
@@ -1013,6 +1094,7 @@ fn sync_directory(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use tempfile::TempDir;
 
     // ── Defaults ─────────────────────────────────────────────
 
@@ -1142,6 +1224,7 @@ mod tests {
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             identity: IdentityConfig::default(),
+            agents: HashMap::new(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -1213,6 +1296,7 @@ default_temperature = 0.7
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             identity: IdentityConfig::default(),
+            agents: HashMap::new(),
         };
 
         config.save().unwrap();
@@ -1966,5 +2050,172 @@ default_temperature = 0.7
         assert!(g.require_pairing);
         assert!(!g.allow_public_bind);
         assert!(g.paired_tokens.is_empty());
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // AGENT DELEGATION CONFIG TESTS
+    // ══════════════════════════════════════════════════════════
+
+    #[test]
+    fn agents_config_default_empty() {
+        let c = Config::default();
+        assert!(c.agents.is_empty());
+    }
+
+    #[test]
+    fn agents_config_backward_compat_missing_section() {
+        let minimal = r#"
+workspace_dir = "/tmp/ws"
+config_path = "/tmp/config.toml"
+default_temperature = 0.7
+"#;
+        let parsed: Config = toml::from_str(minimal).unwrap();
+        assert!(parsed.agents.is_empty());
+    }
+
+    #[test]
+    fn agents_config_toml_roundtrip() {
+        let toml_str = r#"
+default_temperature = 0.7
+
+[agents.researcher]
+provider = "gemini"
+model = "gemini-2.0-flash"
+system_prompt = "You are a research assistant."
+max_depth = 2
+
+[agents.coder]
+provider = "openrouter"
+model = "anthropic/claude-sonnet-4-20250514"
+"#;
+        let parsed: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.agents.len(), 2);
+
+        let researcher = &parsed.agents["researcher"];
+        assert_eq!(researcher.provider, "gemini");
+        assert_eq!(researcher.model, "gemini-2.0-flash");
+        assert_eq!(
+            researcher.system_prompt.as_deref(),
+            Some("You are a research assistant.")
+        );
+        assert_eq!(researcher.max_depth, 2);
+        assert!(researcher.api_key.is_none());
+        assert!(researcher.temperature.is_none());
+
+        let coder = &parsed.agents["coder"];
+        assert_eq!(coder.provider, "openrouter");
+        assert_eq!(coder.model, "anthropic/claude-sonnet-4-20250514");
+        assert!(coder.system_prompt.is_none());
+        assert_eq!(coder.max_depth, 3); // default
+    }
+
+    #[test]
+    fn agents_config_with_api_key_and_temperature() {
+        let toml_str = r#"
+[agents.fast]
+provider = "groq"
+model = "llama-3.3-70b-versatile"
+api_key = "gsk-test-key"
+temperature = 0.3
+"#;
+        let parsed: HashMap<String, DelegateAgentConfig> = toml::from_str::<toml::Value>(toml_str)
+            .unwrap()["agents"]
+            .clone()
+            .try_into()
+            .unwrap();
+        let fast = &parsed["fast"];
+        assert_eq!(fast.api_key.as_deref(), Some("gsk-test-key"));
+        assert!((fast.temperature.unwrap() - 0.3).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn agent_api_key_encrypted_on_save_and_decrypted_on_load() {
+        let tmp = TempDir::new().unwrap();
+        let zeroclaw_dir = tmp.path();
+        let config_path = zeroclaw_dir.join("config.toml");
+
+        // Create a config with a plaintext agent API key
+        let mut agents = HashMap::new();
+        agents.insert(
+            "test_agent".to_string(),
+            DelegateAgentConfig {
+                provider: "openrouter".to_string(),
+                model: "test-model".to_string(),
+                system_prompt: None,
+                api_key: Some("sk-super-secret".to_string()),
+                temperature: None,
+                max_depth: 3,
+            },
+        );
+        let mut config = Config {
+            config_path: config_path.clone(),
+            workspace_dir: zeroclaw_dir.join("workspace"),
+            secrets: SecretsConfig { encrypt: true },
+            agents,
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        config.save().unwrap();
+
+        // Read the raw TOML and verify the key is encrypted (not plaintext)
+        let raw = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !raw.contains("sk-super-secret"),
+            "Plaintext API key should not appear in saved config"
+        );
+        assert!(
+            raw.contains("enc2:"),
+            "Encrypted key should use enc2: prefix"
+        );
+
+        // Parse and decrypt — simulate load_or_init by reading + decrypting
+        let store = crate::security::SecretStore::new(zeroclaw_dir, true);
+        let mut loaded: Config = toml::from_str(&raw).unwrap();
+        for agent in loaded.agents.values_mut() {
+            if let Some(ref encrypted_key) = agent.api_key {
+                agent.api_key = Some(store.decrypt(encrypted_key).unwrap());
+            }
+        }
+        assert_eq!(
+            loaded.agents["test_agent"].api_key.as_deref(),
+            Some("sk-super-secret"),
+            "Decrypted key should match original"
+        );
+    }
+
+    #[test]
+    fn agent_api_key_not_encrypted_when_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let zeroclaw_dir = tmp.path();
+        let config_path = zeroclaw_dir.join("config.toml");
+
+        let mut agents = HashMap::new();
+        agents.insert(
+            "test_agent".to_string(),
+            DelegateAgentConfig {
+                provider: "openrouter".to_string(),
+                model: "test-model".to_string(),
+                system_prompt: None,
+                api_key: Some("sk-plaintext-ok".to_string()),
+                temperature: None,
+                max_depth: 3,
+            },
+        );
+        let config = Config {
+            config_path: config_path.clone(),
+            workspace_dir: zeroclaw_dir.join("workspace"),
+            secrets: SecretsConfig { encrypt: false },
+            agents,
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        config.save().unwrap();
+
+        let raw = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            raw.contains("sk-plaintext-ok"),
+            "With encryption disabled, key should remain plaintext"
+        );
+        assert!(!raw.contains("enc2:"), "No encryption prefix when disabled");
     }
 }

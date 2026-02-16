@@ -396,6 +396,8 @@ pub async fn run(
         mem.clone(),
         composio_key,
         &config.browser,
+        &config.agents,
+        config.api_key.as_deref(),
     );
 
     // ── Resolve provider ─────────────────────────────────────────
@@ -468,6 +470,14 @@ pub async fn run(
         tool_descs.push((
             "composio",
             "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover, 'execute' to run, 'connect' to OAuth.",
+        ));
+    }
+    if !config.agents.is_empty() {
+        tool_descs.push((
+            "delegate",
+            "Delegate a subtask to a specialized agent. Use when: a task benefits from a different model \
+             (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single \
+             prompt and returns its response.",
         ));
     }
     let mut system_prompt = crate::channels::build_system_prompt(
