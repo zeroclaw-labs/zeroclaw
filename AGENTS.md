@@ -301,6 +301,16 @@ Treat privacy and neutrality as merge gates, not best-effort guidelines.
 - If reproducing external incidents, redact and anonymize all payloads before committing.
 - Before push, review `git diff --cached` specifically for accidental sensitive strings and identity leakage.
 
+### 9.2 Superseded-PR Attribution (Required)
+
+When a PR supersedes another contributor's PR and carries forward substantive code or design decisions, preserve authorship explicitly.
+
+- In the integrating commit message, add one `Co-authored-by: Name <email>` trailer per superseded contributor whose work is materially incorporated.
+- Use a GitHub-recognized email (`<login@users.noreply.github.com>` or the contributor's verified commit email) so attribution is rendered correctly.
+- Keep trailers on their own lines after a blank line at commit-message end; never encode them as escaped `\\n` text.
+- In the PR body, list superseded PR links and briefly state what was incorporated from each.
+- If no actual code/design was incorporated (only inspiration), do not use `Co-authored-by`; give credit in PR notes instead.
+
 Reference docs:
 
 - `CONTRIBUTING.md`
