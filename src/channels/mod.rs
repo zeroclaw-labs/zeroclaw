@@ -323,7 +323,8 @@ pub fn build_system_prompt(
         prompt.push_str("```\n<invoke>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</invoke>\n```\n\n");
         prompt.push_str("You may use multiple tool calls in a single response. ");
         prompt.push_str("After tool execution, results appear in <tool_result> tags. ");
-        prompt.push_str("Continue reasoning with the results until you can give a final answer.\n\n");
+        prompt
+            .push_str("Continue reasoning with the results until you can give a final answer.\n\n");
     }
 
     // ── 2. Safety ───────────────────────────────────────────────
@@ -1269,7 +1270,10 @@ mod tests {
 
         // Reproduces the production crash path where channel logs truncate at 80 chars.
         let result = std::panic::catch_unwind(|| crate::util::truncate_with_ellipsis(msg, 80));
-        assert!(result.is_ok(), "truncate_with_ellipsis should never panic on UTF-8");
+        assert!(
+            result.is_ok(),
+            "truncate_with_ellipsis should never panic on UTF-8"
+        );
 
         let truncated = result.unwrap();
         assert!(!truncated.is_empty());
