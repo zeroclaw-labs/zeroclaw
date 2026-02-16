@@ -353,13 +353,7 @@ mod tests {
 
     #[test]
     fn lark_user_denied_empty() {
-        let ch = LarkChannel::new(
-            "id".into(),
-            "secret".into(),
-            "token".into(),
-            9898,
-            vec![],
-        );
+        let ch = LarkChannel::new("id".into(), "secret".into(), "token".into(), 9898, vec![]);
         assert!(!ch.is_user_allowed("ou_anyone"));
     }
 
@@ -581,16 +575,16 @@ mod tests {
         let lc = LarkConfig {
             app_id: "cli_app123".into(),
             app_secret: "secret456".into(),
-            verification_token: "vtoken789".into(),
-            port: 9898,
+            encrypt_key: None,
+            verification_token: Some("vtoken789".into()),
             allowed_users: vec!["ou_user1".into(), "ou_user2".into()],
+            use_feishu: false,
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.app_id, "cli_app123");
         assert_eq!(parsed.app_secret, "secret456");
-        assert_eq!(parsed.verification_token, "vtoken789");
-        assert_eq!(parsed.port, 9898);
+        assert_eq!(parsed.verification_token.as_deref(), Some("vtoken789"));
         assert_eq!(parsed.allowed_users.len(), 2);
     }
 
@@ -600,23 +594,24 @@ mod tests {
         let lc = LarkConfig {
             app_id: "app".into(),
             app_secret: "secret".into(),
-            verification_token: "tok".into(),
-            port: 8080,
+            encrypt_key: None,
+            verification_token: Some("tok".into()),
             allowed_users: vec!["*".into()],
+            use_feishu: false,
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.app_id, "app");
-        assert_eq!(parsed.port, 8080);
+        assert_eq!(parsed.verification_token.as_deref(), Some("tok"));
         assert_eq!(parsed.allowed_users, vec!["*"]);
     }
 
     #[test]
-    fn lark_config_default_port() {
+    fn lark_config_defaults_optional_fields() {
         use crate::config::schema::LarkConfig;
-        let json = r#"{"app_id":"a","app_secret":"s","verification_token":"t"}"#;
+        let json = r#"{"app_id":"a","app_secret":"s"}"#;
         let parsed: LarkConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.port, 9898);
+        assert!(parsed.verification_token.is_none());
         assert!(parsed.allowed_users.is_empty());
     }
 
