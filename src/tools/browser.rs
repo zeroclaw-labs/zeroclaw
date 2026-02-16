@@ -393,9 +393,10 @@ impl BrowserTool {
             anyhow::bail!("URL cannot be empty");
         }
 
-        // Allow file:// URLs for local testing
+        // Block file:// URLs — browser file access bypasses all SSRF and
+        // domain-allowlist controls and can exfiltrate arbitrary local files.
         if url.starts_with("file://") {
-            return Ok(());
+            anyhow::bail!("file:// URLs are not allowed in browser automation");
         }
 
         if !url.starts_with("https://") && !url.starts_with("http://") {
@@ -1966,49 +1967,63 @@ fn is_private_host(host: &str) -> bool {
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host);
 
-    if bare == "localhost" {
+    if bare == "localhost" || bare.ends_with(".localhost") {
+        return true;
+    }
+
+    // .local TLD (mDNS)
+    if bare
+        .rsplit('.')
+        .next()
+        .is_some_and(|label| label == "local")
+    {
         return true;
     }
 
     // Parse as IP address to catch all representations (decimal, hex, octal, mapped)
     if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
         return match ip {
-            std::net::IpAddr::V4(v4) => {
-                v4.is_loopback()
-                    || v4.is_private()
-                    || v4.is_link_local()
-                    || v4.is_unspecified()
-                    || v4.is_broadcast()
-            }
-            std::net::IpAddr::V6(v6) => {
-                let segs = v6.segments();
-                v6.is_loopback()
-                    || v6.is_unspecified()
-                    // Unique-local (fc00::/7) — IPv6 equivalent of RFC 1918
-                    || (segs[0] & 0xfe00) == 0xfc00
-                    // Link-local (fe80::/10)
-                    || (segs[0] & 0xffc0) == 0xfe80
-                    // IPv4-mapped addresses (::ffff:127.0.0.1)
-                    || v6.to_ipv4_mapped().is_some_and(|v4| {
-                        v4.is_loopback()
-                            || v4.is_private()
-                            || v4.is_link_local()
-                            || v4.is_unspecified()
-                            || v4.is_broadcast()
-                    })
-            }
+            std::net::IpAddr::V4(v4) => is_non_global_v4(v4),
+            std::net::IpAddr::V6(v6) => is_non_global_v6(v6),
         };
     }
 
-    // Fallback string patterns for hostnames that look like IPs but don't parse
-    // (e.g., partial addresses used in DNS names).
-    let string_patterns = [
-        "127.", "10.", "192.168.", "0.0.0.0", "172.16.", "172.17.", "172.18.", "172.19.",
-        "172.20.", "172.21.", "172.22.", "172.23.", "172.24.", "172.25.", "172.26.", "172.27.",
-        "172.28.", "172.29.", "172.30.", "172.31.",
-    ];
+    false
+}
 
-    string_patterns.iter().any(|p| bare.starts_with(p))
+/// Returns `true` for any IPv4 address that is not globally routable.
+fn is_non_global_v4(v4: std::net::Ipv4Addr) -> bool {
+    let [a, b, _, _] = v4.octets();
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || v4.is_multicast()
+        // Shared address space (100.64/10)
+        || (a == 100 && (64..=127).contains(&b))
+        // Reserved (240.0.0.0/4)
+        || a >= 240
+        // Documentation (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24)
+        || (a == 192 && b == 0)
+        || (a == 198 && b == 51)
+        || (a == 203 && b == 0)
+        // Benchmarking (198.18.0.0/15)
+        || (a == 198 && (18..=19).contains(&b))
+}
+
+/// Returns `true` for any IPv6 address that is not globally routable.
+fn is_non_global_v6(v6: std::net::Ipv6Addr) -> bool {
+    let segs = v6.segments();
+    v6.is_loopback()
+        || v6.is_unspecified()
+        || v6.is_multicast()
+        // Unique-local (fc00::/7) — IPv6 equivalent of RFC 1918
+        || (segs[0] & 0xfe00) == 0xfc00
+        // Link-local (fe80::/10)
+        || (segs[0] & 0xffc0) == 0xfe80
+        // IPv4-mapped addresses
+        || v6.to_ipv4_mapped().is_some_and(|v4| is_non_global_v4(v4))
 }
 
 fn host_matches_allowlist(host: &str, allowed: &[String]) -> bool {
@@ -2070,11 +2085,25 @@ mod tests {
     #[test]
     fn is_private_host_detects_local() {
         assert!(is_private_host("localhost"));
+        assert!(is_private_host("app.localhost"));
+        assert!(is_private_host("printer.local"));
         assert!(is_private_host("127.0.0.1"));
         assert!(is_private_host("192.168.1.1"));
         assert!(is_private_host("10.0.0.1"));
         assert!(!is_private_host("example.com"));
         assert!(!is_private_host("google.com"));
+    }
+
+    #[test]
+    fn is_private_host_blocks_multicast_and_reserved() {
+        assert!(is_private_host("224.0.0.1")); // multicast
+        assert!(is_private_host("255.255.255.255")); // broadcast
+        assert!(is_private_host("100.64.0.1")); // shared address space
+        assert!(is_private_host("240.0.0.1")); // reserved
+        assert!(is_private_host("192.0.2.1")); // documentation
+        assert!(is_private_host("198.51.100.1")); // documentation
+        assert!(is_private_host("203.0.113.1")); // documentation
+        assert!(is_private_host("198.18.0.1")); // benchmarking
     }
 
     #[test]
@@ -2303,8 +2332,8 @@ mod tests {
         // Invalid - not https
         assert!(tool.validate_url("ftp://example.com").is_err());
 
-        // File URLs allowed
-        assert!(tool.validate_url("file:///tmp/test.html").is_ok());
+        // file:// URLs blocked (local file exfiltration risk)
+        assert!(tool.validate_url("file:///tmp/test.html").is_err());
     }
 
     #[test]
