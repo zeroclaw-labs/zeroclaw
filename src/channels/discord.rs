@@ -12,7 +12,7 @@ pub struct DiscordChannel {
     allowed_users: Vec<String>,
     listen_to_bots: bool,
     client: reqwest::Client,
-    typing_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    typing_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl DiscordChannel {
@@ -28,7 +28,7 @@ impl DiscordChannel {
             allowed_users,
             listen_to_bots,
             client: reqwest::Client::new(),
-            typing_handle: std::sync::Mutex::new(None),
+            typing_handle: parking_lot::Mutex::new(None),
         }
     }
 
@@ -395,7 +395,8 @@ impl Channel for DiscordChannel {
             }
         });
 
-        if let Ok(mut guard) = self.typing_handle.lock() {
+        {
+            let mut guard = self.typing_handle.lock();
             *guard = Some(handle);
         }
 
@@ -403,10 +404,9 @@ impl Channel for DiscordChannel {
     }
 
     async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
-        if let Ok(mut guard) = self.typing_handle.lock() {
-            if let Some(handle) = guard.take() {
-                handle.abort();
-            }
+        let mut guard = self.typing_handle.lock();
+        if let Some(handle) = guard.take() {
+            handle.abort();
         }
         Ok(())
     }
@@ -659,7 +659,7 @@ mod tests {
     #[test]
     fn typing_handle_starts_as_none() {
         let ch = DiscordChannel::new("fake".into(), None, vec![], false);
-        let guard = ch.typing_handle.lock().unwrap();
+        let guard = ch.typing_handle.lock();
         assert!(guard.is_none());
     }
 
@@ -667,7 +667,7 @@ mod tests {
     async fn start_typing_sets_handle() {
         let ch = DiscordChannel::new("fake".into(), None, vec![], false);
         let _ = ch.start_typing("123456").await;
-        let guard = ch.typing_handle.lock().unwrap();
+        let guard = ch.typing_handle.lock();
         assert!(guard.is_some());
     }
 
@@ -676,7 +676,7 @@ mod tests {
         let ch = DiscordChannel::new("fake".into(), None, vec![], false);
         let _ = ch.start_typing("123456").await;
         let _ = ch.stop_typing("123456").await;
-        let guard = ch.typing_handle.lock().unwrap();
+        let guard = ch.typing_handle.lock();
         assert!(guard.is_none());
     }
 
@@ -692,7 +692,7 @@ mod tests {
         let ch = DiscordChannel::new("fake".into(), None, vec![], false);
         let _ = ch.start_typing("111").await;
         let _ = ch.start_typing("222").await;
-        let guard = ch.typing_handle.lock().unwrap();
+        let guard = ch.typing_handle.lock();
         assert!(guard.is_some());
     }
 }

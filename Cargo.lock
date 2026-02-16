@@ -3608,6 +3608,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "parking_lot",
  "prometheus",
  "reqwest",
  "rusqlite",
