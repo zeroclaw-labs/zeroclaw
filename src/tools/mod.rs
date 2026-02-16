@@ -10,6 +10,7 @@ pub mod image_info;
 pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
+pub mod schedule;
 pub mod screenshot;
 pub mod shell;
 pub mod traits;
@@ -26,6 +27,7 @@ pub use image_info::ImageInfoTool;
 pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
+pub use schedule::ScheduleTool;
 pub use screenshot::ScreenshotTool;
 pub use shell::ShellTool;
 pub use traits::Tool;
@@ -67,6 +69,7 @@ pub fn all_tools(
     workspace_dir: &std::path::Path,
     agents: &HashMap<String, DelegateAgentConfig>,
     fallback_api_key: Option<&str>,
+    config: &crate::config::Config,
 ) -> Vec<Box<dyn Tool>> {
     all_tools_with_runtime(
         security,
@@ -78,6 +81,7 @@ pub fn all_tools(
         workspace_dir,
         agents,
         fallback_api_key,
+        config,
     )
 }
 
@@ -93,6 +97,7 @@ pub fn all_tools_with_runtime(
     workspace_dir: &std::path::Path,
     agents: &HashMap<String, DelegateAgentConfig>,
     fallback_api_key: Option<&str>,
+    config: &crate::config::Config,
 ) -> Vec<Box<dyn Tool>> {
     let mut tools: Vec<Box<dyn Tool>> = vec![
         Box::new(ShellTool::new(security.clone(), runtime)),
@@ -101,6 +106,7 @@ pub fn all_tools_with_runtime(
         Box::new(MemoryStoreTool::new(memory.clone())),
         Box::new(MemoryRecallTool::new(memory.clone())),
         Box::new(MemoryForgetTool::new(memory)),
+        Box::new(ScheduleTool::new(security.clone(), config.clone())),
         Box::new(GitOperationsTool::new(
             security.clone(),
             workspace_dir.to_path_buf(),
@@ -158,8 +164,16 @@ pub fn all_tools_with_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BrowserConfig, MemoryConfig};
+    use crate::config::{BrowserConfig, Config, MemoryConfig};
     use tempfile::TempDir;
+
+    fn test_config(tmp: &TempDir) -> Config {
+        Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        }
+    }
 
     #[test]
     fn default_tools_has_three() {
@@ -186,6 +200,7 @@ mod tests {
             ..BrowserConfig::default()
         };
         let http = crate::config::HttpRequestConfig::default();
+        let cfg = test_config(&tmp);
 
         let tools = all_tools(
             &security,
@@ -196,9 +211,11 @@ mod tests {
             tmp.path(),
             &HashMap::new(),
             None,
+            &cfg,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"browser_open"));
+        assert!(names.contains(&"schedule"));
     }
 
     #[test]
@@ -219,6 +236,7 @@ mod tests {
             ..BrowserConfig::default()
         };
         let http = crate::config::HttpRequestConfig::default();
+        let cfg = test_config(&tmp);
 
         let tools = all_tools(
             &security,
@@ -229,6 +247,7 @@ mod tests {
             tmp.path(),
             &HashMap::new(),
             None,
+            &cfg,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"browser_open"));
@@ -341,6 +360,7 @@ mod tests {
 
         let browser = BrowserConfig::default();
         let http = crate::config::HttpRequestConfig::default();
+        let cfg = test_config(&tmp);
 
         let mut agents = HashMap::new();
         agents.insert(
@@ -364,6 +384,7 @@ mod tests {
             tmp.path(),
             &agents,
             Some("sk-test"),
+            &cfg,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"delegate"));
@@ -382,6 +403,7 @@ mod tests {
 
         let browser = BrowserConfig::default();
         let http = crate::config::HttpRequestConfig::default();
+        let cfg = test_config(&tmp);
 
         let tools = all_tools(
             &security,
@@ -392,6 +414,7 @@ mod tests {
             tmp.path(),
             &HashMap::new(),
             None,
+            &cfg,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"delegate"));

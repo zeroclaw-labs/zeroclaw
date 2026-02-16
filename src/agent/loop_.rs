@@ -598,6 +598,7 @@ pub async fn run(
         &config.workspace_dir,
         &config.agents,
         config.api_key.as_deref(),
+        &config,
     );
 
     // ── Resolve provider ─────────────────────────────────────────
@@ -672,6 +673,10 @@ pub async fn run(
             "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover, 'execute' to run, 'connect' to OAuth.",
         ));
     }
+    tool_descs.push((
+        "schedule",
+        "Manage scheduled tasks (create/list/get/cancel/pause/resume). Supports recurring cron and one-shot delays.",
+    ));
     if !config.agents.is_empty() {
         tool_descs.push((
             "delegate",

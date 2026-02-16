@@ -730,6 +730,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.workspace_dir,
         &config.agents,
         config.api_key.as_deref(),
+        &config,
     ));
 
     // Build system prompt from workspace identity files + skills
@@ -776,6 +777,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
             "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover, 'execute' to run, 'connect' to OAuth.",
         ));
     }
+    tool_descs.push((
+        "schedule",
+        "Manage scheduled tasks (create/list/get/cancel/pause/resume). Supports recurring cron and one-shot delays.",
+    ));
     if !config.agents.is_empty() {
         tool_descs.push((
             "delegate",
