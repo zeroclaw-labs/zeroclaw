@@ -919,7 +919,8 @@ mod tests {
 
     #[test]
     fn telegram_split_at_newline() {
-        let text_block = "Line of text\n".repeat(TELEGRAM_MAX_MESSAGE_LENGTH / 13);
+        let line = "Line of text\n";
+        let text_block = line.repeat(TELEGRAM_MAX_MESSAGE_LENGTH / line.len() + 1);
         let chunks = split_message_for_telegram(&text_block);
         assert!(chunks.len() >= 2);
         for chunk in chunks {
