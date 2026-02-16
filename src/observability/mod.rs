@@ -22,7 +22,10 @@ pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
             ) {
                 Ok(obs) => {
                     tracing::info!(
-                        endpoint = config.otel_endpoint.as_deref().unwrap_or("http://localhost:4318"),
+                        endpoint = config
+                            .otel_endpoint
+                            .as_deref()
+                            .unwrap_or("http://localhost:4318"),
                         "OpenTelemetry observer initialized"
                     );
                     Box::new(obs)
