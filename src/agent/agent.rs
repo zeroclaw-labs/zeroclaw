@@ -226,6 +226,7 @@ impl Agent {
         };
 
         let tools = tools::all_tools_with_runtime(
+            Arc::new(config.clone()),
             &security,
             runtime,
             memory.clone(),
