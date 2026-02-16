@@ -418,6 +418,48 @@ jobs:
               return refined;
             }
 
+            function compactNoisyModuleLabels(labels) {
+              const noisyPrefixes = new Set(["tool", "provider", "channel"]);
+              const groupedSegments = new Map();
+              const compacted = new Set();
+              const forcePathPrefixes = new Set();
+
+              for (const label of labels) {
+                const parsed = parseModuleLabel(label);
+                if (!parsed) continue;
+                if (!groupedSegments.has(parsed.prefix)) {
+                  groupedSegments.set(parsed.prefix, new Set());
+                }
+                groupedSegments.get(parsed.prefix).add(parsed.segment);
+              }
+
+              for (const label of labels) {
+                const parsed = parseModuleLabel(label);
+                if (!parsed) continue;
+                if (!noisyPrefixes.has(parsed.prefix)) {
+                  compacted.add(label);
+                }
+              }
+
+              for (const [prefix, segments] of groupedSegments) {
+                if (!noisyPrefixes.has(prefix)) continue;
+
+                const specificSegments = [...segments].filter((segment) => segment !== "core");
+                const uniqueSpecificSegments = [...new Set(specificSegments)];
+
+                if (uniqueSpecificSegments.length === 1) {
+                  compacted.add(`${prefix}:${uniqueSpecificSegments[0]}`);
+                } else {
+                  forcePathPrefixes.add(prefix);
+                }
+              }
+
+              return {
+                moduleLabels: compacted,
+                forcePathPrefixes,
+              };
+            }
+
             function colorForLabel(label) {
               if (staticLabelColors[label]) return staticLabelColors[label];
               const matchedPrefix = Object.keys(modulePrefixColors).find((prefix) => label.startsWith(prefix));
@@ -558,8 +600,11 @@ jobs:
             }
 
             const refinedModuleLabels = refineModuleLabels(detectedModuleLabels);
+            const compactedModuleState = compactNoisyModuleLabels(refinedModuleLabels);
+            const selectedModuleLabels = compactedModuleState.moduleLabels;
+            const forcePathPrefixes = compactedModuleState.forcePathPrefixes;
             const modulePrefixesWithLabels = new Set(
-              [...refinedModuleLabels]
+              [...selectedModuleLabels]
                 .map((label) => parseModuleLabel(label)?.prefix)
                 .filter(Boolean)
             );
@@ -571,9 +616,11 @@ jobs:
             });
             const currentLabelNames = currentLabels.map((label) => label.name);
             const currentPathLabels = currentLabelNames.filter((label) => managedPathLabelSet.has(label));
+            const candidatePathLabels = new Set([...currentPathLabels, ...forcePathPrefixes]);
 
-            const dedupedPathLabels = currentPathLabels.filter((label) => {
+            const dedupedPathLabels = [...candidatePathLabels].filter((label) => {
               if (label === "core") return true;
+              if (forcePathPrefixes.has(label)) return true;
               return !modulePrefixesWithLabels.has(label);
             });
 
@@ -627,7 +674,7 @@ jobs:
               manualRiskOverrideLabel,
               ...managedPathLabels,
               ...contributorTierLabels,
-              ...refinedModuleLabels,
+              ...selectedModuleLabels,
             ]);
 
             for (const label of labelsToEnsure) {
@@ -663,7 +710,7 @@ jobs:
             const manualRiskSelection =
               currentLabelNames.find((label) => computedRiskLabels.includes(label)) || riskLabel;
 
-            const moduleLabelList = sortModuleLabels([...refinedModuleLabels]);
+            const moduleLabelList = sortModuleLabels([...selectedModuleLabels]);
             const contributorLabelList = contributorTierLabel ? [contributorTierLabel] : [];
             const selectedRiskLabels = hasManualRiskOverride
               ? sortByPriority([manualRiskSelection, manualRiskOverrideLabel], riskPriorityIndex)
