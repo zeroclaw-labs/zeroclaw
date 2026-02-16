@@ -63,10 +63,6 @@ landlock = { version = "0.4", optional = true }
 # Async traits
 async-trait = "0.1"
 
-# Streaming support
-async-stream = "0.3"
-futures = "0.3"
-
 # Memory / persistence
 rusqlite = { version = "0.38", features = ["bundled"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }

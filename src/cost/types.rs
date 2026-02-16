@@ -18,6 +18,14 @@ pub struct TokenUsage {
 }
 
 impl TokenUsage {
+    fn sanitize_price(value: f64) -> f64 {
+        if value.is_finite() && value > 0.0 {
+            value
+        } else {
+            0.0
+        }
+    }
+
     /// Create a new token usage record.
     pub fn new(
         model: impl Into<String>,
@@ -27,8 +35,8 @@ impl TokenUsage {
         output_price_per_million: f64,
     ) -> Self {
         let model = model.into();
-        let input_tokens = input_tokens;
-        let output_tokens = output_tokens;
+        let input_price_per_million = Self::sanitize_price(input_price_per_million);
+        let output_price_per_million = Self::sanitize_price(output_price_per_million);
         let total_tokens = input_tokens.saturating_add(output_tokens);
 
         // Calculate cost: (tokens / 1M) * price_per_million
@@ -162,8 +170,15 @@ mod tests {
     #[test]
     fn token_usage_zero_tokens() {
         let usage = TokenUsage::new("test/model", 0, 0, 3.0, 15.0);
-        assert_eq!(usage.cost_usd, 0.0);
+        assert!(usage.cost_usd.abs() < f64::EPSILON);
         assert_eq!(usage.total_tokens, 0);
+    }
+
+    #[test]
+    fn token_usage_negative_or_non_finite_prices_are_clamped() {
+        let usage = TokenUsage::new("test/model", 1000, 1000, -3.0, f64::NAN);
+        assert!(usage.cost_usd.abs() < f64::EPSILON);
+        assert_eq!(usage.total_tokens, 2000);
     }
 
     #[test]
