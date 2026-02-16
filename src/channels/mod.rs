@@ -715,16 +715,20 @@ pub async fn start_channels(config: Config) -> Result<()> {
         config.api_key.as_deref(),
     )?);
 
-    let composio_key = if config.composio.enabled {
-        config.composio.api_key.as_deref()
+    let (composio_key, composio_entity_id) = if config.composio.enabled {
+        (
+            config.composio.api_key.as_deref(),
+            Some(config.composio.entity_id.as_str()),
+        )
     } else {
-        None
+        (None, None)
     };
     let tools_registry = Arc::new(tools::all_tools_with_runtime(
         &security,
         runtime,
         Arc::clone(&mem),
         composio_key,
+        composio_entity_id,
         &config.browser,
         &config.http_request,
         &config.workspace_dir,
@@ -774,7 +778,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     if config.composio.enabled {
         tool_descs.push((
             "composio",
-            "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover, 'execute' to run, 'connect' to OAuth.",
+            "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover, 'execute' to run (optionally with connected_account_id), 'connect' to OAuth.",
         ));
     }
     tool_descs.push((
