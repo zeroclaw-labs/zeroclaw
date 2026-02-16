@@ -544,8 +544,9 @@ async fn handle_webhook(
     let Json(webhook_body) = match body {
         Ok(b) => b,
         Err(e) => {
+            tracing::warn!("Webhook JSON parse error: {e}");
             let err = serde_json::json!({
-                "error": format!("Invalid JSON: {e}. Expected: {{\"message\": \"...\"}}")
+                "error": "Invalid JSON body. Expected: {\"message\": \"...\"}"
             });
             return (StatusCode::BAD_REQUEST, Json(err));
         }
