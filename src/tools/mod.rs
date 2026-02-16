@@ -10,6 +10,7 @@ pub mod image_info;
 pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
+pub mod schedule;
 pub mod screenshot;
 pub mod shell;
 pub mod traits;
@@ -26,6 +27,7 @@ pub use image_info::ImageInfoTool;
 pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
+pub use schedule::ScheduleTool;
 pub use screenshot::ScreenshotTool;
 pub use shell::ShellTool;
 pub use traits::Tool;
@@ -143,6 +145,15 @@ pub fn all_tools_with_runtime(
             tools.push(Box::new(ComposioTool::new(key)));
         }
     }
+
+    // Schedule tool is always available
+    tools.push(Box::new(ScheduleTool::new(
+        security.clone(),
+        crate::config::Config {
+            workspace_dir: workspace_dir.to_path_buf(),
+            ..crate::config::Config::default()
+        },
+    )));
 
     // Add delegation tool when agents are configured
     if !agents.is_empty() {
