@@ -56,11 +56,26 @@ impl OpenAiCompatibleProvider {
         }
     }
 
+    fn has_explicit_api_path(&self) -> bool {
+        let Ok(url) = reqwest::Url::parse(&self.base_url) else {
+            return false;
+        };
+
+        let path = url.path().trim_end_matches('/');
+        !path.is_empty() && path != "/"
+    }
+
     /// Build the full URL for responses API, detecting if base_url already includes the path.
     fn responses_url(&self) -> String {
         // If base_url already contains "responses", use it as-is
         if self.base_url.contains("responses") {
-            self.base_url.clone()
+            return self.base_url.clone();
+        }
+
+        // If an explicit API path already exists (e.g. /v1, /openai, /api/coding/v3),
+        // append responses directly to avoid duplicate /v1 segments.
+        if self.has_explicit_api_path() {
+            format!("{}/responses", self.base_url)
         } else {
             format!("{}/v1/responses", self.base_url)
         }
@@ -636,6 +651,21 @@ mod tests {
         assert_eq!(
             p.responses_url(),
             "https://my-api.example.com/api/v2/responses"
+        );
+    }
+
+    #[test]
+    fn responses_url_base_with_v1_no_duplicate() {
+        let p = make_provider("test", "https://api.example.com/v1", None);
+        assert_eq!(p.responses_url(), "https://api.example.com/v1/responses");
+    }
+
+    #[test]
+    fn responses_url_non_v1_api_path_uses_raw_suffix() {
+        let p = make_provider("test", "https://api.example.com/api/coding/v3", None);
+        assert_eq!(
+            p.responses_url(),
+            "https://api.example.com/api/coding/v3/responses"
         );
     }
 
