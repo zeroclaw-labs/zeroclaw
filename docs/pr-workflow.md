@@ -49,7 +49,11 @@ Maintain these branch protection rules on `main`:
 ### Step A: Intake
 
 - Contributor opens PR with full `.github/pull_request_template.md`.
-- `PR Labeler` applies scope/path labels + size labels + risk labels + module labels (for example `channel:telegram`, `provider:kimi`, `tool:shell`) and contributor tiers by merged PR count (`experienced` >=10, `principal` >=20, `distinguished` >=50).
+- `PR Labeler` applies scope/path labels + size labels + risk labels + module labels (for example `channel:telegram`, `provider:kimi`, `tool:shell`) and contributor tiers by merged PR count (`experienced` >=10, `principal` >=20, `distinguished` >=50), while de-duplicating less-specific scope labels when a more specific module label is present.
+- For `tool` / `provider` / `channel`, module labels are compacted to reduce noise: one specific module keeps `prefix:component`, but multiple specifics collapse to the base scope label.
+- Label ordering is priority-first: `risk:*` -> `size:*` -> contributor tier -> module/path labels.
+- Hovering a label in GitHub shows its auto-managed description (rule/threshold summary).
+- Managed label colors are arranged by display order to create a smooth gradient across long label rows.
 - `Auto Response` posts first-time guidance and handles label-driven routing for low-signal items.
 
 ### Step B: Validation
