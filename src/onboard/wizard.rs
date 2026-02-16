@@ -1,4 +1,4 @@
-use crate::config::schema::{IrcConfig, WhatsAppConfig};
+use crate::config::schema::{DingTalkConfig, IrcConfig, WhatsAppConfig};
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
     HeartbeatConfig, IMessageConfig, MatrixConfig, MemoryConfig, ObservabilityConfig,
@@ -155,7 +155,8 @@ pub fn run_wizard() -> Result<Config> {
         || config.channels_config.slack.is_some()
         || config.channels_config.imessage.is_some()
         || config.channels_config.matrix.is_some()
-        || config.channels_config.email.is_some();
+        || config.channels_config.email.is_some()
+        || config.channels_config.dingtalk.is_some();
 
     if has_channels && config.api_key.is_some() {
         let launch: bool = Confirm::new()
@@ -211,7 +212,8 @@ pub fn run_channels_repair_wizard() -> Result<Config> {
         || config.channels_config.slack.is_some()
         || config.channels_config.imessage.is_some()
         || config.channels_config.matrix.is_some()
-        || config.channels_config.email.is_some();
+        || config.channels_config.email.is_some()
+        || config.channels_config.dingtalk.is_some();
 
     if has_channels && config.api_key.is_some() {
         let launch: bool = Confirm::new()
@@ -2230,6 +2232,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
         email: None,
         irc: None,
         lark: None,
+        dingtalk: None,
     };
 
     loop {
@@ -2298,13 +2301,21 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     "— HTTP endpoint"
                 }
             ),
+            format!(
+                "DingTalk   {}",
+                if config.dingtalk.is_some() {
+                    "✅ connected"
+                } else {
+                    "— 钉钉 Stream Mode"
+                }
+            ),
             "Done — finish setup".to_string(),
         ];
 
         let choice = Select::new()
             .with_prompt("  Connect a channel (or Done to continue)")
             .items(&options)
-            .default(8)
+            .default(9)
             .interact()?;
 
         match choice {
@@ -3023,6 +3034,76 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     style(&port).cyan()
                 );
             }
+            8 => {
+                // ── DingTalk ──
+                println!();
+                println!(
+                    "  {} {}",
+                    style("DingTalk Setup").white().bold(),
+                    style("— 钉钉 Stream Mode").dim()
+                );
+                print_bullet("1. Go to DingTalk developer console (open.dingtalk.com)");
+                print_bullet("2. Create an app and enable the Stream Mode bot");
+                print_bullet("3. Copy the Client ID (AppKey) and Client Secret (AppSecret)");
+                println!();
+
+                let client_id: String = Input::new()
+                    .with_prompt("  Client ID (AppKey)")
+                    .interact_text()?;
+
+                if client_id.trim().is_empty() {
+                    println!("  {} Skipped", style("→").dim());
+                    continue;
+                }
+
+                let client_secret: String = Input::new()
+                    .with_prompt("  Client Secret (AppSecret)")
+                    .interact_text()?;
+
+                // Test connection
+                print!("  {} Testing connection... ", style("⏳").dim());
+                let client = reqwest::blocking::Client::new();
+                let body = serde_json::json!({
+                    "clientId": client_id,
+                    "clientSecret": client_secret,
+                });
+                match client
+                    .post("https://api.dingtalk.com/v1.0/gateway/connections/open")
+                    .json(&body)
+                    .send()
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        println!(
+                            "\r  {} DingTalk credentials verified        ",
+                            style("✅").green().bold()
+                        );
+                    }
+                    _ => {
+                        println!(
+                            "\r  {} Connection failed — check your credentials",
+                            style("❌").red().bold()
+                        );
+                        continue;
+                    }
+                }
+
+                let users_str: String = Input::new()
+                    .with_prompt("  Allowed staff IDs (comma-separated, '*' for all)")
+                    .allow_empty(true)
+                    .interact_text()?;
+
+                let allowed_users: Vec<String> = users_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+
+                config.dingtalk = Some(DingTalkConfig {
+                    client_id,
+                    client_secret,
+                    allowed_users,
+                });
+            }
             _ => break, // Done
         }
         println!();
@@ -3056,6 +3137,9 @@ fn setup_channels() -> Result<ChannelsConfig> {
     }
     if config.webhook.is_some() {
         active.push("Webhook");
+    }
+    if config.dingtalk.is_some() {
+        active.push("DingTalk");
     }
 
     println!(
@@ -3507,7 +3591,8 @@ fn print_summary(config: &Config) {
         || config.channels_config.slack.is_some()
         || config.channels_config.imessage.is_some()
         || config.channels_config.matrix.is_some()
-        || config.channels_config.email.is_some();
+        || config.channels_config.email.is_some()
+        || config.channels_config.dingtalk.is_some();
 
     println!();
     println!(

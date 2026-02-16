@@ -1198,6 +1198,7 @@ pub struct ChannelsConfig {
     pub email: Option<crate::channels::email_channel::EmailConfig>,
     pub irc: Option<IrcConfig>,
     pub lark: Option<LarkConfig>,
+    pub dingtalk: Option<DingTalkConfig>,
 }
 
 impl Default for ChannelsConfig {
@@ -1214,6 +1215,7 @@ impl Default for ChannelsConfig {
             email: None,
             irc: None,
             lark: None,
+            dingtalk: None,
         }
     }
 }
@@ -1485,6 +1487,18 @@ impl Default for AuditConfig {
             sign_events: false,
         }
     }
+}
+
+/// DingTalk (钉钉) configuration for Stream Mode messaging
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DingTalkConfig {
+    /// Client ID (AppKey) from DingTalk developer console
+    pub client_id: String,
+    /// Client Secret (AppSecret) from DingTalk developer console
+    pub client_secret: String,
+    /// Allowed user IDs (staff IDs). Empty = deny all, "*" = allow all
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
 }
 
 // ── Config impl ──────────────────────────────────────────────────
@@ -1865,6 +1879,7 @@ mod tests {
                 email: None,
                 irc: None,
                 lark: None,
+                dingtalk: None,
             },
             memory: MemoryConfig::default(),
             tunnel: TunnelConfig::default(),
@@ -2127,6 +2142,7 @@ default_temperature = 0.7
             email: None,
             irc: None,
             lark: None,
+            dingtalk: None,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -2286,6 +2302,7 @@ channel_id = "C123"
             email: None,
             irc: None,
             lark: None,
+            dingtalk: None,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
