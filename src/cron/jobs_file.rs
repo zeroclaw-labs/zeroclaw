@@ -64,8 +64,9 @@ fn read_runtime_states(workspace_dir: &Path) -> Result<HashMap<String, RuntimeCr
 
 fn write_json_atomic(path: &Path, payload: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create jobs file directory: {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| {
+            format!("Failed to create jobs file directory: {}", parent.display())
+        })?;
     }
     let tmp = path.with_extension("json.tmp");
     fs::write(&tmp, payload)

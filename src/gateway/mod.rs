@@ -218,6 +218,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/sessions/:key/reset", post(api_reset_session))
         .route("/api/sessions/:key", delete(api_delete_session))
         .route("/api/events", get(api_list_events))
+        .route("/api/inbox", get(api_list_inbox))
+        .route("/api/inbox/:id/read", post(api_mark_inbox_read))
+        .route("/api/inbox/:id/archive", post(api_archive_inbox))
+        .route("/api/inbox/:id/open-chat", post(api_open_inbox_chat))
         .route("/api/nodes", get(api_list_nodes))
         .route("/api/metrics", get(api_get_metrics))
         .route("/api/status", get(api_get_status))
@@ -501,6 +505,14 @@ struct ApiPatchChannelBody {
 #[derive(serde::Deserialize)]
 struct ApiPatchSkillBody {
     enabled: Option<bool>,
+}
+
+#[derive(serde::Deserialize)]
+struct InboxListQuery {
+    status: Option<String>,
+    source: Option<String>,
+    limit: Option<u32>,
+    cursor: Option<i64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1313,6 +1325,249 @@ async fn api_list_events(State(state): State<AppState>, headers: HeaderMap) -> i
     }
 }
 
+async fn api_list_inbox(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<InboxListQuery>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let limit = query.limit.unwrap_or(50).clamp(1, 200) as i64;
+    let source_filter = query.source.unwrap_or_default();
+    let status_filter = query.status.unwrap_or_else(|| "unread".to_string());
+    let cursor = query.cursor.unwrap_or(i64::MAX);
+
+    let sql = if source_filter.is_empty() {
+        "SELECT id, source_type, source_id, run_id, chat_id, title, preview, body, metadata_json, status, created_at, read_at
+         FROM inbox_items
+         WHERE tenant_id=?1 AND status=?2 AND created_at < ?3
+         ORDER BY created_at DESC
+         LIMIT ?4"
+    } else {
+        "SELECT id, source_type, source_id, run_id, chat_id, title, preview, body, metadata_json, status, created_at, read_at
+         FROM inbox_items
+         WHERE tenant_id=?1 AND status=?2 AND source_type=?3 AND created_at < ?4
+         ORDER BY created_at DESC
+         LIMIT ?5"
+    };
+
+    let res = state.registry_db.with_conn(|conn| {
+        let mut stmt = conn.prepare(sql)?;
+        let mut items = Vec::new();
+        if source_filter.is_empty() {
+            let rows = stmt.query_map(
+                rusqlite::params![tenant, status_filter, cursor, limit],
+                |row| {
+                    Ok(serde_json::json!({
+                        "id": row.get::<_, String>(0)?,
+                        "sourceType": row.get::<_, String>(1)?,
+                        "sourceId": row.get::<_, Option<String>>(2)?,
+                        "runId": row.get::<_, Option<String>>(3)?,
+                        "chatId": row.get::<_, Option<String>>(4)?,
+                        "title": row.get::<_, String>(5)?,
+                        "preview": row.get::<_, Option<String>>(6)?,
+                        "body": row.get::<_, Option<String>>(7)?,
+                        "metadata": row
+                            .get::<_, Option<String>>(8)?
+                            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                            .unwrap_or(serde_json::json!({})),
+                        "status": row.get::<_, String>(9)?,
+                        "createdAt": iso_from_millis(row.get::<_, i64>(10)?),
+                        "readAt": row.get::<_, Option<i64>>(11)?.map(iso_from_millis),
+                    }))
+                },
+            )?;
+            items.extend(rows.filter_map(std::result::Result::ok));
+        } else {
+            let rows = stmt.query_map(
+                rusqlite::params![tenant, status_filter, source_filter, cursor, limit],
+                |row| {
+                    Ok(serde_json::json!({
+                        "id": row.get::<_, String>(0)?,
+                        "sourceType": row.get::<_, String>(1)?,
+                        "sourceId": row.get::<_, Option<String>>(2)?,
+                        "runId": row.get::<_, Option<String>>(3)?,
+                        "chatId": row.get::<_, Option<String>>(4)?,
+                        "title": row.get::<_, String>(5)?,
+                        "preview": row.get::<_, Option<String>>(6)?,
+                        "body": row.get::<_, Option<String>>(7)?,
+                        "metadata": row
+                            .get::<_, Option<String>>(8)?
+                            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                            .unwrap_or(serde_json::json!({})),
+                        "status": row.get::<_, String>(9)?,
+                        "createdAt": iso_from_millis(row.get::<_, i64>(10)?),
+                        "readAt": row.get::<_, Option<i64>>(11)?.map(iso_from_millis),
+                    }))
+                },
+            )?;
+            items.extend(rows.filter_map(std::result::Result::ok));
+        }
+        let next_cursor = items
+            .last()
+            .and_then(|item| item["createdAt"].as_str())
+            .and_then(|iso| chrono::DateTime::parse_from_rfc3339(iso).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc).timestamp_millis());
+        Ok(serde_json::json!({
+            "items": items,
+            "nextCursor": next_cursor,
+        }))
+    });
+    match res {
+        Ok(v) => api_ok(v),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn api_mark_inbox_read(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let ts = now_ms();
+    let res = state.registry_db.with_conn(|conn| {
+        let changed = conn.execute(
+            "UPDATE inbox_items
+             SET status='read', read_at=?1
+             WHERE tenant_id=?2 AND id=?3 AND status!='archived'",
+            rusqlite::params![ts, tenant, id],
+        )?;
+        Ok(changed)
+    });
+    match res {
+        Ok(0) => api_err(StatusCode::NOT_FOUND, "Inbox item not found"),
+        Ok(_) => {
+            api_ok(serde_json::json!({ "id": id, "status": "read", "readAt": iso_from_millis(ts) }))
+        }
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn api_archive_inbox(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let ts = now_ms();
+    let res = state.registry_db.with_conn(|conn| {
+        let changed = conn.execute(
+            "UPDATE inbox_items
+             SET status='archived', archived_at=?1
+             WHERE tenant_id=?2 AND id=?3",
+            rusqlite::params![ts, tenant, id],
+        )?;
+        Ok(changed)
+    });
+    match res {
+        Ok(0) => api_err(StatusCode::NOT_FOUND, "Inbox item not found"),
+        Ok(_) => api_ok(serde_json::json!({ "id": id, "status": "archived" })),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn api_open_inbox_chat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let ts = now_ms();
+    let res = state.registry_db.with_conn(|conn| {
+        let row = conn.query_row(
+            "SELECT title, preview, body, chat_id FROM inbox_items WHERE tenant_id=?1 AND id=?2",
+            rusqlite::params![tenant, id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                ))
+            },
+        );
+        let (title, preview, body, existing_chat_id) = match row {
+            Ok(v) => v,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                return Ok((None::<String>, false));
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        let created_new = existing_chat_id.is_none();
+        let chat_id = existing_chat_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        if created_new {
+            let seed = preview.clone().unwrap_or_else(|| title.clone());
+            conn.execute(
+                "INSERT OR IGNORE INTO chats (id, tenant_id, title, preview, session_id, message_count, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?6)",
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(),
+                    tenant,
+                    title,
+                    seed,
+                    chat_id,
+                    ts
+                ],
+            )?;
+            let assistant_text = body
+                .or(preview)
+                .unwrap_or_else(|| "Inbox item opened".to_string());
+            conn.execute(
+                "INSERT INTO messages (id, tenant_id, chat_id, role, content, created_at)
+                 VALUES (?1, ?2, ?3, 'assistant', ?4, ?5)",
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(),
+                    tenant,
+                    chat_id,
+                    assistant_text,
+                    ts
+                ],
+            )?;
+            conn.execute(
+                "UPDATE chats SET message_count = message_count + 1, preview=?1, updated_at=?2
+                 WHERE tenant_id=?3 AND session_id=?4",
+                rusqlite::params![
+                    assistant_text.chars().take(200).collect::<String>(),
+                    ts,
+                    tenant,
+                    chat_id
+                ],
+            )?;
+        }
+
+        conn.execute(
+            "UPDATE inbox_items
+             SET chat_id=?1, status='read', read_at=?2
+             WHERE tenant_id=?3 AND id=?4",
+            rusqlite::params![chat_id, ts, tenant, id],
+        )?;
+        Ok((Some(chat_id), created_new))
+    });
+
+    match res {
+        Ok((None, _)) => api_err(StatusCode::NOT_FOUND, "Inbox item not found"),
+        Ok((Some(chat_id), created)) => api_ok(serde_json::json!({
+            "id": id,
+            "chatId": chat_id,
+            "created": created,
+        })),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
 async fn api_list_nodes(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let tenant = match api_tenant(&state, &headers) {
         Ok(t) => t,
@@ -1476,26 +1731,94 @@ async fn api_list_cron(State(state): State<AppState>, headers: HeaderMap) -> imp
         Ok(t) => t,
         Err(e) => return e,
     };
+    let runtime_db_path = state.workspace_dir.join("cron").join("jobs.db");
+    let mut runtime_map: HashMap<String, (Option<String>, Option<String>, Option<String>)> =
+        HashMap::new();
+    if runtime_db_path.exists() {
+        if let Ok(conn) = rusqlite::Connection::open(runtime_db_path) {
+            if let Ok(mut stmt) =
+                conn.prepare("SELECT id, next_run, last_run, last_status FROM cron_jobs")
+            {
+                if let Ok(rows) = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                }) {
+                    for (id, next, last, status) in rows.flatten() {
+                        runtime_map.insert(id, (next, last, status));
+                    }
+                }
+            }
+        }
+    }
+
     let res = state.registry_db.with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT id, name, schedule_data, status, created_at, updated_at FROM aria_cron_functions
+            "SELECT id, name, description, schedule_kind, schedule_data, status, enabled, cron_job_id, created_at, updated_at
+             FROM aria_cron_functions
              WHERE tenant_id=?1 ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map(rusqlite::params![tenant], |row| {
-            let schedule = row
-                .get::<_, String>(2)
-                .unwrap_or_else(|_| "{\"cron\":\"* * * * *\"}".to_string());
+            let schedule_kind: String = row.get(3)?;
+            let schedule_raw: String = row.get(4)?;
+            let schedule_json: serde_json::Value = serde_json::from_str(&schedule_raw)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            let schedule = match schedule_kind.as_str() {
+                "cron" => schedule_json
+                    .get("expr")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("* * * * *")
+                    .to_string(),
+                "every" => format!(
+                    "every {}s",
+                    schedule_json
+                        .get("every_ms")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(60000)
+                        / 1000
+                ),
+                "at" => format!(
+                    "at {}",
+                    schedule_json
+                        .get("at_ms")
+                        .and_then(serde_json::Value::as_i64)
+                        .map(|ms| iso_from_millis(ms))
+                        .unwrap_or_else(|| "unknown".to_string())
+                ),
+                _ => schedule_raw.clone(),
+            };
+
+            let enabled = row.get::<_, i64>(6)? != 0;
+            let declared_status: String = row.get(5)?;
+            let status = if enabled && declared_status == "active" {
+                "active"
+            } else {
+                "paused"
+            };
+            let runtime_id: Option<String> = row.get(7)?;
+            let (next_run, last_run) = if let Some(rid) = runtime_id {
+                if let Some((next, last, _)) = runtime_map.get(&rid) {
+                    (next.clone(), last.clone())
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
             Ok(serde_json::json!({
                 "id": row.get::<_, String>(0)?,
                 "name": row.get::<_, String>(1)?,
                 "schedule": schedule,
-                "status": row.get::<_, String>(3)?,
-                "lastRun": serde_json::Value::Null,
-                "nextRun": serde_json::Value::Null,
+                "status": status,
+                "lastRun": last_run,
+                "nextRun": next_run,
                 "handler": "cron_handler",
-                "description": "",
-                "createdAt": row.get::<_, String>(4)?,
-                "updatedAt": row.get::<_, String>(5)?,
+                "description": row.get::<_, String>(2)?,
+                "createdAt": row.get::<_, String>(8)?,
+                "updatedAt": row.get::<_, String>(9)?,
             }))
         })?;
         Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
@@ -1507,18 +1830,135 @@ async fn api_list_cron(State(state): State<AppState>, headers: HeaderMap) -> imp
 }
 
 async fn api_patch_cron(
+    State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(body): Json<ApiUpdateStatusBody>,
 ) -> impl IntoResponse {
-    api_ok(
-        serde_json::json!({ "id": id, "status": body.status.unwrap_or_else(|| "active".to_string()) }),
-    )
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let status = body.status.unwrap_or_else(|| "active".to_string());
+    let enabled = status != "paused";
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let updated = state.registry_db.with_conn(|conn| {
+        let changed = conn.execute(
+            "UPDATE aria_cron_functions
+             SET enabled=?1, status=?2, updated_at=?3
+             WHERE id=?4 AND tenant_id=?5",
+            rusqlite::params![
+                i64::from(enabled),
+                if enabled { "active" } else { "paused" },
+                now,
+                id,
+                tenant
+            ],
+        )?;
+        Ok(changed)
+    });
+    match updated {
+        Ok(0) => api_err(StatusCode::NOT_FOUND, "Cron function not found"),
+        Ok(_) => {
+            crate::aria::hooks::notify_cron_uploaded(&id);
+            api_ok(
+                serde_json::json!({ "id": id, "status": if enabled { "active" } else { "paused" } }),
+            )
+        }
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
-async fn api_delete_cron(Path(id): Path<String>) -> impl IntoResponse {
-    api_ok(serde_json::json!({"id": id, "deleted": true}))
+async fn api_delete_cron(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let res = state.registry_db.with_conn(|conn| {
+        let changed = conn.execute(
+            "DELETE FROM aria_cron_functions WHERE id=?1 AND tenant_id=?2",
+            rusqlite::params![id, tenant],
+        )?;
+        Ok(changed)
+    });
+    match res {
+        Ok(0) => api_err(StatusCode::NOT_FOUND, "Cron function not found"),
+        Ok(_) => {
+            crate::aria::hooks::notify_cron_deleted(&id);
+            api_ok(serde_json::json!({"id": id, "deleted": true}))
+        }
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
-async fn api_run_cron(Path(id): Path<String>) -> impl IntoResponse {
-    api_ok(serde_json::json!({"id": id, "ran": true}))
+async fn api_run_cron(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let cron_job_id = state.registry_db.with_conn(|conn| {
+        let found = conn.query_row(
+            "SELECT cron_job_id FROM aria_cron_functions WHERE id=?1 AND tenant_id=?2",
+            rusqlite::params![id, tenant],
+            |row| row.get::<_, Option<String>>(0),
+        );
+        match found {
+            Ok(v) => Ok(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    });
+
+    let mut runtime_id = match cron_job_id {
+        Ok(v) => v,
+        Err(_) => return api_err(StatusCode::NOT_FOUND, "Cron function not found"),
+    };
+    if runtime_id.is_none() {
+        crate::aria::hooks::notify_cron_uploaded(&id);
+        runtime_id = state
+            .registry_db
+            .with_conn(|conn| {
+                let found = conn.query_row(
+                    "SELECT cron_job_id FROM aria_cron_functions WHERE id=?1 AND tenant_id=?2",
+                    rusqlite::params![id, tenant],
+                    |row| row.get::<_, Option<String>>(0),
+                );
+                match found {
+                    Ok(v) => Ok(v),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                    Err(e) => Err(e.into()),
+                }
+            })
+            .unwrap_or(None);
+    }
+
+    let Some(rid) = runtime_id else {
+        return api_err(StatusCode::CONFLICT, "Cron function is not schedulable");
+    };
+
+    let db_path = state.workspace_dir.join("cron").join("jobs.db");
+    let queued = (|| -> Result<bool> {
+        let conn = rusqlite::Connection::open(db_path)?;
+        let due_at = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        let changed = conn.execute(
+            "UPDATE cron_jobs SET next_run=?1 WHERE id=?2",
+            rusqlite::params![due_at, rid],
+        )?;
+        Ok(changed > 0)
+    })();
+
+    match queued {
+        Ok(true) => api_ok(serde_json::json!({"id": id, "queued": true})),
+        Ok(false) => api_err(StatusCode::NOT_FOUND, "Runtime cron job not found"),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
 async fn api_list_skills(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {

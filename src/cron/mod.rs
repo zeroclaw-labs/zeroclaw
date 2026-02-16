@@ -256,7 +256,11 @@ pub fn reschedule_after_run(
     })
 }
 
-fn next_run_for(expression: &str, timezone: Option<&str>, from: DateTime<Utc>) -> Result<DateTime<Utc>> {
+fn next_run_for(
+    expression: &str,
+    timezone: Option<&str>,
+    from: DateTime<Utc>,
+) -> Result<DateTime<Utc>> {
     let normalized = normalize_expression(expression)?;
     let schedule = Schedule::from_str(&normalized)
         .with_context(|| format!("Invalid cron expression: {expression}"))?;

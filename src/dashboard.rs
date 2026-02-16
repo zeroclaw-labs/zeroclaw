@@ -1,9 +1,11 @@
 use crate::aria::db::AriaDb;
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use rusqlite::params;
+use serde_json::Value;
 use std::path::Path;
 
-const DASHBOARD_SCHEMA_VERSION: i64 = 10;
+const DASHBOARD_SCHEMA_VERSION: i64 = 11;
 
 pub fn ensure_schema(db: &AriaDb) -> Result<()> {
     db.with_conn(|conn| {
@@ -91,6 +93,26 @@ pub fn ensure_schema(db: &AriaDb) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_events_tenant ON events(tenant_id);
             CREATE INDEX IF NOT EXISTS idx_events_type ON events(tenant_id, type);
             CREATE INDEX IF NOT EXISTS idx_events_time ON events(tenant_id, timestamp DESC);
+
+            CREATE TABLE IF NOT EXISTS inbox_items (
+              id TEXT PRIMARY KEY,
+              tenant_id TEXT NOT NULL,
+              source_type TEXT NOT NULL,
+              source_id TEXT,
+              run_id TEXT,
+              chat_id TEXT,
+              title TEXT NOT NULL,
+              preview TEXT,
+              body TEXT,
+              metadata_json TEXT,
+              status TEXT NOT NULL DEFAULT 'unread',
+              created_at INTEGER NOT NULL,
+              read_at INTEGER,
+              archived_at INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_inbox_tenant_status ON inbox_items(tenant_id, status, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_inbox_tenant_source ON inbox_items(tenant_id, source_type, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_inbox_run ON inbox_items(run_id);
 
             CREATE TABLE IF NOT EXISTS nodes (
               id TEXT PRIMARY KEY,
@@ -300,6 +322,7 @@ pub fn import_from_cloud_db(db: &AriaDb, source_path: &Path) -> Result<usize> {
         "approvals",
         "sessions",
         "events",
+        "inbox_items",
         "nodes",
         "channels",
         "cron_jobs",
@@ -342,5 +365,173 @@ pub fn import_from_cloud_db(db: &AriaDb, source_path: &Path) -> Result<usize> {
         conn.execute_batch("DETACH DATABASE cloud")
             .context("Failed to detach cloud DB")?;
         Ok(imported)
+    })
+}
+
+fn parse_event_millis(timestamp_rfc3339: &str) -> i64 {
+    DateTime::parse_from_rfc3339(timestamp_rfc3339)
+        .map(|dt| dt.with_timezone(&Utc).timestamp_millis())
+        .unwrap_or_else(|_| Utc::now().timestamp_millis())
+}
+
+fn source_for_event(event_type: &str) -> &'static str {
+    if event_type.starts_with("cron.") {
+        "cron"
+    } else if event_type.starts_with("feed.") {
+        "feed"
+    } else if event_type.starts_with("task.") || event_type.starts_with("heartbeat.") {
+        "task"
+    } else {
+        "agent"
+    }
+}
+
+fn title_for_event(event_type: &str, data: &Value) -> String {
+    match event_type {
+        "cron.completed" => format!(
+            "Cron completed: {}",
+            data["jobId"].as_str().unwrap_or("unknown")
+        ),
+        "cron.failed" => format!(
+            "Cron failed: {}",
+            data["jobId"].as_str().unwrap_or("unknown")
+        ),
+        "feed.run.completed" => format!(
+            "Feed run completed: {}",
+            data["feedName"]
+                .as_str()
+                .or_else(|| data["feedId"].as_str())
+                .unwrap_or("unknown")
+        ),
+        "feed.run.failed" => format!(
+            "Feed run failed: {}",
+            data["feedName"]
+                .as_str()
+                .or_else(|| data["feedId"].as_str())
+                .unwrap_or("unknown")
+        ),
+        "task.completed" => format!(
+            "Task completed: {}",
+            data["name"].as_str().unwrap_or("task")
+        ),
+        "task.failed" => format!("Task failed: {}", data["name"].as_str().unwrap_or("task")),
+        "heartbeat.task.completed" => "Heartbeat task completed".to_string(),
+        "heartbeat.task.failed" => "Heartbeat task failed".to_string(),
+        _ => event_type.to_string(),
+    }
+}
+
+fn preview_for_event(event_type: &str, data: &Value) -> String {
+    match event_type {
+        "cron.completed" => data["summary"].as_str().unwrap_or("Completed").to_string(),
+        "cron.failed" => data["error"].as_str().unwrap_or("Failed").to_string(),
+        "feed.run.completed" => format!(
+            "{} item(s) inserted",
+            data["inserted"].as_i64().unwrap_or(0)
+        ),
+        "feed.run.failed" => data["error"]
+            .as_str()
+            .unwrap_or("Feed execution failed")
+            .to_string(),
+        "task.completed" => {
+            let d = data["durationMs"].as_i64().unwrap_or(0);
+            if d > 0 {
+                format!("{d}ms")
+            } else {
+                "Completed".to_string()
+            }
+        }
+        "task.failed" => data["errorMessage"]
+            .as_str()
+            .unwrap_or("Task failed")
+            .to_string(),
+        "heartbeat.task.failed" => data["error"]
+            .as_str()
+            .unwrap_or("Heartbeat task failed")
+            .to_string(),
+        "heartbeat.task.completed" => data["task"]
+            .as_str()
+            .unwrap_or("Heartbeat task")
+            .to_string(),
+        _ => String::new(),
+    }
+}
+
+fn should_create_inbox(event_type: &str, data: &Value) -> bool {
+    match event_type {
+        "cron.completed" | "cron.failed" | "task.failed" | "heartbeat.task.failed" => true,
+        "feed.run.failed" => true,
+        "feed.run.completed" => data["inserted"].as_i64().unwrap_or(0) > 0,
+        _ => false,
+    }
+}
+
+pub fn persist_status_event(
+    db: &AriaDb,
+    default_tenant_id: &str,
+    event_type: &str,
+    data: &Value,
+    timestamp_rfc3339: &str,
+) -> Result<()> {
+    let ts_ms = parse_event_millis(timestamp_rfc3339);
+    let tenant = data["tenantId"].as_str().unwrap_or(default_tenant_id);
+    let title = title_for_event(event_type, data);
+    let description = preview_for_event(event_type, data);
+    let source = source_for_event(event_type);
+    let metadata = serde_json::to_string(data).unwrap_or_else(|_| "{}".to_string());
+    let event_id = uuid::Uuid::new_v4().to_string();
+
+    db.with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO events (id, tenant_id, type, title, description, source, metadata_json, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                event_id,
+                tenant,
+                event_type,
+                title,
+                if description.is_empty() { None::<String> } else { Some(description.clone()) },
+                source,
+                metadata,
+                ts_ms
+            ],
+        )?;
+
+        if should_create_inbox(event_type, data) {
+            let inbox_id = uuid::Uuid::new_v4().to_string();
+            let source_id = data
+                .get("jobId")
+                .and_then(Value::as_str)
+                .or_else(|| data.get("feedId").and_then(Value::as_str))
+                .or_else(|| data.get("id").and_then(Value::as_str))
+                .map(str::to_string);
+            let run_id = data.get("runId").and_then(Value::as_str).map(str::to_string);
+            let body = data
+                .get("fullOutput")
+                .and_then(Value::as_str)
+                .or_else(|| data.get("error").and_then(Value::as_str))
+                .or_else(|| data.get("summary").and_then(Value::as_str))
+                .unwrap_or("")
+                .to_string();
+
+            conn.execute(
+                "INSERT INTO inbox_items
+                 (id, tenant_id, source_type, source_id, run_id, chat_id, title, preview, body, metadata_json, status, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, 'unread', ?10)",
+                params![
+                    inbox_id,
+                    tenant,
+                    source,
+                    source_id,
+                    run_id,
+                    title,
+                    if description.is_empty() { None::<String> } else { Some(description) },
+                    if body.is_empty() { None::<String> } else { Some(body) },
+                    serde_json::to_string(data).unwrap_or_else(|_| "{}".to_string()),
+                    ts_ms
+                ],
+            )?;
+        }
+        Ok(())
     })
 }

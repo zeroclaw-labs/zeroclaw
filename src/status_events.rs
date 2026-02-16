@@ -6,12 +6,18 @@ use std::sync::{Mutex, OnceLock};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 type SubscriberMap = HashMap<u64, UnboundedSender<String>>;
+type PersistHook = Box<dyn Fn(&str, &Value, &str) + Send + Sync>;
 
 static SUBSCRIBERS: OnceLock<Mutex<SubscriberMap>> = OnceLock::new();
+static PERSIST_HOOK: OnceLock<Mutex<Option<PersistHook>>> = OnceLock::new();
 static NEXT_SUBSCRIBER_ID: AtomicU64 = AtomicU64::new(1);
 
 fn subscribers() -> &'static Mutex<SubscriberMap> {
     SUBSCRIBERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn persist_hook() -> &'static Mutex<Option<PersistHook>> {
+    PERSIST_HOOK.get_or_init(|| Mutex::new(None))
 }
 
 pub fn subscribe() -> (u64, UnboundedReceiver<String>) {
@@ -25,11 +31,24 @@ pub fn unsubscribe(id: u64) {
     subscribers().lock().unwrap().remove(&id);
 }
 
+pub fn set_persist_hook(hook: PersistHook) {
+    *persist_hook().lock().unwrap() = Some(hook);
+}
+
+pub fn clear_persist_hook() {
+    *persist_hook().lock().unwrap() = None;
+}
+
 pub fn emit(event_type: &str, data: Value) {
+    let timestamp = Utc::now().to_rfc3339();
+    if let Some(hook) = persist_hook().lock().unwrap().as_ref() {
+        hook(event_type, &data, &timestamp);
+    }
+
     let payload = serde_json::json!({
         "type": event_type,
         "data": data,
-        "timestamp": Utc::now().to_rfc3339(),
+        "timestamp": timestamp,
     })
     .to_string();
 

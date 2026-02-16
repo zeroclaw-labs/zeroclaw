@@ -1,5 +1,7 @@
 use crate::config::Config;
 use crate::cron::{due_jobs, reschedule_after_run, CronJob};
+use crate::memory;
+use crate::providers;
 use crate::security::SecurityPolicy;
 use crate::status_events;
 use crate::{agent, aria};
@@ -7,8 +9,10 @@ use anyhow::Result;
 use chrono::Utc;
 use rusqlite::params;
 use serde_json::Value;
+use std::sync::Arc;
 use tokio::process::Command;
 use tokio::time::{self, Duration};
+use uuid::Uuid;
 
 const MIN_POLL_SECONDS: u64 = 5;
 
@@ -18,6 +22,7 @@ struct JobRunOutcome {
     output: String,
     tenant_id: Option<String>,
     remove_after_run: bool,
+    run_id: Option<String>,
 }
 
 pub async fn run(config: Config) -> Result<()> {
@@ -43,12 +48,15 @@ pub async fn run(config: Config) -> Result<()> {
             crate::health::mark_component_ok("scheduler");
             let outcome = execute_job_with_retry(&config, &security, &job).await;
             let tenant = outcome.tenant_id.clone();
+            let full_output = outcome.output.clone();
             if outcome.success {
                 status_events::emit(
                     "cron.completed",
                     serde_json::json!({
                         "jobId": job.id,
                         "summary": outcome.output.lines().next().unwrap_or("ok"),
+                        "fullOutput": full_output,
+                        "runId": outcome.run_id,
                         "tenantId": tenant,
                     }),
                 );
@@ -58,6 +66,8 @@ pub async fn run(config: Config) -> Result<()> {
                     serde_json::json!({
                         "jobId": job.id,
                         "error": outcome.output,
+                        "fullOutput": full_output,
+                        "runId": outcome.run_id,
                         "tenantId": tenant,
                     }),
                 );
@@ -92,6 +102,7 @@ async fn execute_job_with_retry(
         output: String::new(),
         tenant_id: None,
         remove_after_run: false,
+        run_id: None,
     };
     let retries = config.reliability.scheduler_retries;
     let mut backoff_ms = config.reliability.provider_backoff_ms.max(200);
@@ -198,6 +209,7 @@ async fn run_job_command(
             ),
             tenant_id: None,
             remove_after_run: false,
+            run_id: None,
         };
     }
 
@@ -207,6 +219,7 @@ async fn run_job_command(
             output: format!("blocked by security policy: forbidden path argument: {path}"),
             tenant_id: None,
             remove_after_run: false,
+            run_id: None,
         };
     }
 
@@ -232,6 +245,7 @@ async fn run_job_command(
                 output: combined,
                 tenant_id: None,
                 remove_after_run: false,
+                run_id: None,
             }
         }
         Err(e) => JobRunOutcome {
@@ -239,6 +253,7 @@ async fn run_job_command(
             output: format!("spawn error: {e}"),
             tenant_id: None,
             remove_after_run: false,
+            run_id: None,
         },
     }
 }
@@ -313,6 +328,7 @@ async fn run_aria_cron_function(config: &Config, cron_func_id: &str) -> JobRunOu
                 output: format!("failed to open aria db: {e}"),
                 tenant_id: None,
                 remove_after_run: false,
+                run_id: None,
             }
         }
     };
@@ -357,6 +373,7 @@ async fn run_aria_cron_function(config: &Config, cron_func_id: &str) -> JobRunOu
             output: format!("cron function {cron_func_id} not found, removing orphaned job"),
             tenant_id: None,
             remove_after_run: true,
+            run_id: None,
         };
     };
 
@@ -366,10 +383,12 @@ async fn run_aria_cron_function(config: &Config, cron_func_id: &str) -> JobRunOu
             output: format!("cron function {name} is disabled/inactive, removing job"),
             tenant_id: Some(tenant_id),
             remove_after_run: true,
+            run_id: None,
         };
     }
 
     let (message, model) = payload_message(&payload_kind, &payload_data, &name);
+    let run_id = Uuid::new_v4().to_string();
 
     if wake_mode == "next-heartbeat" {
         let summary = format!("[Cron:{name}] {message}");
@@ -383,6 +402,7 @@ async fn run_aria_cron_function(config: &Config, cron_func_id: &str) -> JobRunOu
                     output: "queued for next heartbeat".to_string(),
                     tenant_id: Some(tenant_id),
                     remove_after_run: delete_after_run,
+                    run_id: Some(run_id),
                 }
             }
             Err(e) => JobRunOutcome {
@@ -390,20 +410,21 @@ async fn run_aria_cron_function(config: &Config, cron_func_id: &str) -> JobRunOu
                 output: format!("failed to queue heartbeat task: {e}"),
                 tenant_id: Some(tenant_id),
                 remove_after_run: false,
+                run_id: Some(run_id),
             },
         }
     } else {
-        let temp = config.default_temperature;
-        match agent::run(config.clone(), Some(message), None, model, temp).await {
-            Ok(_) => {
+        match execute_agent_turn(config, &tenant_id, &message, model.as_deref()).await {
+            Ok(output) => {
                 if delete_after_run {
                     let _ = consume_delete_after_run(config, cron_func_id);
                 }
                 JobRunOutcome {
                     success: true,
-                    output: "ran immediately".to_string(),
+                    output,
                     tenant_id: Some(tenant_id),
                     remove_after_run: delete_after_run,
+                    run_id: Some(run_id),
                 }
             }
             Err(e) => JobRunOutcome {
@@ -411,9 +432,65 @@ async fn run_aria_cron_function(config: &Config, cron_func_id: &str) -> JobRunOu
                 output: format!("agent execution failed: {e}"),
                 tenant_id: Some(tenant_id),
                 remove_after_run: false,
+                run_id: Some(run_id),
             },
         }
     }
+}
+
+async fn execute_agent_turn(
+    config: &Config,
+    tenant_id: &str,
+    message: &str,
+    model_override: Option<&str>,
+) -> Result<String> {
+    let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
+    let model_name = model_override
+        .or(config.default_model.as_deref())
+        .unwrap_or("anthropic/claude-sonnet-4-20250514");
+
+    let provider = providers::create_resilient_provider(
+        provider_name,
+        config.api_key.as_deref(),
+        &config.reliability,
+    )?;
+    let mem = memory::create_memory(
+        &config.memory,
+        &config.workspace_dir,
+        config.api_key.as_deref(),
+    )?;
+    let security = Arc::new(SecurityPolicy::from_config(
+        &config.autonomy,
+        &config.workspace_dir,
+    ));
+    let registry_db = aria::db::AriaDb::open(&config.workspace_dir.join("aria.db"))?;
+
+    let result = agent::orchestrator::run_live_turn(
+        agent::orchestrator::LiveTurnConfig {
+            provider: provider.as_ref(),
+            security: &security,
+            memory: Arc::from(mem),
+            composio_api_key: if config.composio.enabled {
+                config.composio.api_key.as_deref()
+            } else {
+                None
+            },
+            browser_config: &config.browser,
+            registry_db: &registry_db,
+            workspace_dir: &config.workspace_dir,
+            tenant_id,
+            model: model_name,
+            temperature: config.default_temperature,
+            mode_hint: "cron",
+            max_turns: Some(25),
+            external_tool_context: None,
+        },
+        message,
+        None,
+    )
+    .await?;
+
+    Ok(result.output)
 }
 
 #[cfg(test)]

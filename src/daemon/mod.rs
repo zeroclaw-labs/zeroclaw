@@ -19,6 +19,21 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
 
     crate::health::mark_component_ok("daemon");
 
+    if let Ok(event_db) = crate::aria::db::AriaDb::open(&config.workspace_dir.join("aria.db")) {
+        let tenant_fallback = "dev-tenant".to_string();
+        crate::status_events::set_persist_hook(Box::new(move |event_type, data, timestamp| {
+            if let Err(e) = crate::dashboard::persist_status_event(
+                &event_db,
+                &tenant_fallback,
+                event_type,
+                data,
+                timestamp,
+            ) {
+                tracing::warn!("Failed to persist status event '{event_type}': {e}");
+            }
+        }));
+    }
+
     if let Err(e) = crate::cron::jobs_file::import_jobs_file(&config.workspace_dir) {
         tracing::warn!("Failed to import ~/aria/jobs.json before daemon start: {e}");
     }
@@ -119,6 +134,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     for handle in handles {
         let _ = handle.await;
     }
+    crate::status_events::clear_persist_hook();
 
     Ok(())
 }
