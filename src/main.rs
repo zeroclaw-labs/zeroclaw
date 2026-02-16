@@ -44,6 +44,7 @@ mod session;
 mod skills;
 mod status_events;
 mod team;
+mod tenant;
 mod tools;
 mod tunnel;
 

@@ -4,29 +4,9 @@ use crate::observability::{self, Observer, ObserverEvent};
 use crate::providers::{self, Provider};
 use crate::runtime;
 use crate::security::SecurityPolicy;
-use crate::tools;
 use anyhow::Result;
-use std::fmt::Write;
 use std::sync::Arc;
 use std::time::Instant;
-
-/// Build context preamble by searching memory for relevant entries
-async fn build_context(mem: &dyn Memory, user_msg: &str) -> String {
-    let mut context = String::new();
-
-    // Pull relevant memories for this message
-    if let Ok(entries) = mem.recall(user_msg, 5).await {
-        if !entries.is_empty() {
-            context.push_str("[Memory context]\n");
-            for entry in &entries {
-                let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
-            }
-            context.push('\n');
-        }
-    }
-
-    context
-}
 
 #[allow(clippy::too_many_lines)]
 pub async fn run(
@@ -53,13 +33,14 @@ pub async fn run(
     )?);
     tracing::info!(backend = mem.name(), "Memory initialized");
 
-    // ── Tools (including memory tools) ────────────────────────────
+    // ── Tool registry context ─────────────────────────────────────
     let composio_key = if config.composio.enabled {
         config.composio.api_key.as_deref()
     } else {
         None
     };
-    let agent_tools = tools::all_tools(&security, mem.clone(), composio_key, &config.browser);
+    let registry_db = crate::aria::db::AriaDb::open(&config.workspace_dir.join("aria.db"))?;
+    let tenant = crate::tenant::resolve_tenant_from_token(&registry_db, "");
 
     // ── Resolve provider ─────────────────────────────────────────
     let provider_name = provider_override
@@ -83,47 +64,6 @@ pub async fn run(
         model: model_name.to_string(),
     });
 
-    // ── Build system prompt from workspace MD files (Aria framework) ──
-    let skills = crate::skills::load_skills(&config.workspace_dir);
-    let mut tool_descs: Vec<(&str, &str)> = vec![
-        (
-            "shell",
-            "Execute terminal commands. Use when: running local checks, build/test commands, diagnostics. Don't use when: a safer dedicated tool exists, or command is destructive without approval.",
-        ),
-        (
-            "file_read",
-            "Read file contents. Use when: inspecting project files, configs, logs. Don't use when: a targeted search is enough.",
-        ),
-        (
-            "file_write",
-            "Write file contents. Use when: applying focused edits, scaffolding files, updating docs/code. Don't use when: side effects are unclear or file ownership is uncertain.",
-        ),
-        (
-            "memory_store",
-            "Save to memory. Use when: preserving durable preferences, decisions, key context. Don't use when: information is transient/noisy/sensitive without need.",
-        ),
-        (
-            "memory_recall",
-            "Search memory. Use when: retrieving prior decisions, user preferences, historical context. Don't use when: answer is already in current context.",
-        ),
-        (
-            "memory_forget",
-            "Delete a memory entry. Use when: memory is incorrect/stale or explicitly requested for removal. Don't use when: impact is uncertain.",
-        ),
-    ];
-    if config.browser.enabled {
-        tool_descs.push((
-            "browser_open",
-            "Open approved HTTPS URLs in Brave Browser (allowlist-only, no scraping)",
-        ));
-    }
-    let system_prompt = crate::channels::build_system_prompt(
-        &config.workspace_dir,
-        model_name,
-        &tool_descs,
-        &skills,
-    );
-
     // ── Execute ──────────────────────────────────────────────────
     let start = Instant::now();
 
@@ -135,23 +75,24 @@ pub async fn run(
                 .await;
         }
 
-        // Inject memory context into user message
-        let context = build_context(mem.as_ref(), &msg).await;
-        let enriched = if context.is_empty() {
-            msg.clone()
-        } else {
-            format!("{context}{msg}")
-        };
-
-        // Run the agentic loop with tool execution
-        let result = super::executor::execute_agent(
-            provider.as_ref(),
-            &agent_tools,
-            &system_prompt,
-            &enriched,
-            model_name,
-            temperature,
-            Some(25),
+        let result = super::orchestrator::run_live_turn(
+            super::orchestrator::LiveTurnConfig {
+                provider: provider.as_ref(),
+                security: &security,
+                memory: mem.clone(),
+                composio_api_key: composio_key,
+                browser_config: &config.browser,
+                registry_db: &registry_db,
+                workspace_dir: &config.workspace_dir,
+                tenant_id: &tenant,
+                model: model_name,
+                temperature,
+                mode_hint: "",
+                max_turns: Some(25),
+                external_tool_context: None,
+            },
+            &msg,
+            None,
         )
         .await?;
 
@@ -197,23 +138,24 @@ pub async fn run(
                     .await;
             }
 
-            // Inject memory context into user message
-            let context = build_context(mem.as_ref(), &msg.content).await;
-            let enriched = if context.is_empty() {
-                msg.content.clone()
-            } else {
-                format!("{context}{}", msg.content)
-            };
-
-            // Run the agentic loop with tool execution
-            let result = super::executor::execute_agent(
-                provider.as_ref(),
-                &agent_tools,
-                &system_prompt,
-                &enriched,
-                model_name,
-                temperature,
-                Some(25),
+            let result = super::orchestrator::run_live_turn(
+                super::orchestrator::LiveTurnConfig {
+                    provider: provider.as_ref(),
+                    security: &security,
+                    memory: mem.clone(),
+                    composio_api_key: composio_key,
+                    browser_config: &config.browser,
+                    registry_db: &registry_db,
+                    workspace_dir: &config.workspace_dir,
+                    tenant_id: &tenant,
+                    model: model_name,
+                    temperature,
+                    mode_hint: "",
+                    max_turns: Some(25),
+                    external_tool_context: None,
+                },
+                &msg.content,
+                None,
             )
             .await?;
 

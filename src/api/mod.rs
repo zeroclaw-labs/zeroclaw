@@ -86,6 +86,7 @@ impl<T: Serialize> ApiResponse<T> {
 /// In production, this would validate the token and extract tenant/user IDs.
 /// For now, we use a simple extraction from the token format: "`tenant_id:token`".
 fn extract_route_context(
+    db: &AriaDb,
     headers: &HeaderMap,
 ) -> Result<RouteContext, (StatusCode, Json<ApiResponse<()>>)> {
     let auth = headers
@@ -101,18 +102,8 @@ fn extract_route_context(
         ));
     }
 
-    // Normalize tenant identity to match gateway token resolution.
-    let tenant_id = if token.starts_with("zc_") {
-        "dev-tenant".to_string()
-    } else if let Some((tid, _)) = token.split_once(':') {
-        if tid == "tenant" {
-            "dev-tenant".to_string()
-        } else {
-            tid.to_string()
-        }
-    } else {
-        token.to_string()
-    };
+    // Normalize tenant identity with the same resolver used by runtime execution.
+    let tenant_id = crate::tenant::resolve_tenant_from_token(db, token);
 
     Ok(RouteContext {
         tenant_id,
@@ -235,7 +226,7 @@ async fn tools_upload(
     headers: HeaderMap,
     Json(body): Json<ToolUploadBody>,
 ) -> impl IntoResponse {
-    let ctx = match extract_route_context(&headers) {
+    let ctx = match extract_route_context(&state.db, &headers) {
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
@@ -312,7 +303,7 @@ async fn tools_list(
     headers: HeaderMap,
     Query(pagination): Query<PaginationQuery>,
 ) -> impl IntoResponse {
-    let ctx = match extract_route_context(&headers) {
+    let ctx = match extract_route_context(&state.db, &headers) {
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
@@ -364,7 +355,7 @@ async fn tools_get(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let ctx = match extract_route_context(&headers) {
+    let ctx = match extract_route_context(&state.db, &headers) {
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
@@ -409,7 +400,7 @@ async fn tools_delete(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let ctx = match extract_route_context(&headers) {
+    let ctx = match extract_route_context(&state.db, &headers) {
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
@@ -456,7 +447,7 @@ async fn agents_upload(
     headers: HeaderMap,
     Json(body): Json<AgentUploadBody>,
 ) -> impl IntoResponse {
-    let ctx = match extract_route_context(&headers) {
+    let ctx = match extract_route_context(&state.db, &headers) {
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
@@ -543,7 +534,7 @@ macro_rules! impl_list_get_delete {
             headers: HeaderMap,
             Query(pagination): Query<PaginationQuery>,
         ) -> impl IntoResponse {
-            let ctx = match extract_route_context(&headers) {
+            let ctx = match extract_route_context(&state.db, &headers) {
                 Ok(c) => c,
                 Err(e) => return e.into_response(),
             };
@@ -598,7 +589,7 @@ macro_rules! impl_list_get_delete {
             headers: HeaderMap,
             Path(id): Path<String>,
         ) -> impl IntoResponse {
-            let ctx = match extract_route_context(&headers) {
+            let ctx = match extract_route_context(&state.db, &headers) {
                 Ok(c) => c,
                 Err(e) => return e.into_response(),
             };
@@ -644,7 +635,7 @@ macro_rules! impl_list_get_delete {
             headers: HeaderMap,
             Path(id): Path<String>,
         ) -> impl IntoResponse {
-            let ctx = match extract_route_context(&headers) {
+            let ctx = match extract_route_context(&state.db, &headers) {
                 Ok(c) => c,
                 Err(e) => return e.into_response(),
             };
@@ -703,7 +694,7 @@ async fn memory_set(
     headers: HeaderMap,
     Json(body): Json<MemorySetBody>,
 ) -> impl IntoResponse {
-    let ctx = match extract_route_context(&headers) {
+    let ctx = match extract_route_context(&state.db, &headers) {
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
@@ -784,7 +775,7 @@ async fn memory_sweep(
     State(state): State<RegistryApiState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let ctx = match extract_route_context(&headers) {
+    let ctx = match extract_route_context(&state.db, &headers) {
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
@@ -817,7 +808,7 @@ async fn memory_clear_session(
     headers: HeaderMap,
     Path(session_id): Path<String>,
 ) -> impl IntoResponse {
-    let ctx = match extract_route_context(&headers) {
+    let ctx = match extract_route_context(&state.db, &headers) {
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
@@ -860,7 +851,7 @@ async fn tasks_create(
     headers: HeaderMap,
     Json(body): Json<TaskCreateBody>,
 ) -> impl IntoResponse {
-    let ctx = match extract_route_context(&headers) {
+    let ctx = match extract_route_context(&state.db, &headers) {
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
@@ -916,7 +907,7 @@ async fn tasks_update_status(
     Path(id): Path<String>,
     Json(body): Json<TaskStatusUpdateBody>,
 ) -> impl IntoResponse {
-    let ctx = match extract_route_context(&headers) {
+    let ctx = match extract_route_context(&state.db, &headers) {
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
@@ -969,7 +960,7 @@ async fn tasks_cancel(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let ctx = match extract_route_context(&headers) {
+    let ctx = match extract_route_context(&state.db, &headers) {
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
@@ -1026,7 +1017,7 @@ async fn feeds_upload(
     headers: HeaderMap,
     Json(body): Json<FeedUploadBody>,
 ) -> impl IntoResponse {
-    let ctx = match extract_route_context(&headers) {
+    let ctx = match extract_route_context(&state.db, &headers) {
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
@@ -1114,7 +1105,7 @@ async fn feeds_delete(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let ctx = match extract_route_context(&headers) {
+    let ctx = match extract_route_context(&state.db, &headers) {
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
@@ -1162,7 +1153,7 @@ async fn crons_upload(
     headers: HeaderMap,
     Json(body): Json<CronUploadBody>,
 ) -> impl IntoResponse {
-    let ctx = match extract_route_context(&headers) {
+    let ctx = match extract_route_context(&state.db, &headers) {
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
@@ -1256,7 +1247,7 @@ async fn crons_delete(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let ctx = match extract_route_context(&headers) {
+    let ctx = match extract_route_context(&state.db, &headers) {
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
@@ -1306,7 +1297,7 @@ async fn kv_set(
     headers: HeaderMap,
     Json(body): Json<KvSetBody>,
 ) -> impl IntoResponse {
-    let ctx = match extract_route_context(&headers) {
+    let ctx = match extract_route_context(&state.db, &headers) {
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
@@ -1378,7 +1369,7 @@ async fn kv_query(
     headers: HeaderMap,
     Query(params): Query<KvQueryParams>,
 ) -> impl IntoResponse {
-    let ctx = match extract_route_context(&headers) {
+    let ctx = match extract_route_context(&state.db, &headers) {
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
@@ -1439,7 +1430,7 @@ async fn teams_upload(
     headers: HeaderMap,
     Json(body): Json<TeamUploadBody>,
 ) -> impl IntoResponse {
-    let ctx = match extract_route_context(&headers) {
+    let ctx = match extract_route_context(&state.db, &headers) {
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
@@ -1527,7 +1518,7 @@ async fn pipelines_upload(
     headers: HeaderMap,
     Json(body): Json<PipelineUploadBody>,
 ) -> impl IntoResponse {
-    let ctx = match extract_route_context(&headers) {
+    let ctx = match extract_route_context(&state.db, &headers) {
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
@@ -1606,7 +1597,7 @@ async fn containers_upload(
     headers: HeaderMap,
     Json(body): Json<ContainerUploadBody>,
 ) -> impl IntoResponse {
-    let ctx = match extract_route_context(&headers) {
+    let ctx = match extract_route_context(&state.db, &headers) {
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
@@ -1691,7 +1682,7 @@ async fn networks_upload(
     headers: HeaderMap,
     Json(body): Json<NetworkUploadBody>,
 ) -> impl IntoResponse {
-    let ctx = match extract_route_context(&headers) {
+    let ctx = match extract_route_context(&state.db, &headers) {
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
@@ -1797,7 +1788,7 @@ async fn bulk_upload(
     headers: HeaderMap,
     Json(body): Json<BulkUploadBody>,
 ) -> impl IntoResponse {
-    let ctx = match extract_route_context(&headers) {
+    let ctx = match extract_route_context(&state.db, &headers) {
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
@@ -2072,7 +2063,7 @@ async fn pipelines_execute(
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let ctx = match extract_route_context(&headers) {
+    let ctx = match extract_route_context(&state.db, &headers) {
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
@@ -2160,7 +2151,7 @@ async fn teams_execute(
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let ctx = match extract_route_context(&headers) {
+    let ctx = match extract_route_context(&state.db, &headers) {
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
@@ -2257,7 +2248,7 @@ async fn feeds_execute(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let ctx = match extract_route_context(&headers) {
+    let ctx = match extract_route_context(&state.db, &headers) {
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
@@ -2341,30 +2332,33 @@ mod tests {
 
     #[test]
     fn extract_route_context_requires_auth() {
+        let db = AriaDb::open_in_memory().unwrap();
         let headers = HeaderMap::new();
-        let result = extract_route_context(&headers);
+        let result = extract_route_context(&db, &headers);
         assert!(result.is_err());
     }
 
     #[test]
     fn extract_route_context_parses_tenant() {
+        let db = AriaDb::open_in_memory().unwrap();
         let mut headers = HeaderMap::new();
         headers.insert(
             header::AUTHORIZATION,
             "Bearer tenant123:secret".parse().unwrap(),
         );
-        let ctx = extract_route_context(&headers).unwrap();
+        let ctx = extract_route_context(&db, &headers).unwrap();
         assert_eq!(ctx.tenant_id, "tenant123");
     }
 
     #[test]
     fn extract_route_context_uses_token_as_tenant() {
+        let db = AriaDb::open_in_memory().unwrap();
         let mut headers = HeaderMap::new();
         headers.insert(
             header::AUTHORIZATION,
             "Bearer simple_token".parse().unwrap(),
         );
-        let ctx = extract_route_context(&headers).unwrap();
+        let ctx = extract_route_context(&db, &headers).unwrap();
         assert_eq!(ctx.tenant_id, "simple_token");
     }
 

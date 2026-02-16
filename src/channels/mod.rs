@@ -274,57 +274,17 @@ pub async fn start_channels(config: Config) -> Result<()> {
         config.api_key.as_deref(),
     )?);
 
-    // Build system prompt from workspace identity files + skills
     let workspace = config.workspace_dir.clone();
-    let skills = crate::skills::load_skills(&workspace);
-
-    // Collect tool descriptions for the prompt
-    let mut tool_descs: Vec<(&str, &str)> = vec![
-        (
-            "shell",
-            "Execute terminal commands. Use when: running local checks, build/test commands, diagnostics. Don't use when: a safer dedicated tool exists, or command is destructive without approval.",
-        ),
-        (
-            "file_read",
-            "Read file contents. Use when: inspecting project files, configs, logs. Don't use when: a targeted search is enough.",
-        ),
-        (
-            "file_write",
-            "Write file contents. Use when: applying focused edits, scaffolding files, updating docs/code. Don't use when: side effects are unclear or file ownership is uncertain.",
-        ),
-        (
-            "memory_store",
-            "Save to memory. Use when: preserving durable preferences, decisions, key context. Don't use when: information is transient/noisy/sensitive without need.",
-        ),
-        (
-            "memory_recall",
-            "Search memory. Use when: retrieving prior decisions, user preferences, historical context. Don't use when: answer is already in current context.",
-        ),
-        (
-            "memory_forget",
-            "Delete a memory entry. Use when: memory is incorrect/stale or explicitly requested for removal. Don't use when: impact is uncertain.",
-        ),
-    ];
-
-    if config.browser.enabled {
-        tool_descs.push((
-            "browser_open",
-            "Open approved HTTPS URLs in Brave Browser (allowlist-only, no scraping)",
-        ));
-    }
-
-    let system_prompt = build_system_prompt(&workspace, &model, &tool_descs, &skills);
-
-    if !skills.is_empty() {
-        println!(
-            "  🧩 Skills:   {}",
-            skills
-                .iter()
-                .map(|s| s.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
+    let registry_db = crate::aria::db::AriaDb::open(&workspace.join("aria.db"))?;
+    let security = Arc::new(crate::security::SecurityPolicy::from_config(
+        &config.autonomy,
+        &workspace,
+    ));
+    let composio_api_key = if config.composio.enabled {
+        config.composio.api_key.as_deref()
+    } else {
+        None
+    };
 
     // Collect active channels
     let mut channels: Vec<Arc<dyn Channel>> = Vec::new();
@@ -448,12 +408,34 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 .await;
         }
 
-        // Call the LLM with system prompt (identity + soul + tools)
-        match provider
-            .chat_with_system(Some(&system_prompt), &msg.content, &model, temperature)
-            .await
+        let tenant = crate::tenant::resolve_tenant_from_token(&registry_db, "");
+        match crate::agent::orchestrator::run_live_turn(
+            crate::agent::orchestrator::LiveTurnConfig {
+                provider: provider.as_ref(),
+                security: &security,
+                memory: mem.clone(),
+                composio_api_key,
+                browser_config: &config.browser,
+                registry_db: &registry_db,
+                workspace_dir: &workspace,
+                tenant_id: &tenant,
+                model: &model,
+                temperature,
+                mode_hint: "",
+                max_turns: Some(25),
+                external_tool_context: None,
+            },
+            &msg.content,
+            None,
+        )
+        .await
         {
-            Ok(response) => {
+            Ok(result) => {
+                let response = if result.output.is_empty() {
+                    "Tool execution completed".to_string()
+                } else {
+                    result.output
+                };
                 println!(
                     "  🤖 Reply: {}",
                     if response.len() > 80 {

@@ -14,7 +14,6 @@ use crate::providers::{self, Provider};
 use crate::security::pairing::{constant_time_eq, is_public_bind};
 use crate::security::SecurityPolicy;
 use crate::status_events;
-use crate::tools;
 use anyhow::Result;
 use async_trait::async_trait;
 use axum::{
@@ -30,6 +29,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
+
+mod local_bridge;
 
 /// Maximum request body size (64KB) — prevents memory exhaustion
 pub const MAX_BODY_SIZE: usize = 65_536;
@@ -53,6 +54,7 @@ pub struct AppState {
     pub gateway_host: String,
     pub gateway_port: u16,
     pub whatsapp: Option<Arc<WhatsAppChannel>>,
+    pub local_tool_bridge: Arc<local_bridge::LocalToolBridge>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -178,7 +180,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         model,
         temperature,
         mem,
-        security,
+        security: security.clone(),
         composio_api_key,
         browser_config: config.browser.clone(),
         workspace_dir: config.workspace_dir.clone(),
@@ -188,6 +190,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         gateway_host: host.to_string(),
         gateway_port: actual_port,
         whatsapp: whatsapp_channel,
+        local_tool_bridge: Arc::new(local_bridge::LocalToolBridge::new(
+            security.clone(),
+            aria_registries.db.clone(),
+        )),
     };
 
     // Build router with middleware
@@ -268,6 +274,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         // WebSocket endpoints (canonical /ws/* paths)
         .route("/ws/events", get(handle_events_ws_events))
         .route("/ws/chat", get(handle_events_ws_chat))
+        .route("/ws/local-bridge", get(handle_events_ws_local_bridge))
         .route("/ws/status", get(handle_events_ws_status))
         .route("/ws/logs", get(handle_events_ws_logs))
         // Backward-compat alias; keep temporarily while clients migrate.
@@ -348,13 +355,37 @@ async fn handle_webhook(
             .await;
     }
 
-    match state
-        .provider
-        .chat(message, &state.model, state.temperature)
-        .await
-    {
+    let auth = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let token = auth.strip_prefix("Bearer ").unwrap_or("");
+    let tenant = resolve_tenant_from_token(&state, token);
+
+    let run_result = crate::agent::orchestrator::run_live_turn(
+        crate::agent::orchestrator::LiveTurnConfig {
+            provider: state.provider.as_ref(),
+            security: &state.security,
+            memory: state.mem.clone(),
+            composio_api_key: state.composio_api_key.as_deref(),
+            browser_config: &state.browser_config,
+            registry_db: &state.registry_db,
+            workspace_dir: &state.workspace_dir,
+            tenant_id: &tenant,
+            model: &state.model,
+            temperature: state.temperature,
+            mode_hint: "",
+            max_turns: Some(25),
+            external_tool_context: None,
+        },
+        message,
+        None,
+    )
+    .await;
+
+    match run_result {
         Ok(response) => {
-            let body = serde_json::json!({"response": response, "model": state.model});
+            let body = serde_json::json!({"response": response.output, "model": state.model});
             (StatusCode::OK, Json(body))
         }
         Err(e) => {
@@ -395,22 +426,7 @@ fn api_err(
 }
 
 fn resolve_tenant_from_token(state: &AppState, token: &str) -> String {
-    if token.is_empty() {
-        return "dev-tenant".to_string();
-    }
-
-    if let Some((tenant, _)) = token.split_once(':') {
-        return tenant.to_string();
-    }
-
-    if token.starts_with("zc_") {
-        if let Some(primary) = detect_primary_tenant(&state.registry_db) {
-            return primary;
-        }
-        return "dev-tenant".to_string();
-    }
-
-    token.to_string()
+    crate::tenant::resolve_tenant_from_token(&state.registry_db, token)
 }
 
 fn api_tenant(
@@ -425,33 +441,6 @@ fn api_tenant(
     // Dashboard API routes intentionally do not enforce bearer tokens.
     // Pairing remains available for webhook-level hardening.
     Ok(resolve_tenant_from_token(state, token))
-}
-
-fn detect_primary_tenant(db: &crate::aria::db::AriaDb) -> Option<String> {
-    db.with_conn(|conn| {
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT tenant_id, score
-            FROM (
-              SELECT tenant_id, COUNT(*) AS score FROM aria_tools GROUP BY tenant_id
-              UNION ALL
-              SELECT tenant_id, COUNT(*) AS score FROM aria_agents GROUP BY tenant_id
-              UNION ALL
-              SELECT tenant_id, COUNT(*) AS score FROM aria_feeds GROUP BY tenant_id
-              UNION ALL
-              SELECT tenant_id, COUNT(*) AS score FROM aria_tasks GROUP BY tenant_id
-            )
-            WHERE tenant_id NOT LIKE 'zc_%'
-            ORDER BY score DESC, tenant_id ASC
-            LIMIT 1
-            "#,
-        )?;
-
-        let tenant = stmt.query_row([], |row| row.get::<_, String>(0)).ok();
-        Ok(tenant)
-    })
-    .ok()
-    .flatten()
 }
 
 fn iso_from_millis(ms: i64) -> String {
@@ -844,31 +833,29 @@ async fn api_send_message(
     ensure_chat_row(&state, &tenant, &session_id, &content, now);
     let _ = insert_chat_message(&state, &tenant, &session_id, "user", &content, now);
 
-    let tools = tools::all_tools_for_tenant(
-        &state.security,
-        state.mem.clone(),
-        state.composio_api_key.as_deref(),
-        &state.browser_config,
-        &state.registry_db,
-        &tenant,
-    );
-    let memory_context = build_chat_memory_context(state.mem.as_ref(), &content).await;
     let mode_hint = mode_prompt(mode);
-    let system_prompt = build_live_system_prompt(&state, &tenant, &tools, mode_hint);
-    let enriched = if memory_context.is_empty() {
-        content.clone()
-    } else {
-        format!("{memory_context}{content}")
-    };
-
-    let run_result = crate::agent::executor::execute_agent_with_sink(
-        state.provider.as_ref(),
-        &tools,
-        &system_prompt,
-        &enriched,
-        &state.model,
-        state.temperature,
-        Some(25),
+    let run_result = crate::agent::orchestrator::run_live_turn(
+        crate::agent::orchestrator::LiveTurnConfig {
+            provider: state.provider.as_ref(),
+            security: &state.security,
+            memory: state.mem.clone(),
+            composio_api_key: state.composio_api_key.as_deref(),
+            browser_config: &state.browser_config,
+            registry_db: &state.registry_db,
+            workspace_dir: &state.workspace_dir,
+            tenant_id: &tenant,
+            model: &state.model,
+            temperature: state.temperature,
+            mode_hint,
+            max_turns: Some(25),
+            external_tool_context: Some(crate::agent::executor::ExternalToolContext {
+                tenant_id: tenant.clone(),
+                chat_id: session_id.clone(),
+                run_id: run_id.clone(),
+                executor: state.local_tool_bridge.clone(),
+            }),
+        },
+        &content,
         None,
     )
     .await;
@@ -2615,15 +2602,37 @@ async fn handle_whatsapp_message(State(state): State<AppState>, body: Bytes) -> 
                 .await;
         }
 
-        // Call the LLM
-        match state
-            .provider
-            .chat(&msg.content, &state.model, state.temperature)
-            .await
+        // Run a full live turn with tenant-scoped tools/prompt.
+        let tenant = resolve_tenant_from_token(&state, "");
+        match crate::agent::orchestrator::run_live_turn(
+            crate::agent::orchestrator::LiveTurnConfig {
+                provider: state.provider.as_ref(),
+                security: &state.security,
+                memory: state.mem.clone(),
+                composio_api_key: state.composio_api_key.as_deref(),
+                browser_config: &state.browser_config,
+                registry_db: &state.registry_db,
+                workspace_dir: &state.workspace_dir,
+                tenant_id: &tenant,
+                model: &state.model,
+                temperature: state.temperature,
+                mode_hint: "",
+                max_turns: Some(25),
+                external_tool_context: None,
+            },
+            &msg.content,
+            None,
+        )
+        .await
         {
             Ok(response) => {
+                let reply = if response.output.is_empty() {
+                    "Tool execution completed".to_string()
+                } else {
+                    response.output
+                };
                 // Send reply via WhatsApp
-                if let Err(e) = wa.send(&response, &msg.sender).await {
+                if let Err(e) = wa.send(&reply, &msg.sender).await {
                     tracing::error!("Failed to send WhatsApp reply: {e}");
                 }
             }
@@ -2668,6 +2677,31 @@ async fn handle_events_ws_chat(
     };
     let tenant = resolve_tenant_from_token(&state, &token);
     ws.on_upgrade(move |socket| handle_chat_socket(socket, state, tenant))
+}
+
+async fn handle_events_ws_local_bridge(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let auth = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let bearer = auth.strip_prefix("Bearer ").unwrap_or("");
+    let token = if !bearer.is_empty() {
+        bearer.to_string()
+    } else {
+        query.get("token").cloned().unwrap_or_default()
+    };
+    let tenant = resolve_tenant_from_token(&state, &token);
+    let device_id = query
+        .get("deviceId")
+        .cloned()
+        .unwrap_or_else(|| "default-device".to_string());
+    let bridge = state.local_tool_bridge.clone();
+    ws.on_upgrade(move |socket| bridge.handle_socket(socket, tenant, device_id))
 }
 
 async fn handle_events_ws_status(
@@ -3051,23 +3085,7 @@ async fn handle_chat_socket(mut socket: ws::WebSocket, state: AppState, tenant: 
             ))
             .await;
 
-        let tools = tools::all_tools_for_tenant(
-            &state.security,
-            state.mem.clone(),
-            state.composio_api_key.as_deref(),
-            &state.browser_config,
-            &state.registry_db,
-            &tenant,
-        );
-        let memory_context = build_chat_memory_context(state.mem.as_ref(), &content).await;
         let mode_hint = mode_prompt(mode);
-        let system_prompt = build_live_system_prompt(&state, &tenant, &tools, mode_hint);
-        let enriched = if memory_context.is_empty() {
-            content.clone()
-        } else {
-            format!("{memory_context}{content}")
-        };
-
         let run_result = {
             let mut sink = WsChatSink {
                 socket: &mut socket,
@@ -3080,14 +3098,28 @@ async fn handle_chat_socket(mut socket: ws::WebSocket, state: AppState, tenant: 
                 thinking_started_ms: None,
                 thinking_content: String::new(),
             };
-            crate::agent::executor::execute_agent_with_sink(
-                state.provider.as_ref(),
-                &tools,
-                &system_prompt,
-                &enriched,
-                &state.model,
-                state.temperature,
-                Some(25),
+            crate::agent::orchestrator::run_live_turn(
+                crate::agent::orchestrator::LiveTurnConfig {
+                    provider: state.provider.as_ref(),
+                    security: &state.security,
+                    memory: state.mem.clone(),
+                    composio_api_key: state.composio_api_key.as_deref(),
+                    browser_config: &state.browser_config,
+                    registry_db: &state.registry_db,
+                    workspace_dir: &state.workspace_dir,
+                    tenant_id: &tenant,
+                    model: &state.model,
+                    temperature: state.temperature,
+                    mode_hint,
+                    max_turns: Some(25),
+                    external_tool_context: Some(crate::agent::executor::ExternalToolContext {
+                        tenant_id: tenant.clone(),
+                        chat_id: chat_id.clone(),
+                        run_id: run_id.clone(),
+                        executor: state.local_tool_bridge.clone(),
+                    }),
+                },
+                &content,
                 Some(&mut sink),
             )
             .await

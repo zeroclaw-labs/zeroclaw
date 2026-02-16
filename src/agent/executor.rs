@@ -14,6 +14,7 @@ use crate::providers::{
 use crate::tools::Tool;
 use anyhow::Result;
 use async_trait::async_trait;
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Maximum agentic turns (LLM calls) before forcing stop.
@@ -48,6 +49,38 @@ pub struct AgentToolTrace {
     pub result: String,
     pub is_error: bool,
     pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExternalToolCall {
+    pub tenant_id: String,
+    pub chat_id: String,
+    pub run_id: String,
+    pub call_id: String,
+    pub tool_name: String,
+    pub tool_input: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExternalToolResult {
+    pub output: String,
+    pub is_error: bool,
+}
+
+#[async_trait]
+pub trait ExternalToolExecutor: Send + Sync {
+    async fn execute_external_tool(
+        &self,
+        call: &ExternalToolCall,
+    ) -> Result<Option<ExternalToolResult>>;
+}
+
+#[derive(Clone)]
+pub struct ExternalToolContext {
+    pub tenant_id: String,
+    pub chat_id: String,
+    pub run_id: String,
+    pub executor: Arc<dyn ExternalToolExecutor>,
 }
 
 #[async_trait]
@@ -105,6 +138,7 @@ pub async fn execute_agent(
         temperature,
         max_turns,
         None,
+        None,
     )
     .await
 }
@@ -117,6 +151,7 @@ pub async fn execute_agent_with_sink(
     model: &str,
     temperature: f64,
     max_turns: Option<u32>,
+    external_tool_context: Option<ExternalToolContext>,
     mut sink: Option<&mut dyn AgentExecutionSink>,
 ) -> Result<AgentExecutionResult> {
     let start = Instant::now();
@@ -247,24 +282,53 @@ pub async fn execute_agent_with_sink(
             // Find the matching tool
             let tool = tools.iter().find(|t| t.name() == tool_name);
 
-            let (result_content, is_error) = match tool {
-                Some(tool) => match tool.execute(tool_input.clone()).await {
-                    Ok(result) => {
-                        if result.success {
-                            (result.output, false)
-                        } else {
-                            (
-                                format!(
-                                    "Error: {}",
-                                    result.error.unwrap_or_else(|| "Unknown error".into())
-                                ),
-                                true,
-                            )
-                        }
+            let mut external_execution: Option<(String, bool)> = None;
+            if let Some(ctx) = external_tool_context.as_ref() {
+                match ctx
+                    .executor
+                    .execute_external_tool(&ExternalToolCall {
+                        tenant_id: ctx.tenant_id.clone(),
+                        chat_id: ctx.chat_id.clone(),
+                        run_id: ctx.run_id.clone(),
+                        call_id: call_id.to_string(),
+                        tool_name: tool_name.to_string(),
+                        tool_input: tool_input.clone(),
+                    })
+                    .await
+                {
+                    Ok(Some(result)) => {
+                        external_execution = Some((result.output, result.is_error));
                     }
-                    Err(e) => (format!("Tool execution error: {e}"), true),
-                },
-                None => (format!("Unknown tool: {tool_name}"), true),
+                    Ok(None) => {}
+                    Err(e) => {
+                        external_execution =
+                            Some((format!("External tool execution error: {e}"), true));
+                    }
+                }
+            }
+
+            let (result_content, is_error) = if let Some(external_result) = external_execution {
+                external_result
+            } else {
+                match tool {
+                    Some(tool) => match tool.execute(tool_input.clone()).await {
+                        Ok(result) => {
+                            if result.success {
+                                (result.output, false)
+                            } else {
+                                (
+                                    format!(
+                                        "Error: {}",
+                                        result.error.unwrap_or_else(|| "Unknown error".into())
+                                    ),
+                                    true,
+                                )
+                            }
+                        }
+                        Err(e) => (format!("Tool execution error: {e}"), true),
+                    },
+                    None => (format!("Unknown tool: {tool_name}"), true),
+                }
             };
             let tool_duration_ms = tool_started.elapsed().as_millis() as u64;
 
