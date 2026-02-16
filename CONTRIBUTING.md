@@ -48,6 +48,7 @@ When PR traffic is high (especially with AI-assisted contributions), these rules
 - **Security-first review**: changes in `src/security/`, runtime, and CI need stricter validation.
 
 Full maintainer workflow: [`docs/pr-workflow.md`](docs/pr-workflow.md).
+CI workflow ownership and triage map: [`docs/ci-map.md`](docs/ci-map.md).
 
 ## Agent Collaboration Guidance
 

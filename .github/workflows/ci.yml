@@ -1,178 +1,161 @@
 name: CI
 
 on:
-  push:
-    branches: [main, develop]
-  pull_request:
-    branches: [main]
+    push:
+        branches: [main, develop]
+    pull_request:
+        branches: [main]
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.sha }}
-  cancel-in-progress: true
+    group: ci-${{ github.event.pull_request.number || github.sha }}
+    cancel-in-progress: true
 
 permissions:
-  contents: read
+    contents: read
 
 env:
-  CARGO_TERM_COLOR: always
+    CARGO_TERM_COLOR: always
 
 jobs:
-  changes:
-    name: Detect Change Scope
-    runs-on: ubuntu-latest
-    outputs:
-      docs_only: ${{ steps.scope.outputs.docs_only }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+    changes:
+        name: Detect Change Scope
+        runs-on: ubuntu-latest
+        outputs:
+            docs_only: ${{ steps.scope.outputs.docs_only }}
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
 
-      - name: Detect docs-only changes
-        id: scope
-        shell: bash
-        run: |
-          set -euo pipefail
+            - name: Detect docs-only changes
+              id: scope
+              shell: bash
+              run: |
+                  set -euo pipefail
 
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            BASE="${{ github.event.pull_request.base.sha }}"
-          else
-            BASE="${{ github.event.before }}"
-          fi
+                  if [ "${{ github.event_name }}" = "pull_request" ]; then
+                    BASE="${{ github.event.pull_request.base.sha }}"
+                  else
+                    BASE="${{ github.event.before }}"
+                  fi
 
-          if [ -z "$BASE" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
-            echo "docs_only=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+                  if [ -z "$BASE" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+                    echo "docs_only=false" >> "$GITHUB_OUTPUT"
+                    exit 0
+                  fi
 
-          CHANGED="$(git diff --name-only "$BASE" HEAD || true)"
-          if [ -z "$CHANGED" ]; then
-            echo "docs_only=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+                  CHANGED="$(git diff --name-only "$BASE" HEAD || true)"
+                  if [ -z "$CHANGED" ]; then
+                    echo "docs_only=false" >> "$GITHUB_OUTPUT"
+                    exit 0
+                  fi
 
-          docs_only=true
-          while IFS= read -r file; do
-            [ -z "$file" ] && continue
+                  docs_only=true
+                  while IFS= read -r file; do
+                    [ -z "$file" ] && continue
 
-            if [[ "$file" == docs/* ]] \
-              || [[ "$file" == *.md ]] \
-              || [[ "$file" == *.mdx ]] \
-              || [[ "$file" == "LICENSE" ]] \
-              || [[ "$file" == .github/ISSUE_TEMPLATE/* ]] \
-              || [[ "$file" == .github/pull_request_template.md ]]; then
-              continue
-            fi
+                    if [[ "$file" == docs/* ]] \
+                      || [[ "$file" == *.md ]] \
+                      || [[ "$file" == *.mdx ]] \
+                      || [[ "$file" == "LICENSE" ]] \
+                      || [[ "$file" == .github/ISSUE_TEMPLATE/* ]] \
+                      || [[ "$file" == .github/pull_request_template.md ]]; then
+                      continue
+                    fi
 
-            docs_only=false
-            break
-          done <<< "$CHANGED"
+                    docs_only=false
+                    break
+                  done <<< "$CHANGED"
 
-          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+                  echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
 
-  lint:
-    name: Format & Lint
-    needs: [changes]
-    if: needs.changes.outputs.docs_only != 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Detect Rust source changes
-        id: rust_changes
-        shell: bash
-        run: |
-          set -euo pipefail
+    lint:
+        name: Format & Lint
+        needs: [changes]
+        if: needs.changes.outputs.docs_only != 'true'
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
+            - uses: dtolnay/rust-toolchain@stable
+              with:
+                  toolchain: 1.92
+                  components: rustfmt, clippy
+            - uses: Swatinem/rust-cache@v2
+            - name: Run rustfmt
+              run: cargo fmt --all -- --check
+            - name: Run clippy
+              run: cargo clippy --locked --all-targets -- -D warnings
 
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            BASE="${{ github.event.pull_request.base.sha }}"
-            CHANGED="$(git diff --name-only "$BASE" HEAD -- '*.rs' || true)"
-          else
-            CHANGED="$(git diff --name-only "${{ github.event.before }}" HEAD -- '*.rs' || true)"
-          fi
+    test:
+        name: Test
+        needs: [changes]
+        if: needs.changes.outputs.docs_only != 'true'
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        steps:
+            - uses: actions/checkout@v4
+            - uses: dtolnay/rust-toolchain@stable
+              with:
+                  toolchain: 1.92
+            - uses: Swatinem/rust-cache@v2
+            - name: Run tests
+              run: cargo test --locked --verbose
 
-          if [ -z "$CHANGED" ]; then
-            echo "has_rust_changes=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+    build:
+        name: Build (Smoke)
+        needs: [changes]
+        if: needs.changes.outputs.docs_only != 'true'
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
 
-          echo "has_rust_changes=true" >> "$GITHUB_OUTPUT"
-      - name: Run rustfmt
-        if: steps.rust_changes.outputs.has_rust_changes == 'true'
-        run: cargo fmt --all -- --check
-      - name: Run clippy
-        if: steps.rust_changes.outputs.has_rust_changes == 'true'
-        run: cargo clippy --all-targets -- -D warnings
-      - name: Skip rust lint (no Rust changes)
-        if: steps.rust_changes.outputs.has_rust_changes != 'true'
-        run: echo "No Rust source changes detected; skipping rustfmt and clippy."
+        steps:
+            - uses: actions/checkout@v4
+            - uses: dtolnay/rust-toolchain@stable
+              with:
+                  toolchain: 1.92
+            - uses: Swatinem/rust-cache@v2
+            - name: Build release binary
+              run: cargo build --release --locked --verbose
 
-  test:
-    name: Test
-    needs: [changes]
-    if: needs.changes.outputs.docs_only != 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Run tests
-        run: cargo test --verbose
+    docs-only:
+        name: Docs-Only Fast Path
+        needs: [changes]
+        if: needs.changes.outputs.docs_only == 'true'
+        runs-on: ubuntu-latest
+        steps:
+            - name: Skip heavy jobs for docs-only change
+              run: echo "Docs-only change detected. Rust lint/test/build skipped."
 
-  build:
-    name: Build (Smoke)
-    needs: [changes]
-    if: needs.changes.outputs.docs_only != 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    ci-required:
+        name: CI Required Gate
+        if: always()
+        needs: [changes, lint, test, build, docs-only]
+        runs-on: ubuntu-latest
+        steps:
+            - name: Enforce required status
+              shell: bash
+              run: |
+                  set -euo pipefail
 
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build release binary
-        run: cargo build --release --locked --verbose
+                  if [ "${{ needs.changes.outputs.docs_only }}" = "true" ]; then
+                    echo "Docs-only fast path passed."
+                    exit 0
+                  fi
 
-  docs-only:
-    name: Docs-Only Fast Path
-    needs: [changes]
-    if: needs.changes.outputs.docs_only == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Skip heavy jobs for docs-only change
-        run: echo "Docs-only change detected. Rust lint/test/build skipped."
+                  lint_result="${{ needs.lint.result }}"
+                  test_result="${{ needs.test.result }}"
+                  build_result="${{ needs.build.result }}"
 
-  ci-required:
-    name: CI Required Gate
-    if: always()
-    needs: [changes, lint, test, build, docs-only]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Enforce required status
-        shell: bash
-        run: |
-          set -euo pipefail
+                  echo "lint=${lint_result}"
+                  echo "test=${test_result}"
+                  echo "build=${build_result}"
 
-          if [ "${{ needs.changes.outputs.docs_only }}" = "true" ]; then
-            echo "Docs-only fast path passed."
-            exit 0
-          fi
+                  if [ "$lint_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ]; then
+                    echo "Required CI jobs did not pass."
+                    exit 1
+                  fi
 
-          lint_result="${{ needs.lint.result }}"
-          test_result="${{ needs.test.result }}"
-          build_result="${{ needs.build.result }}"
-
-          echo "lint=${lint_result}"
-          echo "test=${test_result}"
-          echo "build=${build_result}"
-
-          if [ "$lint_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ]; then
-            echo "Required CI jobs did not pass."
-            exit 1
-          fi
-
-          echo "All required CI jobs passed."
+                  echo "All required CI jobs passed."

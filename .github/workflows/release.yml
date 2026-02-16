@@ -14,7 +14,9 @@ jobs:
   build-release:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -73,6 +75,7 @@ jobs:
     name: Publish Release
     needs: build-release
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 

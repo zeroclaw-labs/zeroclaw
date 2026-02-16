@@ -1,37 +1,47 @@
 name: Security Audit
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  schedule:
-    - cron: "0 6 * * 1" # Weekly on Monday 6am UTC
+    push:
+        branches: [main]
+    pull_request:
+        branches: [main]
+    schedule:
+        - cron: "0 6 * * 1" # Weekly on Monday 6am UTC
+
+concurrency:
+    group: security-${{ github.event.pull_request.number || github.ref }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
 
 env:
-  CARGO_TERM_COLOR: always
+    CARGO_TERM_COLOR: always
 
 jobs:
-  audit:
-    name: Security Audit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+    audit:
+        name: Security Audit
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        steps:
+            - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+            - uses: dtolnay/rust-toolchain@stable
+            - uses: Swatinem/rust-cache@v2
 
-      - name: Install cargo-audit
-        run: cargo install --locked cargo-audit --version 0.22.1
+            - name: Install cargo-audit
+              run: cargo install --locked cargo-audit --version 0.22.1
 
-      - name: Run cargo-audit
-        run: cargo audit
+            - name: Run cargo-audit
+              run: cargo audit
 
-  deny:
-    name: License & Supply Chain
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+    deny:
+        name: License & Supply Chain
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        steps:
+            - uses: actions/checkout@v4
 
-      - uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check advisories licenses sources
+            - uses: EmbarkStudios/cargo-deny-action@v2
+              with:
+                  command: check advisories licenses sources
