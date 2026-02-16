@@ -187,6 +187,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             &mut history,
             ctx.tools_registry.as_ref(),
             ctx.observer.as_ref(),
+            "channel-runtime",
             ctx.model.as_str(),
             ctx.temperature,
         ),
