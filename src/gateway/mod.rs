@@ -4530,18 +4530,22 @@ async fn handle_chat_socket(mut socket: ws::WebSocket, state: AppState, tenant: 
         let run_id = format!("run-{}", &uuid::Uuid::new_v4().to_string()[..8]);
         let started = now_ms();
         let mode = parse_chat_mode(req.mode.as_deref());
+        let request_id = req.request_id.clone();
 
-        ensure_chat_row(&state, &tenant, &chat_id, &content, started);
-        ensure_session_row(
-            &state,
-            &tenant,
-            &chat_id,
-            started,
-            "macos-app",
-            "desktop",
-            "macOS App",
-        );
-        let _ = insert_chat_message(&state, &tenant, &chat_id, "user", &content, started);
+        let _ = socket
+            .send(ws::Message::Text(
+                serde_json::json!({
+                    "type": "run.ack",
+                    "runId": run_id,
+                    "chatId": chat_id,
+                    "requestId": request_id,
+                    "status": "accepted",
+                    "acceptedAt": chrono::Utc::now().to_rfc3339(),
+                })
+                .to_string()
+                .into(),
+            ))
+            .await;
 
         let _ = socket
             .send(ws::Message::Text(
@@ -4556,6 +4560,18 @@ async fn handle_chat_socket(mut socket: ws::WebSocket, state: AppState, tenant: 
                 .into(),
             ))
             .await;
+
+        ensure_chat_row(&state, &tenant, &chat_id, &content, started);
+        ensure_session_row(
+            &state,
+            &tenant,
+            &chat_id,
+            started,
+            "macos-app",
+            "desktop",
+            "macOS App",
+        );
+        let _ = insert_chat_message(&state, &tenant, &chat_id, "user", &content, started);
 
         let mode_hint = mode_prompt(mode);
         let run_result = {
