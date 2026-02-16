@@ -765,18 +765,16 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.autonomy,
         &config.workspace_dir,
     ));
-
     let model = config
         .default_model
         .clone()
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4".into());
+        .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
     let temperature = config.default_temperature;
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory(
         &config.memory,
         &config.workspace_dir,
         config.api_key.as_deref(),
     )?);
-
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
             config.composio.api_key.as_deref(),
@@ -785,6 +783,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
     } else {
         (None, None)
     };
+    // Build system prompt from workspace identity files + skills
+    let workspace = config.workspace_dir.clone();
     let tools_registry = Arc::new(tools::all_tools_with_runtime(
         &security,
         runtime,
@@ -793,14 +793,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
         composio_entity_id,
         &config.browser,
         &config.http_request,
-        &config.workspace_dir,
+        &workspace,
         &config.agents,
         config.api_key.as_deref(),
         &config,
     ));
 
-    // Build system prompt from workspace identity files + skills
-    let workspace = config.workspace_dir.clone();
     let skills = crate::skills::load_skills(&workspace);
 
     // Collect tool descriptions for the prompt
@@ -1112,23 +1110,19 @@ mod tests {
             message: &str,
             _model: &str,
             _temperature: f64,
-        ) -> anyhow::Result<ChatResponse> {
+        ) -> anyhow::Result<String> {
             tokio::time::sleep(self.delay).await;
-            Ok(ChatResponse::with_text(format!("echo: {message}")))
+            Ok(format!("echo: {message}"))
         }
     }
 
     struct ToolCallingProvider;
 
-    fn tool_call_payload() -> ChatResponse {
-        ChatResponse {
-            text: Some(String::new()),
-            tool_calls: vec![ToolCall {
-                id: "call_1".into(),
-                name: "mock_price".into(),
-                arguments: r#"{"symbol":"BTC"}"#.into(),
-            }],
-        }
+    fn tool_call_payload() -> String {
+        r#"<tool_call>
+{"name":"mock_price","arguments":{"symbol":"BTC"}}
+</tool_call>"#
+            .to_string()
     }
 
     #[async_trait::async_trait]
@@ -1139,7 +1133,7 @@ mod tests {
             _message: &str,
             _model: &str,
             _temperature: f64,
-        ) -> anyhow::Result<ChatResponse> {
+        ) -> anyhow::Result<String> {
             Ok(tool_call_payload())
         }
 
@@ -1148,14 +1142,12 @@ mod tests {
             messages: &[ChatMessage],
             _model: &str,
             _temperature: f64,
-        ) -> anyhow::Result<ChatResponse> {
+        ) -> anyhow::Result<String> {
             let has_tool_results = messages
                 .iter()
                 .any(|msg| msg.role == "user" && msg.content.contains("[Tool results]"));
             if has_tool_results {
-                Ok(ChatResponse::with_text(
-                    "BTC is currently around $65,000 based on latest tool output.",
-                ))
+                Ok("BTC is currently around $65,000 based on latest tool output.".to_string())
             } else {
                 Ok(tool_call_payload())
             }

@@ -221,14 +221,9 @@ impl Tool for DelegateTool {
 
         match result {
             Ok(response) => {
-                let has_tool_calls = response.has_tool_calls();
-                let mut rendered = response.text.unwrap_or_default();
+                let mut rendered = response;
                 if rendered.trim().is_empty() {
-                    if has_tool_calls {
-                        rendered = "[Tool-only response; no text content]".to_string();
-                    } else {
-                        rendered = "[Empty response]".to_string();
-                    }
+                    rendered = "[Empty response]".to_string();
                 }
 
                 Ok(ToolResult {
