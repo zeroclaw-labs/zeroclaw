@@ -63,6 +63,9 @@ pub struct Config {
     pub browser: BrowserConfig,
 
     #[serde(default)]
+    pub http_request: HttpRequestConfig,
+
+    #[serde(default)]
     pub identity: IdentityConfig,
 
     /// Hardware Abstraction Layer (HAL) configuration.
@@ -280,6 +283,32 @@ pub struct BrowserConfig {
     /// Browser session name (for agent-browser automation)
     #[serde(default)]
     pub session_name: Option<String>,
+}
+
+// ── HTTP request tool ───────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HttpRequestConfig {
+    /// Enable `http_request` tool for API interactions
+    #[serde(default)]
+    pub enabled: bool,
+    /// Allowed domains for HTTP requests (exact or subdomain match)
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+    /// Maximum response size in bytes (default: 1MB)
+    #[serde(default = "default_http_max_response_size")]
+    pub max_response_size: usize,
+    /// Request timeout in seconds (default: 30)
+    #[serde(default = "default_http_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_http_max_response_size() -> usize {
+    1_000_000 // 1MB
+}
+
+fn default_http_timeout_secs() -> u64 {
+    30
 }
 
 // ── Memory ───────────────────────────────────────────────────
@@ -1084,6 +1113,7 @@ impl Default for Config {
             composio: ComposioConfig::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
+            http_request: HttpRequestConfig::default(),
             identity: IdentityConfig::default(),
             hardware: crate::hardware::HardwareConfig::default(),
             agents: HashMap::new(),
@@ -1437,6 +1467,7 @@ mod tests {
             composio: ComposioConfig::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
+            http_request: HttpRequestConfig::default(),
             identity: IdentityConfig::default(),
             hardware: crate::hardware::HardwareConfig::default(),
             agents: HashMap::new(),
@@ -1511,6 +1542,7 @@ default_temperature = 0.7
             composio: ComposioConfig::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
+            http_request: HttpRequestConfig::default(),
             identity: IdentityConfig::default(),
             hardware: crate::hardware::HardwareConfig::default(),
             agents: HashMap::new(),

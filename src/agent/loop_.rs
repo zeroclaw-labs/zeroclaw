@@ -476,6 +476,7 @@ pub async fn run(
         mem.clone(),
         composio_key,
         &config.browser,
+        &config.http_request,
         &config.agents,
         config.api_key.as_deref(),
     );
