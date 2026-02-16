@@ -123,6 +123,9 @@ fn resolve_api_key(name: &str, api_key: Option<&str>) -> Option<String> {
         "glm" | "zhipu" => vec!["GLM_API_KEY"],
         "minimax" => vec!["MINIMAX_API_KEY"],
         "qianfan" | "baidu" => vec!["QIANFAN_API_KEY"],
+        "qwen" | "dashscope" | "qwen-intl" | "dashscope-intl" | "qwen-us" | "dashscope-us" => {
+            vec!["DASHSCOPE_API_KEY"]
+        }
         "zai" | "z.ai" => vec!["ZAI_API_KEY"],
         "synthetic" => vec!["SYNTHETIC_API_KEY"],
         "opencode" | "opencode-zen" => vec!["OPENCODE_API_KEY"],
@@ -234,6 +237,15 @@ pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<
         ))),
         "qianfan" | "baidu" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Qianfan", "https://aip.baidubce.com", key, AuthStyle::Bearer,
+        ))),
+        "qwen" | "dashscope" => Ok(Box::new(OpenAiCompatibleProvider::new(
+            "Qwen", "https://dashscope.aliyuncs.com/compatible-mode/v1", key, AuthStyle::Bearer,
+        ))),
+        "qwen-intl" | "dashscope-intl" => Ok(Box::new(OpenAiCompatibleProvider::new(
+            "Qwen", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", key, AuthStyle::Bearer,
+        ))),
+        "qwen-us" | "dashscope-us" => Ok(Box::new(OpenAiCompatibleProvider::new(
+            "Qwen", "https://dashscope-us.aliyuncs.com/compatible-mode/v1", key, AuthStyle::Bearer,
         ))),
 
         // ── Extended ecosystem (community favorites) ─────────
@@ -527,6 +539,16 @@ mod tests {
         assert!(create_provider("baidu", Some("key")).is_ok());
     }
 
+    #[test]
+    fn factory_qwen() {
+        assert!(create_provider("qwen", Some("key")).is_ok());
+        assert!(create_provider("dashscope", Some("key")).is_ok());
+        assert!(create_provider("qwen-intl", Some("key")).is_ok());
+        assert!(create_provider("dashscope-intl", Some("key")).is_ok());
+        assert!(create_provider("qwen-us", Some("key")).is_ok());
+        assert!(create_provider("dashscope-us", Some("key")).is_ok());
+    }
+
     // ── Extended ecosystem ───────────────────────────────────
 
     #[test]
@@ -755,6 +777,9 @@ mod tests {
             "minimax",
             "bedrock",
             "qianfan",
+            "qwen",
+            "qwen-intl",
+            "qwen-us",
             "groq",
             "mistral",
             "xai",
