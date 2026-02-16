@@ -161,7 +161,6 @@ jobs:
                   args: >-
                       --offline
                       --no-progress
-                      --exclude-mail
                       --format detailed
                       README.md
                       CONTRIBUTING.md
