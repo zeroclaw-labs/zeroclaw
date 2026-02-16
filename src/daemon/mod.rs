@@ -551,6 +551,9 @@ fn wire_cron_bridge_hooks(config: &Config) -> Result<()> {
         aria_db, add_job, remove_job,
     ));
     bridge.sync_all()?;
+    if let Err(e) = crate::cron::prune_orphaned_aria_jobs(config) {
+        tracing::warn!("Failed to prune orphaned runtime aria cron jobs: {e}");
+    }
     if let Err(e) = crate::cron::jobs_file::export_jobs_file(&export_cfg.workspace_dir) {
         tracing::warn!("Failed to export cron jobs to ~/.aria/jobs.json after startup sync: {e}");
     }

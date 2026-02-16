@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use cron::Schedule;
 use rusqlite::{params, Connection};
+use std::collections::HashMap;
 use std::str::FromStr;
 use uuid::Uuid;
 
@@ -88,8 +89,65 @@ pub fn sync_from_aria(config: &Config) -> Result<()> {
 
     let bridge = aria::cron_bridge::CronBridge::new(aria_db, add_job_cb, remove_job_cb);
     bridge.sync_all()?;
+    let _ = prune_orphaned_aria_jobs(config)?;
     jobs_file::export_jobs_file(&config.workspace_dir)?;
     Ok(())
+}
+
+pub fn prune_orphaned_aria_jobs(config: &Config) -> Result<usize> {
+    let aria_db = aria::db::AriaDb::open(&config.registry_db_path())?;
+    let active_runtime_bindings = aria_db.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, cron_job_id
+             FROM aria_cron_functions
+             WHERE status = 'active' AND enabled = 1 AND cron_job_id IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let (cron_id, runtime_job_id) = row?;
+            map.insert(runtime_job_id, cron_id);
+        }
+        Ok(map)
+    })?;
+
+    with_connection(config, |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, command
+             FROM cron_jobs
+             WHERE command LIKE ?1",
+        )?;
+        let rows = stmt.query_map(
+            params![format!("{}%", aria::cron_bridge::ARIA_CRON_COMMAND_PREFIX)],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?;
+
+        let mut stale_runtime_ids = Vec::new();
+        for row in rows {
+            let (runtime_id, command) = row?;
+            let Some(cron_func_id) = command
+                .strip_prefix(aria::cron_bridge::ARIA_CRON_COMMAND_PREFIX)
+                .map(str::trim)
+            else {
+                stale_runtime_ids.push(runtime_id);
+                continue;
+            };
+            let is_valid = active_runtime_bindings
+                .get(&runtime_id)
+                .is_some_and(|bound_cron_id| bound_cron_id == cron_func_id);
+            if !is_valid {
+                stale_runtime_ids.push(runtime_id);
+            }
+        }
+
+        let mut removed = 0usize;
+        for runtime_id in stale_runtime_ids {
+            removed += conn.execute("DELETE FROM cron_jobs WHERE id = ?1", params![runtime_id])?;
+        }
+        Ok(removed)
+    })
 }
 
 pub fn add_job(
@@ -337,6 +395,7 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aria::db::AriaDb;
     use crate::config::Config;
     use chrono::Duration as ChronoDuration;
     use tempfile::TempDir;
@@ -381,6 +440,53 @@ mod tests {
 
         remove_job(&config, &job.id).unwrap();
         assert!(list_jobs(&config).unwrap().is_empty());
+    }
+
+    #[test]
+    fn prune_orphaned_aria_jobs_removes_stale_runtime_rows() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let now = Utc::now().to_rfc3339();
+        let aria_db = AriaDb::open(&config.registry_db_path()).unwrap();
+
+        // Active cron function bound to runtime job "keep-runtime-job".
+        aria_db
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO aria_cron_functions
+                     (id, tenant_id, name, description, schedule_kind, schedule_data,
+                      session_target, wake_mode, payload_kind, payload_data, isolation,
+                      enabled, delete_after_run, cron_job_id, status, created_at, updated_at)
+                     VALUES (?1, 't1', 'keep', '', 'cron', '{\"expr\":\"0 8 * * *\"}',
+                             'main', 'now', 'agentTurn', '{\"message\":\"hi\"}', NULL,
+                             1, 0, 'keep-runtime-job', 'active', ?2, ?2)",
+                    params!["cron-keep", now],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        with_connection(&config, |conn| {
+            conn.execute(
+                "INSERT INTO cron_jobs (id, expression, timezone, command, created_at, next_run)
+                 VALUES ('keep-runtime-job', '0 8 * * *', NULL, '__ARIA_CRON__:cron-keep', ?1, ?1)",
+                params![now],
+            )?;
+            conn.execute(
+                "INSERT INTO cron_jobs (id, expression, timezone, command, created_at, next_run)
+                 VALUES ('stale-runtime-job', '*/10 * * * *', NULL, '__ARIA_CRON__:deleted-cron', ?1, ?1)",
+                params![now],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let removed = prune_orphaned_aria_jobs(&config).unwrap();
+        assert_eq!(removed, 1);
+
+        let jobs = list_jobs(&config).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, "keep-runtime-job");
     }
 
     #[test]
