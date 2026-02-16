@@ -16,7 +16,12 @@ pub struct DiscordChannel {
 }
 
 impl DiscordChannel {
-    pub fn new(bot_token: String, guild_id: Option<String>, allowed_users: Vec<String>, listen_to_bots: bool) -> Self {
+    pub fn new(
+        bot_token: String,
+        guild_id: Option<String>,
+        allowed_users: Vec<String>,
+        listen_to_bots: bool,
+    ) -> Self {
         Self {
             bot_token,
             guild_id,

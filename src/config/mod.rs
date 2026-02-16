@@ -1,7 +1,7 @@
 pub mod schema;
 
 pub use schema::{
-    AutonomyConfig, AuditConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config,
+    AuditConfig, AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config,
     DelegateAgentConfig, DiscordConfig, DockerRuntimeConfig, GatewayConfig, HeartbeatConfig,
     HttpRequestConfig, IMessageConfig, IdentityConfig, LarkConfig, MatrixConfig, MemoryConfig,
     ModelRouteConfig, ObservabilityConfig, ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig,

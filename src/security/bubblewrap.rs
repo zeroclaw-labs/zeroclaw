@@ -35,14 +35,23 @@ impl BubblewrapSandbox {
 impl Sandbox for BubblewrapSandbox {
     fn wrap_command(&self, cmd: &mut Command) -> std::io::Result<()> {
         let program = cmd.get_program().to_string_lossy().to_string();
-        let args: Vec<String> = cmd.get_args().map(|s| s.to_string_lossy().to_string()).collect();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
 
         let mut bwrap_cmd = Command::new("bwrap");
         bwrap_cmd.args([
-            "--ro-bind", "/usr", "/usr",
-            "--dev", "/dev",
-            "--proc", "/proc",
-            "--bind", "/tmp", "/tmp",
+            "--ro-bind",
+            "/usr",
+            "/usr",
+            "--dev",
+            "/dev",
+            "--proc",
+            "/proc",
+            "--bind",
+            "/tmp",
+            "/tmp",
             "--unshare-all",
             "--die-with-parent",
         ]);

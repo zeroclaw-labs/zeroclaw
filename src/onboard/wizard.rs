@@ -1093,7 +1093,9 @@ fn setup_hardware() -> Result<HardwareConfig> {
     }
 
     // ── Probe: ask for target chip ──
-    if hw_config.transport_mode() == hardware::HardwareTransport::Probe && hw_config.probe_target.is_none() {
+    if hw_config.transport_mode() == hardware::HardwareTransport::Probe
+        && hw_config.probe_target.is_none()
+    {
         let target: String = Input::new()
             .with_prompt("  Target MCU chip (e.g. STM32F411CEUx, nRF52840_xxAA)")
             .default("STM32F411CEUx".into())
@@ -2698,21 +2700,25 @@ fn print_summary(config: &Config) {
         if config.hardware.enabled {
             let mode = config.hardware.transport_mode();
             match mode {
-                hardware::HardwareTransport::Native => style("Native GPIO (direct)").green().to_string(),
+                hardware::HardwareTransport::Native => {
+                    style("Native GPIO (direct)").green().to_string()
+                }
                 hardware::HardwareTransport::Serial => format!(
                     "{}",
                     style(format!(
                         "Serial → {} @ {} baud",
                         config.hardware.serial_port.as_deref().unwrap_or("?"),
                         config.hardware.baud_rate
-                    )).green()
+                    ))
+                    .green()
                 ),
                 hardware::HardwareTransport::Probe => format!(
                     "{}",
                     style(format!(
                         "Probe → {}",
                         config.hardware.probe_target.as_deref().unwrap_or("?")
-                    )).green()
+                    ))
+                    .green()
                 ),
                 hardware::HardwareTransport::None => "disabled (software only)".to_string(),
             }
