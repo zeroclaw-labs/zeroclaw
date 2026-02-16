@@ -30,6 +30,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
     - Purpose: scope/path labels + size/risk labels + fine-grained module labels (`<module>:<component>`)
     - Additional behavior: provider-related keywords in provider/config/onboard/integration changes are promoted to `provider:*` labels (for example `provider:kimi`, `provider:deepseek`)
     - Additional behavior: applies contributor tiers on PRs by merged PR count (`experienced` >=10, `principal` >=20, `distinguished` >=50)
+    - Additional behavior: risk labels are auto-corrected on manual PR label edits (`labeled`/`unlabeled` events); apply `risk: manual` when maintainers intentionally override automated risk selection
     - High-risk heuristic paths: `src/security/**`, `src/runtime/**`, `src/gateway/**`, `src/tools/**`, `.github/workflows/**`
     - Guardrail: maintainers can apply `risk: manual` to freeze automated risk recalculation
 - `.github/workflows/auto-response.yml` (`Auto Response`)

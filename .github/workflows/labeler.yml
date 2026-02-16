@@ -2,7 +2,7 @@ name: PR Labeler
 
 on:
   pull_request_target:
-    types: [opened, reopened, synchronize, edited]
+    types: [opened, reopened, synchronize, edited, labeled, unlabeled]
 
 permissions:
   contents: read
@@ -26,11 +26,19 @@ jobs:
             const pr = context.payload.pull_request;
             const owner = context.repo.owner;
             const repo = context.repo.repo;
+            const action = context.payload.action;
+            const changedLabel = context.payload.label?.name;
 
             const sizeLabels = ["size: XS", "size: S", "size: M", "size: L", "size: XL"];
             const computedRiskLabels = ["risk: low", "risk: medium", "risk: high"];
             const manualRiskOverrideLabel = "risk: manual";
+            const managedRiskLabels = new Set([manualRiskOverrideLabel, ...computedRiskLabels]);
             const legacyTrustedContributorLabel = "trusted contributor";
+
+            if ((action === "labeled" || action === "unlabeled") && !managedRiskLabels.has(changedLabel)) {
+              core.info(`skip non-risk label event: ${changedLabel || "unknown"}`);
+              return;
+            }
 
             const contributorTierRules = [
               { label: "distinguished contributor", minMergedPRs: 50 },
