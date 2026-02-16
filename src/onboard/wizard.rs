@@ -226,9 +226,9 @@ pub fn run_quick_setup(api_key: Option<&str>, provider: Option<&str>) -> Result<
     let home = directories::UserDirs::new()
         .map(|u| u.home_dir().to_path_buf())
         .context("Could not find home directory")?;
-    let afw_dir = home.join(".afw");
-    let workspace_dir = afw_dir.join("workspace");
-    let config_path = afw_dir.join("config.toml");
+    let aria_dir = home.join("aria");
+    let workspace_dir = aria_dir.join("workspace");
+    let config_path = aria_dir.join("config.toml");
 
     fs::create_dir_all(&workspace_dir).context("Failed to create workspace directory")?;
 
@@ -334,7 +334,7 @@ pub fn run_quick_setup(api_key: Option<&str>, provider: Option<&str>) -> Result<
     println!("  {}", style("Next steps:").white().bold());
     if api_key.is_none() {
         println!("    1. Set your API key:  export OPENROUTER_API_KEY=\"sk-...\"");
-        println!("    2. Or edit:           ~/.afw/config.toml");
+        println!("    2. Or edit:           ~/aria/config.toml");
         println!("    3. Chat:              afw agent -m \"Hello!\"");
         println!("    4. Gateway:           afw gateway");
     } else {
@@ -381,7 +381,7 @@ fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
     let home = directories::UserDirs::new()
         .map(|u| u.home_dir().to_path_buf())
         .context("Could not find home directory")?;
-    let default_dir = home.join(".afw");
+    let default_dir = home.join("aria");
 
     print_bullet(&format!(
         "Default location: {}",
@@ -393,7 +393,7 @@ fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
         .default(true)
         .interact()?;
 
-    let afw_dir = if use_default {
+    let aria_dir = if use_default {
         default_dir
     } else {
         let custom: String = Input::new()
@@ -403,8 +403,8 @@ fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
         PathBuf::from(expanded)
     };
 
-    let workspace_dir = afw_dir.join("workspace");
-    let config_path = afw_dir.join("config.toml");
+    let workspace_dir = aria_dir.join("workspace");
+    let config_path = aria_dir.join("config.toml");
 
     fs::create_dir_all(&workspace_dir).context("Failed to create workspace directory")?;
 

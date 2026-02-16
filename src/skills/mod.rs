@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// A skill is a user-defined or community-built capability.
-/// Skills live in `~/.afw/workspace/skills/<name>/SKILL.md`
+/// Skills live in `~/aria/skills/<name>/SKILL.md`
 /// and can include tool definitions, prompts, and automation scripts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Skill {
@@ -62,7 +62,7 @@ fn default_version() -> String {
 
 /// Load all skills from the workspace skills directory
 pub fn load_skills(workspace_dir: &Path) -> Vec<Skill> {
-    let skills_dir = workspace_dir.join("skills");
+    let skills_dir = skills_dir(workspace_dir);
     if !skills_dir.exists() {
         return Vec::new();
     }
@@ -179,6 +179,16 @@ pub fn skills_to_prompt(skills: &[Skill]) -> String {
 
 /// Get the skills directory path
 pub fn skills_dir(workspace_dir: &Path) -> PathBuf {
+    if workspace_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "workspace")
+    {
+        return workspace_dir
+            .parent()
+            .map(|p| p.join("skills"))
+            .unwrap_or_else(|| workspace_dir.join("skills"));
+    }
     workspace_dir.join("skills")
 }
 
@@ -246,10 +256,8 @@ pub fn handle_command(command: super::SkillCommands, workspace_dir: &Path) -> Re
             if skills.is_empty() {
                 println!("No skills installed.");
                 println!();
-                println!("  Create one: mkdir -p ~/.afw/workspace/skills/my-skill");
-                println!(
-                    "              echo '# My Skill' > ~/.afw/workspace/skills/my-skill/SKILL.md"
-                );
+                println!("  Create one: mkdir -p ~/aria/skills/my-skill");
+                println!("              echo '# My Skill' > ~/aria/skills/my-skill/SKILL.md");
                 println!();
                 println!("  Or install: afw skills install <github-url>");
             } else {
@@ -668,9 +676,9 @@ description = "Bare minimum"
 
     #[test]
     fn skills_dir_path() {
-        let base = std::path::Path::new("/home/user/.afw");
-        let dir = skills_dir(base);
-        assert_eq!(dir, PathBuf::from("/home/user/.afw/skills"));
+        let workspace = std::path::Path::new("/home/user/aria/workspace");
+        let dir = skills_dir(workspace);
+        assert_eq!(dir, PathBuf::from("/home/user/aria/skills"));
     }
 
     #[test]

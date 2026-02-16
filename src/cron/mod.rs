@@ -74,7 +74,7 @@ pub fn handle_command(command: super::CronCommands, config: Config) -> Result<()
 }
 
 pub fn sync_from_aria(config: &Config) -> Result<()> {
-    let aria_db = aria::db::AriaDb::open(&config.workspace_dir.join("aria.db"))?;
+    let aria_db = aria::db::AriaDb::open(&config.registry_db_path())?;
     let add_cfg = config.clone();
     let remove_cfg = config.clone();
 

@@ -1590,6 +1590,7 @@ struct ContainerUploadBody {
     config: Option<serde_json::Value>,
     network_id: Option<String>,
     labels: Option<serde_json::Value>,
+    strict: Option<bool>,
 }
 
 async fn containers_upload(
@@ -1613,14 +1614,22 @@ async fn containers_upload(
             )
             .ok();
 
+        let mut effective_config = body.config.unwrap_or(serde_json::json!({}));
+        if body.strict.unwrap_or(false) {
+            if let serde_json::Value::Object(ref mut map) = effective_config {
+                map.insert("strict".to_string(), serde_json::Value::Bool(true));
+            } else {
+                effective_config = serde_json::json!({ "strict": true });
+            }
+        }
+
         let container_id = if let Some(existing_id) = existing {
             conn.execute(
                 "UPDATE aria_containers SET image = ?1, config = ?2, network_id = ?3,
                  labels = ?4, updated_at = ?5 WHERE id = ?6",
                 rusqlite::params![
                     body.image,
-                    serde_json::to_string(&body.config.unwrap_or(serde_json::json!({})))
-                        .unwrap_or_default(),
+                    serde_json::to_string(&effective_config).unwrap_or_default(),
                     body.network_id,
                     serde_json::to_string(&body.labels.unwrap_or(serde_json::json!({})))
                         .unwrap_or_default(),
@@ -1639,8 +1648,7 @@ async fn containers_upload(
                     ctx.tenant_id,
                     body.name,
                     body.image,
-                    serde_json::to_string(&body.config.unwrap_or(serde_json::json!({})))
-                        .unwrap_or_default(),
+                    serde_json::to_string(&effective_config).unwrap_or_default(),
                     body.network_id,
                     serde_json::to_string(&body.labels.unwrap_or(serde_json::json!({})))
                         .unwrap_or_default(),
@@ -1978,9 +1986,16 @@ async fn bulk_upload(
                     serde_json::from_value(item.data.clone());
                 match body {
                     Ok(v) => {
+                        let mut effective_config = v.config.unwrap_or(serde_json::json!({}));
+                        if v.strict.unwrap_or(false) {
+                            if let serde_json::Value::Object(ref mut map) = effective_config {
+                                map.insert("strict".to_string(), serde_json::Value::Bool(true));
+                            } else {
+                                effective_config = serde_json::json!({ "strict": true });
+                            }
+                        }
                         let config_json =
-                            serde_json::to_string(&v.config.unwrap_or(serde_json::json!({})))
-                                .unwrap_or_default();
+                            serde_json::to_string(&effective_config).unwrap_or_default();
                         let labels =
                             serde_json::to_string(&v.labels.unwrap_or(serde_json::json!({})))
                                 .unwrap_or_default();

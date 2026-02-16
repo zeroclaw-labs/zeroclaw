@@ -39,7 +39,7 @@ pub async fn run(
     } else {
         None
     };
-    let registry_db = crate::aria::db::AriaDb::open(&config.workspace_dir.join("aria.db"))?;
+    let registry_db = crate::aria::db::AriaDb::open(&config.registry_db_path())?;
     let tenant = crate::tenant::resolve_tenant_from_token(&registry_db, "");
 
     // ── Resolve provider ─────────────────────────────────────────

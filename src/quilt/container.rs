@@ -235,6 +235,7 @@ pub async fn ensure_sandbox_container(
         cpu_limit_percent: Some(config.cpu_limit_percent),
         volumes: None,
         labels: Some(labels),
+        strict: None,
     };
 
     let result = client.create_container(create_params).await?;

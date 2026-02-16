@@ -152,7 +152,7 @@ fn show_integration_info(config: &Config, name: &str) -> Result<()> {
         }
         "Cron" => {
             println!("  Built-in:");
-            println!("    Schedule tasks in ~/.afw/workspace/cron/");
+            println!("    Schedule tasks in ~/aria/workspace/cron/");
             println!("    Run: afw cron list");
         }
         "Webhooks" => {

@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use directories::UserDirs;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ── Top-level config ──────────────────────────────────────────────
 
@@ -598,11 +598,11 @@ impl Default for Config {
     fn default() -> Self {
         let home =
             UserDirs::new().map_or_else(|| PathBuf::from("."), |u| u.home_dir().to_path_buf());
-        let afw_dir = home.join(".afw");
+        let aria_dir = home.join("aria");
 
         Self {
-            workspace_dir: afw_dir.join("workspace"),
-            config_path: afw_dir.join("config.toml"),
+            workspace_dir: aria_dir.join("workspace"),
+            config_path: aria_dir.join("config.toml"),
             api_key: None,
             default_provider: Some("openrouter".to_string()),
             default_model: Some("anthropic/claude-sonnet-4-20250514".to_string()),
@@ -624,18 +624,129 @@ impl Default for Config {
     }
 }
 
+fn merge_dir_recursive(src: &PathBuf, dst: &PathBuf) -> Result<()> {
+    if !src.exists() {
+        return Ok(());
+    }
+    fs::create_dir_all(dst).with_context(|| format!("Failed to create {}", dst.display()))?;
+
+    let entries = fs::read_dir(src).with_context(|| format!("Failed to read {}", src.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("Failed to read entry in {}", src.display()))?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+
+        if src_path.is_dir() {
+            merge_dir_recursive(&src_path, &dst_path)?;
+            continue;
+        }
+
+        if !dst_path.exists() {
+            fs::copy(&src_path, &dst_path).with_context(|| {
+                format!(
+                    "Failed to copy {} -> {}",
+                    src_path.display(),
+                    dst_path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_aria_structure(aria_dir: &PathBuf) -> Result<()> {
+    for sub in [
+        "workspace",
+        "skills",
+        "hooks",
+        "plugins",
+        "tools",
+        "agents",
+        "teams",
+        "pipelines",
+        "feed",
+        "cron",
+        "feeds",
+        "crons",
+    ] {
+        let dir = aria_dir.join(sub);
+        fs::create_dir_all(&dir).with_context(|| format!("Failed to create {}", dir.display()))?;
+    }
+    Ok(())
+}
+
+pub fn aria_root_dir_for_workspace(workspace_dir: &Path) -> PathBuf {
+    if workspace_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "workspace")
+    {
+        return workspace_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| workspace_dir.to_path_buf());
+    }
+    workspace_dir.to_path_buf()
+}
+
+pub fn registry_db_path_for_workspace(workspace_dir: &Path) -> PathBuf {
+    aria_root_dir_for_workspace(workspace_dir).join("aria.db")
+}
+
 impl Config {
+    pub fn aria_root_dir(&self) -> PathBuf {
+        aria_root_dir_for_workspace(&self.workspace_dir)
+    }
+
+    pub fn registry_db_path(&self) -> PathBuf {
+        self.aria_root_dir().join("aria.db")
+    }
+
     pub fn load_or_init() -> Result<Self> {
         let home = UserDirs::new()
             .map(|u| u.home_dir().to_path_buf())
             .context("Could not find home directory")?;
-        let afw_dir = home.join(".afw");
-        let config_path = afw_dir.join("config.toml");
+        let aria_dir = home.join("aria");
+        let config_path = aria_dir.join("config.toml");
+        let legacy_afw_dir = home.join(".afw");
+        let legacy_desktop_aria_dir = home.join("Desktop").join("ARIA");
 
-        if !afw_dir.exists() {
-            fs::create_dir_all(&afw_dir).context("Failed to create .afw directory")?;
-            fs::create_dir_all(afw_dir.join("workspace"))
-                .context("Failed to create workspace directory")?;
+        if !aria_dir.exists() {
+            fs::create_dir_all(&aria_dir).context("Failed to create ~/aria directory")?;
+        }
+        ensure_aria_structure(&aria_dir)?;
+
+        // Best-effort migration from legacy locations into ~/aria.
+        if legacy_afw_dir.exists() {
+            merge_dir_recursive(&legacy_afw_dir, &aria_dir)
+                .context("Failed to migrate legacy ~/.afw contents into ~/aria")?;
+        }
+        if legacy_desktop_aria_dir.exists() {
+            merge_dir_recursive(&legacy_desktop_aria_dir, &aria_dir)
+                .context("Failed to migrate legacy ~/Desktop/ARIA contents into ~/aria")?;
+        }
+        let db_candidates = [
+            legacy_afw_dir.join("aria.db"),
+            legacy_afw_dir.join("workspace").join("aria.db"),
+            legacy_desktop_aria_dir.join("aria.db"),
+            legacy_desktop_aria_dir.join("workspace").join("aria.db"),
+            aria_dir.join("workspace").join("aria.db"),
+        ];
+        let root_db = aria_dir.join("aria.db");
+        if !root_db.exists() {
+            for candidate in db_candidates {
+                if !candidate.exists() {
+                    continue;
+                }
+                fs::copy(&candidate, &root_db).with_context(|| {
+                    format!(
+                        "Failed to migrate registry db {} -> {}",
+                        candidate.display(),
+                        root_db.display()
+                    )
+                })?;
+                break;
+            }
         }
 
         if config_path.exists() {
@@ -643,6 +754,13 @@ impl Config {
                 fs::read_to_string(&config_path).context("Failed to read config file")?;
             let config: Config =
                 toml::from_str(&contents).context("Failed to parse config file")?;
+            ensure_aria_structure(
+                &config
+                    .workspace_dir
+                    .parent()
+                    .unwrap_or(&aria_dir)
+                    .to_path_buf(),
+            )?;
             Ok(config)
         } else {
             let config = Config::default();

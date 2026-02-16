@@ -231,6 +231,8 @@ pub struct ContainerConfig {
     pub restart_policy: RestartPolicy,
     pub labels: HashMap<String, String>,
     pub network: Option<String>,
+    #[serde(default)]
+    pub strict: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -137,6 +137,8 @@ pub struct QuiltCreateParams {
     pub volumes: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub labels: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -599,6 +601,7 @@ mod tests {
             cpu_limit_percent: Some(100),
             volumes: Some(vec!["/host/data:/data:ro".into()]),
             labels: Some(HashMap::from([("aria.sandbox".into(), "true".into())])),
+            strict: Some(true),
         };
 
         let json = serde_json::to_value(&params).unwrap();
@@ -609,6 +612,7 @@ mod tests {
         assert_eq!(json["volumes"][0], "/host/data:/data:ro");
         assert_eq!(json["memory_limit_mb"], 4096);
         assert_eq!(json["labels"]["aria.sandbox"], "true");
+        assert_eq!(json["strict"], true);
     }
 
     #[test]
@@ -622,6 +626,7 @@ mod tests {
             cpu_limit_percent: None,
             volumes: None,
             labels: None,
+            strict: None,
         };
 
         let json = serde_json::to_value(&params).unwrap();
@@ -632,6 +637,7 @@ mod tests {
         assert!(json.get("cpu_limit_percent").is_none());
         assert!(json.get("volumes").is_none());
         assert!(json.get("labels").is_none());
+        assert!(json.get("strict").is_none());
     }
 
     #[test]

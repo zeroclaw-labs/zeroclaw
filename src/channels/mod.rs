@@ -125,7 +125,7 @@ pub fn handle_command(command: super::ChannelCommands, config: &Config) -> Resul
             );
         }
         super::ChannelCommands::Remove { name } => {
-            anyhow::bail!("Remove channel '{name}' — edit ~/.afw/config.toml directly");
+            anyhow::bail!("Remove channel '{name}' — edit ~/aria/config.toml directly");
         }
     }
 }
@@ -275,7 +275,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     )?);
 
     let workspace = config.workspace_dir.clone();
-    let registry_db = crate::aria::db::AriaDb::open(&workspace.join("aria.db"))?;
+    let registry_db = crate::aria::db::AriaDb::open(&config.registry_db_path())?;
     let security = Arc::new(crate::security::SecurityPolicy::from_config(
         &config.autonomy,
         &workspace,

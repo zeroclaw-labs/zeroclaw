@@ -154,7 +154,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     crate::health::mark_component_ok("gateway");
 
     // ── Aria Registry API + Dashboard Schema ───────────────────
-    let aria_db_path = config.workspace_dir.join("aria.db");
+    let aria_db_path = config.registry_db_path();
     let aria_registries =
         crate::aria::initialize_aria_registries(&aria_db_path).unwrap_or_else(|e| {
             tracing::warn!("Failed to initialize Aria registries: {e}");
@@ -736,6 +736,74 @@ fn ensure_chat_row(state: &AppState, tenant: &str, chat_id: &str, seed: &str, ts
     });
 }
 
+fn classify_session_client(headers: &HeaderMap) -> (String, String, String) {
+    let hinted = headers
+        .get("x-aria-client")
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| headers.get("x-client-source").and_then(|v| v.to_str().ok()))
+        .or_else(|| headers.get("user-agent").and_then(|v| v.to_str().ok()))
+        .unwrap_or_default()
+        .to_lowercase();
+
+    if hinted.contains("cli") || hinted.contains("tui") {
+        return ("cli".to_string(), "cli".to_string(), "CLI/TUI".to_string());
+    }
+    if hinted.contains("mobile") || hinted.contains("android") || hinted.contains("ios") {
+        return (
+            "mobile".to_string(),
+            "mobile".to_string(),
+            "Mobile App".to_string(),
+        );
+    }
+    if hinted.contains("web") || hinted.contains("mozilla") || hinted.contains("chrome") {
+        return ("web".to_string(), "web".to_string(), "Web App".to_string());
+    }
+    (
+        "macos-app".to_string(),
+        "desktop".to_string(),
+        "macOS App".to_string(),
+    )
+}
+
+fn ensure_session_row(
+    state: &AppState,
+    tenant: &str,
+    session_id: &str,
+    ts: i64,
+    source: &str,
+    platform: &str,
+    device_name: &str,
+) {
+    let _ = state.registry_db.with_conn(|conn| {
+        let updated = conn.execute(
+            "UPDATE sessions
+             SET status='active', last_activity=?1, source=?2, platform=?3, device_name=?4
+             WHERE tenant_id=?5 AND id=?6",
+            rusqlite::params![ts, source, platform, device_name, tenant, session_id],
+        )?;
+        if updated == 0 {
+            conn.execute(
+                "INSERT INTO sessions (id, tenant_id, name, status, last_activity, run_count, created_at, user_id, source, platform, device_name, location)
+                 VALUES (?1, ?2, ?3, 'active', ?4, 0, ?4, NULL, ?5, ?6, ?7, NULL)",
+                rusqlite::params![session_id, tenant, device_name, ts, source, platform, device_name],
+            )?;
+        }
+        Ok(())
+    });
+}
+
+fn increment_session_run_count(state: &AppState, tenant: &str, session_id: &str, ts: i64) {
+    let _ = state.registry_db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE sessions
+             SET run_count=run_count+1, last_activity=?1
+             WHERE tenant_id=?2 AND id=?3",
+            rusqlite::params![ts, tenant, session_id],
+        )?;
+        Ok(())
+    });
+}
+
 fn insert_chat_message(
     state: &AppState,
     tenant: &str,
@@ -813,6 +881,7 @@ async fn api_create_chat(
     let now = now_ms();
     let title = body.title.unwrap_or_else(|| "New Chat".to_string());
     let session_id = body.session_id.unwrap_or_else(|| chat_id.clone());
+    let (source, platform, device_name) = classify_session_client(&headers);
     let res = state.registry_db.with_conn(|conn| {
         conn.execute(
             "INSERT INTO chats (id, tenant_id, title, preview, session_id, message_count, created_at, updated_at)
@@ -824,6 +893,15 @@ async fn api_create_chat(
     if let Err(e) = res {
         return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
+    ensure_session_row(
+        &state,
+        &tenant,
+        &session_id,
+        now,
+        &source,
+        &platform,
+        &device_name,
+    );
     api_ok(serde_json::json!({
         "id": session_id,
         "title": title,
@@ -858,8 +936,18 @@ async fn api_send_message(
     let mode = parse_chat_mode(body.mode.as_deref());
     let run_id = format!("run-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let now = now_ms();
+    let (source, platform, device_name) = classify_session_client(&headers);
 
     ensure_chat_row(&state, &tenant, &session_id, &content, now);
+    ensure_session_row(
+        &state,
+        &tenant,
+        &session_id,
+        now,
+        &source,
+        &platform,
+        &device_name,
+    );
     let _ = insert_chat_message(&state, &tenant, &session_id, "user", &content, now);
 
     let mode_hint = mode_prompt(mode);
@@ -925,7 +1013,9 @@ async fn api_send_message(
         &assistant_text,
         now_ms(),
     );
-    update_chat_preview(&state, &tenant, &session_id, &assistant_text, now_ms());
+    let finished = now_ms();
+    update_chat_preview(&state, &tenant, &session_id, &assistant_text, finished);
+    increment_session_run_count(&state, &tenant, &session_id, finished);
 
     api_ok(serde_json::json!({
         "id": assistant_id,
@@ -1224,7 +1314,7 @@ async fn api_list_sessions(State(state): State<AppState>, headers: HeaderMap) ->
     };
     let res = state.registry_db.with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT id, name, status, last_activity, run_count, created_at, user_id
+            "SELECT id, name, status, last_activity, run_count, created_at, user_id, source, platform, device_name, location
              FROM sessions WHERE tenant_id=?1 ORDER BY last_activity DESC",
         )?;
         let rows = stmt.query_map(rusqlite::params![tenant], |row| {
@@ -1236,6 +1326,10 @@ async fn api_list_sessions(State(state): State<AppState>, headers: HeaderMap) ->
                 "runCount": row.get::<_, i64>(4)?,
                 "createdAt": iso_from_millis(row.get::<_, i64>(5)?),
                 "userId": row.get::<_, Option<String>>(6)?,
+                "source": row.get::<_, Option<String>>(7)?,
+                "platform": row.get::<_, Option<String>>(8)?,
+                "deviceName": row.get::<_, Option<String>>(9)?,
+                "location": row.get::<_, Option<String>>(10)?,
             }))
         })?;
         Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
@@ -2040,7 +2134,10 @@ async fn api_list_skills(State(state): State<AppState>, headers: HeaderMap) -> i
         Ok(t) => t,
         Err(e) => return e,
     };
+    let file_skills = crate::skills::load_skills(&state.workspace_dir);
     let res = state.registry_db.with_conn(|conn| {
+        let mut db_by_id: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::new();
         let mut stmt = conn.prepare(
             "SELECT id,name,description,enabled,call_count,version,category,permissions_json
              FROM skills WHERE tenant_id=?1 ORDER BY name ASC",
@@ -2060,7 +2157,57 @@ async fn api_list_skills(State(state): State<AppState>, headers: HeaderMap) -> i
                     .unwrap_or(serde_json::json!([])),
             }))
         })?;
-        Ok(rows.filter_map(std::result::Result::ok).collect::<Vec<_>>())
+        for row in rows.filter_map(std::result::Result::ok) {
+            if let Some(id) = row.get("id").and_then(serde_json::Value::as_str) {
+                db_by_id.insert(id.to_string(), row);
+            }
+        }
+
+        let mut out = Vec::new();
+        for skill in &file_skills {
+            let db_row = db_by_id.get(&skill.name);
+            out.push(serde_json::json!({
+                "id": skill.name,
+                "name": skill.name,
+                "description": if skill.description.is_empty() {
+                    db_row.and_then(|v| v.get("description")).and_then(serde_json::Value::as_str).unwrap_or_default().to_string()
+                } else {
+                    skill.description.clone()
+                },
+                "enabled": db_row
+                    .and_then(|v| v.get("enabled"))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true),
+                "callCount": db_row
+                    .and_then(|v| v.get("callCount"))
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0),
+                "version": db_row
+                    .and_then(|v| v.get("version"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| skill.version.clone()),
+                "category": db_row
+                    .and_then(|v| v.get("category"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("system"),
+                "permissions": db_row
+                    .and_then(|v| v.get("permissions"))
+                    .cloned()
+                    .unwrap_or(serde_json::json!([])),
+            }));
+        }
+
+        // Keep DB-only rows visible for compatibility.
+        for row in db_by_id.values() {
+            let id = row.get("id").and_then(serde_json::Value::as_str).unwrap_or_default();
+            if file_skills.iter().any(|s| s.name == id) {
+                continue;
+            }
+            out.push(row.clone());
+        }
+
+        Ok(out)
     });
     match res {
         Ok(v) => api_ok(v),
@@ -2379,9 +2526,18 @@ async fn api_list_containers(
         Err(e) => return e,
     };
     let res = state.registry_db.with_conn(|conn| {
-        let mut stmt = conn.prepare("SELECT id,name,image,state,created_at FROM aria_containers WHERE tenant_id=?1 ORDER BY created_at DESC")?;
+        let mut stmt = conn.prepare("SELECT id,name,image,config,state,created_at FROM aria_containers WHERE tenant_id=?1 ORDER BY created_at DESC")?;
         let rows = stmt.query_map(rusqlite::params![tenant], |row| {
-            let status = match row.get::<_, String>(3)?.as_str() {
+            let config_raw = row
+                .get::<_, Option<String>>(3)?
+                .unwrap_or_else(|| "{}".to_string());
+            let config_val: serde_json::Value =
+                serde_json::from_str(&config_raw).unwrap_or(serde_json::json!({}));
+            let strict = config_val
+                .get("strict")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let status = match row.get::<_, String>(4)?.as_str() {
                 "running" => "running",
                 "pending" => "starting",
                 "stopped" => "stopped",
@@ -2395,7 +2551,8 @@ async fn api_list_containers(
                 "cpuUsage": 0,
                 "memoryUsage": 0,
                 "ports": [],
-                "createdAt": row.get::<_, String>(4)?,
+                "strict": strict,
+                "createdAt": row.get::<_, String>(5)?,
                 "uptime": "0m",
             }))
         })?;
@@ -3585,6 +3742,15 @@ async fn handle_chat_socket(mut socket: ws::WebSocket, state: AppState, tenant: 
         let mode = parse_chat_mode(req.mode.as_deref());
 
         ensure_chat_row(&state, &tenant, &chat_id, &content, started);
+        ensure_session_row(
+            &state,
+            &tenant,
+            &chat_id,
+            started,
+            "macos-app",
+            "desktop",
+            "macOS App",
+        );
         let _ = insert_chat_message(&state, &tenant, &chat_id, "user", &content, started);
 
         let _ = socket
@@ -3658,6 +3824,7 @@ async fn handle_chat_socket(mut socket: ws::WebSocket, state: AppState, tenant: 
                     now,
                 );
                 update_chat_preview(&state, &tenant, &chat_id, &assistant_text, now);
+                increment_session_run_count(&state, &tenant, &chat_id, now);
 
                 let _ = socket
                     .send(ws::Message::Text(

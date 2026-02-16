@@ -312,7 +312,7 @@ fn parse_feed_execution_command(command: &str) -> Option<String> {
 }
 
 async fn run_internal_feed_execution(config: &Config, feed_id: &str) -> JobRunOutcome {
-    let db_path = config.workspace_dir.join("aria.db");
+    let db_path = config.registry_db_path();
     let db = match aria::db::AriaDb::open(&db_path) {
         Ok(db) => db,
         Err(e) => {
@@ -408,7 +408,7 @@ fn append_heartbeat_task(workspace_dir: &std::path::Path, task: &str) -> Result<
 }
 
 fn consume_delete_after_run(config: &Config, cron_func_id: &str) -> Result<()> {
-    let db = aria::db::AriaDb::open(&config.workspace_dir.join("aria.db"))?;
+    let db = aria::db::AriaDb::open(&config.registry_db_path())?;
     let now = Utc::now().to_rfc3339();
     db.with_conn(|conn| {
         conn.execute(
@@ -422,7 +422,7 @@ fn consume_delete_after_run(config: &Config, cron_func_id: &str) -> Result<()> {
 }
 
 async fn run_aria_cron_function(config: &Config, cron_func_id: &str) -> JobRunOutcome {
-    let db_path = config.workspace_dir.join("aria.db");
+    let db_path = config.registry_db_path();
     let db = match aria::db::AriaDb::open(&db_path) {
         Ok(db) => db,
         Err(e) => {
@@ -566,7 +566,7 @@ async fn execute_agent_turn(
         &config.autonomy,
         &config.workspace_dir,
     ));
-    let registry_db = aria::db::AriaDb::open(&config.workspace_dir.join("aria.db"))?;
+    let registry_db = aria::db::AriaDb::open(&config.registry_db_path())?;
 
     let result = agent::orchestrator::run_live_turn(
         agent::orchestrator::LiveTurnConfig {
@@ -627,7 +627,7 @@ mod tests {
     }
 
     fn insert_active_feed(config: &Config, feed_id: &str) {
-        let db = AriaDb::open(&config.workspace_dir.join("aria.db")).unwrap();
+        let db = AriaDb::open(&config.registry_db_path()).unwrap();
         let now = Utc::now().to_rfc3339();
         db.with_conn(|conn| {
             conn.execute(

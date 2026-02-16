@@ -1,4 +1,5 @@
 use crate::aria::db::AriaDb;
+use crate::config::schema::registry_db_path_for_workspace;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use directories::UserDirs;
@@ -77,7 +78,7 @@ fn write_json_atomic(path: &Path, payload: &str) -> Result<()> {
 }
 
 pub fn export_jobs_file(workspace_dir: &Path) -> Result<usize> {
-    let db = AriaDb::open(&workspace_dir.join("aria.db"))?;
+    let db = AriaDb::open(&registry_db_path_for_workspace(workspace_dir))?;
     let runtime_states = read_runtime_states(workspace_dir)?;
 
     let rows = db.with_conn(|conn| {
@@ -227,7 +228,7 @@ pub fn import_jobs_file(workspace_dir: &Path) -> Result<usize> {
         .cloned()
         .unwrap_or_default();
 
-    let db = AriaDb::open(&workspace_dir.join("aria.db"))?;
+    let db = AriaDb::open(&registry_db_path_for_workspace(workspace_dir))?;
     let now = Utc::now().to_rfc3339();
     let mut imported = 0usize;
 

@@ -5,7 +5,7 @@ use rusqlite::params;
 use serde_json::Value;
 use std::path::Path;
 
-const DASHBOARD_SCHEMA_VERSION: i64 = 11;
+const DASHBOARD_SCHEMA_VERSION: i64 = 12;
 
 pub fn ensure_schema(db: &AriaDb) -> Result<()> {
     db.with_conn(|conn| {
@@ -75,7 +75,11 @@ pub fn ensure_schema(db: &AriaDb) -> Result<()> {
               last_activity INTEGER,
               run_count INTEGER DEFAULT 0,
               created_at INTEGER NOT NULL,
-              user_id TEXT
+              user_id TEXT,
+              source TEXT,
+              platform TEXT,
+              device_name TEXT,
+              location TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_sessions_tenant ON sessions(tenant_id);
             CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(tenant_id, status);
@@ -305,6 +309,12 @@ pub fn ensure_schema(db: &AriaDb) -> Result<()> {
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('dashboard_schema_version', ?1)",
             params![DASHBOARD_SCHEMA_VERSION.to_string()],
         )?;
+
+        // Backward-compatible column adds for existing databases.
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN source TEXT", []);
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN platform TEXT", []);
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN device_name TEXT", []);
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN location TEXT", []);
 
         Ok(())
     })

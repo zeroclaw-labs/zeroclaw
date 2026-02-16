@@ -22,7 +22,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
 
     crate::health::mark_component_ok("daemon");
 
-    if let Ok(event_db) = crate::aria::db::AriaDb::open(&config.workspace_dir.join("aria.db")) {
+    if let Ok(event_db) = crate::aria::db::AriaDb::open(&config.registry_db_path()) {
         let tenant_fallback = "dev-tenant".to_string();
         crate::status_events::set_persist_hook(Box::new(move |event_type, data, timestamp| {
             if let Err(e) = crate::dashboard::persist_status_event(
@@ -295,7 +295,7 @@ async fn execute_heartbeat_task(config: &Config, prompt: &str) -> Result<String>
         &config.autonomy,
         &config.workspace_dir,
     ));
-    let registry_db = crate::aria::db::AriaDb::open(&config.workspace_dir.join("aria.db"))?;
+    let registry_db = crate::aria::db::AriaDb::open(&config.registry_db_path())?;
     let tenant = crate::tenant::resolve_tenant_from_token(&registry_db, "");
 
     let result = crate::agent::orchestrator::run_live_turn(
@@ -329,7 +329,7 @@ async fn execute_heartbeat_task(config: &Config, prompt: &str) -> Result<String>
 const HEARTBEAT_INBOX_DEDUP_WINDOW_MINUTES: i64 = 120;
 
 fn persist_heartbeat_response_to_inbox(config: &Config, task: &str, output: &str) -> Result<bool> {
-    let db = crate::aria::db::AriaDb::open(&config.workspace_dir.join("aria.db"))?;
+    let db = crate::aria::db::AriaDb::open(&config.registry_db_path())?;
     crate::dashboard::ensure_schema(&db)?;
     let tenant = crate::tenant::resolve_tenant_from_token(&db, "");
     let ts = chrono::Utc::now().timestamp_millis();
@@ -426,7 +426,7 @@ fn persist_heartbeat_response_to_inbox(config: &Config, task: &str, output: &str
 }
 
 fn wire_cron_bridge_hooks(config: &Config) -> Result<()> {
-    let aria_db = crate::aria::db::AriaDb::open(&config.workspace_dir.join("aria.db"))?;
+    let aria_db = crate::aria::db::AriaDb::open(&config.registry_db_path())?;
     let add_cfg = config.clone();
     let remove_cfg = config.clone();
     let export_cfg = config.clone();
@@ -471,7 +471,7 @@ fn wire_cron_bridge_hooks(config: &Config) -> Result<()> {
 }
 
 async fn run_feed_scheduler_worker(config: Config) -> Result<()> {
-    let db = crate::aria::db::AriaDb::open(&config.workspace_dir.join("aria.db"))?;
+    let db = crate::aria::db::AriaDb::open(&config.registry_db_path())?;
     let scheduler = crate::feed::scheduler::FeedScheduler::new(
         db.clone(),
         crate::feed::executor::FeedExecutor::new(db),
@@ -602,7 +602,7 @@ mod tests {
             persist_heartbeat_response_to_inbox(&config, "Check weather", "First output").unwrap();
         assert!(created);
 
-        let db = crate::aria::db::AriaDb::open(&config.workspace_dir.join("aria.db")).unwrap();
+        let db = crate::aria::db::AriaDb::open(&config.registry_db_path()).unwrap();
         let (count_after_first, first_body): (i64, String) = db
             .with_conn(|conn| {
                 let count: i64 =
