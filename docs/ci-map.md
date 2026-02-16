@@ -76,6 +76,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 
 - Keep merge-blocking checks deterministic and reproducible (`--locked` where applicable).
 - Prefer explicit workflow permissions (least privilege).
+- Keep Actions source policy restricted to approved allowlist patterns (see `docs/actions-source-policy.md`).
 - Use path filters for expensive workflows when practical.
 - Keep docs quality checks low-noise (`markdownlint` + offline link checks).
 - Keep dependency update volume controlled (grouping + PR limits).
