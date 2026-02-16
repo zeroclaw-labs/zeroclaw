@@ -16,9 +16,17 @@ use uuid::Uuid;
 /// Maximum agentic tool-use iterations per user message to prevent runaway loops.
 const MAX_TOOL_ITERATIONS: usize = 10;
 
-/// Maximum number of non-system messages to keep in history.
-/// When exceeded, the oldest messages are dropped (system prompt is always preserved).
+/// Trigger auto-compaction when non-system message count exceeds this threshold.
 const MAX_HISTORY_MESSAGES: usize = 50;
+
+/// Keep this many most-recent non-system messages after compaction.
+const COMPACTION_KEEP_RECENT_MESSAGES: usize = 20;
+
+/// Safety cap for compaction source transcript passed to the summarizer.
+const COMPACTION_MAX_SOURCE_CHARS: usize = 12_000;
+
+/// Max characters retained in stored compaction summary.
+const COMPACTION_MAX_SUMMARY_CHARS: usize = 2_000;
 
 fn autosave_memory_key(prefix: &str) -> String {
     format!("{prefix}_{}", Uuid::new_v4())
@@ -42,6 +50,78 @@ fn trim_history(history: &mut Vec<ChatMessage>) {
     let start = if has_system { 1 } else { 0 };
     let to_remove = non_system_count - MAX_HISTORY_MESSAGES;
     history.drain(start..start + to_remove);
+}
+
+fn build_compaction_transcript(messages: &[ChatMessage]) -> String {
+    let mut transcript = String::new();
+    for msg in messages {
+        let role = msg.role.to_uppercase();
+        let _ = writeln!(transcript, "{role}: {}", msg.content.trim());
+    }
+
+    if transcript.chars().count() > COMPACTION_MAX_SOURCE_CHARS {
+        truncate_with_ellipsis(&transcript, COMPACTION_MAX_SOURCE_CHARS)
+    } else {
+        transcript
+    }
+}
+
+fn apply_compaction_summary(
+    history: &mut Vec<ChatMessage>,
+    start: usize,
+    compact_end: usize,
+    summary: &str,
+) {
+    let summary_msg = ChatMessage::assistant(format!("[Compaction summary]\n{}", summary.trim()));
+    history.splice(start..compact_end, std::iter::once(summary_msg));
+}
+
+async fn auto_compact_history(
+    history: &mut Vec<ChatMessage>,
+    provider: &dyn Provider,
+    model: &str,
+) -> Result<bool> {
+    let has_system = history.first().map_or(false, |m| m.role == "system");
+    let non_system_count = if has_system {
+        history.len().saturating_sub(1)
+    } else {
+        history.len()
+    };
+
+    if non_system_count <= MAX_HISTORY_MESSAGES {
+        return Ok(false);
+    }
+
+    let start = if has_system { 1 } else { 0 };
+    let keep_recent = COMPACTION_KEEP_RECENT_MESSAGES.min(non_system_count);
+    let compact_count = non_system_count.saturating_sub(keep_recent);
+    if compact_count == 0 {
+        return Ok(false);
+    }
+
+    let compact_end = start + compact_count;
+    let to_compact: Vec<ChatMessage> = history[start..compact_end].to_vec();
+    let transcript = build_compaction_transcript(&to_compact);
+
+    let summarizer_system = "You are a conversation compaction engine. Summarize older chat history into concise context for future turns. Preserve: user preferences, commitments, decisions, unresolved tasks, key facts. Omit: filler, repeated chit-chat, verbose tool logs. Output plain text bullet points only.";
+
+    let summarizer_user = format!(
+        "Summarize the following conversation history for context preservation. Keep it short (max 12 bullet points).\n\n{}",
+        transcript
+    );
+
+    let summary_raw = provider
+        .chat_with_system(Some(summarizer_system), &summarizer_user, model, 0.2)
+        .await
+        .unwrap_or_else(|_| {
+            // Fallback to deterministic local truncation when summarization fails.
+            truncate_with_ellipsis(&transcript, COMPACTION_MAX_SUMMARY_CHARS)
+        });
+
+    let summary = truncate_with_ellipsis(&summary_raw, COMPACTION_MAX_SUMMARY_CHARS);
+    apply_compaction_summary(history, start, compact_end, &summary);
+
+    Ok(true)
 }
 
 /// Build context preamble by searching memory for relevant entries
@@ -587,7 +667,16 @@ pub async fn run(
             };
             println!("\n{response}\n");
 
-            // Prevent unbounded history growth in long interactive sessions
+            // Auto-compaction before hard trimming to preserve long-context signal.
+            if let Ok(compacted) =
+                auto_compact_history(&mut history, provider.as_ref(), model_name).await
+            {
+                if compacted {
+                    println!("🧹 Auto-compaction complete");
+                }
+            }
+
+            // Hard cap as a safety net.
             trim_history(&mut history);
 
             if config.memory.auto_save {
@@ -816,6 +905,35 @@ I will now call the tool with this payload:
         ];
         trim_history(&mut history);
         assert_eq!(history.len(), 3);
+    }
+
+    #[test]
+    fn build_compaction_transcript_formats_roles() {
+        let messages = vec![
+            ChatMessage::user("I like dark mode"),
+            ChatMessage::assistant("Got it"),
+        ];
+        let transcript = build_compaction_transcript(&messages);
+        assert!(transcript.contains("USER: I like dark mode"));
+        assert!(transcript.contains("ASSISTANT: Got it"));
+    }
+
+    #[test]
+    fn apply_compaction_summary_replaces_old_segment() {
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("old 1"),
+            ChatMessage::assistant("old 2"),
+            ChatMessage::user("recent 1"),
+            ChatMessage::assistant("recent 2"),
+        ];
+
+        apply_compaction_summary(&mut history, 1, 3, "- user prefers concise replies");
+
+        assert_eq!(history.len(), 4);
+        assert!(history[1].content.contains("Compaction summary"));
+        assert!(history[2].content.contains("recent 1"));
+        assert!(history[3].content.contains("recent 2"));
     }
 
     #[test]
