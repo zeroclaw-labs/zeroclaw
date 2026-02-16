@@ -1,9 +1,9 @@
 //! Team collaboration mode implementations.
 //!
 //! Each mode defines a different strategy for how a team of agents collaborates
-//! to accomplish a task. Agent execution uses a deterministic local processor
-//! when no LLM provider is injected, or delegates to the agentic executor
-//! when a provider is available via the team execution context.
+//! to accomplish a task. In production builds, each member execution is a real
+//! live-turn agent run. Unit tests use deterministic local execution for
+//! isolation and speed.
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -12,13 +12,7 @@ use std::collections::HashMap;
 use super::types::{TeamExecutionContext, TeamMemberRuntime, TeamMessage};
 use crate::aria::types::{AgentResult, TeamResult};
 
-/// Execute a single agent on a given input.
-///
-/// Uses deterministic local processing based on the agent's role and
-/// capabilities. When an LLM provider is injected into the team context,
-/// the agentic executor (`crate::agent::execute_agent`) can be used instead
-/// for full multi-turn tool-use execution.
-fn run_agent(member: &TeamMemberRuntime, input: &str) -> AgentResult {
+fn deterministic_agent_result(member: &TeamMemberRuntime, input: &str) -> AgentResult {
     let role_desc = member.role.as_deref().unwrap_or("general");
     let content = format!(
         "[Agent '{}' (role: {}, capabilities: [{}])]: Processing input: \"{}\"",
@@ -43,6 +37,144 @@ fn run_agent(member: &TeamMemberRuntime, input: &str) -> AgentResult {
         tokens_used: None,
         duration_ms: Some(1),
         metadata: None,
+    }
+}
+
+/// Execute a single team member.
+///
+/// In tests this uses deterministic output. In production this executes a real
+/// live turn using the runtime provider/tool stack.
+async fn run_agent(
+    ctx: &TeamExecutionContext,
+    member: &TeamMemberRuntime,
+    input: &str,
+) -> AgentResult {
+    #[cfg(test)]
+    {
+        let _ = ctx;
+        return deterministic_agent_result(member, input);
+    }
+
+    #[cfg(not(test))]
+    {
+        let start = std::time::Instant::now();
+        let config = match crate::config::Config::load_or_init() {
+            Ok(c) => c,
+            Err(e) => {
+                return AgentResult {
+                    success: false,
+                    result: None,
+                    error: Some(format!("failed to load config for team run: {e}")),
+                    model: None,
+                    tokens_used: None,
+                    duration_ms: Some(start.elapsed().as_millis() as u64),
+                    metadata: None,
+                };
+            }
+        };
+
+        let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
+        let provider = match crate::providers::create_resilient_provider(
+            provider_name,
+            config.api_key.as_deref(),
+            &config.reliability,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                return AgentResult {
+                    success: false,
+                    result: None,
+                    error: Some(format!("failed to initialize provider for team run: {e}")),
+                    model: None,
+                    tokens_used: None,
+                    duration_ms: Some(start.elapsed().as_millis() as u64),
+                    metadata: None,
+                };
+            }
+        };
+        let registry_db = match crate::aria::db::AriaDb::open(&config.registry_db_path()) {
+            Ok(db) => db,
+            Err(e) => {
+                return AgentResult {
+                    success: false,
+                    result: None,
+                    error: Some(format!("failed to open registry DB for team run: {e}")),
+                    model: None,
+                    tokens_used: None,
+                    duration_ms: Some(start.elapsed().as_millis() as u64),
+                    metadata: None,
+                };
+            }
+        };
+
+        let member_model = registry_db
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT model
+                     FROM aria_agents
+                     WHERE tenant_id=?1 AND status!='deleted' AND (id=?2 OR name=?3)
+                     ORDER BY updated_at DESC LIMIT 1",
+                )?;
+                let found = stmt.query_row(
+                    rusqlite::params![ctx.tenant_id, member.agent_id, member.agent_name],
+                    |row| row.get::<_, Option<String>>(0),
+                );
+                match found {
+                    Ok(v) => Ok(v),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                    Err(e) => Err(e.into()),
+                }
+            })
+            .unwrap_or(None);
+
+        let model = member_model
+            .as_deref()
+            .filter(|v| !v.trim().is_empty())
+            .or(config.default_model.as_deref())
+            .unwrap_or("anthropic/claude-sonnet-4-20250514");
+        let role_desc = member.role.as_deref().unwrap_or("general");
+        let mode_hint = format!(
+            "TEAM MEMBER MODE: You are '{}' acting as role '{}'. Capabilities: [{}].",
+            member.agent_name,
+            role_desc,
+            member.capabilities.join(", ")
+        );
+        let system_prompt = format!(
+            "{mode_hint}\nProvide a concise, high-signal response for the assigned team objective."
+        );
+
+        match provider
+            .chat_with_system(
+                Some(&system_prompt),
+                input,
+                model,
+                config.default_temperature,
+            )
+            .await
+        {
+            Ok(output) => AgentResult {
+                success: true,
+                result: Some(serde_json::json!({
+                    "agent_id": member.agent_id,
+                    "agent_name": member.agent_name,
+                    "output": output,
+                })),
+                error: None,
+                model: Some(model.to_string()),
+                tokens_used: None,
+                duration_ms: Some(start.elapsed().as_millis() as u64),
+                metadata: None,
+            },
+            Err(e) => AgentResult {
+                success: false,
+                result: None,
+                error: Some(format!("team member execution failed: {e}")),
+                model: Some(model.to_string()),
+                tokens_used: None,
+                duration_ms: Some(start.elapsed().as_millis() as u64),
+                metadata: None,
+            },
+        }
     }
 }
 
@@ -132,7 +264,7 @@ pub async fn run_coordinator(
             )
         };
 
-        let coord_result = run_agent(coordinator, &coordinator_input);
+        let coord_result = run_agent(ctx, coordinator, &coordinator_input).await;
         let coord_output = coord_result
             .result
             .as_ref()
@@ -151,7 +283,7 @@ pub async fn run_coordinator(
                 ctx.input,
                 build_context_from_memory(ctx)
             );
-            let worker_result = run_agent(worker, &worker_input);
+            let worker_result = run_agent(ctx, worker, &worker_input).await;
             let worker_output = worker_result
                 .result
                 .as_ref()
@@ -169,7 +301,7 @@ pub async fn run_coordinator(
         "Synthesize a final answer from all team contributions.\n{}",
         build_context_from_memory(ctx)
     );
-    let final_result = run_agent(coordinator, &synthesis_input);
+    let final_result = run_agent(ctx, coordinator, &synthesis_input).await;
     let final_output = final_result
         .result
         .as_ref()
@@ -229,7 +361,7 @@ pub async fn run_round_robin(
                 )
             };
 
-            let result = run_agent(member, &agent_input);
+            let result = run_agent(ctx, member, &agent_input).await;
             let output = result
                 .result
                 .as_ref()
@@ -289,7 +421,7 @@ pub async fn run_delegate_to_best(
         })
         .context("No members to select from")?;
 
-    let result = run_agent(best_member, &ctx.input);
+    let result = run_agent(ctx, best_member, &ctx.input).await;
     let output = result
         .result
         .as_ref()
@@ -368,7 +500,9 @@ pub async fn run_parallel(
     for member in members {
         let member_clone = member.clone();
         let input_clone = ctx.input.clone();
-        let handle = tokio::spawn(async move { run_agent(&member_clone, &input_clone) });
+        let ctx_clone = ctx.clone();
+        let handle =
+            tokio::spawn(async move { run_agent(&ctx_clone, &member_clone, &input_clone).await });
         handles.push((member.clone(), handle));
     }
 
@@ -448,7 +582,7 @@ pub async fn run_sequential(
     let mut current_input = ctx.input.clone();
 
     for member in members {
-        let result = run_agent(member, &current_input);
+        let result = run_agent(ctx, member, &current_input).await;
 
         let output = result
             .result

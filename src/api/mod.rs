@@ -170,6 +170,9 @@ pub fn registry_router(db: AriaDb) -> Router {
         .route("/api/v1/registry/crons", get(crons_list))
         .route("/api/v1/registry/crons/:id", get(crons_get))
         .route("/api/v1/registry/crons/:id", delete(crons_delete))
+        .route("/api/v1/registry/crons/:id/enable", post(crons_enable))
+        .route("/api/v1/registry/crons/:id/disable", post(crons_disable))
+        .route("/api/v1/registry/crons/:id/trigger", post(crons_trigger))
         // ── KV ────────────────────────────────────────────────
         .route("/api/v1/registry/kv", post(kv_set))
         .route("/api/v1/registry/kv", get(kv_list))
@@ -1278,6 +1281,155 @@ async fn crons_delete(
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"success": true}))).into_response(),
         Err(_) => {
             ApiResponse::<()>::err(StatusCode::NOT_FOUND, "Cron function not found").into_response()
+        }
+    }
+}
+
+async fn set_cron_enabled(
+    state: &RegistryApiState,
+    tenant_id: &str,
+    id: &str,
+    enabled: bool,
+) -> Result<()> {
+    state.db.with_conn(|conn| {
+        let changed = conn.execute(
+            "UPDATE aria_cron_functions
+             SET enabled = ?1, status = ?2, updated_at = ?3
+             WHERE id = ?4 AND tenant_id = ?5",
+            rusqlite::params![
+                i64::from(enabled),
+                if enabled { "active" } else { "paused" },
+                chrono::Utc::now().to_rfc3339(),
+                id,
+                tenant_id,
+            ],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("Cron function not found");
+        }
+        Ok(())
+    })?;
+    crate::aria::hooks::notify_cron_uploaded(id);
+    Ok(())
+}
+
+fn queue_runtime_cron_now(workspace_dir: &std::path::Path, runtime_id: &str) -> Result<bool> {
+    let db_path = workspace_dir.join("cron").join("jobs.db");
+    let conn = rusqlite::Connection::open(db_path)?;
+    let due_at = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+    let changed = conn.execute(
+        "UPDATE cron_jobs SET next_run = ?1 WHERE id = ?2",
+        rusqlite::params![due_at, runtime_id],
+    )?;
+    Ok(changed > 0)
+}
+
+async fn crons_enable(
+    State(state): State<RegistryApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let ctx = match extract_route_context(&state.db, &headers) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    match set_cron_enabled(&state, &ctx.tenant_id, &id, true).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"success": true, "data": {"id": id, "status": "active"}})),
+        )
+            .into_response(),
+        Err(_) => {
+            ApiResponse::<()>::err(StatusCode::NOT_FOUND, "Cron function not found").into_response()
+        }
+    }
+}
+
+async fn crons_disable(
+    State(state): State<RegistryApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let ctx = match extract_route_context(&state.db, &headers) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    match set_cron_enabled(&state, &ctx.tenant_id, &id, false).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"success": true, "data": {"id": id, "status": "paused"}})),
+        )
+            .into_response(),
+        Err(_) => {
+            ApiResponse::<()>::err(StatusCode::NOT_FOUND, "Cron function not found").into_response()
+        }
+    }
+}
+
+async fn crons_trigger(
+    State(state): State<RegistryApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let ctx = match extract_route_context(&state.db, &headers) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+
+    let mut runtime_id = match state.db.with_conn(|conn| {
+        let found = conn.query_row(
+            "SELECT cron_job_id FROM aria_cron_functions WHERE id = ?1 AND tenant_id = ?2",
+            rusqlite::params![id, ctx.tenant_id],
+            |row| row.get::<_, Option<String>>(0),
+        );
+        match found {
+            Ok(v) => Ok(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }) {
+        Ok(v) => v,
+        Err(e) => {
+            return ApiResponse::<()>::err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                .into_response();
+        }
+    };
+
+    if runtime_id.is_none() {
+        crate::aria::hooks::notify_cron_uploaded(&id);
+        runtime_id = state
+            .db
+            .with_conn(|conn| {
+                let found = conn.query_row(
+                    "SELECT cron_job_id FROM aria_cron_functions WHERE id = ?1 AND tenant_id = ?2",
+                    rusqlite::params![id, ctx.tenant_id],
+                    |row| row.get::<_, Option<String>>(0),
+                );
+                match found {
+                    Ok(v) => Ok(v),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                    Err(e) => Err(e.into()),
+                }
+            })
+            .unwrap_or(None);
+    }
+
+    let Some(runtime_id) = runtime_id else {
+        return ApiResponse::<()>::err(StatusCode::CONFLICT, "Cron function is not schedulable")
+            .into_response();
+    };
+
+    let workspace_dir = crate::config::schema::default_workspace_dir();
+    match queue_runtime_cron_now(&workspace_dir, &runtime_id) {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"success": true, "data": {"id": id, "queued": true}})),
+        )
+            .into_response(),
+        Ok(false) => ApiResponse::<()>::err(StatusCode::NOT_FOUND, "Runtime cron job not found")
+            .into_response(),
+        Err(e) => {
+            ApiResponse::<()>::err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
         }
     }
 }

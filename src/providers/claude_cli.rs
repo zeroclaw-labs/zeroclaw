@@ -5,6 +5,7 @@ use crate::providers::traits::{
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -39,6 +40,21 @@ impl ClaudeCliProvider {
         }
 
         id
+    }
+
+    fn resolve_exec_cwd() -> Option<PathBuf> {
+        let from_env = std::env::var("ARIA_PROVIDER_CWD")
+            .ok()
+            .or_else(|| std::env::var("AFW_PROVIDER_CWD").ok())
+            .or_else(|| std::env::var("HOME").ok());
+        from_env.and_then(|raw| {
+            let p = PathBuf::from(raw);
+            if p.exists() {
+                Some(p)
+            } else {
+                None
+            }
+        })
     }
 
     fn parse_output(stdout: &str) -> anyhow::Result<String> {
@@ -213,6 +229,9 @@ impl ClaudeCliProvider {
             .env_remove("ANTHROPIC_API_KEY_OLD")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(cwd) = Self::resolve_exec_cwd() {
+            cmd.current_dir(cwd);
+        }
 
         if let Some(system) = system_prompt {
             if !system.trim().is_empty() {
@@ -431,6 +450,9 @@ impl Provider for ClaudeCliProvider {
             .arg(message)
             .env_remove("ANTHROPIC_API_KEY")
             .env_remove("ANTHROPIC_API_KEY_OLD");
+        if let Some(cwd) = Self::resolve_exec_cwd() {
+            cmd.current_dir(cwd);
+        }
 
         if let Some(system) = system_prompt {
             if !system.trim().is_empty() {

@@ -451,6 +451,24 @@ pub enum CronPayload {
         to: Option<String>,
         best_effort_deliver: Option<bool>,
     },
+    /// Execute a named tool as a one-shot run
+    ToolRun { tool: String, prompt: String },
+    /// Execute a named team as a one-shot run
+    TeamRun {
+        team: String,
+        objective: String,
+        max_rounds: Option<u32>,
+        timeout_ms: Option<u64>,
+    },
+    /// Execute a named pipeline as a one-shot run
+    PipelineRun {
+        pipeline: String,
+        variables: Option<std::collections::HashMap<String, serde_json::Value>>,
+        max_parallel: Option<u32>,
+        timeout_ms: Option<u64>,
+    },
+    /// Execute a named feed as a one-shot run
+    FeedRun { feed: String },
 }
 
 /// Channel target for cron agent turn delivery

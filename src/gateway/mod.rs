@@ -74,6 +74,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let actual_port = listener.local_addr()?.port();
     let display_addr = format!("{host}:{actual_port}");
+    let gateway_url = format!("http://{display_addr}");
+    std::env::set_var("AFW_GATEWAY_URL", &gateway_url);
+    if std::env::var_os("ARIA_GATEWAY_URL").is_none() {
+        std::env::set_var("ARIA_GATEWAY_URL", &gateway_url);
+    }
 
     let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider(
         config.default_provider.as_deref().unwrap_or("openrouter"),
@@ -205,6 +210,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         // Dashboard parity routes (cloud-compatible)
         .route("/api/messages", post(api_send_message))
         .route("/api/messages", get(api_list_messages))
+        .route("/api/v1/run/tool", post(api_v1_run_tool))
+        .route("/api/v1/run/agent", post(api_v1_run_agent))
+        .route("/api/v1/run/team", post(api_v1_run_team))
+        .route("/api/v1/run/pipeline", post(api_v1_run_pipeline))
         .route("/api/chats", post(api_create_chat))
         .route("/api/chats", get(api_list_chats))
         .route("/api/chats/:chat_id/messages", get(api_get_chat_messages))
@@ -472,6 +481,35 @@ struct ApiSendMessageBody {
     #[serde(rename = "sessionId")]
     session_id: Option<String>,
     mode: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct ApiRunToolBody {
+    tool: String,
+    prompt: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ApiRunAgentBody {
+    agent: String,
+    prompt: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ApiRunTeamBody {
+    team: String,
+    objective: Option<String>,
+    input: Option<String>,
+    timeout_ms: Option<u64>,
+    max_rounds: Option<u32>,
+}
+
+#[derive(serde::Deserialize)]
+struct ApiRunPipelineBody {
+    pipeline: String,
+    variables: Option<std::collections::HashMap<String, serde_json::Value>>,
+    timeout_ms: Option<u64>,
+    max_parallel: Option<u32>,
 }
 
 #[derive(serde::Deserialize)]
@@ -877,6 +915,337 @@ fn persist_tool_trace(
         )?;
         Ok(())
     });
+}
+
+struct AgentRuntimeConfig {
+    model: Option<String>,
+    temperature: Option<f64>,
+    system_prompt: Option<String>,
+    tools: Vec<String>,
+}
+
+fn find_agent_runtime_config(
+    state: &AppState,
+    tenant: &str,
+    agent_ref: &str,
+) -> anyhow::Result<Option<AgentRuntimeConfig>> {
+    state.registry_db.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT model, temperature, system_prompt, tools
+             FROM aria_agents
+             WHERE tenant_id=?1 AND status!='deleted' AND (id=?2 OR name=?2)
+             ORDER BY updated_at DESC LIMIT 1",
+        )?;
+        let found = stmt.query_row(rusqlite::params![tenant, agent_ref], |row| {
+            let tools_raw: String = row.get::<_, Option<String>>(3)?.unwrap_or_default();
+            let tools = serde_json::from_str::<Vec<String>>(&tools_raw).unwrap_or_default();
+            Ok(AgentRuntimeConfig {
+                model: row.get(0)?,
+                temperature: row.get(1)?,
+                system_prompt: row.get(2)?,
+                tools,
+            })
+        });
+        match found {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    })
+}
+
+fn run_mode_hint(mode: &str, detail: &str) -> String {
+    format!("{mode}\n\n{detail}")
+}
+
+async fn api_v1_run_tool(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ApiRunToolBody>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    if body.tool.trim().is_empty() || body.prompt.trim().is_empty() {
+        return api_err(StatusCode::BAD_REQUEST, "tool and prompt are required");
+    }
+    let mode_hint = run_mode_hint(
+        "TOOL RUN MODE",
+        &format!(
+            "You are executing a one-shot run for tool '{}'. Use this tool to satisfy the prompt.",
+            body.tool
+        ),
+    );
+    match crate::agent::orchestrator::run_live_turn(
+        crate::agent::orchestrator::LiveTurnConfig {
+            provider: state.provider.as_ref(),
+            security: &state.security,
+            memory: state.mem.clone(),
+            composio_api_key: state.composio_api_key.as_deref(),
+            browser_config: &state.browser_config,
+            registry_db: &state.registry_db,
+            workspace_dir: &state.workspace_dir,
+            tenant_id: &tenant,
+            model: &state.model,
+            temperature: state.temperature,
+            mode_hint: &mode_hint,
+            max_turns: Some(25),
+            external_tool_context: None,
+        },
+        &body.prompt,
+        None,
+    )
+    .await
+    {
+        Ok(result) => api_ok(serde_json::json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "status": if result.success { "completed" } else { "failed" },
+            "output": result.output,
+            "result": result.output,
+            "error": result.error,
+            "usage": serde_json::Value::Null,
+        })),
+        Err(e) => api_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Tool run failed: {e}"),
+        ),
+    }
+}
+
+async fn api_v1_run_agent(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ApiRunAgentBody>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    if body.agent.trim().is_empty() || body.prompt.trim().is_empty() {
+        return api_err(StatusCode::BAD_REQUEST, "agent and prompt are required");
+    }
+
+    let agent_cfg = match find_agent_runtime_config(&state, &tenant, &body.agent) {
+        Ok(Some(cfg)) => cfg,
+        Ok(None) => return api_err(StatusCode::NOT_FOUND, "Agent not found"),
+        Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+
+    let mut tools = crate::tools::all_tools_for_tenant(
+        &state.security,
+        state.mem.clone(),
+        state.composio_api_key.as_deref(),
+        &state.browser_config,
+        &state.registry_db,
+        &tenant,
+    );
+    if !agent_cfg.tools.is_empty() {
+        let allowed: std::collections::HashSet<String> = agent_cfg.tools.into_iter().collect();
+        tools.retain(|t| allowed.contains(t.name()));
+    }
+
+    let base_prompt = build_live_system_prompt(&state, &tenant, &tools, "");
+    let system_prompt = if let Some(custom) = agent_cfg.system_prompt {
+        format!("{base_prompt}\n\n## Agent Instructions\n{custom}")
+    } else {
+        base_prompt
+    };
+
+    let model = agent_cfg
+        .model
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| state.model.clone());
+    let temperature = agent_cfg.temperature.unwrap_or(state.temperature);
+
+    match crate::agent::executor::execute_agent(
+        state.provider.as_ref(),
+        &tools,
+        &system_prompt,
+        &body.prompt,
+        &model,
+        temperature,
+        Some(25),
+    )
+    .await
+    {
+        Ok(result) => api_ok(serde_json::json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "status": if result.success { "completed" } else { "failed" },
+            "output": result.output,
+            "result": result.output,
+            "error": result.error,
+            "usage": serde_json::Value::Null,
+        })),
+        Err(e) => api_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Agent run failed: {e}"),
+        ),
+    }
+}
+
+async fn api_v1_run_team(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ApiRunTeamBody>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    if body.team.trim().is_empty() {
+        return api_err(StatusCode::BAD_REQUEST, "team is required");
+    }
+    let input = body
+        .objective
+        .or(body.input)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if input.is_empty() {
+        return api_err(StatusCode::BAD_REQUEST, "objective or input is required");
+    }
+
+    let team = match state.registry_db.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, mode, members
+             FROM aria_teams
+             WHERE tenant_id=?1 AND status!='deleted' AND (id=?2 OR name=?2)
+             ORDER BY updated_at DESC LIMIT 1",
+        )?;
+        let found = stmt.query_row(rusqlite::params![tenant, body.team], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        });
+        match found {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }) {
+        Ok(Some(v)) => v,
+        Ok(None) => return api_err(StatusCode::NOT_FOUND, "Team not found"),
+        Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+
+    let members: Vec<crate::team::types::TeamMemberRuntime> = match serde_json::from_str(&team.2) {
+        Ok(v) => v,
+        Err(e) => {
+            return api_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Invalid team members JSON: {e}"),
+            );
+        }
+    };
+    let mode: crate::aria::types::TeamMode = match serde_json::from_str(&format!("\"{}\"", team.1))
+    {
+        Ok(v) => v,
+        Err(e) => {
+            return api_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Invalid team mode '{}': {e}", team.1),
+            );
+        }
+    };
+    let timeout = body.timeout_ms.map(std::time::Duration::from_millis);
+
+    let engine = crate::team::engine::TeamEngine::new(state.registry_db.clone());
+    match engine
+        .execute(crate::team::engine::TeamExecutionRequest {
+            team_id: &team.0,
+            tenant_id: &tenant,
+            input: &input,
+            mode: &mode,
+            members: &members,
+            timeout,
+            max_rounds: body.max_rounds,
+        })
+        .await
+    {
+        Ok(result) => api_ok(serde_json::json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "status": if result.success { "completed" } else { "failed" },
+            "result": result.result,
+            "output": result.result.as_ref().and_then(|v| v.get("output")).and_then(serde_json::Value::as_str).unwrap_or_default(),
+            "error": result.error,
+        })),
+        Err(e) => api_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Team run failed: {e}"),
+        ),
+    }
+}
+
+async fn api_v1_run_pipeline(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ApiRunPipelineBody>,
+) -> impl IntoResponse {
+    let tenant = match api_tenant(&state, &headers) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    if body.pipeline.trim().is_empty() {
+        return api_err(StatusCode::BAD_REQUEST, "pipeline is required");
+    }
+    let pipeline = match state.registry_db.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, steps
+             FROM aria_pipelines
+             WHERE tenant_id=?1 AND status!='deleted' AND (id=?2 OR name=?2)
+             ORDER BY updated_at DESC LIMIT 1",
+        )?;
+        let found = stmt.query_row(rusqlite::params![tenant, body.pipeline], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        });
+        match found {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }) {
+        Ok(Some(v)) => v,
+        Ok(None) => return api_err(StatusCode::NOT_FOUND, "Pipeline not found"),
+        Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+
+    let steps: Vec<crate::aria::types::PipelineStep> = match serde_json::from_str(&pipeline.1) {
+        Ok(v) => v,
+        Err(e) => {
+            return api_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Invalid pipeline steps JSON: {e}"),
+            );
+        }
+    };
+
+    let engine = crate::pipeline::executor::PipelineEngine::new(state.registry_db.clone());
+    match engine
+        .execute(
+            &pipeline.0,
+            &tenant,
+            &steps,
+            body.variables.unwrap_or_default(),
+            body.timeout_ms.map(std::time::Duration::from_millis),
+            body.max_parallel,
+        )
+        .await
+    {
+        Ok(result) => api_ok(serde_json::json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "status": if result.success { "completed" } else { "failed" },
+            "result": result.result,
+            "output": result.result.clone().unwrap_or(serde_json::Value::Null),
+            "error": result.error,
+        })),
+        Err(e) => api_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Pipeline run failed: {e}"),
+        ),
+    }
 }
 
 async fn api_create_chat(

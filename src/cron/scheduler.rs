@@ -348,7 +348,33 @@ async fn run_internal_feed_execution(config: &Config, feed_id: &str) -> JobRunOu
     }
 }
 
-fn payload_message(payload_kind: &str, payload_data: &str, name: &str) -> (String, Option<String>) {
+enum CronPayloadAction {
+    AgentTurn {
+        message: String,
+        model: Option<String>,
+    },
+    ToolRun {
+        tool: String,
+        prompt: String,
+    },
+    TeamRun {
+        team: String,
+        objective: String,
+        max_rounds: Option<u32>,
+        timeout_ms: Option<u64>,
+    },
+    PipelineRun {
+        pipeline: String,
+        variables: std::collections::HashMap<String, Value>,
+        max_parallel: Option<u32>,
+        timeout_ms: Option<u64>,
+    },
+    FeedRun {
+        feed: String,
+    },
+}
+
+fn payload_action(payload_kind: &str, payload_data: &str, name: &str) -> CronPayloadAction {
     let parsed: Value = serde_json::from_str(payload_data).unwrap_or_else(|_| Value::Null);
     match payload_kind {
         "systemEvent" => {
@@ -357,11 +383,15 @@ fn payload_message(payload_kind: &str, payload_data: &str, name: &str) -> (Strin
                 .and_then(Value::as_str)
                 .map(str::to_owned)
                 .unwrap_or_else(|| payload_data.to_string());
-            (format!("[Cron:{name}] {text}"), None)
+            CronPayloadAction::AgentTurn {
+                message: format!("[Cron:{name}] {text}"),
+                model: None,
+            }
         }
-        "agentTurn" => {
+        "agentTurn" | "agentRun" | "agent" => {
             let text = parsed
                 .get("message")
+                .or_else(|| parsed.get("prompt"))
                 .and_then(Value::as_str)
                 .unwrap_or("cron trigger")
                 .to_string();
@@ -369,9 +399,89 @@ fn payload_message(payload_kind: &str, payload_data: &str, name: &str) -> (Strin
                 .get("model")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            (text, model)
+            CronPayloadAction::AgentTurn {
+                message: text,
+                model,
+            }
         }
-        _ => (format!("[Cron:{name}] trigger"), None),
+        "toolRun" | "tool" => {
+            let tool = parsed
+                .get("tool")
+                .or_else(|| parsed.get("name"))
+                .or_else(|| parsed.get("tool_name"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let prompt = parsed
+                .get("prompt")
+                .or_else(|| parsed.get("message"))
+                .or_else(|| parsed.get("input"))
+                .and_then(Value::as_str)
+                .unwrap_or("cron tool execution")
+                .to_string();
+            CronPayloadAction::ToolRun { tool, prompt }
+        }
+        "teamRun" | "team" => {
+            let team = parsed
+                .get("team")
+                .or_else(|| parsed.get("name"))
+                .or_else(|| parsed.get("team_name"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let objective = parsed
+                .get("objective")
+                .or_else(|| parsed.get("input"))
+                .or_else(|| parsed.get("prompt"))
+                .and_then(Value::as_str)
+                .unwrap_or("cron team execution")
+                .to_string();
+            CronPayloadAction::TeamRun {
+                team,
+                objective,
+                max_rounds: parsed
+                    .get("max_rounds")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as u32),
+                timeout_ms: parsed.get("timeout_ms").and_then(Value::as_u64),
+            }
+        }
+        "pipelineRun" | "pipeline" => {
+            let pipeline = parsed
+                .get("pipeline")
+                .or_else(|| parsed.get("name"))
+                .or_else(|| parsed.get("pipeline_name"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let variables = parsed
+                .get("variables")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            CronPayloadAction::PipelineRun {
+                pipeline,
+                variables,
+                max_parallel: parsed
+                    .get("max_parallel")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as u32),
+                timeout_ms: parsed.get("timeout_ms").and_then(Value::as_u64),
+            }
+        }
+        "feedRun" | "feed" => {
+            let feed = parsed
+                .get("feed")
+                .or_else(|| parsed.get("name"))
+                .or_else(|| parsed.get("feed_id"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            CronPayloadAction::FeedRun { feed }
+        }
+        _ => CronPayloadAction::AgentTurn {
+            message: format!("[Cron:{name}] trigger"),
+            model: None,
+        },
     }
 }
 
@@ -493,54 +603,74 @@ async fn run_aria_cron_function(config: &Config, cron_func_id: &str) -> JobRunOu
         };
     }
 
-    let (message, model) = payload_message(&payload_kind, &payload_data, &name);
+    let action = payload_action(&payload_kind, &payload_data, &name);
     let run_id = Uuid::new_v4().to_string();
 
-    if wake_mode == "next-heartbeat" {
-        let summary = format_heartbeat_summary(&name, &message);
-        match append_heartbeat_task(&config.workspace_dir, &summary) {
-            Ok(()) => {
-                if delete_after_run {
-                    let _ = consume_delete_after_run(config, cron_func_id);
+    let execution = match action {
+        CronPayloadAction::AgentTurn { message, model } => {
+            if wake_mode == "next-heartbeat" {
+                let summary = format_heartbeat_summary(&name, &message);
+                match append_heartbeat_task(&config.workspace_dir, &summary) {
+                    Ok(()) => Ok("queued for next heartbeat".to_string()),
+                    Err(e) => Err(anyhow::anyhow!("failed to queue heartbeat task: {e}")),
                 }
-                JobRunOutcome {
-                    success: true,
-                    output: "queued for next heartbeat".to_string(),
-                    tenant_id: Some(tenant_id),
-                    remove_after_run: delete_after_run,
-                    run_id: Some(run_id),
-                }
+            } else {
+                execute_agent_turn(config, &tenant_id, &message, model.as_deref()).await
             }
-            Err(e) => JobRunOutcome {
-                success: false,
-                output: format!("failed to queue heartbeat task: {e}"),
-                tenant_id: Some(tenant_id),
-                remove_after_run: false,
-                run_id: Some(run_id),
-            },
         }
-    } else {
-        match execute_agent_turn(config, &tenant_id, &message, model.as_deref()).await {
-            Ok(output) => {
-                if delete_after_run {
-                    let _ = consume_delete_after_run(config, cron_func_id);
-                }
-                JobRunOutcome {
-                    success: true,
-                    output,
-                    tenant_id: Some(tenant_id),
-                    remove_after_run: delete_after_run,
-                    run_id: Some(run_id),
-                }
+        CronPayloadAction::ToolRun { tool, prompt } => {
+            execute_tool_run(config, &tenant_id, &tool, &prompt).await
+        }
+        CronPayloadAction::TeamRun {
+            team,
+            objective,
+            max_rounds,
+            timeout_ms,
+        } => {
+            execute_team_run(
+                config, &tenant_id, &team, &objective, max_rounds, timeout_ms,
+            )
+            .await
+        }
+        CronPayloadAction::PipelineRun {
+            pipeline,
+            variables,
+            max_parallel,
+            timeout_ms,
+        } => {
+            execute_pipeline_run(
+                config,
+                &tenant_id,
+                &pipeline,
+                variables,
+                max_parallel,
+                timeout_ms,
+            )
+            .await
+        }
+        CronPayloadAction::FeedRun { feed } => execute_feed_run(config, &tenant_id, &feed).await,
+    };
+
+    match execution {
+        Ok(output) => {
+            if delete_after_run {
+                let _ = consume_delete_after_run(config, cron_func_id);
             }
-            Err(e) => JobRunOutcome {
-                success: false,
-                output: format!("agent execution failed: {e}"),
+            JobRunOutcome {
+                success: true,
+                output,
                 tenant_id: Some(tenant_id),
-                remove_after_run: false,
+                remove_after_run: delete_after_run,
                 run_id: Some(run_id),
-            },
+            }
         }
+        Err(e) => JobRunOutcome {
+            success: false,
+            output: e.to_string(),
+            tenant_id: Some(tenant_id),
+            remove_after_run: false,
+            run_id: Some(run_id),
+        },
     }
 }
 
@@ -549,6 +679,180 @@ async fn execute_agent_turn(
     tenant_id: &str,
     message: &str,
     model_override: Option<&str>,
+) -> Result<String> {
+    execute_agent_turn_with_mode_hint(config, tenant_id, message, model_override, "cron").await
+}
+
+async fn execute_tool_run(
+    config: &Config,
+    tenant_id: &str,
+    tool_name: &str,
+    prompt: &str,
+) -> Result<String> {
+    if tool_name.trim().is_empty() {
+        anyhow::bail!("cron toolRun payload requires 'tool'");
+    }
+    let mode_hint = format!(
+        "TOOL RUN MODE: Execute one-shot request with tool '{}'. Use that tool to satisfy the prompt.",
+        tool_name
+    );
+    execute_agent_turn_with_mode_hint(config, tenant_id, prompt, None, &mode_hint).await
+}
+
+async fn execute_team_run(
+    config: &Config,
+    tenant_id: &str,
+    team_ref: &str,
+    objective: &str,
+    max_rounds: Option<u32>,
+    timeout_ms: Option<u64>,
+) -> Result<String> {
+    if team_ref.trim().is_empty() {
+        anyhow::bail!("cron teamRun payload requires 'team'");
+    }
+    let db = aria::db::AriaDb::open(&config.registry_db_path())?;
+    let team = db.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, mode, members
+             FROM aria_teams
+             WHERE tenant_id=?1 AND status!='deleted' AND (id=?2 OR name=?2)
+             ORDER BY updated_at DESC LIMIT 1",
+        )?;
+        let found = stmt.query_row(params![tenant_id, team_ref], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        });
+        match found {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    })?;
+    let Some((team_id, mode_raw, members_raw)) = team else {
+        anyhow::bail!("team not found: {team_ref}");
+    };
+
+    let members: Vec<crate::team::types::TeamMemberRuntime> = serde_json::from_str(&members_raw)
+        .map_err(|e| anyhow::anyhow!("invalid team members json: {e}"))?;
+    let mode: crate::aria::types::TeamMode = serde_json::from_str(&format!("\"{mode_raw}\""))
+        .map_err(|e| anyhow::anyhow!("invalid team mode '{mode_raw}': {e}"))?;
+    let engine = crate::team::engine::TeamEngine::new(db);
+    let result = engine
+        .execute(crate::team::engine::TeamExecutionRequest {
+            team_id: &team_id,
+            tenant_id,
+            input: objective,
+            mode: &mode,
+            members: &members,
+            timeout: timeout_ms.map(Duration::from_millis),
+            max_rounds,
+        })
+        .await?;
+    if !result.success {
+        anyhow::bail!(result
+            .error
+            .unwrap_or_else(|| "team execution failed".to_string()));
+    }
+    Ok(result
+        .result
+        .and_then(|v| v.get("output").and_then(Value::as_str).map(str::to_owned))
+        .unwrap_or_else(|| "team executed".to_string()))
+}
+
+async fn execute_pipeline_run(
+    config: &Config,
+    tenant_id: &str,
+    pipeline_ref: &str,
+    variables: std::collections::HashMap<String, Value>,
+    max_parallel: Option<u32>,
+    timeout_ms: Option<u64>,
+) -> Result<String> {
+    if pipeline_ref.trim().is_empty() {
+        anyhow::bail!("cron pipelineRun payload requires 'pipeline'");
+    }
+    let db = aria::db::AriaDb::open(&config.registry_db_path())?;
+    let pipeline = db.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, steps
+             FROM aria_pipelines
+             WHERE tenant_id=?1 AND status!='deleted' AND (id=?2 OR name=?2)
+             ORDER BY updated_at DESC LIMIT 1",
+        )?;
+        let found = stmt.query_row(params![tenant_id, pipeline_ref], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        });
+        match found {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    })?;
+    let Some((pipeline_id, steps_raw)) = pipeline else {
+        anyhow::bail!("pipeline not found: {pipeline_ref}");
+    };
+
+    let steps: Vec<crate::aria::types::PipelineStep> = serde_json::from_str(&steps_raw)
+        .map_err(|e| anyhow::anyhow!("invalid pipeline steps json: {e}"))?;
+    let engine = crate::pipeline::executor::PipelineEngine::new(db);
+    let result = engine
+        .execute(
+            &pipeline_id,
+            tenant_id,
+            &steps,
+            variables,
+            timeout_ms.map(Duration::from_millis),
+            max_parallel,
+        )
+        .await?;
+    if !result.success {
+        anyhow::bail!(result
+            .error
+            .unwrap_or_else(|| "pipeline execution failed".to_string()));
+    }
+    Ok(result
+        .result
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "pipeline executed".to_string()))
+}
+
+async fn execute_feed_run(config: &Config, tenant_id: &str, feed_ref: &str) -> Result<String> {
+    if feed_ref.trim().is_empty() {
+        anyhow::bail!("cron feedRun payload requires 'feed'");
+    }
+    let db = aria::db::AriaDb::open(&config.registry_db_path())?;
+    let feed_id = db.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id
+             FROM aria_feeds
+             WHERE tenant_id=?1 AND status!='deleted' AND (id=?2 OR name=?2)
+             ORDER BY updated_at DESC LIMIT 1",
+        )?;
+        let found = stmt.query_row(params![tenant_id, feed_ref], |row| row.get::<_, String>(0));
+        match found {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    })?;
+    let Some(feed_id) = feed_id else {
+        anyhow::bail!("feed not found: {feed_ref}");
+    };
+    let outcome = run_internal_feed_execution(config, &feed_id).await;
+    if !outcome.success {
+        anyhow::bail!(outcome.output);
+    }
+    Ok(outcome.output)
+}
+
+async fn execute_agent_turn_with_mode_hint(
+    config: &Config,
+    tenant_id: &str,
+    message: &str,
+    model_override: Option<&str>,
+    mode_hint: &str,
 ) -> Result<String> {
     let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
     let model_name = model_override
@@ -587,7 +891,7 @@ async fn execute_agent_turn(
             tenant_id,
             model: model_name,
             temperature: config.default_temperature,
-            mode_hint: "cron",
+            mode_hint,
             max_turns: Some(25),
             external_tool_context: None,
         },
@@ -595,7 +899,6 @@ async fn execute_agent_turn(
         None,
     )
     .await?;
-
     Ok(result.output)
 }
 

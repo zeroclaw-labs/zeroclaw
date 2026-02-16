@@ -116,6 +116,161 @@ impl FeedExecutor {
         Self { db }
     }
 
+    fn gateway_candidates() -> Vec<String> {
+        let mut urls = Vec::new();
+        if let Ok(v) = std::env::var("ARIA_GATEWAY_URL") {
+            if !v.trim().is_empty() {
+                urls.push(v);
+            }
+        }
+        if let Ok(v) = std::env::var("AFW_GATEWAY_URL") {
+            if !v.trim().is_empty() {
+                urls.push(v);
+            }
+        }
+        urls.push("http://127.0.0.1:8080".to_string());
+        urls.sort();
+        urls.dedup();
+        urls
+    }
+
+    async fn execute_feed_run_action(run: &Value) -> Value {
+        let run_obj = match run.as_object() {
+            Some(v) => v,
+            None => {
+                return serde_json::json!({
+                    "ok": false,
+                    "error": "metadata.run must be an object"
+                });
+            }
+        };
+        let kind = run_obj
+            .get("kind")
+            .or_else(|| run_obj.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        let (path, payload) = match kind {
+            "tool" | "toolRun" => {
+                let tool = run_obj
+                    .get("tool")
+                    .or_else(|| run_obj.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let prompt = run_obj
+                    .get("prompt")
+                    .or_else(|| run_obj.get("input"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                (
+                    "/api/v1/run/tool",
+                    serde_json::json!({ "tool": tool, "prompt": prompt }),
+                )
+            }
+            "agent" | "agentRun" => {
+                let agent = run_obj
+                    .get("agent")
+                    .or_else(|| run_obj.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let prompt = run_obj
+                    .get("prompt")
+                    .or_else(|| run_obj.get("input"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                (
+                    "/api/v1/run/agent",
+                    serde_json::json!({ "agent": agent, "prompt": prompt }),
+                )
+            }
+            "team" | "teamRun" => {
+                let team = run_obj
+                    .get("team")
+                    .or_else(|| run_obj.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let objective = run_obj
+                    .get("objective")
+                    .or_else(|| run_obj.get("input"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                (
+                    "/api/v1/run/team",
+                    serde_json::json!({ "team": team, "objective": objective }),
+                )
+            }
+            "pipeline" | "pipelineRun" => {
+                let pipeline = run_obj
+                    .get("pipeline")
+                    .or_else(|| run_obj.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let variables = run_obj
+                    .get("variables")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                (
+                    "/api/v1/run/pipeline",
+                    serde_json::json!({ "pipeline": pipeline, "variables": variables }),
+                )
+            }
+            _ => {
+                return serde_json::json!({
+                    "ok": false,
+                    "error": format!("unsupported metadata.run kind: {}", kind)
+                });
+            }
+        };
+
+        let token = std::env::var("ARIA_TOKEN")
+            .or_else(|_| std::env::var("AFW_TOKEN"))
+            .unwrap_or_default();
+        let client = reqwest::Client::new();
+        let mut last_err = String::new();
+
+        for base in Self::gateway_candidates() {
+            let url = format!("{}{}", base.trim_end_matches('/'), path);
+            let mut req = client.post(url).json(&payload);
+            if !token.is_empty() {
+                req = req.bearer_auth(&token);
+            }
+            match req.send().await {
+                Ok(resp) => {
+                    if !resp.status().is_success() {
+                        last_err = format!("HTTP {}", resp.status());
+                        continue;
+                    }
+                    match resp.json::<Value>().await {
+                        Ok(v) => {
+                            if v.get("success").and_then(Value::as_bool) == Some(false) {
+                                let err = v
+                                    .get("error")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("request failed");
+                                return serde_json::json!({ "ok": false, "error": err });
+                            }
+                            return serde_json::json!({
+                                "ok": true,
+                                "result": v.get("data").cloned().unwrap_or(v),
+                            });
+                        }
+                        Err(e) => {
+                            last_err = e.to_string();
+                        }
+                    }
+                }
+                Err(e) => {
+                    last_err = e.to_string();
+                }
+            }
+        }
+
+        serde_json::json!({
+            "ok": false,
+            "error": if last_err.is_empty() { "gateway call failed".to_string() } else { last_err }
+        })
+    }
+
     fn shell_single_quote(input: &str) -> String {
         let escaped = input.replace('\'', r#"'\''"#);
         format!("'{escaped}'")
@@ -543,6 +698,16 @@ impl FeedExecutor {
             "last_run_at": chrono::Utc::now().timestamp_millis(),
         })
         .to_string();
+        let gateway_url = std::env::var("ARIA_GATEWAY_URL")
+            .or_else(|_| std::env::var("AFW_GATEWAY_URL"))
+            .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+        let auth_token = std::env::var("ARIA_TOKEN")
+            .or_else(|_| std::env::var("AFW_TOKEN"))
+            .unwrap_or_default();
+        let gateway_url_json = serde_json::to_string(&gateway_url)
+            .unwrap_or_else(|_| "\"http://127.0.0.1:8080\"".to_string());
+        let auth_token_json =
+            serde_json::to_string(&auth_token).unwrap_or_else(|_| "\"\"".to_string());
 
         let script = format!(
             r#"'use strict';
@@ -579,7 +744,7 @@ function hashString(s) {{
 }}
 function parseCsvRows(csv) {{
   const lines = String(csv).trim().split(/\r?\n/).filter(Boolean);
-  if (lines.length < 2) throw new Error("CSV has no rows");
+  if (lines.length < 2) return [];
   const headers = lines[0].split(",").map((h) => h.trim());
   const rows = [];
   for (const line of lines.slice(1)) {{
@@ -590,6 +755,48 @@ function parseCsvRows(csv) {{
   }}
   return rows;
 }}
+const ARIA_GATEWAY_URL = {gateway_url};
+const ARIA_TOKEN = {auth_token};
+const ARIA_GATEWAY_CANDIDATES = Array.from(new Set([
+  ARIA_GATEWAY_URL,
+  "http://host.docker.internal:8080",
+  "http://127.0.0.1:8080",
+])).filter((v) => typeof v === "string" && v.length > 0);
+
+async function ariaFetch(path, payload) {{
+  let lastErr = null;
+  for (const base of ARIA_GATEWAY_CANDIDATES) {{
+    try {{
+      const headers = {{ "Content-Type": "application/json" }};
+      if (ARIA_TOKEN) headers.Authorization = `Bearer ${{ARIA_TOKEN}}`;
+      const res = await fetch(`${{String(base).replace(/\/$/, "")}}${{path}}`, {{
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+      }});
+      if (!res.ok) {{
+        lastErr = new Error(`HTTP ${{res.status}} from ${{base}}: ${{await res.text()}}`);
+        continue;
+      }}
+      const parsed = await res.json();
+      if (parsed && parsed.success === false) {{
+        throw new Error(parsed.error?.message || parsed.error || "Aria request failed");
+      }}
+      return parsed?.data ?? parsed;
+    }} catch (err) {{
+      lastErr = err;
+    }}
+  }}
+  throw (lastErr || new Error("Failed calling Aria gateway"));
+}}
+
+const aria = {{
+  runTool: (tool, prompt) => ariaFetch("/api/v1/run/tool", {{ tool, prompt }}),
+  runAgent: (agent, prompt) => ariaFetch("/api/v1/run/agent", {{ agent, prompt }}),
+  runTeam: (team, objective, options = {{}}) => ariaFetch("/api/v1/run/team", {{ team, objective, ...options }}),
+  runPipeline: (pipeline, variables = {{}}, options = {{}}) =>
+    ariaFetch("/api/v1/run/pipeline", {{ pipeline, variables, ...options }}),
+}};
 async function fetchJson(url, {{ timeoutMs = 8000, headers }} = {{}}) {{
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
@@ -620,6 +827,7 @@ async function fetchText(url, {{ timeoutMs = 8000, headers }} = {{}}) {{
 }}
 
 {handler}
+__ctx.aria = aria;
 
 function __normalize(raw) {{
   if (Array.isArray(raw)) return {{ success: true, items: raw }};
@@ -664,6 +872,8 @@ async function __run() {{
 "#,
             marker = RESULT_MARKER,
             ctx_json = ctx_json,
+            gateway_url = gateway_url_json,
+            auth_token = auth_token_json,
             handler = handler_clean,
             class_name = class_name,
         );
@@ -824,8 +1034,56 @@ async function __run() {{
                         .with_context(|| format!("items[{i}].metadata"))?;
 
                     let meta_obj = require_obj(meta, "metadata")?;
-                    let meta_map: std::collections::HashMap<String, serde_json::Value> =
-                        meta_obj.clone().into_iter().collect();
+                    let mut meta_json = Value::Object(meta_obj.clone());
+                    if let FeedCardType::Integration = card_type {
+                        let maybe_run = meta_json
+                            .get("run")
+                            .cloned()
+                            .or_else(|| meta_json.get("action").cloned());
+                        if let Some(run_spec) = maybe_run {
+                            let run_outcome = Self::execute_feed_run_action(&run_spec).await;
+                            if let Value::Object(ref mut obj) = meta_json {
+                                obj.remove("run");
+                                obj.remove("action");
+                                obj.insert(
+                                    "lastSync".to_string(),
+                                    Value::String(Utc::now().to_rfc3339()),
+                                );
+                                let ok = run_outcome
+                                    .get("ok")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false);
+                                obj.insert(
+                                    "status".to_string(),
+                                    Value::String(
+                                        if ok { "connected" } else { "error" }.to_string(),
+                                    ),
+                                );
+                                let mut metrics = obj
+                                    .get("metrics")
+                                    .and_then(Value::as_array)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                metrics.push(serde_json::json!({
+                                    "label": "run_ok",
+                                    "value": if ok { "true" } else { "false" },
+                                }));
+                                let preview = serde_json::to_string(&run_outcome)
+                                    .unwrap_or_else(|_| "run outcome unavailable".to_string());
+                                metrics.push(serde_json::json!({
+                                    "label": "run_preview",
+                                    "value": preview.chars().take(220).collect::<String>(),
+                                }));
+                                obj.insert("metrics".to_string(), Value::Array(metrics));
+                            }
+                        }
+                    }
+                    let meta_map: std::collections::HashMap<String, serde_json::Value> = meta_json
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .collect();
 
                     let body = item_obj
                         .get("body")
