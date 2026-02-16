@@ -1,4 +1,4 @@
-# AGENTS.md — ZeroClaw Agent Coding Guide
+# AGENTS.md — ZeroClaw Agent Engineering Protocol
 
 This file defines the default working protocol for coding agents in this repository.
 Scope: entire repository.
@@ -25,7 +25,111 @@ Key extension points:
 - `src/observability/traits.rs` (`Observer`)
 - `src/runtime/traits.rs` (`RuntimeAdapter`)
 
-## 2) Repository Map (High-Level)
+## 2) Deep Architecture Observations (Why This Protocol Exists)
+
+These codebase realities should drive every design decision:
+
+1. **Trait + factory architecture is the stability backbone**
+   - Extension points are intentionally explicit and swappable.
+   - Most features should be added via trait implementation + factory registration, not cross-cutting rewrites.
+2. **Security-critical surfaces are first-class and internet-adjacent**
+   - `src/gateway/`, `src/security/`, `src/tools/`, `src/runtime/` carry high blast radius.
+   - Defaults already lean secure-by-default (pairing, bind safety, limits, secret handling); keep it that way.
+3. **Performance and binary size are product goals, not nice-to-have**
+   - `Cargo.toml` release profile and dependency choices optimize for size and determinism.
+   - Convenience dependencies and broad abstractions can silently regress these goals.
+4. **Config and runtime contracts are user-facing API**
+   - `src/config/schema.rs` and CLI commands are effectively public interfaces.
+   - Backward compatibility and explicit migration matter.
+5. **The project now runs in high-concurrency collaboration mode**
+   - CI + docs governance + label routing are part of the product delivery system.
+   - PR throughput is a design constraint; not just a maintainer inconvenience.
+
+## 3) Engineering Principles (Normative)
+
+These principles are mandatory by default. They are not slogans; they are implementation constraints.
+
+### 3.1 KISS (Keep It Simple, Stupid)
+
+**Why here:** Runtime + security behavior must stay auditable under pressure.
+
+Required:
+
+- Prefer straightforward control flow over clever meta-programming.
+- Prefer explicit match branches and typed structs over hidden dynamic behavior.
+- Keep error paths obvious and localized.
+
+### 3.2 YAGNI (You Aren't Gonna Need It)
+
+**Why here:** Premature features increase attack surface and maintenance burden.
+
+Required:
+
+- Do not add new config keys, trait methods, feature flags, or workflow branches without a concrete accepted use case.
+- Do not introduce speculative “future-proof” abstractions without at least one current caller.
+- Keep unsupported paths explicit (error out) rather than adding partial fake support.
+
+### 3.3 DRY + Rule of Three
+
+**Why here:** Naive DRY can create brittle shared abstractions across providers/channels/tools.
+
+Required:
+
+- Duplicate small, local logic when it preserves clarity.
+- Extract shared utilities only after repeated, stable patterns (rule-of-three).
+- When extracting, preserve module boundaries and avoid hidden coupling.
+
+### 3.4 SRP + ISP (Single Responsibility + Interface Segregation)
+
+**Why here:** Trait-driven architecture already encodes subsystem boundaries.
+
+Required:
+
+- Keep each module focused on one concern.
+- Extend behavior by implementing existing narrow traits whenever possible.
+- Avoid fat interfaces and “god modules” that mix policy + transport + storage.
+
+### 3.5 Fail Fast + Explicit Errors
+
+**Why here:** Silent fallback in agent runtimes can create unsafe or costly behavior.
+
+Required:
+
+- Prefer explicit `bail!`/errors for unsupported or unsafe states.
+- Never silently broaden permissions/capabilities.
+- Document fallback behavior when fallback is intentional and safe.
+
+### 3.6 Secure by Default + Least Privilege
+
+**Why here:** Gateway/tools/runtime can execute actions with real-world side effects.
+
+Required:
+
+- Deny-by-default for access and exposure boundaries.
+- Never log secrets, raw tokens, or sensitive payloads.
+- Keep network/filesystem/shell scope as narrow as possible unless explicitly justified.
+
+### 3.7 Determinism + Reproducibility
+
+**Why here:** Reliable CI and low-latency triage depend on deterministic behavior.
+
+Required:
+
+- Prefer reproducible commands and locked dependency behavior in CI-sensitive paths.
+- Keep tests deterministic (no flaky timing/network dependence without guardrails).
+- Ensure local validation commands map to CI expectations.
+
+### 3.8 Reversibility + Rollback-First Thinking
+
+**Why here:** Fast recovery is mandatory under high PR volume.
+
+Required:
+
+- Keep changes easy to revert (small scope, clear blast radius).
+- For risky changes, define rollback path before merge.
+- Avoid mixed mega-patches that block safe rollback.
+
+## 4) Repository Map (High-Level)
 
 - `src/main.rs` — CLI entrypoint and command routing
 - `src/lib.rs` — module exports and shared command enums
@@ -37,73 +141,71 @@ Key extension points:
 - `src/providers/` — model providers and resilient wrapper
 - `src/channels/` — Telegram/Discord/Slack/etc channels
 - `src/tools/` — tool execution surface (shell, file, memory, browser)
-- `src/runtime/` — runtime adapters (currently native)
+- `src/runtime/` — runtime adapters (currently native/docker)
 - `docs/` — architecture + process docs
 - `.github/` — CI, templates, automation workflows
 
-## 3) Non-Negotiable Engineering Constraints
+## 5) Risk Tiers by Path (Review Depth Contract)
 
-### 3.1 Performance and Footprint
+Use these tiers when deciding validation depth and review rigor.
 
-- Prefer minimal dependencies; avoid adding crates unless clearly justified.
-- Preserve release-size profile assumptions in `Cargo.toml`.
-- Avoid unnecessary allocations, clones, and blocking operations.
-- Keep startup path lean; avoid heavy initialization in command parsing flow.
+- **Low risk**: docs/chore/tests-only changes
+- **Medium risk**: most `src/**` behavior changes without boundary/security impact
+- **High risk**: `src/security/**`, `src/runtime/**`, `src/gateway/**`, `src/tools/**`, `.github/workflows/**`, access-control boundaries
 
-### 3.2 Security and Safety
+When uncertain, classify as higher risk.
 
-- Treat `src/security/`, `src/gateway/`, `src/tools/` as high-risk surfaces.
-- Never broaden filesystem/network execution scope without explicit policy checks.
-- Never log secrets, tokens, raw credentials, or sensitive payloads.
-- Keep default behavior secure-by-default (deny-by-default where applicable).
-
-### 3.3 Stability and Compatibility
-
-- Preserve CLI contract unless change is intentional and documented.
-- Prefer explicit errors over silent fallback for unsupported critical paths.
-- Keep changes local; avoid cross-module refactors in unrelated tasks.
-
-## 4) Agent Workflow (Required)
+## 6) Agent Workflow (Required)
 
 1. **Read before write**
-   - Inspect existing module and adjacent tests before editing.
+   - Inspect existing module, factory wiring, and adjacent tests before editing.
 2. **Define scope boundary**
    - One concern per PR; avoid mixed feature+refactor+infra patches.
 3. **Implement minimal patch**
-   - Follow KISS/YAGNI/DRY; no speculative abstractions.
-4. **Validate by risk**
-   - Docs-only: keep checks lightweight.
-   - Code changes: run relevant checks and tests.
+   - Apply KISS/YAGNI/DRY rule-of-three explicitly.
+4. **Validate by risk tier**
+   - Docs-only: lightweight checks.
+   - Code/risky changes: full relevant checks and focused scenarios.
 5. **Document impact**
-   - Update docs/PR notes for behavior, risk, rollback.
+   - Update docs/PR notes for behavior, risk, side effects, and rollback.
+6. **Respect queue hygiene**
+   - If stacked PR: declare `Depends on #...`.
+   - If replacing old PR: declare `Supersedes #...`.
 
-## 5) Change Playbooks
+## 7) Change Playbooks
 
-### 5.1 Adding a Provider
+### 7.1 Adding a Provider
 
 - Implement `Provider` in `src/providers/`.
 - Register in `src/providers/mod.rs` factory.
 - Add focused tests for factory wiring and error paths.
+- Avoid provider-specific behavior leaks into shared orchestration code.
 
-### 5.2 Adding a Channel
+### 7.2 Adding a Channel
 
 - Implement `Channel` in `src/channels/`.
-- Ensure `send`, `listen`, and `health_check` semantics are consistent.
+- Keep `send`, `listen`, `health_check`, typing semantics consistent.
 - Cover auth/allowlist/health behavior with tests.
 
-### 5.3 Adding a Tool
+### 7.3 Adding a Tool
 
 - Implement `Tool` in `src/tools/` with strict parameter schema.
 - Validate and sanitize all inputs.
 - Return structured `ToolResult`; avoid panics in runtime path.
 
-### 5.4 Security / Runtime / Gateway Changes
+### 7.4 Memory / Runtime / Config Changes
+
+- Keep compatibility explicit (config defaults, migration impact, fallback behavior).
+- Add targeted tests for boundary conditions and unsupported values.
+- Avoid hidden side effects in startup path.
+
+### 7.5 Security / Gateway / CI Changes
 
 - Include threat/risk notes and rollback strategy.
-- Add or update tests for boundary checks and failure modes.
+- Add/update tests or validation evidence for failure modes and boundaries.
 - Keep observability useful but non-sensitive.
 
-## 6) Validation Matrix
+## 8) Validation Matrix
 
 Default local checks for code changes:
 
@@ -113,31 +215,40 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
+Additional expectations by change type:
+
+- **Docs/template-only**: run markdown lint and relevant doc checks.
+- **Workflow changes**: validate YAML syntax; run workflow lint/sanity checks when available.
+- **Security/runtime/gateway/tools**: include at least one boundary/failure-mode validation.
+
 If full checks are impractical, run the most relevant subset and document what was skipped and why.
 
-For workflow/template-only changes, at least ensure YAML/template syntax validity.
+## 9) Collaboration and PR Discipline
 
-## 7) Collaboration and PR Discipline
-
-- Follow `.github/pull_request_template.md`.
+- Follow `.github/pull_request_template.md` fully (including side effects / blast radius).
 - Keep PR descriptions concrete: problem, change, non-goals, risk, rollback.
 - Use conventional commit titles.
 - Prefer small PRs (`size: XS/S/M`) when possible.
+- Agent-assisted PRs are welcome, **but contributors remain accountable for understanding what their code will do**.
 
 Reference docs:
 
 - `CONTRIBUTING.md`
 - `docs/pr-workflow.md`
+- `docs/reviewer-playbook.md`
+- `docs/ci-map.md`
 
-## 8) Anti-Patterns (Do Not)
+## 10) Anti-Patterns (Do Not)
 
 - Do not add heavy dependencies for minor convenience.
 - Do not silently weaken security policy or access constraints.
+- Do not add speculative config/feature flags “just in case”.
 - Do not mix massive formatting-only changes with functional changes.
-- Do not modify unrelated modules "while here".
+- Do not modify unrelated modules “while here”.
 - Do not bypass failing checks without explicit explanation.
+- Do not hide behavior-changing side effects in refactor commits.
 
-## 9) Handoff Template (Agent -> Agent / Maintainer)
+## 11) Handoff Template (Agent -> Agent / Maintainer)
 
 When handing off work, include:
 
@@ -147,12 +258,12 @@ When handing off work, include:
 4. Remaining risks / unknowns
 5. Next recommended action
 
-## 10) Vibe Coding Guardrails
+## 12) Vibe Coding Guardrails
 
-When working in a fast iterative "vibe coding" style:
+When working in fast iterative mode:
 
 - Keep each iteration reversible (small commits, clear rollback).
 - Validate assumptions with code search before implementing.
 - Prefer deterministic behavior over clever shortcuts.
-- Do not "ship and hope" on security-sensitive paths.
+- Do not “ship and hope” on security-sensitive paths.
 - If uncertain, leave a concrete TODO with verification context, not a hidden guess.
