@@ -810,7 +810,9 @@ mod tests {
                 .requests
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.1 = Instant::now() - Duration::from_secs(RATE_LIMITER_SWEEP_INTERVAL_SECS + 1);
+            guard.1 = Instant::now()
+                .checked_sub(Duration::from_secs(RATE_LIMITER_SWEEP_INTERVAL_SECS + 1))
+                .unwrap();
             // Clear timestamps for ip-2 and ip-3 to simulate stale entries
             guard.0.get_mut("ip-2").unwrap().clear();
             guard.0.get_mut("ip-3").unwrap().clear();

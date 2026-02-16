@@ -7,7 +7,7 @@ pub mod prompt;
 
 #[allow(unused_imports)]
 pub use agent::{Agent, AgentBuilder};
-pub use loop_::{process_message, run};
+pub use loop_::run;
 
 #[cfg(test)]
 mod tests {
@@ -18,7 +18,6 @@ mod tests {
     #[test]
     fn run_function_is_reexported() {
         assert_reexport_exists(run);
-        assert_reexport_exists(process_message);
         assert_reexport_exists(loop_::run);
         assert_reexport_exists(loop_::process_message);
     }

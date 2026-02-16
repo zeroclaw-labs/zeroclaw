@@ -74,6 +74,7 @@ impl LucidMemory {
     }
 
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     fn with_options(
         workspace_dir: &Path,
         local: SqliteMemory,

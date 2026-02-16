@@ -6,11 +6,9 @@ pub mod traits;
 pub mod verbose;
 
 pub use self::log::LogObserver;
-pub use self::multi::MultiObserver;
 pub use noop::NoopObserver;
 pub use otel::OtelObserver;
 pub use traits::{Observer, ObserverEvent};
-pub use verbose::VerboseObserver;
 
 use crate::config::ObservabilityConfig;
 

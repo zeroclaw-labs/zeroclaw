@@ -269,7 +269,7 @@ pub fn create_provider_with_url(
             "Groq", "https://api.groq.com/openai", key, AuthStyle::Bearer,
         ))),
         "mistral" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Mistral", "https://api.mistral.ai", key, AuthStyle::Bearer,
+            "Mistral", "https://api.mistral.ai/v1", key, AuthStyle::Bearer,
         ))),
         "xai" | "grok" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "xAI", "https://api.x.ai", key, AuthStyle::Bearer,
