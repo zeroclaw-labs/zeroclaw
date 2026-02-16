@@ -1625,16 +1625,34 @@ impl Default for Config {
 
 impl Config {
     pub fn load_or_init() -> Result<Self> {
-        let home = UserDirs::new()
-            .map(|u| u.home_dir().to_path_buf())
-            .context("Could not find home directory")?;
-        let zeroclaw_dir = home.join(".zeroclaw");
+        // Check ZEROCLAW_WORKSPACE first, before determining config path
+        let (zeroclaw_dir, workspace_dir) =
+            if let Ok(custom_workspace) = std::env::var("ZEROCLAW_WORKSPACE") {
+                if !custom_workspace.is_empty() {
+                    let workspace = PathBuf::from(&custom_workspace);
+                    let config_dir = workspace.join(".zeroclaw");
+                    (config_dir, workspace)
+                } else {
+                    // Fall through to default if empty
+                    let home = UserDirs::new()
+                        .map(|u| u.home_dir().to_path_buf())
+                        .context("Could not find home directory")?;
+                    let default_dir = home.join(".zeroclaw");
+                    (default_dir.clone(), default_dir.join("workspace"))
+                }
+            } else {
+                let home = UserDirs::new()
+                    .map(|u| u.home_dir().to_path_buf())
+                    .context("Could not find home directory")?;
+                let default_dir = home.join(".zeroclaw");
+                (default_dir.clone(), default_dir.join("workspace"))
+            };
+
         let config_path = zeroclaw_dir.join("config.toml");
 
         if !zeroclaw_dir.exists() {
             fs::create_dir_all(&zeroclaw_dir).context("Failed to create .zeroclaw directory")?;
-            fs::create_dir_all(zeroclaw_dir.join("workspace"))
-                .context("Failed to create workspace directory")?;
+            fs::create_dir_all(&workspace_dir).context("Failed to create workspace directory")?;
         }
 
         if config_path.exists() {
@@ -1644,13 +1662,13 @@ impl Config {
                 toml::from_str(&contents).context("Failed to parse config file")?;
             // Set computed paths that are skipped during serialization
             config.config_path = config_path.clone();
-            config.workspace_dir = zeroclaw_dir.join("workspace");
+            config.workspace_dir = workspace_dir;
             config.apply_env_overrides();
             Ok(config)
         } else {
             let mut config = Config::default();
             config.config_path = config_path.clone();
-            config.workspace_dir = zeroclaw_dir.join("workspace");
+            config.workspace_dir = workspace_dir;
             config.save()?;
             config.apply_env_overrides();
             Ok(config)
