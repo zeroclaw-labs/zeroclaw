@@ -5,6 +5,9 @@ use crate::config::{
     RuntimeConfig, SecretsConfig, SlackConfig, TelegramConfig, WebhookConfig,
 };
 use crate::hardware::{self, HardwareConfig};
+use crate::memory::{
+    default_memory_backend_key, memory_backend_profile, selectable_memory_backends,
+};
 use anyhow::{Context, Result};
 use console::style;
 use dialoguer::{Confirm, Input, Select};
@@ -237,8 +240,38 @@ pub fn run_channels_repair_wizard() -> Result<Config> {
 // ── Quick setup (zero prompts) ───────────────────────────────────
 
 /// Non-interactive setup: generates a sensible default config instantly.
-/// Use `zeroclaw onboard` or `zeroclaw onboard --api-key sk-... --provider openrouter --memory sqlite`.
+/// Use `zeroclaw onboard` or `zeroclaw onboard --api-key sk-... --provider openrouter --memory sqlite|lucid`.
 /// Use `zeroclaw onboard --interactive` for the full wizard.
+fn backend_key_from_choice(choice: usize) -> &'static str {
+    selectable_memory_backends()
+        .get(choice)
+        .map_or(default_memory_backend_key(), |backend| backend.key)
+}
+
+fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
+    let profile = memory_backend_profile(backend);
+
+    MemoryConfig {
+        backend: backend.to_string(),
+        auto_save: profile.auto_save_default,
+        hygiene_enabled: profile.uses_sqlite_hygiene,
+        archive_after_days: if profile.uses_sqlite_hygiene { 7 } else { 0 },
+        purge_after_days: if profile.uses_sqlite_hygiene { 30 } else { 0 },
+        conversation_retention_days: 30,
+        embedding_provider: "none".to_string(),
+        embedding_model: "text-embedding-3-small".to_string(),
+        embedding_dimensions: 1536,
+        vector_weight: 0.7,
+        keyword_weight: 0.3,
+        embedding_cache_size: if profile.uses_sqlite_hygiene {
+            10000
+        } else {
+            0
+        },
+        chunk_max_tokens: 512,
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn run_quick_setup(
     api_key: Option<&str>,
@@ -265,36 +298,12 @@ pub fn run_quick_setup(
 
     let provider_name = provider.unwrap_or("openrouter").to_string();
     let model = default_model_for_provider(&provider_name);
-    let memory_backend_name = memory_backend.unwrap_or("sqlite").to_string();
+    let memory_backend_name = memory_backend
+        .unwrap_or(default_memory_backend_key())
+        .to_string();
 
     // Create memory config based on backend choice
-    let memory_config = MemoryConfig {
-        backend: memory_backend_name.clone(),
-        auto_save: memory_backend_name != "none",
-        hygiene_enabled: memory_backend_name == "sqlite",
-        archive_after_days: if memory_backend_name == "sqlite" {
-            7
-        } else {
-            0
-        },
-        purge_after_days: if memory_backend_name == "sqlite" {
-            30
-        } else {
-            0
-        },
-        conversation_retention_days: 30,
-        embedding_provider: "none".to_string(),
-        embedding_model: "text-embedding-3-small".to_string(),
-        embedding_dimensions: 1536,
-        vector_weight: 0.7,
-        keyword_weight: 0.3,
-        embedding_cache_size: if memory_backend_name == "sqlite" {
-            10000
-        } else {
-            0
-        },
-        chunk_max_tokens: 512,
-    };
+    let memory_config = memory_config_defaults_for_backend(&memory_backend_name);
 
     let config = Config {
         workspace_dir: workspace_dir.clone(),
@@ -2164,11 +2173,10 @@ fn setup_memory() -> Result<MemoryConfig> {
     print_bullet("You can always change this later in config.toml.");
     println!();
 
-    let options = vec![
-        "SQLite with Vector Search (recommended) — fast, hybrid search, embeddings",
-        "Markdown Files — simple, human-readable, no dependencies",
-        "None — disable persistent memory",
-    ];
+    let options: Vec<&str> = selectable_memory_backends()
+        .iter()
+        .map(|backend| backend.label)
+        .collect();
 
     let choice = Select::new()
         .with_prompt("  Select memory backend")
@@ -2176,20 +2184,16 @@ fn setup_memory() -> Result<MemoryConfig> {
         .default(0)
         .interact()?;
 
-    let backend = match choice {
-        1 => "markdown",
-        2 => "none",
-        _ => "sqlite", // 0 and any unexpected value defaults to sqlite
-    };
+    let backend = backend_key_from_choice(choice);
+    let profile = memory_backend_profile(backend);
 
-    let auto_save = if backend == "none" {
+    let auto_save = if !profile.auto_save_default {
         false
     } else {
-        let save = Confirm::new()
+        Confirm::new()
             .with_prompt("  Auto-save conversations to memory?")
             .default(true)
-            .interact()?;
-        save
+            .interact()?
     };
 
     println!(
@@ -2199,21 +2203,9 @@ fn setup_memory() -> Result<MemoryConfig> {
         if auto_save { "on" } else { "off" }
     );
 
-    Ok(MemoryConfig {
-        backend: backend.to_string(),
-        auto_save,
-        hygiene_enabled: backend == "sqlite", // Only enable hygiene for SQLite
-        archive_after_days: if backend == "sqlite" { 7 } else { 0 },
-        purge_after_days: if backend == "sqlite" { 30 } else { 0 },
-        conversation_retention_days: 30,
-        embedding_provider: "none".to_string(),
-        embedding_model: "text-embedding-3-small".to_string(),
-        embedding_dimensions: 1536,
-        vector_weight: 0.7,
-        keyword_weight: 0.3,
-        embedding_cache_size: if backend == "sqlite" { 10000 } else { 0 },
-        chunk_max_tokens: 512,
-    })
+    let mut config = memory_config_defaults_for_backend(backend);
+    config.auto_save = auto_save;
+    Ok(config)
 }
 
 // ── Step 3: Channels ────────────────────────────────────────────
@@ -4343,18 +4335,54 @@ mod tests {
     }
 
     #[test]
-    fn default_model_for_minimax_is_m2_5() {
-        assert_eq!(default_model_for_provider("minimax"), "MiniMax-M2.5");
+    fn backend_key_from_choice_maps_supported_backends() {
+        assert_eq!(backend_key_from_choice(0), "sqlite");
+        assert_eq!(backend_key_from_choice(1), "lucid");
+        assert_eq!(backend_key_from_choice(2), "markdown");
+        assert_eq!(backend_key_from_choice(3), "none");
+        assert_eq!(backend_key_from_choice(999), "sqlite");
     }
 
     #[test]
-    fn minimax_onboard_models_include_m2_variants() {
-        let model_names: Vec<&str> = MINIMAX_ONBOARD_MODELS
-            .iter()
-            .map(|(name, _)| *name)
-            .collect();
-        assert_eq!(model_names.first().copied(), Some("MiniMax-M2.5"));
-        assert!(model_names.contains(&"MiniMax-M2.1"));
-        assert!(model_names.contains(&"MiniMax-M2.1-highspeed"));
+    fn memory_backend_profile_marks_lucid_as_optional_sqlite_backed() {
+        let lucid = memory_backend_profile("lucid");
+        assert!(lucid.auto_save_default);
+        assert!(lucid.uses_sqlite_hygiene);
+        assert!(lucid.sqlite_based);
+        assert!(lucid.optional_dependency);
+
+        let markdown = memory_backend_profile("markdown");
+        assert!(markdown.auto_save_default);
+        assert!(!markdown.uses_sqlite_hygiene);
+
+        let none = memory_backend_profile("none");
+        assert!(!none.auto_save_default);
+        assert!(!none.uses_sqlite_hygiene);
+
+        let custom = memory_backend_profile("custom-memory");
+        assert!(custom.auto_save_default);
+        assert!(!custom.uses_sqlite_hygiene);
+    }
+
+    #[test]
+    fn memory_config_defaults_for_lucid_enable_sqlite_hygiene() {
+        let config = memory_config_defaults_for_backend("lucid");
+        assert_eq!(config.backend, "lucid");
+        assert!(config.auto_save);
+        assert!(config.hygiene_enabled);
+        assert_eq!(config.archive_after_days, 7);
+        assert_eq!(config.purge_after_days, 30);
+        assert_eq!(config.embedding_cache_size, 10000);
+    }
+
+    #[test]
+    fn memory_config_defaults_for_none_disable_sqlite_hygiene() {
+        let config = memory_config_defaults_for_backend("none");
+        assert_eq!(config.backend, "none");
+        assert!(!config.auto_save);
+        assert!(!config.hygiene_enabled);
+        assert_eq!(config.archive_after_days, 0);
+        assert_eq!(config.purge_after_days, 0);
+        assert_eq!(config.embedding_cache_size, 0);
     }
 }

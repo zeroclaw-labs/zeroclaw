@@ -699,9 +699,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .default_provider
         .clone()
         .unwrap_or_else(|| "openrouter".into());
-
     let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider(
-        provider_name.as_str(),
+        &provider_name,
         config.api_key.as_deref(),
         &config.reliability,
     )?);
@@ -1163,7 +1162,7 @@ mod tests {
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(ToolCallingProvider),
-            provider_name: Arc::new("test-provider".to_string()),
+            provider_name: Arc::new("openrouter".to_string()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
@@ -1254,7 +1253,7 @@ mod tests {
             provider: Arc::new(SlowProvider {
                 delay: Duration::from_millis(250),
             }),
-            provider_name: Arc::new("test-provider".to_string()),
+            provider_name: Arc::new("openrouter".to_string()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
