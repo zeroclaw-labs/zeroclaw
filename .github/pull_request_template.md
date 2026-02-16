@@ -28,6 +28,14 @@ Describe this PR in 2-5 bullets:
 - Depends on # (if stacked)
 - Supersedes # (if replacing older PR)
 
+## Supersede Attribution (required when `Supersedes #` is used)
+
+- Superseded PRs + authors (`#<pr> by @<author>`, one per line):
+- Integrated scope by source PR (what was materially carried forward):
+- `Co-authored-by` trailers added for materially incorporated contributors? (`Yes/No`)
+- If `No`, explain why (for example: inspiration-only, no direct code/design carry-over):
+- Trailer format check (separate lines, no escaped `\n`): (`Pass/Fail`)
+
 ## Validation Evidence (required)
 
 Commands and result summary:
