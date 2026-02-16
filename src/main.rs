@@ -44,6 +44,7 @@ mod cron;
 mod daemon;
 mod doctor;
 mod gateway;
+mod hardware;
 mod health;
 mod heartbeat;
 mod identity;

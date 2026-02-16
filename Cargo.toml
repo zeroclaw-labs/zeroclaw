@@ -54,6 +54,9 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 
+# Landlock (Linux sandbox) - optional dependency
+landlock = { version = "0.4", optional = true }
+
 # Async traits
 async-trait = "0.1"
 
@@ -65,6 +68,9 @@ cron = "0.12"
 # Interactive CLI prompts
 dialoguer = { version = "0.11", features = ["fuzzy-select"] }
 console = "0.15"
+
+# Hardware discovery (device path globbing)
+glob = "0.3"
 
 # Discord WebSocket gateway
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
@@ -87,6 +93,20 @@ http-body-util = "0.1"
 opentelemetry = { version = "0.31", default-features = false, features = ["trace", "metrics"] }
 opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "metrics"] }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client"] }
+
+[features]
+default = []
+
+# Sandbox backends (platform-specific, opt-in)
+sandbox-landlock = ["landlock"]  # Linux kernel LSM
+sandbox-bubblewrap = []         # User namespaces (Linux/macOS)
+
+# Full security suite
+security-full = ["sandbox-landlock"]
+
+[[bin]]
+name = "zeroclaw"
+path = "src/main.rs"
 
 [profile.release]
 opt-level = "z"      # Optimize for size

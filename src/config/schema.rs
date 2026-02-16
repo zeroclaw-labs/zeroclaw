@@ -63,7 +63,16 @@ pub struct Config {
     pub browser: BrowserConfig,
 
     #[serde(default)]
+    pub http_request: HttpRequestConfig,
+
+    #[serde(default)]
     pub identity: IdentityConfig,
+
+    /// Hardware Abstraction Layer (HAL) configuration.
+    /// Controls how ZeroClaw interfaces with physical hardware
+    /// (GPIO, serial, debug probes).
+    #[serde(default)]
+    pub hardware: crate::hardware::HardwareConfig,
 
     /// Named delegate agents for agent-to-agent handoff.
     ///
@@ -80,6 +89,10 @@ pub struct Config {
     /// ```
     #[serde(default)]
     pub agents: HashMap<String, DelegateAgentConfig>,
+
+    /// Security configuration (sandboxing, resource limits, audit logging)
+    #[serde(default)]
+    pub security: SecurityConfig,
 }
 
 // ── Identity (AIEOS / OpenClaw format) ──────────────────────────
@@ -270,6 +283,32 @@ pub struct BrowserConfig {
     /// Browser session name (for agent-browser automation)
     #[serde(default)]
     pub session_name: Option<String>,
+}
+
+// ── HTTP request tool ───────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HttpRequestConfig {
+    /// Enable `http_request` tool for API interactions
+    #[serde(default)]
+    pub enabled: bool,
+    /// Allowed domains for HTTP requests (exact or subdomain match)
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+    /// Maximum response size in bytes (default: 1MB)
+    #[serde(default = "default_http_max_response_size")]
+    pub max_response_size: usize,
+    /// Request timeout in seconds (default: 30)
+    #[serde(default = "default_http_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_http_max_response_size() -> usize {
+    1_000_000 // 1MB
+}
+
+fn default_http_timeout_secs() -> u64 {
+    30
 }
 
 // ── Memory ───────────────────────────────────────────────────
@@ -878,6 +917,174 @@ pub struct LarkConfig {
     pub use_feishu: bool,
 }
 
+// ── Security Config ─────────────────────────────────────────────────
+
+/// Security configuration for sandboxing, resource limits, and audit logging
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityConfig {
+    /// Sandbox configuration
+    #[serde(default)]
+    pub sandbox: SandboxConfig,
+
+    /// Resource limits
+    #[serde(default)]
+    pub resources: ResourceLimitsConfig,
+
+    /// Audit logging configuration
+    #[serde(default)]
+    pub audit: AuditConfig,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            sandbox: SandboxConfig::default(),
+            resources: ResourceLimitsConfig::default(),
+            audit: AuditConfig::default(),
+        }
+    }
+}
+
+/// Sandbox configuration for OS-level isolation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxConfig {
+    /// Enable sandboxing (None = auto-detect, Some = explicit)
+    #[serde(default)]
+    pub enabled: Option<bool>,
+
+    /// Sandbox backend to use
+    #[serde(default)]
+    pub backend: SandboxBackend,
+
+    /// Custom Firejail arguments (when backend = firejail)
+    #[serde(default)]
+    pub firejail_args: Vec<String>,
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self {
+            enabled: None,  // Auto-detect
+            backend: SandboxBackend::Auto,
+            firejail_args: Vec::new(),
+        }
+    }
+}
+
+/// Sandbox backend selection
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SandboxBackend {
+    /// Auto-detect best available (default)
+    Auto,
+    /// Landlock (Linux kernel LSM, native)
+    Landlock,
+    /// Firejail (user-space sandbox)
+    Firejail,
+    /// Bubblewrap (user namespaces)
+    Bubblewrap,
+    /// Docker container isolation
+    Docker,
+    /// No sandboxing (application-layer only)
+    None,
+}
+
+impl Default for SandboxBackend {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+/// Resource limits for command execution
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceLimitsConfig {
+    /// Maximum memory in MB per command
+    #[serde(default = "default_max_memory_mb")]
+    pub max_memory_mb: u32,
+
+    /// Maximum CPU time in seconds per command
+    #[serde(default = "default_max_cpu_time_seconds")]
+    pub max_cpu_time_seconds: u64,
+
+    /// Maximum number of subprocesses
+    #[serde(default = "default_max_subprocesses")]
+    pub max_subprocesses: u32,
+
+    /// Enable memory monitoring
+    #[serde(default = "default_memory_monitoring_enabled")]
+    pub memory_monitoring: bool,
+}
+
+fn default_max_memory_mb() -> u32 {
+    512
+}
+
+fn default_max_cpu_time_seconds() -> u64 {
+    60
+}
+
+fn default_max_subprocesses() -> u32 {
+    10
+}
+
+fn default_memory_monitoring_enabled() -> bool {
+    true
+}
+
+impl Default for ResourceLimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_memory_mb: default_max_memory_mb(),
+            max_cpu_time_seconds: default_max_cpu_time_seconds(),
+            max_subprocesses: default_max_subprocesses(),
+            memory_monitoring: default_memory_monitoring_enabled(),
+        }
+    }
+}
+
+/// Audit logging configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditConfig {
+    /// Enable audit logging
+    #[serde(default = "default_audit_enabled")]
+    pub enabled: bool,
+
+    /// Path to audit log file (relative to zeroclaw dir)
+    #[serde(default = "default_audit_log_path")]
+    pub log_path: String,
+
+    /// Maximum log size in MB before rotation
+    #[serde(default = "default_audit_max_size_mb")]
+    pub max_size_mb: u32,
+
+    /// Sign events with HMAC for tamper evidence
+    #[serde(default)]
+    pub sign_events: bool,
+}
+
+fn default_audit_enabled() -> bool {
+    true
+}
+
+fn default_audit_log_path() -> String {
+    "audit.log".to_string()
+}
+
+fn default_audit_max_size_mb() -> u32 {
+    100
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_audit_enabled(),
+            log_path: default_audit_log_path(),
+            max_size_mb: default_audit_max_size_mb(),
+            sign_events: false,
+        }
+    }
+}
+
 // ── Config impl ──────────────────────────────────────────────────
 
 impl Default for Config {
@@ -906,8 +1113,11 @@ impl Default for Config {
             composio: ComposioConfig::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
+            http_request: HttpRequestConfig::default(),
             identity: IdentityConfig::default(),
+            hardware: crate::hardware::HardwareConfig::default(),
             agents: HashMap::new(),
+            security: SecurityConfig::default(),
         }
     }
 }
@@ -1257,8 +1467,11 @@ mod tests {
             composio: ComposioConfig::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
+            http_request: HttpRequestConfig::default(),
             identity: IdentityConfig::default(),
+            hardware: crate::hardware::HardwareConfig::default(),
             agents: HashMap::new(),
+            security: SecurityConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -1329,8 +1542,11 @@ default_temperature = 0.7
             composio: ComposioConfig::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
+            http_request: HttpRequestConfig::default(),
             identity: IdentityConfig::default(),
+            hardware: crate::hardware::HardwareConfig::default(),
             agents: HashMap::new(),
+            security: SecurityConfig::default(),
         };
 
         config.save().unwrap();
@@ -1396,6 +1612,7 @@ default_temperature = 0.7
             bot_token: "discord-token".into(),
             guild_id: Some("12345".into()),
             allowed_users: vec![],
+            listen_to_bots: false,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -1409,6 +1626,7 @@ default_temperature = 0.7
             bot_token: "tok".into(),
             guild_id: None,
             allowed_users: vec![],
+            listen_to_bots: false,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
