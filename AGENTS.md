@@ -314,6 +314,37 @@ When a PR supersedes another contributor's PR and carries forward substantive co
 - In the PR body, list superseded PR links and briefly state what was incorporated from each.
 - If no actual code/design was incorporated (only inspiration), do not use `Co-authored-by`; give credit in PR notes instead.
 
+### 9.3 Superseded-PR PR Template (Recommended)
+
+When superseding multiple PRs, use a consistent title/body structure to reduce reviewer ambiguity.
+
+- Recommended title format: `feat(<scope>): unify and supersede #<pr_a>, #<pr_b> [and #<pr_n>]`
+- If this is docs/chore/meta only, keep the same supersede suffix and use the appropriate conventional-commit type.
+- In the PR body, include the following template (fill placeholders, remove non-applicable lines):
+
+```md
+## Supersedes
+- #<pr_a> by @<author_a>
+- #<pr_b> by @<author_b>
+- #<pr_n> by @<author_n>
+
+## Integrated Scope
+- From #<pr_a>: <what was materially incorporated>
+- From #<pr_b>: <what was materially incorporated>
+- From #<pr_n>: <what was materially incorporated>
+
+## Attribution
+- Co-authored-by trailers added for materially incorporated contributors: Yes/No
+- If No, explain why (for example: no direct code/design carry-over)
+
+## Non-goals
+- <explicitly list what was not carried over>
+
+## Risk and Rollback
+- Risk: <summary>
+- Rollback: <revert commit/PR strategy>
+```
+
 Reference docs:
 
 - `CONTRIBUTING.md`
