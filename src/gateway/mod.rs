@@ -46,7 +46,7 @@ pub struct AppState {
     pub security: Arc<SecurityPolicy>,
     pub composio_api_key: Option<String>,
     pub browser_config: crate::config::BrowserConfig,
-    pub base_system_prompt: String,
+    pub workspace_dir: std::path::PathBuf,
     pub registry_db: crate::aria::db::AriaDb,
     pub auto_save: bool,
     pub webhook_secret: Option<Arc<str>>,
@@ -97,33 +97,6 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     } else {
         None
     };
-    let mut tool_descs: Vec<(&str, &str)> = vec![
-        (
-            "shell",
-            "Execute terminal commands for diagnostics/build/test and controlled automation.",
-        ),
-        ("file_read", "Read file contents from workspace paths."),
-        ("file_write", "Write files in workspace paths."),
-        (
-            "memory_store",
-            "Store durable facts, preferences, and decisions in memory.",
-        ),
-        (
-            "memory_recall",
-            "Recall relevant memory entries for context.",
-        ),
-        ("memory_forget", "Delete stale or incorrect memory entries."),
-    ];
-    if config.browser.enabled {
-        tool_descs.push((
-            "browser_open",
-            "Open allowlisted HTTPS URLs in Brave Browser.",
-        ));
-    }
-    let skills = crate::skills::load_skills(&config.workspace_dir);
-    let base_system_prompt =
-        crate::channels::build_system_prompt(&config.workspace_dir, &model, &tool_descs, &skills);
-
     // Extract webhook secret for authentication
     let webhook_secret: Option<Arc<str>> = config
         .channels_config
@@ -208,7 +181,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         security,
         composio_api_key,
         browser_config: config.browser.clone(),
-        base_system_prompt,
+        workspace_dir: config.workspace_dir.clone(),
         registry_db: aria_registries.db.clone(),
         auto_save: config.memory.auto_save,
         webhook_secret,
@@ -610,6 +583,120 @@ fn mode_prompt(mode: ChatRunMode) -> &'static str {
     }
 }
 
+fn load_registry_tools_prompt_section(
+    db: &crate::aria::db::AriaDb,
+    tenant_id: &str,
+) -> anyhow::Result<String> {
+    db.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT name, description, version, schema
+             FROM aria_tools
+             WHERE tenant_id=?1 AND status='active'
+             ORDER BY updated_at DESC",
+        )?;
+        let mut rows = stmt.query([tenant_id])?;
+        let mut out = String::new();
+        while let Some(row) = rows.next()? {
+            if out.is_empty() {
+                out.push_str("## Available Tools\n\n");
+            }
+            let name: String = row.get(0)?;
+            let description: String = row.get::<_, Option<String>>(1)?.unwrap_or_default();
+            let version: i64 = row.get::<_, Option<i64>>(2)?.unwrap_or(1);
+            let schema: String = row
+                .get::<_, Option<String>>(3)?
+                .unwrap_or_else(|| "{}".to_string());
+            out.push_str(&format!(
+                "- **{}** (v{}): {}\n  Schema: {}\n",
+                name, version, description, schema
+            ));
+        }
+        Ok(out)
+    })
+}
+
+fn load_registry_agents_prompt_section(
+    db: &crate::aria::db::AriaDb,
+    tenant_id: &str,
+) -> anyhow::Result<String> {
+    db.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT name, description, version, model
+             FROM aria_agents
+             WHERE tenant_id=?1 AND status='active'
+             ORDER BY updated_at DESC",
+        )?;
+        let mut rows = stmt.query([tenant_id])?;
+        let mut out = String::new();
+        while let Some(row) = rows.next()? {
+            if out.is_empty() {
+                out.push_str("## Available Agents\n\n");
+            }
+            let name: String = row.get(0)?;
+            let description: String = row.get::<_, Option<String>>(1)?.unwrap_or_default();
+            let version: i64 = row.get::<_, Option<i64>>(2)?.unwrap_or(1);
+            let model: String = row
+                .get::<_, Option<String>>(3)?
+                .unwrap_or_else(|| "default".to_string());
+            out.push_str(&format!(
+                "- **{}** (v{}): {}\n  Model: {}\n",
+                name, version, description, model
+            ));
+        }
+        Ok(out)
+    })
+}
+
+fn build_live_system_prompt(
+    state: &AppState,
+    tenant: &str,
+    tools: &[Box<dyn crate::tools::Tool>],
+    mode_hint: &str,
+) -> String {
+    let skills = crate::skills::load_skills(&state.workspace_dir);
+    let descriptors: Vec<crate::prompt::SkillDescriptor> = skills
+        .iter()
+        .map(|s| crate::prompt::SkillDescriptor {
+            name: s.name.clone(),
+            description: s.description.clone(),
+        })
+        .collect();
+
+    let tool_descs_owned: Vec<(String, String)> = tools
+        .iter()
+        .map(|t| (t.name().to_string(), t.description().to_string()))
+        .collect();
+    let tool_descs: Vec<(&str, &str)> = tool_descs_owned
+        .iter()
+        .map(|(name, desc)| (name.as_str(), desc.as_str()))
+        .collect();
+
+    let registry_tools_section = load_registry_tools_prompt_section(&state.registry_db, tenant)
+        .unwrap_or_else(|e| {
+            tracing::warn!(tenant, error = %e, "Failed to build registry tools prompt section");
+            String::new()
+        });
+    let registry_agents_section = load_registry_agents_prompt_section(&state.registry_db, tenant)
+        .unwrap_or_else(|e| {
+            tracing::warn!(tenant, error = %e, "Failed to build registry agents prompt section");
+            String::new()
+        });
+
+    let prompt = crate::prompt::SystemPromptBuilder::new(&state.workspace_dir)
+        .tools(&tool_descs)
+        .skills(&descriptors)
+        .model(&state.model)
+        .registry_tools_section(registry_tools_section)
+        .registry_agents_section(registry_agents_section)
+        .build();
+
+    if mode_hint.is_empty() {
+        prompt
+    } else {
+        format!("{prompt}\n\n{mode_hint}")
+    }
+}
+
 fn ensure_chat_row(state: &AppState, tenant: &str, chat_id: &str, seed: &str, ts: i64) {
     let _ = state.registry_db.with_conn(|conn| {
         let exists: Option<String> = conn
@@ -767,11 +854,7 @@ async fn api_send_message(
     );
     let memory_context = build_chat_memory_context(state.mem.as_ref(), &content).await;
     let mode_hint = mode_prompt(mode);
-    let system_prompt = if mode_hint.is_empty() {
-        state.base_system_prompt.clone()
-    } else {
-        format!("{}\n\n{}", state.base_system_prompt, mode_hint)
-    };
+    let system_prompt = build_live_system_prompt(&state, &tenant, &tools, mode_hint);
     let enriched = if memory_context.is_empty() {
         content.clone()
     } else {
@@ -2978,11 +3061,7 @@ async fn handle_chat_socket(mut socket: ws::WebSocket, state: AppState, tenant: 
         );
         let memory_context = build_chat_memory_context(state.mem.as_ref(), &content).await;
         let mode_hint = mode_prompt(mode);
-        let system_prompt = if mode_hint.is_empty() {
-            state.base_system_prompt.clone()
-        } else {
-            format!("{}\n\n{}", state.base_system_prompt, mode_hint)
-        };
+        let system_prompt = build_live_system_prompt(&state, &tenant, &tools, mode_hint);
         let enriched = if memory_context.is_empty() {
             content.clone()
         } else {
@@ -3254,5 +3333,85 @@ mod tests {
     fn app_state_is_clone() {
         fn assert_clone<T: Clone>() {}
         assert_clone::<AppState>();
+    }
+
+    #[test]
+    fn tools_prompt_section_reads_live_registry_updates() {
+        let db = crate::aria::db::AriaDb::open_in_memory().unwrap();
+        let tenant = "t1";
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO aria_tools (id, tenant_id, name, description, schema, status, version, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'active', 1, ?6, ?6)",
+                rusqlite::params![
+                    "tool_1",
+                    tenant,
+                    "live_tool",
+                    "v1",
+                    "{\"type\":\"object\",\"properties\":{}}",
+                    "2026-01-01T00:00:00Z"
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let before = load_registry_tools_prompt_section(&db, tenant).unwrap();
+        assert!(before.contains("live_tool"));
+        assert!(before.contains("v1"));
+
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE aria_tools SET description=?1, updated_at=?2 WHERE id=?3",
+                rusqlite::params!["v2", "2026-01-01T00:01:00Z", "tool_1"],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let after = load_registry_tools_prompt_section(&db, tenant).unwrap();
+        assert!(after.contains("live_tool"));
+        assert!(after.contains("v2"));
+        assert!(!after.contains("): v1\n"));
+    }
+
+    #[test]
+    fn agents_prompt_section_reads_live_registry_updates() {
+        let db = crate::aria::db::AriaDb::open_in_memory().unwrap();
+        let tenant = "t1";
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO aria_agents (id, tenant_id, name, description, model, status, version, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'active', 1, ?6, ?6)",
+                rusqlite::params![
+                    "agent_1",
+                    tenant,
+                    "writer",
+                    "v1",
+                    "model-a",
+                    "2026-01-01T00:00:00Z"
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let before = load_registry_agents_prompt_section(&db, tenant).unwrap();
+        assert!(before.contains("writer"));
+        assert!(before.contains("model-a"));
+
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE aria_agents SET model=?1, updated_at=?2 WHERE id=?3",
+                rusqlite::params!["model-b", "2026-01-01T00:01:00Z", "agent_1"],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let after = load_registry_agents_prompt_section(&db, tenant).unwrap();
+        assert!(after.contains("writer"));
+        assert!(after.contains("Model: model-b"));
+        assert!(!after.contains("Model: model-a"));
     }
 }

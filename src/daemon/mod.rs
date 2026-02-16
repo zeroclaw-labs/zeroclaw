@@ -249,9 +249,8 @@ fn wire_cron_bridge_hooks(config: &Config) -> Result<()> {
         let job = crate::cron::add_job(&add_cfg, expr, command)?;
         Ok(crate::aria::cron_bridge::CronJobHandle { id: job.id })
     });
-    let remove_job: crate::aria::cron_bridge::RemoveJobFn = Arc::new(move |job_id| {
-        crate::cron::remove_job(&remove_cfg, job_id)
-    });
+    let remove_job: crate::aria::cron_bridge::RemoveJobFn =
+        Arc::new(move |job_id| crate::cron::remove_job(&remove_cfg, job_id));
 
     let bridge = Arc::new(crate::aria::cron_bridge::CronBridge::new(
         aria_db, add_job, remove_job,

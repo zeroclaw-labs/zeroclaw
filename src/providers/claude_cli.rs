@@ -288,7 +288,9 @@ impl ClaudeCliProvider {
                                     .and_then(Value::as_str)
                                     .unwrap_or("")
                                     .to_string();
-                                if !id.is_empty() && !name.is_empty() && !seen_tool_ids.contains(&id)
+                                if !id.is_empty()
+                                    && !name.is_empty()
+                                    && !seen_tool_ids.contains(&id)
                                 {
                                     seen_tool_ids.insert(id.clone());
                                     let input = block

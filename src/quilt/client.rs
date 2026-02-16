@@ -75,16 +75,26 @@ pub struct QuiltContainerStatus {
     #[serde(default, deserialize_with = "deserialize_opt_f64_flexible")]
     pub cpu_limit_percent: Option<f64>,
     pub labels: Option<HashMap<String, String>>,
-    #[serde(default, alias = "started_at", deserialize_with = "deserialize_opt_epoch_ms")]
+    #[serde(
+        default,
+        alias = "started_at",
+        deserialize_with = "deserialize_opt_epoch_ms"
+    )]
     pub started_at_ms: Option<i64>,
-    #[serde(default, alias = "exited_at", deserialize_with = "deserialize_opt_epoch_ms")]
+    #[serde(
+        default,
+        alias = "exited_at",
+        deserialize_with = "deserialize_opt_epoch_ms"
+    )]
     pub exited_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum ContainersListResponse {
-    Wrapped { containers: Vec<QuiltContainerStatus> },
+    Wrapped {
+        containers: Vec<QuiltContainerStatus>,
+    },
     Direct(Vec<QuiltContainerStatus>),
 }
 

@@ -84,7 +84,11 @@ impl FeedExecutor {
                 .chars()
                 .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
                 .collect::<String>();
-            if name.is_empty() { None } else { Some(name) }
+            if name.is_empty() {
+                None
+            } else {
+                Some(name)
+            }
         }
 
         fn parse_card_type(s: &str) -> Result<FeedCardType> {
@@ -98,7 +102,8 @@ impl FeedExecutor {
             v: &'a serde_json::Value,
             ctx: &str,
         ) -> Result<&'a serde_json::Map<String, serde_json::Value>> {
-            v.as_object().with_context(|| format!("{ctx} must be an object"))
+            v.as_object()
+                .with_context(|| format!("{ctx} must be an object"))
         }
 
         fn require_str<'a>(
@@ -204,7 +209,9 @@ impl FeedExecutor {
                     obj.get("options")
                         .and_then(|v| v.as_array())
                         .filter(|a| a.len() >= 2)
-                        .with_context(|| "metadata.options must be an array with at least 2 items")?;
+                        .with_context(|| {
+                            "metadata.options must be an array with at least 2 items"
+                        })?;
                     require_int(obj, "totalVotes", "metadata")?;
                 }
                 Chart => {
@@ -430,7 +437,9 @@ impl FeedExecutor {
                 items: Vec::new(),
                 summary: None,
                 metadata: None,
-                error: Some("Feed handler class not found (no `class Name` in handler_code)".into()),
+                error: Some(
+                    "Feed handler class not found (no `class Name` in handler_code)".into(),
+                ),
             });
         };
 
@@ -662,7 +671,10 @@ async function __run() {{
                         );
                     }
                 };
-                let ok = parsed.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+                let ok = parsed
+                    .get("success")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 if !ok {
                     let err = parsed
                         .get("error")
@@ -690,7 +702,10 @@ async function __run() {{
                         items: Vec::new(),
                         summary: None,
                         metadata: None,
-                        error: Some(format!("Handler exited with code {}: {hint}", result.exit_code)),
+                        error: Some(format!(
+                            "Handler exited with code {}: {hint}",
+                            result.exit_code
+                        )),
                     });
                 }
 
@@ -708,7 +723,9 @@ async function __run() {{
                     let title = require_str(item_obj, "title", &format!("items[{i}]"))?.to_string();
                     let card_type = parse_card_type(ct).with_context(|| format!("items[{i}]"))?;
 
-                    let meta = item_obj.get("metadata").context("items[].metadata is required")?;
+                    let meta = item_obj
+                        .get("metadata")
+                        .context("items[].metadata is required")?;
                     validate_metadata(&card_type, meta)
                         .with_context(|| format!("items[{i}].metadata"))?;
 
@@ -716,9 +733,18 @@ async function __run() {{
                     let meta_map: std::collections::HashMap<String, serde_json::Value> =
                         meta_obj.clone().into_iter().collect();
 
-                    let body = item_obj.get("body").and_then(|v| v.as_str()).map(|s| s.to_string());
-                    let source = item_obj.get("source").and_then(|v| v.as_str()).map(|s| s.to_string());
-                    let url = item_obj.get("url").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    let body = item_obj
+                        .get("body")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let source = item_obj
+                        .get("source")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let url = item_obj
+                        .get("url")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
                     let ts = item_obj
                         .get("timestamp")
                         .and_then(|v| v.as_i64())
@@ -736,11 +762,20 @@ async function __run() {{
                 }
 
                 Ok(FeedResult {
-                    success: res_obj.get("success").and_then(|v| v.as_bool()).unwrap_or(true),
+                    success: res_obj
+                        .get("success")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true),
                     items: out_items,
-                    summary: res_obj.get("summary").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    summary: res_obj
+                        .get("summary")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
                     metadata: res_obj.get("metadata").cloned(),
-                    error: res_obj.get("error").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    error: res_obj
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
                 })
             }
             Err(e) => Ok(FeedResult {
@@ -887,10 +922,16 @@ mod tests {
                 url: Some(format!("https://example.com/{i}")),
                 metadata: Some(HashMap::from([
                     ("id".to_string(), serde_json::json!(format!("n_{i}"))),
-                    ("headline".to_string(), serde_json::json!(format!("Headline {i}"))),
+                    (
+                        "headline".to_string(),
+                        serde_json::json!(format!("Headline {i}")),
+                    ),
                     ("source".to_string(), serde_json::json!("test")),
                     ("category".to_string(), serde_json::json!("test")),
-                    ("timestamp".to_string(), serde_json::json!(Utc::now().to_rfc3339())),
+                    (
+                        "timestamp".to_string(),
+                        serde_json::json!(Utc::now().to_rfc3339()),
+                    ),
                 ])),
                 timestamp: Some(Utc::now().timestamp_millis()),
             })
@@ -960,7 +1001,10 @@ mod tests {
                 ("headline".to_string(), serde_json::json!("Test News")),
                 ("source".to_string(), serde_json::json!("reuters")),
                 ("category".to_string(), serde_json::json!("markets")),
-                ("timestamp".to_string(), serde_json::json!("2025-01-01T00:00:00Z")),
+                (
+                    "timestamp".to_string(),
+                    serde_json::json!("2025-01-01T00:00:00Z"),
+                ),
             ])),
             timestamp: Some(1_700_000_000_000),
         }];

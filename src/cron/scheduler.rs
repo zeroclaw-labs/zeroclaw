@@ -72,7 +72,9 @@ pub async fn run(config: Config) -> Result<()> {
                     crate::health::mark_component_error("scheduler", e.to_string());
                     tracing::warn!("Failed to remove one-shot cron job {}: {e}", job.id);
                 }
-            } else if let Err(e) = reschedule_after_run(&config, &job, outcome.success, &outcome.output) {
+            } else if let Err(e) =
+                reschedule_after_run(&config, &job, outcome.success, &outcome.output)
+            {
                 crate::health::mark_component_error("scheduler", e.to_string());
                 tracing::warn!("Failed to persist scheduler run result: {e}");
             }
@@ -258,7 +260,10 @@ fn payload_message(payload_kind: &str, payload_data: &str, name: &str) -> (Strin
                 .and_then(Value::as_str)
                 .unwrap_or("cron trigger")
                 .to_string();
-            let model = parsed.get("model").and_then(Value::as_str).map(str::to_owned);
+            let model = parsed
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             (text, model)
         }
         _ => (format!("[Cron:{name}] trigger"), None),
@@ -336,8 +341,16 @@ async fn run_aria_cron_function(config: &Config, cron_func_id: &str) -> JobRunOu
         }
     });
 
-    let Some((tenant_id, name, payload_kind, payload_data, wake_mode, enabled, status, delete_after_run)) =
-        row.unwrap_or(None)
+    let Some((
+        tenant_id,
+        name,
+        payload_kind,
+        payload_data,
+        wake_mode,
+        enabled,
+        status,
+        delete_after_run,
+    )) = row.unwrap_or(None)
     else {
         return JobRunOutcome {
             success: true,

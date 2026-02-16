@@ -60,7 +60,11 @@ pub struct CronBridge {
 
 impl CronBridge {
     pub fn new(db: AriaDb, add_job: AddJobFn, remove_job: RemoveJobFn) -> Self {
-        Self { db, add_job, remove_job }
+        Self {
+            db,
+            add_job,
+            remove_job,
+        }
     }
 
     /// Sync a single cron function to the runtime cron system.
@@ -252,15 +256,11 @@ pub fn schedule_to_cron_expression(kind: &str, data: &str) -> Result<String> {
         "cron" => {
             // schedule_data contains the cron expression itself (possibly wrapped in JSON)
             let expr = if data.starts_with('"') {
-                serde_json::from_str::<String>(data)
-                    .unwrap_or_else(|_| data.to_string())
+                serde_json::from_str::<String>(data).unwrap_or_else(|_| data.to_string())
             } else if data.starts_with('{') {
                 let parsed: serde_json::Value =
                     serde_json::from_str(data).context("Invalid cron schedule JSON")?;
-                parsed["expr"]
-                    .as_str()
-                    .unwrap_or(data)
-                    .to_string()
+                parsed["expr"].as_str().unwrap_or(data).to_string()
             } else {
                 data.to_string()
             };
@@ -334,7 +334,9 @@ mod tests {
         let add_counter = counter.clone();
         let add_fn: AddJobFn = Arc::new(move |_expr, _cmd| {
             let n = add_counter.fetch_add(1, AtomicOrdering::Relaxed);
-            Ok(CronJobHandle { id: format!("job-{n}") })
+            Ok(CronJobHandle {
+                id: format!("job-{n}"),
+            })
         });
         let remove_fn: RemoveJobFn = Arc::new(|_id| Ok(()));
 
@@ -359,7 +361,15 @@ mod tests {
                   enabled, status, created_at, updated_at)
                  VALUES (?1, 'test-tenant', ?2, ?3, ?4, 'systemEvent', '{\"text\":\"hello\"}',
                          ?5, ?6, ?7, ?7)",
-                params![id, name, schedule_kind, schedule_data, enabled as i32, status, now],
+                params![
+                    id,
+                    name,
+                    schedule_kind,
+                    schedule_data,
+                    enabled as i32,
+                    status,
+                    now
+                ],
             )?;
             Ok(())
         })
@@ -493,7 +503,15 @@ mod tests {
     fn sync_cron_creates_job() {
         let (db, bridge) = setup();
 
-        insert_cron_function(&db, "cf-1", "test-cron", "cron", "*/5 * * * *", true, "active");
+        insert_cron_function(
+            &db,
+            "cf-1",
+            "test-cron",
+            "cron",
+            "*/5 * * * *",
+            true,
+            "active",
+        );
 
         bridge.sync_cron("cf-1").unwrap();
 
@@ -515,7 +533,15 @@ mod tests {
     fn sync_cron_skips_disabled() {
         let (db, bridge) = setup();
 
-        insert_cron_function(&db, "cf-2", "disabled-cron", "cron", "*/5 * * * *", false, "active");
+        insert_cron_function(
+            &db,
+            "cf-2",
+            "disabled-cron",
+            "cron",
+            "*/5 * * * *",
+            false,
+            "active",
+        );
 
         bridge.sync_cron("cf-2").unwrap();
 
@@ -545,7 +571,15 @@ mod tests {
     fn remove_cron_clears_job_id() {
         let (db, bridge) = setup();
 
-        insert_cron_function(&db, "cf-3", "to-remove", "cron", "*/10 * * * *", true, "active");
+        insert_cron_function(
+            &db,
+            "cf-3",
+            "to-remove",
+            "cron",
+            "*/10 * * * *",
+            true,
+            "active",
+        );
         bridge.sync_cron("cf-3").unwrap();
 
         // Verify job was created
@@ -582,9 +616,33 @@ mod tests {
         let (db, bridge) = setup();
 
         insert_cron_function(&db, "cf-a", "cron-a", "cron", "*/5 * * * *", true, "active");
-        insert_cron_function(&db, "cf-b", "cron-b", "cron", "*/10 * * * *", true, "active");
-        insert_cron_function(&db, "cf-c", "cron-c", "cron", "*/15 * * * *", false, "active");
-        insert_cron_function(&db, "cf-d", "cron-d", "cron", "*/20 * * * *", true, "deleted");
+        insert_cron_function(
+            &db,
+            "cf-b",
+            "cron-b",
+            "cron",
+            "*/10 * * * *",
+            true,
+            "active",
+        );
+        insert_cron_function(
+            &db,
+            "cf-c",
+            "cron-c",
+            "cron",
+            "*/15 * * * *",
+            false,
+            "active",
+        );
+        insert_cron_function(
+            &db,
+            "cf-d",
+            "cron-d",
+            "cron",
+            "*/20 * * * *",
+            true,
+            "deleted",
+        );
 
         bridge.sync_all().unwrap();
 
@@ -604,14 +662,22 @@ mod tests {
         assert!(get_job_id("cf-a").is_some());
         assert!(get_job_id("cf-b").is_some());
         assert!(get_job_id("cf-c").is_none()); // disabled
-        // cf-d is deleted, not in sync_all query
+                                               // cf-d is deleted, not in sync_all query
     }
 
     #[test]
     fn sync_cron_replaces_existing_job() {
         let (db, bridge) = setup();
 
-        insert_cron_function(&db, "cf-5", "replace-me", "cron", "*/5 * * * *", true, "active");
+        insert_cron_function(
+            &db,
+            "cf-5",
+            "replace-me",
+            "cron",
+            "*/5 * * * *",
+            true,
+            "active",
+        );
 
         // First sync
         bridge.sync_cron("cf-5").unwrap();

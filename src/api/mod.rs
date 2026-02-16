@@ -206,10 +206,7 @@ pub fn registry_router(db: AriaDb) -> Router {
         .route("/api/v1/registry/containers", post(containers_upload))
         .route("/api/v1/registry/containers", get(containers_list))
         .route("/api/v1/registry/containers/:id", get(containers_get))
-        .route(
-            "/api/v1/registry/containers/:id",
-            delete(containers_delete),
-        )
+        .route("/api/v1/registry/containers/:id", delete(containers_delete))
         // ── Networks ──────────────────────────────────────────
         .route("/api/v1/registry/networks", post(networks_upload))
         .route("/api/v1/registry/networks", get(networks_list))

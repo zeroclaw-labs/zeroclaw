@@ -253,7 +253,9 @@ async fn execute_handler_with_quilt(
     tool: &RegistryTool,
     args: Value,
 ) -> anyhow::Result<ToolResult> {
-    use crate::quilt::client::{QuiltClient, QuiltContainerState, QuiltExecCommand, QuiltExecParams};
+    use crate::quilt::client::{
+        QuiltClient, QuiltContainerState, QuiltExecCommand, QuiltExecParams,
+    };
 
     let quilt = match QuiltClient::from_env() {
         Ok(client) => client,
