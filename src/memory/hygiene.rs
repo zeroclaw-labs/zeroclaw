@@ -306,6 +306,8 @@ fn prune_conversation_rows(workspace_dir: &Path, retention_days: u32) -> Result<
     }
 
     let conn = Connection::open(db_path)?;
+    // Use WAL so hygiene pruning doesn't block agent reads
+    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
     let cutoff = (Local::now() - Duration::days(i64::from(retention_days))).to_rfc3339();
 
     let affected = conn.execute(

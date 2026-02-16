@@ -50,6 +50,21 @@ impl SqliteMemory {
         }
 
         let conn = Connection::open(&db_path)?;
+
+        // ── Production-grade PRAGMA tuning ──────────────────────
+        // WAL mode: concurrent reads during writes, crash-safe
+        // normal sync: 2× write speed, still durable on WAL
+        // mmap 8 MB: let the OS page-cache serve hot reads
+        // cache 2 MB: keep ~500 hot pages in-process
+        // temp_store memory: temp tables never hit disk
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous  = NORMAL;
+             PRAGMA mmap_size    = 8388608;
+             PRAGMA cache_size   = -2000;
+             PRAGMA temp_store   = MEMORY;",
+        )?;
+
         Self::init_schema(&conn)?;
 
         Ok(Self {

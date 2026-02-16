@@ -4,6 +4,7 @@ pub mod composio;
 pub mod delegate;
 pub mod file_read;
 pub mod file_write;
+pub mod git_operations;
 pub mod http_request;
 pub mod image_info;
 pub mod memory_forget;
@@ -19,6 +20,7 @@ pub use composio::ComposioTool;
 pub use delegate::DelegateTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
+pub use git_operations::GitOperationsTool;
 pub use http_request::HttpRequestTool;
 pub use image_info::ImageInfoTool;
 pub use memory_forget::MemoryForgetTool;
@@ -62,6 +64,7 @@ pub fn all_tools(
     composio_key: Option<&str>,
     browser_config: &crate::config::BrowserConfig,
     http_config: &crate::config::HttpRequestConfig,
+    workspace_dir: &std::path::Path,
     agents: &HashMap<String, DelegateAgentConfig>,
     fallback_api_key: Option<&str>,
 ) -> Vec<Box<dyn Tool>> {
@@ -72,6 +75,7 @@ pub fn all_tools(
         composio_key,
         browser_config,
         http_config,
+        workspace_dir,
         agents,
         fallback_api_key,
     )
@@ -86,6 +90,7 @@ pub fn all_tools_with_runtime(
     composio_key: Option<&str>,
     browser_config: &crate::config::BrowserConfig,
     http_config: &crate::config::HttpRequestConfig,
+    workspace_dir: &std::path::Path,
     agents: &HashMap<String, DelegateAgentConfig>,
     fallback_api_key: Option<&str>,
 ) -> Vec<Box<dyn Tool>> {
@@ -96,6 +101,7 @@ pub fn all_tools_with_runtime(
         Box::new(MemoryStoreTool::new(memory.clone())),
         Box::new(MemoryRecallTool::new(memory.clone())),
         Box::new(MemoryForgetTool::new(memory)),
+        Box::new(GitOperationsTool::new(security.clone(), workspace_dir.to_path_buf())),
     ];
 
     if browser_config.enabled {
@@ -178,7 +184,7 @@ mod tests {
         };
         let http = crate::config::HttpRequestConfig::default();
 
-        let tools = all_tools(&security, mem, None, &browser, &http, &HashMap::new(), None);
+        let tools = all_tools(&security, mem, None, &browser, &http, tmp.path(), &HashMap::new(), None);
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"browser_open"));
     }
@@ -202,7 +208,7 @@ mod tests {
         };
         let http = crate::config::HttpRequestConfig::default();
 
-        let tools = all_tools(&security, mem, None, &browser, &http, &HashMap::new(), None);
+        let tools = all_tools(&security, mem, None, &browser, &http, tmp.path(), &HashMap::new(), None);
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"browser_open"));
     }
@@ -328,15 +334,7 @@ mod tests {
             },
         );
 
-        let tools = all_tools(
-            &security,
-            mem,
-            None,
-            &browser,
-            &http,
-            &agents,
-            Some("sk-test"),
-        );
+        let tools = all_tools(&security, mem, None, &browser, &http, tmp.path(), &agents, Some("sk-test"));
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"delegate"));
     }
@@ -355,7 +353,7 @@ mod tests {
         let browser = BrowserConfig::default();
         let http = crate::config::HttpRequestConfig::default();
 
-        let tools = all_tools(&security, mem, None, &browser, &http, &HashMap::new(), None);
+        let tools = all_tools(&security, mem, None, &browser, &http, tmp.path(), &HashMap::new(), None);
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"delegate"));
     }
