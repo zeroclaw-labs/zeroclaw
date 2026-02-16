@@ -441,6 +441,7 @@ MIT — see [LICENSE](LICENSE)
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Implement a trait, submit a PR:
+- CI workflow guide: [docs/ci-map.md](docs/ci-map.md)
 - New `Provider` → `src/providers/`
 - New `Channel` → `src/channels/`
 - New `Observer` → `src/observability/`
