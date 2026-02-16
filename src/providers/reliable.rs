@@ -392,13 +392,13 @@ mod tests {
             _message: &str,
             model: &str,
             _temperature: f64,
-        ) -> anyhow::Result<String> {
+        ) -> anyhow::Result<ChatResponse> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.models_seen.lock().unwrap().push(model.to_string());
             if self.fail_models.contains(&model) {
                 anyhow::bail!("500 model {} unavailable", model);
             }
-            Ok(self.response.to_string())
+            Ok(ChatResponse::with_text(self.response))
         }
     }
 
@@ -666,7 +666,7 @@ mod tests {
         .with_model_fallbacks(fallbacks);
 
         let result = provider.chat("hello", "claude-opus", 0.0).await.unwrap();
-        assert_eq!(result, "ok from sonnet");
+        assert_eq!(result.text_or_empty(), "ok from sonnet");
 
         let seen = mock.models_seen.lock().unwrap();
         assert_eq!(seen.len(), 2);
@@ -725,7 +725,7 @@ mod tests {
         );
         // No model_fallbacks set — should work exactly as before
         let result = provider.chat("hello", "test", 0.0).await.unwrap();
-        assert_eq!(result, "ok");
+        assert_eq!(result.text_or_empty(), "ok");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
@@ -822,7 +822,7 @@ mod tests {
             message: &str,
             model: &str,
             temperature: f64,
-        ) -> anyhow::Result<String> {
+        ) -> anyhow::Result<ChatResponse> {
             self.as_ref()
                 .chat_with_system(system_prompt, message, model, temperature)
                 .await
