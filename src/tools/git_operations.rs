@@ -2,7 +2,6 @@ use super::traits::{Tool, ToolResult};
 use crate::security::{AutonomyLevel, SecurityPolicy};
 use async_trait::async_trait;
 use serde_json::json;
-use std::path::Path;
 use std::sync::Arc;
 
 /// Git operations tool for structured repository management.
@@ -556,6 +555,7 @@ impl Tool for GitOperationsTool {
 mod tests {
     use super::*;
     use crate::security::SecurityPolicy;
+    use std::path::Path;
     use tempfile::TempDir;
 
     fn test_tool(dir: &Path) -> GitOperationsTool {

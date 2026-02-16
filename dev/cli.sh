@@ -46,6 +46,7 @@ function print_help {
     echo -e "  ${GREEN}agent${NC}   Enter Agent (ZeroClaw CLI)"
     echo -e "  ${GREEN}logs${NC}    View logs"
     echo -e "  ${GREEN}build${NC}   Rebuild images"
+    echo -e "  ${GREEN}ci${NC}      Run local CI checks in Docker (see ./dev/ci.sh)"
     echo -e "  ${GREEN}clean${NC}   Stop and wipe workspace data"
 }
 
@@ -92,6 +93,15 @@ case "$1" in
         ensure_config
         docker compose -f "$COMPOSE_FILE" up -d
         echo -e "${GREEN}✅ Rebuild complete.${NC}"
+        ;;
+
+    ci)
+        shift
+        if [ "$BASE_DIR" = "." ]; then
+            ./ci.sh "${@:-all}"
+        else
+            ./dev/ci.sh "${@:-all}"
+        fi
         ;;
 
     clean)
