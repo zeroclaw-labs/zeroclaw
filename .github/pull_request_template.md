@@ -10,7 +10,7 @@ Describe this PR in 2-5 bullets:
 ## Label Snapshot (required)
 
 - Risk label (`risk: low|medium|high`):
-- Size label (`size: XS|S|M|L|XL`):
+- Size label (`size: XS|S|M|L|XL`, auto-managed/read-only):
 - Scope labels (`core|agent|channel|config|cron|daemon|doctor|gateway|health|heartbeat|integration|memory|observability|onboard|provider|runtime|security|service|skillforge|skills|tool|tunnel|docs|dependencies|ci|tests|scripts|dev`, comma-separated):
 - Module labels (`<module>:<component>`, for example `channel:telegram`, `provider:kimi`, `tool:shell`):
 - Contributor tier label (`experienced contributor|principal contributor|distinguished contributor`, auto-managed/read-only; author merged PRs >=10/20/50):

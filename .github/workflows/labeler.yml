@@ -32,11 +32,15 @@ jobs:
             const sizeLabels = ["size: XS", "size: S", "size: M", "size: L", "size: XL"];
             const computedRiskLabels = ["risk: low", "risk: medium", "risk: high"];
             const manualRiskOverrideLabel = "risk: manual";
-            const managedRiskLabels = new Set([manualRiskOverrideLabel, ...computedRiskLabels]);
+            const managedEnforcedLabels = new Set([
+              ...sizeLabels,
+              manualRiskOverrideLabel,
+              ...computedRiskLabels,
+            ]);
             const legacyTrustedContributorLabel = "trusted contributor";
 
-            if ((action === "labeled" || action === "unlabeled") && !managedRiskLabels.has(changedLabel)) {
-              core.info(`skip non-risk label event: ${changedLabel || "unknown"}`);
+            if ((action === "labeled" || action === "unlabeled") && !managedEnforcedLabels.has(changedLabel)) {
+              core.info(`skip non-size/risk label event: ${changedLabel || "unknown"}`);
               return;
             }
 
