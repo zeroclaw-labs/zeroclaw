@@ -1509,10 +1509,7 @@ mod tests {
             timestamp: 2,
         };
 
-        assert_ne!(
-            conversation_memory_key(&msg1),
-            conversation_memory_key(&msg2)
-        );
+        assert_ne!(conversation_memory_key(&msg1), conversation_memory_key(&msg2));
     }
 
     #[tokio::test]
