@@ -345,6 +345,33 @@ When superseding multiple PRs, use a consistent title/body structure to reduce r
 - Rollback: <revert commit/PR strategy>
 ```
 
+### 9.4 Superseded-PR Commit Template (Recommended)
+
+When a commit unifies or supersedes prior PR work, use a deterministic commit message layout so attribution is machine-parsed and reviewer-friendly.
+
+- Keep one blank line between message sections, and exactly one blank line before trailer lines.
+- Keep each trailer on its own line; do not wrap, indent, or encode as escaped `\n` text.
+- Add one `Co-authored-by` trailer per materially incorporated contributor, using GitHub-recognized email.
+- If no direct code/design is carried over, omit `Co-authored-by` and explain attribution in the PR body instead.
+
+```text
+feat(<scope>): unify and supersede #<pr_a>, #<pr_b> [and #<pr_n>]
+
+<one-paragraph summary of integrated outcome>
+
+Supersedes:
+- #<pr_a> by @<author_a>
+- #<pr_b> by @<author_b>
+- #<pr_n> by @<author_n>
+
+Integrated scope:
+- <subsystem_or_feature_a>: from #<pr_x>
+- <subsystem_or_feature_b>: from #<pr_y>
+
+Co-authored-by: <Name A> <login_a@users.noreply.github.com>
+Co-authored-by: <Name B> <login_b@users.noreply.github.com>
+```
+
 Reference docs:
 
 - `CONTRIBUTING.md`
