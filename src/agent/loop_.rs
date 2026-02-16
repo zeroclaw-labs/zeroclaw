@@ -255,6 +255,15 @@ fn parse_tool_calls_from_json_value(value: &serde_json::Value) -> Vec<ParsedTool
     calls
 }
 
+/// Extract JSON values from a string.
+///
+/// # Security Warning
+///
+/// This function extracts ANY JSON objects/arrays from the input. It MUST only
+/// be used on content that is already trusted to be from the LLM, such as
+/// content inside `<invoke>` tags where the LLM has explicitly indicated intent
+/// to make a tool call. Do NOT use this on raw user input or content that
+/// could contain prompt injection payloads.
 fn extract_json_values(input: &str) -> Vec<serde_json::Value> {
     let mut values = Vec::new();
     let trimmed = input.trim();
@@ -353,14 +362,13 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         }
     }
 
-    if calls.is_empty() {
-        for value in extract_json_values(response) {
-            let parsed_calls = parse_tool_calls_from_json_value(&value);
-            if !parsed_calls.is_empty() {
-                calls.extend(parsed_calls);
-            }
-        }
-    }
+    // SECURITY: We do NOT fall back to extracting arbitrary JSON from the response
+    // here. That would enable prompt injection attacks where malicious content
+    // (e.g., in emails, files, or web pages) could include JSON that mimics a
+    // tool call. Tool calls MUST be explicitly wrapped in either:
+    // 1. OpenAI-style JSON with a "tool_calls" array
+    // 2. ZeroClaw <invoke>...</invoke> tags
+    // This ensures only the LLM's intentional tool calls are executed.
 
     // Remaining text after last tool call
     if !remaining.trim().is_empty() {
@@ -1246,18 +1254,16 @@ I will now call the tool with this payload:
     }
 
     #[test]
-    fn parse_tool_calls_handles_raw_tool_json_without_tags() {
+    fn parse_tool_calls_rejects_raw_tool_json_without_tags() {
+        // SECURITY: Raw JSON without explicit wrappers should NOT be parsed
+        // This prevents prompt injection attacks where malicious content
+        // could include JSON that mimics a tool call.
         let response = r#"Sure, creating the file now.
 {"name": "file_write", "arguments": {"path": "hello.py", "content": "print('hello')"}}"#;
 
         let (text, calls) = parse_tool_calls(response);
         assert!(text.contains("Sure, creating the file now."));
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "file_write");
-        assert_eq!(
-            calls[0].arguments.get("path").unwrap().as_str().unwrap(),
-            "hello.py"
-        );
+        assert_eq!(calls.len(), 0, "Raw JSON without wrappers should not be parsed");
     }
 
     #[test]
