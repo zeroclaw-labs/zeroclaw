@@ -216,6 +216,7 @@ fn has_supervised_channels(config: &Config) -> bool {
         || config.channels_config.matrix.is_some()
         || config.channels_config.whatsapp.is_some()
         || config.channels_config.email.is_some()
+        || config.channels_config.lark.is_some()
 }
 
 #[cfg(test)]

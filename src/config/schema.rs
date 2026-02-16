@@ -1397,8 +1397,20 @@ fn default_irc_port() -> u16 {
     6697
 }
 
-/// Lark/Feishu configuration for messaging integration
-/// Lark is the international version, Feishu is the Chinese version
+/// How ZeroClaw receives events from Feishu / Lark.
+///
+/// - `websocket` (default) — persistent WSS long-connection; no public URL required.
+/// - `webhook`             — HTTP callback server; requires a public HTTPS endpoint.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LarkReceiveMode {
+    #[default]
+    Websocket,
+    Webhook,
+}
+
+/// Lark/Feishu configuration for messaging integration.
+/// Lark is the international version; Feishu is the Chinese version.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LarkConfig {
     /// App ID from Lark/Feishu developer console
@@ -1417,6 +1429,13 @@ pub struct LarkConfig {
     /// Whether to use the Feishu (Chinese) endpoint instead of Lark (International)
     #[serde(default)]
     pub use_feishu: bool,
+    /// Event receive mode: "websocket" (default) or "webhook"
+    #[serde(default)]
+    pub receive_mode: LarkReceiveMode,
+    /// HTTP port for webhook mode only. Must be set when receive_mode = "webhook".
+    /// Not required (and ignored) for websocket mode.
+    #[serde(default)]
+    pub port: Option<u16>,
 }
 
 // ── Security Config ─────────────────────────────────────────────────
@@ -3104,5 +3123,240 @@ default_model = "legacy-model"
         assert_eq!(parsed.boards.len(), 1);
         assert_eq!(parsed.boards[0].board, "nucleo-f401re");
         assert_eq!(parsed.boards[0].path.as_deref(), Some("/dev/ttyACM0"));
+    }
+
+    #[test]
+    fn lark_config_serde() {
+        let lc = LarkConfig {
+            app_id: "cli_123456".into(),
+            app_secret: "secret_abc".into(),
+            encrypt_key: Some("encrypt_key".into()),
+            verification_token: Some("verify_token".into()),
+            allowed_users: vec!["user_123".into(), "user_456".into()],
+            use_feishu: true,
+            receive_mode: LarkReceiveMode::Websocket,
+            port: None,
+        };
+        let json = serde_json::to_string(&lc).unwrap();
+        let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.app_id, "cli_123456");
+        assert_eq!(parsed.app_secret, "secret_abc");
+        assert_eq!(parsed.encrypt_key.as_deref(), Some("encrypt_key"));
+        assert_eq!(parsed.verification_token.as_deref(), Some("verify_token"));
+        assert_eq!(parsed.allowed_users.len(), 2);
+        assert!(parsed.use_feishu);
+    }
+
+    #[test]
+    fn lark_config_toml_roundtrip() {
+        let lc = LarkConfig {
+            app_id: "cli_123456".into(),
+            app_secret: "secret_abc".into(),
+            encrypt_key: Some("encrypt_key".into()),
+            verification_token: Some("verify_token".into()),
+            allowed_users: vec!["*".into()],
+            use_feishu: false,
+            receive_mode: LarkReceiveMode::Webhook,
+            port: Some(9898),
+        };
+        let toml_str = toml::to_string(&lc).unwrap();
+        let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.app_id, "cli_123456");
+        assert_eq!(parsed.app_secret, "secret_abc");
+        assert!(!parsed.use_feishu);
+    }
+
+    #[test]
+    fn lark_config_deserializes_without_optional_fields() {
+        let json = r#"{"app_id":"cli_123","app_secret":"secret"}"#;
+        let parsed: LarkConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.encrypt_key.is_none());
+        assert!(parsed.verification_token.is_none());
+        assert!(parsed.allowed_users.is_empty());
+        assert!(!parsed.use_feishu);
+    }
+
+    #[test]
+    fn lark_config_defaults_to_lark_endpoint() {
+        let json = r#"{"app_id":"cli_123","app_secret":"secret"}"#;
+        let parsed: LarkConfig = serde_json::from_str(json).unwrap();
+        assert!(
+            !parsed.use_feishu,
+            "use_feishu should default to false (Lark)"
+        );
+    }
+
+    #[test]
+    fn lark_config_with_wildcard_allowed_users() {
+        let json = r#"{"app_id":"cli_123","app_secret":"secret","allowed_users":["*"]}"#;
+        let parsed: LarkConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.allowed_users, vec!["*"]);
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // AGENT DELEGATION CONFIG TESTS
+    // ══════════════════════════════════════════════════════════
+
+    #[test]
+    fn agents_config_default_empty() {
+        let c = Config::default();
+        assert!(c.agents.is_empty());
+    }
+
+    #[test]
+    fn agents_config_backward_compat_missing_section() {
+        let minimal = r#"
+workspace_dir = "/tmp/ws"
+config_path = "/tmp/config.toml"
+default_temperature = 0.7
+"#;
+        let parsed: Config = toml::from_str(minimal).unwrap();
+        assert!(parsed.agents.is_empty());
+    }
+
+    #[test]
+    fn agents_config_toml_roundtrip() {
+        let toml_str = r#"
+default_temperature = 0.7
+
+[agents.researcher]
+provider = "gemini"
+model = "gemini-2.0-flash"
+system_prompt = "You are a research assistant."
+max_depth = 2
+
+[agents.coder]
+provider = "openrouter"
+model = "anthropic/claude-sonnet-4-20250514"
+"#;
+        let parsed: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.agents.len(), 2);
+
+        let researcher = &parsed.agents["researcher"];
+        assert_eq!(researcher.provider, "gemini");
+        assert_eq!(researcher.model, "gemini-2.0-flash");
+        assert_eq!(
+            researcher.system_prompt.as_deref(),
+            Some("You are a research assistant.")
+        );
+        assert_eq!(researcher.max_depth, 2);
+        assert!(researcher.api_key.is_none());
+        assert!(researcher.temperature.is_none());
+
+        let coder = &parsed.agents["coder"];
+        assert_eq!(coder.provider, "openrouter");
+        assert_eq!(coder.model, "anthropic/claude-sonnet-4-20250514");
+        assert!(coder.system_prompt.is_none());
+        assert_eq!(coder.max_depth, 3); // default
+    }
+
+    #[test]
+    fn agents_config_with_api_key_and_temperature() {
+        let toml_str = r#"
+[agents.fast]
+provider = "groq"
+model = "llama-3.3-70b-versatile"
+api_key = "gsk-test-key"
+temperature = 0.3
+"#;
+        let parsed: HashMap<String, DelegateAgentConfig> = toml::from_str::<toml::Value>(toml_str)
+            .unwrap()["agents"]
+            .clone()
+            .try_into()
+            .unwrap();
+        let fast = &parsed["fast"];
+        assert_eq!(fast.api_key.as_deref(), Some("gsk-test-key"));
+        assert!((fast.temperature.unwrap() - 0.3).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn agent_api_key_encrypted_on_save_and_decrypted_on_load() {
+        let tmp = TempDir::new().unwrap();
+        let zeroclaw_dir = tmp.path();
+        let config_path = zeroclaw_dir.join("config.toml");
+
+        // Create a config with a plaintext agent API key
+        let mut agents = HashMap::new();
+        agents.insert(
+            "test_agent".to_string(),
+            DelegateAgentConfig {
+                provider: "openrouter".to_string(),
+                model: "test-model".to_string(),
+                system_prompt: None,
+                api_key: Some("sk-super-secret".to_string()),
+                temperature: None,
+                max_depth: 3,
+            },
+        );
+        let config = Config {
+            config_path: config_path.clone(),
+            workspace_dir: zeroclaw_dir.join("workspace"),
+            secrets: SecretsConfig { encrypt: true },
+            agents,
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        config.save().unwrap();
+
+        // Read the raw TOML and verify the key is encrypted (not plaintext)
+        let raw = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !raw.contains("sk-super-secret"),
+            "Plaintext API key should not appear in saved config"
+        );
+        assert!(
+            raw.contains("enc2:"),
+            "Encrypted key should use enc2: prefix"
+        );
+
+        // Parse and decrypt — simulate load_or_init by reading + decrypting
+        let store = crate::security::SecretStore::new(zeroclaw_dir, true);
+        let mut loaded: Config = toml::from_str(&raw).unwrap();
+        for agent in loaded.agents.values_mut() {
+            if let Some(ref encrypted_key) = agent.api_key {
+                agent.api_key = Some(store.decrypt(encrypted_key).unwrap());
+            }
+        }
+        assert_eq!(
+            loaded.agents["test_agent"].api_key.as_deref(),
+            Some("sk-super-secret"),
+            "Decrypted key should match original"
+        );
+    }
+
+    #[test]
+    fn agent_api_key_not_encrypted_when_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let zeroclaw_dir = tmp.path();
+        let config_path = zeroclaw_dir.join("config.toml");
+
+        let mut agents = HashMap::new();
+        agents.insert(
+            "test_agent".to_string(),
+            DelegateAgentConfig {
+                provider: "openrouter".to_string(),
+                model: "test-model".to_string(),
+                system_prompt: None,
+                api_key: Some("sk-plaintext-ok".to_string()),
+                temperature: None,
+                max_depth: 3,
+            },
+        );
+        let config = Config {
+            config_path: config_path.clone(),
+            workspace_dir: zeroclaw_dir.join("workspace"),
+            secrets: SecretsConfig { encrypt: false },
+            agents,
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        config.save().unwrap();
+
+        let raw = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            raw.contains("sk-plaintext-ok"),
+            "With encryption disabled, key should remain plaintext"
+        );
+        assert!(!raw.contains("enc2:"), "No encryption prefix when disabled");
     }
 }
