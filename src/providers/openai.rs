@@ -68,7 +68,7 @@ impl OpenAiProvider {
     }
 
     fn uses_text_completion_endpoint(model: &str) -> bool {
-        model.contains("search-api")
+        model.contains("search-api") || model.contains("codex")
     }
 
     fn supports_custom_temperature(model: &str) -> bool {
@@ -299,6 +299,12 @@ mod tests {
         ));
         assert!(OpenAiProvider::uses_text_completion_endpoint(
             "gpt-5-search-api-2025-10-14"
+        ));
+        assert!(OpenAiProvider::uses_text_completion_endpoint(
+            "gpt-5.2-codex"
+        ));
+        assert!(OpenAiProvider::uses_text_completion_endpoint(
+            "gpt-5.1-codex-max"
         ));
         assert!(!OpenAiProvider::uses_text_completion_endpoint("gpt-5"));
     }
