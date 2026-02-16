@@ -15,6 +15,9 @@ pub struct OpenAiCompatibleProvider {
     pub(crate) base_url: String,
     pub(crate) api_key: Option<String>,
     pub(crate) auth_header: AuthStyle,
+    /// When false, do not fall back to /v1/responses on chat completions 404.
+    /// GLM/Zhipu does not support the responses API.
+    supports_responses_fallback: bool,
     client: Client,
 }
 
@@ -36,6 +39,29 @@ impl OpenAiCompatibleProvider {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.map(ToString::to_string),
             auth_header: auth_style,
+            supports_responses_fallback: true,
+            client: Client::builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| Client::new()),
+        }
+    }
+
+    /// Same as `new` but skips the /v1/responses fallback on 404.
+    /// Use for providers (e.g. GLM) that only support chat completions.
+    pub fn new_no_responses_fallback(
+        name: &str,
+        base_url: &str,
+        api_key: Option<&str>,
+        auth_style: AuthStyle,
+    ) -> Self {
+        Self {
+            name: name.to_string(),
+            base_url: base_url.trim_end_matches('/').to_string(),
+            api_key: api_key.map(ToString::to_string),
+            auth_header: auth_style,
+            supports_responses_fallback: false,
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
                 .connect_timeout(std::time::Duration::from_secs(10))
@@ -112,6 +138,8 @@ struct ChatRequest {
     model: String,
     messages: Vec<Message>,
     temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -348,6 +376,7 @@ impl Provider for OpenAiCompatibleProvider {
             model: model.to_string(),
             messages,
             temperature,
+            stream: Some(false),
         };
 
         let url = self.chat_completions_url();
@@ -362,7 +391,7 @@ impl Provider for OpenAiCompatibleProvider {
             let error = response.text().await?;
             let sanitized = super::sanitize_api_error(&error);
 
-            if status == reqwest::StatusCode::NOT_FOUND {
+            if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
                 return self
                     .chat_via_responses(api_key, system_prompt, message, model)
                     .await
@@ -413,6 +442,7 @@ impl Provider for OpenAiCompatibleProvider {
             model: model.to_string(),
             messages: api_messages,
             temperature,
+            stream: Some(false),
         };
 
         let url = self.chat_completions_url();
@@ -425,7 +455,7 @@ impl Provider for OpenAiCompatibleProvider {
             let status = response.status();
 
             // Mirror chat_with_system: 404 may mean this provider uses the Responses API
-            if status == reqwest::StatusCode::NOT_FOUND {
+            if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
                 // Extract system prompt and last user message for responses fallback
                 let system = messages.iter().find(|m| m.role == "system");
                 let last_user = messages.iter().rfind(|m| m.role == "user");
@@ -517,7 +547,8 @@ mod tests {
                     content: "hello".to_string(),
                 },
             ],
-            temperature: 0.7,
+            temperature: 0.4,
+            stream: Some(false),
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("llama-3.3-70b"));

@@ -125,10 +125,11 @@ pub fn run_wizard() -> Result<Config> {
         browser: BrowserConfig::default(),
         http_request: crate::config::HttpRequestConfig::default(),
         identity: crate::config::IdentityConfig::default(),
-        cost: crate::config::schema::CostConfig::default(),
-        hardware: hardware_config,
+        cost: crate::config::CostConfig::default(),
+        peripherals: crate::config::PeripheralsConfig::default(),
+        agent: crate::config::AgentConfig::default(),
         agents: std::collections::HashMap::new(),
-        security: crate::config::SecurityConfig::default(),
+        hardware: hardware_config,
     };
 
     println!(
@@ -328,10 +329,11 @@ pub fn run_quick_setup(
         browser: BrowserConfig::default(),
         http_request: crate::config::HttpRequestConfig::default(),
         identity: crate::config::IdentityConfig::default(),
-        cost: crate::config::schema::CostConfig::default(),
-        hardware: HardwareConfig::default(),
+        cost: crate::config::CostConfig::default(),
+        peripherals: crate::config::PeripheralsConfig::default(),
+        agent: crate::config::AgentConfig::default(),
         agents: std::collections::HashMap::new(),
-        security: crate::config::SecurityConfig::default(),
+        hardware: crate::config::HardwareConfig::default(),
     };
 
     config.save()?;
@@ -2328,18 +2330,27 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     continue;
                 }
 
-                // Test connection
+                // Test connection (run entirely in separate thread — reqwest::blocking Response
+                // must be used and dropped there to avoid "Cannot drop a runtime" panic)
                 print!("  {} Testing connection... ", style("⏳").dim());
-                let client = reqwest::blocking::Client::new();
-                let url = format!("https://api.telegram.org/bot{token}/getMe");
-                match client.get(&url).send() {
-                    Ok(resp) if resp.status().is_success() => {
-                        let data: serde_json::Value = resp.json().unwrap_or_default();
-                        let bot_name = data
-                            .get("result")
-                            .and_then(|r| r.get("username"))
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("unknown");
+                let token_clone = token.clone();
+                let thread_result = std::thread::spawn(move || {
+                    let client = reqwest::blocking::Client::new();
+                    let url = format!("https://api.telegram.org/bot{token_clone}/getMe");
+                    let resp = client.get(&url).send()?;
+                    let ok = resp.status().is_success();
+                    let data: serde_json::Value = resp.json().unwrap_or_default();
+                    let bot_name = data
+                        .get("result")
+                        .and_then(|r| r.get("username"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string();
+                    Ok::<_, reqwest::Error>((ok, bot_name))
+                })
+                .join();
+                match thread_result {
+                    Ok(Ok((true, bot_name))) => {
                         println!(
                             "\r  {} Connected as @{bot_name}        ",
                             style("✅").green().bold()
@@ -2412,20 +2423,27 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     continue;
                 }
 
-                // Test connection
+                // Test connection (run entirely in separate thread — Response must be used/dropped there)
                 print!("  {} Testing connection... ", style("⏳").dim());
-                let client = reqwest::blocking::Client::new();
-                match client
-                    .get("https://discord.com/api/v10/users/@me")
-                    .header("Authorization", format!("Bot {token}"))
-                    .send()
-                {
-                    Ok(resp) if resp.status().is_success() => {
-                        let data: serde_json::Value = resp.json().unwrap_or_default();
-                        let bot_name = data
-                            .get("username")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("unknown");
+                let token_clone = token.clone();
+                let thread_result = std::thread::spawn(move || {
+                    let client = reqwest::blocking::Client::new();
+                    let resp = client
+                        .get("https://discord.com/api/v10/users/@me")
+                        .header("Authorization", format!("Bot {token_clone}"))
+                        .send()?;
+                    let ok = resp.status().is_success();
+                    let data: serde_json::Value = resp.json().unwrap_or_default();
+                    let bot_name = data
+                        .get("username")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string();
+                    Ok::<_, reqwest::Error>((ok, bot_name))
+                })
+                .join();
+                match thread_result {
+                    Ok(Ok((true, bot_name))) => {
                         println!(
                             "\r  {} Connected as {bot_name}        ",
                             style("✅").green().bold()
@@ -2504,37 +2522,44 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     continue;
                 }
 
-                // Test connection
+                // Test connection (run entirely in separate thread — Response must be used/dropped there)
                 print!("  {} Testing connection... ", style("⏳").dim());
-                let client = reqwest::blocking::Client::new();
-                match client
-                    .get("https://slack.com/api/auth.test")
-                    .bearer_auth(&token)
-                    .send()
-                {
-                    Ok(resp) if resp.status().is_success() => {
-                        let data: serde_json::Value = resp.json().unwrap_or_default();
-                        let ok = data
-                            .get("ok")
-                            .and_then(serde_json::Value::as_bool)
-                            .unwrap_or(false);
-                        let team = data
-                            .get("team")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("unknown");
-                        if ok {
-                            println!(
-                                "\r  {} Connected to workspace: {team}        ",
-                                style("✅").green().bold()
-                            );
-                        } else {
-                            let err = data
-                                .get("error")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or("unknown error");
-                            println!("\r  {} Slack error: {err}", style("❌").red().bold());
-                            continue;
-                        }
+                let token_clone = token.clone();
+                let thread_result = std::thread::spawn(move || {
+                    let client = reqwest::blocking::Client::new();
+                    let resp = client
+                        .get("https://slack.com/api/auth.test")
+                        .bearer_auth(&token_clone)
+                        .send()?;
+                    let ok = resp.status().is_success();
+                    let data: serde_json::Value = resp.json().unwrap_or_default();
+                    let api_ok = data
+                        .get("ok")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    let team = data
+                        .get("team")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let err = data
+                        .get("error")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown error")
+                        .to_string();
+                    Ok::<_, reqwest::Error>((ok, api_ok, team, err))
+                })
+                .join();
+                match thread_result {
+                    Ok(Ok((true, true, team, _))) => {
+                        println!(
+                            "\r  {} Connected to workspace: {team}        ",
+                            style("✅").green().bold()
+                        );
+                    }
+                    Ok(Ok((true, false, _, err))) => {
+                        println!("\r  {} Slack error: {err}", style("❌").red().bold());
+                        continue;
                     }
                     _ => {
                         println!(
@@ -2673,21 +2698,29 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     continue;
                 }
 
-                // Test connection
+                // Test connection (run entirely in separate thread — Response must be used/dropped there)
                 let hs = homeserver.trim_end_matches('/');
                 print!("  {} Testing connection... ", style("⏳").dim());
-                let client = reqwest::blocking::Client::new();
-                match client
-                    .get(format!("{hs}/_matrix/client/v3/account/whoami"))
-                    .header("Authorization", format!("Bearer {access_token}"))
-                    .send()
-                {
-                    Ok(resp) if resp.status().is_success() => {
-                        let data: serde_json::Value = resp.json().unwrap_or_default();
-                        let user_id = data
-                            .get("user_id")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("unknown");
+                let hs_owned = hs.to_string();
+                let access_token_clone = access_token.clone();
+                let thread_result = std::thread::spawn(move || {
+                    let client = reqwest::blocking::Client::new();
+                    let resp = client
+                        .get(format!("{hs_owned}/_matrix/client/v3/account/whoami"))
+                        .header("Authorization", format!("Bearer {access_token_clone}"))
+                        .send()?;
+                    let ok = resp.status().is_success();
+                    let data: serde_json::Value = resp.json().unwrap_or_default();
+                    let user_id = data
+                        .get("user_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string();
+                    Ok::<_, reqwest::Error>((ok, user_id))
+                })
+                .join();
+                match thread_result {
+                    Ok(Ok((true, user_id))) => {
                         println!(
                             "\r  {} Connected as {user_id}        ",
                             style("✅").green().bold()
@@ -2761,19 +2794,28 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     .default("zeroclaw-whatsapp-verify".into())
                     .interact_text()?;
 
-                // Test connection
+                // Test connection (run entirely in separate thread — Response must be used/dropped there)
                 print!("  {} Testing connection... ", style("⏳").dim());
-                let client = reqwest::blocking::Client::new();
-                let url = format!(
-                    "https://graph.facebook.com/v18.0/{}",
-                    phone_number_id.trim()
-                );
-                match client
-                    .get(&url)
-                    .header("Authorization", format!("Bearer {}", access_token.trim()))
-                    .send()
-                {
-                    Ok(resp) if resp.status().is_success() => {
+                let phone_number_id_clone = phone_number_id.clone();
+                let access_token_clone = access_token.clone();
+                let thread_result = std::thread::spawn(move || {
+                    let client = reqwest::blocking::Client::new();
+                    let url = format!(
+                        "https://graph.facebook.com/v18.0/{}",
+                        phone_number_id_clone.trim()
+                    );
+                    let resp = client
+                        .get(&url)
+                        .header(
+                            "Authorization",
+                            format!("Bearer {}", access_token_clone.trim()),
+                        )
+                        .send()?;
+                    Ok::<_, reqwest::Error>(resp.status().is_success())
+                })
+                .join();
+                match thread_result {
+                    Ok(Ok(true)) => {
                         println!(
                             "\r  {} Connected to WhatsApp API        ",
                             style("✅").green().bold()

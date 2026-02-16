@@ -73,6 +73,7 @@ async fn gateway_agent_reply(state: &AppState, message: &str) -> Result<String> 
         "gateway",
         &state.model,
         state.temperature,
+        true, // silent — gateway responses go over HTTP
     )
     .await?;
 
@@ -285,6 +286,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         &tool_descs,
         &skills,
         Some(&config.identity),
+        None, // bootstrap_max_chars — no compact context for gateway
     );
     system_prompt.push_str(&crate::agent::loop_::build_tool_instructions(
         tools_registry.as_ref(),

@@ -24,6 +24,7 @@ Key extension points:
 - `src/memory/traits.rs` (`Memory`)
 - `src/observability/traits.rs` (`Observer`)
 - `src/runtime/traits.rs` (`RuntimeAdapter`)
+- `src/peripherals/traits.rs` (`Peripheral`) — hardware boards (STM32, RPi GPIO)
 
 ## 2) Deep Architecture Observations (Why This Protocol Exists)
 
@@ -141,7 +142,8 @@ Required:
 - `src/providers/` — model providers and resilient wrapper
 - `src/channels/` — Telegram/Discord/Slack/etc channels
 - `src/tools/` — tool execution surface (shell, file, memory, browser)
-- `src/runtime/` — runtime adapters (currently native/docker)
+- `src/peripherals/` — hardware peripherals (STM32, RPi GPIO); see `docs/hardware-peripherals-design.md`
+- `src/runtime/` — runtime adapters (currently native)
 - `docs/` — architecture + process docs
 - `.github/` — CI, templates, automation workflows
 
@@ -236,13 +238,14 @@ Use these rules to keep the trait/factory architecture stable under growth.
 - Validate and sanitize all inputs.
 - Return structured `ToolResult`; avoid panics in runtime path.
 
-### 7.4 Memory / Runtime / Config Changes
+### 5.4 Adding a Peripheral
 
-- Keep compatibility explicit (config defaults, migration impact, fallback behavior).
-- Add targeted tests for boundary conditions and unsupported values.
-- Avoid hidden side effects in startup path.
+- Implement `Peripheral` in `src/peripherals/`.
+- Peripherals expose `tools()` — each tool delegates to the hardware (GPIO, sensors, etc.).
+- Register board type in config schema if needed.
+- See `docs/hardware-peripherals-design.md` for protocol and firmware notes.
 
-### 7.5 Security / Gateway / CI Changes
+### 5.5 Security / Runtime / Gateway Changes
 
 - Include threat/risk notes and rollback strategy.
 - Add/update tests or validation evidence for failure modes and boundaries.

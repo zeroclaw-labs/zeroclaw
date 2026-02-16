@@ -217,8 +217,8 @@ pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<
         "zai" | "z.ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Z.AI", "https://api.z.ai/api/coding/paas/v4", key, AuthStyle::Bearer,
         ))),
-        "glm" | "zhipu" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "GLM", "https://open.bigmodel.cn/api/paas/v4", key, AuthStyle::Bearer,
+        "glm" | "zhipu" => Ok(Box::new(OpenAiCompatibleProvider::new_no_responses_fallback(
+            "GLM", "https://api.z.ai/api/paas/v4", key, AuthStyle::Bearer,
         ))),
         "minimax" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "MiniMax",
