@@ -372,13 +372,14 @@ struct ParsedToolCall {
 
 /// Execute a single turn for channel runtime paths.
 ///
-/// Channels currently do not thread an explicit provider label into this call,
-/// so we route through the full loop with a stable placeholder provider name.
+/// Channel runtime now provides an explicit provider label so observer events
+/// stay consistent with the main agent loop execution path.
 pub(crate) async fn agent_turn(
     provider: &dyn Provider,
     history: &mut Vec<ChatMessage>,
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
+    provider_name: &str,
     model: &str,
     temperature: f64,
 ) -> Result<String> {
@@ -387,7 +388,7 @@ pub(crate) async fn agent_turn(
         history,
         tools_registry,
         observer,
-        "channel-runtime",
+        provider_name,
         model,
         temperature,
     )
