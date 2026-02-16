@@ -22,7 +22,7 @@ jobs:
       STALE_HOURS: "48"
     steps:
       - name: Nudge PRs that need rebase or CI refresh
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const staleHours = Number(process.env.STALE_HOURS || "48");
