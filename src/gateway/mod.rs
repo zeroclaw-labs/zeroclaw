@@ -3435,6 +3435,55 @@ struct WsChatSink<'a> {
     stream_seq: u64,
     thinking_started_ms: Option<i64>,
     thinking_content: String,
+    subagent_calls: std::collections::HashMap<String, SubagentCallMeta>,
+}
+
+#[derive(Debug, Clone)]
+struct SubagentCallMeta {
+    task_label: String,
+    subagent_type: Option<String>,
+    model: Option<String>,
+}
+
+fn claude_task_call_meta(name: &str, args: &serde_json::Value) -> Option<SubagentCallMeta> {
+    if !name.eq_ignore_ascii_case("Task") {
+        return None;
+    }
+
+    let task_label = args
+        .get("description")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| args.get("prompt").and_then(serde_json::Value::as_str))
+        .or_else(|| {
+            args.get("subagent_type")
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or("Subagent task")
+        .trim()
+        .chars()
+        .take(120)
+        .collect::<String>();
+
+    let subagent_type = args
+        .get("subagent_type")
+        .and_then(serde_json::Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let model = args
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    Some(SubagentCallMeta {
+        task_label: if task_label.is_empty() {
+            "Subagent task".to_string()
+        } else {
+            task_label
+        },
+        subagent_type,
+        model,
+    })
 }
 
 #[async_trait]
@@ -3574,6 +3623,22 @@ impl crate::agent::executor::AgentExecutionSink for WsChatSink<'_> {
                 "status": "running",
             }),
         );
+        if let Some(meta) = claude_task_call_meta(name, args) {
+            self.subagent_calls.insert(id.to_string(), meta.clone());
+            status_events::emit(
+                "subagent.started",
+                serde_json::json!({
+                    "runId": self.run_id,
+                    "chatId": self.chat_id,
+                    "tenantId": self.tenant,
+                    "toolId": id,
+                    "toolName": name,
+                    "taskLabel": meta.task_label,
+                    "subagentType": meta.subagent_type,
+                    "model": meta.model,
+                }),
+            );
+        }
         bus.emit_tool(
             &self.run_id,
             Some(&self.chat_id),
@@ -3659,6 +3724,47 @@ impl crate::agent::executor::AgentExecutionSink for WsChatSink<'_> {
                 "durationMs": duration_ms,
             }),
         );
+        if let Some(meta) = self.subagent_calls.remove(id) {
+            let lowered = result.to_ascii_lowercase();
+            if is_error {
+                let event = if lowered.contains("timeout") || lowered.contains("timed out") {
+                    "subagent.timeout"
+                } else {
+                    "subagent.failed"
+                };
+                status_events::emit(
+                    event,
+                    serde_json::json!({
+                        "runId": self.run_id,
+                        "chatId": self.chat_id,
+                        "tenantId": self.tenant,
+                        "toolId": id,
+                        "toolName": name,
+                        "taskLabel": meta.task_label,
+                        "subagentType": meta.subagent_type,
+                        "model": meta.model,
+                        "error": result,
+                        "durationMs": duration_ms,
+                    }),
+                );
+            } else {
+                status_events::emit(
+                    "subagent.completed",
+                    serde_json::json!({
+                        "runId": self.run_id,
+                        "chatId": self.chat_id,
+                        "tenantId": self.tenant,
+                        "toolId": id,
+                        "toolName": name,
+                        "taskLabel": meta.task_label,
+                        "subagentType": meta.subagent_type,
+                        "model": meta.model,
+                        "result": result,
+                        "durationMs": duration_ms,
+                    }),
+                );
+            }
+        }
         bus.emit_tool(
             &self.run_id,
             Some(&self.chat_id),
@@ -3800,6 +3906,7 @@ async fn handle_chat_socket(mut socket: ws::WebSocket, state: AppState, tenant: 
                 stream_seq: 0,
                 thinking_started_ms: None,
                 thinking_content: String::new(),
+                subagent_calls: std::collections::HashMap::new(),
             };
             crate::agent::orchestrator::run_live_turn(
                 crate::agent::orchestrator::LiveTurnConfig {
@@ -4160,5 +4267,38 @@ mod tests {
         assert!(after.contains("writer"));
         assert!(after.contains("Model: model-b"));
         assert!(!after.contains("Model: model-a"));
+    }
+
+    #[test]
+    fn claude_task_call_meta_extracts_expected_fields() {
+        let args = serde_json::json!({
+            "subagent_type": "general-purpose",
+            "description": "Output subagent-ok text",
+            "prompt": "Output exactly subagent-ok",
+            "model": "haiku"
+        });
+        let meta = claude_task_call_meta("Task", &args).expect("Task should map to subagent");
+        assert_eq!(meta.task_label, "Output subagent-ok text");
+        assert_eq!(meta.subagent_type.as_deref(), Some("general-purpose"));
+        assert_eq!(meta.model.as_deref(), Some("haiku"));
+    }
+
+    #[test]
+    fn claude_task_call_meta_uses_prompt_when_description_missing() {
+        let args = serde_json::json!({
+            "prompt": "Gather docs and summarize"
+        });
+        let meta = claude_task_call_meta("task", &args).expect("task should map");
+        assert_eq!(meta.task_label, "Gather docs and summarize");
+        assert!(meta.subagent_type.is_none());
+        assert!(meta.model.is_none());
+    }
+
+    #[test]
+    fn claude_task_call_meta_rejects_non_task_tools() {
+        let args = serde_json::json!({
+            "description": "not a subagent"
+        });
+        assert!(claude_task_call_meta("shell", &args).is_none());
     }
 }
