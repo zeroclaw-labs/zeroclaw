@@ -1259,6 +1259,19 @@ mod tests {
     }
 
     #[test]
+    fn channel_log_truncation_is_utf8_safe_for_multibyte_text() {
+        let msg = "你好！我是监察，武威节点的 AI 助手。目前节点运行正常，有什么需要我帮助的吗？";
+
+        // Reproduces the production crash path where channel logs truncate at 80 chars.
+        let result = std::panic::catch_unwind(|| crate::util::truncate_with_ellipsis(msg, 80));
+        assert!(result.is_ok(), "truncate_with_ellipsis should never panic on UTF-8");
+
+        let truncated = result.unwrap();
+        assert!(!truncated.is_empty());
+        assert!(truncated.is_char_boundary(truncated.len()));
+    }
+
+    #[test]
     fn prompt_workspace_path() {
         let ws = make_workspace();
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], None);
