@@ -24,10 +24,10 @@ jobs:
         runs-on: ${{ github.event_name != 'pull_request' && fromJSON('["self-hosted","Linux","X64","lxc-ci"]') || 'ubuntu-latest' }}
         timeout-minutes: 20
         steps:
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-            - uses: dtolnay/rust-toolchain@stable
-            - uses: Swatinem/rust-cache@v2
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
 
             - name: Install cargo-audit
               run: cargo install --locked cargo-audit --version 0.22.1
@@ -40,8 +40,8 @@ jobs:
         runs-on: ${{ github.event_name != 'pull_request' && fromJSON('["self-hosted","Linux","X64","lxc-ci"]') || 'ubuntu-latest' }}
         timeout-minutes: 20
         steps:
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-            - uses: EmbarkStudios/cargo-deny-action@v2
+            - uses: EmbarkStudios/cargo-deny-action@3fd3802e88374d3fe9159b834c7714ec57d6c979 # v2
               with:
                   command: check advisories licenses sources
