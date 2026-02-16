@@ -269,6 +269,14 @@ impl GitOperationsTool {
         })
     }
 
+    fn truncate_commit_message(message: &str) -> String {
+        if message.chars().count() > 2000 {
+            format!("{}...", message.chars().take(1997).collect::<String>())
+        } else {
+            message.to_string()
+        }
+    }
+
     async fn git_commit(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let message = args
             .get("message")
@@ -288,11 +296,7 @@ impl GitOperationsTool {
         }
 
         // Limit message length
-        let message = if sanitized.len() > 2000 {
-            format!("{}...", &sanitized[..1997])
-        } else {
-            sanitized
-        };
+        let message = Self::truncate_commit_message(&sanitized);
 
         let output = self.run_git_command(&["commit", "-m", &message]).await;
 
@@ -693,4 +697,13 @@ mod tests {
             .unwrap_or("")
             .contains("Unknown operation"));
     }
+
+    #[test]
+    fn truncates_multibyte_commit_message_without_panicking() {
+        let long = "🦀".repeat(2500);
+        let truncated = GitOperationsTool::truncate_commit_message(&long);
+
+        assert_eq!(truncated.chars().count(), 2000);
+    }
 }
+
