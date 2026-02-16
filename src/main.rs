@@ -351,6 +351,10 @@ async fn main() -> Result<()> {
             println!("Version:     {}", env!("CARGO_PKG_VERSION"));
             println!("Workspace:   {}", config.workspace_dir.display());
             println!("Config:      {}", config.config_path.display());
+            println!(
+                "Environment: {:?}",
+                crate::agent::executor::ToolExecutionEnvironment::from_env()
+            );
             println!();
             println!(
                 "🤖 Provider:      {}",

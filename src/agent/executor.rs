@@ -17,6 +17,32 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::Instant;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolExecutionEnvironment {
+    Dev,
+    Prod,
+}
+
+impl ToolExecutionEnvironment {
+    pub fn from_env() -> Self {
+        let raw = std::env::var("ARIA_ENVIRONMENT")
+            .or_else(|_| std::env::var("AFW_ENV"))
+            .unwrap_or_else(|_| "dev".to_string());
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "prod" | "production" => Self::Prod,
+            _ => Self::Dev,
+        }
+    }
+
+    fn block_local_fallback(self, tool_name: &str, external_execution_handled: bool) -> bool {
+        self == Self::Prod && is_local_machine_tool(tool_name) && !external_execution_handled
+    }
+}
+
+fn is_local_machine_tool(name: &str) -> bool {
+    matches!(name, "shell" | "file_read" | "file_write")
+}
+
 /// Maximum agentic turns (LLM calls) before forcing stop.
 const DEFAULT_MAX_TURNS: u32 = 25;
 /// Default `max_tokens` per LLM call.
@@ -156,6 +182,7 @@ pub async fn execute_agent_with_sink(
 ) -> Result<AgentExecutionResult> {
     let start = Instant::now();
     let max = max_turns.unwrap_or(DEFAULT_MAX_TURNS);
+    let execution_environment = ToolExecutionEnvironment::from_env();
 
     // Build tool definitions for the LLM
     let tool_defs: Vec<ToolDefinition> = tools
@@ -307,8 +334,17 @@ pub async fn execute_agent_with_sink(
                 }
             }
 
+            let external_execution_handled = external_execution.is_some();
             let (result_content, is_error) = if let Some(external_result) = external_execution {
                 external_result
+            } else if execution_environment.block_local_fallback(tool_name, external_execution_handled)
+            {
+                (
+                    format!(
+                        "Tool '{tool_name}' requires local-bridge execution in production mode; backend fallback is disabled"
+                    ),
+                    true,
+                )
             } else {
                 match tool {
                     Some(tool) => match tool.execute(tool_input.clone()).await {
@@ -404,6 +440,36 @@ pub async fn execute_agent_with_sink(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_execution_environment_from_env_defaults_to_dev() {
+        unsafe {
+            std::env::remove_var("ARIA_ENVIRONMENT");
+            std::env::remove_var("AFW_ENV");
+        }
+        assert_eq!(ToolExecutionEnvironment::from_env(), ToolExecutionEnvironment::Dev);
+    }
+
+    #[test]
+    fn tool_execution_environment_from_env_reads_prod() {
+        unsafe {
+            std::env::set_var("ARIA_ENVIRONMENT", "production");
+            std::env::remove_var("AFW_ENV");
+        }
+        assert_eq!(ToolExecutionEnvironment::from_env(), ToolExecutionEnvironment::Prod);
+        unsafe {
+            std::env::remove_var("ARIA_ENVIRONMENT");
+        }
+    }
+
+    #[test]
+    fn prod_blocks_local_fallback_for_local_tools() {
+        assert!(ToolExecutionEnvironment::Prod.block_local_fallback("shell", false));
+        assert!(ToolExecutionEnvironment::Prod.block_local_fallback("file_read", false));
+        assert!(ToolExecutionEnvironment::Prod.block_local_fallback("file_write", false));
+        assert!(!ToolExecutionEnvironment::Prod.block_local_fallback("browser_open", false));
+        assert!(!ToolExecutionEnvironment::Prod.block_local_fallback("shell", true));
+    }
 
     #[test]
     fn tool_to_definition_works() {

@@ -14,13 +14,14 @@ use crate::providers::{self, Provider};
 use crate::security::pairing::{constant_time_eq, is_public_bind};
 use crate::security::SecurityPolicy;
 use crate::status_events;
+use crate::agent::executor::ToolExecutionEnvironment;
 use anyhow::Result;
 use async_trait::async_trait;
 use axum::{
     body::Bytes,
     extract::{ws, Multipart, Path, Query, State, WebSocketUpgrade},
     http::{header, HeaderMap, StatusCode},
-    response::{IntoResponse, Json},
+    response::{IntoResponse, Json, Response},
     routing::{delete, get, patch, post, put},
     Router,
 };
@@ -55,11 +56,13 @@ pub struct AppState {
     pub gateway_port: u16,
     pub whatsapp: Option<Arc<WhatsAppChannel>>,
     pub local_tool_bridge: Arc<local_bridge::LocalToolBridge>,
+    pub execution_environment: ToolExecutionEnvironment,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
 #[allow(clippy::too_many_lines)]
 pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
+    let execution_environment = ToolExecutionEnvironment::from_env();
     // ── Security: refuse public bind without tunnel or explicit opt-in ──
     if is_public_bind(host) && config.tunnel.provider == "none" && !config.gateway.allow_public_bind
     {
@@ -199,6 +202,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             security.clone(),
             aria_registries.db.clone(),
         )),
+        execution_environment,
     };
 
     // Build router with middleware
@@ -370,12 +374,14 @@ async fn handle_webhook(
             .await;
     }
 
-    let auth = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let token = auth.strip_prefix("Bearer ").unwrap_or("");
-    let tenant = resolve_tenant_from_token(&state, token);
+    let token = auth_token_from_headers(&headers);
+    if state.execution_environment == ToolExecutionEnvironment::Prod && token.is_empty() {
+        let err = serde_json::json!({"error": "Unauthorized — missing Bearer token"});
+        return (StatusCode::UNAUTHORIZED, Json(err));
+    }
+    let tenant = resolve_tenant_from_token(&state, &token);
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let chat_id = format!("webhook-{tenant}");
 
     let run_result = crate::agent::orchestrator::run_live_turn(
         crate::agent::orchestrator::LiveTurnConfig {
@@ -391,7 +397,12 @@ async fn handle_webhook(
             temperature: state.temperature,
             mode_hint: "",
             max_turns: Some(25),
-            external_tool_context: None,
+            external_tool_context: Some(crate::agent::executor::ExternalToolContext {
+                tenant_id: tenant.clone(),
+                chat_id,
+                run_id,
+                executor: state.local_tool_bridge.clone(),
+            }),
         },
         message,
         None,
@@ -444,18 +455,35 @@ fn resolve_tenant_from_token(state: &AppState, token: &str) -> String {
     crate::tenant::resolve_tenant_from_token(&state.registry_db, token)
 }
 
-fn api_tenant(
-    state: &AppState,
-    headers: &HeaderMap,
-) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+fn auth_token_from_headers(headers: &HeaderMap) -> String {
     let auth = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let token = auth.strip_prefix("Bearer ").unwrap_or("");
-    // Dashboard API routes intentionally do not enforce bearer tokens.
-    // Pairing remains available for webhook-level hardening.
-    Ok(resolve_tenant_from_token(state, token))
+    auth.strip_prefix("Bearer ").unwrap_or("").to_string()
+}
+
+fn auth_token_from_headers_or_query(headers: &HeaderMap, query: &HashMap<String, String>) -> String {
+    let bearer = auth_token_from_headers(headers);
+    if !bearer.is_empty() {
+        bearer
+    } else {
+        query.get("token").cloned().unwrap_or_default()
+    }
+}
+
+fn api_tenant(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    let token = auth_token_from_headers(headers);
+    if state.execution_environment == ToolExecutionEnvironment::Prod && token.is_empty() {
+        return Err(api_err(
+            StatusCode::UNAUTHORIZED,
+            "Missing bearer token in production environment",
+        ));
+    }
+    Ok(resolve_tenant_from_token(state, &token))
 }
 
 fn iso_from_millis(ms: i64) -> String {
@@ -977,6 +1005,8 @@ async fn api_v1_run_tool(
             body.tool
         ),
     );
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let chat_id = format!("api-v1-run-tool-{tenant}");
     match crate::agent::orchestrator::run_live_turn(
         crate::agent::orchestrator::LiveTurnConfig {
             provider: state.provider.as_ref(),
@@ -991,7 +1021,12 @@ async fn api_v1_run_tool(
             temperature: state.temperature,
             mode_hint: &mode_hint,
             max_turns: Some(25),
-            external_tool_context: None,
+            external_tool_context: Some(crate::agent::executor::ExternalToolContext {
+                tenant_id: tenant.clone(),
+                chat_id,
+                run_id: run_id.clone(),
+                executor: state.local_tool_bridge.clone(),
+            }),
         },
         &body.prompt,
         None,
@@ -999,7 +1034,7 @@ async fn api_v1_run_tool(
     .await
     {
         Ok(result) => api_ok(serde_json::json!({
-            "id": uuid::Uuid::new_v4().to_string(),
+            "id": run_id,
             "status": if result.success { "completed" } else { "failed" },
             "output": result.output,
             "result": result.output,
@@ -3934,6 +3969,8 @@ async fn handle_whatsapp_message(State(state): State<AppState>, body: Bytes) -> 
 
         // Run a full live turn with tenant-scoped tools/prompt.
         let tenant = resolve_tenant_from_token(&state, "");
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let chat_id = format!("whatsapp-{}", msg.sender);
         match crate::agent::orchestrator::run_live_turn(
             crate::agent::orchestrator::LiveTurnConfig {
                 provider: state.provider.as_ref(),
@@ -3948,7 +3985,12 @@ async fn handle_whatsapp_message(State(state): State<AppState>, body: Bytes) -> 
                 temperature: state.temperature,
                 mode_hint: "",
                 max_turns: Some(25),
-                external_tool_context: None,
+                external_tool_context: Some(crate::agent::executor::ExternalToolContext {
+                    tenant_id: tenant.clone(),
+                    chat_id,
+                    run_id,
+                    executor: state.local_tool_bridge.clone(),
+                }),
             },
             &msg.content,
             None,
@@ -3994,19 +4036,14 @@ async fn handle_events_ws_chat(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
-) -> impl IntoResponse {
-    let auth = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let bearer = auth.strip_prefix("Bearer ").unwrap_or("");
-    let token = if !bearer.is_empty() {
-        bearer.to_string()
-    } else {
-        query.get("token").cloned().unwrap_or_default()
-    };
+) -> Response {
+    let token = auth_token_from_headers_or_query(&headers, &query);
+    if state.execution_environment == ToolExecutionEnvironment::Prod && token.is_empty() {
+        return (StatusCode::UNAUTHORIZED, "missing auth token").into_response();
+    }
     let tenant = resolve_tenant_from_token(&state, &token);
     ws.on_upgrade(move |socket| handle_chat_socket(socket, state, tenant))
+        .into_response()
 }
 
 async fn handle_events_ws_local_bridge(
@@ -4014,17 +4051,11 @@ async fn handle_events_ws_local_bridge(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
-) -> impl IntoResponse {
-    let auth = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let bearer = auth.strip_prefix("Bearer ").unwrap_or("");
-    let token = if !bearer.is_empty() {
-        bearer.to_string()
-    } else {
-        query.get("token").cloned().unwrap_or_default()
-    };
+) -> Response {
+    let token = auth_token_from_headers_or_query(&headers, &query);
+    if state.execution_environment == ToolExecutionEnvironment::Prod && token.is_empty() {
+        return (StatusCode::UNAUTHORIZED, "missing auth token").into_response();
+    }
     let tenant = resolve_tenant_from_token(&state, &token);
     let device_id = query
         .get("deviceId")
@@ -4032,6 +4063,7 @@ async fn handle_events_ws_local_bridge(
         .unwrap_or_else(|| "default-device".to_string());
     let bridge = state.local_tool_bridge.clone();
     ws.on_upgrade(move |socket| bridge.handle_socket(socket, tenant, device_id))
+        .into_response()
 }
 
 async fn handle_events_ws_status(
@@ -4039,19 +4071,14 @@ async fn handle_events_ws_status(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
-) -> impl IntoResponse {
-    let auth = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let bearer = auth.strip_prefix("Bearer ").unwrap_or("");
-    let token = if !bearer.is_empty() {
-        bearer.to_string()
-    } else {
-        query.get("token").cloned().unwrap_or_default()
-    };
+) -> Response {
+    let token = auth_token_from_headers_or_query(&headers, &query);
+    if state.execution_environment == ToolExecutionEnvironment::Prod && token.is_empty() {
+        return (StatusCode::UNAUTHORIZED, "missing auth token").into_response();
+    }
     let tenant = resolve_tenant_from_token(&state, &token);
     ws.on_upgrade(move |socket| handle_status_socket(socket, tenant, state))
+        .into_response()
 }
 
 async fn handle_events_ws_logs(
