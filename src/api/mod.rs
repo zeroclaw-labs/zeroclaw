@@ -1027,6 +1027,7 @@ async fn feeds_upload(
     let now = chrono::Utc::now().to_rfc3339();
     let id = uuid::Uuid::new_v4().to_string();
     let handler_hash = hash_code(body.handler_code.as_deref().unwrap_or(""));
+    let normalized_schedule = crate::aria::feed_registry::normalize_feed_schedule(&body.schedule);
 
     let result = state.db.with_conn(|conn| {
         let existing: Option<String> = conn
@@ -1046,7 +1047,7 @@ async fn feeds_upload(
                 rusqlite::params![
                     body.description.as_deref().unwrap_or(""),
                     body.handler_code.as_deref().unwrap_or(""),
-                    handler_hash, body.schedule,
+                    handler_hash, normalized_schedule,
                     body.refresh_seconds.map(|v| v as i64),
                     body.category,
                     body.retention.as_ref().map(|v| serde_json::to_string(v).unwrap_or_default()),
@@ -1066,7 +1067,7 @@ async fn feeds_upload(
                     id, ctx.tenant_id, body.name,
                     body.description.as_deref().unwrap_or(""),
                     body.handler_code.as_deref().unwrap_or(""),
-                    handler_hash, body.schedule,
+                    handler_hash, normalized_schedule,
                     body.refresh_seconds.map(|v| v as i64),
                     body.category,
                     body.retention.as_ref().map(|v| serde_json::to_string(v).unwrap_or_default()),
@@ -1186,7 +1187,7 @@ async fn crons_upload(
                     body.schedule_kind,
                     schedule_data_json,
                     body.session_target.as_deref().unwrap_or("main"),
-                    body.wake_mode.as_deref().unwrap_or("next-heartbeat"),
+                    body.wake_mode.as_deref().unwrap_or("now"),
                     body.payload_kind,
                     payload_data_json,
                     body.isolation.as_ref().map(|v| serde_json::to_string(v).unwrap_or_default()),
@@ -1208,7 +1209,7 @@ async fn crons_upload(
                     body.schedule_kind,
                     schedule_data_json,
                     body.session_target.as_deref().unwrap_or("main"),
-                    body.wake_mode.as_deref().unwrap_or("next-heartbeat"),
+                    body.wake_mode.as_deref().unwrap_or("now"),
                     body.payload_kind,
                     payload_data_json,
                     body.isolation.as_ref().map(|v| serde_json::to_string(v).unwrap_or_default()),
@@ -2034,13 +2035,15 @@ async fn bulk_upload(
                             .sandbox_config
                             .as_ref()
                             .map(|j| serde_json::to_string(j).unwrap_or_default());
+                        let normalized_schedule =
+                            crate::aria::feed_registry::normalize_feed_schedule(&v.schedule);
                         crate::aria::feed_registry::AriaFeedRegistry::new(state.db.clone())
                             .upload(crate::aria::feed_registry::FeedUploadRequest {
                                 tenant_id: &ctx.tenant_id,
                                 name: &v.name,
                                 description: v.description.as_deref().unwrap_or(""),
                                 handler_code: v.handler_code.as_deref().unwrap_or(""),
-                                schedule: &v.schedule,
+                                schedule: &normalized_schedule,
                                 refresh_seconds: v.refresh_seconds.map(|n| n as i64),
                                 category: v.category.as_deref(),
                                 retention: retention.as_deref(),
@@ -2072,7 +2075,7 @@ async fn bulk_upload(
                                 &v.schedule_kind,
                                 &schedule,
                                 v.session_target.as_deref().unwrap_or("main"),
-                                v.wake_mode.as_deref().unwrap_or("next-heartbeat"),
+                                v.wake_mode.as_deref().unwrap_or("now"),
                                 &v.payload_kind,
                                 &payload,
                                 isolation.as_deref(),

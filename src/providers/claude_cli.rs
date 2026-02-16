@@ -67,8 +67,8 @@ impl ClaudeCliProvider {
     }
 
     fn resolve_add_dirs(exec_cwd: Option<&PathBuf>) -> Vec<PathBuf> {
-        if let Ok(raw) = std::env::var("ARIA_CLAUDE_ADD_DIRS")
-            .or_else(|_| std::env::var("AFW_CLAUDE_ADD_DIRS"))
+        if let Ok(raw) =
+            std::env::var("ARIA_CLAUDE_ADD_DIRS").or_else(|_| std::env::var("AFW_CLAUDE_ADD_DIRS"))
         {
             let parsed = Self::parse_add_dirs_env(&raw);
             if !parsed.is_empty() {

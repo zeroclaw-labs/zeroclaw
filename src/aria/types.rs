@@ -430,8 +430,8 @@ pub enum CronSessionTarget {
 #[derive(Default)]
 pub enum CronWakeMode {
     #[default]
-    NextHeartbeat,
     Now,
+    NextHeartbeat,
 }
 
 /// Payload types for cron job execution

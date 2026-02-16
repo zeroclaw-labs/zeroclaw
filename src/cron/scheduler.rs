@@ -534,6 +534,20 @@ fn consume_delete_after_run(config: &Config, cron_func_id: &str) -> Result<()> {
     })
 }
 
+fn consume_next_heartbeat_wake_mode(config: &Config, cron_func_id: &str) -> Result<()> {
+    let db = aria::db::AriaDb::open(&config.registry_db_path())?;
+    let now = Utc::now().to_rfc3339();
+    db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE aria_cron_functions
+             SET wake_mode = 'now', updated_at = ?1
+             WHERE id = ?2 AND wake_mode = 'next-heartbeat'",
+            params![now, cron_func_id],
+        )?;
+        Ok(())
+    })
+}
+
 async fn run_aria_cron_function(config: &Config, cron_func_id: &str) -> JobRunOutcome {
     let db_path = config.registry_db_path();
     let db = match aria::db::AriaDb::open(&db_path) {
@@ -611,7 +625,16 @@ async fn run_aria_cron_function(config: &Config, cron_func_id: &str) -> JobRunOu
             if wake_mode == "next-heartbeat" {
                 let summary = format_heartbeat_summary(&name, &message);
                 match append_heartbeat_task(&config.workspace_dir, &summary) {
-                    Ok(()) => Ok("queued for next heartbeat".to_string()),
+                    Ok(()) => {
+                        if let Err(err) = consume_next_heartbeat_wake_mode(config, cron_func_id) {
+                            tracing::warn!(
+                                cron_func_id = cron_func_id,
+                                error = %err,
+                                "Failed to consume next-heartbeat wake mode"
+                            );
+                        }
+                        Ok("queued for next heartbeat".to_string())
+                    }
                     Err(e) => Err(anyhow::anyhow!("failed to queue heartbeat task: {e}")),
                 }
             } else {
@@ -1101,5 +1124,41 @@ mod tests {
             .filter(|line| line.contains("[[AFW_QUEUE]] [Cron:test] once"))
             .count();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn consume_next_heartbeat_wake_mode_switches_to_now() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let db = AriaDb::open(&config.registry_db_path()).unwrap();
+        let now = Utc::now().to_rfc3339();
+        let cron_id = "cron-next-heartbeat";
+
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO aria_cron_functions
+                 (id, tenant_id, name, description, schedule_kind, schedule_data, session_target,
+                  wake_mode, payload_kind, payload_data, enabled, delete_after_run, status, created_at, updated_at)
+                 VALUES (?1, 'test-tenant', 'cron-name', '', 'cron', '{\"expr\":\"0 8 * * *\"}',
+                         'main', 'next-heartbeat', 'agentTurn', '{\"message\":\"hi\"}', 1, 0, 'active', ?2, ?2)",
+                params![cron_id, now],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        consume_next_heartbeat_wake_mode(&config, cron_id).unwrap();
+
+        let wake_mode = db
+            .with_conn(|conn| {
+                let mode: String = conn.query_row(
+                    "SELECT wake_mode FROM aria_cron_functions WHERE id = ?1",
+                    params![cron_id],
+                    |row| row.get(0),
+                )?;
+                Ok(mode)
+            })
+            .unwrap();
+        assert_eq!(wake_mode, "now");
     }
 }

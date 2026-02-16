@@ -13,6 +13,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use uuid::Uuid;
 
+pub const DEFAULT_FEED_SCHEDULE: &str = "0 8 * * *";
+
+pub fn normalize_feed_schedule(schedule: &str) -> String {
+    let trimmed = schedule.trim();
+    if trimmed.is_empty() {
+        DEFAULT_FEED_SCHEDULE.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 // ── Helpers ──────────────────────────────────────────────────────
 
 fn sha256_hex(input: &str) -> String {
@@ -174,6 +185,7 @@ impl AriaFeedRegistry {
         self.ensure_loaded()?;
         let now = Utc::now().to_rfc3339();
         let hash = sha256_hex(handler_code);
+        let normalized_schedule = normalize_feed_schedule(schedule);
 
         let existing_id = {
             let ni = self.name_index.lock().unwrap();
@@ -192,7 +204,7 @@ impl AriaFeedRegistry {
                         description,
                         handler_code,
                         hash,
-                        schedule,
+                        normalized_schedule,
                         refresh_seconds,
                         category,
                         retention,
@@ -208,7 +220,7 @@ impl AriaFeedRegistry {
                 description: description.to_string(),
                 handler_code: handler_code.to_string(),
                 handler_hash: hash,
-                schedule: schedule.to_string(),
+                schedule: normalized_schedule.clone(),
                 refresh_seconds,
                 category: category.map(String::from),
                 retention: retention.map(String::from),
@@ -228,7 +240,7 @@ impl AriaFeedRegistry {
                 description: description.to_string(),
                 handler_code: handler_code.to_string(),
                 handler_hash: hash,
-                schedule: schedule.to_string(),
+                schedule: normalized_schedule.clone(),
                 refresh_seconds,
                 category: category.map(String::from),
                 retention: retention.map(String::from),
@@ -403,6 +415,26 @@ mod tests {
 
         let fetched = reg.get(&entry.id).unwrap().unwrap();
         assert_eq!(fetched.id, entry.id);
+    }
+
+    #[test]
+    fn upload_empty_schedule_uses_daily_default() {
+        let reg = setup();
+        let entry = reg
+            .upload(FeedUploadRequest {
+                tenant_id: "t1",
+                name: "daily-feed",
+                description: "desc",
+                handler_code: "handler()",
+                schedule: "   ",
+                refresh_seconds: None,
+                category: None,
+                retention: None,
+                display: None,
+                sandbox_config: None,
+            })
+            .unwrap();
+        assert_eq!(entry.schedule, DEFAULT_FEED_SCHEDULE);
     }
 
     #[test]

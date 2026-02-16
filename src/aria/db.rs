@@ -214,7 +214,7 @@ impl AriaDb {
                     schedule_kind   TEXT NOT NULL,
                     schedule_data   TEXT NOT NULL,
                     session_target  TEXT NOT NULL DEFAULT 'main',
-                    wake_mode       TEXT NOT NULL DEFAULT 'next-heartbeat',
+                    wake_mode       TEXT NOT NULL DEFAULT 'now',
                     payload_kind    TEXT NOT NULL,
                     payload_data    TEXT NOT NULL,
                     isolation       TEXT,

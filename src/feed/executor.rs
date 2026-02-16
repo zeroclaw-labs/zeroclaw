@@ -1368,12 +1368,11 @@ mod tests {
         }))
         .await;
         assert_eq!(out.get("ok").and_then(Value::as_bool), Some(false));
-        assert!(
-            out.get("error")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .contains("requires non-empty agent and prompt")
-        );
+        assert!(out
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("requires non-empty agent and prompt"));
     }
 
     #[tokio::test]

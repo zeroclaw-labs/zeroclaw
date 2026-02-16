@@ -381,7 +381,7 @@ mod tests {
             "every",
             r#"{"every_ms":60000}"#,
             "main",
-            "next-heartbeat",
+            "now",
             "systemEvent",
             r#"{"text":"tick"}"#,
             None,

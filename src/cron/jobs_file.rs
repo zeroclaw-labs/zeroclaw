@@ -280,7 +280,7 @@ pub fn import_jobs_file(workspace_dir: &Path) -> Result<usize> {
             let wake_mode = job
                 .get("wakeMode")
                 .and_then(Value::as_str)
-                .unwrap_or("next-heartbeat");
+                .unwrap_or("now");
 
             let payload = job.get("payload").cloned().unwrap_or_else(|| json!({}));
             let payload_kind = payload

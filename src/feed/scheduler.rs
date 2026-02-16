@@ -4,10 +4,11 @@
 //! schedules, and spawns repeating tokio tasks for each feed.
 
 use crate::aria::db::AriaDb;
+use crate::aria::feed_registry::{normalize_feed_schedule, DEFAULT_FEED_SCHEDULE};
 use crate::feed::executor::FeedExecutor;
 use crate::status_events;
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{Local, Utc};
 use cron::Schedule;
 use rusqlite::params;
 use std::collections::HashMap;
@@ -140,7 +141,22 @@ impl FeedScheduler {
             return Ok(());
         }
 
-        let interval_secs = parse_schedule_to_interval(&schedule);
+        let normalized_schedule = normalize_feed_schedule(&schedule);
+        let cron_schedule = match parse_cron_schedule(&normalized_schedule) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    feed_id = feed_id,
+                    schedule = normalized_schedule.as_str(),
+                    error = %e,
+                    fallback = DEFAULT_FEED_SCHEDULE,
+                    "Failed to parse feed cron schedule; using default"
+                );
+                // This default must always parse.
+                parse_cron_schedule(DEFAULT_FEED_SCHEDULE).expect("default feed cron must parse")
+            }
+        };
+        let interval_secs = parse_schedule_to_interval(&normalized_schedule);
 
         // Parse retention config
         let (max_items, max_age_days) = if let Some(ref json) = retention_json {
@@ -177,13 +193,20 @@ impl FeedScheduler {
         let handler_code_owned = handler_code.clone();
 
         let handle = tokio::spawn(async move {
-            let mut interval = time::interval(Duration::from_secs(interval_secs));
-            // Skip the initial immediate tick
-            interval.tick().await;
-
             loop {
-                interval.tick().await;
-
+                if !running.load(Ordering::SeqCst) {
+                    break;
+                }
+                let delay = next_fire_delay(&cron_schedule).unwrap_or_else(|| {
+                    tracing::warn!(
+                        feed_id = feed_id_owned.as_str(),
+                        schedule = normalized_schedule.as_str(),
+                        fallback_secs = 86400u64,
+                        "Unable to compute next feed fire time; falling back to daily delay"
+                    );
+                    Duration::from_secs(86_400)
+                });
+                time::sleep(delay).await;
                 if !running.load(Ordering::SeqCst) {
                     break;
                 }
@@ -462,6 +485,23 @@ pub fn parse_schedule_to_interval(schedule: &str) -> u64 {
     }
 
     interval
+}
+
+fn parse_cron_schedule(schedule: &str) -> Result<Schedule> {
+    let trimmed = schedule.trim();
+    let normalized = match trimmed.split_whitespace().count() {
+        5 => format!("0 {trimmed}"),
+        6 | 7 => trimmed.to_string(),
+        _ => anyhow::bail!("invalid cron field count"),
+    };
+    Schedule::from_str(&normalized).context("invalid cron expression")
+}
+
+fn next_fire_delay(schedule: &Schedule) -> Option<Duration> {
+    let now = Local::now();
+    let next = schedule.after(&now).next()?;
+    let millis = (next - now).num_milliseconds();
+    Some(Duration::from_millis(millis.max(1) as u64))
 }
 
 #[cfg(test)]

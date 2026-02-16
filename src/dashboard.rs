@@ -497,9 +497,9 @@ fn preview_for_event(event_type: &str, data: &Value) -> String {
                 "Completed".to_string()
             }
         }
-        "task.failed" => summarize_status_error_for_inbox(
-            data["errorMessage"].as_str().unwrap_or("Task failed"),
-        ),
+        "task.failed" => {
+            summarize_status_error_for_inbox(data["errorMessage"].as_str().unwrap_or("Task failed"))
+        }
         "heartbeat.task.failed" => summarize_status_error_for_inbox(
             data["error"].as_str().unwrap_or("Heartbeat task failed"),
         ),
@@ -662,10 +662,9 @@ pub fn maybe_create_inbox_for_status_event(
                      ORDER BY created_at DESC
                      LIMIT 1",
                 )?;
-                let row = stmt.query_row(
-                    params![tenant, source_type, existing_source_id],
-                    |r| r.get::<_, String>(0),
-                );
+                let row = stmt.query_row(params![tenant, source_type, existing_source_id], |r| {
+                    r.get::<_, String>(0)
+                });
                 match row {
                     Ok(id) => Ok(Some(id)),
                     Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -1074,7 +1073,8 @@ mod tests {
 
         let row = db
             .with_conn(|conn| {
-                let count: i64 = conn.query_row("SELECT COUNT(*) FROM inbox_items", [], |r| r.get(0))?;
+                let count: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM inbox_items", [], |r| r.get(0))?;
                 let tuple = conn.query_row(
                     "SELECT title, preview, status FROM inbox_items WHERE id=?1",
                     params![first.id],
