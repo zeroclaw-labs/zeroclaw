@@ -50,6 +50,8 @@ struct ChannelRuntimeContext {
     model: Arc<String>,
     temperature: f64,
     auto_save_memory: bool,
+    tools_registry: Arc<Vec<Box<dyn crate::tools::Tool>>>,
+    observer: Arc<dyn crate::observability::Observer>,
 }
 
 fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
@@ -166,14 +168,22 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
     println!("  ⏳ Processing message...");
     let started_at = Instant::now();
 
+    // Create conversation history
+    let mut history = vec![
+        crate::providers::traits::ChatMessage::system(ctx.system_prompt.as_str()),
+        crate::providers::traits::ChatMessage::user(&enriched_message),
+    ];
+
     let llm_result = tokio::time::timeout(
         Duration::from_secs(CHANNEL_MESSAGE_TIMEOUT_SECS),
-        ctx.provider.chat_with_system(
-            Some(ctx.system_prompt.as_str()),
-            &enriched_message,
+        crate::agent::loop_::agent_turn(
+            ctx.provider.as_ref(),
+            &mut history,
+            &ctx.tools_registry,
+            ctx.observer.as_ref(),
             ctx.model.as_str(),
             ctx.temperature,
-        ),
+        )
     )
     .await;
 
@@ -871,6 +881,30 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     println!("  🚦 In-flight message limit: {max_in_flight_messages}");
 
+    let runtime = Arc::from(crate::runtime::create_runtime(&config.runtime)?);
+    let security = Arc::new(crate::security::policy::SecurityPolicy::from_config(
+        &config.autonomy,
+        &config.workspace_dir,
+    ));
+    
+    let composio_key = if config.composio.enabled {
+        config.composio.api_key.as_deref()
+    } else {
+        None
+    };
+
+    let tools_registry = crate::tools::all_tools_with_runtime(
+        &security,
+        runtime,
+        mem.clone(),
+        composio_key,
+        &config.browser,
+        &config.agents,
+        config.api_key.as_deref(),
+    );
+
+    let observer: Arc<dyn crate::observability::Observer> = Arc::from(crate::observability::create_observer(&config.observability));
+
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
         provider: Arc::clone(&provider),
@@ -879,6 +913,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
         model: Arc::new(model.clone()),
         temperature,
         auto_save_memory: config.memory.auto_save,
+        tools_registry: Arc::new(tools_registry),
+        observer,
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;

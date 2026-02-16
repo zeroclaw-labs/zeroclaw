@@ -285,15 +285,20 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     }
 
     // Fall back to XML-style <invoke> tag parsing (ZeroClaw's original format)
-    while let Some(start) = remaining.find("<tool_call>") {
+    while let Some(start) = remaining.find("<invoke>").or_else(|| remaining.find("<tool_call>")) {
+        // Find which tag matched to find the corresponding closing tag
+        let is_invoke = remaining[start..].starts_with("<invoke>");
+        let tag_len = if is_invoke { 8 } else { 11 };
+        let close_tag = if is_invoke { "</invoke>" } else { "</tool_call>" };
+        
         // Everything before the tag is text
         let before = &remaining[..start];
         if !before.trim().is_empty() {
             text_parts.push(before.trim().to_string());
         }
 
-        if let Some(end) = remaining[start..].find("</tool_call>") {
-            let inner = &remaining[start + 11..start + end];
+        if let Some(end) = remaining[start..].find(close_tag) {
+            let inner = &remaining[start + tag_len..start + end];
             let mut parsed_any = false;
             let json_values = extract_json_values(inner);
             for value in json_values {
@@ -305,10 +310,11 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
             }
 
             if !parsed_any {
-                tracing::warn!("Malformed <tool_call> JSON: expected tool-call object in tag body");
+                tracing::warn!("Malformed tool call JSON: expected tool-call object in tag body");
             }
 
-            remaining = &remaining[start + end + 12..];
+            let close_len = if is_invoke { 9 } else { 12 };
+            remaining = &remaining[start + end + close_len..];
         } else {
             break;
         }
@@ -339,7 +345,7 @@ struct ParsedToolCall {
 
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
-async fn agent_turn(
+pub async fn agent_turn(
     provider: &dyn Provider,
     history: &mut Vec<ChatMessage>,
     tools_registry: &[Box<dyn Tool>],
