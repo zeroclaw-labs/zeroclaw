@@ -6,6 +6,7 @@ pub mod file_write;
 pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
+pub mod schedule;
 pub mod shell;
 pub mod traits;
 
@@ -17,6 +18,7 @@ pub use file_write::FileWriteTool;
 pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
+pub use schedule::ScheduleTool;
 pub use shell::ShellTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
@@ -41,6 +43,7 @@ pub fn all_tools(
     memory: Arc<dyn Memory>,
     composio_key: Option<&str>,
     browser_config: &crate::config::BrowserConfig,
+    config: Arc<crate::config::Config>,
 ) -> Vec<Box<dyn Tool>> {
     let mut tools: Vec<Box<dyn Tool>> = vec![
         Box::new(ShellTool::new(security.clone())),
@@ -49,6 +52,7 @@ pub fn all_tools(
         Box::new(MemoryStoreTool::new(memory.clone())),
         Box::new(MemoryRecallTool::new(memory.clone())),
         Box::new(MemoryForgetTool::new(memory)),
+        Box::new(ScheduleTool::new(config)),
     ];
 
     if browser_config.enabled {
@@ -77,7 +81,7 @@ pub fn all_tools(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BrowserConfig, MemoryConfig};
+    use crate::config::{BrowserConfig, Config, MemoryConfig};
     use tempfile::TempDir;
 
     #[test]
@@ -104,7 +108,7 @@ mod tests {
             session_name: None,
         };
 
-        let tools = all_tools(&security, mem, None, &browser);
+        let tools = all_tools(&security, mem, None, &browser, Arc::new(Config::default()));
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"browser_open"));
     }
@@ -126,7 +130,7 @@ mod tests {
             session_name: None,
         };
 
-        let tools = all_tools(&security, mem, None, &browser);
+        let tools = all_tools(&security, mem, None, &browser, Arc::new(Config::default()));
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"browser_open"));
     }

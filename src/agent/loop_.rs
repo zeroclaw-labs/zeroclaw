@@ -59,7 +59,7 @@ pub async fn run(
     } else {
         None
     };
-    let _tools = tools::all_tools(&security, mem.clone(), composio_key, &config.browser);
+    let _tools = tools::all_tools(&security, mem.clone(), composio_key, &config.browser, Arc::new(config.clone()));
 
     // ── Resolve provider ─────────────────────────────────────────
     let provider_name = provider_override

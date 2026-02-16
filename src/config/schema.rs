@@ -54,6 +54,9 @@ pub struct Config {
 
     #[serde(default)]
     pub identity: IdentityConfig,
+
+    #[serde(default)]
+    pub scheduler: SchedulerConfig,
 }
 
 // ── Identity (AIEOS / OpenClaw format) ──────────────────────────
@@ -442,6 +445,43 @@ impl Default for ReliabilityConfig {
     }
 }
 
+// ── Scheduler ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulerConfig {
+    /// Enable the built-in task scheduler.
+    #[serde(default = "default_scheduler_enabled")]
+    pub enabled: bool,
+    /// Maximum number of scheduled tasks allowed.
+    #[serde(default = "default_scheduler_max_tasks")]
+    pub max_tasks: usize,
+    /// Maximum concurrent task executions.
+    #[serde(default = "default_scheduler_max_concurrent")]
+    pub max_concurrent: usize,
+}
+
+fn default_scheduler_enabled() -> bool {
+    true
+}
+
+fn default_scheduler_max_tasks() -> usize {
+    50
+}
+
+fn default_scheduler_max_concurrent() -> usize {
+    5
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_scheduler_enabled(),
+            max_tasks: default_scheduler_max_tasks(),
+            max_concurrent: default_scheduler_max_concurrent(),
+        }
+    }
+}
+
 // ── Heartbeat ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -641,6 +681,7 @@ impl Default for Config {
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             identity: IdentityConfig::default(),
+            scheduler: SchedulerConfig::default(),
         }
     }
 }
@@ -880,6 +921,7 @@ mod tests {
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             identity: IdentityConfig::default(),
+            scheduler: SchedulerConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -950,6 +992,7 @@ default_temperature = 0.7
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             identity: IdentityConfig::default(),
+            scheduler: SchedulerConfig::default(),
         };
 
         config.save().unwrap();

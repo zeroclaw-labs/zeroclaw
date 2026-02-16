@@ -16,6 +16,10 @@ pub struct CronJob {
     pub next_run: DateTime<Utc>,
     pub last_run: Option<DateTime<Utc>>,
     pub last_status: Option<String>,
+    /// If true, the job is paused and will not be picked up by the scheduler.
+    pub paused: bool,
+    /// If true, the job runs once and is then automatically removed.
+    pub one_shot: bool,
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -27,6 +31,7 @@ pub fn handle_command(command: super::CronCommands, config: &Config) -> Result<(
                 println!("No scheduled tasks yet.");
                 println!("\nUsage:");
                 println!("  zeroclaw cron add '0 9 * * *' 'agent -m \"Good morning!\"'");
+                println!("  zeroclaw cron once 30m 'echo reminder'");
                 return Ok(());
             }
 
@@ -36,13 +41,20 @@ pub fn handle_command(command: super::CronCommands, config: &Config) -> Result<(
                     .last_run
                     .map_or_else(|| "never".into(), |d| d.to_rfc3339());
                 let last_status = job.last_status.unwrap_or_else(|| "n/a".into());
+                let flags = match (job.paused, job.one_shot) {
+                    (true, true) => " [paused, one-shot]",
+                    (true, false) => " [paused]",
+                    (false, true) => " [one-shot]",
+                    (false, false) => "",
+                };
                 println!(
-                    "- {} | {} | next={} | last={} ({})\n    cmd: {}",
+                    "- {} | {} | next={} | last={} ({}){}\n    cmd: {}",
                     job.id,
                     job.expression,
                     job.next_run.to_rfc3339(),
                     last_run,
                     last_status,
+                    flags,
                     job.command
                 );
             }
@@ -59,19 +71,37 @@ pub fn handle_command(command: super::CronCommands, config: &Config) -> Result<(
             println!("  Cmd : {}", job.command);
             Ok(())
         }
+        super::CronCommands::Once { delay, command } => {
+            let job = add_once(config, &delay, &command)?;
+            println!("✅ Added one-shot task {}", job.id);
+            println!("  Runs at: {}", job.next_run.to_rfc3339());
+            println!("  Cmd    : {}", job.command);
+            Ok(())
+        }
         super::CronCommands::Remove { id } => remove_job(config, &id),
+        super::CronCommands::Pause { id } => {
+            pause_job(config, &id)?;
+            println!("⏸️  Paused job {id}");
+            Ok(())
+        }
+        super::CronCommands::Resume { id } => {
+            resume_job(config, &id)?;
+            println!("▶️  Resumed job {id}");
+            Ok(())
+        }
     }
 }
 
 pub fn add_job(config: &Config, expression: &str, command: &str) -> Result<CronJob> {
+    check_max_tasks(config)?;
     let now = Utc::now();
     let next_run = next_run_for(expression, now)?;
     let id = Uuid::new_v4().to_string();
 
     with_connection(config, |conn| {
         conn.execute(
-            "INSERT INTO cron_jobs (id, expression, command, created_at, next_run)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO cron_jobs (id, expression, command, created_at, next_run, paused, one_shot)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, 0)",
             params![
                 id,
                 expression,
@@ -91,13 +121,151 @@ pub fn add_job(config: &Config, expression: &str, command: &str) -> Result<CronJ
         next_run,
         last_run: None,
         last_status: None,
+        paused: false,
+        one_shot: false,
     })
+}
+
+/// Add a one-shot delayed task. `delay` is a human-friendly duration like "30m", "2h", "1d".
+pub fn add_once(config: &Config, delay: &str, command: &str) -> Result<CronJob> {
+    check_max_tasks(config)?;
+    let now = Utc::now();
+    let duration = parse_duration(delay)?;
+    let next_run = now + duration;
+    let id = Uuid::new_v4().to_string();
+    let expression = format!("@once:{delay}");
+
+    with_connection(config, |conn| {
+        conn.execute(
+            "INSERT INTO cron_jobs (id, expression, command, created_at, next_run, paused, one_shot)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, 1)",
+            params![
+                id,
+                expression,
+                command,
+                now.to_rfc3339(),
+                next_run.to_rfc3339()
+            ],
+        )
+        .context("Failed to insert one-shot task")?;
+        Ok(())
+    })?;
+
+    Ok(CronJob {
+        id,
+        expression,
+        command: command.to_string(),
+        next_run,
+        last_run: None,
+        last_status: None,
+        paused: false,
+        one_shot: true,
+    })
+}
+
+/// Add a one-shot task at an absolute time.
+pub fn add_once_at(config: &Config, at: DateTime<Utc>, command: &str) -> Result<CronJob> {
+    check_max_tasks(config)?;
+    let now = Utc::now();
+    if at <= now {
+        anyhow::bail!("Scheduled time must be in the future");
+    }
+    let id = Uuid::new_v4().to_string();
+    let expression = format!("@at:{}", at.to_rfc3339());
+
+    with_connection(config, |conn| {
+        conn.execute(
+            "INSERT INTO cron_jobs (id, expression, command, created_at, next_run, paused, one_shot)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, 1)",
+            params![
+                id,
+                expression,
+                command,
+                now.to_rfc3339(),
+                at.to_rfc3339()
+            ],
+        )
+        .context("Failed to insert one-shot task")?;
+        Ok(())
+    })?;
+
+    Ok(CronJob {
+        id,
+        expression,
+        command: command.to_string(),
+        next_run: at,
+        last_run: None,
+        last_status: None,
+        paused: false,
+        one_shot: true,
+    })
+}
+
+pub fn pause_job(config: &Config, id: &str) -> Result<()> {
+    let changed = with_connection(config, |conn| {
+        conn.execute(
+            "UPDATE cron_jobs SET paused = 1 WHERE id = ?1",
+            params![id],
+        )
+        .context("Failed to pause cron job")
+    })?;
+    if changed == 0 {
+        anyhow::bail!("Cron job '{id}' not found");
+    }
+    Ok(())
+}
+
+pub fn resume_job(config: &Config, id: &str) -> Result<()> {
+    let changed = with_connection(config, |conn| {
+        conn.execute(
+            "UPDATE cron_jobs SET paused = 0 WHERE id = ?1",
+            params![id],
+        )
+        .context("Failed to resume cron job")
+    })?;
+    if changed == 0 {
+        anyhow::bail!("Cron job '{id}' not found");
+    }
+    Ok(())
+}
+
+fn check_max_tasks(config: &Config) -> Result<()> {
+    let count = with_connection(config, |conn| {
+        let mut stmt = conn.prepare("SELECT COUNT(*) FROM cron_jobs")?;
+        let count: usize = stmt.query_row([], |row| row.get(0))?;
+        Ok(count)
+    })?;
+    if count >= config.scheduler.max_tasks {
+        anyhow::bail!(
+            "Maximum number of scheduled tasks ({}) reached",
+            config.scheduler.max_tasks
+        );
+    }
+    Ok(())
+}
+
+fn parse_duration(s: &str) -> Result<chrono::Duration> {
+    let s = s.trim();
+    if s.is_empty() {
+        anyhow::bail!("Empty duration string");
+    }
+    let (num_str, unit) = s.split_at(s.len() - 1);
+    let num: i64 = num_str
+        .parse()
+        .with_context(|| format!("Invalid duration number: {num_str}"))?;
+    match unit {
+        "s" => Ok(chrono::Duration::seconds(num)),
+        "m" => Ok(chrono::Duration::minutes(num)),
+        "h" => Ok(chrono::Duration::hours(num)),
+        "d" => Ok(chrono::Duration::days(num)),
+        _ => anyhow::bail!("Unknown duration unit '{unit}', expected s/m/h/d"),
+    }
 }
 
 pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
     with_connection(config, |conn| {
         let mut stmt = conn.prepare(
-            "SELECT id, expression, command, next_run, last_run, last_status
+            "SELECT id, expression, command, next_run, last_run, last_status, paused, one_shot
              FROM cron_jobs ORDER BY next_run ASC",
         )?;
 
@@ -111,12 +279,14 @@ pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
                 next_run_raw,
                 last_run_raw,
                 row.get::<_, Option<String>>(5)?,
+                row.get::<_, bool>(6)?,
+                row.get::<_, bool>(7)?,
             ))
         })?;
 
         let mut jobs = Vec::new();
         for row in rows {
-            let (id, expression, command, next_run_raw, last_run_raw, last_status) = row?;
+            let (id, expression, command, next_run_raw, last_run_raw, last_status, paused, one_shot) = row?;
             jobs.push(CronJob {
                 id,
                 expression,
@@ -127,6 +297,8 @@ pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
                     None => None,
                 },
                 last_status,
+                paused,
+                one_shot,
             });
         }
         Ok(jobs)
@@ -150,8 +322,8 @@ pub fn remove_job(config: &Config, id: &str) -> Result<()> {
 pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
     with_connection(config, |conn| {
         let mut stmt = conn.prepare(
-            "SELECT id, expression, command, next_run, last_run, last_status
-             FROM cron_jobs WHERE next_run <= ?1 ORDER BY next_run ASC",
+            "SELECT id, expression, command, next_run, last_run, last_status, paused, one_shot
+             FROM cron_jobs WHERE next_run <= ?1 AND paused = 0 ORDER BY next_run ASC",
         )?;
 
         let rows = stmt.query_map(params![now.to_rfc3339()], |row| {
@@ -164,12 +336,14 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
                 next_run_raw,
                 last_run_raw,
                 row.get::<_, Option<String>>(5)?,
+                row.get::<_, bool>(6)?,
+                row.get::<_, bool>(7)?,
             ))
         })?;
 
         let mut jobs = Vec::new();
         for row in rows {
-            let (id, expression, command, next_run_raw, last_run_raw, last_status) = row?;
+            let (id, expression, command, next_run_raw, last_run_raw, last_status, paused, one_shot) = row?;
             jobs.push(CronJob {
                 id,
                 expression,
@@ -180,6 +354,8 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
                     None => None,
                 },
                 last_status,
+                paused,
+                one_shot,
             });
         }
         Ok(jobs)
@@ -192,6 +368,16 @@ pub fn reschedule_after_run(
     success: bool,
     output: &str,
 ) -> Result<()> {
+    // One-shot tasks are removed after execution regardless of outcome.
+    if job.one_shot {
+        with_connection(config, |conn| {
+            conn.execute("DELETE FROM cron_jobs WHERE id = ?1", params![job.id])
+                .context("Failed to remove one-shot task after execution")?;
+            Ok(())
+        })?;
+        return Ok(());
+    }
+
     let now = Utc::now();
     let next_run = next_run_for(&job.expression, now)?;
     let status = if success { "ok" } else { "error" };
@@ -264,11 +450,22 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
             next_run    TEXT NOT NULL,
             last_run    TEXT,
             last_status TEXT,
-            last_output TEXT
+            last_output TEXT,
+            paused      INTEGER NOT NULL DEFAULT 0,
+            one_shot    INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_cron_jobs_next_run ON cron_jobs(next_run);",
     )
     .context("Failed to initialize cron schema")?;
+
+    // Migrate existing databases that lack the new columns.
+    for col in &["paused", "one_shot"] {
+        let alter = format!(
+            "ALTER TABLE cron_jobs ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0"
+        );
+        // Ignore "duplicate column" errors from already-migrated DBs.
+        let _ = conn.execute_batch(&alter);
+    }
 
     f(&conn)
 }
