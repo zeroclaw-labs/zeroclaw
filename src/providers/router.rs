@@ -14,7 +14,7 @@ pub struct Route {
 /// based on a task hint encoded in the model parameter.
 ///
 /// The model parameter can be:
-/// - A regular model name (e.g. "anthropic/claude-sonnet-4-20250514") → uses default provider
+/// - A regular model name (e.g. "anthropic/claude-sonnet-4") → uses default provider
 /// - A hint-prefixed string (e.g. "hint:reasoning") → resolves via route table
 ///
 /// This wraps multiple pre-created providers and selects the right one per request.
