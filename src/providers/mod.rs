@@ -1,5 +1,6 @@
 pub mod anthropic;
 pub mod compatible;
+pub mod copilot;
 pub mod gemini;
 pub mod ollama;
 pub mod openai;
@@ -37,9 +38,18 @@ fn token_end(input: &str, from: usize) -> usize {
 
 /// Scrub known secret-like token prefixes from provider error strings.
 ///
-/// Redacts tokens with prefixes like `sk-`, `xoxb-`, and `xoxp-`.
+/// Redacts tokens with prefixes like `sk-`, `xoxb-`, `xoxp-`, `ghp_`, `gho_`,
+/// `ghu_`, and `github_pat_`.
 pub fn scrub_secret_patterns(input: &str) -> String {
-    const PREFIXES: [&str; 3] = ["sk-", "xoxb-", "xoxp-"];
+    const PREFIXES: [&str; 7] = [
+        "sk-",
+        "xoxb-",
+        "xoxp-",
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "github_pat_",
+    ];
 
     let mut scrubbed = input.to_string();
 
@@ -290,9 +300,9 @@ pub fn create_provider_with_url(
         "cohere" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Cohere", "https://api.cohere.com/compatibility", key, AuthStyle::Bearer,
         ))),
-        "copilot" | "github-copilot" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "GitHub Copilot", "https://api.githubcopilot.com", key, AuthStyle::Bearer,
-        ))),
+        "copilot" | "github-copilot" => {
+            Ok(Box::new(copilot::CopilotProvider::new(api_key)))
+        },
         "lmstudio" | "lm-studio" => {
             let lm_studio_key = api_key
                 .map(str::trim)
@@ -966,5 +976,33 @@ mod tests {
         let input = "simple upstream timeout";
         let result = sanitize_api_error(input);
         assert_eq!(result, input);
+    }
+
+    #[test]
+    fn scrub_github_personal_access_token() {
+        let input = "auth failed with token ghp_abc123def456";
+        let result = scrub_secret_patterns(input);
+        assert_eq!(result, "auth failed with token [REDACTED]");
+    }
+
+    #[test]
+    fn scrub_github_oauth_token() {
+        let input = "Bearer gho_1234567890abcdef";
+        let result = scrub_secret_patterns(input);
+        assert_eq!(result, "Bearer [REDACTED]");
+    }
+
+    #[test]
+    fn scrub_github_user_token() {
+        let input = "token ghu_sessiontoken123";
+        let result = scrub_secret_patterns(input);
+        assert_eq!(result, "token [REDACTED]");
+    }
+
+    #[test]
+    fn scrub_github_fine_grained_pat() {
+        let input = "failed: github_pat_11AABBC_xyzzy789";
+        let result = scrub_secret_patterns(input);
+        assert_eq!(result, "failed: [REDACTED]");
     }
 }
