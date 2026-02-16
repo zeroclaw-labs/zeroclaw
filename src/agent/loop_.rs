@@ -319,6 +319,11 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         for value in extract_json_values(response) {
             let parsed_calls = parse_tool_calls_from_json_value(&value);
             if !parsed_calls.is_empty() {
+                tracing::warn!(
+                    "Extracted tool call(s) from free-text JSON (no <tool_call> tags or structured format). \
+                     Tool names: {:?}. This fallback path is susceptible to prompt injection.",
+                    parsed_calls.iter().map(|c| &c.name).collect::<Vec<_>>()
+                );
                 calls.extend(parsed_calls);
             }
         }
@@ -451,7 +456,19 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         if tool_calls.is_empty() {
-            let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
+            let (fallback_text, mut fallback_calls) = parse_tool_calls(&response_text);
+            // Filter free-text-extracted tool calls to only known tool names.
+            // This prevents prompt injection payloads embedded in user content
+            // (emails, files, etc.) from executing arbitrary tool-like JSON.
+            let before_count = fallback_calls.len();
+            fallback_calls.retain(|c| find_tool(tools_registry, &c.name).is_some());
+            if fallback_calls.len() < before_count {
+                tracing::warn!(
+                    "Dropped {} tool call(s) with unknown names from free-text extraction \
+                     (possible prompt injection attempt)",
+                    before_count - fallback_calls.len()
+                );
+            }
             parsed_text = fallback_text;
             tool_calls = fallback_calls;
         }
