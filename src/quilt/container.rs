@@ -15,10 +15,10 @@ use super::config::SandboxQuiltConfig;
 const HOT_CONTAINER_WINDOW_MS: i64 = 5 * 60 * 1000; // 5 minutes
 
 /// Default working directory inside sandbox containers.
-const DEFAULT_WORKDIR: &str = "/workspace";
-
-/// Default container image for sandboxes.
-const DEFAULT_IMAGE: &str = "ubuntu:22.04";
+///
+/// Note: In practice the Quilt runtime image may not contain `/workspace`.
+/// `/tmp` is universally present and matches the existing `aria-exec` container.
+const DEFAULT_WORKDIR: &str = "/tmp";
 
 // ── Label keys ──────────────────────────────────────────────────────
 
@@ -227,38 +227,33 @@ pub async fn ensure_sandbox_container(
     let labels = build_labels(session_key, &desired_hash);
 
     let create_params = QuiltCreateParams {
-        name: name.clone(),
-        image: DEFAULT_IMAGE.into(),
-        command: Some(vec!["bash".into(), "-c".into(), "sleep infinity".into()]),
-        environment: HashMap::new(),
-        volumes: vec![],
-        ports: vec![],
+        name: Some(name.clone()),
+        command: Some(vec!["sleep".into(), "infinity".into()]),
+        environment: None,
+        working_directory: Some(DEFAULT_WORKDIR.into()),
         memory_limit_mb: Some(config.memory_limit_mb),
         cpu_limit_percent: Some(config.cpu_limit_percent),
-        labels,
-        network: None,
-        restart_policy: None,
+        volumes: None,
+        labels: Some(labels),
     };
 
     let result = client.create_container(create_params).await?;
     let container_id = result.container_id.clone();
 
-    // Start the container
-    client.start_container(&container_id).await?;
-
     // Register in the in-memory map
     register_container(session_key, &container_id);
 
-    info!(container_id = %container_id, "Sandbox container created and started");
+    info!(container_id = %container_id, "Sandbox container created");
 
     // 4. Run setup command if configured
     if let Some(ref setup_cmd) = config.setup_command {
         info!(cmd = %setup_cmd, "Running setup command");
         let exec_params = QuiltExecParams {
-            command: vec!["bash".into(), "-c".into(), setup_cmd.clone()],
+            command: super::client::QuiltExecCommand::String(setup_cmd.clone()),
+            workdir: None,
+            capture_output: Some(true),
             timeout_ms: Some(120_000), // 2 minute timeout for setup
-            working_dir: Some(DEFAULT_WORKDIR.into()),
-            environment: None,
+            detach: Some(false),
         };
 
         match client.exec(&container_id, exec_params).await {
@@ -344,6 +339,7 @@ mod tests {
             pid: None,
             exit_code: None,
             ip_address: None,
+            created_at: None,
             memory_limit_mb: None,
             cpu_limit_percent: None,
             labels: Some(HashMap::from([(LABEL_CONFIG_HASH.into(), "abc123".into())])),
@@ -364,6 +360,7 @@ mod tests {
             pid: None,
             exit_code: None,
             ip_address: None,
+            created_at: None,
             memory_limit_mb: None,
             cpu_limit_percent: None,
             labels: None,
@@ -383,6 +380,7 @@ mod tests {
             pid: None,
             exit_code: None,
             ip_address: None,
+            created_at: None,
             memory_limit_mb: None,
             cpu_limit_percent: None,
             labels: Some(HashMap::from([("other.label".into(), "value".into())])),
@@ -404,6 +402,7 @@ mod tests {
             pid: None,
             exit_code: None,
             ip_address: None,
+            created_at: None,
             memory_limit_mb: None,
             cpu_limit_percent: None,
             labels: None,
@@ -423,6 +422,7 @@ mod tests {
             pid: None,
             exit_code: None,
             ip_address: None,
+            created_at: None,
             memory_limit_mb: None,
             cpu_limit_percent: None,
             labels: None,
@@ -442,6 +442,7 @@ mod tests {
             pid: None,
             exit_code: None,
             ip_address: None,
+            created_at: None,
             memory_limit_mb: None,
             cpu_limit_percent: None,
             labels: None,
@@ -530,11 +531,6 @@ mod tests {
 
     #[test]
     fn default_workdir_is_workspace() {
-        assert_eq!(DEFAULT_WORKDIR, "/workspace");
-    }
-
-    #[test]
-    fn default_image_is_ubuntu() {
-        assert_eq!(DEFAULT_IMAGE, "ubuntu:22.04");
+        assert_eq!(DEFAULT_WORKDIR, "/tmp");
     }
 }

@@ -11,7 +11,7 @@ use crate::channels::{Channel, WhatsAppChannel};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::providers::{self, Provider};
-use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
+use crate::security::pairing::{constant_time_eq, is_public_bind};
 use crate::security::SecurityPolicy;
 use crate::status_events;
 use crate::tools;
@@ -50,7 +50,8 @@ pub struct AppState {
     pub registry_db: crate::aria::db::AriaDb,
     pub auto_save: bool,
     pub webhook_secret: Option<Arc<str>>,
-    pub pairing: Arc<PairingGuard>,
+    pub gateway_host: String,
+    pub gateway_port: u16,
     pub whatsapp: Option<Arc<WhatsAppChannel>>,
 }
 
@@ -142,12 +143,6 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             ))
         });
 
-    // ── Pairing guard ──────────────────────────────────────
-    let pairing = Arc::new(PairingGuard::new(
-        config.gateway.require_pairing,
-        &config.gateway.paired_tokens,
-    ));
-
     // ── Tunnel ────────────────────────────────────────────────
     let tunnel = crate::tunnel::create_tunnel(&config.tunnel)?;
     let mut tunnel_url: Option<String> = None;
@@ -170,25 +165,12 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     if let Some(ref url) = tunnel_url {
         println!("  🌐 Public URL: {url}");
     }
-    println!("  POST /pair      — pair a new client (X-Pairing-Code header)");
     println!("  POST /webhook   — {{\"message\": \"your prompt\"}}");
     if whatsapp_channel.is_some() {
         println!("  GET  /whatsapp  — Meta webhook verification");
         println!("  POST /whatsapp  — WhatsApp message webhook");
     }
     println!("  GET  /health    — health check");
-    if let Some(code) = pairing.pairing_code() {
-        println!();
-        println!("  🔐 PAIRING REQUIRED — use this one-time code:");
-        println!("     ┌──────────────┐");
-        println!("     │  {code}  │");
-        println!("     └──────────────┘");
-        println!("     Send: POST /pair with header X-Pairing-Code: {code}");
-    } else if pairing.require_pairing() {
-        println!("  🔒 Pairing: ACTIVE (bearer token required)");
-    } else {
-        println!("  ⚠️  Pairing: DISABLED (all requests accepted)");
-    }
     if webhook_secret.is_some() {
         println!("  🔒 Webhook secret: ENABLED");
     }
@@ -230,7 +212,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         registry_db: aria_registries.db.clone(),
         auto_save: config.memory.auto_save,
         webhook_secret,
-        pairing,
+        gateway_host: host.to_string(),
+        gateway_port: actual_port,
         whatsapp: whatsapp_channel,
     };
 
@@ -239,7 +222,6 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     // Timeout is handled by tokio's TcpListener accept timeout and hyper's built-in timeouts
     let app = Router::new()
         .route("/health", get(handle_health))
-        .route("/pair", post(handle_pair))
         .route("/webhook", post(handle_webhook))
         // Dashboard parity routes (cloud-compatible)
         .route("/api/messages", post(api_send_message))
@@ -338,48 +320,12 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 // ══════════════════════════════════════════════════════════════════════════════
 
 /// GET /health — always public (no secrets leaked)
-async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
+async fn handle_health(State(_state): State<AppState>) -> impl IntoResponse {
     let body = serde_json::json!({
         "status": "ok",
-        "paired": state.pairing.is_paired(),
         "runtime": crate::health::snapshot_json(),
     });
     Json(body)
-}
-
-/// POST /pair — exchange one-time code for bearer token
-async fn handle_pair(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let code = headers
-        .get("X-Pairing-Code")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    match state.pairing.try_pair(code) {
-        Ok(Some(token)) => {
-            tracing::info!("🔐 New client paired successfully");
-            let body = serde_json::json!({
-                "paired": true,
-                "token": token,
-                "message": "Save this token — use it as Authorization: Bearer <token>"
-            });
-            (StatusCode::OK, Json(body))
-        }
-        Ok(None) => {
-            tracing::warn!("🔐 Pairing attempt with invalid code");
-            let err = serde_json::json!({"error": "Invalid pairing code"});
-            (StatusCode::FORBIDDEN, Json(err))
-        }
-        Err(lockout_secs) => {
-            tracing::warn!(
-                "🔐 Pairing locked out — too many failed attempts ({lockout_secs}s remaining)"
-            );
-            let err = serde_json::json!({
-                "error": format!("Too many failed attempts. Try again in {lockout_secs}s."),
-                "retry_after": lockout_secs
-            });
-            (StatusCode::TOO_MANY_REQUESTS, Json(err))
-        }
-    }
 }
 
 /// Webhook request body
@@ -394,22 +340,6 @@ async fn handle_webhook(
     headers: HeaderMap,
     body: Result<Json<WebhookBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
-    // ── Bearer token auth (pairing) ──
-    if state.pairing.require_pairing() {
-        let auth = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let token = auth.strip_prefix("Bearer ").unwrap_or("");
-        if !state.pairing.is_authenticated(token) {
-            tracing::warn!("Webhook: rejected — not paired / invalid bearer token");
-            let err = serde_json::json!({
-                "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
-            });
-            return (StatusCode::UNAUTHORIZED, Json(err));
-        }
-    }
-
     // ── Webhook secret auth (optional, additional layer) ──
     if let Some(ref secret) = state.webhook_secret {
         let header_val = headers
@@ -519,7 +449,7 @@ fn api_tenant(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let token = auth.strip_prefix("Bearer ").unwrap_or("");
-    // Dashboard API routes intentionally do not enforce pairing tokens.
+    // Dashboard API routes intentionally do not enforce bearer tokens.
     // Pairing remains available for webhook-level hardening.
     Ok(resolve_tenant_from_token(state, token))
 }
@@ -1584,9 +1514,9 @@ async fn api_patch_skill(
     }
 }
 
-async fn api_get_config(_state: State<AppState>, _headers: HeaderMap) -> impl IntoResponse {
+async fn api_get_config(State(state): State<AppState>, _headers: HeaderMap) -> impl IntoResponse {
     api_ok(serde_json::json!({
-        "gateway": { "port": 4040, "host": "127.0.0.1", "cors": {"enabled": true, "origins": ["*"]}},
+        "gateway": { "port": state.gateway_port, "host": state.gateway_host, "cors": {"enabled": true, "origins": ["*"]}},
         "auth": { "provider": "apikey" },
         "limits": { "maxConcurrentRuns": 8, "timeoutMs": 30000, "maxTokensPerRequest": 8192, "rateLimitPerMinute": 120 }
     }))
@@ -2134,7 +2064,13 @@ async fn api_list_feeds(State(state): State<AppState>, headers: HeaderMap) -> im
         Err(e) => return e,
     };
     let res = state.registry_db.with_conn(|conn| {
-        let mut stmt = conn.prepare("SELECT id,name,description,schedule,refresh_seconds,category,status,created_at,updated_at FROM aria_feeds WHERE tenant_id=?1 AND status!='deleted' ORDER BY created_at DESC")?;
+        let mut stmt = conn.prepare(
+            "SELECT f.id,f.name,f.description,f.schedule,f.refresh_seconds,f.category,f.status,f.created_at,f.updated_at,
+                    (SELECT COUNT(*) FROM aria_feed_items i WHERE i.tenant_id=f.tenant_id AND i.feed_id=f.id) AS item_count
+             FROM aria_feeds f
+             WHERE f.tenant_id=?1 AND f.status!='deleted'
+             ORDER BY f.created_at DESC",
+        )?;
         let rows = stmt.query_map(rusqlite::params![tenant], |row| {
             Ok(serde_json::json!({
                 "id": row.get::<_, String>(0)?,
@@ -2148,7 +2084,7 @@ async fn api_list_feeds(State(state): State<AppState>, headers: HeaderMap) -> im
                 "tools": [],
                 "category": row.get::<_, Option<String>>(5)?,
                 "status": row.get::<_, String>(6)?,
-                "itemCount": 0,
+                "itemCount": row.get::<_, i64>(9)?,
                 "createdAt": row.get::<_, String>(7)?,
                 "updatedAt": row.get::<_, String>(8)?,
             }))
@@ -2172,7 +2108,10 @@ async fn api_get_feed(
     };
     let res = state.registry_db.with_conn(|conn| {
         conn.query_row(
-            "SELECT id,name,description,schedule,refresh_seconds,category,status,created_at,updated_at FROM aria_feeds WHERE tenant_id=?1 AND id=?2 AND status!='deleted'",
+            "SELECT f.id,f.name,f.description,f.schedule,f.refresh_seconds,f.category,f.status,f.created_at,f.updated_at,
+                    (SELECT COUNT(*) FROM aria_feed_items i WHERE i.tenant_id=f.tenant_id AND i.feed_id=f.id) AS item_count
+             FROM aria_feeds f
+             WHERE f.tenant_id=?1 AND f.id=?2 AND f.status!='deleted'",
             rusqlite::params![tenant, id],
             |row| {
                 Ok(serde_json::json!({
@@ -2187,7 +2126,7 @@ async fn api_get_feed(
                     "tools": [],
                     "category": row.get::<_, Option<String>>(5)?,
                     "status": row.get::<_, String>(6)?,
-                    "itemCount": 0,
+                    "itemCount": row.get::<_, i64>(9)?,
                     "createdAt": row.get::<_, String>(7)?,
                     "updatedAt": row.get::<_, String>(8)?,
                 }))

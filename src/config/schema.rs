@@ -89,8 +89,10 @@ impl Default for IdentityConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewayConfig {
-    /// Require pairing before accepting requests (default: true)
-    #[serde(default = "default_true")]
+    /// Deprecated: pairing mode (no longer enforced by the gateway).
+    ///
+    /// Kept for config backward compatibility only.
+    #[serde(default)]
     pub require_pairing: bool,
     /// Allow binding to non-localhost without a tunnel (default: false)
     #[serde(default)]
@@ -100,18 +102,18 @@ pub struct GatewayConfig {
     pub paired_tokens: Vec<String>,
 }
 
-fn default_true() -> bool {
-    true
-}
-
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
-            require_pairing: true,
+            require_pairing: false,
             allow_public_bind: false,
             paired_tokens: Vec::new(),
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 // ── Composio (managed tool surface) ─────────────────────────────
@@ -1150,9 +1152,12 @@ channel_id = "C123"
     // ══════════════════════════════════════════════════════════
 
     #[test]
-    fn checklist_gateway_default_requires_pairing() {
+    fn checklist_gateway_default_pairing_disabled() {
         let g = GatewayConfig::default();
-        assert!(g.require_pairing, "Pairing must be required by default");
+        assert!(
+            !g.require_pairing,
+            "Pairing is deprecated and must be disabled by default"
+        );
     }
 
     #[test]
@@ -1179,8 +1184,8 @@ channel_id = "C123"
         // Here we verify the config default matches
         let c = Config::default();
         assert!(
-            c.gateway.require_pairing,
-            "Config default must require pairing"
+            !c.gateway.require_pairing,
+            "Config default must have pairing disabled"
         );
         assert!(
             !c.gateway.allow_public_bind,
@@ -1212,8 +1217,8 @@ default_temperature = 0.7
 "#;
         let parsed: Config = toml::from_str(minimal).unwrap();
         assert!(
-            parsed.gateway.require_pairing,
-            "Missing [gateway] must default to require_pairing=true"
+            !parsed.gateway.require_pairing,
+            "Missing [gateway] must default to require_pairing=false"
         );
         assert!(
             !parsed.gateway.allow_public_bind,

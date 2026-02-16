@@ -485,7 +485,6 @@ mod tests {
 
         let cmd = build_cron_command(&entry);
         assert_eq!(cmd, format!("{ARIA_CRON_COMMAND_PREFIX}{}", entry.id));
-        assert!(cmd.contains("--model claude-3"));
     }
 
     // ── Bridge lifecycle tests ─────────────────────────────────

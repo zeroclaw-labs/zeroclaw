@@ -261,6 +261,10 @@ enum IntegrationCommands {
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
+    // Load `.env` from the current working directory (no override).
+    // Additional `.env` locations are loaded after config is available.
+    let _ = dotenvy::dotenv();
+
     let cli = Cli::parse();
 
     // Initialize logging
@@ -301,6 +305,13 @@ async fn main() -> Result<()> {
 
     // All other commands need config loaded first
     let config = Config::load_or_init()?;
+
+    // Also load `.env` from the persistent AFW config/workspace directories.
+    // This keeps Quilt/API keys working even when the process isn't started from repo root.
+    if let Some(dir) = config.config_path.parent() {
+        let _ = dotenvy::from_path(dir.join(".env"));
+    }
+    let _ = dotenvy::from_path(config.workspace_dir.join(".env"));
 
     match cli.command {
         Commands::Onboard { .. } => unreachable!(),

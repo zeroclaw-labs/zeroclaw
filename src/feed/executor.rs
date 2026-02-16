@@ -1,10 +1,9 @@
 //! Feed executor — runs feed handlers and manages feed item persistence.
 //!
-//! Supports two execution modes:
-//! - **URL feeds**: When `handler_code` is an HTTP(S) URL, the executor fetches
-//!   the content and returns it as a single `FeedItem` with `card_type` `Text`.
-//! - **Code handlers**: Dispatched to the Quilt container runtime for sandboxed
-//!   execution. Requires `QUILT_API_URL` and `QUILT_API_KEY` to be configured.
+//! Strict mode:
+//! - Only code handlers are supported.
+//! - Handlers must emit valid items of the canonical 24 feed card types.
+//! - No URL-feed support, no legacy/backward compatibility fallbacks.
 
 use crate::aria::db::AriaDb;
 use crate::aria::types::{FeedCardType, FeedItem, FeedResult};
@@ -23,115 +22,12 @@ impl FeedExecutor {
         Self { db }
     }
 
-    /// Returns `true` if `handler_code` looks like an HTTP(S) URL.
-    fn is_url_feed(handler_code: &str) -> bool {
-        let trimmed = handler_code.trim();
-        trimmed.starts_with("http://") || trimmed.starts_with("https://")
-    }
-
-    /// Derive a human-readable title from a URL.
-    ///
-    /// Strips the scheme and uses the host + path as the title.
-    /// Falls back to the full URL if parsing fails.
-    fn title_from_url(url: &str) -> String {
-        // Try to extract host + path for a concise title
-        if let Some(rest) = url
-            .strip_prefix("https://")
-            .or_else(|| url.strip_prefix("http://"))
-        {
-            let trimmed = rest.trim_end_matches('/');
-            if trimmed.is_empty() {
-                return url.to_string();
-            }
-            format!("Feed: {trimmed}")
-        } else {
-            format!("Feed: {url}")
-        }
-    }
-
     fn shell_single_quote(input: &str) -> String {
         let escaped = input.replace('\'', r#"'\''"#);
         format!("'{escaped}'")
     }
 
-    /// Execute a URL-based feed by fetching the content via HTTP.
-    ///
-    /// Returns a `FeedResult` containing a single `FeedItem` with the
-    /// fetched body as text content.
-    async fn execute_url_feed(feed_id: &str, url: &str, run_id: &str) -> Result<FeedResult> {
-        let url = url.trim();
-
-        tracing::info!(
-            feed_id = feed_id,
-            url = url,
-            run_id = run_id,
-            "Fetching URL feed"
-        );
-
-        let response = reqwest::get(url)
-            .await
-            .with_context(|| format!("Failed to fetch URL feed: {url}"))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            return Ok(FeedResult {
-                success: false,
-                items: Vec::new(),
-                summary: None,
-                metadata: None,
-                error: Some(format!("HTTP {status} fetching feed URL: {url}")),
-            });
-        }
-
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("text/plain")
-            .to_string();
-
-        let body_text = response
-            .text()
-            .await
-            .with_context(|| format!("Failed to read response body from: {url}"))?;
-
-        let title = Self::title_from_url(url);
-
-        let mut metadata = std::collections::HashMap::new();
-        metadata.insert("content_type".to_string(), serde_json::json!(content_type));
-        metadata.insert("source_url".to_string(), serde_json::json!(url));
-        metadata.insert(
-            "fetched_at".to_string(),
-            serde_json::json!(Utc::now().to_rfc3339()),
-        );
-
-        let item = FeedItem {
-            card_type: FeedCardType::Text,
-            title,
-            body: Some(body_text),
-            source: Some(url.to_string()),
-            url: Some(url.to_string()),
-            metadata: Some(metadata),
-            timestamp: Some(Utc::now().timestamp()),
-        };
-
-        Ok(FeedResult {
-            success: true,
-            items: vec![item],
-            summary: Some(format!("Fetched URL feed for {feed_id} (run_id={run_id})")),
-            metadata: None,
-            error: None,
-        })
-    }
-
-    /// Execute a feed's handler and return the result.
-    ///
-    /// Three execution modes are supported:
-    /// - **URL feeds** (`handler_code` starts with `http://` or `https://`):
-    ///   Fetches the URL content and returns it as a single `FeedItem`.
-    /// - **Code handlers**: Dispatched to the Quilt container runtime for
-    ///   sandboxed execution. Requires a Quilt endpoint to be configured.
-    /// - **Empty handler**: Returns an error.
+    /// Execute a feed's handler and return the result (strict code-only mode).
     pub async fn execute(
         &self,
         feed_id: &str,
@@ -157,11 +53,6 @@ impl FeedExecutor {
             });
         }
 
-        // URL feeds: fetch the content directly via HTTP.
-        if Self::is_url_feed(handler_code) {
-            return Self::execute_url_feed(feed_id, handler_code, run_id).await;
-        }
-
         // Code handler: dispatch to Quilt container runtime.
         Self::execute_code_handler(feed_id, tenant_id, handler_code, run_id).await
     }
@@ -177,6 +68,293 @@ impl FeedExecutor {
         run_id: &str,
     ) -> Result<FeedResult> {
         use crate::quilt::client::QuiltClient;
+        const RESULT_MARKER: &str = "__ARIA_FEED_RESULT__";
+
+        fn handler_code_sanitize(src: &str) -> &str {
+            // SDK may append `// Handler method:` with a raw class-method snippet
+            // (e.g. `async fetch(ctx){...}`) which is invalid at top-level JS.
+            src.split("\n// Handler method:\n").next().unwrap_or(src)
+        }
+
+        fn extract_class_name(src: &str) -> Option<String> {
+            let s = src;
+            let idx = s.find("class ")?;
+            let rest = &s[idx + "class ".len()..];
+            let name = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
+                .collect::<String>();
+            if name.is_empty() { None } else { Some(name) }
+        }
+
+        fn parse_card_type(s: &str) -> Result<FeedCardType> {
+            // FeedCardType is serde snake_case, so parsing from JSON string is easiest.
+            let json = format!("\"{s}\"");
+            serde_json::from_str::<FeedCardType>(&json)
+                .with_context(|| format!("Unknown cardType '{s}'"))
+        }
+
+        fn require_obj<'a>(
+            v: &'a serde_json::Value,
+            ctx: &str,
+        ) -> Result<&'a serde_json::Map<String, serde_json::Value>> {
+            v.as_object().with_context(|| format!("{ctx} must be an object"))
+        }
+
+        fn require_str<'a>(
+            obj: &'a serde_json::Map<String, serde_json::Value>,
+            k: &str,
+            ctx: &str,
+        ) -> Result<&'a str> {
+            obj.get(k)
+                .and_then(|v| v.as_str())
+                .with_context(|| format!("{ctx}.{k} must be a string"))
+        }
+
+        fn require_num(
+            obj: &serde_json::Map<String, serde_json::Value>,
+            k: &str,
+            ctx: &str,
+        ) -> Result<()> {
+            obj.get(k)
+                .and_then(|v| v.as_f64())
+                .with_context(|| format!("{ctx}.{k} must be a number"))?;
+            Ok(())
+        }
+
+        fn require_int(
+            obj: &serde_json::Map<String, serde_json::Value>,
+            k: &str,
+            ctx: &str,
+        ) -> Result<()> {
+            obj.get(k)
+                .and_then(|v| v.as_i64())
+                .with_context(|| format!("{ctx}.{k} must be an integer"))?;
+            Ok(())
+        }
+
+        fn validate_metadata(card_type: &FeedCardType, meta: &serde_json::Value) -> Result<()> {
+            use FeedCardType::*;
+            let obj = require_obj(meta, "metadata")?;
+            match card_type {
+                Stock => {
+                    require_str(obj, "ticker", "metadata")?;
+                    require_str(obj, "name", "metadata")?;
+                    require_num(obj, "price", "metadata")?;
+                    require_num(obj, "change", "metadata")?;
+                    require_num(obj, "changePercent", "metadata")?;
+                    obj.get("sparkline")
+                        .and_then(|v| v.as_array())
+                        .filter(|a| !a.is_empty())
+                        .with_context(|| "metadata.sparkline must be a non-empty array")?;
+                }
+                Crypto => {
+                    require_str(obj, "symbol", "metadata")?;
+                    require_str(obj, "name", "metadata")?;
+                    require_num(obj, "price", "metadata")?;
+                    require_num(obj, "change24h", "metadata")?;
+                    require_num(obj, "changePercent24h", "metadata")?;
+                    require_num(obj, "volume24h", "metadata")?;
+                    require_num(obj, "marketCap", "metadata")?;
+                    obj.get("sparkline")
+                        .and_then(|v| v.as_array())
+                        .filter(|a| !a.is_empty())
+                        .with_context(|| "metadata.sparkline must be a non-empty array")?;
+                }
+                Prediction => {
+                    require_str(obj, "id", "metadata")?;
+                    require_str(obj, "question", "metadata")?;
+                    require_num(obj, "yesPrice", "metadata")?;
+                    require_num(obj, "volume", "metadata")?;
+                    require_str(obj, "category", "metadata")?;
+                    require_str(obj, "endDate", "metadata")?;
+                    require_str(obj, "source", "metadata")?;
+                }
+                Game => {
+                    require_str(obj, "id", "metadata")?;
+                    require_str(obj, "league", "metadata")?;
+                    require_str(obj, "teamA", "metadata")?;
+                    require_str(obj, "teamB", "metadata")?;
+                    if obj.get("scoreA").is_none() || obj.get("scoreB").is_none() {
+                        anyhow::bail!("metadata.scoreA and metadata.scoreB are required");
+                    }
+                    require_str(obj, "status", "metadata")?;
+                    require_str(obj, "detail", "metadata")?;
+                }
+                News => {
+                    require_str(obj, "id", "metadata")?;
+                    require_str(obj, "headline", "metadata")?;
+                    require_str(obj, "source", "metadata")?;
+                    require_str(obj, "category", "metadata")?;
+                    require_str(obj, "timestamp", "metadata")?;
+                }
+                Social => {
+                    require_str(obj, "id", "metadata")?;
+                    require_str(obj, "handle", "metadata")?;
+                    require_str(obj, "displayName", "metadata")?;
+                    require_str(obj, "content", "metadata")?;
+                    require_int(obj, "likes", "metadata")?;
+                    require_int(obj, "reposts", "metadata")?;
+                    require_str(obj, "timestamp", "metadata")?;
+                    require_str(obj, "platform", "metadata")?;
+                }
+                Poll => {
+                    require_str(obj, "id", "metadata")?;
+                    require_str(obj, "question", "metadata")?;
+                    obj.get("options")
+                        .and_then(|v| v.as_array())
+                        .filter(|a| a.len() >= 2)
+                        .with_context(|| "metadata.options must be an array with at least 2 items")?;
+                    require_int(obj, "totalVotes", "metadata")?;
+                }
+                Chart => {
+                    require_str(obj, "id", "metadata")?;
+                    require_str(obj, "title", "metadata")?;
+                    require_str(obj, "chartType", "metadata")?;
+                    obj.get("data")
+                        .and_then(|v| v.as_array())
+                        .filter(|a| !a.is_empty())
+                        .with_context(|| "metadata.data must be a non-empty array")?;
+                }
+                Logs => {
+                    require_str(obj, "id", "metadata")?;
+                    require_str(obj, "title", "metadata")?;
+                    obj.get("entries")
+                        .and_then(|v| v.as_array())
+                        .filter(|a| !a.is_empty())
+                        .with_context(|| "metadata.entries must be a non-empty array")?;
+                }
+                Table => {
+                    require_str(obj, "id", "metadata")?;
+                    require_str(obj, "title", "metadata")?;
+                    obj.get("columns")
+                        .and_then(|v| v.as_array())
+                        .filter(|a| !a.is_empty())
+                        .with_context(|| "metadata.columns must be a non-empty array")?;
+                    obj.get("rows")
+                        .and_then(|v| v.as_array())
+                        .filter(|a| !a.is_empty())
+                        .with_context(|| "metadata.rows must be a non-empty array")?;
+                }
+                Kv => {
+                    require_str(obj, "id", "metadata")?;
+                    require_str(obj, "title", "metadata")?;
+                    obj.get("pairs")
+                        .and_then(|v| v.as_array())
+                        .filter(|a| !a.is_empty())
+                        .with_context(|| "metadata.pairs must be a non-empty array")?;
+                }
+                Metric => {
+                    require_str(obj, "id", "metadata")?;
+                    require_str(obj, "label", "metadata")?;
+                    require_num(obj, "value", "metadata")?;
+                }
+                Code => {
+                    require_str(obj, "id", "metadata")?;
+                    require_str(obj, "title", "metadata")?;
+                    require_str(obj, "language", "metadata")?;
+                    require_str(obj, "code", "metadata")?;
+                }
+                Integration => {
+                    require_str(obj, "id", "metadata")?;
+                    require_str(obj, "name", "metadata")?;
+                    require_str(obj, "type", "metadata")?;
+                    require_str(obj, "status", "metadata")?;
+                    require_str(obj, "lastSync", "metadata")?;
+                    obj.get("metrics")
+                        .and_then(|v| v.as_array())
+                        .with_context(|| "metadata.metrics must be an array")?;
+                }
+                Weather => {
+                    require_str(obj, "id", "metadata")?;
+                    require_str(obj, "location", "metadata")?;
+                    require_num(obj, "temp", "metadata")?;
+                    require_num(obj, "feelsLike", "metadata")?;
+                    require_str(obj, "condition", "metadata")?;
+                    require_num(obj, "humidity", "metadata")?;
+                    require_num(obj, "wind", "metadata")?;
+                    obj.get("forecast")
+                        .and_then(|v| v.as_array())
+                        .filter(|a| !a.is_empty())
+                        .with_context(|| "metadata.forecast must be a non-empty array")?;
+                }
+                Calendar => {
+                    require_str(obj, "id", "metadata")?;
+                    require_str(obj, "date", "metadata")?;
+                    obj.get("events")
+                        .and_then(|v| v.as_array())
+                        .with_context(|| "metadata.events must be an array")?;
+                }
+                Flight => {
+                    require_str(obj, "id", "metadata")?;
+                    require_str(obj, "flightNumber", "metadata")?;
+                    require_str(obj, "airline", "metadata")?;
+                    obj.get("departure")
+                        .and_then(|v| v.as_object())
+                        .with_context(|| "metadata.departure must be an object")?;
+                    obj.get("arrival")
+                        .and_then(|v| v.as_object())
+                        .with_context(|| "metadata.arrival must be an object")?;
+                    require_str(obj, "status", "metadata")?;
+                }
+                Ci => {
+                    require_str(obj, "id", "metadata")?;
+                    require_str(obj, "repo", "metadata")?;
+                    require_str(obj, "branch", "metadata")?;
+                    require_str(obj, "commit", "metadata")?;
+                    require_str(obj, "status", "metadata")?;
+                    require_str(obj, "author", "metadata")?;
+                    require_str(obj, "message", "metadata")?;
+                    obj.get("stages")
+                        .and_then(|v| v.as_array())
+                        .filter(|a| !a.is_empty())
+                        .with_context(|| "metadata.stages must be a non-empty array")?;
+                }
+                Github => {
+                    require_str(obj, "id", "metadata")?;
+                    require_str(obj, "repo", "metadata")?;
+                    obj.get("events")
+                        .and_then(|v| v.as_array())
+                        .filter(|a| !a.is_empty())
+                        .with_context(|| "metadata.events must be a non-empty array")?;
+                }
+                Image => {
+                    require_str(obj, "id", "metadata")?;
+                    require_str(obj, "title", "metadata")?;
+                    require_str(obj, "url", "metadata")?;
+                }
+                Video => {
+                    require_str(obj, "id", "metadata")?;
+                    require_str(obj, "title", "metadata")?;
+                    require_str(obj, "url", "metadata")?;
+                }
+                Audio => {
+                    require_str(obj, "id", "metadata")?;
+                    require_str(obj, "title", "metadata")?;
+                    require_str(obj, "url", "metadata")?;
+                }
+                Webview => {
+                    require_str(obj, "id", "metadata")?;
+                    require_str(obj, "title", "metadata")?;
+                    require_str(obj, "url", "metadata")?;
+                }
+                File => {
+                    require_str(obj, "id", "metadata")?;
+                    require_str(obj, "name", "metadata")?;
+                    require_str(obj, "extension", "metadata")?;
+                    require_str(obj, "contentType", "metadata")?;
+                    require_int(obj, "size", "metadata")?;
+                    require_str(obj, "createdAt", "metadata")?;
+                    if obj.get("updatedAt").is_none()
+                        || obj.get("description").is_none()
+                        || obj.get("tags").is_none()
+                    {
+                        anyhow::bail!("metadata.updatedAt, metadata.description, and metadata.tags are required");
+                    }
+                }
+            }
+            Ok(())
+        }
 
         // Attempt to connect to Quilt runtime
         let quilt = match QuiltClient::from_env() {
@@ -189,35 +367,16 @@ impl FeedExecutor {
                     metadata: None,
                     error: Some(
                         "Code handler execution requires a running Quilt container runtime. \
-                         Set QUILT_API_URL and QUILT_API_KEY, or use a URL as handler_code \
-                         for basic HTTP feeds."
+                         Set QUILT_API_URL and QUILT_API_KEY."
                             .to_string(),
                     ),
                 });
             }
         };
 
-        // Create a sandboxed container for the feed execution
-        let container_name = format!("feed-{feed_id}-{run_id}");
-        let params = crate::quilt::client::QuiltCreateParams {
-            image: "node:20-slim".to_string(),
-            name: container_name,
-            command: None,
-            labels: std::collections::HashMap::from([
-                ("aria.feed_id".to_string(), feed_id.to_string()),
-                ("aria.tenant_id".to_string(), tenant_id.to_string()),
-                ("aria.run_id".to_string(), run_id.to_string()),
-            ]),
-            memory_limit_mb: Some(256),
-            cpu_limit_percent: Some(50),
-            environment: std::collections::HashMap::new(),
-            volumes: Vec::new(),
-            ports: Vec::new(),
-            network: None,
-            restart_policy: None,
-        };
-
-        let container = match quilt.create_container(params).await {
+        // Prefer the long-lived `aria-exec` container (it has Node installed).
+        // In some Quilt environments, newly-created containers may not have Node by default.
+        let containers = match quilt.list_containers().await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(FeedResult {
@@ -225,83 +384,363 @@ impl FeedExecutor {
                     items: Vec::new(),
                     summary: None,
                     metadata: None,
-                    error: Some(format!("Failed to create Quilt container: {e}")),
+                    error: Some(format!("Failed to list Quilt containers: {e}")),
                 });
             }
         };
 
-        // Start the container
-        if let Err(e) = quilt.start_container(&container.container_id).await {
-            let _ = quilt.delete_container(&container.container_id).await;
+        let container = containers
+            .iter()
+            .find(|c| c.name == "aria-exec")
+            .cloned()
+            .or_else(|| {
+                containers
+                    .iter()
+                    .find(|c| c.state == crate::quilt::client::QuiltContainerState::Running)
+                    .cloned()
+            });
+
+        let Some(container) = container else {
             return Ok(FeedResult {
                 success: false,
                 items: Vec::new(),
                 summary: None,
                 metadata: None,
-                error: Some(format!("Failed to start container: {e}")),
+                error: Some("No usable Quilt container found (expected 'aria-exec')".into()),
+            });
+        };
+
+        if container.state != crate::quilt::client::QuiltContainerState::Running {
+            if let Err(e) = quilt.start_container(&container.id).await {
+                return Ok(FeedResult {
+                    success: false,
+                    items: Vec::new(),
+                    summary: None,
+                    metadata: None,
+                    error: Some(format!("Failed to start Quilt container: {e}")),
+                });
+            }
+        }
+
+        // Execute strict wrapper inside the container
+        let handler_clean = handler_code_sanitize(handler_code);
+        let Some(class_name) = extract_class_name(handler_clean) else {
+            return Ok(FeedResult {
+                success: false,
+                items: Vec::new(),
+                summary: None,
+                metadata: None,
+                error: Some("Feed handler class not found (no `class Name` in handler_code)".into()),
+            });
+        };
+
+        let ctx_json = serde_json::json!({
+            "feed_id": feed_id.to_string(),
+            "tenant_id": tenant_id.to_string(),
+            "last_run_at": chrono::Utc::now().timestamp_millis(),
+        })
+        .to_string();
+
+        let script = format!(
+            r#"'use strict';
+const RESULT_MARKER = '{marker}';
+const __ctx = {ctx_json};
+
+function nowIso() {{ return new Date().toISOString(); }}
+function isoFromEpochSeconds(sec) {{ return new Date(Math.floor(Number(sec) * 1000)).toISOString(); }}
+function stripHtml(s) {{
+  if (typeof s !== "string") return "";
+  return s.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+}}
+function clamp(n, lo, hi) {{
+  const x = Number(n);
+  if (!Number.isFinite(x)) return lo;
+  return Math.max(lo, Math.min(hi, x));
+}}
+function sparklineFromSeries(values, n = 30) {{
+  const xs = Array.isArray(values) ? values.map(Number).filter(Number.isFinite) : [];
+  if (xs.length === 0) throw new Error("sparkline series empty");
+  if (xs.length <= n) return xs;
+  const step = xs.length / n;
+  const out = [];
+  for (let i = 0; i < n; i++) out.push(xs[Math.floor(i * step)]);
+  return out;
+}}
+function hashString(s) {{
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {{
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }}
+  return h >>> 0;
+}}
+function parseCsvRows(csv) {{
+  const lines = String(csv).trim().split(/\r?\n/).filter(Boolean);
+  if (lines.length < 2) throw new Error("CSV has no rows");
+  const headers = lines[0].split(",").map((h) => h.trim());
+  const rows = [];
+  for (const line of lines.slice(1)) {{
+    const cols = line.split(",");
+    const row = {{}};
+    for (let i = 0; i < headers.length; i++) row[headers[i]] = (cols[i] ?? "").trim();
+    rows.push(row);
+  }}
+  return rows;
+}}
+async function fetchJson(url, {{ timeoutMs = 8000, headers }} = {{}}) {{
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {{
+    const res = await fetch(url, {{
+      headers: {{ "User-Agent": "aria-feed/1.0", ...(headers ?? {{}}) }},
+      signal: controller.signal,
+    }});
+    if (!res.ok) throw new Error(`HTTP ${{res.status}} ${{res.statusText}}`);
+    return await res.json();
+  }} finally {{
+    clearTimeout(id);
+  }}
+}}
+async function fetchText(url, {{ timeoutMs = 8000, headers }} = {{}}) {{
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {{
+    const res = await fetch(url, {{
+      headers: {{ "User-Agent": "aria-feed/1.0", ...(headers ?? {{}}) }},
+      signal: controller.signal,
+    }});
+    if (!res.ok) throw new Error(`HTTP ${{res.status}} ${{res.statusText}}`);
+    return await res.text();
+  }} finally {{
+    clearTimeout(id);
+  }}
+}}
+
+{handler}
+
+function __normalize(raw) {{
+  if (Array.isArray(raw)) return {{ success: true, items: raw }};
+  if (raw && typeof raw === 'object') {{
+    return {{
+      success: typeof raw.success === 'boolean' ? raw.success : true,
+      items: Array.isArray(raw.items) ? raw.items : [],
+      summary: typeof raw.summary === 'string' ? raw.summary : undefined,
+      metadata: raw.metadata,
+      error: typeof raw.error === 'string' ? raw.error : undefined,
+    }};
+  }}
+  return {{ success: true, items: [] }};
+}}
+
+async function __run() {{
+  const candidates = ['handler','execute','fetch','run'];
+  const C = {class_name};
+  const inst = new C();
+  for (const name of candidates) {{
+    if (typeof inst?.[name] === 'function') {{
+      const out = await inst[name](__ctx);
+      return __normalize(out);
+    }}
+  }}
+  throw new Error('Feed handler method not found (expected one of: handler/execute/fetch/run)');
+}}
+
+(async () => {{
+  try {{
+    const out = await __run();
+    console.log(RESULT_MARKER + JSON.stringify({{ success: true, result: out }}));
+  }} catch (err) {{
+    console.log(RESULT_MARKER + JSON.stringify({{
+      success: false,
+      error: err?.message || String(err),
+      stack: err?.stack,
+    }}));
+    process.exit(1);
+  }}
+}})();
+"#,
+            marker = RESULT_MARKER,
+            ctx_json = ctx_json,
+            handler = handler_clean,
+            class_name = class_name,
+        );
+
+        let script_path = format!("/tmp/aria-feed-{feed_id}-{run_id}.js");
+        let eof = format!("ARIA_FEED_SCRIPT_EOF_{run_id}");
+        let write_cmd = format!("cat > {script_path} << '{eof}'\n{script}\n{eof}");
+
+        // Write script to container
+        let write_result = quilt
+            .exec(
+                &container.id,
+                crate::quilt::client::QuiltExecParams {
+                    command: crate::quilt::client::QuiltExecCommand::Vec(vec![
+                        "sh".into(),
+                        "-c".into(),
+                        write_cmd,
+                    ]),
+                    workdir: None,
+                    capture_output: Some(true),
+                    timeout_ms: Some(10_000),
+                    detach: Some(false),
+                },
+            )
+            .await;
+        if let Err(e) = write_result {
+            return Ok(FeedResult {
+                success: false,
+                items: Vec::new(),
+                summary: None,
+                metadata: None,
+                error: Some(format!("Failed to write handler script: {e}")),
             });
         }
 
-        // Execute the handler code inside the container
-        let exec_params = crate::quilt::client::QuiltExecParams {
-            command: vec![
-                "node".into(),
-                "-e".into(),
-                Self::shell_single_quote(handler_code),
-            ],
-            timeout_ms: Some(60_000), // 60 second timeout
-            working_dir: Some("/app".into()),
-            environment: Some(std::collections::HashMap::from([
-                ("FEED_ID".to_string(), feed_id.to_string()),
-                ("TENANT_ID".to_string(), tenant_id.to_string()),
-                ("RUN_ID".to_string(), run_id.to_string()),
-            ])),
-        };
+        // Execute script
+        let exec_result = quilt
+            .exec(
+                &container.id,
+                crate::quilt::client::QuiltExecParams {
+                    command: crate::quilt::client::QuiltExecCommand::Vec(vec![
+                        "node".into(),
+                        script_path.clone(),
+                    ]),
+                    workdir: None,
+                    capture_output: Some(true),
+                    timeout_ms: Some(60_000),
+                    detach: Some(false),
+                },
+            )
+            .await;
 
-        let exec_result = quilt.exec(&container.container_id, exec_params).await;
-
-        // Clean up the container regardless of result
-        let _ = quilt.stop_container(&container.container_id).await;
-        let _ = quilt.delete_container(&container.container_id).await;
+        // Best-effort cleanup of script file
+        let _ = quilt
+            .exec(
+                &container.id,
+                crate::quilt::client::QuiltExecParams {
+                    command: crate::quilt::client::QuiltExecCommand::Vec(vec![
+                        "rm".into(),
+                        "-f".into(),
+                        script_path,
+                    ]),
+                    workdir: None,
+                    capture_output: Some(true),
+                    timeout_ms: Some(2_000),
+                    detach: Some(false),
+                },
+            )
+            .await;
 
         match exec_result {
             Ok(result) => {
-                if result.exit_code != 0 {
+                let idx = result
+                    .stdout
+                    .find(RESULT_MARKER)
+                    .context("Feed handler did not emit __ARIA_FEED_RESULT__ marker")?;
+                let json_str = result.stdout[idx + RESULT_MARKER.len()..]
+                    .trim()
+                    .lines()
+                    .next()
+                    .unwrap_or("");
+
+                let parsed: serde_json::Value = match serde_json::from_str(json_str) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let stdout_tail: String = result
+                            .stdout
+                            .chars()
+                            .rev()
+                            .take(500)
+                            .collect::<String>()
+                            .chars()
+                            .rev()
+                            .collect();
+                        anyhow::bail!(
+                            "Failed to parse feed marker JSON: {e}; marker_line={:?}; stdout_tail={:?}",
+                            json_str,
+                            stdout_tail
+                        );
+                    }
+                };
+                let ok = parsed.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+                if !ok {
+                    let err = parsed
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Feed handler failed");
                     return Ok(FeedResult {
                         success: false,
                         items: Vec::new(),
                         summary: None,
                         metadata: None,
-                        error: Some(format!(
-                            "Handler exited with code {}: {}",
-                            result.exit_code, result.stderr
-                        )),
+                        error: Some(err.to_string()),
                     });
                 }
 
-                // Parse stdout as JSON feed items
-                let item = FeedItem {
-                    card_type: FeedCardType::Text,
-                    title: format!("Feed {feed_id} run {run_id}"),
-                    body: Some(result.stdout),
-                    source: Some("quilt".to_string()),
-                    url: None,
-                    metadata: Some(std::collections::HashMap::from([
-                        ("run_id".to_string(), serde_json::json!(run_id)),
-                        (
-                            "executed_at".to_string(),
-                            serde_json::json!(Utc::now().to_rfc3339()),
-                        ),
-                    ])),
-                    timestamp: Some(Utc::now().timestamp()),
-                };
+                if result.exit_code != 0 {
+                    let stderr = result.stderr.trim();
+                    let hint = if !stderr.is_empty() {
+                        stderr.to_string()
+                    } else {
+                        // Wrapper prints structured error JSON to stdout before exiting non-zero.
+                        "(no stderr)".to_string()
+                    };
+                    return Ok(FeedResult {
+                        success: false,
+                        items: Vec::new(),
+                        summary: None,
+                        metadata: None,
+                        error: Some(format!("Handler exited with code {}: {hint}", result.exit_code)),
+                    });
+                }
+
+                let result_obj = parsed.get("result").context("Missing result in marker")?;
+                let res_obj = require_obj(result_obj, "result")?;
+                let items = res_obj
+                    .get("items")
+                    .and_then(|v| v.as_array())
+                    .context("result.items must be an array")?;
+
+                let mut out_items: Vec<FeedItem> = Vec::new();
+                for (i, item) in items.iter().enumerate() {
+                    let item_obj = require_obj(item, &format!("items[{i}]"))?;
+                    let ct = require_str(item_obj, "cardType", &format!("items[{i}]"))?;
+                    let title = require_str(item_obj, "title", &format!("items[{i}]"))?.to_string();
+                    let card_type = parse_card_type(ct).with_context(|| format!("items[{i}]"))?;
+
+                    let meta = item_obj.get("metadata").context("items[].metadata is required")?;
+                    validate_metadata(&card_type, meta)
+                        .with_context(|| format!("items[{i}].metadata"))?;
+
+                    let meta_obj = require_obj(meta, "metadata")?;
+                    let meta_map: std::collections::HashMap<String, serde_json::Value> =
+                        meta_obj.clone().into_iter().collect();
+
+                    let body = item_obj.get("body").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    let source = item_obj.get("source").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    let url = item_obj.get("url").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    let ts = item_obj
+                        .get("timestamp")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or_else(|| Utc::now().timestamp_millis());
+
+                    out_items.push(FeedItem {
+                        card_type,
+                        title,
+                        body,
+                        source,
+                        url,
+                        metadata: Some(meta_map),
+                        timestamp: Some(ts),
+                    });
+                }
 
                 Ok(FeedResult {
-                    success: true,
-                    items: vec![item],
-                    summary: Some(format!("Executed code handler for {feed_id}")),
-                    metadata: None,
-                    error: None,
+                    success: res_obj.get("success").and_then(|v| v.as_bool()).unwrap_or(true),
+                    items: out_items,
+                    summary: res_obj.get("summary").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    metadata: res_obj.get("metadata").cloned(),
+                    error: res_obj.get("error").and_then(|v| v.as_str()).map(|s| s.to_string()),
                 })
             }
             Err(e) => Ok(FeedResult {
@@ -332,14 +771,21 @@ impl FeedExecutor {
 
             for item in items {
                 let id = Uuid::new_v4().to_string();
-                let card_type = serde_json::to_string(&item.card_type)
-                    .unwrap_or_else(|_| "\"text\"".to_string());
-                // Strip surrounding quotes from the serialized card_type
-                let card_type = card_type.trim_matches('"');
-                let metadata_json = item
+                let card_type = serde_json::to_value(&item.card_type)
+                    .context("Failed to serialize FeedItem.card_type")?
+                    .as_str()
+                    .context("FeedItem.card_type must serialize to a string")?
+                    .to_string();
+                let meta = item
                     .metadata
                     .as_ref()
-                    .map(|m| serde_json::to_string(m).unwrap_or_default());
+                    .context("FeedItem.metadata is required")?;
+                let metadata_json = Some(
+                    serde_json::to_string(meta).context("Failed to serialize FeedItem.metadata")?,
+                );
+                let ts = item.timestamp.context("FeedItem.timestamp is required")?;
+                // The dashboard expects ms; auto-upconvert if it looks like seconds.
+                let ts = if ts.abs() < 100_000_000_000 { ts * 1000 } else { ts };
 
                 stmt.execute(params![
                     id,
@@ -352,7 +798,7 @@ impl FeedExecutor {
                     item.source,
                     item.url,
                     metadata_json,
-                    item.timestamp,
+                    ts,
                     now,
                 ])?;
             }
@@ -434,13 +880,19 @@ mod tests {
     fn sample_items(count: usize) -> Vec<FeedItem> {
         (0..count)
             .map(|i| FeedItem {
-                card_type: FeedCardType::Text,
+                card_type: FeedCardType::News,
                 title: format!("Item {i}"),
                 body: Some(format!("Body of item {i}")),
                 source: Some("test".to_string()),
                 url: Some(format!("https://example.com/{i}")),
-                metadata: Some(HashMap::from([("index".to_string(), serde_json::json!(i))])),
-                timestamp: Some(Utc::now().timestamp()),
+                metadata: Some(HashMap::from([
+                    ("id".to_string(), serde_json::json!(format!("n_{i}"))),
+                    ("headline".to_string(), serde_json::json!(format!("Headline {i}"))),
+                    ("source".to_string(), serde_json::json!("test")),
+                    ("category".to_string(), serde_json::json!("test")),
+                    ("timestamp".to_string(), serde_json::json!(Utc::now().to_rfc3339())),
+                ])),
+                timestamp: Some(Utc::now().timestamp_millis()),
             })
             .collect()
     }
@@ -474,33 +926,6 @@ mod tests {
     }
 
     #[test]
-    fn is_url_feed_detects_http_urls() {
-        assert!(FeedExecutor::is_url_feed("https://example.com/feed.json"));
-        assert!(FeedExecutor::is_url_feed("http://example.com/rss"));
-        assert!(FeedExecutor::is_url_feed("  https://example.com/feed  "));
-        assert!(!FeedExecutor::is_url_feed("console.log('hello')"));
-        assert!(!FeedExecutor::is_url_feed(""));
-        assert!(!FeedExecutor::is_url_feed("ftp://example.com/file"));
-        assert!(!FeedExecutor::is_url_feed("httpx://not-a-url"));
-    }
-
-    #[test]
-    fn title_from_url_extracts_host_and_path() {
-        assert_eq!(
-            FeedExecutor::title_from_url("https://example.com/feed.json"),
-            "Feed: example.com/feed.json"
-        );
-        assert_eq!(
-            FeedExecutor::title_from_url("http://api.example.com/v1/data"),
-            "Feed: api.example.com/v1/data"
-        );
-        assert_eq!(
-            FeedExecutor::title_from_url("https://example.com/"),
-            "Feed: example.com"
-        );
-    }
-
-    #[test]
     fn store_items_persists_to_db() {
         let (db, executor) = setup();
         let items = sample_items(3);
@@ -525,13 +950,19 @@ mod tests {
     fn store_items_records_correct_fields() {
         let (db, executor) = setup();
         let items = vec![FeedItem {
-            card_type: FeedCardType::Link,
-            title: "Test Link".to_string(),
-            body: Some("A link body".to_string()),
-            source: Some("reddit".to_string()),
-            url: Some("https://reddit.com/r/rust".to_string()),
-            metadata: None,
-            timestamp: Some(1_700_000_000),
+            card_type: FeedCardType::News,
+            title: "Test News".to_string(),
+            body: Some("A news body".to_string()),
+            source: Some("reuters".to_string()),
+            url: Some("https://example.com/news".to_string()),
+            metadata: Some(HashMap::from([
+                ("id".to_string(), serde_json::json!("news_1")),
+                ("headline".to_string(), serde_json::json!("Test News")),
+                ("source".to_string(), serde_json::json!("reuters")),
+                ("category".to_string(), serde_json::json!("markets")),
+                ("timestamp".to_string(), serde_json::json!("2025-01-01T00:00:00Z")),
+            ])),
+            timestamp: Some(1_700_000_000_000),
         }];
         executor.store_items("t1", "f1", "r1", &items).unwrap();
 
@@ -541,9 +972,9 @@ mod tests {
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?;
-            assert_eq!(title, "Test Link");
-            assert_eq!(card_type, "link");
-            assert_eq!(source, "reddit");
+            assert_eq!(title, "Test News");
+            assert_eq!(card_type, "news");
+            assert_eq!(source, "reuters");
             Ok(())
         })
         .unwrap();
@@ -565,7 +996,7 @@ mod tests {
             db.with_conn(|conn| {
                 conn.execute(
                     "INSERT INTO aria_feed_items (id, tenant_id, feed_id, run_id, card_type, title, created_at)
-                     VALUES (?1, 't1', 'f1', 'r1', 'text', ?2, ?3)",
+                     VALUES (?1, 't1', 'f1', 'r1', 'news', ?2, ?3)",
                     params![format!("item-{i}"), format!("Item {i}"), created],
                 )?;
                 Ok(())
@@ -600,12 +1031,12 @@ mod tests {
         db.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO aria_feed_items (id, tenant_id, feed_id, run_id, card_type, title, created_at)
-                 VALUES ('old', 't1', 'f1', 'r1', 'text', 'Old Item', ?1)",
+                 VALUES ('old', 't1', 'f1', 'r1', 'news', 'Old Item', ?1)",
                 params![old_date],
             )?;
             conn.execute(
                 "INSERT INTO aria_feed_items (id, tenant_id, feed_id, run_id, card_type, title, created_at)
-                 VALUES ('new', 't1', 'f1', 'r1', 'text', 'New Item', ?1)",
+                 VALUES ('new', 't1', 'f1', 'r1', 'news', 'New Item', ?1)",
                 params![recent_date],
             )?;
             Ok(())

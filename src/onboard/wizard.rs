@@ -312,7 +312,7 @@ pub fn run_quick_setup(api_key: Option<&str>, provider: Option<&str>) -> Result<
     println!(
         "  {} Gateway:    {}",
         style("✓").green().bold(),
-        style("pairing required (127.0.0.1:8080)").green()
+        style("no pairing (127.0.0.1:8080)").green()
     );
     println!(
         "  {} Tunnel:     {}",
@@ -2163,11 +2163,7 @@ fn print_summary(config: &Config) {
     println!(
         "    {} Gateway:       {}",
         style("🚪").cyan(),
-        if config.gateway.require_pairing {
-            "pairing required (secure)"
-        } else {
-            "pairing disabled"
-        }
+        "no pairing (pairing is deprecated)"
     );
 
     println!();

@@ -253,7 +253,7 @@ async fn execute_handler_with_quilt(
     tool: &RegistryTool,
     args: Value,
 ) -> anyhow::Result<ToolResult> {
-    use crate::quilt::client::{QuiltClient, QuiltContainerState, QuiltExecParams};
+    use crate::quilt::client::{QuiltClient, QuiltContainerState, QuiltExecCommand, QuiltExecParams};
 
     let quilt = match QuiltClient::from_env() {
         Ok(client) => client,
@@ -295,22 +295,24 @@ async fn execute_handler_with_quilt(
     let script_path = format!("/tmp/aria-tool-{}.js", uuid::Uuid::new_v4());
     let wrapper = js_exec_wrapper(&tool.handler_code, &args)?;
     let write_script = QuiltExecParams {
-        command: vec![
+        command: QuiltExecCommand::Vec(vec![
             "sh".into(),
             "-c".into(),
             format!("cat > {script_path} << 'ARIA_TOOL_EOF'\n{wrapper}\nARIA_TOOL_EOF"),
-        ],
+        ]),
+        workdir: Some("/tmp".into()),
+        capture_output: Some(true),
         timeout_ms: Some(10_000),
-        working_dir: Some("/tmp".into()),
-        environment: None,
+        detach: Some(false),
     };
     quilt.exec(&container.id, write_script).await?;
 
     let exec = QuiltExecParams {
-        command: vec!["node".into(), script_path.clone()],
+        command: QuiltExecCommand::Vec(vec!["node".into(), script_path.clone()]),
+        workdir: Some("/tmp".into()),
+        capture_output: Some(true),
         timeout_ms,
-        working_dir: Some("/app".into()),
-        environment: None,
+        detach: Some(false),
     };
 
     let exec_result = quilt.exec(&container.id, exec).await;
@@ -318,10 +320,11 @@ async fn execute_handler_with_quilt(
         .exec(
             &container.id,
             QuiltExecParams {
-                command: vec!["rm".into(), "-f".into(), script_path],
+                command: QuiltExecCommand::Vec(vec!["rm".into(), "-f".into(), script_path]),
+                workdir: Some("/tmp".into()),
+                capture_output: Some(true),
                 timeout_ms: Some(5_000),
-                working_dir: Some("/tmp".into()),
-                environment: None,
+                detach: Some(false),
             },
         )
         .await;

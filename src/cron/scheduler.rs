@@ -468,7 +468,7 @@ mod tests {
         let outcome = run_job_command(&config, &security, &job).await;
         assert!(!outcome.success);
         assert!(outcome.output.contains("blocked by security policy"));
-        assert!(output.contains("command not allowed"));
+        assert!(outcome.output.contains("command not allowed"));
     }
 
     #[tokio::test]
@@ -479,11 +479,11 @@ mod tests {
         let job = test_job("cat /etc/passwd");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) = run_job_command(&config, &security, &job).await;
-        assert!(!success);
-        assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("forbidden path argument"));
-        assert!(output.contains("/etc/passwd"));
+        let outcome = run_job_command(&config, &security, &job).await;
+        assert!(!outcome.success);
+        assert!(outcome.output.contains("blocked by security policy"));
+        assert!(outcome.output.contains("forbidden path argument"));
+        assert!(outcome.output.contains("/etc/passwd"));
     }
 
     #[tokio::test]
@@ -502,9 +502,9 @@ mod tests {
         .unwrap();
         let job = test_job("sh ./retry-once.sh");
 
-        let (success, output) = execute_job_with_retry(&config, &security, &job).await;
-        assert!(success);
-        assert!(output.contains("recovered"));
+        let outcome = execute_job_with_retry(&config, &security, &job).await;
+        assert!(outcome.success);
+        assert!(outcome.output.contains("recovered"));
     }
 
     #[tokio::test]
@@ -517,8 +517,8 @@ mod tests {
 
         let job = test_job("ls always_missing_for_retry_test");
 
-        let (success, output) = execute_job_with_retry(&config, &security, &job).await;
-        assert!(!success);
-        assert!(output.contains("always_missing_for_retry_test"));
+        let outcome = execute_job_with_retry(&config, &security, &job).await;
+        assert!(!outcome.success);
+        assert!(outcome.output.contains("always_missing_for_retry_test"));
     }
 }

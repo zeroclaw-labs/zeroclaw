@@ -289,34 +289,34 @@ pub struct NetworkDnsConfig {
 
 // ── Feed Types ───────────────────────────────────────────────────
 
-/// All 24 supported feed card types
+/// Feed card types (canonical desktop/cloud contract: 24 types).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FeedCardType {
-    Text,
-    Image,
-    Link,
-    Quote,
-    Code,
-    Markdown,
-    Chart,
-    Table,
-    List,
-    Metric,
-    Alert,
-    Weather,
     Stock,
+    Crypto,
+    Prediction,
+    Game,
     News,
     Social,
-    Calendar,
-    Task,
-    File,
-    Audio,
-    Video,
-    Map,
     Poll,
-    Embed,
-    Custom,
+    Chart,
+    Logs,
+    Table,
+    Kv,
+    Metric,
+    Code,
+    Integration,
+    Weather,
+    Calendar,
+    Flight,
+    Ci,
+    Github,
+    Image,
+    Video,
+    Audio,
+    Webview,
+    File,
 }
 
 /// Feed content categories
@@ -932,10 +932,11 @@ mod tests {
     #[test]
     fn feed_card_types_serialize() {
         let cards = vec![
-            FeedCardType::Text,
-            FeedCardType::Image,
+            FeedCardType::Stock,
+            FeedCardType::Crypto,
+            FeedCardType::News,
             FeedCardType::Chart,
-            FeedCardType::Custom,
+            FeedCardType::File,
         ];
         for card in cards {
             let json = serde_json::to_string(&card).unwrap();

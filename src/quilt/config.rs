@@ -21,7 +21,7 @@ pub struct SandboxQuiltConfig {
     /// Env: `QUILT_API_URL`, default: `https://backend.quilt.sh`
     pub api_url: String,
 
-    /// Quilt API key (must start with `qlt_`).
+    /// Quilt API key (typically starts with `qlt_` or `quilt_sk_`).
     /// Env: `QUILT_API_KEY`
     pub api_key: String,
 

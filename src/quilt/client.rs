@@ -21,6 +21,7 @@ struct QuiltErrorBody {
     #[serde(default)]
     error_code: String,
     #[serde(default)]
+    #[serde(alias = "error")]
     message: String,
     #[serde(default)]
     hint: Option<String>,
@@ -31,23 +32,24 @@ struct QuiltErrorBody {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QuiltContainerState {
-    Created,
     Pending,
     Starting,
     Running,
     Exited,
     Error,
+    #[serde(other)]
+    Unknown,
 }
 
 impl std::fmt::Display for QuiltContainerState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Created => write!(f, "created"),
             Self::Pending => write!(f, "pending"),
             Self::Starting => write!(f, "starting"),
             Self::Running => write!(f, "running"),
             Self::Exited => write!(f, "exited"),
             Self::Error => write!(f, "error"),
+            Self::Unknown => write!(f, "unknown"),
         }
     }
 }
@@ -66,7 +68,11 @@ pub struct QuiltContainerStatus {
     pub pid: Option<u32>,
     pub exit_code: Option<i32>,
     pub ip_address: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<i64>,
+    #[serde(default, deserialize_with = "deserialize_opt_u32_flexible")]
     pub memory_limit_mb: Option<u32>,
+    #[serde(default, deserialize_with = "deserialize_opt_f64_flexible")]
     pub cpu_limit_percent: Option<f64>,
     pub labels: Option<HashMap<String, String>>,
     #[serde(default, alias = "started_at", deserialize_with = "deserialize_opt_epoch_ms")]
@@ -80,12 +86,6 @@ pub struct QuiltContainerStatus {
 enum ContainersListResponse {
     Wrapped { containers: Vec<QuiltContainerStatus> },
     Direct(Vec<QuiltContainerStatus>),
-}
-
-#[derive(Debug, Deserialize)]
-struct GetContainerByNameResponse {
-    container_id: Option<String>,
-    found: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,48 +103,43 @@ pub struct QuiltCreateResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VolumeMount {
-    pub host_path: String,
-    pub container_path: String,
-    pub read_only: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PortMapping {
-    pub host_port: u16,
-    pub container_port: u16,
-    pub protocol: String,
+#[serde(untagged)]
+pub enum QuiltExecCommand {
+    String(String),
+    Vec(Vec<String>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuiltCreateParams {
-    pub name: String,
-    pub image: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<Vec<String>>,
-    pub environment: HashMap<String, String>,
-    pub volumes: Vec<VolumeMount>,
-    pub ports: Vec<PortMapping>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_limit_mb: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_limit_percent: Option<u32>,
-    pub labels: HashMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub network: Option<String>,
+    pub volumes: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub restart_policy: Option<String>,
+    pub labels: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuiltExecParams {
-    pub command: Vec<String>,
+    pub command: QuiltExecCommand,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_output: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub working_dir: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub environment: Option<HashMap<String, String>>,
+    pub detach: Option<bool>,
 }
 
 // ── Client ──────────────────────────────────────────────────────────
@@ -197,10 +192,10 @@ impl QuiltClient {
 
     /// Build a new `QuiltClient`.
     ///
-    /// Requires the current Quilt key format: `quilt_sk_...`.
+    /// Quilt keys are typically prefixed with `qlt_` or `quilt_sk_`.
     pub fn new(api_url: &str, api_key: &str) -> Result<Self, anyhow::Error> {
-        if !api_key.starts_with("quilt_sk_") {
-            anyhow::bail!("Quilt API key must start with 'quilt_sk_' prefix");
+        if !(api_key.starts_with("qlt_") || api_key.starts_with("quilt_sk_")) {
+            anyhow::bail!("Quilt API key must start with 'qlt_' or 'quilt_sk_' prefix");
         }
 
         let http = reqwest::Client::builder()
@@ -305,18 +300,7 @@ impl QuiltClient {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            return Err(self.handle_error(resp).await.into());
-        }
-
-        let payload: GetContainerByNameResponse = resp.json().await?;
-        if !payload.found.unwrap_or(false) {
-            anyhow::bail!("Container '{name}' not found");
-        }
-        let id = payload
-            .container_id
-            .ok_or_else(|| anyhow::anyhow!("Container '{name}' lookup returned no container_id"))?;
-        self.get_container(&id).await
+        self.parse_status_response(resp).await
     }
 
     /// Start a container.
@@ -426,7 +410,11 @@ impl QuiltClient {
             .await?;
 
         if resp.status().is_success() {
-            let payload: ContainersListResponse = resp.json().await?;
+            let bytes = resp.bytes().await?;
+            let payload: ContainersListResponse = serde_json::from_slice(&bytes).map_err(|e| {
+                let snippet = String::from_utf8_lossy(&bytes[..bytes.len().min(800)]);
+                anyhow::anyhow!("error decoding response body: {e}; body: {snippet}")
+            })?;
             Ok(match payload {
                 ContainersListResponse::Wrapped { containers } => containers,
                 ContainersListResponse::Direct(containers) => containers,
@@ -484,6 +472,66 @@ where
     }
 }
 
+fn deserialize_opt_u32_flexible<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum V {
+        U32(u32),
+        U64(u64),
+        I64(i64),
+        F64(f64),
+        Str(String),
+        Null,
+    }
+
+    let raw = Option::<V>::deserialize(deserializer)?;
+    let Some(v) = raw else { return Ok(None) };
+    match v {
+        V::U32(x) => Ok(Some(x)),
+        V::U64(x) => Ok(Some(x as u32)),
+        V::I64(x) => Ok(Some(x as u32)),
+        V::F64(x) => Ok(Some(x as u32)),
+        V::Str(s) => s
+            .trim()
+            .parse::<f64>()
+            .map(|x| Some(x as u32))
+            .map_err(serde::de::Error::custom),
+        V::Null => Ok(None),
+    }
+}
+
+fn deserialize_opt_f64_flexible<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum V {
+        F64(f64),
+        I64(i64),
+        U64(u64),
+        Str(String),
+        Null,
+    }
+
+    let raw = Option::<V>::deserialize(deserializer)?;
+    let Some(v) = raw else { return Ok(None) };
+    match v {
+        V::F64(x) => Ok(Some(x)),
+        V::I64(x) => Ok(Some(x as f64)),
+        V::U64(x) => Ok(Some(x as f64)),
+        V::Str(s) => s
+            .trim()
+            .parse::<f64>()
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        V::Null => Ok(None),
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -496,8 +544,9 @@ mod tests {
     fn client_rejects_key_without_prefix() {
         let err = QuiltClient::new("https://backend.quilt.sh", "bad-key-no-prefix");
         assert!(err.is_err());
+        let msg = err.unwrap_err().to_string();
         assert!(
-            err.unwrap_err().to_string().contains("quilt_sk_"),
+            msg.contains("qlt_") || msg.contains("quilt_sk_"),
             "error should mention the required prefix"
         );
     }
@@ -532,96 +581,83 @@ mod tests {
     #[test]
     fn create_params_serializes_correctly() {
         let params = QuiltCreateParams {
-            name: "sandbox-001".into(),
-            image: "ubuntu:22.04".into(),
-            command: Some(vec!["bash".into(), "-c".into(), "sleep infinity".into()]),
-            environment: HashMap::from([("FOO".into(), "bar".into())]),
-            volumes: vec![VolumeMount {
-                host_path: "/host/data".into(),
-                container_path: "/data".into(),
-                read_only: true,
-            }],
-            ports: vec![PortMapping {
-                host_port: 8080,
-                container_port: 80,
-                protocol: "tcp".into(),
-            }],
+            name: Some("sandbox-001".into()),
+            command: Some(vec!["sleep".into(), "infinity".into()]),
+            environment: Some(HashMap::from([("FOO".into(), "bar".into())])),
+            working_directory: Some("/workspace".into()),
             memory_limit_mb: Some(4096),
             cpu_limit_percent: Some(100),
-            labels: HashMap::from([("aria.sandbox".into(), "true".into())]),
-            network: Some("bridge".into()),
-            restart_policy: None,
+            volumes: Some(vec!["/host/data:/data:ro".into()]),
+            labels: Some(HashMap::from([("aria.sandbox".into(), "true".into())])),
         };
 
         let json = serde_json::to_value(&params).unwrap();
         assert_eq!(json["name"], "sandbox-001");
-        assert_eq!(json["image"], "ubuntu:22.04");
-        assert_eq!(json["command"][0], "bash");
+        assert_eq!(json["command"][0], "sleep");
         assert_eq!(json["environment"]["FOO"], "bar");
-        assert_eq!(json["volumes"][0]["host_path"], "/host/data");
-        assert!(json["volumes"][0]["read_only"].as_bool().unwrap());
-        assert_eq!(json["ports"][0]["host_port"], 8080);
+        assert_eq!(json["working_directory"], "/workspace");
+        assert_eq!(json["volumes"][0], "/host/data:/data:ro");
         assert_eq!(json["memory_limit_mb"], 4096);
         assert_eq!(json["labels"]["aria.sandbox"], "true");
-        assert_eq!(json["network"], "bridge");
-        // restart_policy is None, should be omitted
-        assert!(json.get("restart_policy").is_none());
     }
 
     #[test]
     fn create_params_omits_none_fields() {
         let params = QuiltCreateParams {
-            name: "test".into(),
-            image: "alpine:latest".into(),
+            name: Some("test".into()),
             command: None,
-            environment: HashMap::new(),
-            volumes: vec![],
-            ports: vec![],
+            environment: None,
+            working_directory: None,
             memory_limit_mb: None,
             cpu_limit_percent: None,
-            labels: HashMap::new(),
-            network: None,
-            restart_policy: None,
+            volumes: None,
+            labels: None,
         };
 
         let json = serde_json::to_value(&params).unwrap();
         assert!(json.get("command").is_none());
+        assert!(json.get("environment").is_none());
+        assert!(json.get("working_directory").is_none());
         assert!(json.get("memory_limit_mb").is_none());
         assert!(json.get("cpu_limit_percent").is_none());
-        assert!(json.get("network").is_none());
-        assert!(json.get("restart_policy").is_none());
+        assert!(json.get("volumes").is_none());
+        assert!(json.get("labels").is_none());
     }
 
     #[test]
     fn exec_params_serializes_correctly() {
         let params = QuiltExecParams {
-            command: vec!["ls".into(), "-la".into()],
+            command: QuiltExecCommand::Vec(vec!["ls".into(), "-la".into()]),
+            workdir: Some("/workspace".into()),
+            capture_output: Some(true),
             timeout_ms: Some(30_000),
-            working_dir: Some("/workspace".into()),
-            environment: Some(HashMap::from([("PATH".into(), "/usr/bin".into())])),
+            detach: Some(false),
         };
 
         let json = serde_json::to_value(&params).unwrap();
         assert_eq!(json["command"][0], "ls");
         assert_eq!(json["command"][1], "-la");
+        assert_eq!(json["workdir"], "/workspace");
+        assert_eq!(json["capture_output"], true);
         assert_eq!(json["timeout_ms"], 30_000);
-        assert_eq!(json["working_dir"], "/workspace");
-        assert_eq!(json["environment"]["PATH"], "/usr/bin");
+        assert_eq!(json["detach"], false);
     }
 
     #[test]
     fn exec_params_omits_none_fields() {
         let params = QuiltExecParams {
-            command: vec!["echo".into(), "hello".into()],
+            command: QuiltExecCommand::Vec(vec!["echo".into(), "hello".into()]),
+            workdir: None,
+            capture_output: None,
             timeout_ms: None,
-            working_dir: None,
-            environment: None,
+            detach: None,
         };
 
         let json = serde_json::to_value(&params).unwrap();
+        assert!(json.get("workdir").is_none());
+        assert!(json.get("capture_output").is_none());
         assert!(json.get("timeout_ms").is_none());
-        assert!(json.get("working_dir").is_none());
-        assert!(json.get("environment").is_none());
+        assert!(json.get("detach").is_none());
     }
 
     // ── Response deserialization ─────────────────────────────────
@@ -652,7 +688,7 @@ mod tests {
         assert!(status.exit_code.is_none());
         assert_eq!(status.ip_address.as_deref(), Some("10.0.0.5"));
         assert_eq!(status.memory_limit_mb, Some(4096));
-        assert_eq!(status.cpu_limit_percent, Some(100));
+        assert_eq!(status.cpu_limit_percent, Some(100.0));
         let labels = status.labels.unwrap();
         assert_eq!(labels.get("aria.sandbox").unwrap(), "true");
         assert_eq!(status.started_at_ms, Some(1_700_000_000_000));
@@ -848,53 +884,18 @@ mod tests {
         assert!(body.hint.is_none());
     }
 
-    // ── Volume and port types ───────────────────────────────────
-
-    #[test]
-    fn volume_mount_serde() {
-        let vol = VolumeMount {
-            host_path: "/tmp/data".into(),
-            container_path: "/mnt/data".into(),
-            read_only: false,
-        };
-        let json = serde_json::to_value(&vol).unwrap();
-        assert_eq!(json["host_path"], "/tmp/data");
-        assert_eq!(json["container_path"], "/mnt/data");
-        assert!(!json["read_only"].as_bool().unwrap());
-
-        let parsed: VolumeMount = serde_json::from_value(json).unwrap();
-        assert_eq!(parsed.host_path, "/tmp/data");
-        assert!(!parsed.read_only);
-    }
-
-    #[test]
-    fn port_mapping_serde() {
-        let port = PortMapping {
-            host_port: 3000,
-            container_port: 80,
-            protocol: "tcp".into(),
-        };
-        let json = serde_json::to_value(&port).unwrap();
-        assert_eq!(json["host_port"], 3000);
-        assert_eq!(json["container_port"], 80);
-        assert_eq!(json["protocol"], "tcp");
-
-        let parsed: PortMapping = serde_json::from_value(json).unwrap();
-        assert_eq!(parsed.host_port, 3000);
-    }
-
     // ── Singleton ───────────────────────────────────────────────
 
     #[tokio::test]
     async fn singleton_reset_clears_client() {
         reset_client().await;
-        let c = get_client("https://example.com", "quilt_sk_test_key")
+        let c = get_client("https://example.com", "qlt_test_key")
             .await
             .unwrap();
         assert_eq!(c.api_url(), "https://example.com");
 
         reset_client().await;
-        let c2 = get_client("https://other.com", "quilt_sk_other_key")
+        let c2 = get_client("https://other.com", "qlt_other_key")
             .await
             .unwrap();
         assert_eq!(c2.api_url(), "https://other.com");

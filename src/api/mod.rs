@@ -142,79 +142,79 @@ pub fn registry_router(db: AriaDb) -> Router {
         // ── Tools ─────────────────────────────────────────────
         .route("/api/v1/registry/tools", post(tools_upload))
         .route("/api/v1/registry/tools", get(tools_list))
-        .route("/api/v1/registry/tools/{id}", get(tools_get))
-        .route("/api/v1/registry/tools/{id}", delete(tools_delete))
+        .route("/api/v1/registry/tools/:id", get(tools_get))
+        .route("/api/v1/registry/tools/:id", delete(tools_delete))
         // ── Agents ────────────────────────────────────────────
         .route("/api/v1/registry/agents", post(agents_upload))
         .route("/api/v1/registry/agents", get(agents_list))
-        .route("/api/v1/registry/agents/{id}", get(agents_get))
-        .route("/api/v1/registry/agents/{id}", delete(agents_delete))
+        .route("/api/v1/registry/agents/:id", get(agents_get))
+        .route("/api/v1/registry/agents/:id", delete(agents_delete))
         // ── Memory ────────────────────────────────────────────
         .route("/api/v1/registry/memory", post(memory_set))
         .route("/api/v1/registry/memory", get(memory_list))
-        .route("/api/v1/registry/memory/{id}", get(memory_get))
-        .route("/api/v1/registry/memory/{id}", delete(memory_delete))
+        .route("/api/v1/registry/memory/:id", get(memory_get))
+        .route("/api/v1/registry/memory/:id", delete(memory_delete))
         .route("/api/v1/registry/memory/sweep", post(memory_sweep))
         .route(
-            "/api/v1/registry/memory/session/{session_id}",
+            "/api/v1/registry/memory/session/:session_id",
             delete(memory_clear_session),
         )
         // ── Tasks ─────────────────────────────────────────────
         .route("/api/v1/registry/tasks", post(tasks_create))
         .route("/api/v1/registry/tasks", get(tasks_list))
-        .route("/api/v1/registry/tasks/{id}", get(tasks_get))
-        .route("/api/v1/registry/tasks/{id}", delete(tasks_delete_unused))
+        .route("/api/v1/registry/tasks/:id", get(tasks_get))
+        .route("/api/v1/registry/tasks/:id", delete(tasks_delete_unused))
         .route(
-            "/api/v1/registry/tasks/{id}/status",
+            "/api/v1/registry/tasks/:id/status",
             patch(tasks_update_status),
         )
-        .route("/api/v1/registry/tasks/{id}/cancel", post(tasks_cancel))
+        .route("/api/v1/registry/tasks/:id/cancel", post(tasks_cancel))
         // ── Feeds ─────────────────────────────────────────────
         .route("/api/v1/registry/feeds", post(feeds_upload))
         .route("/api/v1/registry/feeds", get(feeds_list))
-        .route("/api/v1/registry/feeds/{id}", get(feeds_get))
-        .route("/api/v1/registry/feeds/{id}", delete(feeds_delete))
+        .route("/api/v1/registry/feeds/:id", get(feeds_get))
+        .route("/api/v1/registry/feeds/:id", delete(feeds_delete))
         // ── Crons ─────────────────────────────────────────────
         .route("/api/v1/registry/crons", post(crons_upload))
         .route("/api/v1/registry/crons", get(crons_list))
-        .route("/api/v1/registry/crons/{id}", get(crons_get))
-        .route("/api/v1/registry/crons/{id}", delete(crons_delete))
+        .route("/api/v1/registry/crons/:id", get(crons_get))
+        .route("/api/v1/registry/crons/:id", delete(crons_delete))
         // ── KV ────────────────────────────────────────────────
         .route("/api/v1/registry/kv", post(kv_set))
         .route("/api/v1/registry/kv", get(kv_list))
-        .route("/api/v1/registry/kv/{id}", get(kv_get))
-        .route("/api/v1/registry/kv/{id}", delete(kv_delete))
+        .route("/api/v1/registry/kv/:id", get(kv_get))
+        .route("/api/v1/registry/kv/:id", delete(kv_delete))
         .route("/api/v1/registry/kv/query", get(kv_query))
         // ── Teams ─────────────────────────────────────────────
         .route("/api/v1/registry/teams", post(teams_upload))
         .route("/api/v1/registry/teams", get(teams_list))
-        .route("/api/v1/registry/teams/{id}", get(teams_get))
-        .route("/api/v1/registry/teams/{id}", delete(teams_delete))
+        .route("/api/v1/registry/teams/:id", get(teams_get))
+        .route("/api/v1/registry/teams/:id", delete(teams_delete))
         // ── Pipelines ─────────────────────────────────────────
         .route("/api/v1/registry/pipelines", post(pipelines_upload))
         .route("/api/v1/registry/pipelines", get(pipelines_list))
-        .route("/api/v1/registry/pipelines/{id}", get(pipelines_get))
-        .route("/api/v1/registry/pipelines/{id}", delete(pipelines_delete))
+        .route("/api/v1/registry/pipelines/:id", get(pipelines_get))
+        .route("/api/v1/registry/pipelines/:id", delete(pipelines_delete))
         // ── Execution ───────────────────────────────────────
         .route(
-            "/api/v1/registry/pipelines/{id}/execute",
+            "/api/v1/registry/pipelines/:id/execute",
             post(pipelines_execute),
         )
-        .route("/api/v1/registry/teams/{id}/execute", post(teams_execute))
-        .route("/api/v1/registry/feeds/{id}/execute", post(feeds_execute))
+        .route("/api/v1/registry/teams/:id/execute", post(teams_execute))
+        .route("/api/v1/registry/feeds/:id/execute", post(feeds_execute))
         // ── Containers ────────────────────────────────────────
         .route("/api/v1/registry/containers", post(containers_upload))
         .route("/api/v1/registry/containers", get(containers_list))
-        .route("/api/v1/registry/containers/{id}", get(containers_get))
+        .route("/api/v1/registry/containers/:id", get(containers_get))
         .route(
-            "/api/v1/registry/containers/{id}",
+            "/api/v1/registry/containers/:id",
             delete(containers_delete),
         )
         // ── Networks ──────────────────────────────────────────
         .route("/api/v1/registry/networks", post(networks_upload))
         .route("/api/v1/registry/networks", get(networks_list))
-        .route("/api/v1/registry/networks/{id}", get(networks_get))
-        .route("/api/v1/registry/networks/{id}", delete(networks_delete))
+        .route("/api/v1/registry/networks/:id", get(networks_get))
+        .route("/api/v1/registry/networks/:id", delete(networks_delete))
         // ── Bulk ──────────────────────────────────────────────
         .route("/api/v1/registry/bulk", post(bulk_upload))
         .with_state(state)

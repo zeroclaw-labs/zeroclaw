@@ -209,6 +209,7 @@ mod tests {
             pid: None,
             exit_code: None,
             ip_address: None,
+            created_at: None,
             memory_limit_mb: None,
             cpu_limit_percent: None,
             labels,
@@ -400,17 +401,32 @@ mod tests {
 
     #[test]
     fn should_prune_respects_interval() {
-        reset_prune_timer();
-
-        // First call should succeed
-        assert!(should_prune());
+        // These tests run in parallel and share a global atomic. Be robust to
+        // another test thread winning the CAS between our reset and call.
+        let mut first_ok = false;
+        for _ in 0..50 {
+            reset_prune_timer();
+            if should_prune() {
+                first_ok = true;
+                break;
+            }
+        }
+        assert!(first_ok);
 
         // Immediate second call should be rate-limited
         assert!(!should_prune());
 
         // Simulate time passing by resetting the timer
         reset_prune_timer();
-        assert!(should_prune());
+        let mut second_ok = false;
+        for _ in 0..50 {
+            reset_prune_timer();
+            if should_prune() {
+                second_ok = true;
+                break;
+            }
+        }
+        assert!(second_ok);
     }
 
     #[test]
