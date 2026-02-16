@@ -1,19 +1,31 @@
 name: Feature Request
 description: Propose an improvement or new capability
 title: "[Feature]: "
+labels:
+  - enhancement
 body:
   - type: markdown
     attributes:
       value: |
         Thanks for sharing your idea.
         Please focus on user value, constraints, and rollout safety.
+        Do not include personal/sensitive data; use neutral project-scoped placeholders.
 
   - type: input
+    id: summary
+    attributes:
+      label: Summary
+      description: One-line statement of the requested capability.
+      placeholder: Add a provider-level retry budget override for long-running channels.
+    validations:
+      required: true
+
+  - type: textarea
     id: problem
     attributes:
       label: Problem statement
-      description: What user problem are you trying to solve?
-      placeholder: Teams need a way to ...
+      description: What user pain does this solve and why is current behavior insufficient?
+      placeholder: Teams operating in unstable networks cannot tune retries per provider...
     validations:
       required: true
 
@@ -21,8 +33,17 @@ body:
     id: proposal
     attributes:
       label: Proposed solution
-      description: Describe the preferred solution.
-      placeholder: Add a new subcommand / trait implementation ...
+      description: Describe preferred behavior and interfaces.
+      placeholder: Add `[provider.retry]` config and enforce bounds in config validation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Non-goals / out of scope
+      description: Clarify what should not be included in the first iteration.
+      placeholder: No UI changes, no cross-provider dynamic adaptation in v1.
     validations:
       required: true
 
@@ -31,16 +52,28 @@ body:
     attributes:
       label: Alternatives considered
       description: What alternatives did you evaluate?
-      placeholder: Keep current behavior, use external tool, etc.
+      placeholder: Keep current behavior, use wrapper scripts, etc.
     validations:
       required: false
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: What outcomes would make this request complete?
+      placeholder: |
+        - Config key is documented and validated
+        - Runtime path uses configured retry budget
+        - Regression tests cover fallback and invalid config
+    validations:
+      required: true
 
   - type: textarea
     id: architecture
     attributes:
       label: Architecture impact
       description: Which subsystem(s) are affected?
-      placeholder: providers/, channels/, memory/, runtime/, security/ ...
+      placeholder: providers/, channels/, memory/, runtime/, security/, docs/ ...
     validations:
       required: true
 
@@ -62,3 +95,13 @@ body:
         - Yes
     validations:
       required: true
+
+  - type: checkboxes
+    id: hygiene
+    attributes:
+      label: Data hygiene checks
+      options:
+        - label: I removed personal/sensitive data from examples, payloads, and logs.
+          required: true
+        - label: I used neutral, project-focused wording and placeholders.
+          required: true

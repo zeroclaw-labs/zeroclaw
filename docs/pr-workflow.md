@@ -9,7 +9,10 @@ This document defines how ZeroClaw handles high PR volume while maintaining:
 - High sustainability
 - High security
 
-Related reference: [`docs/ci-map.md`](ci-map.md) for per-workflow ownership, triggers, and triage flow.
+Related references:
+
+- [`docs/ci-map.md`](ci-map.md) for per-workflow ownership, triggers, and triage flow.
+- [`docs/reviewer-playbook.md`](reviewer-playbook.md) for day-to-day reviewer execution.
 
 ## 1) Governance Goals
 
@@ -17,6 +20,18 @@ Related reference: [`docs/ci-map.md`](ci-map.md) for per-workflow ownership, tri
 2. Keep CI signal quality high (fast feedback, low false positives).
 3. Keep security review explicit for risky surfaces.
 4. Keep changes easy to reason about and easy to revert.
+5. Keep repository artifacts free of personal/sensitive data leakage.
+
+### Governance Design Logic (Control Loop)
+
+This workflow is intentionally layered to reduce reviewer load while keeping accountability clear:
+
+1. **Intake classification**: path/size/risk/module labels route the PR to the right review depth.
+2. **Deterministic validation**: merge gate depends on reproducible checks, not subjective comments.
+3. **Risk-based review depth**: high-risk paths trigger deep review; low-risk paths stay fast.
+4. **Rollback-first merge contract**: every merge path includes concrete recovery steps.
+
+Automation assists with triage and guardrails, but final merge accountability remains with human maintainers and PR authors.
 
 ## 2) Required Repository Settings
 
@@ -34,8 +49,8 @@ Maintain these branch protection rules on `main`:
 ### Step A: Intake
 
 - Contributor opens PR with full `.github/pull_request_template.md`.
-- `PR Labeler` applies path labels + size labels.
-- `Auto Response` posts first-time contributor guidance.
+- `PR Labeler` applies scope/path labels + size labels + risk labels + module labels (for example `channel:telegram`, `provider:kimi`, `tool:shell`) and contributor tiers by merged PR count (`experienced` >=10, `principal` >=20, `distinguished` >=50).
+- `Auto Response` posts first-time guidance and handles label-driven routing for low-signal items.
 
 ### Step B: Validation
 
@@ -46,7 +61,7 @@ Maintain these branch protection rules on `main`:
 ### Step C: Review
 
 - Reviewers prioritize by risk and size labels.
-- Security-sensitive paths (`src/security`, runtime, CI) require maintainer attention.
+- Security-sensitive paths (`src/security`, `src/runtime`, `src/gateway`, and CI workflows) require maintainer attention.
 - Large PRs (`size: L`/`size: XL`) should be split unless strongly justified.
 
 ### Step D: Merge
@@ -55,7 +70,26 @@ Maintain these branch protection rules on `main`:
 - PR title should follow Conventional Commit style.
 - Merge only when rollback path is documented.
 
-## 4) PR Size Policy
+## 4) PR Readiness Contracts (DoR / DoD)
+
+### Definition of Ready (before requesting review)
+
+- PR template fully completed.
+- Scope boundary is explicit (what changed / what did not).
+- Validation evidence attached (not just "CI will check").
+- Security and rollback fields completed for risky paths.
+- Privacy/data-hygiene checks are completed and test language is neutral/project-scoped.
+- If identity-like wording appears in tests/examples, it is normalized to ZeroClaw/project-native labels.
+
+### Definition of Done (merge-ready)
+
+- `CI Required Gate` is green.
+- Required reviewers approved (including CODEOWNERS paths).
+- Risk class labels match touched paths.
+- Migration/compatibility impact is documented.
+- Rollback path is concrete and fast.
+
+## 5) PR Size Policy
 
 - `size: XS` <= 80 changed lines
 - `size: S` <= 250 changed lines
@@ -69,7 +103,12 @@ Policy:
 - `L/XL` PRs need explicit justification and tighter test evidence.
 - If a large feature is unavoidable, split into stacked PRs.
 
-## 5) AI/Agent Contribution Policy
+Automation behavior:
+
+- `PR Labeler` applies `size:*` labels from effective changed lines.
+- Docs-only/lockfile-heavy PRs are normalized to avoid size inflation.
+
+## 6) AI/Agent Contribution Policy
 
 AI-assisted PRs are welcome, and review can also be agent-assisted.
 
@@ -93,22 +132,43 @@ Review emphasis for AI-heavy PRs:
 - Error handling and fallback behavior
 - Performance and memory regressions
 
-## 6) Review SLA and Queue Discipline
+## 7) Review SLA and Queue Discipline
 
 - First maintainer triage target: within 48 hours.
 - If PR is blocked, maintainer leaves one actionable checklist.
 - `stale` automation is used to keep queue healthy; maintainers can apply `no-stale` when needed.
 - `pr-hygiene` automation checks open PRs every 12 hours and posts a nudge when a PR has no new commits for 48+ hours and is either behind `main` or missing/failing `CI Required Gate` on the head commit.
 
-## 7) Security and Stability Rules
+Backlog pressure controls:
+
+- Use a review queue budget: limit concurrent deep-review PRs per maintainer and keep the rest in triage state.
+- For stacked work, require explicit `Depends on #...` so review order is deterministic.
+- If a new PR replaces an older open PR, require `Supersedes #...` and close the older one after maintainer confirmation.
+- Mark dormant/redundant PRs with `stale-candidate` or `superseded` to reduce duplicate review effort.
+
+Issue triage discipline:
+
+- `r:needs-repro` for incomplete bug reports (request deterministic repro before deep triage).
+- `r:support` for usage/help items better handled outside bug backlog.
+- `invalid` / `duplicate` labels trigger **issue-only** closing automation with guidance.
+
+Automation side-effect guards:
+
+- `Auto Response` deduplicates label-based comments to avoid spam.
+- Automated close routes are limited to issues, not PRs.
+- Maintainers can freeze automated risk recalculation with `risk: manual` when context demands human override.
+
+## 8) Security and Stability Rules
 
 Changes in these areas require stricter review and stronger test evidence:
 
 - `src/security/**`
 - runtime process management
+- gateway ingress/authentication behavior (`src/gateway/**`)
 - filesystem access boundaries
 - network/authentication behavior
 - GitHub workflows and release pipeline
+- tools with execution capability (`src/tools/**`)
 
 Minimum for risky PRs:
 
@@ -116,7 +176,14 @@ Minimum for risky PRs:
 - mitigation notes
 - rollback steps
 
-## 8) Failure Recovery
+Recommended for high-risk PRs:
+
+- include a focused test proving boundary behavior
+- include one explicit failure-mode scenario and expected degradation
+
+For agent-assisted contributions, reviewers should also verify the author demonstrates understanding of runtime behavior and blast radius.
+
+## 9) Failure Recovery
 
 If a merged PR causes regressions:
 
@@ -126,16 +193,18 @@ If a merged PR causes regressions:
 
 Prefer fast restore of service quality over delayed perfect fixes.
 
-## 9) Maintainer Checklist (Merge-Ready)
+## 10) Maintainer Checklist (Merge-Ready)
 
 - Scope is focused and understandable.
 - CI gate is green.
+- Docs-quality checks are green when docs changed.
 - Security impact fields are complete.
+- Privacy/data-hygiene fields are complete and evidence is redacted/anonymized.
 - Agent workflow notes are sufficient for reproducibility (if automation was used).
 - Rollback plan is explicit.
 - Commit title follows Conventional Commits.
 
-## 10) Agent Review Operating Model
+## 11) Agent Review Operating Model
 
 To keep review quality stable under high PR volume, we use a two-lane review model:
 
@@ -145,6 +214,8 @@ To keep review quality stable under high PR volume, we use a two-lane review mod
 - Confirm CI gate signal (`CI Required Gate`).
 - Confirm risk class via labels and touched paths.
 - Confirm rollback statement exists.
+- Confirm privacy/data-hygiene section and neutral wording requirements are satisfied.
+- Confirm any required identity-like wording uses ZeroClaw/project-native terminology.
 
 ### Lane B: Deep review (risk-based)
 
@@ -155,7 +226,7 @@ Required for high-risk changes (security/runtime/gateway/CI):
 - Validate backward compatibility and migration impact.
 - Validate observability/logging impact.
 
-## 11) Queue Priority and Label Discipline
+## 12) Queue Priority and Label Discipline
 
 Triage order recommendation:
 
@@ -167,9 +238,12 @@ Label discipline:
 
 - Path labels identify subsystem ownership quickly.
 - Size labels drive batching strategy.
+- Risk labels drive review depth (`risk: low/medium/high`).
+- Module labels (`<module>:<component>`) improve reviewer routing for integration-specific changes and future newly-added modules.
+- `risk: manual` allows maintainers to preserve a human risk judgment when automation lacks context.
 - `no-stale` is reserved for accepted-but-blocked work.
 
-## 12) Agent Handoff Contract
+## 13) Agent Handoff Contract
 
 When one agent hands off to another (or to a maintainer), include:
 

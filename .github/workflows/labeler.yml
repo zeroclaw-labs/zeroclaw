@@ -2,7 +2,7 @@ name: PR Labeler
 
 on:
   pull_request_target:
-    types: [opened, reopened, synchronize, edited]
+    types: [opened, reopened, synchronize, edited, labeled, unlabeled]
 
 permissions:
   contents: read
@@ -17,15 +17,373 @@ jobs:
         uses: actions/labeler@v5
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
+          sync-labels: true
 
-      - name: Apply size label
+      - name: Apply size/risk/module labels
         uses: actions/github-script@v7
         with:
           script: |
             const pr = context.payload.pull_request;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const action = context.payload.action;
+            const changedLabel = context.payload.label?.name;
+
             const sizeLabels = ["size: XS", "size: S", "size: M", "size: L", "size: XL"];
-            const labelColor = "BFDADC";
-            const changedLines = (pr.additions || 0) + (pr.deletions || 0);
+            const computedRiskLabels = ["risk: low", "risk: medium", "risk: high"];
+            const manualRiskOverrideLabel = "risk: manual";
+            const managedEnforcedLabels = new Set([
+              ...sizeLabels,
+              manualRiskOverrideLabel,
+              ...computedRiskLabels,
+            ]);
+            const legacyTrustedContributorLabel = "trusted contributor";
+
+            if ((action === "labeled" || action === "unlabeled") && !managedEnforcedLabels.has(changedLabel)) {
+              core.info(`skip non-size/risk label event: ${changedLabel || "unknown"}`);
+              return;
+            }
+
+            const contributorTierRules = [
+              { label: "distinguished contributor", minMergedPRs: 50 },
+              { label: "principal contributor", minMergedPRs: 20 },
+              { label: "experienced contributor", minMergedPRs: 10 },
+            ];
+            const contributorTierLabels = contributorTierRules.map((rule) => rule.label);
+            const contributorTierColor = "39FF14";
+
+            const managedPathLabels = [
+              "docs",
+              "dependencies",
+              "ci",
+              "core",
+              "agent",
+              "channel",
+              "config",
+              "cron",
+              "daemon",
+              "doctor",
+              "gateway",
+              "health",
+              "heartbeat",
+              "integration",
+              "memory",
+              "observability",
+              "onboard",
+              "provider",
+              "runtime",
+              "security",
+              "service",
+              "skillforge",
+              "skills",
+              "tool",
+              "tunnel",
+              "tests",
+              "scripts",
+              "dev",
+            ];
+
+            const moduleNamespaceRules = [
+              { root: "src/agent/", prefix: "agent", coreEntries: new Set(["mod.rs"]) },
+              { root: "src/channels/", prefix: "channel", coreEntries: new Set(["mod.rs", "traits.rs"]) },
+              { root: "src/config/", prefix: "config", coreEntries: new Set(["mod.rs", "schema.rs"]) },
+              { root: "src/cron/", prefix: "cron", coreEntries: new Set(["mod.rs"]) },
+              { root: "src/daemon/", prefix: "daemon", coreEntries: new Set(["mod.rs"]) },
+              { root: "src/doctor/", prefix: "doctor", coreEntries: new Set(["mod.rs"]) },
+              { root: "src/gateway/", prefix: "gateway", coreEntries: new Set(["mod.rs"]) },
+              { root: "src/health/", prefix: "health", coreEntries: new Set(["mod.rs"]) },
+              { root: "src/heartbeat/", prefix: "heartbeat", coreEntries: new Set(["mod.rs"]) },
+              { root: "src/integrations/", prefix: "integration", coreEntries: new Set(["mod.rs", "registry.rs"]) },
+              { root: "src/memory/", prefix: "memory", coreEntries: new Set(["mod.rs", "traits.rs"]) },
+              { root: "src/observability/", prefix: "observability", coreEntries: new Set(["mod.rs", "traits.rs"]) },
+              { root: "src/onboard/", prefix: "onboard", coreEntries: new Set(["mod.rs"]) },
+              { root: "src/providers/", prefix: "provider", coreEntries: new Set(["mod.rs", "traits.rs"]) },
+              { root: "src/runtime/", prefix: "runtime", coreEntries: new Set(["mod.rs", "traits.rs"]) },
+              { root: "src/security/", prefix: "security", coreEntries: new Set(["mod.rs"]) },
+              { root: "src/service/", prefix: "service", coreEntries: new Set(["mod.rs"]) },
+              { root: "src/skillforge/", prefix: "skillforge", coreEntries: new Set(["mod.rs"]) },
+              { root: "src/skills/", prefix: "skills", coreEntries: new Set(["mod.rs"]) },
+              { root: "src/tools/", prefix: "tool", coreEntries: new Set(["mod.rs", "traits.rs"]) },
+              { root: "src/tunnel/", prefix: "tunnel", coreEntries: new Set(["mod.rs"]) },
+            ];
+            const managedModulePrefixes = [...new Set(moduleNamespaceRules.map((rule) => `${rule.prefix}:`))];
+
+            const staticLabelColors = {
+              "size: XS": "BFDADC",
+              "size: S": "BFDADC",
+              "size: M": "BFDADC",
+              "size: L": "BFDADC",
+              "size: XL": "BFDADC",
+              "risk: low": "2EA043",
+              "risk: medium": "FBCA04",
+              "risk: high": "D73A49",
+              "risk: manual": "1F6FEB",
+              docs: "1D76DB",
+              dependencies: "C26F00",
+              ci: "8250DF",
+              core: "24292F",
+              agent: "2EA043",
+              channel: "1D76DB",
+              config: "0969DA",
+              cron: "9A6700",
+              daemon: "57606A",
+              doctor: "0E8A8A",
+              gateway: "D73A49",
+              health: "0E8A8A",
+              heartbeat: "0E8A8A",
+              integration: "8250DF",
+              memory: "1F883D",
+              observability: "6E7781",
+              onboard: "B62DBA",
+              provider: "5319E7",
+              runtime: "C26F00",
+              security: "B60205",
+              service: "0052CC",
+              skillforge: "A371F7",
+              skills: "6F42C1",
+              tool: "D73A49",
+              tunnel: "0052CC",
+              tests: "0E8A16",
+              scripts: "B08800",
+              dev: "6E7781",
+            };
+            for (const label of contributorTierLabels) {
+              staticLabelColors[label] = contributorTierColor;
+            }
+
+            const modulePrefixColors = {
+              "agent:": "2EA043",
+              "channel:": "1D76DB",
+              "config:": "0969DA",
+              "cron:": "9A6700",
+              "daemon:": "57606A",
+              "doctor:": "0E8A8A",
+              "gateway:": "D73A49",
+              "health:": "0E8A8A",
+              "heartbeat:": "0E8A8A",
+              "integration:": "8250DF",
+              "memory:": "1F883D",
+              "observability:": "6E7781",
+              "onboard:": "B62DBA",
+              "provider:": "5319E7",
+              "runtime:": "C26F00",
+              "security:": "B60205",
+              "service:": "0052CC",
+              "skillforge:": "A371F7",
+              "skills:": "6F42C1",
+              "tool:": "D73A49",
+              "tunnel:": "0052CC",
+            };
+
+            const providerKeywordHints = [
+              "deepseek",
+              "moonshot",
+              "kimi",
+              "qwen",
+              "mistral",
+              "doubao",
+              "baichuan",
+              "yi",
+              "siliconflow",
+              "vertex",
+              "azure",
+              "perplexity",
+              "venice",
+              "vercel",
+              "cloudflare",
+              "synthetic",
+              "opencode",
+              "zai",
+              "glm",
+              "minimax",
+              "bedrock",
+              "qianfan",
+              "groq",
+              "together",
+              "fireworks",
+              "cohere",
+              "openai",
+              "openrouter",
+              "anthropic",
+              "gemini",
+              "ollama",
+            ];
+
+            const channelKeywordHints = [
+              "telegram",
+              "discord",
+              "slack",
+              "whatsapp",
+              "matrix",
+              "irc",
+              "imessage",
+              "email",
+              "cli",
+            ];
+
+            function isDocsLike(path) {
+              return (
+                path.startsWith("docs/") ||
+                path.endsWith(".md") ||
+                path.endsWith(".mdx") ||
+                path === "LICENSE" ||
+                path === ".markdownlint-cli2.yaml" ||
+                path === ".github/pull_request_template.md" ||
+                path.startsWith(".github/ISSUE_TEMPLATE/")
+              );
+            }
+
+            function normalizeLabelSegment(segment) {
+              return (segment || "")
+                .toLowerCase()
+                .replace(/\.rs$/g, "")
+                .replace(/[^a-z0-9_-]+/g, "-")
+                .replace(/^-+|-+$/g, "")
+                .slice(0, 40);
+            }
+
+            function containsKeyword(text, keyword) {
+              const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+              const pattern = new RegExp(`(^|[^a-z0-9_])${escaped}([^a-z0-9_]|$)`, "i");
+              return pattern.test(text);
+            }
+
+            function colorForLabel(label) {
+              if (staticLabelColors[label]) return staticLabelColors[label];
+              const matchedPrefix = Object.keys(modulePrefixColors).find((prefix) => label.startsWith(prefix));
+              if (matchedPrefix) return modulePrefixColors[matchedPrefix];
+              return "BFDADC";
+            }
+
+            async function ensureLabel(name) {
+              const expectedColor = colorForLabel(name);
+              try {
+                const { data: existing } = await github.rest.issues.getLabel({ owner, repo, name });
+                const currentColor = (existing.color || "").toUpperCase();
+                if (currentColor !== expectedColor) {
+                  await github.rest.issues.updateLabel({
+                    owner,
+                    repo,
+                    name,
+                    new_name: name,
+                    color: expectedColor,
+                  });
+                }
+              } catch (error) {
+                if (error.status !== 404) throw error;
+                await github.rest.issues.createLabel({
+                  owner,
+                  repo,
+                  name,
+                  color: expectedColor,
+                });
+              }
+            }
+
+            function selectContributorTier(mergedCount) {
+              const matchedTier = contributorTierRules.find((rule) => mergedCount >= rule.minMergedPRs);
+              return matchedTier ? matchedTier.label : null;
+            }
+
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner,
+              repo,
+              pull_number: pr.number,
+              per_page: 100,
+            });
+
+            const detectedModuleLabels = new Set();
+            for (const file of files) {
+              const path = (file.filename || "").toLowerCase();
+              for (const rule of moduleNamespaceRules) {
+                if (!path.startsWith(rule.root)) continue;
+
+                const relative = path.slice(rule.root.length);
+                if (!relative) continue;
+
+                const first = relative.split("/")[0];
+                const firstStem = first.endsWith(".rs") ? first.slice(0, -3) : first;
+                let segment = firstStem;
+
+                if (rule.coreEntries.has(first) || rule.coreEntries.has(firstStem)) {
+                  segment = "core";
+                }
+
+                segment = normalizeLabelSegment(segment);
+                if (!segment) continue;
+
+                detectedModuleLabels.add(`${rule.prefix}:${segment}`);
+              }
+            }
+
+            const providerRelevantFiles = files.filter((file) => {
+              const path = file.filename || "";
+              return (
+                path.startsWith("src/providers/") ||
+                path.startsWith("src/integrations/") ||
+                path.startsWith("src/onboard/") ||
+                path.startsWith("src/config/")
+              );
+            });
+
+            if (providerRelevantFiles.length > 0) {
+              const searchableText = [
+                pr.title || "",
+                pr.body || "",
+                ...providerRelevantFiles.map((file) => file.filename || ""),
+                ...providerRelevantFiles.map((file) => file.patch || ""),
+              ]
+                .join("\n")
+                .toLowerCase();
+
+              for (const keyword of providerKeywordHints) {
+                if (containsKeyword(searchableText, keyword)) {
+                  detectedModuleLabels.add(`provider:${keyword}`);
+                }
+              }
+            }
+
+            const channelRelevantFiles = files.filter((file) => {
+              const path = file.filename || "";
+              return (
+                path.startsWith("src/channels/") ||
+                path.startsWith("src/onboard/") ||
+                path.startsWith("src/config/")
+              );
+            });
+
+            if (channelRelevantFiles.length > 0) {
+              const searchableText = [
+                pr.title || "",
+                pr.body || "",
+                ...channelRelevantFiles.map((file) => file.filename || ""),
+                ...channelRelevantFiles.map((file) => file.patch || ""),
+              ]
+                .join("\n")
+                .toLowerCase();
+
+              for (const keyword of channelKeywordHints) {
+                if (containsKeyword(searchableText, keyword)) {
+                  detectedModuleLabels.add(`channel:${keyword}`);
+                }
+              }
+            }
+
+            const { data: currentLabels } = await github.rest.issues.listLabelsOnIssue({
+              owner,
+              repo,
+              issue_number: pr.number,
+            });
+            const currentLabelNames = currentLabels.map((label) => label.name);
+
+            const excludedLockfiles = new Set(["Cargo.lock"]);
+            const changedLines = files.reduce((total, file) => {
+              const path = file.filename || "";
+              if (isDocsLike(path) || excludedLockfiles.has(path)) {
+                return total;
+              }
+              return total + (file.additions || 0) + (file.deletions || 0);
+            }, 0);
 
             let sizeLabel = "size: XL";
             if (changedLines <= 80) sizeLabel = "size: XS";
@@ -33,38 +391,85 @@ jobs:
             else if (changedLines <= 500) sizeLabel = "size: M";
             else if (changedLines <= 1000) sizeLabel = "size: L";
 
-            for (const label of sizeLabels) {
+            const hasHighRiskPath = files.some((file) => {
+              const path = file.filename || "";
+              return (
+                path.startsWith("src/security/") ||
+                path.startsWith("src/runtime/") ||
+                path.startsWith("src/gateway/") ||
+                path.startsWith("src/tools/") ||
+                path.startsWith(".github/workflows/")
+              );
+            });
+
+            const hasMediumRiskPath = files.some((file) => {
+              const path = file.filename || "";
+              return (
+                path.startsWith("src/") ||
+                path === "Cargo.toml" ||
+                path === "Cargo.lock" ||
+                path === "deny.toml" ||
+                path.startsWith(".githooks/")
+              );
+            });
+
+            let riskLabel = "risk: low";
+            if (hasHighRiskPath) {
+              riskLabel = "risk: high";
+            } else if (hasMediumRiskPath) {
+              riskLabel = "risk: medium";
+            }
+
+            const labelsToEnsure = new Set([
+              ...sizeLabels,
+              ...computedRiskLabels,
+              manualRiskOverrideLabel,
+              ...managedPathLabels,
+              ...contributorTierLabels,
+              ...detectedModuleLabels,
+            ]);
+
+            for (const label of labelsToEnsure) {
+              await ensureLabel(label);
+            }
+
+            let contributorTierLabel = null;
+            const authorLogin = pr.user?.login;
+            if (authorLogin && pr.user?.type !== "Bot") {
               try {
-                await github.rest.issues.getLabel({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  name: label,
+                const { data: mergedSearch } = await github.rest.search.issuesAndPullRequests({
+                  q: `repo:${owner}/${repo} is:pr is:merged author:${authorLogin}`,
+                  per_page: 1,
                 });
+                const mergedCount = mergedSearch.total_count || 0;
+                contributorTierLabel = selectContributorTier(mergedCount);
               } catch (error) {
-                if (error.status !== 404) throw error;
-                await github.rest.issues.createLabel({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  name: label,
-                  color: labelColor,
-                });
+                core.warning(`failed to compute contributor tier label: ${error.message}`);
               }
             }
 
-            const { data: currentLabels } = await github.rest.issues.listLabelsOnIssue({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: pr.number,
+            const hasManualRiskOverride = currentLabelNames.includes(manualRiskOverrideLabel);
+            const keepNonManagedLabels = currentLabelNames.filter((label) => {
+              if (label === manualRiskOverrideLabel) return true;
+              if (label === legacyTrustedContributorLabel) return false;
+              if (contributorTierLabels.includes(label)) return false;
+              if (sizeLabels.includes(label) || computedRiskLabels.includes(label)) return false;
+              if (managedModulePrefixes.some((prefix) => label.startsWith(prefix))) return false;
+              return true;
             });
 
-            const keepLabels = currentLabels
-              .map((label) => label.name)
-              .filter((label) => !sizeLabels.includes(label));
+            const manualRiskSelection =
+              currentLabelNames.find((label) => computedRiskLabels.includes(label)) || riskLabel;
 
-            const nextLabels = [...new Set([...keepLabels, sizeLabel])];
+            const moduleLabelList = [...detectedModuleLabels];
+            const contributorLabelList = contributorTierLabel ? [contributorTierLabel] : [];
+            const nextLabels = hasManualRiskOverride
+              ? [...new Set([...keepNonManagedLabels, ...moduleLabelList, ...contributorLabelList, sizeLabel, manualRiskSelection])]
+              : [...new Set([...keepNonManagedLabels, ...moduleLabelList, ...contributorLabelList, sizeLabel, riskLabel])];
+
             await github.rest.issues.setLabels({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
+              owner,
+              repo,
               issue_number: pr.number,
               labels: nextLabels,
             });

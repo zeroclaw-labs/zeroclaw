@@ -7,33 +7,30 @@ Describe this PR in 2-5 bullets:
 - What changed:
 - What did **not** change (scope boundary):
 
-## Change Type
+## Label Snapshot (required)
 
-- [ ] Bug fix
-- [ ] Feature
-- [ ] Refactor
-- [ ] Docs
-- [ ] Security hardening
-- [ ] Chore / infra
+- Risk label (`risk: low|medium|high`):
+- Size label (`size: XS|S|M|L|XL`, auto-managed/read-only):
+- Scope labels (`core|agent|channel|config|cron|daemon|doctor|gateway|health|heartbeat|integration|memory|observability|onboard|provider|runtime|security|service|skillforge|skills|tool|tunnel|docs|dependencies|ci|tests|scripts|dev`, comma-separated):
+- Module labels (`<module>:<component>`, for example `channel:telegram`, `provider:kimi`, `tool:shell`):
+- Contributor tier label (`experienced contributor|principal contributor|distinguished contributor`, auto-managed/read-only; author merged PRs >=10/20/50):
+- If any auto-label is incorrect, note requested correction:
 
-## Scope
+## Change Metadata
 
-- [ ] Core runtime / daemon
-- [ ] Provider integration
-- [ ] Channel integration
-- [ ] Memory / storage
-- [ ] Security / sandbox
-- [ ] CI / release / tooling
-- [ ] Documentation
+- Change type (`bug|feature|refactor|docs|security|chore`):
+- Primary scope (`runtime|provider|channel|memory|security|ci|docs|multi`):
 
 ## Linked Issue
 
 - Closes #
 - Related #
+- Depends on # (if stacked)
+- Supersedes # (if replacing older PR)
 
-## Testing
+## Validation Evidence (required)
 
-Commands and result summary (required):
+Commands and result summary:
 
 ```bash
 cargo fmt --all -- --check
@@ -41,9 +38,10 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-If any command is intentionally skipped, explain why.
+- Evidence provided (test/log/trace/screenshot/perf):
+- If any command is intentionally skipped, explain why:
 
-## Security Impact
+## Security Impact (required)
 
 - New permissions/capabilities? (`Yes/No`)
 - New external network calls? (`Yes/No`)
@@ -51,20 +49,49 @@ If any command is intentionally skipped, explain why.
 - File system access scope changed? (`Yes/No`)
 - If any `Yes`, describe risk and mitigation:
 
+## Privacy and Data Hygiene (required)
+
+- Data-hygiene status (`pass|needs-follow-up`):
+- Redaction/anonymization notes:
+- Neutral wording confirmation (use ZeroClaw/project-native labels if identity-like wording is needed):
+
+## Compatibility / Migration
+
+- Backward compatible? (`Yes/No`)
+- Config/env changes? (`Yes/No`)
+- Migration needed? (`Yes/No`)
+- If yes, exact upgrade steps:
+
+## Human Verification (required)
+
+What was personally validated beyond CI:
+
+- Verified scenarios:
+- Edge cases checked:
+- What was not verified:
+
+## Side Effects / Blast Radius (required)
+
+- Affected subsystems/workflows:
+- Potential unintended effects:
+- Guardrails/monitoring for early detection:
+
 ## Agent Collaboration Notes (recommended)
 
-- [ ] If agent/automation tools were used, I added brief workflow notes.
-- [ ] I included concrete validation evidence for this change.
-- [ ] I can explain design choices and rollback steps.
-
-If agent tools were used, optional context:
-
-- Tool(s):
-- Prompt/plan summary:
+- Agent tools used (if any):
+- Workflow/plan summary (if any):
 - Verification focus:
+- Confirmation: naming + architecture boundaries followed (`AGENTS.md` + `CONTRIBUTING.md`):
 
-## Rollback Plan
+## Rollback Plan (required)
 
 - Fast rollback command/path:
 - Feature flags or config toggles (if any):
 - Observable failure symptoms:
+
+## Risks and Mitigations
+
+List real risks in this PR (or write `None`).
+
+- Risk:
+  - Mitigation:

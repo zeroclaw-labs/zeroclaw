@@ -9,7 +9,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 ### Merge-Blocking
 
 - `.github/workflows/ci.yml` (`CI`)
-    - Purpose: Rust validation (`fmt`, `clippy`, `test`, release build smoke)
+    - Purpose: Rust validation (`fmt`, `clippy`, `test`, release build smoke) + docs quality checks when docs change
     - Merge gate: `CI Required Gate`
 - `.github/workflows/workflow-sanity.yml` (`Workflow Sanity`)
     - Purpose: lint GitHub workflow files (`actionlint`, tab checks)
@@ -27,24 +27,35 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 ### Optional Repository Automation
 
 - `.github/workflows/labeler.yml` (`PR Labeler`)
-    - Purpose: path labels + size labels
+    - Purpose: scope/path labels + size/risk labels + fine-grained module labels (`<module>:<component>`)
+    - Additional behavior: provider-related keywords in provider/config/onboard/integration changes are promoted to `provider:*` labels (for example `provider:kimi`, `provider:deepseek`)
+    - Additional behavior: applies contributor tiers on PRs by merged PR count (`experienced` >=10, `principal` >=20, `distinguished` >=50)
+    - Additional behavior: risk + size labels are auto-corrected on manual PR label edits (`labeled`/`unlabeled` events); apply `risk: manual` when maintainers intentionally override automated risk selection
+    - High-risk heuristic paths: `src/security/**`, `src/runtime/**`, `src/gateway/**`, `src/tools/**`, `.github/workflows/**`
+    - Guardrail: maintainers can apply `risk: manual` to freeze automated risk recalculation
 - `.github/workflows/auto-response.yml` (`Auto Response`)
-    - Purpose: first-time contributor onboarding messages
+    - Purpose: first-time contributor onboarding + label-driven response routing (`r:support`, `r:needs-repro`, etc.)
+    - Additional behavior: applies contributor tiers on issues by merged PR count (`experienced` >=10, `principal` >=20, `distinguished` >=50)
+    - Additional behavior: contributor-tier labels are treated as automation-managed (manual add/remove on PR/issue is auto-corrected)
+    - Guardrail: label-based close routes are issue-only; PRs are never auto-closed by route labels
 - `.github/workflows/stale.yml` (`Stale`)
     - Purpose: stale issue/PR lifecycle automation
+- `.github/dependabot.yml` (`Dependabot`)
+    - Purpose: grouped, rate-limited dependency update PRs (Cargo + GitHub Actions)
 - `.github/workflows/pr-hygiene.yml` (`PR Hygiene`)
     - Purpose: nudge stale-but-active PRs to rebase/re-run required checks before queue starvation
 
 ## Trigger Map
 
-- `CI`: push to `main`/`develop`, PRs to `main`
+- `CI`: push to `main`, PRs to `main`
 - `Docker`: push to `main`, tag push (`v*`), PRs touching docker/workflow files, manual dispatch
 - `Release`: tag push (`v*`)
 - `Security Audit`: push to `main`, PRs to `main`, weekly schedule
 - `Workflow Sanity`: PR/push when `.github/workflows/**`, `.github/*.yml`, or `.github/*.yaml` change
 - `PR Labeler`: `pull_request_target` lifecycle events
-- `Auto Response`: issue opened, `pull_request_target` opened
+- `Auto Response`: issue opened/labeled, `pull_request_target` opened/labeled
 - `Stale`: daily schedule, manual dispatch
+- `Dependabot`: weekly dependency maintenance windows
 - `PR Hygiene`: every 12 hours schedule, manual dispatch
 
 ## Fast Triage Guide
@@ -54,10 +65,21 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 3. Release failures on tags: inspect `.github/workflows/release.yml`.
 4. Security failures: inspect `.github/workflows/security.yml` and `deny.toml`.
 5. Workflow syntax/lint failures: inspect `.github/workflows/workflow-sanity.yml`.
+6. Docs failures in CI: inspect `docs-quality` job logs in `.github/workflows/ci.yml`.
 
 ## Maintenance Rules
 
 - Keep merge-blocking checks deterministic and reproducible (`--locked` where applicable).
 - Prefer explicit workflow permissions (least privilege).
 - Use path filters for expensive workflows when practical.
+- Keep docs quality checks low-noise (`markdownlint` + offline link checks).
+- Keep dependency update volume controlled (grouping + PR limits).
 - Avoid mixing onboarding/community automation with merge-gating logic.
+
+## Automation Side-Effect Controls
+
+- Prefer deterministic automation that can be manually overridden (`risk: manual`) when context is nuanced.
+- Keep auto-response comments deduplicated to prevent triage noise.
+- Keep auto-close behavior scoped to issues; maintainers own PR close/merge decisions.
+- If automation is wrong, correct labels first, then continue review with explicit rationale.
+- Use `superseded` / `stale-candidate` labels to prune duplicate or dormant PRs before deep review.
