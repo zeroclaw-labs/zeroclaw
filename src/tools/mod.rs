@@ -15,7 +15,7 @@ pub mod screenshot;
 pub mod shell;
 pub mod traits;
 
-pub use browser::BrowserTool;
+pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
 pub use composio::ComposioTool;
 pub use delegate::DelegateTool;
@@ -131,6 +131,15 @@ pub fn all_tools_with_runtime(
             browser_config.native_headless,
             browser_config.native_webdriver_url.clone(),
             browser_config.native_chrome_path.clone(),
+            ComputerUseConfig {
+                endpoint: browser_config.computer_use.endpoint.clone(),
+                api_key: browser_config.computer_use.api_key.clone(),
+                timeout_ms: browser_config.computer_use.timeout_ms,
+                allow_remote_endpoint: browser_config.computer_use.allow_remote_endpoint,
+                window_allowlist: browser_config.computer_use.window_allowlist.clone(),
+                max_coordinate_x: browser_config.computer_use.max_coordinate_x,
+                max_coordinate_y: browser_config.computer_use.max_coordinate_y,
+            },
         )));
     }
 

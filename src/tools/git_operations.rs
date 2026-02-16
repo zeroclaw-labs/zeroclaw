@@ -2,6 +2,8 @@ use super::traits::{Tool, ToolResult};
 use crate::security::{AutonomyLevel, SecurityPolicy};
 use async_trait::async_trait;
 use serde_json::json;
+#[cfg(test)]
+use std::path::Path;
 use std::sync::Arc;
 
 /// Git operations tool for structured repository management.

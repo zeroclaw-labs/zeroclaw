@@ -3,18 +3,48 @@
 //! By default this uses Vercel's `agent-browser` CLI for automation.
 //! Optionally, a Rust-native backend can be enabled at build time via
 //! `--features browser-native` and selected through config.
+//! Computer-use (OS-level) actions are supported via an optional sidecar endpoint.
 
 use super::traits::{Tool, ToolResult};
 use crate::security::SecurityPolicy;
+use anyhow::Context;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::net::ToSocketAddrs;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::process::Command;
 use tracing::debug;
 
-/// Browser automation tool using agent-browser CLI
+/// Computer-use sidecar settings.
+#[derive(Debug, Clone)]
+pub struct ComputerUseConfig {
+    pub endpoint: String,
+    pub api_key: Option<String>,
+    pub timeout_ms: u64,
+    pub allow_remote_endpoint: bool,
+    pub window_allowlist: Vec<String>,
+    pub max_coordinate_x: Option<i64>,
+    pub max_coordinate_y: Option<i64>,
+}
+
+impl Default for ComputerUseConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: "http://127.0.0.1:8787/v1/actions".into(),
+            api_key: None,
+            timeout_ms: 15_000,
+            allow_remote_endpoint: false,
+            window_allowlist: Vec::new(),
+            max_coordinate_x: None,
+            max_coordinate_y: None,
+        }
+    }
+}
+
+/// Browser automation tool using pluggable backends.
 pub struct BrowserTool {
     security: Arc<SecurityPolicy>,
     allowed_domains: Vec<String>,
@@ -23,6 +53,7 @@ pub struct BrowserTool {
     native_headless: bool,
     native_webdriver_url: String,
     native_chrome_path: Option<String>,
+    computer_use: ComputerUseConfig,
     #[cfg(feature = "browser-native")]
     native_state: tokio::sync::Mutex<native_backend::NativeBrowserState>,
 }
@@ -31,6 +62,7 @@ pub struct BrowserTool {
 enum BrowserBackendKind {
     AgentBrowser,
     RustNative,
+    ComputerUse,
     Auto,
 }
 
@@ -38,6 +70,7 @@ enum BrowserBackendKind {
 enum ResolvedBackend {
     AgentBrowser,
     RustNative,
+    ComputerUse,
 }
 
 impl BrowserBackendKind {
@@ -46,9 +79,10 @@ impl BrowserBackendKind {
         match key.as_str() {
             "agent_browser" | "agentbrowser" => Ok(Self::AgentBrowser),
             "rust_native" | "native" => Ok(Self::RustNative),
+            "computer_use" | "computeruse" => Ok(Self::ComputerUse),
             "auto" => Ok(Self::Auto),
             _ => anyhow::bail!(
-                "Unsupported browser backend '{raw}'. Use 'agent_browser', 'rust_native', or 'auto'"
+                "Unsupported browser backend '{raw}'. Use 'agent_browser', 'rust_native', 'computer_use', or 'auto'"
             ),
         }
     }
@@ -57,6 +91,7 @@ impl BrowserBackendKind {
         match self {
             Self::AgentBrowser => "agent_browser",
             Self::RustNative => "rust_native",
+            Self::ComputerUse => "computer_use",
             Self::Auto => "auto",
         }
     }
@@ -67,6 +102,17 @@ impl BrowserBackendKind {
 struct AgentBrowserResponse {
     success: bool,
     data: Option<Value>,
+    error: Option<String>,
+}
+
+/// Response format from computer-use sidecar.
+#[derive(Debug, Deserialize)]
+struct ComputerUseResponse {
+    #[serde(default)]
+    success: Option<bool>,
+    #[serde(default)]
+    data: Option<Value>,
+    #[serde(default)]
     error: Option<String>,
 }
 
@@ -151,9 +197,11 @@ impl BrowserTool {
             true,
             "http://127.0.0.1:9515".into(),
             None,
+            ComputerUseConfig::default(),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_backend(
         security: Arc<SecurityPolicy>,
         allowed_domains: Vec<String>,
@@ -162,6 +210,7 @@ impl BrowserTool {
         native_headless: bool,
         native_webdriver_url: String,
         native_chrome_path: Option<String>,
+        computer_use: ComputerUseConfig,
     ) -> Self {
         Self {
             security,
@@ -171,6 +220,7 @@ impl BrowserTool {
             native_headless,
             native_webdriver_url,
             native_chrome_path,
+            computer_use,
             #[cfg(feature = "browser-native")]
             native_state: tokio::sync::Mutex::new(native_backend::NativeBrowserState::default()),
         }
@@ -216,6 +266,52 @@ impl BrowserTool {
         }
     }
 
+    fn computer_use_endpoint_url(&self) -> anyhow::Result<reqwest::Url> {
+        if self.computer_use.timeout_ms == 0 {
+            anyhow::bail!("browser.computer_use.timeout_ms must be > 0");
+        }
+
+        let endpoint = self.computer_use.endpoint.trim();
+        if endpoint.is_empty() {
+            anyhow::bail!("browser.computer_use.endpoint cannot be empty");
+        }
+
+        let parsed = reqwest::Url::parse(endpoint).map_err(|_| {
+            anyhow::anyhow!(
+                "Invalid browser.computer_use.endpoint: '{endpoint}'. Expected http(s) URL"
+            )
+        })?;
+
+        let scheme = parsed.scheme();
+        if scheme != "http" && scheme != "https" {
+            anyhow::bail!("browser.computer_use.endpoint must use http:// or https://");
+        }
+
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("browser.computer_use.endpoint must include host"))?;
+
+        let host_is_private = is_private_host(host);
+        if !self.computer_use.allow_remote_endpoint && !host_is_private {
+            anyhow::bail!(
+                "browser.computer_use.endpoint host '{host}' is public. Set browser.computer_use.allow_remote_endpoint=true to allow it"
+            );
+        }
+
+        if self.computer_use.allow_remote_endpoint && !host_is_private && scheme != "https" {
+            anyhow::bail!(
+                "browser.computer_use.endpoint must use https:// when allow_remote_endpoint=true and host is public"
+            );
+        }
+
+        Ok(parsed)
+    }
+
+    fn computer_use_available(&self) -> anyhow::Result<bool> {
+        let endpoint = self.computer_use_endpoint_url()?;
+        Ok(endpoint_reachable(&endpoint, Duration::from_millis(500)))
+    }
+
     async fn resolve_backend(&self) -> anyhow::Result<ResolvedBackend> {
         let configured = self.configured_backend()?;
 
@@ -243,6 +339,14 @@ impl BrowserTool {
                 }
                 Ok(ResolvedBackend::RustNative)
             }
+            BrowserBackendKind::ComputerUse => {
+                if !self.computer_use_available()? {
+                    anyhow::bail!(
+                        "browser.backend='computer_use' but sidecar endpoint is unreachable. Check browser.computer_use.endpoint and sidecar status"
+                    );
+                }
+                Ok(ResolvedBackend::ComputerUse)
+            }
             BrowserBackendKind::Auto => {
                 if Self::rust_native_compiled() && self.rust_native_available() {
                     return Ok(ResolvedBackend::RustNative);
@@ -251,14 +355,31 @@ impl BrowserTool {
                     return Ok(ResolvedBackend::AgentBrowser);
                 }
 
+                let computer_use_err = match self.computer_use_available() {
+                    Ok(true) => return Ok(ResolvedBackend::ComputerUse),
+                    Ok(false) => None,
+                    Err(err) => Some(err.to_string()),
+                };
+
                 if Self::rust_native_compiled() {
+                    if let Some(err) = computer_use_err {
+                        anyhow::bail!(
+                            "browser.backend='auto' found no usable backend (agent-browser missing, rust-native unavailable, computer-use invalid: {err})"
+                        );
+                    }
                     anyhow::bail!(
-                        "browser.backend='auto' found no usable backend (agent-browser missing, rust-native unavailable)"
+                        "browser.backend='auto' found no usable backend (agent-browser missing, rust-native unavailable, computer-use sidecar unreachable)"
                     )
                 }
 
+                if let Some(err) = computer_use_err {
+                    anyhow::bail!(
+                        "browser.backend='auto' needs agent-browser CLI, browser-native, or valid computer-use sidecar (error: {err})"
+                    );
+                }
+
                 anyhow::bail!(
-                    "browser.backend='auto' needs agent-browser CLI, or build with --features browser-native"
+                    "browser.backend='auto' needs agent-browser CLI, browser-native, or computer-use sidecar"
                 )
             }
         }
@@ -523,6 +644,179 @@ impl BrowserTool {
         }
     }
 
+    fn validate_coordinate(&self, key: &str, value: i64, max: Option<i64>) -> anyhow::Result<()> {
+        if value < 0 {
+            anyhow::bail!("'{key}' must be >= 0")
+        }
+        if let Some(limit) = max {
+            if limit < 0 {
+                anyhow::bail!("Configured coordinate limit for '{key}' must be >= 0")
+            }
+            if value > limit {
+                anyhow::bail!("'{key}'={value} exceeds configured limit {limit}")
+            }
+        }
+        Ok(())
+    }
+
+    fn read_required_i64(
+        &self,
+        params: &serde_json::Map<String, Value>,
+        key: &str,
+    ) -> anyhow::Result<i64> {
+        params
+            .get(key)
+            .and_then(Value::as_i64)
+            .ok_or_else(|| anyhow::anyhow!("Missing or invalid '{key}' parameter"))
+    }
+
+    fn validate_computer_use_action(
+        &self,
+        action: &str,
+        params: &serde_json::Map<String, Value>,
+    ) -> anyhow::Result<()> {
+        match action {
+            "open" => {
+                let url = params
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("Missing 'url' for open action"))?;
+                self.validate_url(url)?;
+            }
+            "mouse_move" | "mouse_click" => {
+                let x = self.read_required_i64(params, "x")?;
+                let y = self.read_required_i64(params, "y")?;
+                self.validate_coordinate("x", x, self.computer_use.max_coordinate_x)?;
+                self.validate_coordinate("y", y, self.computer_use.max_coordinate_y)?;
+            }
+            "mouse_drag" => {
+                let from_x = self.read_required_i64(params, "from_x")?;
+                let from_y = self.read_required_i64(params, "from_y")?;
+                let to_x = self.read_required_i64(params, "to_x")?;
+                let to_y = self.read_required_i64(params, "to_y")?;
+                self.validate_coordinate("from_x", from_x, self.computer_use.max_coordinate_x)?;
+                self.validate_coordinate("to_x", to_x, self.computer_use.max_coordinate_x)?;
+                self.validate_coordinate("from_y", from_y, self.computer_use.max_coordinate_y)?;
+                self.validate_coordinate("to_y", to_y, self.computer_use.max_coordinate_y)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn execute_computer_use_action(
+        &self,
+        action: &str,
+        args: &Value,
+    ) -> anyhow::Result<ToolResult> {
+        let endpoint = self.computer_use_endpoint_url()?;
+
+        let mut params = args
+            .as_object()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("browser args must be a JSON object"))?;
+        params.remove("action");
+
+        self.validate_computer_use_action(action, &params)?;
+
+        let payload = json!({
+            "action": action,
+            "params": params,
+            "policy": {
+                "allowed_domains": self.allowed_domains,
+                "window_allowlist": self.computer_use.window_allowlist,
+                "max_coordinate_x": self.computer_use.max_coordinate_x,
+                "max_coordinate_y": self.computer_use.max_coordinate_y,
+            },
+            "metadata": {
+                "session_name": self.session_name,
+                "source": "zeroclaw.browser",
+                "version": env!("CARGO_PKG_VERSION"),
+            }
+        });
+
+        let client = reqwest::Client::new();
+        let mut request = client
+            .post(endpoint)
+            .timeout(Duration::from_millis(self.computer_use.timeout_ms))
+            .json(&payload);
+
+        if let Some(api_key) = self.computer_use.api_key.as_deref() {
+            let token = api_key.trim();
+            if !token.is_empty() {
+                request = request.bearer_auth(token);
+            }
+        }
+
+        let response = request.send().await.with_context(|| {
+            format!(
+                "Failed to call computer-use sidecar at {}",
+                self.computer_use.endpoint
+            )
+        })?;
+
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .context("Failed to read computer-use sidecar response body")?;
+
+        if let Ok(parsed) = serde_json::from_str::<ComputerUseResponse>(&body) {
+            if status.is_success() && parsed.success.unwrap_or(true) {
+                let output = parsed
+                    .data
+                    .map(|data| serde_json::to_string_pretty(&data).unwrap_or_default())
+                    .unwrap_or_else(|| {
+                        serde_json::to_string_pretty(&json!({
+                            "backend": "computer_use",
+                            "action": action,
+                            "ok": true,
+                        }))
+                        .unwrap_or_default()
+                    });
+
+                return Ok(ToolResult {
+                    success: true,
+                    output,
+                    error: None,
+                });
+            }
+
+            let error = parsed.error.or_else(|| {
+                if status.is_success() && parsed.success == Some(false) {
+                    Some("computer-use sidecar returned success=false".to_string())
+                } else {
+                    Some(format!(
+                        "computer-use sidecar request failed with status {status}"
+                    ))
+                }
+            });
+
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error,
+            });
+        }
+
+        if status.is_success() {
+            return Ok(ToolResult {
+                success: true,
+                output: body,
+                error: None,
+            });
+        }
+
+        Ok(ToolResult {
+            success: false,
+            output: String::new(),
+            error: Some(format!(
+                "computer-use sidecar request failed with status {status}: {}",
+                body.trim()
+            )),
+        })
+    }
+
     async fn execute_action(
         &self,
         action: BrowserAction,
@@ -531,6 +825,9 @@ impl BrowserTool {
         match backend {
             ResolvedBackend::AgentBrowser => self.execute_agent_browser_action(action).await,
             ResolvedBackend::RustNative => self.execute_rust_native_action(action).await,
+            ResolvedBackend::ComputerUse => anyhow::bail!(
+                "Internal error: computer_use backend must be handled before BrowserAction parsing"
+            ),
         }
     }
 
@@ -564,10 +861,12 @@ impl Tool for BrowserTool {
     }
 
     fn description(&self) -> &str {
-        "Web browser automation with pluggable backends (agent-browser or rust-native). \
-        Supports navigation, clicking, filling forms, screenshots, and page snapshots. \
-        Use 'snapshot' to map interactive elements to refs (@e1, @e2), then use refs for \
-        precise interaction. Enforces browser.allowed_domains for open actions."
+        concat!(
+            "Web/browser automation with pluggable backends (agent-browser, rust-native, computer_use). ",
+            "Supports DOM actions plus optional OS-level actions (mouse_move, mouse_click, mouse_drag, ",
+            "key_type, key_press, screen_capture) through a computer-use sidecar. Use 'snapshot' to map ",
+            "interactive elements to refs (@e1, @e2). Enforces browser.allowed_domains for open actions."
+        )
     }
 
     fn parameters_schema(&self) -> Value {
@@ -578,8 +877,10 @@ impl Tool for BrowserTool {
                     "type": "string",
                     "enum": ["open", "snapshot", "click", "fill", "type", "get_text",
                              "get_title", "get_url", "screenshot", "wait", "press",
-                             "hover", "scroll", "is_visible", "close", "find"],
-                    "description": "Browser action to perform"
+                             "hover", "scroll", "is_visible", "close", "find",
+                             "mouse_move", "mouse_click", "mouse_drag", "key_type",
+                             "key_press", "screen_capture"],
+                    "description": "Browser action to perform (OS-level actions require backend=computer_use)"
                 },
                 "url": {
                     "type": "string",
@@ -600,6 +901,35 @@ impl Tool for BrowserTool {
                 "key": {
                     "type": "string",
                     "description": "Key to press (Enter, Tab, Escape, etc.)"
+                },
+                "x": {
+                    "type": "integer",
+                    "description": "Screen X coordinate (computer_use: mouse_move/mouse_click)"
+                },
+                "y": {
+                    "type": "integer",
+                    "description": "Screen Y coordinate (computer_use: mouse_move/mouse_click)"
+                },
+                "from_x": {
+                    "type": "integer",
+                    "description": "Drag source X coordinate (computer_use: mouse_drag)"
+                },
+                "from_y": {
+                    "type": "integer",
+                    "description": "Drag source Y coordinate (computer_use: mouse_drag)"
+                },
+                "to_x": {
+                    "type": "integer",
+                    "description": "Drag target X coordinate (computer_use: mouse_drag)"
+                },
+                "to_y": {
+                    "type": "integer",
+                    "description": "Drag target Y coordinate (computer_use: mouse_drag)"
+                },
+                "button": {
+                    "type": "string",
+                    "enum": ["left", "right", "middle"],
+                    "description": "Mouse button for computer_use mouse_click"
                 },
                 "direction": {
                     "type": "string",
@@ -687,6 +1017,18 @@ impl Tool for BrowserTool {
             .get("action")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'action' parameter"))?;
+
+        if !is_supported_browser_action(action_str) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Unknown action: {action_str}")),
+            });
+        }
+
+        if backend == ResolvedBackend::ComputerUse {
+            return self.execute_computer_use_action(action_str, &args).await;
+        }
 
         let action = match action_str {
             "open" => {
@@ -839,7 +1181,14 @@ impl Tool for BrowserTool {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(format!("Unknown action: {action_str}")),
+                    error: Some(format!(
+                        "Action '{action_str}' is unavailable for backend '{}'",
+                        match backend {
+                            ResolvedBackend::AgentBrowser => "agent_browser",
+                            ResolvedBackend::RustNative => "rust_native",
+                            ResolvedBackend::ComputerUse => "computer_use",
+                        }
+                    )),
                 });
             }
         };
@@ -1523,12 +1872,64 @@ mod native_backend {
 
 // ── Helper functions ─────────────────────────────────────────────
 
+fn is_supported_browser_action(action: &str) -> bool {
+    matches!(
+        action,
+        "open"
+            | "snapshot"
+            | "click"
+            | "fill"
+            | "type"
+            | "get_text"
+            | "get_title"
+            | "get_url"
+            | "screenshot"
+            | "wait"
+            | "press"
+            | "hover"
+            | "scroll"
+            | "is_visible"
+            | "close"
+            | "find"
+            | "mouse_move"
+            | "mouse_click"
+            | "mouse_drag"
+            | "key_type"
+            | "key_press"
+            | "screen_capture"
+    )
+}
+
 fn normalize_domains(domains: Vec<String>) -> Vec<String> {
     domains
         .into_iter()
         .map(|d| d.trim().to_lowercase())
         .filter(|d| !d.is_empty())
         .collect()
+}
+
+fn endpoint_reachable(endpoint: &reqwest::Url, timeout: Duration) -> bool {
+    let host = match endpoint.host_str() {
+        Some(host) if !host.is_empty() => host,
+        _ => return false,
+    };
+
+    let port = match endpoint.port_or_known_default() {
+        Some(port) => port,
+        None => return false,
+    };
+
+    let mut addrs = match (host, port).to_socket_addrs() {
+        Ok(addrs) => addrs,
+        Err(_) => return false,
+    };
+
+    let addr = match addrs.next() {
+        Some(addr) => addr,
+        None => return false,
+    };
+
+    std::net::TcpStream::connect_timeout(&addr, timeout).is_ok()
 }
 
 fn extract_host(url_str: &str) -> anyhow::Result<String> {
@@ -1747,6 +2148,10 @@ mod tests {
             BrowserBackendKind::RustNative
         );
         assert_eq!(
+            BrowserBackendKind::parse("computer_use").unwrap(),
+            BrowserBackendKind::ComputerUse
+        );
+        assert_eq!(
             BrowserBackendKind::parse("auto").unwrap(),
             BrowserBackendKind::Auto
         );
@@ -1778,8 +2183,98 @@ mod tests {
             true,
             "http://127.0.0.1:9515".into(),
             None,
+            ComputerUseConfig::default(),
         );
         assert_eq!(tool.configured_backend().unwrap(), BrowserBackendKind::Auto);
+    }
+
+    #[test]
+    fn browser_tool_accepts_computer_use_backend_config() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["example.com".into()],
+            None,
+            "computer_use".into(),
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig::default(),
+        );
+        assert_eq!(
+            tool.configured_backend().unwrap(),
+            BrowserBackendKind::ComputerUse
+        );
+    }
+
+    #[test]
+    fn computer_use_endpoint_rejects_public_http_by_default() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["example.com".into()],
+            None,
+            "computer_use".into(),
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig {
+                endpoint: "http://computer-use.example.com/v1/actions".into(),
+                ..ComputerUseConfig::default()
+            },
+        );
+
+        assert!(tool.computer_use_endpoint_url().is_err());
+    }
+
+    #[test]
+    fn computer_use_endpoint_requires_https_for_public_remote() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["example.com".into()],
+            None,
+            "computer_use".into(),
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig {
+                endpoint: "https://computer-use.example.com/v1/actions".into(),
+                allow_remote_endpoint: true,
+                ..ComputerUseConfig::default()
+            },
+        );
+
+        assert!(tool.computer_use_endpoint_url().is_ok());
+    }
+
+    #[test]
+    fn computer_use_coordinate_validation_applies_limits() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["example.com".into()],
+            None,
+            "computer_use".into(),
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig {
+                max_coordinate_x: Some(100),
+                max_coordinate_y: Some(100),
+                ..ComputerUseConfig::default()
+            },
+        );
+
+        assert!(tool
+            .validate_coordinate("x", 50, tool.computer_use.max_coordinate_x)
+            .is_ok());
+        assert!(tool
+            .validate_coordinate("x", 101, tool.computer_use.max_coordinate_x)
+            .is_err());
+        assert!(tool
+            .validate_coordinate("y", -1, tool.computer_use.max_coordinate_y)
+            .is_err());
     }
 
     #[test]

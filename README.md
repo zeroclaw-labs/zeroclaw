@@ -305,14 +305,33 @@ encrypt = true                  # API keys encrypted with local key file
 [browser]
 enabled = false                        # opt-in browser_open + browser tools
 allowed_domains = ["docs.rs"]         # required when browser is enabled
-backend = "agent_browser"             # "agent_browser" (default), "rust_native", "auto"
+backend = "agent_browser"             # "agent_browser" (default), "rust_native", "computer_use", "auto"
 native_headless = true                 # applies when backend uses rust-native
 native_webdriver_url = "http://127.0.0.1:9515" # WebDriver endpoint (chromedriver/selenium)
 # native_chrome_path = "/usr/bin/chromium"  # optional explicit browser binary for driver
 
+[browser.computer_use]
+endpoint = "http://127.0.0.1:8787/v1/actions" # computer-use sidecar HTTP endpoint
+timeout_ms = 15000                    # per-action timeout
+allow_remote_endpoint = false         # secure default: only private/localhost endpoint
+window_allowlist = []                 # optional window title/process allowlist hints
+# api_key = "..."                    # optional bearer token for sidecar
+# max_coordinate_x = 3840             # optional coordinate guardrail
+# max_coordinate_y = 2160             # optional coordinate guardrail
+
 # Rust-native backend build flag:
 # cargo build --release --features browser-native
 # Ensure a WebDriver server is running, e.g. chromedriver --port=9515
+
+# Computer-use sidecar contract (MVP)
+# POST browser.computer_use.endpoint
+# Request: {
+#   "action": "mouse_click",
+#   "params": {"x": 640, "y": 360, "button": "left"},
+#   "policy": {"allowed_domains": [...], "window_allowlist": [...], "max_coordinate_x": 3840, "max_coordinate_y": 2160},
+#   "metadata": {"session_name": "...", "source": "zeroclaw.browser", "version": "..."}
+# }
+# Response: {"success": true, "data": {...}} or {"success": false, "error": "..."}
 
 [composio]
 enabled = false                 # opt-in: 1000+ OAuth apps via composio.dev
