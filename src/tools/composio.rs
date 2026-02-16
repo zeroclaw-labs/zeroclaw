@@ -855,7 +855,8 @@ mod tests {
 
     #[test]
     fn composio_action_with_null_fields() {
-        let json_str = r#"{"name": "TEST_ACTION", "appName": null, "description": null, "enabled": false}"#;
+        let json_str =
+            r#"{"name": "TEST_ACTION", "appName": null, "description": null, "enabled": false}"#;
         let action: ComposioAction = serde_json::from_str(json_str).unwrap();
         assert_eq!(action.name, "TEST_ACTION");
         assert!(action.app_name.is_none());
