@@ -40,7 +40,7 @@ pub struct EmailConfig {
     pub imap_folder: String,
     /// SMTP server hostname
     pub smtp_host: String,
-    /// SMTP server port (default: 587 for STARTTLS)
+    /// SMTP server port (default: 465 for TLS)
     #[serde(default = "default_smtp_port")]
     pub smtp_port: u16,
     /// Use TLS for SMTP (default: true)
@@ -64,7 +64,7 @@ fn default_imap_port() -> u16 {
     993
 }
 fn default_smtp_port() -> u16 {
-    587
+    465
 }
 fn default_imap_folder() -> String {
     "INBOX".into()
