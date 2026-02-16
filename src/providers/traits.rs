@@ -191,8 +191,30 @@ pub enum StreamError {
     Io(#[from] std::io::Error),
 }
 
+/// Provider capabilities declaration.
+///
+/// Describes what features a provider supports, enabling intelligent
+/// adaptation of tool calling modes and request formatting.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderCapabilities {
+    /// Whether the provider supports native tool calling via API primitives.
+    ///
+    /// When `true`, the provider can convert tool definitions to API-native
+    /// formats (e.g., Gemini's functionDeclarations, Anthropic's input_schema).
+    ///
+    /// When `false`, tools must be injected via system prompt as text.
+    pub native_tool_calling: bool,
+}
+
 #[async_trait]
 pub trait Provider: Send + Sync {
+    /// Query provider capabilities.
+    ///
+    /// Default implementation returns minimal capabilities (no native tool calling).
+    /// Providers should override this to declare their actual capabilities.
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities::default()
+    }
     /// Simple one-shot chat (single user message, no explicit system prompt).
     ///
     /// This is the preferred API for non-agentic direct interactions.
@@ -397,5 +419,27 @@ mod tests {
         }]);
         let json = serde_json::to_string(&tool_result).unwrap();
         assert!(json.contains("\"type\":\"ToolResults\""));
+    }
+
+    #[test]
+    fn provider_capabilities_default() {
+        let caps = ProviderCapabilities::default();
+        assert!(!caps.native_tool_calling);
+    }
+
+    #[test]
+    fn provider_capabilities_equality() {
+        let caps1 = ProviderCapabilities {
+            native_tool_calling: true,
+        };
+        let caps2 = ProviderCapabilities {
+            native_tool_calling: true,
+        };
+        let caps3 = ProviderCapabilities {
+            native_tool_calling: false,
+        };
+
+        assert_eq!(caps1, caps2);
+        assert_ne!(caps1, caps3);
     }
 }
