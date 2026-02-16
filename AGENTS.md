@@ -247,6 +247,7 @@ Use these rules to keep the trait/factory architecture stable under growth.
 - Include threat/risk notes and rollback strategy.
 - Add/update tests or validation evidence for failure modes and boundaries.
 - Keep observability useful but non-sensitive.
+- For `.github/workflows/**` changes, include Actions allowlist impact in PR notes and update `docs/actions-source-policy.md` when sources change.
 
 ## 8) Validation Matrix
 
@@ -307,6 +308,7 @@ Reference docs:
 - `docs/pr-workflow.md`
 - `docs/reviewer-playbook.md`
 - `docs/ci-map.md`
+- `docs/actions-source-policy.md`
 
 ## 10) Anti-Patterns (Do Not)
 
