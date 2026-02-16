@@ -177,11 +177,29 @@ impl EmailChannel {
         "(no readable content)".to_string()
     }
 
+    fn build_imap_tls_config() -> Result<std::sync::Arc<tokio_rustls::rustls::ClientConfig>> {
+        use rustls::ClientConfig as TlsConfig;
+        use std::sync::Arc;
+        use tokio_rustls::rustls;
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+        let crypto_provider = rustls::crypto::CryptoProvider::get_default()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
+
+        let tls_config = TlsConfig::builder_with_provider(crypto_provider)
+            .with_protocol_versions(rustls::DEFAULT_VERSIONS)?
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+        Ok(Arc::new(tls_config))
+    }
+
     /// Fetch unseen emails via IMAP (blocking, run in spawn_blocking)
     fn fetch_unseen_imap(config: &EmailConfig) -> Result<Vec<(String, String, String, u64)>> {
-        use rustls::ClientConfig as TlsConfig;
         use rustls_pki_types::ServerName;
-        use std::sync::Arc;
         use tokio_rustls::rustls;
 
         // Connect TCP
@@ -189,13 +207,7 @@ impl EmailChannel {
         tcp.set_read_timeout(Some(Duration::from_secs(30)))?;
 
         // TLS
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let tls_config = Arc::new(
-            TlsConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth(),
-        );
+        let tls_config = Self::build_imap_tls_config()?;
         let server_name: ServerName<'_> = ServerName::try_from(config.imap_host.clone())?;
         let conn = rustls::ClientConnection::new(tls_config, server_name)?;
         let mut tls = rustls::StreamOwned::new(conn, tcp);
@@ -442,5 +454,17 @@ impl Channel for EmailChannel {
         })
         .await
         .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EmailChannel;
+
+    #[test]
+    fn build_imap_tls_config_succeeds() {
+        let tls_config =
+            EmailChannel::build_imap_tls_config().expect("TLS config construction should succeed");
+        assert_eq!(std::sync::Arc::strong_count(&tls_config), 1);
     }
 }
