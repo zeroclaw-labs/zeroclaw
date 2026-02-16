@@ -81,17 +81,26 @@ jobs:
                   username: ${{ github.actor }}
                   password: ${{ secrets.GITHUB_TOKEN }}
 
-            - name: Extract metadata (tags, labels)
+            - name: Compute tags
               id: meta
-              uses: docker/metadata-action@v5
-              with:
-                  images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-                  tags: |
-                      type=ref,event=branch
-                      type=semver,pattern={{version}}
-                      type=semver,pattern={{major}}.{{minor}}
-                      type=semver,pattern={{major}}
-                      type=raw,value=latest,enable={{is_default_branch}}
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+                  SHA_TAG="${IMAGE}:sha-${GITHUB_SHA::12}"
+
+                  if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+                    TAG_NAME="${GITHUB_REF#refs/tags/}"
+                    TAGS="${IMAGE}:${TAG_NAME},${SHA_TAG}"
+                  elif [[ "${GITHUB_REF}" == "refs/heads/main" ]]; then
+                    TAGS="${IMAGE}:latest,${SHA_TAG}"
+                  else
+                    BRANCH_NAME="${GITHUB_REF#refs/heads/}"
+                    BRANCH_NAME="${BRANCH_NAME//\//-}"
+                    TAGS="${IMAGE}:${BRANCH_NAME},${SHA_TAG}"
+                  fi
+
+                  echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
 
             - name: Build and push Docker image
               uses: docker/build-push-action@v5
@@ -99,7 +108,6 @@ jobs:
                   context: .
                   push: true
                   tags: ${{ steps.meta.outputs.tags }}
-                  labels: ${{ steps.meta.outputs.labels }}
                   cache-from: type=gha
                   cache-to: type=gha,mode=max
                   platforms: ${{ startsWith(github.ref, 'refs/tags/') && 'linux/amd64,linux/arm64' || 'linux/amd64' }}

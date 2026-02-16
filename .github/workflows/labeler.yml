@@ -4,6 +4,10 @@ on:
   pull_request_target:
     types: [opened, reopened, synchronize, edited, labeled, unlabeled]
 
+concurrency:
+  group: pr-labeler-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   pull-requests: write
@@ -12,15 +16,18 @@ permissions:
 jobs:
   label:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Apply path labels
         uses: actions/labeler@v5
+        continue-on-error: true
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
           sync-labels: true
 
       - name: Apply size/risk/module labels
         uses: actions/github-script@v8
+        continue-on-error: true
         with:
           script: |
             const pr = context.payload.pull_request;
