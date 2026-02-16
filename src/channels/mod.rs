@@ -45,6 +45,7 @@ const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 90;
 const CHANNEL_PARALLELISM_PER_CHANNEL: usize = 4;
 const CHANNEL_MIN_IN_FLIGHT_MESSAGES: usize = 8;
 const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
+const MAX_CHANNEL_HISTORY_MESSAGES: usize = 50;
 
 #[derive(Clone)]
 struct ChannelRuntimeContext {
@@ -58,10 +59,42 @@ struct ChannelRuntimeContext {
     model: Arc<String>,
     temperature: f64,
     auto_save_memory: bool,
+    conversation_histories: Arc<tokio::sync::Mutex<HashMap<String, Vec<ChatMessage>>>>,
+    conversation_locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
     format!("{}_{}_{}", msg.channel, msg.sender, msg.id)
+}
+
+fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
+    format!("{}_{}", msg.channel, msg.sender)
+}
+
+fn is_new_conversation_command(msg: &traits::ChannelMessage) -> bool {
+    if msg.channel != "telegram" {
+        return false;
+    }
+
+    let command = msg.content.trim();
+    command == "/new" || command.starts_with("/new@")
+}
+
+fn trim_conversation_history(history: &mut Vec<ChatMessage>) {
+    let has_system = history.first().is_some_and(|msg| msg.role == "system");
+    let non_system_count = if has_system {
+        history.len().saturating_sub(1)
+    } else {
+        history.len()
+    };
+
+    if non_system_count <= MAX_CHANNEL_HISTORY_MESSAGES {
+        return;
+    }
+
+    let start = if has_system { 1 } else { 0 };
+    let to_remove = non_system_count - MAX_CHANNEL_HISTORY_MESSAGES;
+    history.drain(start..start + to_remove);
 }
 
 async fn build_memory_context(mem: &dyn Memory, user_msg: &str) -> String {
@@ -143,6 +176,39 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
         truncate_with_ellipsis(&msg.content, 80)
     );
 
+    let conversation_key = conversation_history_key(&msg);
+
+    let conversation_lock = {
+        let mut locks = ctx.conversation_locks.lock().await;
+        Arc::clone(
+            locks
+                .entry(conversation_key.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    };
+    let _conversation_guard = conversation_lock.lock().await;
+
+    let target_channel = ctx.channels_by_name.get(&msg.channel).cloned();
+
+    if is_new_conversation_command(&msg) {
+        let mut histories = ctx.conversation_histories.lock().await;
+        histories.remove(&conversation_key);
+        drop(histories);
+
+        if let Some(channel) = target_channel.as_ref() {
+            if let Err(e) = channel
+                .send("Started a new conversation context.", &msg.sender)
+                .await
+            {
+                eprintln!(
+                    "  ❌ Failed to send /new confirmation on {}: {e}",
+                    channel.name()
+                );
+            }
+        }
+        return;
+    }
+
     let memory_context = build_memory_context(ctx.memory.as_ref(), &msg.content).await;
 
     if ctx.auto_save_memory {
@@ -162,8 +228,15 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
     } else {
         format!("{memory_context}{}", msg.content)
     };
-
-    let target_channel = ctx.channels_by_name.get(&msg.channel).cloned();
+    let mut history = {
+        let mut histories = ctx.conversation_histories.lock().await;
+        let entry = histories
+            .entry(conversation_key)
+            .or_insert_with(|| vec![ChatMessage::system(ctx.system_prompt.as_str())]);
+        entry.push(ChatMessage::user(&enriched_message));
+        trim_conversation_history(entry);
+        entry.clone()
+    };
 
     if let Some(channel) = target_channel.as_ref() {
         if let Err(e) = channel.start_typing(&msg.sender).await {
@@ -173,11 +246,6 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
 
     println!("  ⏳ Processing message...");
     let started_at = Instant::now();
-
-    let mut history = vec![
-        ChatMessage::system(ctx.system_prompt.as_str()),
-        ChatMessage::user(&enriched_message),
-    ];
 
     let llm_result = tokio::time::timeout(
         Duration::from_secs(CHANNEL_MESSAGE_TIMEOUT_SECS),
@@ -201,6 +269,10 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
 
     match llm_result {
         Ok(Ok(response)) => {
+            trim_conversation_history(&mut history);
+            let mut histories = ctx.conversation_histories.lock().await;
+            histories.insert(conversation_history_key(&msg), history);
+
             println!(
                 "  🤖 Reply ({}ms): {}",
                 started_at.elapsed().as_millis(),
@@ -213,6 +285,10 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             }
         }
         Ok(Err(e)) => {
+            trim_conversation_history(&mut history);
+            let mut histories = ctx.conversation_histories.lock().await;
+            histories.insert(conversation_history_key(&msg), history);
+
             eprintln!(
                 "  ❌ LLM error after {}ms: {e}",
                 started_at.elapsed().as_millis()
@@ -222,6 +298,10 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             }
         }
         Err(_) => {
+            trim_conversation_history(&mut history);
+            let mut histories = ctx.conversation_histories.lock().await;
+            histories.insert(conversation_history_key(&msg), history);
+
             let timeout_msg = format!(
                 "LLM response timed out after {}s",
                 CHANNEL_MESSAGE_TIMEOUT_SECS
@@ -942,6 +1022,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
         model: Arc::new(model.clone()),
         temperature,
         auto_save_memory: config.memory.auto_save,
+        conversation_histories: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        conversation_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -1033,6 +1115,7 @@ mod tests {
     }
 
     struct ToolCallingProvider;
+    struct MultiTurnAwareProvider;
 
     fn tool_call_payload() -> String {
         serde_json::json!({
@@ -1075,6 +1158,46 @@ mod tests {
             } else {
                 Ok(tool_call_payload())
             }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for MultiTurnAwareProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            let latest_user = messages
+                .iter()
+                .rev()
+                .find(|msg| msg.role == "user")
+                .map(|msg| msg.content.as_str())
+                .unwrap_or("");
+
+            if latest_user.contains("second turn") {
+                let saw_first_turn = messages
+                    .iter()
+                    .any(|msg| msg.role == "user" && msg.content.contains("first turn"));
+                return Ok(if saw_first_turn {
+                    "has-context".to_string()
+                } else {
+                    "no-context".to_string()
+                });
+            }
+
+            Ok("first-reply".to_string())
         }
     }
 
@@ -1124,7 +1247,7 @@ mod tests {
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
         let mut channels_by_name = HashMap::new();
-        channels_by_name.insert(channel.name().to_string(), channel);
+        channels_by_name.insert("telegram".to_string(), channel);
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
@@ -1137,6 +1260,8 @@ mod tests {
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            conversation_histories: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            conversation_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -1213,7 +1338,7 @@ mod tests {
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
         let mut channels_by_name = HashMap::new();
-        channels_by_name.insert(channel.name().to_string(), channel);
+        channels_by_name.insert("telegram".to_string(), channel);
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
@@ -1228,6 +1353,8 @@ mod tests {
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            conversation_histories: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            conversation_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -1263,6 +1390,123 @@ mod tests {
 
         let sent_messages = channel_impl.sent_messages.lock().await;
         assert_eq!(sent_messages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_preserves_multi_turn_history_per_conversation() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(MultiTurnAwareProvider),
+            provider_name: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            conversation_histories: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            conversation_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-1".to_string(),
+                sender: "alice".to_string(),
+                content: "first turn".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 1,
+            },
+        )
+        .await;
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-2".to_string(),
+                sender: "alice".to_string(),
+                content: "second turn".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 2,
+            },
+        )
+        .await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent_messages.len(), 2);
+        assert!(sent_messages[1].contains("has-context"));
+    }
+
+    #[tokio::test]
+    async fn telegram_new_command_resets_conversation_history() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert("telegram".to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(MultiTurnAwareProvider),
+            provider_name: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            conversation_histories: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            conversation_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-1".to_string(),
+                sender: "chat-1".to_string(),
+                content: "first turn".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+            },
+        )
+        .await;
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-2".to_string(),
+                sender: "chat-1".to_string(),
+                content: "/new".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 2,
+            },
+        )
+        .await;
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-3".to_string(),
+                sender: "chat-1".to_string(),
+                content: "second turn".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 3,
+            },
+        )
+        .await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent_messages.len(), 3);
+        assert!(sent_messages[1].contains("Started a new conversation context."));
+        assert!(sent_messages[2].contains("no-context"));
     }
 
     #[test]
@@ -1569,6 +1813,48 @@ mod tests {
         let context = build_memory_context(&mem, "age").await;
         assert!(context.contains("[Memory context]"));
         assert!(context.contains("Age is 45"));
+    }
+
+    #[test]
+    fn conversation_history_key_scopes_by_channel_and_sender() {
+        let msg = traits::ChannelMessage {
+            id: "msg_1".into(),
+            sender: "chat_123".into(),
+            content: "hello".into(),
+            channel: "telegram".into(),
+            timestamp: 1,
+        };
+
+        assert_eq!(conversation_history_key(&msg), "telegram_chat_123");
+    }
+
+    #[test]
+    fn new_conversation_command_detected_for_telegram_only() {
+        let telegram_new = traits::ChannelMessage {
+            id: "1".into(),
+            sender: "chat".into(),
+            content: "/new".into(),
+            channel: "telegram".into(),
+            timestamp: 1,
+        };
+        let telegram_new_with_bot = traits::ChannelMessage {
+            id: "2".into(),
+            sender: "chat".into(),
+            content: "/new@zeroclaw_bot".into(),
+            channel: "telegram".into(),
+            timestamp: 2,
+        };
+        let slack_new = traits::ChannelMessage {
+            id: "3".into(),
+            sender: "C123".into(),
+            content: "/new".into(),
+            channel: "slack".into(),
+            timestamp: 3,
+        };
+
+        assert!(is_new_conversation_command(&telegram_new));
+        assert!(is_new_conversation_command(&telegram_new_with_bot));
+        assert!(!is_new_conversation_command(&slack_new));
     }
 
     // ── AIEOS Identity Tests (Issue #168) ─────────────────────────
