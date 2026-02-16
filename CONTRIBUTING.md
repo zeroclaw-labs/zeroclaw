@@ -37,6 +37,112 @@ git push --no-verify
 
 > **Note:** CI runs the same checks, so skipped hooks will be caught on the PR.
 
+## Local Secret Management (Required)
+
+ZeroClaw handles secrets through multiple layers for flexibility and security.
+
+### Secret Storage Options
+
+1. **Environment variables** (recommended for local development)
+    - Copy `.env.example` to `.env` and fill in your values
+    - `.env` files are ignored by Git (never commit them)
+    - Use for temporary/local API keys during development
+    - Variables are documented in `.env.example`
+
+2. **Config file** (`~/.zeroclaw/config.toml`)
+    - Persistent configuration for long-term use
+    - API keys are automatically encrypted when `secrets.encrypt = true` (default)
+    - Encryption uses ChaCha20-Poly1305 AEAD (industry-standard)
+    - Secret key stored in `~/.zeroclaw/.secret_key` with restrictive permissions (0600)
+    - Use `zeroclaw onboard` for guided setup
+
+### Environment Variable Hierarchy
+
+ZeroClaw checks environment variables in this order:
+
+1. Provider-specific: `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, etc.
+2. Generic fallbacks: `ZEROCLAW_API_KEY`, `API_KEY`
+3. Config overrides: `ZEROCLAW_PROVIDER`, `ZEROCLAW_MODEL`
+
+See `.env.example` for the full list of supported variables.
+
+### Pre-Commit Secret Hygiene (Mandatory)
+
+Before every commit, verify:
+
+- [ ] No `.env` files (only `.env.example` is safe)
+- [ ] No raw API keys in code, tests, fixtures, examples, or commit messages
+- [ ] No credentials in logs, error messages, or debug output
+- [ ] No real tokens in test data (use `zeroclaw_test_key`, `example_token`)
+- [ ] Review `git diff --cached` for accidental secret leakage
+
+Commands to audit before push:
+
+```bash
+# Check staged files for common secret patterns
+git diff --cached | grep -iE '(api[_-]?key|secret|token|password|bearer|sk-)'
+
+# Verify .env is not staged
+git status | grep -E '\.env$'
+```
+
+### Secret Scanning Recommendations
+
+For additional protection, consider installing:
+
+- **gitleaks** (local pre-commit scanning): [https://github.com/gitleaks/gitleaks](https://github.com/gitleaks/gitleaks)
+- **truffleHog** (deep history scanning): [https://github.com/trufflesecurity/trufflehog](https://github.com/trufflesecurity/trufflehog)
+- **git-secrets** (AWS-focused, extensible): [https://github.com/awslabs/git-secrets](https://github.com/awslabs/git-secrets)
+
+Installation example (gitleaks):
+
+```bash
+# Install gitleaks
+brew install gitleaks  # macOS
+# or download from GitHub releases
+
+# Run manual scan
+gitleaks detect --source . --verbose
+
+# Install as pre-commit hook (optional)
+gitleaks protect --staged
+```
+
+> **Note:** ZeroClaw's default CI does not currently enforce secret scanning. Manual vigilance remains essential.
+
+### Pre-Commit Hook (Optional, Recommended)
+
+This repo includes a lightweight pre-commit hook at `.githooks/pre-commit` that runs a staged secret scan when **gitleaks** is installed.
+
+Enable it with:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+If `gitleaks` is not installed, the hook prints a warning and allows the commit. Install gitleaks to enforce secret checks locally.
+
+### What Never to Commit
+
+- `.env` files (use `.env.example` as template only)
+- API keys, tokens, passwords, or credentials (plain or encrypted)
+- OAuth tokens or session identifiers
+- Webhook secrets or signing keys
+- Personal identifiers or real user data in tests/fixtures
+- Private URLs or internal service endpoints
+- `~/.zeroclaw/.secret_key` or similar key files
+
+### If You Accidentally Commit a Secret
+
+1. **Immediately revoke/rotate** the exposed credential at the provider
+2. **Do not** simply revert the commit (history still contains it)
+3. Use `git filter-repo` or `BFG Repo-Cleaner` to purge from history
+4. Force-push after cleaning (coordinate with maintainers)
+5. Verify the secret is not in any PR/issue/discussion/comment
+
+Reference: [GitHub's guide to removing sensitive data](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/removing-sensitive-data-from-a-repository)
+
+
 ## Collaboration Tracks (Risk-Based)
 
 To keep review throughput high without lowering quality, every PR should map to one track:
