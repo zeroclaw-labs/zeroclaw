@@ -92,10 +92,15 @@ impl OpenAiProvider {
                 if text.is_empty() {
                     return None;
                 }
+                let content_type = if m.role == "assistant" {
+                    "output_text"
+                } else {
+                    "input_text"
+                };
                 Some(serde_json::json!({
                     "role": m.role,
                     "content": [
-                        { "type": "input_text", "text": text }
+                        { "type": content_type, "text": text }
                     ]
                 }))
             })
@@ -355,12 +360,18 @@ mod tests {
         assert!(json.contains("\"text\":\"hello\""));
         assert!(json.contains("\"text\":\"hi\""));
         assert!(json.contains("\"text\":\"continue\""));
+        assert!(json.contains("\"type\":\"input_text\""));
+        assert!(json.contains("\"type\":\"output_text\""));
 
         let parsed = input.as_array().unwrap();
         assert_eq!(parsed[0]["role"], "system");
         assert_eq!(parsed[1]["role"], "user");
         assert_eq!(parsed[2]["role"], "assistant");
         assert_eq!(parsed[3]["role"], "user");
+        assert_eq!(parsed[0]["content"][0]["type"], "input_text");
+        assert_eq!(parsed[1]["content"][0]["type"], "input_text");
+        assert_eq!(parsed[2]["content"][0]["type"], "output_text");
+        assert_eq!(parsed[3]["content"][0]["type"], "input_text");
     }
 
     #[test]
