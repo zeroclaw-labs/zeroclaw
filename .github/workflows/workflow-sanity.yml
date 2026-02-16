@@ -22,7 +22,7 @@ permissions:
 
 jobs:
     no-tabs:
-        runs-on: blacksmith-2vcpu-ubuntu-240
+        runs-on: blacksmith-2vcpu-ubuntu-2404
         timeout-minutes: 10
         steps:
             - name: Checkout
@@ -55,7 +55,7 @@ jobs:
                   PY
 
     actionlint:
-        runs-on: blacksmith-2vcpu-ubuntu-240
+        runs-on: blacksmith-2vcpu-ubuntu-2404
         timeout-minutes: 10
         steps:
             - name: Checkout
