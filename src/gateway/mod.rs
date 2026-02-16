@@ -198,7 +198,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let model = config
         .default_model
         .clone()
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
+        .unwrap_or_else(|| "anthropic/claude-sonnet-4".into());
     let temperature = config.default_temperature;
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory(
         &config.memory,

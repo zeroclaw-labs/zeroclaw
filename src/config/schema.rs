@@ -774,6 +774,10 @@ pub struct DiscordConfig {
     pub guild_id: Option<String>,
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    /// When true, process messages from other bots (not just humans).
+    /// The bot still ignores its own messages to prevent feedback loops.
+    #[serde(default)]
+    pub listen_to_bots: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -887,7 +891,7 @@ impl Default for Config {
             config_path: zeroclaw_dir.join("config.toml"),
             api_key: None,
             default_provider: Some("openrouter".to_string()),
-            default_model: Some("anthropic/claude-sonnet-4-20250514".to_string()),
+            default_model: Some("anthropic/claude-sonnet-4".to_string()),
             default_temperature: 0.7,
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),

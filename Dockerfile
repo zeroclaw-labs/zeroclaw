@@ -94,9 +94,9 @@ COPY --from=permissions /zeroclaw-data /zeroclaw-data
 # Environment setup
 ENV ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace
 ENV HOME=/zeroclaw-data
-# Defaults for prod (OpenRouter)
+# Default provider (model is set in config.toml, not here,
+# so config file edits are not silently overridden)
 ENV PROVIDER="openrouter"
-ENV ZEROCLAW_MODEL="anthropic/claude-sonnet-4-20250514"
 ENV ZEROCLAW_GATEWAY_PORT=3000
 
 # API_KEY must be provided at runtime!

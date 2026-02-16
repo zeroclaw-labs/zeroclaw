@@ -489,7 +489,7 @@ pub async fn run(
     let model_name = model_override
         .as_deref()
         .or(config.default_model.as_deref())
-        .unwrap_or("anthropic/claude-sonnet-4-20250514");
+        .unwrap_or("anthropic/claude-sonnet-4");
 
     let provider: Box<dyn Provider> = providers::create_routed_provider(
         provider_name,
