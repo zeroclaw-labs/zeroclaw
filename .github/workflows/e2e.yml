@@ -1,0 +1,32 @@
+name: Integration / E2E Tests
+
+on:
+    push:
+        branches: [main]
+    pull_request:
+        branches: [main]
+    workflow_dispatch:
+
+concurrency:
+    group: e2e-${{ github.event.pull_request.number || github.sha }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+
+env:
+    CARGO_TERM_COLOR: always
+
+jobs:
+    integration-tests:
+        name: Integration / E2E Tests
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        timeout-minutes: 30
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+            - name: Run integration / E2E tests
+              run: cargo test --test agent_e2e --locked --verbose
