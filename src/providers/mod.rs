@@ -135,6 +135,7 @@ fn resolve_api_key(name: &str, api_key: Option<&str>) -> Option<String> {
         "opencode" | "opencode-zen" => vec!["OPENCODE_API_KEY"],
         "vercel" | "vercel-ai" => vec!["VERCEL_API_KEY"],
         "cloudflare" | "cloudflare-ai" => vec!["CLOUDFLARE_API_KEY"],
+        "astrai" => vec!["ASTRAI_API_KEY"],
         _ => vec![],
     };
 
@@ -282,6 +283,11 @@ pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<
         ))),
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "NVIDIA NIM", "https://integrate.api.nvidia.com/v1", key, AuthStyle::Bearer,
+        ))),
+
+        // ── AI inference routers ─────────────────────────────
+        "astrai" => Ok(Box::new(OpenAiCompatibleProvider::new(
+            "Astrai", "https://as-trai.com/v1", key, AuthStyle::Bearer,
         ))),
 
         // ── Bring Your Own Provider (custom URL) ───────────
@@ -612,6 +618,13 @@ mod tests {
         assert!(create_provider("nvidia", Some("nvapi-test")).is_ok());
         assert!(create_provider("nvidia-nim", Some("nvapi-test")).is_ok());
         assert!(create_provider("build.nvidia.com", Some("nvapi-test")).is_ok());
+    }
+
+    // ── AI inference routers ─────────────────────────────────
+
+    #[test]
+    fn factory_astrai() {
+        assert!(create_provider("astrai", Some("sk-astrai-test")).is_ok());
     }
 
     // ── Custom / BYOP provider ─────────────────────────────
