@@ -322,6 +322,18 @@ impl Provider for OpenAiProvider {
     fn supports_native_tools(&self) -> bool {
         true
     }
+
+    async fn warmup(&self) -> anyhow::Result<()> {
+        if let Some(credential) = self.credential.as_ref() {
+            self.client
+                .get("https://api.openai.com/v1/models")
+                .header("Authorization", format!("Bearer {credential}"))
+                .send()
+                .await?
+                .error_for_status()?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -436,5 +448,12 @@ mod tests {
         let json = format!(r#"{{"choices":[{{"message":{{"content":"{long}"}}}}]}}"#);
         let resp: ChatResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(resp.choices[0].message.content.len(), 100_000);
+    }
+
+    #[tokio::test]
+    async fn warmup_without_key_is_noop() {
+        let provider = OpenAiProvider::new(None);
+        let result = provider.warmup().await;
+        assert!(result.is_ok());
     }
 }

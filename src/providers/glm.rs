@@ -253,6 +253,24 @@ impl Provider for GlmProvider {
             .map(|c| c.message.content)
             .ok_or_else(|| anyhow::anyhow!("No response from GLM"))
     }
+
+    async fn warmup(&self) -> anyhow::Result<()> {
+        if self.api_key_id.is_empty() || self.api_key_secret.is_empty() {
+            return Ok(());
+        }
+
+        // Generate and cache a JWT token, establishing TLS to the GLM API.
+        let token = self.generate_token()?;
+        let url = format!("{}/chat/completions", self.base_url);
+        // GET will likely return 405 but establishes the TLS + HTTP/2 connection pool.
+        let _ = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -334,5 +352,12 @@ mod tests {
         assert!(!encoded.contains('='));
         assert!(!encoded.contains('+'));
         assert!(!encoded.contains('/'));
+    }
+
+    #[tokio::test]
+    async fn warmup_without_key_is_noop() {
+        let provider = GlmProvider::new(None);
+        let result = provider.warmup().await;
+        assert!(result.is_ok());
     }
 }
