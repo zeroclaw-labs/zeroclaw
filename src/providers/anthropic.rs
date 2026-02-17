@@ -500,6 +500,20 @@ impl Provider for AnthropicProvider {
     fn supports_native_tools(&self) -> bool {
         true
     }
+
+    async fn warmup(&self) -> anyhow::Result<()> {
+        if let Some(credential) = self.credential.as_ref() {
+            let mut request = self
+                .client
+                .post(format!("{}/v1/messages", self.base_url))
+                .header("anthropic-version", "2023-06-01");
+            request = self.apply_auth(request, credential);
+            // Send a minimal request; the goal is TLS + HTTP/2 setup, not a valid response.
+            // Anthropic has no lightweight GET endpoint, so we accept any non-network error.
+            let _ = request.send().await?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1081,5 +1095,12 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("cache_control"));
         assert!(json.contains(r#""system":"System""#));
+    }
+
+    #[tokio::test]
+    async fn warmup_without_key_is_noop() {
+        let provider = AnthropicProvider::new(None);
+        let result = provider.warmup().await;
+        assert!(result.is_ok());
     }
 }

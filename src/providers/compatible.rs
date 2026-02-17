@@ -775,6 +775,20 @@ impl Provider for OpenAiCompatibleProvider {
         })
         .boxed()
     }
+
+    async fn warmup(&self) -> anyhow::Result<()> {
+        if let Some(credential) = self.credential.as_ref() {
+            // Hit the chat completions URL with a GET to establish the connection pool.
+            // The server will likely return 405 Method Not Allowed, which is fine -
+            // the goal is TLS handshake and HTTP/2 negotiation.
+            let url = self.chat_completions_url();
+            let _ = self
+                .apply_auth_header(self.client.get(&url), credential)
+                .send()
+                .await?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1128,5 +1142,12 @@ mod tests {
             p.chat_completions_url(),
             "https://opencode.ai/zen/v1/chat/completions"
         );
+    }
+
+    #[tokio::test]
+    async fn warmup_without_key_is_noop() {
+        let provider = make_provider("test", "https://example.com", None);
+        let result = provider.warmup().await;
+        assert!(result.is_ok());
     }
 }

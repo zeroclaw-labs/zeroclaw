@@ -396,6 +396,27 @@ impl Provider for GeminiProvider {
             .and_then(|p| p.text)
             .ok_or_else(|| anyhow::anyhow!("No response from Gemini"))
     }
+
+    async fn warmup(&self) -> anyhow::Result<()> {
+        if let Some(auth) = self.auth.as_ref() {
+            let url = if auth.is_api_key() {
+                format!(
+                    "https://generativelanguage.googleapis.com/v1beta/models?key={}",
+                    auth.credential()
+                )
+            } else {
+                "https://generativelanguage.googleapis.com/v1beta/models".to_string()
+            };
+
+            let mut request = self.client.get(&url);
+            if let GeminiAuth::OAuthToken(token) = auth {
+                request = request.bearer_auth(token);
+            }
+
+            request.send().await?.error_for_status()?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -664,5 +685,12 @@ mod tests {
         let response: GenerateContentResponse = serde_json::from_str(json).unwrap();
         assert!(response.error.is_some());
         assert_eq!(response.error.unwrap().message, "Invalid API key");
+    }
+
+    #[tokio::test]
+    async fn warmup_without_key_is_noop() {
+        let provider = GeminiProvider::new(None);
+        let result = provider.warmup().await;
+        assert!(result.is_ok());
     }
 }
