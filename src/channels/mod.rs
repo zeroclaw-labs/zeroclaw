@@ -215,6 +215,8 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             ctx.model.as_str(),
             ctx.temperature,
             true, // silent — channels don't write to stdout
+            None,
+            msg.channel.as_str(),
         ),
     )
     .await;

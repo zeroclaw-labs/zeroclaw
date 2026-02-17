@@ -849,6 +849,7 @@ mod tests {
             max_cost_per_day_cents: 1000,
             require_approval_for_medium_risk: false,
             block_high_risk_commands: false,
+            ..crate::config::AutonomyConfig::default()
         };
         let workspace = PathBuf::from("/tmp/test-workspace");
         let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
@@ -1201,6 +1202,7 @@ mod tests {
             max_cost_per_day_cents: 100,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
+            ..crate::config::AutonomyConfig::default()
         };
         let workspace = PathBuf::from("/tmp/test");
         let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
