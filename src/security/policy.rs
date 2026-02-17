@@ -158,6 +158,25 @@ fn skip_env_assignments(s: &str) -> &str {
     }
 }
 
+/// Detect a single `&` operator (background/chain). `&&` is allowed.
+///
+/// We treat any standalone `&` as unsafe in policy validation because it can
+/// chain hidden sub-commands and escape foreground timeout expectations.
+fn contains_single_ampersand(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        if *b != b'&' {
+            continue;
+        }
+        let prev_is_amp = i > 0 && bytes[i - 1] == b'&';
+        let next_is_amp = i + 1 < bytes.len() && bytes[i + 1] == b'&';
+        if !prev_is_amp && !next_is_amp {
+            return true;
+        }
+    }
+    false
+}
+
 impl SecurityPolicy {
     /// Classify command risk. Any high-risk segment marks the whole command high.
     pub fn command_risk_level(&self, command: &str) -> CommandRiskLevel {
@@ -165,7 +184,7 @@ impl SecurityPolicy {
         for sep in ["&&", "||"] {
             normalized = normalized.replace(sep, "\x00");
         }
-        for sep in ['\n', ';', '|'] {
+        for sep in ['\n', ';', '|', '&'] {
             normalized = normalized.replace(sep, "\x00");
         }
 
@@ -336,6 +355,12 @@ impl SecurityPolicy {
 
         // Block output redirections — they can write to arbitrary paths
         if command.contains('>') {
+            return false;
+        }
+
+        // Block background command chaining (`&`), which can hide extra
+        // sub-commands and outlive timeout expectations. Keep `&&` allowed.
+        if contains_single_ampersand(command) {
             return false;
         }
 
@@ -931,6 +956,14 @@ mod tests {
         assert!(!p.is_command_allowed("ls || rm -rf /"));
         // Both allowed — OK
         assert!(p.is_command_allowed("ls || echo fallback"));
+    }
+
+    #[test]
+    fn command_injection_background_chain_blocked() {
+        let p = default_policy();
+        assert!(!p.is_command_allowed("ls & rm -rf /"));
+        assert!(!p.is_command_allowed("ls&rm -rf /"));
+        assert!(!p.is_command_allowed("echo ok & python3 -c 'print(1)'"));
     }
 
     #[test]
