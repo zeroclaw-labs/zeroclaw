@@ -1263,7 +1263,11 @@ I will now call the tool with this payload:
 
         let (text, calls) = parse_tool_calls(response);
         assert!(text.contains("Sure, creating the file now."));
-        assert_eq!(calls.len(), 0, "Raw JSON without wrappers should not be parsed");
+        assert_eq!(
+            calls.len(),
+            0,
+            "Raw JSON without wrappers should not be parsed"
+        );
     }
 
     #[test]

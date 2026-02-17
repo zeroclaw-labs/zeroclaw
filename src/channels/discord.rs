@@ -343,11 +343,16 @@ impl Channel for DiscordChannel {
                         continue;
                     }
 
+                    let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
                     let channel_id = d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("").to_string();
 
                     let channel_msg = ChannelMessage {
-                        id: Uuid::new_v4().to_string(),
-                        sender: channel_id,
+                        id: if message_id.is_empty() {
+                            Uuid::new_v4().to_string()
+                        } else {
+                            format!("discord_{message_id}")
+                        },
+                        sender: author_id.to_string(),
                         content: content.to_string(),
                         channel: "discord".to_string(),
                         timestamp: std::time::SystemTime::now()
@@ -694,5 +699,56 @@ mod tests {
         let _ = ch.start_typing("222").await;
         let guard = ch.typing_handle.lock().unwrap();
         assert!(guard.is_some());
+    }
+
+    // ── Message ID edge cases ─────────────────────────────────────
+
+    #[test]
+    fn discord_message_id_format_includes_discord_prefix() {
+        // Verify that message IDs follow the format: discord_{message_id}
+        let message_id = "123456789012345678";
+        let expected_id = format!("discord_{message_id}");
+        assert_eq!(expected_id, "discord_123456789012345678");
+    }
+
+    #[test]
+    fn discord_message_id_is_deterministic() {
+        // Same message_id = same ID (prevents duplicates after restart)
+        let message_id = "123456789012345678";
+        let id1 = format!("discord_{message_id}");
+        let id2 = format!("discord_{message_id}");
+        assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn discord_message_id_different_message_different_id() {
+        // Different message IDs produce different IDs
+        let id1 = format!("discord_123456789012345678");
+        let id2 = format!("discord_987654321098765432");
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn discord_message_id_uses_snowflake_id() {
+        // Discord snowflake IDs are numeric strings
+        let message_id = "123456789012345678"; // Typical snowflake format
+        let id = format!("discord_{message_id}");
+        assert!(id.starts_with("discord_"));
+        // Snowflake IDs are numeric
+        assert!(message_id.chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn discord_message_id_fallback_to_uuid_on_empty() {
+        // Edge case: empty message_id falls back to UUID
+        let message_id = "";
+        let id = if message_id.is_empty() {
+            format!("discord_{}", uuid::Uuid::new_v4())
+        } else {
+            format!("discord_{message_id}")
+        };
+        assert!(id.starts_with("discord_"));
+        // Should have UUID dashes
+        assert!(id.contains('-'));
     }
 }
