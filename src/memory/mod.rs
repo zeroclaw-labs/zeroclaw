@@ -76,7 +76,10 @@ pub fn create_memory(
     // Auto-hydration: if brain.db is missing but MEMORY_SNAPSHOT.md exists,
     // restore the "soul" from the snapshot before creating the backend.
     if config.auto_hydrate
-        && matches!(classify_memory_backend(&config.backend), MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid)
+        && matches!(
+            classify_memory_backend(&config.backend),
+            MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid
+        )
         && snapshot::should_hydrate(workspace_dir)
     {
         tracing::info!("🧬 Cold boot detected — hydrating from MEMORY_SNAPSHOT.md");
@@ -143,10 +146,7 @@ pub fn create_memory_for_migration(
 }
 
 /// Factory: create an optional response cache from config.
-pub fn create_response_cache(
-    config: &MemoryConfig,
-    workspace_dir: &Path,
-) -> Option<ResponseCache> {
+pub fn create_response_cache(config: &MemoryConfig, workspace_dir: &Path) -> Option<ResponseCache> {
     if !config.response_cache_enabled {
         return None;
     }

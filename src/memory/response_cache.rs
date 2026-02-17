@@ -90,9 +90,7 @@ impl ResponseCache {
              WHERE prompt_hash = ?1 AND created_at > ?2",
         )?;
 
-        let result: Option<String> = stmt
-            .query_row(params![key, cutoff], |row| row.get(0))
-            .ok();
+        let result: Option<String> = stmt.query_row(params![key, cutoff], |row| row.get(0)).ok();
 
         if result.is_some() {
             // Bump hit count and accessed_at
@@ -109,13 +107,7 @@ impl ResponseCache {
     }
 
     /// Store a response in the cache.
-    pub fn put(
-        &self,
-        key: &str,
-        model: &str,
-        response: &str,
-        token_count: u32,
-    ) -> Result<()> {
+    pub fn put(&self, key: &str, model: &str, response: &str, token_count: u32) -> Result<()> {
         let conn = self
             .conn
             .lock()
@@ -162,19 +154,17 @@ impl ResponseCache {
         let count: i64 =
             conn.query_row("SELECT COUNT(*) FROM response_cache", [], |row| row.get(0))?;
 
-        let hits: i64 = conn
-            .query_row(
-                "SELECT COALESCE(SUM(hit_count), 0) FROM response_cache",
-                [],
-                |row| row.get(0),
-            )?;
+        let hits: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(hit_count), 0) FROM response_cache",
+            [],
+            |row| row.get(0),
+        )?;
 
-        let tokens_saved: i64 = conn
-            .query_row(
-                "SELECT COALESCE(SUM(token_count * hit_count), 0) FROM response_cache",
-                [],
-                |row| row.get(0),
-            )?;
+        let tokens_saved: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(token_count * hit_count), 0) FROM response_cache",
+            [],
+            |row| row.get(0),
+        )?;
 
         #[allow(clippy::cast_sign_loss)]
         Ok((count as usize, hits as u64, tokens_saved as u64))
@@ -363,7 +353,9 @@ mod tests {
         let (_tmp, cache) = temp_cache(60);
         let key = ResponseCache::cache_key("gpt-4", None, "日本語のテスト 🦀");
 
-        cache.put(&key, "gpt-4", "はい、Rustは素晴らしい", 30).unwrap();
+        cache
+            .put(&key, "gpt-4", "はい、Rustは素晴らしい", 30)
+            .unwrap();
 
         let result = cache.get(&key).unwrap();
         assert_eq!(result.as_deref(), Some("はい、Rustは素晴らしい"));

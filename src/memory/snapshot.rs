@@ -64,7 +64,10 @@ pub fn export_snapshot(workspace_dir: &Path) -> Result<usize> {
 
     let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     output.push_str(&format!("**Last exported:** {now}\n\n"));
-    output.push_str(&format!("**Total core memories:** {}\n\n---\n\n", rows.len()));
+    output.push_str(&format!(
+        "**Total core memories:** {}\n\n---\n\n",
+        rows.len()
+    ));
 
     for (key, content, _category, created_at, updated_at) in &rows {
         output.push_str(&format!("### 🔑 `{key}`\n\n"));

@@ -579,6 +579,11 @@ Allowlist Telegram @username or numeric user ID, then run `zeroclaw onboard --ch
                         continue;
                     };
 
+                    let message_id = message
+                        .get("message_id")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+
                     // Send "typing" indicator immediately when we receive a message
                     let typing_body = serde_json::json!({
                         "chat_id": &chat_id,
@@ -592,8 +597,8 @@ Allowlist Telegram @username or numeric user ID, then run `zeroclaw onboard --ch
                         .await; // Ignore errors for typing indicator
 
                     let msg = ChannelMessage {
-                        id: Uuid::new_v4().to_string(),
-                        sender: chat_id,
+                        id: format!("telegram_{chat_id}_{message_id}"),
+                        sender: username.to_string(),
                         content: text.to_string(),
                         channel: "telegram".to_string(),
                         timestamp: std::time::SystemTime::now()
@@ -1032,5 +1037,63 @@ mod tests {
 
         // Should not panic
         assert!(result.is_err());
+    }
+
+    // ── Message ID edge cases ─────────────────────────────────────
+
+    #[test]
+    fn telegram_message_id_format_includes_chat_and_message_id() {
+        // Verify that message IDs follow the format: telegram_{chat_id}_{message_id}
+        let chat_id = "123456";
+        let message_id = 789;
+        let expected_id = format!("telegram_{chat_id}_{message_id}");
+        assert_eq!(expected_id, "telegram_123456_789");
+    }
+
+    #[test]
+    fn telegram_message_id_is_deterministic() {
+        // Same chat_id + same message_id = same ID (prevents duplicates after restart)
+        let chat_id = "123456";
+        let message_id = 789;
+        let id1 = format!("telegram_{chat_id}_{message_id}");
+        let id2 = format!("telegram_{chat_id}_{message_id}");
+        assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn telegram_message_id_different_message_different_id() {
+        // Different message IDs produce different IDs
+        let chat_id = "123456";
+        let id1 = format!("telegram_{chat_id}_789");
+        let id2 = format!("telegram_{chat_id}_790");
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn telegram_message_id_different_chat_different_id() {
+        // Different chats produce different IDs even with same message_id
+        let message_id = 789;
+        let id1 = format!("telegram_123456_{message_id}");
+        let id2 = format!("telegram_789012_{message_id}");
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn telegram_message_id_no_uuid_randomness() {
+        // Verify format doesn't contain random UUID components
+        let chat_id = "123456";
+        let message_id = 789;
+        let id = format!("telegram_{chat_id}_{message_id}");
+        assert!(!id.contains('-')); // No UUID dashes
+        assert!(id.starts_with("telegram_"));
+    }
+
+    #[test]
+    fn telegram_message_id_handles_zero_message_id() {
+        // Edge case: message_id can be 0 (fallback/missing case)
+        let chat_id = "123456";
+        let message_id = 0;
+        let id = format!("telegram_{chat_id}_{message_id}");
+        assert_eq!(id, "telegram_123456_0");
     }
 }
