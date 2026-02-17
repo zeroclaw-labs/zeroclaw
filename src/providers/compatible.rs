@@ -262,8 +262,7 @@ fn parse_sse_line(line: &str) -> StreamResult<Option<String>> {
         }
 
         // Parse JSON delta
-        let chunk: StreamChunkResponse = serde_json::from_str(data)
-            .map_err(StreamError::Json)?;
+        let chunk: StreamChunkResponse = serde_json::from_str(data).map_err(StreamError::Json)?;
 
         // Extract content from delta
         if let Some(choice) = chunk.choices.first() {
@@ -294,7 +293,7 @@ async fn sse_bytes_to_chunks(
 
         // Get response body as bytes stream
         match response.error_for_status_ref() {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(e) => {
                 let _ = tx.send(Err(StreamError::Http(e))).await;
                 return;
@@ -310,7 +309,12 @@ async fn sse_bytes_to_chunks(
                     let text = match String::from_utf8(bytes.to_vec()) {
                         Ok(t) => t,
                         Err(e) => {
-                            let _ = tx.send(Err(StreamError::InvalidSse(format!("Invalid UTF-8: {}", e)))).await;
+                            let _ = tx
+                                .send(Err(StreamError::InvalidSse(format!(
+                                    "Invalid UTF-8: {}",
+                                    e
+                                ))))
+                                .await;
                             break;
                         }
                     };
@@ -360,7 +364,8 @@ async fn sse_bytes_to_chunks(
             Some(chunk) => Some((chunk, rx)),
             None => None,
         }
-    }).boxed()
+    })
+    .boxed()
 }
 
 fn first_nonempty(text: Option<&str>) -> Option<String> {
@@ -691,7 +696,8 @@ impl Provider for OpenAiCompatibleProvider {
                         "{} API key not set",
                         provider_name
                     )))
-                }).boxed();
+                })
+                .boxed();
             }
         };
 
@@ -727,7 +733,9 @@ impl Provider for OpenAiCompatibleProvider {
 
             // Apply auth header
             req_builder = match &auth_header {
-                AuthStyle::Bearer => req_builder.header("Authorization", format!("Bearer {}", api_key)),
+                AuthStyle::Bearer => {
+                    req_builder.header("Authorization", format!("Bearer {}", api_key))
+                }
                 AuthStyle::XApiKey => req_builder.header("x-api-key", &api_key),
                 AuthStyle::Custom(header) => req_builder.header(header, &api_key),
             };
@@ -751,7 +759,9 @@ impl Provider for OpenAiCompatibleProvider {
                     Ok(e) => e,
                     Err(_) => format!("HTTP error: {}", status),
                 };
-                let _ = tx.send(Err(StreamError::Provider(format!("{}: {}", status, error)))).await;
+                let _ = tx
+                    .send(Err(StreamError::Provider(format!("{}: {}", status, error))))
+                    .await;
                 return;
             }
 
@@ -770,7 +780,8 @@ impl Provider for OpenAiCompatibleProvider {
                 Some(chunk) => Some((chunk, rx)),
                 None => None,
             }
-        }).boxed()
+        })
+        .boxed()
     }
 }
 

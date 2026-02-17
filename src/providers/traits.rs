@@ -327,10 +327,7 @@ pub trait Provider: Send + Sync {
         let provider_name = "unknown".to_string();
 
         // Create a single empty chunk to indicate not supported
-        let chunk = StreamChunk::error(format!(
-            "{} does not support streaming",
-            provider_name
-        ));
+        let chunk = StreamChunk::error(format!("{} does not support streaming", provider_name));
         stream::once(async move { Ok(chunk) }).boxed()
     }
 }

@@ -402,15 +402,17 @@ impl Provider for ReliableProvider {
                     Some(chunk) => Some((chunk, rx)),
                     None => None,
                 }
-            }).boxed();
+            })
+            .boxed();
         }
 
         // No streaming support available
         stream::once(async move {
             Err(super::traits::StreamError::Provider(
-                "No provider supports streaming".to_string()
+                "No provider supports streaming".to_string(),
             ))
-        }).boxed()
+        })
+        .boxed()
     }
 }
 
