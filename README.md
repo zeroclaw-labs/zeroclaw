@@ -166,6 +166,9 @@ zeroclaw doctor
 # Check channel health
 zeroclaw channel doctor
 
+# Bind a Telegram identity into allowlist
+zeroclaw channel bind-telegram 123456789
+
 # Get integration setup details
 zeroclaw integrations info Telegram
 
@@ -276,6 +279,19 @@ Recommended low-friction setup (secure + fast):
 - **Discord:** allowlist your own Discord user ID.
 - **Slack:** allowlist your own Slack member ID (usually starts with `U`).
 - Use `"*"` only for temporary open testing.
+
+Telegram operator-approval flow:
+
+1. Keep `[channels_config.telegram].allowed_users = []` for deny-by-default startup.
+2. Unauthorized users receive a hint with a copyable operator command:
+   `zeroclaw channel bind-telegram <IDENTITY>`.
+3. Operator runs that command locally, then user retries sending a message.
+
+If you need a one-shot manual approval, run:
+
+```bash
+zeroclaw channel bind-telegram 123456789
+```
 
 If you're not sure which identity to use:
 
@@ -563,6 +579,7 @@ See [aieos.org](https://aieos.org) for the full schema and live examples.
 | `doctor` | Diagnose daemon/scheduler/channel freshness |
 | `status` | Show full system status |
 | `channel doctor` | Run health checks for configured channels |
+| `channel bind-telegram <IDENTITY>` | Add one Telegram username/user ID to allowlist |
 | `integrations info <name>` | Show setup/status details for one integration |
 
 ## Development
