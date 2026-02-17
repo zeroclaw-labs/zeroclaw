@@ -201,20 +201,10 @@ fn summarize_args(args: &serde_json::Value) -> String {
                 .iter()
                 .map(|(k, v)| {
                     let val = match v {
-                        serde_json::Value::String(s) => {
-                            if s.len() > 80 {
-                                format!("{}…", &s[..77])
-                            } else {
-                                s.clone()
-                            }
-                        }
+                        serde_json::Value::String(s) => truncate_for_summary(s, 80),
                         other => {
                             let s = other.to_string();
-                            if s.len() > 80 {
-                                format!("{}…", &s[..77])
-                            } else {
-                                s
-                            }
+                            truncate_for_summary(&s, 80)
                         }
                     };
                     format!("{k}: {val}")
@@ -224,12 +214,18 @@ fn summarize_args(args: &serde_json::Value) -> String {
         }
         other => {
             let s = other.to_string();
-            if s.len() > 120 {
-                format!("{}…", &s[..117])
-            } else {
-                s
-            }
+            truncate_for_summary(&s, 120)
         }
+    }
+}
+
+fn truncate_for_summary(input: &str, max_chars: usize) -> String {
+    let mut chars = input.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        input.to_string()
     }
 }
 
@@ -402,6 +398,15 @@ mod tests {
         let summary = summarize_args(&args);
         assert!(summary.contains('…'));
         assert!(summary.len() < 200);
+    }
+
+    #[test]
+    fn summarize_args_unicode_safe_truncation() {
+        let long_val = "🦀".repeat(120);
+        let args = serde_json::json!({"content": long_val});
+        let summary = summarize_args(&args);
+        assert!(summary.contains("content:"));
+        assert!(summary.contains('…'));
     }
 
     #[test]

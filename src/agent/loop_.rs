@@ -1058,39 +1058,53 @@ pub async fn run(
     } else {
         println!("🦀 ZeroClaw Interactive Mode");
         println!("Type /quit to exit.\n");
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         let cli = crate::channels::CliChannel::new();
-
-        // Spawn listener
-        let listen_handle = tokio::spawn(async move {
-            let _ = crate::channels::Channel::listen(&cli, tx).await;
-        });
 
         // Persistent conversation history across turns
         let mut history = vec![ChatMessage::system(&system_prompt)];
 
-        while let Some(msg) = rx.recv().await {
+        loop {
+            print!("> ");
+            let _ = std::io::stdout().flush();
+
+            let mut input = String::new();
+            match std::io::stdin().read_line(&mut input) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("\nError reading input: {e}\n");
+                    break;
+                }
+            }
+
+            let user_input = input.trim().to_string();
+            if user_input.is_empty() {
+                continue;
+            }
+            if user_input == "/quit" || user_input == "/exit" {
+                break;
+            }
+
             // Auto-save conversation turns
             if config.memory.auto_save {
                 let user_key = autosave_memory_key("user_msg");
                 let _ = mem
-                    .store(&user_key, &msg.content, MemoryCategory::Conversation, None)
+                    .store(&user_key, &user_input, MemoryCategory::Conversation, None)
                     .await;
             }
 
             // Inject memory + hardware RAG context into user message
-            let mem_context = build_context(mem.as_ref(), &msg.content).await;
+            let mem_context = build_context(mem.as_ref(), &user_input).await;
             let rag_limit = if config.agent.compact_context { 2 } else { 5 };
             let hw_context = hardware_rag
                 .as_ref()
-                .map(|r| build_hardware_context(r, &msg.content, &board_names, rag_limit))
+                .map(|r| build_hardware_context(r, &user_input, &board_names, rag_limit))
                 .unwrap_or_default();
             let context = format!("{mem_context}{hw_context}");
             let enriched = if context.is_empty() {
-                msg.content.clone()
+                user_input.clone()
             } else {
-                format!("{context}{}", msg.content)
+                format!("{context}{user_input}")
             };
 
             history.push(ChatMessage::user(&enriched));
@@ -1116,7 +1130,11 @@ pub async fn run(
                 }
             };
             final_output = response.clone();
-            println!("\n{response}\n");
+            if let Err(e) =
+                crate::channels::Channel::send(&cli, &format!("\n{response}\n"), "user").await
+            {
+                eprintln!("\nError sending CLI response: {e}\n");
+            }
             observer.record_event(&ObserverEvent::TurnComplete);
 
             // Auto-compaction before hard trimming to preserve long-context signal.
@@ -1139,8 +1157,6 @@ pub async fn run(
                     .await;
             }
         }
-
-        listen_handle.abort();
     }
 
     let duration = start.elapsed();
