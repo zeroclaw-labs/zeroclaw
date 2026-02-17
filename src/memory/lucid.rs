@@ -313,14 +313,22 @@ impl Memory for LucidMemory {
         key: &str,
         content: &str,
         category: MemoryCategory,
+        session_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        self.local.store(key, content, category.clone()).await?;
+        self.local
+            .store(key, content, category.clone(), session_id)
+            .await?;
         self.sync_to_lucid_async(key, content, &category).await;
         Ok(())
     }
 
-    async fn recall(&self, query: &str, limit: usize) -> anyhow::Result<Vec<MemoryEntry>> {
-        let local_results = self.local.recall(query, limit).await?;
+    async fn recall(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let local_results = self.local.recall(query, limit, session_id).await?;
         if limit == 0
             || local_results.len() >= limit
             || local_results.len() >= self.local_hit_threshold
@@ -357,8 +365,12 @@ impl Memory for LucidMemory {
         self.local.get(key).await
     }
 
-    async fn list(&self, category: Option<&MemoryCategory>) -> anyhow::Result<Vec<MemoryEntry>> {
-        self.local.list(category).await
+    async fn list(
+        &self,
+        category: Option<&MemoryCategory>,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.local.list(category, session_id).await
     }
 
     async fn forget(&self, key: &str) -> anyhow::Result<bool> {
@@ -474,7 +486,7 @@ exit 1
         let memory = test_memory(tmp.path(), "nonexistent-lucid-binary".to_string());
 
         memory
-            .store("lang", "User prefers Rust", MemoryCategory::Core)
+            .store("lang", "User prefers Rust", MemoryCategory::Core, None)
             .await
             .unwrap();
 
@@ -494,11 +506,12 @@ exit 1
                 "local_note",
                 "Local sqlite auth fallback note",
                 MemoryCategory::Core,
+                None,
             )
             .await
             .unwrap();
 
-        let entries = memory.recall("auth", 5).await.unwrap();
+        let entries = memory.recall("auth", 5, None).await.unwrap();
 
         assert!(entries
             .iter()
@@ -525,11 +538,16 @@ exit 1
         );
 
         memory
-            .store("pref", "Rust should stay local-first", MemoryCategory::Core)
+            .store(
+                "pref",
+                "Rust should stay local-first",
+                MemoryCategory::Core,
+                None,
+            )
             .await
             .unwrap();
 
-        let entries = memory.recall("rust", 5).await.unwrap();
+        let entries = memory.recall("rust", 5, None).await.unwrap();
         assert!(entries
             .iter()
             .any(|e| e.content.contains("Rust should stay local-first")));
@@ -589,8 +607,8 @@ exit 1
             Duration::from_secs(5),
         );
 
-        let first = memory.recall("auth", 5).await.unwrap();
-        let second = memory.recall("auth", 5).await.unwrap();
+        let first = memory.recall("auth", 5, None).await.unwrap();
+        let second = memory.recall("auth", 5, None).await.unwrap();
 
         assert!(first.is_empty());
         assert!(second.is_empty());

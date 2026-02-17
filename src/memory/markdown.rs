@@ -143,6 +143,7 @@ impl Memory for MarkdownMemory {
         key: &str,
         content: &str,
         category: MemoryCategory,
+        _session_id: Option<&str>,
     ) -> anyhow::Result<()> {
         let entry = format!("- **{key}**: {content}");
         let path = match category {
@@ -152,7 +153,12 @@ impl Memory for MarkdownMemory {
         self.append_to_file(&path, &entry).await
     }
 
-    async fn recall(&self, query: &str, limit: usize) -> anyhow::Result<Vec<MemoryEntry>> {
+    async fn recall(
+        &self,
+        query: &str,
+        limit: usize,
+        _session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
         let all = self.read_all_entries().await?;
         let query_lower = query.to_lowercase();
         let keywords: Vec<&str> = query_lower.split_whitespace().collect();
@@ -192,7 +198,11 @@ impl Memory for MarkdownMemory {
             .find(|e| e.key == key || e.content.contains(key)))
     }
 
-    async fn list(&self, category: Option<&MemoryCategory>) -> anyhow::Result<Vec<MemoryEntry>> {
+    async fn list(
+        &self,
+        category: Option<&MemoryCategory>,
+        _session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
         let all = self.read_all_entries().await?;
         match category {
             Some(cat) => Ok(all.into_iter().filter(|e| &e.category == cat).collect()),
@@ -243,7 +253,7 @@ mod tests {
     #[tokio::test]
     async fn markdown_store_core() {
         let (_tmp, mem) = temp_workspace();
-        mem.store("pref", "User likes Rust", MemoryCategory::Core)
+        mem.store("pref", "User likes Rust", MemoryCategory::Core, None)
             .await
             .unwrap();
         let content = sync_fs::read_to_string(mem.core_path()).unwrap();
@@ -253,7 +263,7 @@ mod tests {
     #[tokio::test]
     async fn markdown_store_daily() {
         let (_tmp, mem) = temp_workspace();
-        mem.store("note", "Finished tests", MemoryCategory::Daily)
+        mem.store("note", "Finished tests", MemoryCategory::Daily, None)
             .await
             .unwrap();
         let path = mem.daily_path();
@@ -264,17 +274,17 @@ mod tests {
     #[tokio::test]
     async fn markdown_recall_keyword() {
         let (_tmp, mem) = temp_workspace();
-        mem.store("a", "Rust is fast", MemoryCategory::Core)
+        mem.store("a", "Rust is fast", MemoryCategory::Core, None)
             .await
             .unwrap();
-        mem.store("b", "Python is slow", MemoryCategory::Core)
+        mem.store("b", "Python is slow", MemoryCategory::Core, None)
             .await
             .unwrap();
-        mem.store("c", "Rust and safety", MemoryCategory::Core)
+        mem.store("c", "Rust and safety", MemoryCategory::Core, None)
             .await
             .unwrap();
 
-        let results = mem.recall("Rust", 10).await.unwrap();
+        let results = mem.recall("Rust", 10, None).await.unwrap();
         assert!(results.len() >= 2);
         assert!(results
             .iter()
@@ -284,18 +294,20 @@ mod tests {
     #[tokio::test]
     async fn markdown_recall_no_match() {
         let (_tmp, mem) = temp_workspace();
-        mem.store("a", "Rust is great", MemoryCategory::Core)
+        mem.store("a", "Rust is great", MemoryCategory::Core, None)
             .await
             .unwrap();
-        let results = mem.recall("javascript", 10).await.unwrap();
+        let results = mem.recall("javascript", 10, None).await.unwrap();
         assert!(results.is_empty());
     }
 
     #[tokio::test]
     async fn markdown_count() {
         let (_tmp, mem) = temp_workspace();
-        mem.store("a", "first", MemoryCategory::Core).await.unwrap();
-        mem.store("b", "second", MemoryCategory::Core)
+        mem.store("a", "first", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("b", "second", MemoryCategory::Core, None)
             .await
             .unwrap();
         let count = mem.count().await.unwrap();
@@ -305,24 +317,24 @@ mod tests {
     #[tokio::test]
     async fn markdown_list_by_category() {
         let (_tmp, mem) = temp_workspace();
-        mem.store("a", "core fact", MemoryCategory::Core)
+        mem.store("a", "core fact", MemoryCategory::Core, None)
             .await
             .unwrap();
-        mem.store("b", "daily note", MemoryCategory::Daily)
+        mem.store("b", "daily note", MemoryCategory::Daily, None)
             .await
             .unwrap();
 
-        let core = mem.list(Some(&MemoryCategory::Core)).await.unwrap();
+        let core = mem.list(Some(&MemoryCategory::Core), None).await.unwrap();
         assert!(core.iter().all(|e| e.category == MemoryCategory::Core));
 
-        let daily = mem.list(Some(&MemoryCategory::Daily)).await.unwrap();
+        let daily = mem.list(Some(&MemoryCategory::Daily), None).await.unwrap();
         assert!(daily.iter().all(|e| e.category == MemoryCategory::Daily));
     }
 
     #[tokio::test]
     async fn markdown_forget_is_noop() {
         let (_tmp, mem) = temp_workspace();
-        mem.store("a", "permanent", MemoryCategory::Core)
+        mem.store("a", "permanent", MemoryCategory::Core, None)
             .await
             .unwrap();
         let removed = mem.forget("a").await.unwrap();
@@ -332,7 +344,7 @@ mod tests {
     #[tokio::test]
     async fn markdown_empty_recall() {
         let (_tmp, mem) = temp_workspace();
-        let results = mem.recall("anything", 10).await.unwrap();
+        let results = mem.recall("anything", 10, None).await.unwrap();
         assert!(results.is_empty());
     }
 

@@ -64,7 +64,7 @@ impl Tool for MemoryStoreTool {
             _ => MemoryCategory::Core,
         };
 
-        match self.memory.store(key, content, category).await {
+        match self.memory.store(key, content, category, None).await {
             Ok(()) => Ok(ToolResult {
                 success: true,
                 output: format!("Stored memory: {key}"),
