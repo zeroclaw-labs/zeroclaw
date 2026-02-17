@@ -343,6 +343,7 @@ impl SecurityPolicy {
     ///   validates each sub-command against the allowlist
     /// - Blocks single `&` background chaining (`&&` remains supported)
     /// - Blocks output redirections (`>`, `>>`) that could write outside workspace
+    /// - Blocks dangerous arguments (e.g. `find -exec`, `git config`)
     pub fn is_command_allowed(&self, command: &str) -> bool {
         if self.autonomy == AutonomyLevel::ReadOnly {
             return false;
@@ -398,13 +399,9 @@ impl SecurityPolicy {
             // Strip leading env var assignments (e.g. FOO=bar cmd)
             let cmd_part = skip_env_assignments(segment);
 
-            let base_cmd = cmd_part
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .rsplit('/')
-                .next()
-                .unwrap_or("");
+            let mut words = cmd_part.split_whitespace();
+            let base_raw = words.next().unwrap_or("");
+            let base_cmd = base_raw.rsplit('/').next().unwrap_or("");
 
             if base_cmd.is_empty() {
                 continue;
@@ -417,6 +414,12 @@ impl SecurityPolicy {
             {
                 return false;
             }
+
+            // Validate arguments for the command
+            let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
+            if !self.is_args_safe(base_cmd, &args) {
+                return false;
+            }
         }
 
         // At least one command must be present
@@ -426,6 +429,29 @@ impl SecurityPolicy {
         });
 
         has_cmd
+    }
+
+    /// Check for dangerous arguments that allow sub-command execution.
+    fn is_args_safe(&self, base: &str, args: &[String]) -> bool {
+        let base = base.to_ascii_lowercase();
+        match base.as_str() {
+            "find" => {
+                // find -exec and find -ok allow arbitrary command execution
+                !args.iter().any(|arg| arg == "-exec" || arg == "-ok")
+            }
+            "git" => {
+                // git config, alias, and -c can be used to set dangerous options
+                // (e.g. git config core.editor "rm -rf /")
+                !args.iter().any(|arg| {
+                    arg == "config"
+                        || arg.starts_with("config.")
+                        || arg == "alias"
+                        || arg.starts_with("alias.")
+                        || arg == "-c"
+                })
+            }
+            _ => true,
+        }
     }
 
     /// Check if a file path is allowed (no path traversal, within workspace)
@@ -994,6 +1020,22 @@ mod tests {
         let p = default_policy();
         assert!(!p.is_command_allowed("echo secret > /etc/crontab"));
         assert!(!p.is_command_allowed("ls >> /tmp/exfil.txt"));
+    }
+
+    #[test]
+    fn command_argument_injection_blocked() {
+        let p = default_policy();
+        // find -exec is a common bypass
+        assert!(!p.is_command_allowed("find . -exec rm -rf {} +"));
+        assert!(!p.is_command_allowed("find / -ok cat {} \\;"));
+        // git config/alias can execute commands
+        assert!(!p.is_command_allowed("git config core.editor \"rm -rf /\""));
+        assert!(!p.is_command_allowed("git alias.st status"));
+        assert!(!p.is_command_allowed("git -c core.editor=calc.exe commit"));
+        // Legitimate commands should still work
+        assert!(p.is_command_allowed("find . -name '*.txt'"));
+        assert!(p.is_command_allowed("git status"));
+        assert!(p.is_command_allowed("git add ."));
     }
 
     #[test]
