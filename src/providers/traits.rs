@@ -278,7 +278,7 @@ pub trait Provider: Send + Sync {
 
     /// Whether provider supports native tool calls over API.
     fn supports_native_tools(&self) -> bool {
-        false
+        self.capabilities().native_tool_calling
     }
 
     /// Warm up the HTTP connection pool (TLS handshake, DNS, HTTP/2 setup).
@@ -357,6 +357,27 @@ pub trait Provider: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct CapabilityMockProvider;
+
+    #[async_trait]
+    impl Provider for CapabilityMockProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: true,
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("ok".into())
+        }
+    }
 
     #[test]
     fn chat_message_constructors() {
@@ -441,5 +462,11 @@ mod tests {
 
         assert_eq!(caps1, caps2);
         assert_ne!(caps1, caps3);
+    }
+
+    #[test]
+    fn supports_native_tools_reflects_capabilities_default_mapping() {
+        let provider = CapabilityMockProvider;
+        assert!(provider.supports_native_tools());
     }
 }
