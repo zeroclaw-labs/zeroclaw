@@ -35,9 +35,6 @@ static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)(token|api[_-]?key|password|secret|user[_-]?key|bearer|credential)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\.]{8,}))"#).unwrap()
 });
 
-static MALFORMED_TOOL_CALL_PREFIX_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"(?is)^<tool_call>\s*[a-zA-Z_][a-zA-Z0-9_:-]*\s*\{"#).unwrap());
-
 /// Scrub credentials from tool output to prevent accidental exfiltration.
 /// Replaces known credential patterns with a redacted placeholder while preserving
 /// a small prefix for context.
@@ -301,74 +298,6 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
     Some(ParsedToolCall { name, arguments })
 }
 
-fn is_valid_tool_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    match chars.next() {
-        Some(c) if c == '_' || c.is_ascii_alphabetic() => {}
-        _ => return false,
-    }
-    chars.all(|c| c == '_' || c == '-' || c == ':' || c.is_ascii_alphanumeric())
-}
-
-fn parse_legacy_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
-    let object = value.as_object()?;
-
-    // Legacy shorthand: {"schedule": {...args...}}
-    if object.len() == 1 {
-        let (name, arguments) = object.iter().next()?;
-        if is_valid_tool_name(name) && arguments.is_object() {
-            return Some(ParsedToolCall {
-                name: name.to_string(),
-                arguments: arguments.clone(),
-            });
-        }
-    }
-
-    // Legacy shorthand used by some models:
-    // <tool_call>{"action":"create","expression":"...","command":"..."}</tool_call>
-    // Infer "schedule" when payload matches schedule tool schema.
-    let Some(action) = object.get("action").and_then(serde_json::Value::as_str) else {
-        return None;
-    };
-    let schedule_action = matches!(
-        action,
-        "create" | "add" | "once" | "list" | "get" | "cancel" | "remove" | "pause" | "resume"
-    );
-    if !schedule_action {
-        return None;
-    }
-    let looks_like_schedule_payload = object.contains_key("expression")
-        || object.contains_key("delay")
-        || object.contains_key("run_at")
-        || object.contains_key("command")
-        || object.contains_key("id")
-        || action == "list";
-    if !looks_like_schedule_payload {
-        return None;
-    }
-
-    Some(ParsedToolCall {
-        name: "schedule".to_string(),
-        arguments: value.clone(),
-    })
-}
-
-fn parse_prefixed_tool_name_with_json(inner: &str) -> Option<ParsedToolCall> {
-    let trimmed = inner.trim();
-    let first_json_start = trimmed.find('{')?;
-    let name = trimmed[..first_json_start].trim();
-    if !is_valid_tool_name(name) {
-        return None;
-    }
-    let payload = trimmed[first_json_start..].trim();
-    let json = serde_json::from_str::<serde_json::Value>(payload).ok()?;
-
-    Some(ParsedToolCall {
-        name: name.to_string(),
-        arguments: json,
-    })
-}
-
 fn parse_tool_calls_from_json_value(value: &serde_json::Value) -> Vec<ParsedToolCall> {
     let mut calls = Vec::new();
 
@@ -394,8 +323,6 @@ fn parse_tool_calls_from_json_value(value: &serde_json::Value) -> Vec<ParsedTool
     }
 
     if let Some(parsed) = parse_tool_call_value(value) {
-        calls.push(parsed);
-    } else if let Some(parsed) = parse_legacy_tool_call_value(value) {
         calls.push(parsed);
     }
 
@@ -479,11 +406,10 @@ fn extract_json_values(input: &str) -> Vec<serde_json::Value> {
 /// compatibility.
 ///
 /// Also supports JSON with `tool_calls` array from OpenAI-format responses.
-fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>, bool) {
+fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     let mut text_parts = Vec::new();
     let mut calls = Vec::new();
     let mut remaining = response;
-    let mut malformed_markup = false;
 
     // First, try to parse as OpenAI-style JSON response with tool_calls array
     // This handles providers like Minimax that return tool_calls in native JSON format
@@ -496,7 +422,7 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>, bool) {
                     text_parts.push(content.trim().to_string());
                 }
             }
-            return (text_parts.join("\n"), calls, false);
+            return (text_parts.join("\n"), calls);
         }
     }
 
@@ -526,20 +452,11 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>, bool) {
             }
 
             if !parsed_any {
-                if let Some(parsed) = parse_prefixed_tool_name_with_json(inner) {
-                    parsed_any = true;
-                    calls.push(parsed);
-                }
-            }
-
-            if !parsed_any {
                 tracing::warn!("Malformed <tool_call> JSON: expected tool-call object in tag body");
-                malformed_markup = true;
             }
 
             remaining = &after_open[close_idx + close_tag.len()..];
         } else {
-            malformed_markup = true;
             break;
         }
     }
@@ -557,7 +474,7 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>, bool) {
         text_parts.push(remaining.trim().to_string());
     }
 
-    (text_parts.join("\n"), calls, malformed_markup)
+    (text_parts.join("\n"), calls)
 }
 
 fn parse_structured_tool_calls(tool_calls: &[ToolCall]) -> Vec<ParsedToolCall> {
@@ -569,19 +486,6 @@ fn parse_structured_tool_calls(tool_calls: &[ToolCall]) -> Vec<ParsedToolCall> {
                 .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
         })
         .collect()
-}
-
-fn looks_like_malformed_tool_call_markup(response: &str) -> bool {
-    let trimmed = response.trim_start();
-    if !trimmed.starts_with("<tool_call>") {
-        return false;
-    }
-
-    if !trimmed.contains("</tool_call>") {
-        return true;
-    }
-
-    MALFORMED_TOOL_CALL_PREFIX_REGEX.is_match(trimmed)
 }
 
 fn build_assistant_history_with_tool_calls(text: &str, tool_calls: &[ToolCall]) -> String {
@@ -673,7 +577,7 @@ pub(crate) async fn run_tool_call_loop(
         let llm_started_at = Instant::now();
 
         // Choose between native tool-call API and prompt-based tool use.
-        let (response_text, parsed_text, tool_calls, assistant_history_content, malformed_markup) =
+        let (response_text, parsed_text, tool_calls, assistant_history_content) =
             if use_native_tools {
                 match provider
                     .chat_with_tools(history, &tool_definitions, model, temperature)
@@ -690,16 +594,13 @@ pub(crate) async fn run_tool_call_loop(
                         let response_text = resp.text_or_empty().to_string();
                         let mut calls = parse_structured_tool_calls(&resp.tool_calls);
                         let mut parsed_text = String::new();
-                        let mut malformed_markup = false;
 
                         if calls.is_empty() {
-                            let (fallback_text, fallback_calls, fallback_malformed_markup) =
-                                parse_tool_calls(&response_text);
+                            let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
                             if !fallback_text.is_empty() {
                                 parsed_text = fallback_text;
                             }
                             calls = fallback_calls;
-                            malformed_markup = fallback_malformed_markup;
                         }
 
                         let assistant_history_content = if resp.tool_calls.is_empty() {
@@ -711,13 +612,7 @@ pub(crate) async fn run_tool_call_loop(
                             )
                         };
 
-                        (
-                            response_text,
-                            parsed_text,
-                            calls,
-                            assistant_history_content,
-                            malformed_markup,
-                        )
+                        (response_text, parsed_text, calls, assistant_history_content)
                     }
                     Err(e) => {
                         observer.record_event(&ObserverEvent::LlmResponse {
@@ -747,15 +642,8 @@ pub(crate) async fn run_tool_call_loop(
                         });
                         let response_text = resp;
                         let assistant_history_content = response_text.clone();
-                        let (parsed_text, calls, malformed_markup) =
-                            parse_tool_calls(&response_text);
-                        (
-                            response_text,
-                            parsed_text,
-                            calls,
-                            assistant_history_content,
-                            malformed_markup,
-                        )
+                        let (parsed_text, calls) = parse_tool_calls(&response_text);
+                        (response_text, parsed_text, calls, assistant_history_content)
                     }
                     Err(e) => {
                         observer.record_event(&ObserverEvent::LlmResponse {
@@ -772,28 +660,13 @@ pub(crate) async fn run_tool_call_loop(
                 }
             };
 
-        let parsed_text_is_empty = parsed_text.trim().is_empty();
-        let display_text = if parsed_text_is_empty {
+        let display_text = if parsed_text.is_empty() {
             response_text.clone()
         } else {
             parsed_text
         };
-        let has_tool_call_markup =
-            response_text.contains("<tool_call>") && response_text.contains("</tool_call>");
-        let malformed_tool_call_markup =
-            malformed_markup || looks_like_malformed_tool_call_markup(&response_text);
 
         if tool_calls.is_empty() {
-            // Recovery path: the model attempted tool use but emitted malformed JSON.
-            // Ask it to re-send valid tool-call payload instead of leaking raw markup to users.
-            if (has_tool_call_markup && parsed_text_is_empty) || malformed_tool_call_markup {
-                history.push(ChatMessage::assistant(response_text.clone()));
-                history.push(ChatMessage::user(
-                    "[Tool parser error]\nYour previous <tool_call> payload was invalid JSON and was NOT executed. Re-send the same tool call using strict valid JSON only. Escape inner double quotes inside string values.",
-                ));
-                continue;
-            }
-
             // No tool calls — this is the final response
             history.push(ChatMessage::assistant(response_text.clone()));
             return Ok(display_text);
@@ -1509,12 +1382,6 @@ mod tests {
         assert!(scrubbed.contains("public"));
     }
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
-    use crate::observability::NoopObserver;
-    use crate::providers::Provider;
-    use crate::tools::{Tool, ToolResult};
-    use async_trait::async_trait;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
     use tempfile::TempDir;
 
     #[test]
@@ -1524,11 +1391,10 @@ mod tests {
 {"name": "shell", "arguments": {"command": "ls -la"}}
 </tool_call>"#;
 
-        let (text, calls, malformed) = parse_tool_calls(response);
+        let (text, calls) = parse_tool_calls(response);
         assert_eq!(text, "Let me check that.");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
-        assert!(!malformed);
         assert_eq!(
             calls[0].arguments.get("command").unwrap().as_str().unwrap(),
             "ls -la"
@@ -1544,20 +1410,18 @@ mod tests {
 {"name": "file_read", "arguments": {"path": "b.txt"}}
 </tool_call>"#;
 
-        let (_, calls, malformed) = parse_tool_calls(response);
+        let (_, calls) = parse_tool_calls(response);
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "file_read");
         assert_eq!(calls[1].name, "file_read");
-        assert!(!malformed);
     }
 
     #[test]
     fn parse_tool_calls_returns_text_only_when_no_calls() {
         let response = "Just a normal response with no tools.";
-        let (text, calls, malformed) = parse_tool_calls(response);
+        let (text, calls) = parse_tool_calls(response);
         assert_eq!(text, "Just a normal response with no tools.");
         assert!(calls.is_empty());
-        assert!(!malformed);
     }
 
     #[test]
@@ -1567,63 +1431,9 @@ not valid json
 </tool_call>
 Some text after."#;
 
-        let (text, calls, malformed) = parse_tool_calls(response);
+        let (text, calls) = parse_tool_calls(response);
         assert!(calls.is_empty());
         assert!(text.contains("Some text after."));
-        assert!(malformed);
-    }
-
-    #[test]
-    fn parse_tool_calls_infers_schedule_when_text_precedes_schedule_arguments() {
-        let response = r#"I will schedule a 3AM update task. First, I will inspect existing tasks:
-<tool_call>
-{"action":"create","command":"nova update","expression":"0 3 * * *","id":"nova-self-update"}
-</tool_call>"#;
-
-        let (text, calls, malformed) = parse_tool_calls(response);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "schedule");
-        assert!(text.contains("I will schedule a 3AM update task"));
-        assert!(!malformed);
-    }
-
-    #[test]
-    fn parse_tool_calls_marks_malformed_when_text_precedes_invalid_tool_call() {
-        let response = r#"I will inspect existing tasks:
-<tool_call>
-{"invalid":[1,2,3]}
-</tool_call>"#;
-
-        let (text, calls, malformed) = parse_tool_calls(response);
-        assert!(calls.is_empty());
-        assert!(text.contains("I will inspect existing tasks"));
-        assert!(malformed);
-    }
-
-    #[test]
-    fn parse_tool_calls_handles_prefixed_tool_name_inside_tag() {
-        let response = r#"<tool_call>
-schedule {"action":"list"}
-</tool_call>"#;
-
-        let (_, calls, malformed) = parse_tool_calls(response);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "schedule");
-        assert_eq!(calls[0].arguments["action"], "list");
-        assert!(!malformed);
-    }
-
-    #[test]
-    fn parse_tool_calls_handles_single_key_legacy_wrapper() {
-        let response = r#"<tool_call>
-{"schedule":{"action":"list"}}
-</tool_call>"#;
-
-        let (_, calls, malformed) = parse_tool_calls(response);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "schedule");
-        assert_eq!(calls[0].arguments["action"], "list");
-        assert!(!malformed);
     }
 
     #[test]
@@ -1634,11 +1444,10 @@ schedule {"action":"list"}
 </tool_call>
 After text."#;
 
-        let (text, calls, malformed) = parse_tool_calls(response);
+        let (text, calls) = parse_tool_calls(response);
         assert!(text.contains("Before text."));
         assert!(text.contains("After text."));
         assert_eq!(calls.len(), 1);
-        assert!(!malformed);
     }
 
     #[test]
@@ -1646,7 +1455,7 @@ After text."#;
         // OpenAI-style response with tool_calls array
         let response = r#"{"content": "Let me check that for you.", "tool_calls": [{"type": "function", "function": {"name": "shell", "arguments": "{\"command\": \"ls -la\"}"}}]}"#;
 
-        let (text, calls, malformed) = parse_tool_calls(response);
+        let (text, calls) = parse_tool_calls(response);
         assert_eq!(text, "Let me check that for you.");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
@@ -1654,18 +1463,16 @@ After text."#;
             calls[0].arguments.get("command").unwrap().as_str().unwrap(),
             "ls -la"
         );
-        assert!(!malformed);
     }
 
     #[test]
     fn parse_tool_calls_handles_openai_format_multiple_calls() {
         let response = r#"{"tool_calls": [{"type": "function", "function": {"name": "file_read", "arguments": "{\"path\": \"a.txt\"}"}}, {"type": "function", "function": {"name": "file_read", "arguments": "{\"path\": \"b.txt\"}"}}]}"#;
 
-        let (_, calls, malformed) = parse_tool_calls(response);
+        let (_, calls) = parse_tool_calls(response);
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "file_read");
         assert_eq!(calls[1].name, "file_read");
-        assert!(!malformed);
     }
 
     #[test]
@@ -1673,11 +1480,10 @@ After text."#;
         // Some providers don't include content field with tool_calls
         let response = r#"{"tool_calls": [{"type": "function", "function": {"name": "memory_recall", "arguments": "{}"}}]}"#;
 
-        let (text, calls, malformed) = parse_tool_calls(response);
+        let (text, calls) = parse_tool_calls(response);
         assert!(text.is_empty()); // No content field
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "memory_recall");
-        assert!(!malformed);
     }
 
     #[test]
@@ -1688,7 +1494,7 @@ After text."#;
 ```
 </tool_call>"#;
 
-        let (text, calls, malformed) = parse_tool_calls(response);
+        let (text, calls) = parse_tool_calls(response);
         assert!(text.is_empty());
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "file_write");
@@ -1696,7 +1502,6 @@ After text."#;
             calls[0].arguments.get("path").unwrap().as_str().unwrap(),
             "test.py"
         );
-        assert!(!malformed);
     }
 
     #[test]
@@ -1706,7 +1511,7 @@ I will now call the tool with this payload:
 {"name": "shell", "arguments": {"command": "pwd"}}
 </tool_call>"#;
 
-        let (text, calls, malformed) = parse_tool_calls(response);
+        let (text, calls) = parse_tool_calls(response);
         assert!(text.is_empty());
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
@@ -1714,7 +1519,6 @@ I will now call the tool with this payload:
             calls[0].arguments.get("command").unwrap().as_str().unwrap(),
             "pwd"
         );
-        assert!(!malformed);
     }
 
     #[test]
@@ -1769,25 +1573,13 @@ I will now call the tool with this payload:
         let response = r#"Sure, creating the file now.
 {"name": "file_write", "arguments": {"path": "hello.py", "content": "print('hello')"}}"#;
 
-        let (text, calls, malformed) = parse_tool_calls(response);
+        let (text, calls) = parse_tool_calls(response);
         assert!(text.contains("Sure, creating the file now."));
         assert_eq!(
             calls.len(),
             0,
             "Raw JSON without wrappers should not be parsed"
         );
-        assert!(!malformed);
-    }
-
-    #[test]
-    fn looks_like_malformed_tool_call_markup_detects_prefixed_json() {
-        let malformed = r#"<tool_call>schedule{"action":"create","id":"nova-self-update"}"#;
-        assert!(looks_like_malformed_tool_call_markup(malformed));
-
-        let valid = r#"<tool_call>
-{"name":"shell","arguments":{"command":"date"}}
-</tool_call>"#;
-        assert!(!looks_like_malformed_tool_call_markup(valid));
     }
 
     #[test]
@@ -1937,10 +1729,9 @@ I will now call the tool with this payload:
 
 </tool_result>
 Done."#;
-        let (text, calls, malformed) = parse_tool_calls(response);
+        let (text, calls) = parse_tool_calls(response);
         assert!(text.contains("Done."));
         assert!(calls.is_empty());
-        assert!(!malformed);
     }
 
     #[test]
@@ -1955,11 +1746,10 @@ Done."#;
     fn parse_tool_calls_handles_empty_tool_calls_array() {
         // Recovery: Empty tool_calls array returns original response (no tool parsing)
         let response = r#"{"content": "Hello", "tool_calls": []}"#;
-        let (text, calls, malformed) = parse_tool_calls(response);
+        let (text, calls) = parse_tool_calls(response);
         // When tool_calls is empty, the entire JSON is returned as text
         assert!(text.contains("Hello"));
         assert!(calls.is_empty());
-        assert!(!malformed);
     }
 
     #[test]
@@ -2132,274 +1922,5 @@ Done."#;
         ]);
         let result = parse_tool_calls_from_json_value(&value);
         assert_eq!(result.len(), 2);
-    }
-
-    struct MalformedThenValidToolProvider;
-
-    #[async_trait]
-    impl Provider for MalformedThenValidToolProvider {
-        async fn chat_with_system(
-            &self,
-            _system_prompt: Option<&str>,
-            _message: &str,
-            _model: &str,
-            _temperature: f64,
-        ) -> anyhow::Result<String> {
-            anyhow::bail!("chat_with_system should not be called in this test");
-        }
-
-        async fn chat_with_history(
-            &self,
-            messages: &[ChatMessage],
-            _model: &str,
-            _temperature: f64,
-        ) -> anyhow::Result<String> {
-            if messages
-                .iter()
-                .any(|m| m.role == "user" && m.content.contains("[Tool results]"))
-            {
-                return Ok("Top memory users parsed successfully.".to_string());
-            }
-
-            if messages
-                .iter()
-                .any(|m| m.role == "user" && m.content.contains("[Tool parser error]"))
-            {
-                return Ok(r#"<tool_call>
-{"name":"shell","arguments":{"command":"echo fixed"}}
-</tool_call>"#
-                    .to_string());
-            }
-
-            Ok(r#"<tool_call>
-{"name":"shell","arguments":{"command":"echo "$rss $name ($pid)""}}
-</tool_call>"#
-                .to_string())
-        }
-    }
-
-    struct CountingShellTool {
-        runs: Arc<AtomicUsize>,
-    }
-
-    #[async_trait]
-    impl Tool for CountingShellTool {
-        fn name(&self) -> &str {
-            "shell"
-        }
-
-        fn description(&self) -> &str {
-            "Count shell executions"
-        }
-
-        fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "command": { "type": "string" }
-                },
-                "required": ["command"]
-            })
-        }
-
-        async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-            self.runs.fetch_add(1, Ordering::SeqCst);
-            Ok(ToolResult {
-                success: true,
-                output: args
-                    .get("command")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                error: None,
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn run_tool_call_loop_retries_invalid_tool_call_markup() {
-        let runs = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingShellTool {
-            runs: Arc::clone(&runs),
-        })];
-
-        let mut history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::user("check memory"),
-        ];
-
-        let response = run_tool_call_loop(
-            &MalformedThenValidToolProvider,
-            &mut history,
-            &tools_registry,
-            &NoopObserver,
-            "test-provider",
-            "test-model",
-            0.0,
-            true,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(response, "Top memory users parsed successfully.");
-        assert_eq!(runs.load(Ordering::SeqCst), 1);
-        assert!(!response.contains("<tool_call>"));
-        assert!(history
-            .iter()
-            .any(|m| m.role == "user" && m.content.contains("[Tool parser error]")));
-    }
-
-    struct TextPrefixedMalformedThenValidToolProvider;
-
-    #[async_trait]
-    impl Provider for TextPrefixedMalformedThenValidToolProvider {
-        async fn chat_with_system(
-            &self,
-            _system_prompt: Option<&str>,
-            _message: &str,
-            _model: &str,
-            _temperature: f64,
-        ) -> anyhow::Result<String> {
-            anyhow::bail!("chat_with_system should not be called in this test");
-        }
-
-        async fn chat_with_history(
-            &self,
-            messages: &[ChatMessage],
-            _model: &str,
-            _temperature: f64,
-        ) -> anyhow::Result<String> {
-            if messages
-                .iter()
-                .any(|m| m.role == "user" && m.content.contains("[Tool results]"))
-            {
-                return Ok("Scheduled successfully.".to_string());
-            }
-
-            if messages
-                .iter()
-                .any(|m| m.role == "user" && m.content.contains("[Tool parser error]"))
-            {
-                return Ok(r#"<tool_call>
-{"name":"shell","arguments":{"command":"echo fixed"}}
-</tool_call>"#
-                    .to_string());
-            }
-
-            Ok(
-                r#"I will schedule a 3AM update task. First, I will inspect existing tasks:
-<tool_call>
-{"invalid":[1,2,3]}
-</tool_call>"#
-                    .to_string(),
-            )
-        }
-    }
-
-    #[tokio::test]
-    async fn run_tool_call_loop_retries_text_prefixed_invalid_tool_call_markup() {
-        let runs = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingShellTool {
-            runs: Arc::clone(&runs),
-        })];
-
-        let mut history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::user("set schedule"),
-        ];
-
-        let response = run_tool_call_loop(
-            &TextPrefixedMalformedThenValidToolProvider,
-            &mut history,
-            &tools_registry,
-            &NoopObserver,
-            "test-provider",
-            "test-model",
-            0.0,
-            true,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(response, "Scheduled successfully.");
-        assert_eq!(runs.load(Ordering::SeqCst), 1);
-        assert!(!response.contains("<tool_call>"));
-        assert!(history
-            .iter()
-            .any(|m| m.role == "user" && m.content.contains("[Tool parser error]")));
-    }
-
-    struct PrefixMalformedThenValidToolProvider;
-
-    #[async_trait]
-    impl Provider for PrefixMalformedThenValidToolProvider {
-        async fn chat_with_system(
-            &self,
-            _system_prompt: Option<&str>,
-            _message: &str,
-            _model: &str,
-            _temperature: f64,
-        ) -> anyhow::Result<String> {
-            anyhow::bail!("chat_with_system should not be called in this test");
-        }
-
-        async fn chat_with_history(
-            &self,
-            messages: &[ChatMessage],
-            _model: &str,
-            _temperature: f64,
-        ) -> anyhow::Result<String> {
-            if messages
-                .iter()
-                .any(|m| m.role == "user" && m.content.contains("[Tool results]"))
-            {
-                return Ok("Scheduled successfully.".to_string());
-            }
-
-            if messages
-                .iter()
-                .any(|m| m.role == "user" && m.content.contains("[Tool parser error]"))
-            {
-                return Ok(r#"<tool_call>
-{"name":"shell","arguments":{"command":"echo fixed"}}
-</tool_call>"#
-                    .to_string());
-            }
-
-            Ok(r#"<tool_call>schedule{"action":"create","command":"date","expression":"0 3 * * *","id":"nova-self-update"}"#.to_string())
-        }
-    }
-
-    #[tokio::test]
-    async fn run_tool_call_loop_retries_prefixed_tool_call_markup() {
-        let runs = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingShellTool {
-            runs: Arc::clone(&runs),
-        })];
-
-        let mut history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::user("set schedule"),
-        ];
-
-        let response = run_tool_call_loop(
-            &PrefixMalformedThenValidToolProvider,
-            &mut history,
-            &tools_registry,
-            &NoopObserver,
-            "test-provider",
-            "test-model",
-            0.0,
-            true,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(response, "Scheduled successfully.");
-        assert_eq!(runs.load(Ordering::SeqCst), 1);
-        assert!(!response.contains("<tool_call>"));
-        assert!(history
-            .iter()
-            .any(|m| m.role == "user" && m.content.contains("[Tool parser error]")));
     }
 }
