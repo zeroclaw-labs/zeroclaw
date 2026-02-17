@@ -115,9 +115,8 @@ fn status(config: &Config) -> Result<()> {
     if cfg!(target_os = "windows") {
         let _ = config;
         let task_name = windows_task_name();
-        let out = run_capture(
-            Command::new("schtasks").args(["/Query", "/TN", task_name, "/FO", "LIST"]),
-        );
+        let out =
+            run_capture(Command::new("schtasks").args(["/Query", "/TN", task_name, "/FO", "LIST"]));
         match out {
             Ok(text) => {
                 let running = text.contains("Running");
@@ -167,9 +166,7 @@ fn uninstall(config: &Config) -> Result<()> {
 
     if cfg!(target_os = "windows") {
         let task_name = windows_task_name();
-        let _ = run_checked(
-            Command::new("schtasks").args(["/Delete", "/TN", task_name, "/F"]),
-        );
+        let _ = run_checked(Command::new("schtasks").args(["/Delete", "/TN", task_name, "/F"]));
         // Remove the wrapper script
         let wrapper = config
             .config_path
@@ -288,20 +285,18 @@ fn install_windows(config: &Config) -> Result<()> {
         .args(["/Delete", "/TN", task_name, "/F"])
         .output();
 
-    run_checked(
-        Command::new("schtasks").args([
-            "/Create",
-            "/TN",
-            task_name,
-            "/SC",
-            "ONLOGON",
-            "/TR",
-            &format!("\"{}\"", wrapper.display()),
-            "/RL",
-            "HIGHEST",
-            "/F",
-        ]),
-    )?;
+    run_checked(Command::new("schtasks").args([
+        "/Create",
+        "/TN",
+        task_name,
+        "/SC",
+        "ONLOGON",
+        "/TR",
+        &format!("\"{}\"", wrapper.display()),
+        "/RL",
+        "HIGHEST",
+        "/F",
+    ]))?;
 
     println!("✅ Installed Windows scheduled task: {}", task_name);
     println!("   Wrapper: {}", wrapper.display());
