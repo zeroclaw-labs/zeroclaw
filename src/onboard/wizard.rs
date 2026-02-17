@@ -1557,11 +1557,12 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
             | "kimi-intl" | "kimi-global" | "kimi-cn" => {
                 "https://platform.moonshot.cn/console/api-keys"
             }
-            "glm" | "zhipu" | "glm-global" | "zhipu-global" => "https://platform.z.ai/",
+            "glm" | "zhipu" | "glm-global" | "zhipu-global" | "zai" | "z.ai" => {
+                "https://platform.z.ai/"
+            }
             "glm-cn" | "zhipu-cn" | "bigmodel" => {
                 "https://open.bigmodel.cn/usercenter/proj-mgmt/apikeys"
             }
-            "zai" | "z.ai" => "https://platform.z.ai/",
             "minimax" | "minimax-intl" | "minimax-io" | "minimax-global" | "minimax-cn"
             | "minimaxi" => "https://www.minimaxi.com/user-center/basic-information",
             "qwen"
