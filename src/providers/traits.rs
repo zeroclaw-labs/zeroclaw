@@ -140,7 +140,7 @@ impl StreamChunk {
 
     /// Estimate tokens (rough approximation: ~4 chars per token).
     pub fn with_token_estimate(mut self) -> Self {
-        self.token_count = (self.delta.len() + 3) / 4;
+        self.token_count = self.delta.len().div_ceil(4);
         self
     }
 }

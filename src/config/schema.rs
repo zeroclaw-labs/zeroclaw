@@ -124,18 +124,13 @@ fn default_max_depth() -> u32 {
 // ── Hardware Config (wizard-driven) ─────────────────────────────
 
 /// Hardware transport mode.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum HardwareTransport {
+    #[default]
     None,
     Native,
     Serial,
     Probe,
-}
-
-impl Default for HardwareTransport {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 impl std::fmt::Display for HardwareTransport {
@@ -407,7 +402,7 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
 
 // ── Peripherals (hardware: STM32, RPi GPIO, etc.) ────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PeripheralsConfig {
     /// Enable peripheral support (boards become agent tools)
     #[serde(default)]
@@ -442,16 +437,6 @@ fn default_peripheral_transport() -> String {
 
 fn default_peripheral_baud() -> u32 {
     115_200
-}
-
-impl Default for PeripheralsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            boards: Vec::new(),
-            datasheet_dir: None,
-        }
-    }
 }
 
 impl Default for PeripheralBoardConfig {
@@ -710,6 +695,7 @@ fn default_http_timeout_secs() -> u64 {
 // ── Memory ───────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct MemoryConfig {
     /// "sqlite" | "lucid" | "markdown" | "none" (`none` = explicit no-op memory)
     pub backend: String,

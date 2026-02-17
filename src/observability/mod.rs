@@ -5,11 +5,14 @@ pub mod otel;
 pub mod traits;
 pub mod verbose;
 
+#[allow(unused_imports)]
 pub use self::log::LogObserver;
+#[allow(unused_imports)]
 pub use self::multi::MultiObserver;
 pub use noop::NoopObserver;
 pub use otel::OtelObserver;
 pub use traits::{Observer, ObserverEvent};
+#[allow(unused_imports)]
 pub use verbose::VerboseObserver;
 
 use crate::config::ObservabilityConfig;
