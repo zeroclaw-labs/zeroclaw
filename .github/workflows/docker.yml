@@ -28,7 +28,6 @@ jobs:
         runs-on: blacksmith-2vcpu-ubuntu-2404
         timeout-minutes: 25
         permissions:
-            actions: write
             contents: read
         steps:
             - name: Checkout repository
@@ -56,10 +55,6 @@ jobs:
                   tags: zeroclaw-pr-smoke:latest
                   labels: ${{ steps.meta.outputs.labels }}
                   platforms: linux/amd64
-                  cache-from: |
-                      type=gha,scope=zeroclaw-docker-smoke
-                  cache-to: |
-                      type=gha,mode=max,scope=zeroclaw-docker-smoke
 
             - name: Verify image
               run: docker run --rm zeroclaw-pr-smoke:latest --version
