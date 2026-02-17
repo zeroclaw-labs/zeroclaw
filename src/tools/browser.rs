@@ -2023,7 +2023,7 @@ fn is_non_global_v6(v6: std::net::Ipv6Addr) -> bool {
         // Link-local (fe80::/10)
         || (segs[0] & 0xffc0) == 0xfe80
         // IPv4-mapped addresses
-        || v6.to_ipv4_mapped().is_some_and(|v4| is_non_global_v4(v4))
+        || v6.to_ipv4_mapped().is_some_and(is_non_global_v4)
 }
 
 fn host_matches_allowlist(host: &str, allowed: &[String]) -> bool {

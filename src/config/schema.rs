@@ -168,7 +168,7 @@ pub struct HardwareConfig {
 }
 
 fn default_baud_rate() -> u32 {
-    115200
+    115_200
 }
 
 impl HardwareConfig {
@@ -436,7 +436,7 @@ fn default_peripheral_transport() -> String {
 }
 
 fn default_peripheral_baud() -> u32 {
-    115200
+    115_200
 }
 
 impl Default for PeripheralsConfig {
@@ -2892,7 +2892,7 @@ default_temperature = 0.7
         assert!(b.board.is_empty());
         assert_eq!(b.transport, "serial");
         assert!(b.path.is_none());
-        assert_eq!(b.baud, 115200);
+        assert_eq!(b.baud, 115_200);
     }
 
     #[test]
@@ -2903,7 +2903,7 @@ default_temperature = 0.7
                 board: "nucleo-f401re".into(),
                 transport: "serial".into(),
                 path: Some("/dev/ttyACM0".into()),
-                baud: 115200,
+                baud: 115_200,
             }],
             datasheet_dir: None,
         };
