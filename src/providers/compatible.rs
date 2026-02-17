@@ -277,15 +277,11 @@ fn parse_sse_line(line: &str) -> StreamResult<Option<String>> {
 
 /// Convert SSE byte stream to text chunks.
 async fn sse_bytes_to_chunks(
-    mut response: reqwest::Response,
+    response: reqwest::Response,
     count_tokens: bool,
 ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
-    use tokio::io::AsyncBufReadExt;
-
-    let name = "stream".to_string();
-
     // Create a channel to send chunks
-    let (mut tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
+    let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
     tokio::spawn(async move {
         // Buffer for incomplete lines

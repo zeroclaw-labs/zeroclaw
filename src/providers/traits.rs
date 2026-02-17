@@ -308,9 +308,9 @@ pub trait Provider: Send + Sync {
     fn stream_chat_with_history(
         &self,
         messages: &[ChatMessage],
-        model: &str,
-        temperature: f64,
-        options: StreamOptions,
+        _model: &str,
+        _temperature: f64,
+        _options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
         let system = messages
             .iter()
