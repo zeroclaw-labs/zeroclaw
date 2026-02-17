@@ -22,7 +22,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 [build-dependencies]
-embuild = { version = "0.31", features = ["elf"] }
+embuild = "0.31"
 
 [profile.release]
 opt-level = "s"
