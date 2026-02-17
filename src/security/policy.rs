@@ -725,6 +725,14 @@ mod tests {
         assert!(result.unwrap_err().contains("high-risk"));
     }
 
+    #[test]
+    fn validate_command_rejects_background_chain_bypass() {
+        let p = default_policy();
+        let result = p.validate_command_execution("ls & python3 -c 'print(1)'", false);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not allowed"));
+    }
+
     // ── is_path_allowed ─────────────────────────────────────
 
     #[test]
