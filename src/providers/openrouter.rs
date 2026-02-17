@@ -712,4 +712,39 @@ mod tests {
         assert_eq!(response.tool_calls[0].id, "call_789");
         assert_eq!(response.tool_calls[0].name, "file_read");
     }
+
+    #[test]
+    fn convert_messages_parses_assistant_tool_call_payload() {
+        let messages = vec![ChatMessage {
+            role: "assistant".into(),
+            content: r#"{"content":"Using tool","tool_calls":[{"id":"call_abc","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#
+                .into(),
+        }];
+
+        let converted = OpenRouterProvider::convert_messages(&messages);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, "assistant");
+        assert_eq!(converted[0].content.as_deref(), Some("Using tool"));
+
+        let tool_calls = converted[0].tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id.as_deref(), Some("call_abc"));
+        assert_eq!(tool_calls[0].function.name, "shell");
+        assert_eq!(tool_calls[0].function.arguments, r#"{"command":"pwd"}"#);
+    }
+
+    #[test]
+    fn convert_messages_parses_tool_result_payload() {
+        let messages = vec![ChatMessage {
+            role: "tool".into(),
+            content: r#"{"tool_call_id":"call_xyz","content":"done"}"#.into(),
+        }];
+
+        let converted = OpenRouterProvider::convert_messages(&messages);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, "tool");
+        assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_xyz"));
+        assert_eq!(converted[0].content.as_deref(), Some("done"));
+        assert!(converted[0].tool_calls.is_none());
+    }
 }
