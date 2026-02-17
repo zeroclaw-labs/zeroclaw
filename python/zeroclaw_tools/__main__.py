@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import os
 import sys
+from typing import Optional
 
 from langchain_core.messages import HumanMessage
 
@@ -25,7 +26,7 @@ DEFAULT_SYSTEM_PROMPT = """You are ZeroClaw, an AI assistant with full system ac
 Be concise and helpful. Execute tools directly without excessive explanation."""
 
 
-async def chat(message: str, api_key: str, base_url: str, model: str) -> str:
+async def chat(message: str, api_key: str, base_url: Optional[str], model: str) -> str:
     """Run a single chat message through the agent."""
     agent = create_agent(
         tools=[shell, file_read, file_write, web_search, http_request, memory_store, memory_recall],
@@ -39,21 +40,40 @@ async def chat(message: str, api_key: str, base_url: str, model: str) -> str:
     return result["messages"][-1].content or "Done."
 
 
-def main():
-    """CLI main entry point."""
+def _build_parser() -> argparse.ArgumentParser:
+    """Build CLI argument parser."""
     parser = argparse.ArgumentParser(
         description="ZeroClaw Tools - LangGraph-based tool calling for LLMs"
     )
-    parser.add_argument("message", nargs="+", help="Message to send to the agent")
+    parser.add_argument(
+        "message",
+        nargs="*",
+        help="Message to send to the agent (optional in interactive mode)",
+    )
     parser.add_argument("--model", "-m", default="glm-5", help="Model to use")
     parser.add_argument("--api-key", "-k", default=None, help="API key")
     parser.add_argument("--base-url", "-u", default=None, help="API base URL")
     parser.add_argument("--interactive", "-i", action="store_true", help="Interactive mode")
+    return parser
 
-    args = parser.parse_args()
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse CLI arguments and enforce mode-specific requirements."""
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+
+    if not args.interactive and not args.message:
+        parser.error("message is required unless --interactive is set")
+
+    return args
+
+
+def main(argv: list[str] | None = None):
+    """CLI main entry point."""
+    args = parse_args(argv)
 
     api_key = args.api_key or os.environ.get("API_KEY") or os.environ.get("GLM_API_KEY")
-    base_url = args.base_url or os.environ.get("API_BASE", "https://api.z.ai/api/coding/paas/v4")
+    base_url = args.base_url or os.environ.get("API_BASE")
 
     if not api_key:
         print("Error: API key required. Set API_KEY env var or use --api-key", file=sys.stderr)

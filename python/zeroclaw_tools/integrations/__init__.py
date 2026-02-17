@@ -1,5 +1,5 @@
 """
-Integrations for various platforms (Discord, Telegram, etc.)
+Integrations for supported external platforms.
 """
 
 from .discord_bot import DiscordBot

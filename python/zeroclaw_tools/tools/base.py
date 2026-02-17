@@ -38,9 +38,13 @@ def tool(
         ```
     """
     if func is not None:
-        return langchain_tool(func)
+        if name is not None:
+            return langchain_tool(name, func, description=description)
+        return langchain_tool(func, description=description)
 
     def decorator(f: Callable) -> Any:
-        return langchain_tool(f, name=name)
+        if name is not None:
+            return langchain_tool(name, f, description=description)
+        return langchain_tool(f, description=description)
 
     return decorator

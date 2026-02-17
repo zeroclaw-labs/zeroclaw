@@ -60,6 +60,9 @@ export API_BASE="https://api.z.ai/api/coding/paas/v4"
 
 # Run the CLI
 zeroclaw-tools "List files in the current directory"
+
+# Interactive mode (no message required)
+zeroclaw-tools -i
 ```
 
 ### Discord Bot

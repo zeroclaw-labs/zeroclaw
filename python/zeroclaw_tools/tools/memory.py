@@ -3,7 +3,6 @@ Memory storage tools for persisting data between conversations.
 """
 
 import json
-import os
 from pathlib import Path
 
 from langchain_core.tools import tool
@@ -20,7 +19,7 @@ def _load_memory() -> dict:
     if not path.exists():
         return {}
     try:
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {}
@@ -30,7 +29,7 @@ def _save_memory(data: dict) -> None:
     """Save memory to disk."""
     path = _get_memory_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
 

@@ -2,20 +2,18 @@
 Discord bot integration for ZeroClaw.
 """
 
-import asyncio
 import os
 from typing import Optional, Set
 
 try:
     import discord
-    from discord.ext import commands
 
     DISCORD_AVAILABLE = True
 except ImportError:
     DISCORD_AVAILABLE = False
     discord = None
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage
 
 from ..agent import create_agent
 from ..tools import shell, file_read, file_write, web_search
@@ -64,6 +62,18 @@ class DiscordBot:
         self.base_url = base_url or os.environ.get("API_BASE")
         self.model = model
         self.prefix = prefix
+
+        if not self.api_key:
+            raise ValueError(
+                "API key required. Set API_KEY environment variable or pass api_key parameter."
+            )
+
+        self.agent = create_agent(
+            tools=[shell, file_read, file_write, web_search],
+            model=self.model,
+            api_key=self.api_key,
+            base_url=self.base_url,
+        )
 
         self._histories: dict[str, list] = {}
         self._max_history = 20
@@ -117,13 +127,6 @@ class DiscordBot:
 
     async def _process_message(self, content: str, user_id: str) -> str:
         """Process a message and return the response."""
-        agent = create_agent(
-            tools=[shell, file_read, file_write, web_search],
-            model=self.model,
-            api_key=self.api_key,
-            base_url=self.base_url,
-        )
-
         messages = []
 
         if user_id in self._histories:
@@ -132,7 +135,7 @@ class DiscordBot:
 
         messages.append(HumanMessage(content=content))
 
-        result = await agent.ainvoke({"messages": messages})
+        result = await self.agent.ainvoke({"messages": messages})
 
         if user_id not in self._histories:
             self._histories[user_id] = []
