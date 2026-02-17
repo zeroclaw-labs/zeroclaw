@@ -556,9 +556,10 @@ pub async fn run(
     }
 
     agent.observer.record_event(&ObserverEvent::AgentEnd {
+        provider: "cli".to_string(),
+        model: "unknown".to_string(),
         duration: start.elapsed(),
         tokens_used: None,
-        cost_usd: None,
     });
 
     Ok(())

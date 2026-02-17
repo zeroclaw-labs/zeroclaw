@@ -193,8 +193,18 @@ impl Provider for ReliableProvider {
                             } else {
                                 "retryable"
                             };
+                            // For custom providers, strip the URL from the provider name
+                            // to avoid confusion. The format "custom:https://..." in error
+                            // logs makes it look like the model is being appended to the URL.
+                            let display_provider = if provider_name.starts_with("custom:") {
+                                "custom"
+                            } else if provider_name.starts_with("anthropic-custom:") {
+                                "anthropic-custom"
+                            } else {
+                                provider_name
+                            };
                             failures.push(format!(
-                                "provider={provider_name} model={current_model} attempt {}/{}: {failure_reason}",
+                                "{display_provider}/{current_model} attempt {}/{}: {failure_reason}",
                                 attempt + 1,
                                 self.max_retries + 1
                             ));
@@ -298,8 +308,18 @@ impl Provider for ReliableProvider {
                             } else {
                                 "retryable"
                             };
+                            // For custom providers, strip the URL from the provider name
+                            // to avoid confusion. The format "custom:https://..." in error
+                            // logs makes it look like the model is being appended to the URL.
+                            let display_provider = if provider_name.starts_with("custom:") {
+                                "custom"
+                            } else if provider_name.starts_with("anthropic-custom:") {
+                                "anthropic-custom"
+                            } else {
+                                provider_name
+                            };
                             failures.push(format!(
-                                "provider={provider_name} model={current_model} attempt {}/{}: {failure_reason}",
+                                "{display_provider}/{current_model} attempt {}/{}: {failure_reason}",
                                 attempt + 1,
                                 self.max_retries + 1
                             ));
