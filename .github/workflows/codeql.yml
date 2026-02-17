@@ -1,8 +1,6 @@
 name: CodeQL Analysis
 
 on:
-    push:
-        branches: [main]
     schedule:
         - cron: "0 6,18 * * *" # Twice daily at 6am and 6pm UTC
     workflow_dispatch:
