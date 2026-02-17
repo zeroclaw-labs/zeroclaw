@@ -48,9 +48,10 @@ impl Observer for LogObserver {
             ObserverEvent::AgentEnd {
                 duration,
                 tokens_used,
+                cost_usd,
             } => {
                 let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
-                info!(duration_ms = ms, tokens = ?tokens_used, "agent.end");
+                info!(duration_ms = ms, tokens = ?tokens_used, cost_usd = ?cost_usd, "agent.end");
             }
             ObserverEvent::ToolCallStart { tool } => {
                 info!(tool = %tool, "tool.start");
@@ -133,10 +134,12 @@ mod tests {
         obs.record_event(&ObserverEvent::AgentEnd {
             duration: Duration::from_millis(500),
             tokens_used: Some(100),
+            cost_usd: Some(0.0015),
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             duration: Duration::ZERO,
             tokens_used: None,
+            cost_usd: None,
         });
         obs.record_event(&ObserverEvent::ToolCallStart {
             tool: "shell".into(),

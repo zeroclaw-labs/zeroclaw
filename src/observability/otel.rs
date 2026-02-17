@@ -227,6 +227,7 @@ impl Observer for OtelObserver {
             ObserverEvent::AgentEnd {
                 duration,
                 tokens_used,
+                cost_usd,
             } => {
                 let secs = duration.as_secs_f64();
                 let start_time = SystemTime::now()
@@ -242,6 +243,9 @@ impl Observer for OtelObserver {
                 );
                 if let Some(t) = tokens_used {
                     span.set_attribute(KeyValue::new("tokens_used", *t as i64));
+                }
+                if let Some(c) = cost_usd {
+                    span.set_attribute(KeyValue::new("cost_usd", *c));
                 }
                 span.end();
 
@@ -394,10 +398,12 @@ mod tests {
         obs.record_event(&ObserverEvent::AgentEnd {
             duration: Duration::from_millis(500),
             tokens_used: Some(100),
+            cost_usd: Some(0.0015),
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             duration: Duration::ZERO,
             tokens_used: None,
+            cost_usd: None,
         });
         obs.record_event(&ObserverEvent::ToolCallStart {
             tool: "shell".into(),

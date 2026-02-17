@@ -1048,6 +1048,7 @@ pub async fn run(
     observer.record_event(&ObserverEvent::AgentEnd {
         duration,
         tokens_used: None,
+        cost_usd: None,
     });
 
     Ok(final_output)
