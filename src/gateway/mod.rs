@@ -862,7 +862,7 @@ mod tests {
         let msg = ChannelMessage {
             id: "wamid-123".into(),
             sender: "+1234567890".into(),
-            reply_to: "+1234567890".into(),
+            reply_target: "+1234567890".into(),
             content: "hello".into(),
             channel: "whatsapp".into(),
             timestamp: 1,

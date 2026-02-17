@@ -7,7 +7,7 @@ use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
-/// DingTalk (钉钉) channel — connects via Stream Mode WebSocket for real-time messages.
+/// DingTalk channel — connects via Stream Mode WebSocket for real-time messages.
 /// Replies are sent through per-message session webhook URLs.
 pub struct DingTalkChannel {
     client_id: String,

@@ -428,8 +428,8 @@ impl Channel for EmailChannel {
                         } // MutexGuard dropped before await
                         let msg = ChannelMessage {
                             id,
-                            sender: sender.clone(),
-                            reply_to: sender,
+                            reply_target: sender.clone(),
+                            sender,
                             content,
                             channel: "email".to_string(),
                             timestamp: ts,

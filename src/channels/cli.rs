@@ -91,13 +91,14 @@ mod tests {
         let msg = ChannelMessage {
             id: "test-id".into(),
             sender: "user".into(),
-            reply_to: "user".into(),
+            reply_target: "user".into(),
             content: "hello".into(),
             channel: "cli".into(),
             timestamp: 1_234_567_890,
         };
         assert_eq!(msg.id, "test-id");
         assert_eq!(msg.sender, "user");
+        assert_eq!(msg.reply_target, "user");
         assert_eq!(msg.content, "hello");
         assert_eq!(msg.channel, "cli");
         assert_eq!(msg.timestamp, 1_234_567_890);
@@ -108,7 +109,7 @@ mod tests {
         let msg = ChannelMessage {
             id: "id".into(),
             sender: "s".into(),
-            reply_to: "s".into(),
+            reply_target: "s".into(),
             content: "c".into(),
             channel: "ch".into(),
             timestamp: 0,

@@ -614,7 +614,7 @@ impl LarkChannel {
         messages.push(ChannelMessage {
             id: Uuid::new_v4().to_string(),
             sender: chat_id.to_string(),
-            reply_to: chat_id.to_string(),
+            reply_target: chat_id.to_string(),
             content: text,
             channel: "lark".to_string(),
             timestamp,

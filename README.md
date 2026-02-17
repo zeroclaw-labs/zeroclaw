@@ -291,6 +291,21 @@ rerun channel setup only:
 zeroclaw onboard --channels-only
 ```
 
+### Telegram media replies
+
+Telegram routing now replies to the source **chat ID** from incoming updates (instead of usernames),
+which avoids `Bad Request: chat not found` failures.
+
+For non-text replies, ZeroClaw can send Telegram attachments when the assistant includes markers:
+
+- `[IMAGE:<path-or-url>]`
+- `[DOCUMENT:<path-or-url>]`
+- `[VIDEO:<path-or-url>]`
+- `[AUDIO:<path-or-url>]`
+- `[VOICE:<path-or-url>]`
+
+Paths can be local files (for example `/tmp/screenshot.png`) or HTTPS URLs.
+
 ### WhatsApp Business Cloud API Setup
 
 WhatsApp uses Meta's Cloud API with webhooks (push-based, not polling):
