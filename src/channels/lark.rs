@@ -1085,7 +1085,7 @@ mod tests {
                 "sender": { "sender_id": { "open_id": "ou_user" } },
                 "message": {
                     "message_type": "text",
-                    "content": "{\"text\":\"你好世界 🌍\"}",
+                    "content": "{\"text\":\"Hello world 🌍\"}",
                     "chat_id": "oc_chat",
                     "create_time": "1000"
                 }
@@ -1094,7 +1094,7 @@ mod tests {
 
         let msgs = ch.parse_event_payload(&payload);
         assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].content, "你好世界 🌍");
+        assert_eq!(msgs[0].content, "Hello world 🌍");
     }
 
     #[test]

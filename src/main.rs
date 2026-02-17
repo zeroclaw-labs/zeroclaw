@@ -328,6 +328,11 @@ enum ChannelCommands {
         /// Channel name
         name: String,
     },
+    /// Bind a Telegram identity (username or numeric user ID) into allowlist
+    BindTelegram {
+        /// Telegram identity to allow (username without '@' or numeric user ID)
+        identity: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]

@@ -104,6 +104,11 @@ pub enum ChannelCommands {
         /// Channel name to remove
         name: String,
     },
+    /// Bind a Telegram identity (username or numeric user ID) into allowlist
+    BindTelegram {
+        /// Telegram identity to allow (username without '@' or numeric user ID)
+        identity: String,
+    },
 }
 
 /// Skills management subcommands

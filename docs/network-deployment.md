@@ -55,7 +55,7 @@ baud = 115200
 
 [channels_config.telegram]
 bot_token = "YOUR_BOT_TOKEN"
-allowed_users = ["*"]
+allowed_users = []
 
 [gateway]
 host = "127.0.0.1"
@@ -127,10 +127,31 @@ Telegram uses **long-polling** by default:
 ```toml
 [channels_config.telegram]
 bot_token = "YOUR_BOT_TOKEN"
-allowed_users = ["*"]   # or specific @usernames / user IDs
+allowed_users = []      # deny-by-default, bind identities explicitly
 ```
 
 Run `zeroclaw daemon` — Telegram channel starts automatically.
+
+To approve one Telegram account at runtime:
+
+```bash
+zeroclaw channel bind-telegram <IDENTITY>
+```
+
+`<IDENTITY>` can be a numeric Telegram user ID or a username (without `@`).
+
+### 4.1 Single Poller Rule (Important)
+
+Telegram Bot API `getUpdates` supports only one active poller per bot token.
+
+- Keep one runtime instance for the same token (recommended: `zeroclaw daemon` service).
+- Do not run `cargo run -- channel start` or another bot process at the same time.
+
+If you hit this error:
+
+`Conflict: terminated by other getUpdates request`
+
+you have a polling conflict. Stop extra instances and restart only one daemon.
 
 ---
 
