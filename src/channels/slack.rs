@@ -1,6 +1,5 @@
 use super::traits::{Channel, ChannelMessage};
 use async_trait::async_trait;
-use uuid::Uuid;
 
 /// Slack channel — polls conversations.history via Web API
 pub struct SlackChannel {
@@ -162,6 +161,7 @@ impl Channel for SlackChannel {
                     let channel_msg = ChannelMessage {
                         id: format!("slack_{channel_id}_{ts}"),
                         sender: user.to_string(),
+                        reply_to: channel_id.to_string(),
                         content: text.to_string(),
                         channel: "slack".to_string(),
                         timestamp: std::time::SystemTime::now()

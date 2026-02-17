@@ -16,27 +16,53 @@ git config core.hooksPath .githooks
 cargo build
 
 # Run tests (all must pass)
-cargo test
+cargo test --locked
 
 # Format & lint (required before PR)
-cargo fmt --all -- --check
-cargo clippy --all-targets -- -D clippy::correctness
+./scripts/ci/rust_quality_gate.sh
 
-# Optional strict lint audit (recommended periodically)
-cargo clippy --all-targets -- -D warnings
+# Optional strict lint audit (full repo, recommended periodically)
+./scripts/ci/rust_quality_gate.sh --strict
+
+# Optional strict lint delta gate (blocks only changed Rust lines)
+./scripts/ci/rust_strict_delta_gate.sh
+
+# Optional docs lint gate (blocks only markdown issues on changed lines)
+./scripts/ci/docs_quality_gate.sh
+
+# Optional docs links gate (checks only links added on changed lines)
+./scripts/ci/docs_links_gate.sh
 
 # Release build (~3.4MB)
-cargo build --release
+cargo build --release --locked
 ```
 
 ### Pre-push hook
 
-The repo includes a pre-push hook in `.githooks/` that enforces `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D clippy::correctness`, and `cargo test` before every push. Enable it with `git config core.hooksPath .githooks`.
+The repo includes a pre-push hook in `.githooks/` that enforces `./scripts/ci/rust_quality_gate.sh` and `cargo test --locked` before every push. Enable it with `git config core.hooksPath .githooks`.
 
 For an opt-in strict lint pass during pre-push, set:
 
 ```bash
 ZEROCLAW_STRICT_LINT=1 git push
+```
+
+For an opt-in strict lint delta pass during pre-push (changed Rust lines only), set:
+
+```bash
+ZEROCLAW_STRICT_DELTA_LINT=1 git push
+```
+
+For an opt-in docs quality pass during pre-push (changed-line markdown gate), set:
+
+```bash
+ZEROCLAW_DOCS_LINT=1 git push
+```
+
+For an opt-in docs links pass during pre-push (added-links gate), set:
+
+```bash
+ZEROCLAW_DOCS_LINKS=1 git push
 ```
 
 For full CI parity in Docker, run:
@@ -52,6 +78,94 @@ git push --no-verify
 ```
 
 > **Note:** CI runs the same checks, so skipped hooks will be caught on the PR.
+
+## Local Secret Management (Required)
+
+ZeroClaw supports layered secret management for local development and CI hygiene.
+
+### Secret Storage Options
+
+1. **Environment variables** (recommended for local development)
+    - Copy `.env.example` to `.env` and fill in values
+    - `.env` files are Git-ignored and should stay local
+    - Best for temporary/local API keys
+
+2. **Config file** (`~/.zeroclaw/config.toml`)
+    - Persistent setup for long-term use
+    - When `secrets.encrypt = true` (default), secret values are encrypted before save
+    - Secret key is stored at `~/.zeroclaw/.secret_key` with restricted permissions
+    - Use `zeroclaw onboard` for guided setup
+
+### Runtime Resolution Rules
+
+API key resolution follows this order:
+
+1. Explicit key passed from config/CLI
+2. Provider-specific env vars (`OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, ...)
+3. Generic env vars (`ZEROCLAW_API_KEY`, `API_KEY`)
+
+Provider/model config overrides:
+
+- `ZEROCLAW_PROVIDER` / `PROVIDER`
+- `ZEROCLAW_MODEL`
+
+See `.env.example` for practical examples and currently supported provider key env vars.
+
+### Pre-Commit Secret Hygiene (Mandatory)
+
+Before every commit, verify:
+
+- [ ] No `.env` files are staged (`.env.example` only)
+- [ ] No raw API keys/tokens in code, tests, fixtures, examples, logs, or commit messages
+- [ ] No credentials in debug output or error payloads
+- [ ] `git diff --cached` has no accidental secret-like strings
+
+Quick local audit:
+
+```bash
+# Search staged diff for common secret markers
+git diff --cached | grep -iE '(api[_-]?key|secret|token|password|bearer|sk-)'
+
+# Confirm no .env file is staged
+git status --short | grep -E '\.env$'
+```
+
+### Optional Local Secret Scanning
+
+For extra guardrails, install one of:
+
+- **gitleaks**: [GitHub - gitleaks/gitleaks](https://github.com/gitleaks/gitleaks)
+- **truffleHog**: [GitHub - trufflesecurity/trufflehog](https://github.com/trufflesecurity/trufflehog)
+- **git-secrets**: [GitHub - awslabs/git-secrets](https://github.com/awslabs/git-secrets)
+
+This repo includes `.githooks/pre-commit` to run `gitleaks protect --staged --redact` when gitleaks is installed.
+
+Enable hooks with:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+If gitleaks is not installed, the pre-commit hook prints a warning and continues.
+
+### What Must Never Be Committed
+
+- `.env` files (use `.env.example` only)
+- API keys, tokens, passwords, or credentials (plain or encrypted)
+- OAuth tokens or session identifiers
+- Webhook signing secrets
+- `~/.zeroclaw/.secret_key` or similar key files
+- Personal identifiers or real user data in tests/fixtures
+
+### If a Secret Is Committed Accidentally
+
+1. Revoke/rotate the credential immediately
+2. Do not rely only on `git revert` (history still contains the secret)
+3. Purge history with `git filter-repo` or BFG
+4. Force-push cleaned history (coordinate with maintainers)
+5. Ensure the leaked value is removed from PR/issue/discussion/comment history
+
+Reference: [GitHub guide: removing sensitive data from a repository](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/removing-sensitive-data-from-a-repository)
 
 ## Collaboration Tracks (Risk-Based)
 
@@ -340,10 +454,10 @@ impl Tool for YourTool {
 ## Pull Request Checklist
 
 - [ ] PR template sections are completed (including security + rollback)
-- [ ] `cargo fmt --all -- --check` — code is formatted
-- [ ] `cargo clippy --all-targets -- -D clippy::correctness` — merge gate lint baseline passes
-- [ ] `cargo test` — all tests pass locally or skipped tests are explained
-- [ ] Optional strict audit: `cargo clippy --all-targets -- -D warnings` (run when doing lint cleanup or before release-hardening work)
+- [ ] `./scripts/ci/rust_quality_gate.sh` — merge gate formatter/lint baseline passes
+- [ ] `cargo test --locked` — all tests pass locally or skipped tests are explained
+- [ ] Optional strict audit: `./scripts/ci/rust_quality_gate.sh --strict` (full repo, run when doing lint cleanup or release-hardening work)
+- [ ] Optional strict delta audit: `./scripts/ci/rust_strict_delta_gate.sh` (changed Rust lines only, useful for incremental debt control)
 - [ ] New code has inline `#[cfg(test)]` tests
 - [ ] No new dependencies unless absolutely necessary (we optimize for binary size)
 - [ ] README updated if adding user-facing features

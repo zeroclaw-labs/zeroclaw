@@ -4,9 +4,10 @@
 
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ToolCall as ProviderToolCall,
+    Provider, StreamChunk, StreamError, StreamOptions, StreamResult, ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
+use futures_util::{stream, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -16,7 +17,7 @@ use serde::{Deserialize, Serialize};
 pub struct OpenAiCompatibleProvider {
     pub(crate) name: String,
     pub(crate) base_url: String,
-    pub(crate) api_key: Option<String>,
+    pub(crate) credential: Option<String>,
     pub(crate) auth_header: AuthStyle,
     /// When false, do not fall back to /v1/responses on chat completions 404.
     /// GLM/Zhipu does not support the responses API.
@@ -36,11 +37,16 @@ pub enum AuthStyle {
 }
 
 impl OpenAiCompatibleProvider {
-    pub fn new(name: &str, base_url: &str, api_key: Option<&str>, auth_style: AuthStyle) -> Self {
+    pub fn new(
+        name: &str,
+        base_url: &str,
+        credential: Option<&str>,
+        auth_style: AuthStyle,
+    ) -> Self {
         Self {
             name: name.to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
-            api_key: api_key.map(ToString::to_string),
+            credential: credential.map(ToString::to_string),
             auth_header: auth_style,
             supports_responses_fallback: true,
             client: Client::builder()
@@ -56,13 +62,13 @@ impl OpenAiCompatibleProvider {
     pub fn new_no_responses_fallback(
         name: &str,
         base_url: &str,
-        api_key: Option<&str>,
+        credential: Option<&str>,
         auth_style: AuthStyle,
     ) -> Self {
         Self {
             name: name.to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
-            api_key: api_key.map(ToString::to_string),
+            credential: credential.map(ToString::to_string),
             auth_header: auth_style,
             supports_responses_fallback: false,
             client: Client::builder()
@@ -219,6 +225,144 @@ struct ResponsesContent {
     text: Option<String>,
 }
 
+// ═══════════════════════════════════════════════════════════════
+// Streaming support (SSE parser)
+// ═══════════════════════════════════════════════════════════════
+
+/// Server-Sent Event stream chunk for OpenAI-compatible streaming.
+#[derive(Debug, Deserialize)]
+struct StreamChunkResponse {
+    choices: Vec<StreamChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamChoice {
+    delta: StreamDelta,
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamDelta {
+    #[serde(default)]
+    content: Option<String>,
+}
+
+/// Parse SSE (Server-Sent Events) stream from OpenAI-compatible providers.
+/// Handles the `data: {...}` format and `[DONE]` sentinel.
+fn parse_sse_line(line: &str) -> StreamResult<Option<String>> {
+    let line = line.trim();
+
+    // Skip empty lines and comments
+    if line.is_empty() || line.starts_with(':') {
+        return Ok(None);
+    }
+
+    // SSE format: "data: {...}"
+    if let Some(data) = line.strip_prefix("data:") {
+        let data = data.trim();
+
+        // Check for [DONE] sentinel
+        if data == "[DONE]" {
+            return Ok(None);
+        }
+
+        // Parse JSON delta
+        let chunk: StreamChunkResponse = serde_json::from_str(data).map_err(StreamError::Json)?;
+
+        // Extract content from delta
+        if let Some(choice) = chunk.choices.first() {
+            if let Some(content) = &choice.delta.content {
+                return Ok(Some(content.clone()));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// Convert SSE byte stream to text chunks.
+fn sse_bytes_to_chunks(
+    response: reqwest::Response,
+    count_tokens: bool,
+) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+    // Create a channel to send chunks
+    let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
+
+    tokio::spawn(async move {
+        // Buffer for incomplete lines
+        let mut buffer = String::new();
+
+        // Get response body as bytes stream
+        match response.error_for_status_ref() {
+            Ok(_) => {}
+            Err(e) => {
+                let _ = tx.send(Err(StreamError::Http(e))).await;
+                return;
+            }
+        }
+
+        let mut bytes_stream = response.bytes_stream();
+
+        while let Some(item) = bytes_stream.next().await {
+            match item {
+                Ok(bytes) => {
+                    // Convert bytes to string and process line by line
+                    let text = match String::from_utf8(bytes.to_vec()) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(StreamError::InvalidSse(format!(
+                                    "Invalid UTF-8: {}",
+                                    e
+                                ))))
+                                .await;
+                            break;
+                        }
+                    };
+
+                    buffer.push_str(&text);
+
+                    // Process complete lines
+                    while let Some(pos) = buffer.find('\n') {
+                        let line = buffer.drain(..=pos).collect::<String>();
+                        buffer = buffer[pos + 1..].to_string();
+
+                        match parse_sse_line(&line) {
+                            Ok(Some(content)) => {
+                                let mut chunk = StreamChunk::delta(content);
+                                if count_tokens {
+                                    chunk = chunk.with_token_estimate();
+                                }
+                                if tx.send(Ok(chunk)).await.is_err() {
+                                    return; // Receiver dropped
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                let _ = tx.send(Err(e)).await;
+                                return;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(StreamError::Http(e))).await;
+                    break;
+                }
+            }
+        }
+
+        // Send final chunk
+        let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
+    });
+
+    // Convert channel receiver to stream
+    stream::unfold(rx, |mut rx| async {
+        rx.recv().await.map(|chunk| (chunk, rx))
+    })
+    .boxed()
+}
+
 fn first_nonempty(text: Option<&str>) -> Option<String> {
     text.and_then(|value| {
         let trimmed = value.trim();
@@ -260,18 +404,18 @@ impl OpenAiCompatibleProvider {
     fn apply_auth_header(
         &self,
         req: reqwest::RequestBuilder,
-        api_key: &str,
+        credential: &str,
     ) -> reqwest::RequestBuilder {
         match &self.auth_header {
-            AuthStyle::Bearer => req.header("Authorization", format!("Bearer {api_key}")),
-            AuthStyle::XApiKey => req.header("x-api-key", api_key),
-            AuthStyle::Custom(header) => req.header(header, api_key),
+            AuthStyle::Bearer => req.header("Authorization", format!("Bearer {credential}")),
+            AuthStyle::XApiKey => req.header("x-api-key", credential),
+            AuthStyle::Custom(header) => req.header(header, credential),
         }
     }
 
     async fn chat_via_responses(
         &self,
-        api_key: &str,
+        credential: &str,
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
@@ -289,7 +433,7 @@ impl OpenAiCompatibleProvider {
         let url = self.responses_url();
 
         let response = self
-            .apply_auth_header(self.client.post(&url).json(&request), api_key)
+            .apply_auth_header(self.client.post(&url).json(&request), credential)
             .send()
             .await?;
 
@@ -314,7 +458,7 @@ impl Provider for OpenAiCompatibleProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let api_key = self.api_key.as_ref().ok_or_else(|| {
+        let credential = self.credential.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "{} API key not set. Run `zeroclaw onboard` or set the appropriate env var.",
                 self.name
@@ -345,7 +489,7 @@ impl Provider for OpenAiCompatibleProvider {
         let url = self.chat_completions_url();
 
         let response = self
-            .apply_auth_header(self.client.post(&url).json(&request), api_key)
+            .apply_auth_header(self.client.post(&url).json(&request), credential)
             .send()
             .await?;
 
@@ -356,7 +500,7 @@ impl Provider for OpenAiCompatibleProvider {
 
             if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
                 return self
-                    .chat_via_responses(api_key, system_prompt, message, model)
+                    .chat_via_responses(credential, system_prompt, message, model)
                     .await
                     .map_err(|responses_err| {
                         anyhow::anyhow!(
@@ -400,7 +544,7 @@ impl Provider for OpenAiCompatibleProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let api_key = self.api_key.as_ref().ok_or_else(|| {
+        let credential = self.credential.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "{} API key not set. Run `zeroclaw onboard` or set the appropriate env var.",
                 self.name
@@ -424,7 +568,7 @@ impl Provider for OpenAiCompatibleProvider {
 
         let url = self.chat_completions_url();
         let response = self
-            .apply_auth_header(self.client.post(&url).json(&request), api_key)
+            .apply_auth_header(self.client.post(&url).json(&request), credential)
             .send()
             .await?;
 
@@ -439,7 +583,7 @@ impl Provider for OpenAiCompatibleProvider {
                 if let Some(user_msg) = last_user {
                     return self
                         .chat_via_responses(
-                            api_key,
+                            credential,
                             system.map(|m| m.content.as_str()),
                             &user_msg.content,
                             model,
@@ -525,6 +669,112 @@ impl Provider for OpenAiCompatibleProvider {
     fn supports_native_tools(&self) -> bool {
         true
     }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn stream_chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let credential = match self.credential.as_ref() {
+            Some(key) => key.clone(),
+            None => {
+                let provider_name = self.name.clone();
+                return stream::once(async move {
+                    Err(StreamError::Provider(format!(
+                        "{} API key not set",
+                        provider_name
+                    )))
+                })
+                .boxed();
+            }
+        };
+
+        let mut messages = Vec::new();
+        if let Some(sys) = system_prompt {
+            messages.push(Message {
+                role: "system".to_string(),
+                content: sys.to_string(),
+            });
+        }
+        messages.push(Message {
+            role: "user".to_string(),
+            content: message.to_string(),
+        });
+
+        let request = ChatRequest {
+            model: model.to_string(),
+            messages,
+            temperature,
+            stream: Some(options.enabled),
+        };
+
+        let url = self.chat_completions_url();
+        let client = self.client.clone();
+        let auth_header = self.auth_header.clone();
+
+        // Use a channel to bridge the async HTTP response to the stream
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
+
+        tokio::spawn(async move {
+            // Build request with auth
+            let mut req_builder = client.post(&url).json(&request);
+
+            // Apply auth header
+            req_builder = match &auth_header {
+                AuthStyle::Bearer => {
+                    req_builder.header("Authorization", format!("Bearer {}", credential))
+                }
+                AuthStyle::XApiKey => req_builder.header("x-api-key", &credential),
+                AuthStyle::Custom(header) => req_builder.header(header, &credential),
+            };
+
+            // Set accept header for streaming
+            req_builder = req_builder.header("Accept", "text/event-stream");
+
+            // Send request
+            let response = match req_builder.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Err(StreamError::Http(e))).await;
+                    return;
+                }
+            };
+
+            // Check status
+            if !response.status().is_success() {
+                let status = response.status();
+                let error = match response.text().await {
+                    Ok(e) => e,
+                    Err(_) => format!("HTTP error: {}", status),
+                };
+                let _ = tx
+                    .send(Err(StreamError::Provider(format!("{}: {}", status, error))))
+                    .await;
+                return;
+            }
+
+            // Convert to chunk stream and forward to channel
+            let mut chunk_stream = sse_bytes_to_chunks(response, options.count_tokens);
+            while let Some(chunk) = chunk_stream.next().await {
+                if tx.send(chunk).await.is_err() {
+                    break; // Receiver dropped
+                }
+            }
+        });
+
+        // Convert channel receiver to stream
+        stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|chunk| (chunk, rx))
+        })
+        .boxed()
+    }
 }
 
 #[cfg(test)]
@@ -537,16 +787,20 @@ mod tests {
 
     #[test]
     fn creates_with_key() {
-        let p = make_provider("venice", "https://api.venice.ai", Some("vn-key"));
+        let p = make_provider(
+            "venice",
+            "https://api.venice.ai",
+            Some("venice-test-credential"),
+        );
         assert_eq!(p.name, "venice");
         assert_eq!(p.base_url, "https://api.venice.ai");
-        assert_eq!(p.api_key.as_deref(), Some("vn-key"));
+        assert_eq!(p.credential.as_deref(), Some("venice-test-credential"));
     }
 
     #[test]
     fn creates_without_key() {
         let p = make_provider("test", "https://example.com", None);
-        assert!(p.api_key.is_none());
+        assert!(p.credential.is_none());
     }
 
     #[test]

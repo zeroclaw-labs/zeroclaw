@@ -1,6 +1,12 @@
 pub mod browser;
 pub mod browser_open;
 pub mod composio;
+pub mod cron_add;
+pub mod cron_list;
+pub mod cron_remove;
+pub mod cron_run;
+pub mod cron_runs;
+pub mod cron_update;
 pub mod delegate;
 pub mod file_read;
 pub mod file_write;
@@ -13,7 +19,9 @@ pub mod image_info;
 pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
+pub mod pushover;
 pub mod schedule;
+pub mod schema;
 pub mod screenshot;
 pub mod shell;
 pub mod traits;
@@ -21,6 +29,12 @@ pub mod traits;
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
 pub use composio::ComposioTool;
+pub use cron_add::CronAddTool;
+pub use cron_list::CronListTool;
+pub use cron_remove::CronRemoveTool;
+pub use cron_run::CronRunTool;
+pub use cron_runs::CronRunsTool;
+pub use cron_update::CronUpdateTool;
 pub use delegate::DelegateTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
@@ -33,14 +47,16 @@ pub use image_info::ImageInfoTool;
 pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
+pub use pushover::PushoverTool;
 pub use schedule::ScheduleTool;
+pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
 pub use shell::ShellTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
 
-use crate::config::DelegateAgentConfig;
+use crate::config::{Config, DelegateAgentConfig};
 use crate::memory::Memory;
 use crate::runtime::{NativeRuntime, RuntimeAdapter};
 use crate::security::SecurityPolicy;
@@ -67,6 +83,7 @@ pub fn default_tools_with_runtime(
 /// Create full tool registry including memory tools and optional Composio
 #[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
 pub fn all_tools(
+    config: Arc<Config>,
     security: &Arc<SecurityPolicy>,
     memory: Arc<dyn Memory>,
     composio_key: Option<&str>,
@@ -76,9 +93,10 @@ pub fn all_tools(
     workspace_dir: &std::path::Path,
     agents: &HashMap<String, DelegateAgentConfig>,
     fallback_api_key: Option<&str>,
-    config: &crate::config::Config,
+    root_config: &crate::config::Config,
 ) -> Vec<Box<dyn Tool>> {
     all_tools_with_runtime(
+        config,
         security,
         Arc::new(NativeRuntime::new()),
         memory,
@@ -89,13 +107,14 @@ pub fn all_tools(
         workspace_dir,
         agents,
         fallback_api_key,
-        config,
+        root_config,
     )
 }
 
 /// Create full tool registry including memory tools and optional Composio.
 #[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
 pub fn all_tools_with_runtime(
+    config: Arc<Config>,
     security: &Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
     memory: Arc<dyn Memory>,
@@ -106,17 +125,27 @@ pub fn all_tools_with_runtime(
     workspace_dir: &std::path::Path,
     agents: &HashMap<String, DelegateAgentConfig>,
     fallback_api_key: Option<&str>,
-    config: &crate::config::Config,
+    root_config: &crate::config::Config,
 ) -> Vec<Box<dyn Tool>> {
     let mut tools: Vec<Box<dyn Tool>> = vec![
         Box::new(ShellTool::new(security.clone(), runtime)),
         Box::new(FileReadTool::new(security.clone())),
         Box::new(FileWriteTool::new(security.clone())),
+        Box::new(CronAddTool::new(config.clone(), security.clone())),
+        Box::new(CronListTool::new(config.clone())),
+        Box::new(CronRemoveTool::new(config.clone())),
+        Box::new(CronUpdateTool::new(config.clone(), security.clone())),
+        Box::new(CronRunTool::new(config.clone())),
+        Box::new(CronRunsTool::new(config.clone())),
         Box::new(MemoryStoreTool::new(memory.clone())),
         Box::new(MemoryRecallTool::new(memory.clone())),
         Box::new(MemoryForgetTool::new(memory)),
-        Box::new(ScheduleTool::new(security.clone(), config.clone())),
+        Box::new(ScheduleTool::new(security.clone(), root_config.clone())),
         Box::new(GitOperationsTool::new(
+            security.clone(),
+            workspace_dir.to_path_buf(),
+        )),
+        Box::new(PushoverTool::new(
             security.clone(),
             workspace_dir.to_path_buf(),
         )),
@@ -174,9 +203,13 @@ pub fn all_tools_with_runtime(
             .iter()
             .map(|(name, cfg)| (name.clone(), cfg.clone()))
             .collect();
+        let delegate_fallback_credential = fallback_api_key.and_then(|value| {
+            let trimmed_value = value.trim();
+            (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
+        });
         tools.push(Box::new(DelegateTool::new(
             delegate_agents,
-            fallback_api_key.map(String::from),
+            delegate_fallback_credential,
         )));
     }
 
@@ -225,6 +258,7 @@ mod tests {
         let cfg = test_config(&tmp);
 
         let tools = all_tools(
+            Arc::new(Config::default()),
             &security,
             mem,
             None,
@@ -239,6 +273,7 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"browser_open"));
         assert!(names.contains(&"schedule"));
+        assert!(names.contains(&"pushover"));
     }
 
     #[test]
@@ -262,6 +297,7 @@ mod tests {
         let cfg = test_config(&tmp);
 
         let tools = all_tools(
+            Arc::new(Config::default()),
             &security,
             mem,
             None,
@@ -275,6 +311,7 @@ mod tests {
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"browser_open"));
+        assert!(names.contains(&"pushover"));
     }
 
     #[test]
@@ -400,6 +437,7 @@ mod tests {
         );
 
         let tools = all_tools(
+            Arc::new(Config::default()),
             &security,
             mem,
             None,
@@ -408,7 +446,7 @@ mod tests {
             &http,
             tmp.path(),
             &agents,
-            Some("sk-test"),
+            Some("delegate-test-credential"),
             &cfg,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -431,6 +469,7 @@ mod tests {
         let cfg = test_config(&tmp);
 
         let tools = all_tools(
+            Arc::new(Config::default()),
             &security,
             mem,
             None,

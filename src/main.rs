@@ -34,8 +34,8 @@
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use tracing::{info, Level};
-use tracing_subscriber::FmtSubscriber;
+use tracing::info;
+use tracing_subscriber::{fmt, EnvFilter};
 
 mod agent;
 mod channels;
@@ -136,9 +136,9 @@ enum Commands {
         #[arg(long)]
         model: Option<String>,
 
-        /// Temperature (0.0 - 2.0); defaults to config default_temperature
-        #[arg(short, long)]
-        temperature: Option<f64>,
+        /// Temperature (0.0 - 2.0)
+        #[arg(short, long, default_value = "0.7")]
+        temperature: f64,
 
         /// Attach a peripheral (board:path, e.g. nucleo-f401re:/dev/ttyACM0)
         #[arg(long)]
@@ -250,6 +250,23 @@ enum CronCommands {
     Add {
         /// Cron expression
         expression: String,
+        /// Optional IANA timezone (e.g. America/Los_Angeles)
+        #[arg(long)]
+        tz: Option<String>,
+        /// Command to run
+        command: String,
+    },
+    /// Add a one-shot scheduled task at an RFC3339 timestamp
+    AddAt {
+        /// One-shot timestamp in RFC3339 format
+        at: String,
+        /// Command to run
+        command: String,
+    },
+    /// Add a fixed-interval scheduled task
+    AddEvery {
+        /// Interval in milliseconds
+        every_ms: u64,
         /// Command to run
         command: String,
     },
@@ -350,14 +367,19 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Initialize logging
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
+    // Initialize logging - respects RUST_LOG env var, defaults to INFO
+    let subscriber = fmt::Subscriber::builder()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .finish();
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
-    // Onboard runs quick setup by default, or the interactive wizard with --interactive
+    // Onboard runs quick setup by default, or the interactive wizard with --interactive.
+    // The onboard wizard uses reqwest::blocking internally, which creates its own
+    // Tokio runtime. To avoid "Cannot drop a runtime in a context where blocking is
+    // not allowed", we run the wizard on a blocking thread via spawn_blocking.
     if let Commands::Onboard {
         interactive,
         channels_only,
@@ -366,20 +388,29 @@ async fn main() -> Result<()> {
         memory,
     } = &cli.command
     {
-        if *interactive && *channels_only {
+        let interactive = *interactive;
+        let channels_only = *channels_only;
+        let api_key = api_key.clone();
+        let provider = provider.clone();
+        let memory = memory.clone();
+
+        if interactive && channels_only {
             bail!("Use either --interactive or --channels-only, not both");
         }
-        if *channels_only && (api_key.is_some() || provider.is_some() || memory.is_some()) {
+        if channels_only && (api_key.is_some() || provider.is_some() || memory.is_some()) {
             bail!("--channels-only does not accept --api-key, --provider, or --memory");
         }
 
-        let config = if *channels_only {
-            onboard::run_channels_repair_wizard()?
-        } else if *interactive {
-            onboard::run_wizard()?
-        } else {
-            onboard::run_quick_setup(api_key.as_deref(), provider.as_deref(), memory.as_deref())?
-        };
+        let config = tokio::task::spawn_blocking(move || {
+            if channels_only {
+                onboard::run_channels_repair_wizard()
+            } else if interactive {
+                onboard::run_wizard()
+            } else {
+                onboard::run_quick_setup(api_key.as_deref(), provider.as_deref(), memory.as_deref())
+            }
+        })
+        .await??;
         // Auto-start channels if user said yes during wizard
         if std::env::var("ZEROCLAW_AUTOSTART_CHANNELS").as_deref() == Ok("1") {
             channels::start_channels(config).await?;
@@ -400,10 +431,9 @@ async fn main() -> Result<()> {
             model,
             temperature,
             peripheral,
-        } => {
-            let temp = temperature.unwrap_or(config.default_temperature);
-            agent::run(config, message, provider, model, temp, peripheral).await
-        }
+        } => agent::run(config, message, provider, model, temperature, peripheral)
+            .await
+            .map(|_| ()),
 
         Commands::Gateway { port, host } => {
             if port == 0 {

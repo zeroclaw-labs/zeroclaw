@@ -10,7 +10,8 @@
 </p>
 
 <p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License: Apache 2.0" /></a>
+  <a href="NOTICE"><img src="https://img.shields.io/badge/contributors-27+-green.svg" alt="Contributors" /></a>
   <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=flat&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
 </p>
 
@@ -119,7 +120,7 @@ ls -lh target/release/zeroclaw
 
 - **Docker** — required only if using the [Docker sandboxed runtime](#runtime-support-current) (`runtime.kind = "docker"`). Install via your package manager or [docker.com](https://docs.docker.com/engine/install/).
 
-> **Low-memory boards (e.g., Raspberry Pi 3, 1GB RAM):** see [Build troubleshooting](#build-troubleshooting-linux-openssl-errors) and use `CARGO_BUILD_JOBS=1 cargo build --release` if the kernel kills rustc during compilation.
+> **Note:** The default `cargo build --release` uses `codegen-units=1` for compatibility with low-memory devices (e.g., Raspberry Pi 3 with 1GB RAM). For faster builds on powerful machines, use `cargo build --profile release-fast`.
 
 </details>
 
@@ -131,6 +132,9 @@ git clone https://github.com/zeroclaw-labs/zeroclaw.git
 cd zeroclaw
 cargo build --release --locked
 cargo install --path . --force --locked
+
+# Ensure ~/.cargo/bin is in your PATH
+export PATH="$HOME/.cargo/bin:$PATH"
 
 # Quick setup (no prompts)
 zeroclaw onboard --api-key sk-... --provider openrouter
@@ -417,6 +421,40 @@ format = "openclaw"             # "openclaw" (default, markdown files) or "aieos
 # aieos_inline = '{"identity":{"names":{"first":"Nova"}}}'  # inline AIEOS JSON
 ```
 
+## Python Companion Package (`zeroclaw-tools`)
+
+For LLM providers with inconsistent native tool calling (e.g., GLM-5/Zhipu), ZeroClaw ships a Python companion package with **LangGraph-based tool calling** for guaranteed consistency:
+
+```bash
+pip install zeroclaw-tools
+```
+
+```python
+from zeroclaw_tools import create_agent, shell, file_read
+from langchain_core.messages import HumanMessage
+
+# Works with any OpenAI-compatible provider
+agent = create_agent(
+    tools=[shell, file_read],
+    model="glm-5",
+    api_key="your-key",
+    base_url="https://api.z.ai/api/coding/paas/v4"
+)
+
+result = await agent.ainvoke({
+    "messages": [HumanMessage(content="List files in /tmp")]
+})
+print(result["messages"][-1].content)
+```
+
+**Why use it:**
+- **Consistent tool calling** across all providers (even those with poor native support)
+- **Automatic tool loop** — keeps calling tools until the task is complete
+- **Easy extensibility** — add custom tools with `@tool` decorator
+- **Discord bot integration** included (Telegram planned)
+
+See [`python/README.md`](python/README.md) for full documentation.
+
 ## Identity System (AIEOS Support)
 
 ZeroClaw supports **identity-agnostic** AI personas through two formats:
@@ -517,8 +555,8 @@ See [aieos.org](https://aieos.org) for the full schema and live examples.
 
 ```bash
 cargo build              # Dev build
-cargo build --release    # Release build (~3.4MB)
-CARGO_BUILD_JOBS=1 cargo build --release    # Low-memory fallback (Raspberry Pi 3, 1GB RAM)
+cargo build --release    # Release build (codegen-units=1, works on all devices including Raspberry Pi)
+cargo build --profile release-fast    # Faster build (codegen-units=8, requires 16GB+ RAM)
 cargo test               # 1,017 tests
 cargo clippy             # Lint (0 warnings)
 cargo fmt                # Format
@@ -582,7 +620,7 @@ We're building in the open because the best ideas come from everywhere. If you'r
 
 ## License
 
-MIT — see [LICENSE](LICENSE)
+Apache 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE) for contributor attribution
 
 ## Contributing
 
@@ -595,7 +633,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Implement a trait, submit a PR:
 - New `Memory` → `src/memory/`
 - New `Tunnel` → `src/tunnel/`
 - New `Skill` → `~/.zeroclaw/workspace/skills/<name>/`
-
 
 ---
 

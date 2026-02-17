@@ -28,6 +28,7 @@ Commands:
   shell         Open an interactive shell inside the CI container
   lint          Run rustfmt + clippy correctness gate (container only)
   lint-strict   Run rustfmt + full clippy warnings gate (container only)
+  lint-delta    Run strict lint delta gate on changed Rust lines (container only)
   test          Run cargo test (container only)
   build         Run release build smoke check (container only)
   audit         Run cargo audit (container only)
@@ -54,11 +55,15 @@ case "$1" in
     ;;
 
   lint)
-    run_in_ci "cargo fmt --all -- --check && cargo clippy --locked --all-targets -- -D clippy::correctness"
+    run_in_ci "./scripts/ci/rust_quality_gate.sh"
     ;;
 
   lint-strict)
-    run_in_ci "cargo fmt --all -- --check && cargo clippy --locked --all-targets -- -D warnings"
+    run_in_ci "./scripts/ci/rust_quality_gate.sh --strict"
+    ;;
+
+  lint-delta)
+    run_in_ci "./scripts/ci/rust_strict_delta_gate.sh"
     ;;
 
   test)
@@ -88,7 +93,7 @@ case "$1" in
     ;;
 
   all)
-    run_in_ci "cargo fmt --all -- --check && cargo clippy --locked --all-targets -- -D clippy::correctness"
+    run_in_ci "./scripts/ci/rust_quality_gate.sh"
     run_in_ci "cargo test --locked --verbose"
     run_in_ci "cargo build --release --locked --verbose"
     run_in_ci "cargo deny check licenses sources"

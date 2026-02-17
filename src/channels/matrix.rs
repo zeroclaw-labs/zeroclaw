@@ -230,6 +230,7 @@ impl Channel for MatrixChannel {
                     let msg = ChannelMessage {
                         id: format!("mx_{}", chrono::Utc::now().timestamp_millis()),
                         sender: event.sender.clone(),
+                        reply_to: self.room_id.clone(),
                         content: body.clone(),
                         channel: "matrix".to_string(),
                         timestamp: std::time::SystemTime::now()

@@ -1,5 +1,6 @@
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
+use futures_util::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
 
 /// A single message in a conversation.
@@ -97,8 +98,123 @@ pub enum ConversationMessage {
     ToolResults(Vec<ToolResultMessage>),
 }
 
+/// A chunk of content from a streaming response.
+#[derive(Debug, Clone)]
+pub struct StreamChunk {
+    /// Text delta for this chunk.
+    pub delta: String,
+    /// Whether this is the final chunk.
+    pub is_final: bool,
+    /// Approximate token count for this chunk (estimated).
+    pub token_count: usize,
+}
+
+impl StreamChunk {
+    /// Create a new non-final chunk.
+    pub fn delta(text: impl Into<String>) -> Self {
+        Self {
+            delta: text.into(),
+            is_final: false,
+            token_count: 0,
+        }
+    }
+
+    /// Create a final chunk.
+    pub fn final_chunk() -> Self {
+        Self {
+            delta: String::new(),
+            is_final: true,
+            token_count: 0,
+        }
+    }
+
+    /// Create an error chunk.
+    pub fn error(message: impl Into<String>) -> Self {
+        Self {
+            delta: message.into(),
+            is_final: true,
+            token_count: 0,
+        }
+    }
+
+    /// Estimate tokens (rough approximation: ~4 chars per token).
+    pub fn with_token_estimate(mut self) -> Self {
+        self.token_count = (self.delta.len() + 3) / 4;
+        self
+    }
+}
+
+/// Options for streaming chat requests.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StreamOptions {
+    /// Whether to enable streaming (default: true).
+    pub enabled: bool,
+    /// Whether to include token counts in chunks.
+    pub count_tokens: bool,
+}
+
+impl StreamOptions {
+    /// Create new streaming options with enabled flag.
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            count_tokens: false,
+        }
+    }
+
+    /// Enable token counting.
+    pub fn with_token_count(mut self) -> Self {
+        self.count_tokens = true;
+        self
+    }
+}
+
+/// Result type for streaming operations.
+pub type StreamResult<T> = std::result::Result<T, StreamError>;
+
+/// Errors that can occur during streaming.
+#[derive(Debug, thiserror::Error)]
+pub enum StreamError {
+    #[error("HTTP error: {0}")]
+    Http(reqwest::Error),
+
+    #[error("JSON parse error: {0}")]
+    Json(serde_json::Error),
+
+    #[error("Invalid SSE format: {0}")]
+    InvalidSse(String),
+
+    #[error("Provider error: {0}")]
+    Provider(String),
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Provider capabilities declaration.
+///
+/// Describes what features a provider supports, enabling intelligent
+/// adaptation of tool calling modes and request formatting.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderCapabilities {
+    /// Whether the provider supports native tool calling via API primitives.
+    ///
+    /// When `true`, the provider can convert tool definitions to API-native
+    /// formats (e.g., Gemini's functionDeclarations, Anthropic's input_schema).
+    ///
+    /// When `false`, tools must be injected via system prompt as text.
+    pub native_tool_calling: bool,
+}
+
 #[async_trait]
 pub trait Provider: Send + Sync {
+    /// Query provider capabilities.
+    ///
+    /// Default implementation returns minimal capabilities (no native tool calling).
+    /// Providers should override this to declare their actual capabilities.
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities::default()
+    }
     /// Simple one-shot chat (single user message, no explicit system prompt).
     ///
     /// This is the preferred API for non-agentic direct interactions.
@@ -162,7 +278,7 @@ pub trait Provider: Send + Sync {
 
     /// Whether provider supports native tool calls over API.
     fn supports_native_tools(&self) -> bool {
-        false
+        self.capabilities().native_tool_calling
     }
 
     /// Warm up the HTTP connection pool (TLS handshake, DNS, HTTP/2 setup).
@@ -170,11 +286,88 @@ pub trait Provider: Send + Sync {
     async fn warmup(&self) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// Chat with tool definitions for native function calling support.
+    /// The default implementation falls back to chat_with_history and returns
+    /// an empty tool_calls vector (prompt-based tool use only).
+    async fn chat_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        _tools: &[serde_json::Value],
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ChatResponse> {
+        let text = self.chat_with_history(messages, model, temperature).await?;
+        Ok(ChatResponse {
+            text: Some(text),
+            tool_calls: Vec::new(),
+        })
+    }
+
+    /// Whether provider supports streaming responses.
+    /// Default implementation returns false.
+    fn supports_streaming(&self) -> bool {
+        false
+    }
+
+    /// Streaming chat with optional system prompt.
+    /// Returns an async stream of text chunks.
+    /// Default implementation falls back to non-streaming chat.
+    fn stream_chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: f64,
+        _options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        // Default: return an empty stream (not supported)
+        stream::empty().boxed()
+    }
+
+    /// Streaming chat with history.
+    /// Default implementation falls back to stream_chat_with_system with last user message.
+    fn stream_chat_with_history(
+        &self,
+        _messages: &[ChatMessage],
+        _model: &str,
+        _temperature: f64,
+        _options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        // For default implementation, we need to convert to owned strings
+        // This is a limitation of the default implementation
+        let provider_name = "unknown".to_string();
+
+        // Create a single empty chunk to indicate not supported
+        let chunk = StreamChunk::error(format!("{} does not support streaming", provider_name));
+        stream::once(async move { Ok(chunk) }).boxed()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct CapabilityMockProvider;
+
+    #[async_trait]
+    impl Provider for CapabilityMockProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: true,
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("ok".into())
+        }
+    }
 
     #[test]
     fn chat_message_constructors() {
@@ -237,5 +430,33 @@ mod tests {
         }]);
         let json = serde_json::to_string(&tool_result).unwrap();
         assert!(json.contains("\"type\":\"ToolResults\""));
+    }
+
+    #[test]
+    fn provider_capabilities_default() {
+        let caps = ProviderCapabilities::default();
+        assert!(!caps.native_tool_calling);
+    }
+
+    #[test]
+    fn provider_capabilities_equality() {
+        let caps1 = ProviderCapabilities {
+            native_tool_calling: true,
+        };
+        let caps2 = ProviderCapabilities {
+            native_tool_calling: true,
+        };
+        let caps3 = ProviderCapabilities {
+            native_tool_calling: false,
+        };
+
+        assert_eq!(caps1, caps2);
+        assert_ne!(caps1, caps3);
+    }
+
+    #[test]
+    fn supports_native_tools_reflects_capabilities_default_mapping() {
+        let provider = CapabilityMockProvider;
+        assert!(provider.supports_native_tools());
     }
 }

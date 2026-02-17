@@ -226,6 +226,7 @@ impl Agent {
         };
 
         let tools = tools::all_tools_with_runtime(
+            Arc::new(config.clone()),
             &security,
             runtime,
             memory.clone(),
@@ -250,6 +251,7 @@ impl Agent {
         let provider: Box<dyn Provider> = providers::create_routed_provider(
             provider_name,
             config.api_key.as_deref(),
+            config.api_url.as_deref(),
             &config.reliability,
             &config.model_routes,
             &model_name,
@@ -556,6 +558,7 @@ pub async fn run(
     agent.observer.record_event(&ObserverEvent::AgentEnd {
         duration: start.elapsed(),
         tokens_used: None,
+        cost_usd: None,
     });
 
     Ok(())

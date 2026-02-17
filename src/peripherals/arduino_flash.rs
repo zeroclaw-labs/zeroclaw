@@ -38,6 +38,10 @@ pub fn ensure_arduino_cli() -> Result<()> {
             anyhow::bail!("brew install arduino-cli failed. Install manually: https://arduino.github.io/arduino-cli/");
         }
         println!("arduino-cli installed.");
+        if !arduino_cli_available() {
+            anyhow::bail!("arduino-cli still not found after install. Ensure it's in PATH.");
+        }
+        return Ok(());
     }
 
     #[cfg(target_os = "linux")]
@@ -54,11 +58,6 @@ pub fn ensure_arduino_cli() -> Result<()> {
         println!("arduino-cli not found. Install it: https://arduino.github.io/arduino-cli/");
         anyhow::bail!("arduino-cli not installed.");
     }
-
-    if !arduino_cli_available() {
-        anyhow::bail!("arduino-cli still not found after install. Ensure it's in PATH.");
-    }
-    Ok(())
 }
 
 /// Ensure arduino:avr core is installed.

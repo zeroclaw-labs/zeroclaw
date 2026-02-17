@@ -8,7 +8,7 @@ use crate::hardware::{self, HardwareConfig};
 use crate::memory::{
     default_memory_backend_key, memory_backend_profile, selectable_memory_backends,
 };
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use console::style;
 use dialoguer::{Confirm, Input, Select};
 use serde::{Deserialize, Serialize};
@@ -106,6 +106,7 @@ pub fn run_wizard() -> Result<Config> {
         } else {
             Some(api_key)
         },
+        api_url: None,
         default_provider: Some(provider),
         default_model: Some(model),
         default_temperature: 0.7,
@@ -117,6 +118,7 @@ pub fn run_wizard() -> Result<Config> {
         agent: crate::config::schema::AgentConfig::default(),
         model_routes: Vec::new(),
         heartbeat: HeartbeatConfig::default(),
+        cron: crate::config::CronConfig::default(),
         channels_config,
         memory: memory_config, // User-selected memory backend
         tunnel: tunnel_config,
@@ -283,7 +285,7 @@ fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
 
 #[allow(clippy::too_many_lines)]
 pub fn run_quick_setup(
-    api_key: Option<&str>,
+    credential_override: Option<&str>,
     provider: Option<&str>,
     memory_backend: Option<&str>,
 ) -> Result<Config> {
@@ -317,7 +319,8 @@ pub fn run_quick_setup(
     let config = Config {
         workspace_dir: workspace_dir.clone(),
         config_path: config_path.clone(),
-        api_key: api_key.map(String::from),
+        api_key: credential_override.map(String::from),
+        api_url: None,
         default_provider: Some(provider_name.clone()),
         default_model: Some(model.clone()),
         default_temperature: 0.7,
@@ -329,6 +332,7 @@ pub fn run_quick_setup(
         agent: crate::config::schema::AgentConfig::default(),
         model_routes: Vec::new(),
         heartbeat: HeartbeatConfig::default(),
+        cron: crate::config::CronConfig::default(),
         channels_config: ChannelsConfig::default(),
         memory: memory_config,
         tunnel: crate::config::TunnelConfig::default(),
@@ -375,7 +379,7 @@ pub fn run_quick_setup(
     println!(
         "  {} API Key:    {}",
         style("✓").green().bold(),
-        if api_key.is_some() {
+        if credential_override.is_some() {
             style("set").green()
         } else {
             style("not set (use --api-key or edit config.toml)").yellow()
@@ -424,7 +428,7 @@ pub fn run_quick_setup(
     );
     println!();
     println!("  {}", style("Next steps:").white().bold());
-    if api_key.is_none() {
+    if credential_override.is_none() {
         println!("    1. Set your API key:  export OPENROUTER_API_KEY=\"sk-...\"");
         println!("    2. Or edit:           ~/.zeroclaw/config.toml");
         println!("    3. Chat:              zeroclaw agent -m \"Hello!\"");
@@ -459,7 +463,7 @@ const MINIMAX_ONBOARD_MODELS: [(&str, &str); 5] = [
 
 fn default_model_for_provider(provider: &str) -> String {
     match canonical_provider_name(provider) {
-        "anthropic" => "claude-sonnet-4-20250514".into(),
+        "anthropic" => "claude-sonnet-4-5-20250929".into(),
         "openai" => "gpt-5.2".into(),
         "glm" | "zhipu" | "zai" | "z.ai" => "glm-5".into(),
         "minimax" => "MiniMax-M2.5".into(),
@@ -505,16 +509,16 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
         ],
         "anthropic" => vec![
             (
-                "claude-sonnet-4-20250514".to_string(),
-                "Claude Sonnet 4 (balanced, recommended)".to_string(),
+                "claude-sonnet-4-5-20250929".to_string(),
+                "Claude Sonnet 4.5 (balanced, recommended)".to_string(),
             ),
             (
-                "claude-opus-4-1-20250805".to_string(),
-                "Claude Opus 4.1 (best quality)".to_string(),
+                "claude-opus-4-6".to_string(),
+                "Claude Opus 4.6 (best quality)".to_string(),
             ),
             (
-                "claude-3-5-haiku-20241022".to_string(),
-                "Claude 3.5 Haiku (fastest, cheapest)".to_string(),
+                "claude-haiku-4-5-20251001".to_string(),
+                "Claude Haiku 4.5 (fastest, cheapest)".to_string(),
             ),
         ],
         "openai" => vec![
@@ -868,13 +872,29 @@ fn fetch_anthropic_models(api_key: Option<&str>) -> Result<Vec<String>> {
     };
 
     let client = build_model_fetch_client()?;
-    let payload: Value = client
+    let mut request = client
         .get("https://api.anthropic.com/v1/models")
-        .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
+        .header("anthropic-version", "2023-06-01");
+
+    if api_key.starts_with("sk-ant-oat01-") {
+        request = request
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("anthropic-beta", "oauth-2025-04-20");
+    } else {
+        request = request.header("x-api-key", api_key);
+    }
+
+    let response = request
         .send()
-        .and_then(reqwest::blocking::Response::error_for_status)
-        .context("model fetch failed: GET https://api.anthropic.com/v1/models")?
+        .context("model fetch failed: GET https://api.anthropic.com/v1/models")?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().unwrap_or_default();
+        bail!("Anthropic model list request failed (HTTP {status}): {body}");
+    }
+
+    let payload: Value = response
         .json()
         .context("failed to parse Anthropic model list response")?;
 
@@ -917,6 +937,14 @@ fn fetch_live_models_for_provider(provider_name: &str, api_key: &str) -> Result<
     let api_key = if api_key.trim().is_empty() {
         std::env::var(provider_env_var(provider_name))
             .ok()
+            .or_else(|| {
+                // Anthropic also accepts OAuth setup-tokens via ANTHROPIC_OAUTH_TOKEN
+                if provider_name == "anthropic" {
+                    std::env::var("ANTHROPIC_OAUTH_TOKEN").ok()
+                } else {
+                    None
+                }
+            })
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
     } else {
@@ -1433,10 +1461,47 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
                 .allow_empty(true)
                 .interact_text()?
         }
+    } else if canonical_provider_name(provider_name) == "anthropic" {
+        if std::env::var("ANTHROPIC_OAUTH_TOKEN").is_ok() {
+            print_bullet(&format!(
+                "{} ANTHROPIC_OAUTH_TOKEN environment variable detected!",
+                style("✓").green().bold()
+            ));
+            String::new()
+        } else if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+            print_bullet(&format!(
+                "{} ANTHROPIC_API_KEY environment variable detected!",
+                style("✓").green().bold()
+            ));
+            String::new()
+        } else {
+            print_bullet(&format!(
+                "Get your API key at: {}",
+                style("https://console.anthropic.com/settings/keys")
+                    .cyan()
+                    .underlined()
+            ));
+            print_bullet("Or run `claude setup-token` to get an OAuth setup-token.");
+            println!();
+
+            let key: String = Input::new()
+                .with_prompt("  Paste your API key or setup-token (or press Enter to skip)")
+                .allow_empty(true)
+                .interact_text()?;
+
+            if key.is_empty() {
+                print_bullet(&format!(
+                    "Skipped. Set {} or {} or edit config.toml later.",
+                    style("ANTHROPIC_API_KEY").yellow(),
+                    style("ANTHROPIC_OAUTH_TOKEN").yellow()
+                ));
+            }
+
+            key
+        }
     } else {
         let key_url = match provider_name {
             "openrouter" => "https://openrouter.ai/keys",
-            "anthropic" => "https://console.anthropic.com/settings/keys",
             "openai" => "https://platform.openai.com/api-keys",
             "venice" => "https://venice.ai/settings/api",
             "groq" => "https://console.groq.com/keys",
@@ -2206,14 +2271,11 @@ fn setup_memory() -> Result<MemoryConfig> {
     let backend = backend_key_from_choice(choice);
     let profile = memory_backend_profile(backend);
 
-    let auto_save = if !profile.auto_save_default {
-        false
-    } else {
-        Confirm::new()
+    let auto_save = profile.auto_save_default
+        && Confirm::new()
             .with_prompt("  Auto-save conversations to memory?")
             .default(true)
-            .interact()?
-    };
+            .interact()?;
 
     println!(
         "  {} Memory: {} (auto-save: {})",
@@ -2736,22 +2798,14 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         .header("Authorization", format!("Bearer {access_token_clone}"))
                         .send()?;
                     let ok = resp.status().is_success();
-                    let data: serde_json::Value = resp.json().unwrap_or_default();
-                    let user_id = data
-                        .get("user_id")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("unknown")
-                        .to_string();
-                    Ok::<_, reqwest::Error>((ok, user_id))
+                    Ok::<_, reqwest::Error>(ok)
                 })
                 .join();
                 match thread_result {
-                    Ok(Ok((true, user_id))) => {
-                        println!(
-                            "\r  {} Connected as {user_id}        ",
-                            style("✅").green().bold()
-                        );
-                    }
+                    Ok(Ok(true)) => println!(
+                        "\r  {} Connection verified        ",
+                        style("✅").green().bold()
+                    ),
                     _ => {
                         println!(
                             "\r  {} Connection failed — check homeserver URL and token",
@@ -3716,15 +3770,7 @@ fn print_summary(config: &Config) {
     );
 
     // Secrets
-    println!(
-        "    {} Secrets:       {}",
-        style("🔒").cyan(),
-        if config.secrets.encrypt {
-            style("encrypted").green().to_string()
-        } else {
-            style("plaintext").yellow().to_string()
-        }
-    );
+    println!("    {} Secrets:       configured", style("🔒").cyan());
 
     // Gateway
     println!(
@@ -4263,7 +4309,7 @@ mod tests {
         assert_eq!(default_model_for_provider("openai"), "gpt-5.2");
         assert_eq!(
             default_model_for_provider("anthropic"),
-            "claude-sonnet-4-20250514"
+            "claude-sonnet-4-5-20250929"
         );
         assert_eq!(default_model_for_provider("gemini"), "gemini-2.5-pro");
         assert_eq!(default_model_for_provider("google"), "gemini-2.5-pro");
@@ -4282,6 +4328,16 @@ mod tests {
 
         assert!(ids.contains(&"gpt-5.2".to_string()));
         assert!(ids.contains(&"gpt-5-mini".to_string()));
+    }
+
+    #[test]
+    fn curated_models_for_openrouter_use_valid_anthropic_id() {
+        let ids: Vec<String> = curated_models_for_provider("openrouter")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+
+        assert!(ids.contains(&"anthropic/claude-sonnet-4.5".to_string()));
     }
 
     #[test]

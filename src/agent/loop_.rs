@@ -27,6 +27,23 @@ const COMPACTION_MAX_SOURCE_CHARS: usize = 12_000;
 /// Max characters retained in stored compaction summary.
 const COMPACTION_MAX_SUMMARY_CHARS: usize = 2_000;
 
+/// Convert a tool registry to OpenAI function-calling format for native tool support.
+fn tools_to_openai_format(tools_registry: &[Box<dyn Tool>]) -> Vec<serde_json::Value> {
+    tools_registry
+        .iter()
+        .map(|tool| {
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": tool.name(),
+                    "description": tool.description(),
+                    "parameters": tool.parameters_schema()
+                }
+            })
+        })
+        .collect()
+}
+
 fn autosave_memory_key(prefix: &str) -> String {
     format!("{prefix}_{}", Uuid::new_v4())
 }
@@ -454,6 +471,14 @@ pub(crate) async fn run_tool_call_loop(
     temperature: f64,
     silent: bool,
 ) -> Result<String> {
+    // Build native tool definitions once if the provider supports them.
+    let use_native_tools = provider.supports_native_tools() && !tools_registry.is_empty();
+    let tool_definitions = if use_native_tools {
+        tools_to_openai_format(tools_registry)
+    } else {
+        Vec::new()
+    };
+
     for _iteration in 0..MAX_TOOL_ITERATIONS {
         observer.record_event(&ObserverEvent::LlmRequest {
             provider: provider_name.to_string(),
@@ -462,51 +487,106 @@ pub(crate) async fn run_tool_call_loop(
         });
 
         let llm_started_at = Instant::now();
-        let response = match provider
-            .chat_with_history(history, model, temperature)
-            .await
-        {
-            Ok(resp) => {
-                observer.record_event(&ObserverEvent::LlmResponse {
-                    provider: provider_name.to_string(),
-                    model: model.to_string(),
-                    duration: llm_started_at.elapsed(),
-                    success: true,
-                    error_message: None,
-                });
-                resp
-            }
-            Err(e) => {
-                observer.record_event(&ObserverEvent::LlmResponse {
-                    provider: provider_name.to_string(),
-                    model: model.to_string(),
-                    duration: llm_started_at.elapsed(),
-                    success: false,
-                    error_message: Some(crate::providers::sanitize_api_error(&e.to_string())),
-                });
-                return Err(e);
-            }
-        };
 
-        let response_text = response;
-        let mut assistant_history_content = response_text.clone();
-        let (parsed_text, tool_calls) = parse_tool_calls(&response_text);
-        let mut parsed_text = parsed_text;
-        let mut tool_calls = tool_calls;
+        // Choose between native tool-call API and prompt-based tool use.
+        let (response_text, parsed_text, tool_calls, assistant_history_content) =
+            if use_native_tools {
+                match provider
+                    .chat_with_tools(history, &tool_definitions, model, temperature)
+                    .await
+                {
+                    Ok(resp) => {
+                        observer.record_event(&ObserverEvent::LlmResponse {
+                            provider: provider_name.to_string(),
+                            model: model.to_string(),
+                            duration: llm_started_at.elapsed(),
+                            success: true,
+                            error_message: None,
+                        });
+                        let response_text = resp.text_or_empty().to_string();
+                        let mut calls = parse_structured_tool_calls(&resp.tool_calls);
+                        let mut parsed_text = String::new();
+
+                        if calls.is_empty() {
+                            let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
+                            if !fallback_text.is_empty() {
+                                parsed_text = fallback_text;
+                            }
+                            calls = fallback_calls;
+                        }
+
+                        let assistant_history_content = if resp.tool_calls.is_empty() {
+                            response_text.clone()
+                        } else {
+                            build_assistant_history_with_tool_calls(
+                                &response_text,
+                                &resp.tool_calls,
+                            )
+                        };
+
+                        (response_text, parsed_text, calls, assistant_history_content)
+                    }
+                    Err(e) => {
+                        observer.record_event(&ObserverEvent::LlmResponse {
+                            provider: provider_name.to_string(),
+                            model: model.to_string(),
+                            duration: llm_started_at.elapsed(),
+                            success: false,
+                            error_message: Some(crate::providers::sanitize_api_error(
+                                &e.to_string(),
+                            )),
+                        });
+                        return Err(e);
+                    }
+                }
+            } else {
+                match provider
+                    .chat_with_history(history, model, temperature)
+                    .await
+                {
+                    Ok(resp) => {
+                        observer.record_event(&ObserverEvent::LlmResponse {
+                            provider: provider_name.to_string(),
+                            model: model.to_string(),
+                            duration: llm_started_at.elapsed(),
+                            success: true,
+                            error_message: None,
+                        });
+                        let response_text = resp;
+                        let assistant_history_content = response_text.clone();
+                        let (parsed_text, calls) = parse_tool_calls(&response_text);
+                        (response_text, parsed_text, calls, assistant_history_content)
+                    }
+                    Err(e) => {
+                        observer.record_event(&ObserverEvent::LlmResponse {
+                            provider: provider_name.to_string(),
+                            model: model.to_string(),
+                            duration: llm_started_at.elapsed(),
+                            success: false,
+                            error_message: Some(crate::providers::sanitize_api_error(
+                                &e.to_string(),
+                            )),
+                        });
+                        return Err(e);
+                    }
+                }
+            };
+
+        let display_text = if parsed_text.is_empty() {
+            response_text.clone()
+        } else {
+            parsed_text
+        };
 
         if tool_calls.is_empty() {
             // No tool calls — this is the final response
             history.push(ChatMessage::assistant(response_text.clone()));
-            return Ok(if parsed_text.is_empty() {
-                response_text
-            } else {
-                parsed_text
-            });
+            return Ok(display_text);
         }
 
         // Print any text the LLM produced alongside tool calls (unless silent)
-        if !silent && !parsed_text.is_empty() {
-            print!("{parsed_text}");
+        if !silent && !display_text.is_empty() {
+            print!("{display_text}");
             let _ = std::io::stdout().flush();
         }
 
@@ -552,7 +632,7 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         // Add assistant message with tool calls + tool results to history
-        history.push(ChatMessage::assistant(assistant_history_content.clone()));
+        history.push(ChatMessage::assistant(assistant_history_content));
         history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
     }
 
@@ -597,7 +677,7 @@ pub async fn run(
     model_override: Option<String>,
     temperature: f64,
     peripheral_overrides: Vec<String>,
-) -> Result<()> {
+) -> Result<String> {
     // ── Wire up agnostic subsystems ──────────────────────────────
     let base_observer = observability::create_observer(&config.observability);
     let observer: Arc<dyn Observer> = Arc::from(base_observer);
@@ -634,6 +714,7 @@ pub async fn run(
         (None, None)
     };
     let mut tools_registry = tools::all_tools_with_runtime(
+        Arc::new(config.clone()),
         &security,
         runtime,
         mem.clone(),
@@ -668,6 +749,7 @@ pub async fn run(
     let provider: Box<dyn Provider> = providers::create_routed_provider(
         provider_name,
         config.api_key.as_deref(),
+        config.api_url.as_deref(),
         &config.reliability,
         &config.model_routes,
         model_name,
@@ -726,6 +808,24 @@ pub async fn run(
             "Delete a memory entry. Use when: memory is incorrect/stale or explicitly requested for removal. Don't use when: impact is uncertain.",
         ),
     ];
+    tool_descs.push((
+        "cron_add",
+        "Create a cron job. Supports schedule kinds: cron, at, every; and job types: shell or agent.",
+    ));
+    tool_descs.push((
+        "cron_list",
+        "List all cron jobs with schedule, status, and metadata.",
+    ));
+    tool_descs.push(("cron_remove", "Remove a cron job by job_id."));
+    tool_descs.push((
+        "cron_update",
+        "Patch a cron job (schedule, enabled, command/prompt, model, delivery, session_target).",
+    ));
+    tool_descs.push((
+        "cron_run",
+        "Force-run a cron job immediately and record a run history entry.",
+    ));
+    tool_descs.push(("cron_runs", "Show recent run history for a cron job."));
     tool_descs.push((
         "screenshot",
         "Capture a screenshot of the current screen. Returns file path and base64-encoded PNG. Use when: visual verification, UI inspection, debugging displays.",
@@ -806,6 +906,8 @@ pub async fn run(
     // ── Execute ──────────────────────────────────────────────────
     let start = Instant::now();
 
+    let mut final_output = String::new();
+
     if let Some(msg) = message {
         // Auto-save user message to memory
         if config.memory.auto_save {
@@ -845,6 +947,7 @@ pub async fn run(
             false,
         )
         .await?;
+        final_output = response.clone();
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
 
@@ -914,6 +1017,7 @@ pub async fn run(
                     continue;
                 }
             };
+            final_output = response.clone();
             println!("\n{response}\n");
             observer.record_event(&ObserverEvent::TurnComplete);
 
@@ -945,9 +1049,10 @@ pub async fn run(
     observer.record_event(&ObserverEvent::AgentEnd {
         duration,
         tokens_used: None,
+        cost_usd: None,
     });
 
-    Ok(())
+    Ok(final_output)
 }
 
 /// Process a single message through the full agent (with tools, peripherals, memory).
@@ -976,6 +1081,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         (None, None)
     };
     let mut tools_registry = tools::all_tools_with_runtime(
+        Arc::new(config.clone()),
         &security,
         runtime,
         mem.clone(),
@@ -1000,6 +1106,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     let provider: Box<dyn Provider> = providers::create_routed_provider(
         provider_name,
         config.api_key.as_deref(),
+        config.api_url.as_deref(),
         &config.reliability,
         &config.model_routes,
         &model_name,
@@ -1285,6 +1392,32 @@ I will now call the tool with this payload:
         assert!(instructions.contains("shell"));
         assert!(instructions.contains("file_read"));
         assert!(instructions.contains("file_write"));
+    }
+
+    #[test]
+    fn tools_to_openai_format_produces_valid_schema() {
+        use crate::security::SecurityPolicy;
+        let security = Arc::new(SecurityPolicy::from_config(
+            &crate::config::AutonomyConfig::default(),
+            std::path::Path::new("/tmp"),
+        ));
+        let tools = tools::default_tools(security);
+        let formatted = tools_to_openai_format(&tools);
+
+        assert!(!formatted.is_empty());
+        for tool_json in &formatted {
+            assert_eq!(tool_json["type"], "function");
+            assert!(tool_json["function"]["name"].is_string());
+            assert!(tool_json["function"]["description"].is_string());
+            assert!(!tool_json["function"]["name"].as_str().unwrap().is_empty());
+        }
+        // Verify known tools are present
+        let names: Vec<&str> = formatted
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str())
+            .collect();
+        assert!(names.contains(&"shell"));
+        assert!(names.contains(&"file_read"));
     }
 
     #[test]

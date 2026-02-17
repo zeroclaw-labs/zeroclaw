@@ -91,7 +91,7 @@ pub fn handle_command(cmd: crate::PeripheralCommands, config: &Config) -> Result
                 board: board.clone(),
                 transport: transport.to_string(),
                 path: path_opt,
-                baud: 115200,
+                baud: 115_200,
             });
             cfg.save()?;
             println!("Added {} at {}. Restart daemon to apply.", board, path);

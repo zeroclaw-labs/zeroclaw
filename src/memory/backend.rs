@@ -7,6 +7,7 @@ pub enum MemoryBackendKind {
     Unknown,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct MemoryBackendProfile {
     pub key: &'static str,

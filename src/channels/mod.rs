@@ -171,7 +171,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
     let target_channel = ctx.channels_by_name.get(&msg.channel).cloned();
 
     if let Some(channel) = target_channel.as_ref() {
-        if let Err(e) = channel.start_typing(&msg.sender).await {
+        if let Err(e) = channel.start_typing(&msg.reply_to).await {
             tracing::debug!("Failed to start typing on {}: {e}", channel.name());
         }
     }
@@ -200,7 +200,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
     .await;
 
     if let Some(channel) = target_channel.as_ref() {
-        if let Err(e) = channel.stop_typing(&msg.sender).await {
+        if let Err(e) = channel.stop_typing(&msg.reply_to).await {
             tracing::debug!("Failed to stop typing on {}: {e}", channel.name());
         }
     }
@@ -213,7 +213,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                 truncate_with_ellipsis(&response, 80)
             );
             if let Some(channel) = target_channel.as_ref() {
-                if let Err(e) = channel.send(&response, &msg.sender).await {
+                if let Err(e) = channel.send(&response, &msg.reply_to).await {
                     eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
                 }
             }
@@ -224,7 +224,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                 started_at.elapsed().as_millis()
             );
             if let Some(channel) = target_channel.as_ref() {
-                let _ = channel.send(&format!("⚠️ Error: {e}"), &msg.sender).await;
+                let _ = channel.send(&format!("⚠️ Error: {e}"), &msg.reply_to).await;
             }
         }
         Err(_) => {
@@ -241,7 +241,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                 let _ = channel
                     .send(
                         "⚠️ Request timed out while waiting for the model. Please try again.",
-                        &msg.sender,
+                        &msg.reply_to,
                     )
                     .await;
             }
@@ -672,32 +672,23 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     if let Some(ref irc) = config.channels_config.irc {
         channels.push((
             "IRC",
-            Arc::new(IrcChannel::new(
-                irc.server.clone(),
-                irc.port,
-                irc.nickname.clone(),
-                irc.username.clone(),
-                irc.channels.clone(),
-                irc.allowed_users.clone(),
-                irc.server_password.clone(),
-                irc.nickserv_password.clone(),
-                irc.sasl_password.clone(),
-                irc.verify_tls.unwrap_or(true),
-            )),
+            Arc::new(IrcChannel::new(irc::IrcChannelConfig {
+                server: irc.server.clone(),
+                port: irc.port,
+                nickname: irc.nickname.clone(),
+                username: irc.username.clone(),
+                channels: irc.channels.clone(),
+                allowed_users: irc.allowed_users.clone(),
+                server_password: irc.server_password.clone(),
+                nickserv_password: irc.nickserv_password.clone(),
+                sasl_password: irc.sasl_password.clone(),
+                verify_tls: irc.verify_tls.unwrap_or(true),
+            })),
         ));
     }
 
     if let Some(ref lk) = config.channels_config.lark {
-        channels.push((
-            "Lark",
-            Arc::new(LarkChannel::new(
-                lk.app_id.clone(),
-                lk.app_secret.clone(),
-                lk.verification_token.clone().unwrap_or_default(),
-                9898,
-                lk.allowed_users.clone(),
-            )),
-        ));
+        channels.push(("Lark", Arc::new(LarkChannel::from_config(lk))));
     }
 
     if let Some(ref dt) = config.channels_config.dingtalk {
@@ -762,6 +753,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider(
         &provider_name,
         config.api_key.as_deref(),
+        config.api_url.as_deref(),
         &config.reliability,
     )?);
 
@@ -800,6 +792,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     // Build system prompt from workspace identity files + skills
     let workspace = config.workspace_dir.clone();
     let tools_registry = Arc::new(tools::all_tools_with_runtime(
+        Arc::new(config.clone()),
         &security,
         runtime,
         Arc::clone(&mem),
@@ -858,6 +851,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
     tool_descs.push((
         "schedule",
         "Manage scheduled tasks (create/list/get/cancel/pause/resume). Supports recurring cron and one-shot delays.",
+    ));
+    tool_descs.push((
+        "pushover",
+        "Send a Pushover notification to your device. Requires PUSHOVER_TOKEN and PUSHOVER_USER_KEY in .env file.",
     ));
     if !config.agents.is_empty() {
         tool_descs.push((
@@ -946,28 +943,22 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
 
     if let Some(ref irc) = config.channels_config.irc {
-        channels.push(Arc::new(IrcChannel::new(
-            irc.server.clone(),
-            irc.port,
-            irc.nickname.clone(),
-            irc.username.clone(),
-            irc.channels.clone(),
-            irc.allowed_users.clone(),
-            irc.server_password.clone(),
-            irc.nickserv_password.clone(),
-            irc.sasl_password.clone(),
-            irc.verify_tls.unwrap_or(true),
-        )));
+        channels.push(Arc::new(IrcChannel::new(irc::IrcChannelConfig {
+            server: irc.server.clone(),
+            port: irc.port,
+            nickname: irc.nickname.clone(),
+            username: irc.username.clone(),
+            channels: irc.channels.clone(),
+            allowed_users: irc.allowed_users.clone(),
+            server_password: irc.server_password.clone(),
+            nickserv_password: irc.nickserv_password.clone(),
+            sasl_password: irc.sasl_password.clone(),
+            verify_tls: irc.verify_tls.unwrap_or(true),
+        })));
     }
 
     if let Some(ref lk) = config.channels_config.lark {
-        channels.push(Arc::new(LarkChannel::new(
-            lk.app_id.clone(),
-            lk.app_secret.clone(),
-            lk.verification_token.clone().unwrap_or_default(),
-            9898,
-            lk.allowed_users.clone(),
-        )));
+        channels.push(Arc::new(LarkChannel::from_config(lk)));
     }
 
     if let Some(ref dt) = config.channels_config.dingtalk {
@@ -1065,7 +1056,7 @@ mod tests {
     use super::*;
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;
-    use crate::providers::{ChatMessage, ChatResponse, Provider, ToolCall};
+    use crate::providers::{ChatMessage, Provider};
     use crate::tools::{Tool, ToolResult};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1241,6 +1232,7 @@ mod tests {
             traits::ChannelMessage {
                 id: "msg-1".to_string(),
                 sender: "alice".to_string(),
+                reply_to: "alice".to_string(),
                 content: "What is the BTC price now?".to_string(),
                 channel: "test-channel".to_string(),
                 timestamp: 1,
@@ -1330,6 +1322,7 @@ mod tests {
         tx.send(traits::ChannelMessage {
             id: "1".to_string(),
             sender: "alice".to_string(),
+            reply_to: "alice".to_string(),
             content: "hello".to_string(),
             channel: "test-channel".to_string(),
             timestamp: 1,
@@ -1339,6 +1332,7 @@ mod tests {
         tx.send(traits::ChannelMessage {
             id: "2".to_string(),
             sender: "bob".to_string(),
+            reply_to: "bob".to_string(),
             content: "world".to_string(),
             channel: "test-channel".to_string(),
             timestamp: 2,
@@ -1582,6 +1576,7 @@ mod tests {
         let msg = traits::ChannelMessage {
             id: "msg_abc123".into(),
             sender: "U123".into(),
+            reply_to: "U123".into(),
             content: "hello".into(),
             channel: "slack".into(),
             timestamp: 1,
@@ -1595,6 +1590,7 @@ mod tests {
         let msg1 = traits::ChannelMessage {
             id: "msg_1".into(),
             sender: "U123".into(),
+            reply_to: "U123".into(),
             content: "first".into(),
             channel: "slack".into(),
             timestamp: 1,
@@ -1602,6 +1598,7 @@ mod tests {
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
             sender: "U123".into(),
+            reply_to: "U123".into(),
             content: "second".into(),
             channel: "slack".into(),
             timestamp: 2,
@@ -1621,6 +1618,7 @@ mod tests {
         let msg1 = traits::ChannelMessage {
             id: "msg_1".into(),
             sender: "U123".into(),
+            reply_to: "U123".into(),
             content: "I'm Paul".into(),
             channel: "slack".into(),
             timestamp: 1,
@@ -1628,6 +1626,7 @@ mod tests {
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
             sender: "U123".into(),
+            reply_to: "U123".into(),
             content: "I'm 45".into(),
             channel: "slack".into(),
             timestamp: 2,

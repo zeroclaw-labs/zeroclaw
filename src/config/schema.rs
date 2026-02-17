@@ -18,6 +18,8 @@ pub struct Config {
     #[serde(skip)]
     pub config_path: PathBuf,
     pub api_key: Option<String>,
+    /// Base URL override for provider API (e.g. "http://10.0.0.1:11434" for remote Ollama)
+    pub api_url: Option<String>,
     pub default_provider: Option<String>,
     pub default_model: Option<String>,
     pub default_temperature: f64,
@@ -46,6 +48,9 @@ pub struct Config {
 
     #[serde(default)]
     pub heartbeat: HeartbeatConfig,
+
+    #[serde(default)]
+    pub cron: CronConfig,
 
     #[serde(default)]
     pub channels_config: ChannelsConfig,
@@ -168,7 +173,7 @@ pub struct HardwareConfig {
 }
 
 fn default_baud_rate() -> u32 {
-    115200
+    115_200
 }
 
 impl HardwareConfig {
@@ -436,7 +441,7 @@ fn default_peripheral_transport() -> String {
 }
 
 fn default_peripheral_baud() -> u32 {
-    115200
+    115_200
 }
 
 impl Default for PeripheralsConfig {
@@ -1172,6 +1177,29 @@ impl Default for HeartbeatConfig {
     }
 }
 
+// ── Cron ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CronConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_max_run_history")]
+    pub max_run_history: u32,
+}
+
+fn default_max_run_history() -> u32 {
+    50
+}
+
+impl Default for CronConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_run_history: default_max_run_history(),
+        }
+    }
+}
+
 // ── Tunnel ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1369,8 +1397,20 @@ fn default_irc_port() -> u16 {
     6697
 }
 
-/// Lark/Feishu configuration for messaging integration
-/// Lark is the international version, Feishu is the Chinese version
+/// How ZeroClaw receives events from Feishu / Lark.
+///
+/// - `websocket` (default) — persistent WSS long-connection; no public URL required.
+/// - `webhook`             — HTTP callback server; requires a public HTTPS endpoint.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LarkReceiveMode {
+    #[default]
+    Websocket,
+    Webhook,
+}
+
+/// Lark/Feishu configuration for messaging integration.
+/// Lark is the international version; Feishu is the Chinese version.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LarkConfig {
     /// App ID from Lark/Feishu developer console
@@ -1389,6 +1429,13 @@ pub struct LarkConfig {
     /// Whether to use the Feishu (Chinese) endpoint instead of Lark (International)
     #[serde(default)]
     pub use_feishu: bool,
+    /// Event receive mode: "websocket" (default) or "webhook"
+    #[serde(default)]
+    pub receive_mode: LarkReceiveMode,
+    /// HTTP port for webhook mode only. Must be set when receive_mode = "webhook".
+    /// Not required (and ignored) for websocket mode.
+    #[serde(default)]
+    pub port: Option<u16>,
 }
 
 // ── Security Config ─────────────────────────────────────────────────
@@ -1568,6 +1615,7 @@ impl Default for Config {
             workspace_dir: zeroclaw_dir.join("workspace"),
             config_path: zeroclaw_dir.join("config.toml"),
             api_key: None,
+            api_url: None,
             default_provider: Some("openrouter".to_string()),
             default_model: Some("anthropic/claude-sonnet-4".to_string()),
             default_temperature: 0.7,
@@ -1579,6 +1627,7 @@ impl Default for Config {
             agent: AgentConfig::default(),
             model_routes: Vec::new(),
             heartbeat: HeartbeatConfig::default(),
+            cron: CronConfig::default(),
             channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
             tunnel: TunnelConfig::default(),
@@ -1596,19 +1645,88 @@ impl Default for Config {
     }
 }
 
+fn default_config_and_workspace_dirs() -> Result<(PathBuf, PathBuf)> {
+    let home = UserDirs::new()
+        .map(|u| u.home_dir().to_path_buf())
+        .context("Could not find home directory")?;
+    let config_dir = home.join(".zeroclaw");
+    Ok((config_dir.clone(), config_dir.join("workspace")))
+}
+
+fn resolve_config_dir_for_workspace(workspace_dir: &Path) -> PathBuf {
+    let workspace_config_dir = workspace_dir.to_path_buf();
+    if workspace_config_dir.join("config.toml").exists() {
+        return workspace_config_dir;
+    }
+
+    let legacy_config_dir = workspace_dir
+        .parent()
+        .map(|parent| parent.join(".zeroclaw"));
+    if let Some(legacy_dir) = legacy_config_dir {
+        if legacy_dir.join("config.toml").exists() {
+            return legacy_dir;
+        }
+
+        if workspace_dir
+            .file_name()
+            .is_some_and(|name| name == std::ffi::OsStr::new("workspace"))
+        {
+            return legacy_dir;
+        }
+    }
+
+    workspace_config_dir
+}
+
+fn decrypt_optional_secret(
+    store: &crate::security::SecretStore,
+    value: &mut Option<String>,
+    field_name: &str,
+) -> Result<()> {
+    if let Some(raw) = value.clone() {
+        if crate::security::SecretStore::is_encrypted(&raw) {
+            *value = Some(
+                store
+                    .decrypt(&raw)
+                    .with_context(|| format!("Failed to decrypt {field_name}"))?,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn encrypt_optional_secret(
+    store: &crate::security::SecretStore,
+    value: &mut Option<String>,
+    field_name: &str,
+) -> Result<()> {
+    if let Some(raw) = value.clone() {
+        if !crate::security::SecretStore::is_encrypted(&raw) {
+            *value = Some(
+                store
+                    .encrypt(&raw)
+                    .with_context(|| format!("Failed to encrypt {field_name}"))?,
+            );
+        }
+    }
+    Ok(())
+}
+
 impl Config {
     pub fn load_or_init() -> Result<Self> {
-        let home = UserDirs::new()
-            .map(|u| u.home_dir().to_path_buf())
-            .context("Could not find home directory")?;
-        let zeroclaw_dir = home.join(".zeroclaw");
+        // Resolve workspace first so config loading can follow ZEROCLAW_WORKSPACE.
+        let (zeroclaw_dir, workspace_dir) = match std::env::var("ZEROCLAW_WORKSPACE") {
+            Ok(custom_workspace) if !custom_workspace.is_empty() => {
+                let workspace = PathBuf::from(custom_workspace);
+                (resolve_config_dir_for_workspace(&workspace), workspace)
+            }
+            _ => default_config_and_workspace_dirs()?,
+        };
+
         let config_path = zeroclaw_dir.join("config.toml");
 
-        if !zeroclaw_dir.exists() {
-            fs::create_dir_all(&zeroclaw_dir).context("Failed to create .zeroclaw directory")?;
-            fs::create_dir_all(zeroclaw_dir.join("workspace"))
-                .context("Failed to create workspace directory")?;
-        }
+        fs::create_dir_all(&zeroclaw_dir).context("Failed to create config directory")?;
+        fs::create_dir_all(&workspace_dir).context("Failed to create workspace directory")?;
 
         if config_path.exists() {
             let contents =
@@ -1617,13 +1735,30 @@ impl Config {
                 toml::from_str(&contents).context("Failed to parse config file")?;
             // Set computed paths that are skipped during serialization
             config.config_path = config_path.clone();
-            config.workspace_dir = zeroclaw_dir.join("workspace");
+            config.workspace_dir = workspace_dir;
+            let store = crate::security::SecretStore::new(&zeroclaw_dir, config.secrets.encrypt);
+            decrypt_optional_secret(&store, &mut config.api_key, "config.api_key")?;
+            decrypt_optional_secret(
+                &store,
+                &mut config.composio.api_key,
+                "config.composio.api_key",
+            )?;
+
+            decrypt_optional_secret(
+                &store,
+                &mut config.browser.computer_use.api_key,
+                "config.browser.computer_use.api_key",
+            )?;
+
+            for agent in config.agents.values_mut() {
+                decrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
+            }
             config.apply_env_overrides();
             Ok(config)
         } else {
             let mut config = Config::default();
             config.config_path = config_path.clone();
-            config.workspace_dir = zeroclaw_dir.join("workspace");
+            config.workspace_dir = workspace_dir;
             config.save()?;
             config.apply_env_overrides();
             Ok(config)
@@ -1705,23 +1840,29 @@ impl Config {
     }
 
     pub fn save(&self) -> Result<()> {
-        // Encrypt agent API keys before serialization
+        // Encrypt secrets before serialization
         let mut config_to_save = self.clone();
         let zeroclaw_dir = self
             .config_path
             .parent()
             .context("Config path must have a parent directory")?;
         let store = crate::security::SecretStore::new(zeroclaw_dir, self.secrets.encrypt);
+
+        encrypt_optional_secret(&store, &mut config_to_save.api_key, "config.api_key")?;
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.composio.api_key,
+            "config.composio.api_key",
+        )?;
+
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.browser.computer_use.api_key,
+            "config.browser.computer_use.api_key",
+        )?;
+
         for agent in config_to_save.agents.values_mut() {
-            if let Some(ref plaintext_key) = agent.api_key {
-                if !crate::security::SecretStore::is_encrypted(plaintext_key) {
-                    agent.api_key = Some(
-                        store
-                            .encrypt(plaintext_key)
-                            .context("Failed to encrypt agent API key")?,
-                    );
-                }
-            }
+            encrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
         }
 
         let toml_str =
@@ -1810,7 +1951,6 @@ fn sync_directory(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use tempfile::TempDir;
 
     // ── Defaults ─────────────────────────────────────────────
 
@@ -1865,6 +2005,38 @@ mod tests {
     }
 
     #[test]
+    fn cron_config_default() {
+        let c = CronConfig::default();
+        assert!(c.enabled);
+        assert_eq!(c.max_run_history, 50);
+    }
+
+    #[test]
+    fn cron_config_serde_roundtrip() {
+        let c = CronConfig {
+            enabled: false,
+            max_run_history: 100,
+        };
+        let json = serde_json::to_string(&c).unwrap();
+        let parsed: CronConfig = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.enabled);
+        assert_eq!(parsed.max_run_history, 100);
+    }
+
+    #[test]
+    fn config_defaults_cron_when_section_missing() {
+        let toml_str = r#"
+workspace_dir = "/tmp/workspace"
+config_path = "/tmp/config.toml"
+default_temperature = 0.7
+"#;
+
+        let parsed: Config = toml::from_str(toml_str).unwrap();
+        assert!(parsed.cron.enabled);
+        assert_eq!(parsed.cron.max_run_history, 50);
+    }
+
+    #[test]
     fn memory_config_default_hygiene_settings() {
         let m = MemoryConfig::default();
         assert_eq!(m.backend, "sqlite");
@@ -1891,6 +2063,7 @@ mod tests {
             workspace_dir: PathBuf::from("/tmp/test/workspace"),
             config_path: PathBuf::from("/tmp/test/config.toml"),
             api_key: Some("sk-test-key".into()),
+            api_url: None,
             default_provider: Some("openrouter".into()),
             default_model: Some("gpt-4o".into()),
             default_temperature: 0.5,
@@ -1919,6 +2092,7 @@ mod tests {
                 enabled: true,
                 interval_minutes: 15,
             },
+            cron: CronConfig::default(),
             channels_config: ChannelsConfig {
                 cli: true,
                 telegram: Some(TelegramConfig {
@@ -2032,6 +2206,7 @@ tool_dispatcher = "xml"
             workspace_dir: dir.join("workspace"),
             config_path: config_path.clone(),
             api_key: Some("sk-roundtrip".into()),
+            api_url: None,
             default_provider: Some("openrouter".into()),
             default_model: Some("test-model".into()),
             default_temperature: 0.9,
@@ -2042,6 +2217,7 @@ tool_dispatcher = "xml"
             scheduler: SchedulerConfig::default(),
             model_routes: Vec::new(),
             heartbeat: HeartbeatConfig::default(),
+            cron: CronConfig::default(),
             channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
             tunnel: TunnelConfig::default(),
@@ -2063,9 +2239,78 @@ tool_dispatcher = "xml"
 
         let contents = fs::read_to_string(&config_path).unwrap();
         let loaded: Config = toml::from_str(&contents).unwrap();
-        assert_eq!(loaded.api_key.as_deref(), Some("sk-roundtrip"));
+        assert!(loaded
+            .api_key
+            .as_deref()
+            .is_some_and(crate::security::SecretStore::is_encrypted));
+        let store = crate::security::SecretStore::new(&dir, true);
+        let decrypted = store.decrypt(loaded.api_key.as_deref().unwrap()).unwrap();
+        assert_eq!(decrypted, "sk-roundtrip");
         assert_eq!(loaded.default_model.as_deref(), Some("test-model"));
         assert!((loaded.default_temperature - 0.9).abs() < f64::EPSILON);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_save_encrypts_nested_credentials() {
+        let dir = std::env::temp_dir().join(format!(
+            "zeroclaw_test_nested_credentials_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut config = Config::default();
+        config.workspace_dir = dir.join("workspace");
+        config.config_path = dir.join("config.toml");
+        config.api_key = Some("root-credential".into());
+        config.composio.api_key = Some("composio-credential".into());
+        config.browser.computer_use.api_key = Some("browser-credential".into());
+
+        config.agents.insert(
+            "worker".into(),
+            DelegateAgentConfig {
+                provider: "openrouter".into(),
+                model: "model-test".into(),
+                system_prompt: None,
+                api_key: Some("agent-credential".into()),
+                temperature: None,
+                max_depth: 3,
+            },
+        );
+
+        config.save().unwrap();
+
+        let contents = fs::read_to_string(config.config_path.clone()).unwrap();
+        let stored: Config = toml::from_str(&contents).unwrap();
+        let store = crate::security::SecretStore::new(&dir, true);
+
+        let root_encrypted = stored.api_key.as_deref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(root_encrypted));
+        assert_eq!(store.decrypt(root_encrypted).unwrap(), "root-credential");
+
+        let composio_encrypted = stored.composio.api_key.as_deref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(
+            composio_encrypted
+        ));
+        assert_eq!(
+            store.decrypt(composio_encrypted).unwrap(),
+            "composio-credential"
+        );
+
+        let browser_encrypted = stored.browser.computer_use.api_key.as_deref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(
+            browser_encrypted
+        ));
+        assert_eq!(
+            store.decrypt(browser_encrypted).unwrap(),
+            "browser-credential"
+        );
+
+        let worker = stored.agents.get("worker").unwrap();
+        let worker_encrypted = worker.api_key.as_deref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(worker_encrypted));
+        assert_eq!(store.decrypt(worker_encrypted).unwrap(), "agent-credential");
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2759,6 +3004,96 @@ default_temperature = 0.7
     }
 
     #[test]
+    fn load_or_init_workspace_override_uses_workspace_root_for_config() {
+        let _env_guard = env_override_test_guard();
+        let temp_home =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let workspace_dir = temp_home.join("profile-a");
+
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &temp_home);
+        std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir);
+
+        let config = Config::load_or_init().unwrap();
+
+        assert_eq!(config.workspace_dir, workspace_dir);
+        assert_eq!(config.config_path, workspace_dir.join("config.toml"));
+        assert!(workspace_dir.join("config.toml").exists());
+
+        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        let _ = fs::remove_dir_all(temp_home);
+    }
+
+    #[test]
+    fn load_or_init_workspace_suffix_uses_legacy_config_layout() {
+        let _env_guard = env_override_test_guard();
+        let temp_home =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let workspace_dir = temp_home.join("workspace");
+        let legacy_config_path = temp_home.join(".zeroclaw").join("config.toml");
+
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &temp_home);
+        std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir);
+
+        let config = Config::load_or_init().unwrap();
+
+        assert_eq!(config.workspace_dir, workspace_dir);
+        assert_eq!(config.config_path, legacy_config_path);
+        assert!(config.config_path.exists());
+
+        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        let _ = fs::remove_dir_all(temp_home);
+    }
+
+    #[test]
+    fn load_or_init_workspace_override_keeps_existing_legacy_config() {
+        let _env_guard = env_override_test_guard();
+        let temp_home =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let workspace_dir = temp_home.join("custom-workspace");
+        let legacy_config_dir = temp_home.join(".zeroclaw");
+        let legacy_config_path = legacy_config_dir.join("config.toml");
+
+        fs::create_dir_all(&legacy_config_dir).unwrap();
+        fs::write(
+            &legacy_config_path,
+            r#"default_temperature = 0.7
+default_model = "legacy-model"
+"#,
+        )
+        .unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &temp_home);
+        std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir);
+
+        let config = Config::load_or_init().unwrap();
+
+        assert_eq!(config.workspace_dir, workspace_dir);
+        assert_eq!(config.config_path, legacy_config_path);
+        assert_eq!(config.default_model.as_deref(), Some("legacy-model"));
+
+        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        let _ = fs::remove_dir_all(temp_home);
+    }
+
+    #[test]
     fn env_override_empty_values_ignored() {
         let _env_guard = env_override_test_guard();
         let mut config = Config::default();
@@ -2893,7 +3228,7 @@ default_temperature = 0.7
         assert!(b.board.is_empty());
         assert_eq!(b.transport, "serial");
         assert!(b.path.is_none());
-        assert_eq!(b.baud, 115200);
+        assert_eq!(b.baud, 115_200);
     }
 
     #[test]
@@ -2904,7 +3239,7 @@ default_temperature = 0.7
                 board: "nucleo-f401re".into(),
                 transport: "serial".into(),
                 path: Some("/dev/ttyACM0".into()),
-                baud: 115200,
+                baud: 115_200,
             }],
             datasheet_dir: None,
         };
@@ -2914,5 +3249,73 @@ default_temperature = 0.7
         assert_eq!(parsed.boards.len(), 1);
         assert_eq!(parsed.boards[0].board, "nucleo-f401re");
         assert_eq!(parsed.boards[0].path.as_deref(), Some("/dev/ttyACM0"));
+    }
+
+    #[test]
+    fn lark_config_serde() {
+        let lc = LarkConfig {
+            app_id: "cli_123456".into(),
+            app_secret: "secret_abc".into(),
+            encrypt_key: Some("encrypt_key".into()),
+            verification_token: Some("verify_token".into()),
+            allowed_users: vec!["user_123".into(), "user_456".into()],
+            use_feishu: true,
+            receive_mode: LarkReceiveMode::Websocket,
+            port: None,
+        };
+        let json = serde_json::to_string(&lc).unwrap();
+        let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.app_id, "cli_123456");
+        assert_eq!(parsed.app_secret, "secret_abc");
+        assert_eq!(parsed.encrypt_key.as_deref(), Some("encrypt_key"));
+        assert_eq!(parsed.verification_token.as_deref(), Some("verify_token"));
+        assert_eq!(parsed.allowed_users.len(), 2);
+        assert!(parsed.use_feishu);
+    }
+
+    #[test]
+    fn lark_config_toml_roundtrip() {
+        let lc = LarkConfig {
+            app_id: "cli_123456".into(),
+            app_secret: "secret_abc".into(),
+            encrypt_key: Some("encrypt_key".into()),
+            verification_token: Some("verify_token".into()),
+            allowed_users: vec!["*".into()],
+            use_feishu: false,
+            receive_mode: LarkReceiveMode::Webhook,
+            port: Some(9898),
+        };
+        let toml_str = toml::to_string(&lc).unwrap();
+        let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.app_id, "cli_123456");
+        assert_eq!(parsed.app_secret, "secret_abc");
+        assert!(!parsed.use_feishu);
+    }
+
+    #[test]
+    fn lark_config_deserializes_without_optional_fields() {
+        let json = r#"{"app_id":"cli_123","app_secret":"secret"}"#;
+        let parsed: LarkConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.encrypt_key.is_none());
+        assert!(parsed.verification_token.is_none());
+        assert!(parsed.allowed_users.is_empty());
+        assert!(!parsed.use_feishu);
+    }
+
+    #[test]
+    fn lark_config_defaults_to_lark_endpoint() {
+        let json = r#"{"app_id":"cli_123","app_secret":"secret"}"#;
+        let parsed: LarkConfig = serde_json::from_str(json).unwrap();
+        assert!(
+            !parsed.use_feishu,
+            "use_feishu should default to false (Lark)"
+        );
+    }
+
+    #[test]
+    fn lark_config_with_wildcard_allowed_users() {
+        let json = r#"{"app_id":"cli_123","app_secret":"secret","allowed_users":["*"]}"#;
+        let parsed: LarkConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.allowed_users, vec!["*"]);
     }
 }
