@@ -62,7 +62,7 @@ ls -lh target/release/zeroclaw
 /usr/bin/time -l target/release/zeroclaw status
 ```
 
-## Prerequesites
+## Prerequisites
 
 <details>
 <summary><strong>Windows</strong></summary>
