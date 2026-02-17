@@ -1,0 +1,112 @@
+name: Update Contributors NOTICE
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Run every Sunday at 00:00 UTC
+    - cron: '0 0 * * 0'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-notice:
+    name: Update NOTICE with new contributors
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Fetch contributors
+        id: contributors
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Fetch all contributors (excluding bots)
+          gh api \
+            --paginate \
+            repos/${{ github.repository }}/contributors \
+            --jq '.[] | select(.type != "Bot") | .login' > /tmp/contributors_raw.txt
+
+          # Sort alphabetically and filter
+          sort -f < /tmp/contributors_raw.txt > contributors.txt
+
+          # Count contributors
+          count=$(wc -l < contributors.txt | tr -d ' ')
+          echo "count=$count" >> $GITHUB_OUTPUT
+
+      - name: Generate new NOTICE file
+        run: |
+          cat > NOTICE << 'EOF'
+          ZeroClaw
+          Copyright 2025 ZeroClaw Labs
+
+          This product includes software developed at ZeroClaw Labs (https://github.com/zeroclaw-labs).
+
+          Contributors
+          ============
+
+          The following individuals have contributed to ZeroClaw:
+
+          EOF
+
+          # Append contributors in alphabetical order
+          sed 's/^/- /' contributors.txt >> NOTICE
+
+          # Add third-party dependencies section
+          cat >> NOTICE << 'EOF'
+
+
+          Third-Party Dependencies
+          =========================
+
+          This project uses the following third-party libraries and components,
+          each licensed under their respective terms:
+
+          See Cargo.lock for a complete list of dependencies and their licenses.
+          EOF
+
+      - name: Check if NOTICE changed
+        id: check_diff
+        run: |
+          if git diff --quiet NOTICE; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Pull Request
+        if: steps.check_diff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COUNT: ${{ steps.contributors.outputs.count }}
+        run: |
+          branch_name="auto/update-notice-$(date +%Y%m%d)"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git checkout -b "$branch_name"
+          git add NOTICE
+          git commit -m "chore(notice): update contributor list"
+          git push origin "$branch_name"
+
+          gh pr create \
+            --title "chore(notice): update contributor list" \
+            --body "Auto-generated update to NOTICE file with $COUNT contributors." \
+            --label "chore" \
+            --label "docs" \
+            --draft || true
+
+      - name: Summary
+        run: |
+          echo "## NOTICE Update Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.check_diff.outputs.changed }}" = "true" ]; then
+            echo "✅ PR created to update NOTICE" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✓ NOTICE file is up to date" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Contributors:** ${{ steps.contributors.outputs.count }}" >> $GITHUB_STEP_SUMMARY
