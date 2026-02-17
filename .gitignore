@@ -4,6 +4,17 @@ firmware/*/target
 *.db-journal
 .DS_Store
 .wt-pr37/
-.env
 __pycache__/
 *.pyc
+docker-compose.override.yml
+
+# Environment files (may contain secrets)
+.env
+.env.local
+.env.*.local
+
+# Secret keys and credentials
+.secret_key
+*.key
+*.pem
+credentials.json
