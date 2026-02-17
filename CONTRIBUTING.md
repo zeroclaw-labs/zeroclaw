@@ -16,27 +16,44 @@ git config core.hooksPath .githooks
 cargo build
 
 # Run tests (all must pass)
-cargo test
+cargo test --locked
 
 # Format & lint (required before PR)
-cargo fmt --all -- --check
-cargo clippy --all-targets -- -D clippy::correctness
+./scripts/ci/rust_quality_gate.sh
 
 # Optional strict lint audit (recommended periodically)
-cargo clippy --all-targets -- -D warnings
+./scripts/ci/rust_quality_gate.sh --strict
+
+# Optional docs lint gate (blocks only markdown issues on changed lines)
+./scripts/ci/docs_quality_gate.sh
+
+# Optional docs links gate (checks only links added on changed lines)
+./scripts/ci/docs_links_gate.sh
 
 # Release build (~3.4MB)
-cargo build --release
+cargo build --release --locked
 ```
 
 ### Pre-push hook
 
-The repo includes a pre-push hook in `.githooks/` that enforces `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D clippy::correctness`, and `cargo test` before every push. Enable it with `git config core.hooksPath .githooks`.
+The repo includes a pre-push hook in `.githooks/` that enforces `./scripts/ci/rust_quality_gate.sh` and `cargo test --locked` before every push. Enable it with `git config core.hooksPath .githooks`.
 
 For an opt-in strict lint pass during pre-push, set:
 
 ```bash
 ZEROCLAW_STRICT_LINT=1 git push
+```
+
+For an opt-in docs quality pass during pre-push (changed-line markdown gate), set:
+
+```bash
+ZEROCLAW_DOCS_LINT=1 git push
+```
+
+For an opt-in docs links pass during pre-push (added-links gate), set:
+
+```bash
+ZEROCLAW_DOCS_LINKS=1 git push
 ```
 
 For full CI parity in Docker, run:
@@ -340,10 +357,9 @@ impl Tool for YourTool {
 ## Pull Request Checklist
 
 - [ ] PR template sections are completed (including security + rollback)
-- [ ] `cargo fmt --all -- --check` — code is formatted
-- [ ] `cargo clippy --all-targets -- -D clippy::correctness` — merge gate lint baseline passes
-- [ ] `cargo test` — all tests pass locally or skipped tests are explained
-- [ ] Optional strict audit: `cargo clippy --all-targets -- -D warnings` (run when doing lint cleanup or before release-hardening work)
+- [ ] `./scripts/ci/rust_quality_gate.sh` — merge gate formatter/lint baseline passes
+- [ ] `cargo test --locked` — all tests pass locally or skipped tests are explained
+- [ ] Optional strict audit: `./scripts/ci/rust_quality_gate.sh --strict` (run when doing lint cleanup or before release-hardening work)
 - [ ] New code has inline `#[cfg(test)]` tests
 - [ ] No new dependencies unless absolutely necessary (we optimize for binary size)
 - [ ] README updated if adding user-facing features

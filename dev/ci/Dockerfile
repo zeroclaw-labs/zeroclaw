@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-RUN rustup toolchain install 1.92 --profile minimal --component rustfmt --component clippy
+RUN rustup toolchain install 1.92.0 --profile minimal --component rustfmt --component clippy
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \

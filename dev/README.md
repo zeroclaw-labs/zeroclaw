@@ -102,8 +102,7 @@ Use this when you want CI-style validation without relying on GitHub Actions and
 
 This runs inside a container:
 
-- `cargo fmt --all -- --check`
-- `cargo clippy --locked --all-targets -- -D clippy::correctness`
+- `./scripts/ci/rust_quality_gate.sh`
 - `cargo test --locked --verbose`
 - `cargo build --release --locked --verbose`
 - `cargo deny check licenses sources`
@@ -126,6 +125,10 @@ To run an opt-in strict lint audit locally:
 ./dev/ci.sh audit
 ./dev/ci.sh security
 ./dev/ci.sh docker-smoke
+# Optional host-side docs gate (changed-line markdown lint)
+./scripts/ci/docs_quality_gate.sh
+# Optional host-side docs links gate (changed-line added links)
+./scripts/ci/docs_links_gate.sh
 ```
 
 Note: local `deny` focuses on license/source policy; advisory scanning is handled by `audit`.
@@ -154,4 +157,4 @@ Note: local `deny` focuses on license/source policy; advisory scanning is handle
 
 - Both `Dockerfile` and `dev/ci/Dockerfile` use BuildKit cache mounts for Cargo registry/git data.
 - Local CI reuses named Docker volumes for Cargo registry/git and target outputs.
-- The CI image keeps Rust toolchain defaults from `rust:1.92-slim` (no custom `CARGO_HOME`/`RUSTUP_HOME` overrides), preventing repeated toolchain bootstrapping on each run.
+- The CI image keeps Rust toolchain defaults from `rust:1.92-slim` and installs pinned toolchain `1.92.0` (no custom `CARGO_HOME`/`RUSTUP_HOME` overrides), preventing repeated toolchain bootstrapping on each run.

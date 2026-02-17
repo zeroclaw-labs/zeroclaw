@@ -25,6 +25,7 @@ jobs:
             docs_changed: ${{ steps.scope.outputs.docs_changed }}
             rust_changed: ${{ steps.scope.outputs.rust_changed }}
             docs_files: ${{ steps.scope.outputs.docs_files }}
+            base_sha: ${{ steps.scope.outputs.base_sha }}
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
               with:
@@ -54,6 +55,7 @@ jobs:
                       echo "docs_only=false"
                       echo "docs_changed=false"
                       echo "rust_changed=true"
+                      echo "base_sha="
                     } >> "$GITHUB_OUTPUT"
                     write_empty_docs_files
                     exit 0
@@ -65,6 +67,7 @@ jobs:
                       echo "docs_only=false"
                       echo "docs_changed=false"
                       echo "rust_changed=false"
+                      echo "base_sha=$BASE"
                     } >> "$GITHUB_OUTPUT"
                     write_empty_docs_files
                     exit 0
@@ -109,6 +112,7 @@ jobs:
                     echo "docs_only=$docs_only"
                     echo "docs_changed=$docs_changed"
                     echo "rust_changed=$rust_changed"
+                    echo "base_sha=$BASE"
                     echo "docs_files<<EOF"
                     printf '%s\n' "${docs_files[@]}"
                     echo "EOF"
@@ -126,13 +130,11 @@ jobs:
                   fetch-depth: 0
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
-                  toolchain: 1.92
+                  toolchain: 1.92.0
                   components: rustfmt, clippy
             - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-            - name: Run rustfmt
-              run: cargo fmt --all -- --check
-            - name: Run clippy
-              run: cargo clippy --locked --all-targets -- -D clippy::correctness
+            - name: Run rust quality gate
+              run: ./scripts/ci/rust_quality_gate.sh
 
     test:
         name: Test
@@ -144,7 +146,7 @@ jobs:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
-                  toolchain: 1.92
+                  toolchain: 1.92.0
             - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
             - name: Run tests
               run: cargo test --locked --verbose
@@ -160,7 +162,7 @@ jobs:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
-                  toolchain: 1.92
+                  toolchain: 1.92.0
             - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
             - name: Build release binary
               run: cargo build --release --locked --verbose
@@ -191,13 +193,38 @@ jobs:
         timeout-minutes: 15
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-            - name: Markdown lint
-              uses: DavidAnson/markdownlint-cli2-action@07035fd053f7be764496c0f8d8f9f41f98305101 # v22
               with:
-                  globs: ${{ needs.changes.outputs.docs_files }}
+                  fetch-depth: 0
 
-            - name: Link check (offline)
+            - name: Markdown lint (changed lines only)
+              env:
+                  BASE_SHA: ${{ needs.changes.outputs.base_sha }}
+                  DOCS_FILES: ${{ needs.changes.outputs.docs_files }}
+              run: ./scripts/ci/docs_quality_gate.sh
+
+            - name: Collect added links
+              id: collect_links
+              shell: bash
+              env:
+                  BASE_SHA: ${{ needs.changes.outputs.base_sha }}
+                  DOCS_FILES: ${{ needs.changes.outputs.docs_files }}
+              run: |
+                  set -euo pipefail
+                  python3 ./scripts/ci/collect_changed_links.py \
+                    --base "$BASE_SHA" \
+                    --docs-files "$DOCS_FILES" \
+                    --output .ci-added-links.txt
+                  count=$(wc -l < .ci-added-links.txt | tr -d ' ')
+                  echo "count=$count" >> "$GITHUB_OUTPUT"
+                  if [ "$count" -gt 0 ]; then
+                    echo "Added links queued for check:"
+                    cat .ci-added-links.txt
+                  else
+                    echo "No added links found in changed docs lines."
+                  fi
+
+            - name: Link check (offline, added links only)
+              if: steps.collect_links.outputs.count != '0'
               uses: lycheeverse/lychee-action@a8c4c7cb88f0c7386610c35eb25108e448569cb0 # v2
               with:
                   fail: true
@@ -205,9 +232,13 @@ jobs:
                       --offline
                       --no-progress
                       --format detailed
-                      ${{ needs.changes.outputs.docs_files }}
+                      .ci-added-links.txt
               env:
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Skip link check (no added links)
+              if: steps.collect_links.outputs.count == '0'
+              run: echo "No added links in changed docs lines. Link check skipped."
 
     ci-required:
         name: CI Required Gate

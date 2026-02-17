@@ -9,7 +9,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 ### Merge-Blocking
 
 - `.github/workflows/ci.yml` (`CI`)
-    - Purpose: Rust validation (`cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D clippy::correctness`, `test`, release build smoke) + docs quality checks when docs change
+    - Purpose: Rust validation (`cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D clippy::correctness`, `test`, release build smoke) + docs quality checks when docs change (`markdownlint` blocks only issues on changed lines; link check scans only links added on changed lines)
     - Merge gate: `CI Required Gate`
 - `.github/workflows/workflow-sanity.yml` (`Workflow Sanity`)
     - Purpose: lint GitHub workflow files (`actionlint`, tab checks)
@@ -75,12 +75,14 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 ## Maintenance Rules
 
 - Keep merge-blocking checks deterministic and reproducible (`--locked` where applicable).
-- Keep merge-blocking clippy policy aligned across `.github/workflows/ci.yml`, `dev/ci.sh`, and `.githooks/pre-push` (`cargo clippy --all-targets -- -D clippy::correctness`).
-- Run strict lint audits regularly via `cargo clippy --all-targets -- -D warnings` (for example through `./dev/ci.sh lint-strict`) and track cleanup in focused PRs.
+- Keep merge-blocking rust quality policy aligned across `.github/workflows/ci.yml`, `dev/ci.sh`, and `.githooks/pre-push` (`./scripts/ci/rust_quality_gate.sh`).
+- Run strict lint audits regularly via `./scripts/ci/rust_quality_gate.sh --strict` (for example through `./dev/ci.sh lint-strict`) and track cleanup in focused PRs.
+- Keep docs markdown gating incremental via `./scripts/ci/docs_quality_gate.sh` (block changed-line issues, report baseline issues separately).
+- Keep docs link gating incremental via `./scripts/ci/collect_changed_links.py` + lychee (check only links added on changed lines).
 - Prefer explicit workflow permissions (least privilege).
 - Keep Actions source policy restricted to approved allowlist patterns (see `docs/actions-source-policy.md`).
 - Use path filters for expensive workflows when practical.
-- Keep docs quality checks low-noise (`markdownlint` + offline link checks).
+- Keep docs quality checks low-noise (incremental markdown + incremental added-link checks).
 - Keep dependency update volume controlled (grouping + PR limits).
 - Avoid mixing onboarding/community automation with merge-gating logic.
 
