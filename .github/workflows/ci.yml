@@ -24,6 +24,7 @@ jobs:
             docs_only: ${{ steps.scope.outputs.docs_only }}
             docs_changed: ${{ steps.scope.outputs.docs_changed }}
             rust_changed: ${{ steps.scope.outputs.rust_changed }}
+            workflow_changed: ${{ steps.scope.outputs.workflow_changed }}
             docs_files: ${{ steps.scope.outputs.docs_files }}
             base_sha: ${{ steps.scope.outputs.base_sha }}
         steps:
@@ -55,6 +56,7 @@ jobs:
                       echo "docs_only=false"
                       echo "docs_changed=false"
                       echo "rust_changed=true"
+                      echo "workflow_changed=false"
                       echo "base_sha="
                     } >> "$GITHUB_OUTPUT"
                     write_empty_docs_files
@@ -67,6 +69,7 @@ jobs:
                       echo "docs_only=false"
                       echo "docs_changed=false"
                       echo "rust_changed=false"
+                      echo "workflow_changed=false"
                       echo "base_sha=$BASE"
                     } >> "$GITHUB_OUTPUT"
                     write_empty_docs_files
@@ -76,9 +79,14 @@ jobs:
                   docs_only=true
                   docs_changed=false
                   rust_changed=false
+                  workflow_changed=false
                   docs_files=()
                   while IFS= read -r file; do
                     [ -z "$file" ] && continue
+
+                    if [[ "$file" == .github/workflows/* ]]; then
+                      workflow_changed=true
+                    fi
 
                     if [[ "$file" == docs/* ]] \
                       || [[ "$file" == *.md ]] \
@@ -112,6 +120,7 @@ jobs:
                     echo "docs_only=$docs_only"
                     echo "docs_changed=$docs_changed"
                     echo "rust_changed=$rust_changed"
+                    echo "workflow_changed=$workflow_changed"
                     echo "base_sha=$BASE"
                     echo "docs_files<<EOF"
                     printf '%s\n' "${docs_files[@]}"
@@ -260,10 +269,94 @@ jobs:
               if: steps.collect_links.outputs.count == '0'
               run: echo "No added links in changed docs lines. Link check skipped."
 
+    workflow-owner-approval:
+        name: Workflow Owner Approval
+        needs: [changes]
+        if: github.event_name == 'pull_request' && needs.changes.outputs.workflow_changed == 'true'
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        permissions:
+            contents: read
+            pull-requests: read
+        steps:
+            - name: Require owner approval for workflow file changes
+              uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+              env:
+                  WORKFLOW_OWNER_LOGINS: ${{ vars.WORKFLOW_OWNER_LOGINS || 'theonlyhennygod,willsarg' }}
+              with:
+                  script: |
+                      const owner = context.repo.owner;
+                      const repo = context.repo.repo;
+                      const prNumber = context.payload.pull_request?.number;
+                      if (!prNumber) {
+                        core.setFailed("Missing pull_request context.");
+                        return;
+                      }
+
+                      const ownerAllowlist = (process.env.WORKFLOW_OWNER_LOGINS || "")
+                        .split(",")
+                        .map((login) => login.trim().toLowerCase())
+                        .filter(Boolean);
+
+                      if (ownerAllowlist.length === 0) {
+                        core.setFailed("WORKFLOW_OWNER_LOGINS is empty. Set a repository variable or use a fallback value.");
+                        return;
+                      }
+
+                      const files = await github.paginate(github.rest.pulls.listFiles, {
+                        owner,
+                        repo,
+                        pull_number: prNumber,
+                        per_page: 100,
+                      });
+
+                      const workflowFiles = files
+                        .map((file) => file.filename)
+                        .filter((name) => name.startsWith(".github/workflows/"));
+
+                      if (workflowFiles.length === 0) {
+                        core.info("No workflow files changed in this PR.");
+                        return;
+                      }
+
+                      core.info(`Workflow files changed:\n- ${workflowFiles.join("\n- ")}`);
+
+                      const reviews = await github.paginate(github.rest.pulls.listReviews, {
+                        owner,
+                        repo,
+                        pull_number: prNumber,
+                        per_page: 100,
+                      });
+
+                      const latestReviewByUser = new Map();
+                      for (const review of reviews) {
+                        const login = review.user?.login;
+                        if (!login) continue;
+                        latestReviewByUser.set(login.toLowerCase(), review.state);
+                      }
+
+                      const approvedUsers = [...latestReviewByUser.entries()]
+                        .filter(([, state]) => state === "APPROVED")
+                        .map(([login]) => login);
+
+                      if (approvedUsers.length === 0) {
+                        core.setFailed("Workflow files changed but no approving review is present.");
+                        return;
+                      }
+
+                      const ownerApprover = approvedUsers.find((login) => ownerAllowlist.includes(login));
+                      if (!ownerApprover) {
+                        core.setFailed(
+                          `Workflow files changed. Approvals found (${approvedUsers.join(", ")}), but none match WORKFLOW_OWNER_LOGINS.`,
+                        );
+                        return;
+                      }
+
+                      core.info(`Workflow owner approval present: @${ownerApprover}`);
+
     ci-required:
         name: CI Required Gate
         if: always()
-        needs: [changes, lint, lint-strict-delta, test, build, docs-only, non-rust, docs-quality]
+        needs: [changes, lint, lint-strict-delta, test, build, docs-only, non-rust, docs-quality, workflow-owner-approval]
         runs-on: blacksmith-2vcpu-ubuntu-2404
         steps:
             - name: Enforce required status
@@ -273,10 +366,17 @@ jobs:
 
                   docs_changed="${{ needs.changes.outputs.docs_changed }}"
                   rust_changed="${{ needs.changes.outputs.rust_changed }}"
+                  workflow_changed="${{ needs.changes.outputs.workflow_changed }}"
                   docs_result="${{ needs.docs-quality.result }}"
+                  workflow_owner_result="${{ needs.workflow-owner-approval.result }}"
 
                   if [ "${{ needs.changes.outputs.docs_only }}" = "true" ]; then
                     echo "docs=${docs_result}"
+                    echo "workflow_owner_approval=${workflow_owner_result}"
+                    if [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
+                      echo "Workflow files changed but workflow owner approval gate did not pass."
+                      exit 1
+                    fi
                     if [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
                       echo "Docs-only change touched markdown docs, but docs-quality did not pass."
                       exit 1
@@ -288,6 +388,11 @@ jobs:
                   if [ "$rust_changed" != "true" ]; then
                     echo "rust_changed=false (non-rust fast path)"
                     echo "docs=${docs_result}"
+                    echo "workflow_owner_approval=${workflow_owner_result}"
+                    if [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
+                      echo "Workflow files changed but workflow owner approval gate did not pass."
+                      exit 1
+                    fi
                     if [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
                       echo "Docs changed but docs-quality did not pass."
                       exit 1
@@ -306,9 +411,15 @@ jobs:
                   echo "test=${test_result}"
                   echo "build=${build_result}"
                   echo "docs=${docs_result}"
+                  echo "workflow_owner_approval=${workflow_owner_result}"
 
                   if [ "$lint_result" != "success" ] || [ "$lint_strict_delta_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ]; then
                     echo "Required CI jobs did not pass."
+                    exit 1
+                  fi
+
+                  if [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
+                    echo "Workflow files changed but workflow owner approval gate did not pass."
                     exit 1
                   fi
 
