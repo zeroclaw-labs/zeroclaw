@@ -1623,37 +1623,54 @@ impl Default for Config {
     }
 }
 
+fn default_config_and_workspace_dirs() -> Result<(PathBuf, PathBuf)> {
+    let home = UserDirs::new()
+        .map(|u| u.home_dir().to_path_buf())
+        .context("Could not find home directory")?;
+    let config_dir = home.join(".zeroclaw");
+    Ok((config_dir.clone(), config_dir.join("workspace")))
+}
+
+fn resolve_config_dir_for_workspace(workspace_dir: &Path) -> PathBuf {
+    let workspace_config_dir = workspace_dir.to_path_buf();
+    if workspace_config_dir.join("config.toml").exists() {
+        return workspace_config_dir;
+    }
+
+    let legacy_config_dir = workspace_dir
+        .parent()
+        .map(|parent| parent.join(".zeroclaw"));
+    if let Some(legacy_dir) = legacy_config_dir {
+        if legacy_dir.join("config.toml").exists() {
+            return legacy_dir;
+        }
+
+        if workspace_dir
+            .file_name()
+            .is_some_and(|name| name == std::ffi::OsStr::new("workspace"))
+        {
+            return legacy_dir;
+        }
+    }
+
+    workspace_config_dir
+}
+
 impl Config {
     pub fn load_or_init() -> Result<Self> {
-        // Check ZEROCLAW_WORKSPACE first, before determining config path
-        let (zeroclaw_dir, workspace_dir) =
-            if let Ok(custom_workspace) = std::env::var("ZEROCLAW_WORKSPACE") {
-                if !custom_workspace.is_empty() {
-                    let workspace = PathBuf::from(&custom_workspace);
-                    let config_dir = workspace.join(".zeroclaw");
-                    (config_dir, workspace)
-                } else {
-                    // Fall through to default if empty
-                    let home = UserDirs::new()
-                        .map(|u| u.home_dir().to_path_buf())
-                        .context("Could not find home directory")?;
-                    let default_dir = home.join(".zeroclaw");
-                    (default_dir.clone(), default_dir.join("workspace"))
-                }
-            } else {
-                let home = UserDirs::new()
-                    .map(|u| u.home_dir().to_path_buf())
-                    .context("Could not find home directory")?;
-                let default_dir = home.join(".zeroclaw");
-                (default_dir.clone(), default_dir.join("workspace"))
-            };
+        // Resolve workspace first so config loading can follow ZEROCLAW_WORKSPACE.
+        let (zeroclaw_dir, workspace_dir) = match std::env::var("ZEROCLAW_WORKSPACE") {
+            Ok(custom_workspace) if !custom_workspace.is_empty() => {
+                let workspace = PathBuf::from(custom_workspace);
+                (resolve_config_dir_for_workspace(&workspace), workspace)
+            }
+            _ => default_config_and_workspace_dirs()?,
+        };
 
         let config_path = zeroclaw_dir.join("config.toml");
 
-        if !zeroclaw_dir.exists() {
-            fs::create_dir_all(&zeroclaw_dir).context("Failed to create .zeroclaw directory")?;
-            fs::create_dir_all(&workspace_dir).context("Failed to create workspace directory")?;
-        }
+        fs::create_dir_all(&zeroclaw_dir).context("Failed to create config directory")?;
+        fs::create_dir_all(&workspace_dir).context("Failed to create workspace directory")?;
 
         if config_path.exists() {
             let contents =
@@ -2834,6 +2851,96 @@ default_temperature = 0.7
         assert_eq!(config.workspace_dir, PathBuf::from("/custom/workspace"));
 
         std::env::remove_var("ZEROCLAW_WORKSPACE");
+    }
+
+    #[test]
+    fn load_or_init_workspace_override_uses_workspace_root_for_config() {
+        let _env_guard = env_override_test_guard();
+        let temp_home =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let workspace_dir = temp_home.join("profile-a");
+
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &temp_home);
+        std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir);
+
+        let config = Config::load_or_init().unwrap();
+
+        assert_eq!(config.workspace_dir, workspace_dir);
+        assert_eq!(config.config_path, workspace_dir.join("config.toml"));
+        assert!(workspace_dir.join("config.toml").exists());
+
+        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        let _ = fs::remove_dir_all(temp_home);
+    }
+
+    #[test]
+    fn load_or_init_workspace_suffix_uses_legacy_config_layout() {
+        let _env_guard = env_override_test_guard();
+        let temp_home =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let workspace_dir = temp_home.join("workspace");
+        let legacy_config_path = temp_home.join(".zeroclaw").join("config.toml");
+
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &temp_home);
+        std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir);
+
+        let config = Config::load_or_init().unwrap();
+
+        assert_eq!(config.workspace_dir, workspace_dir);
+        assert_eq!(config.config_path, legacy_config_path);
+        assert!(config.config_path.exists());
+
+        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        let _ = fs::remove_dir_all(temp_home);
+    }
+
+    #[test]
+    fn load_or_init_workspace_override_keeps_existing_legacy_config() {
+        let _env_guard = env_override_test_guard();
+        let temp_home =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let workspace_dir = temp_home.join("custom-workspace");
+        let legacy_config_dir = temp_home.join(".zeroclaw");
+        let legacy_config_path = legacy_config_dir.join("config.toml");
+
+        fs::create_dir_all(&legacy_config_dir).unwrap();
+        fs::write(
+            &legacy_config_path,
+            r#"default_temperature = 0.7
+default_model = "legacy-model"
+"#,
+        )
+        .unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &temp_home);
+        std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir);
+
+        let config = Config::load_or_init().unwrap();
+
+        assert_eq!(config.workspace_dir, workspace_dir);
+        assert_eq!(config.config_path, legacy_config_path);
+        assert_eq!(config.default_model.as_deref(), Some("legacy-model"));
+
+        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        let _ = fs::remove_dir_all(temp_home);
     }
 
     #[test]
