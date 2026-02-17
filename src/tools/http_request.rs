@@ -749,4 +749,54 @@ mod tests {
         let _ = HttpRequestTool::redact_headers_for_display(&headers);
         assert_eq!(headers[0].1, "Bearer real-token");
     }
+
+    // ── SSRF: alternate IP notation bypass defense-in-depth ─────────
+    //
+    // Rust's IpAddr::parse() rejects non-standard notations (octal, hex,
+    // decimal integer, zero-padded). These tests document that property
+    // so regressions are caught if the parsing strategy ever changes.
+
+    #[test]
+    fn ssrf_octal_loopback_not_parsed_as_ip() {
+        // 0177.0.0.1 is octal for 127.0.0.1 in some languages, but
+        // Rust's IpAddr rejects it — it falls through as a hostname.
+        assert!(!is_private_or_local_host("0177.0.0.1"));
+    }
+
+    #[test]
+    fn ssrf_hex_loopback_not_parsed_as_ip() {
+        // 0x7f000001 is hex for 127.0.0.1 in some languages.
+        assert!(!is_private_or_local_host("0x7f000001"));
+    }
+
+    #[test]
+    fn ssrf_decimal_loopback_not_parsed_as_ip() {
+        // 2130706433 is decimal for 127.0.0.1 in some languages.
+        assert!(!is_private_or_local_host("2130706433"));
+    }
+
+    #[test]
+    fn ssrf_zero_padded_loopback_not_parsed_as_ip() {
+        // 127.000.000.001 uses zero-padded octets.
+        assert!(!is_private_or_local_host("127.000.000.001"));
+    }
+
+    #[test]
+    fn ssrf_alternate_notations_rejected_by_validate_url() {
+        // Even if is_private_or_local_host doesn't flag these, they
+        // fail the allowlist because they're treated as hostnames.
+        let tool = test_tool(vec!["example.com"]);
+        for notation in [
+            "http://0177.0.0.1",
+            "http://0x7f000001",
+            "http://2130706433",
+            "http://127.000.000.001",
+        ] {
+            let err = tool.validate_url(notation).unwrap_err().to_string();
+            assert!(
+                err.contains("allowed_domains"),
+                "Expected allowlist rejection for {notation}, got: {err}"
+            );
+        }
+    }
 }

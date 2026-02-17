@@ -450,7 +450,7 @@ impl LarkChannel {
                     let channel_msg = ChannelMessage {
                         id: Uuid::new_v4().to_string(),
                         sender: lark_msg.chat_id.clone(),
-                        reply_to: lark_msg.chat_id.clone(),
+                        reply_target: lark_msg.chat_id.clone(),
                         content: text,
                         channel: "lark".to_string(),
                         timestamp: std::time::SystemTime::now()
@@ -614,7 +614,7 @@ impl LarkChannel {
         messages.push(ChannelMessage {
             id: Uuid::new_v4().to_string(),
             sender: chat_id.to_string(),
-            reply_to: chat_id.to_string(),
+            reply_target: chat_id.to_string(),
             content: text,
             channel: "lark".to_string(),
             timestamp,

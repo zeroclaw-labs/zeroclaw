@@ -55,7 +55,7 @@ impl Tool for MemoryRecallTool {
             .and_then(serde_json::Value::as_u64)
             .map_or(5, |v| v as usize);
 
-        match self.memory.recall(query, limit).await {
+        match self.memory.recall(query, limit, None).await {
             Ok(entries) if entries.is_empty() => Ok(ToolResult {
                 success: true,
                 output: "No memories found matching that query.".into(),
@@ -112,10 +112,10 @@ mod tests {
     #[tokio::test]
     async fn recall_finds_match() {
         let (_tmp, mem) = seeded_mem();
-        mem.store("lang", "User prefers Rust", MemoryCategory::Core)
+        mem.store("lang", "User prefers Rust", MemoryCategory::Core, None)
             .await
             .unwrap();
-        mem.store("tz", "Timezone is EST", MemoryCategory::Core)
+        mem.store("tz", "Timezone is EST", MemoryCategory::Core, None)
             .await
             .unwrap();
 
@@ -134,6 +134,7 @@ mod tests {
                 &format!("k{i}"),
                 &format!("Rust fact {i}"),
                 MemoryCategory::Core,
+                None,
             )
             .await
             .unwrap();

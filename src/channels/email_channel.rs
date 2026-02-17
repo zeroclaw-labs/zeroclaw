@@ -14,11 +14,11 @@ use lettre::message::SinglePart;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
 use mail_parser::{MessageParser, MimeHeaders};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io::Write as IoWrite;
 use std::net::TcpStream;
-use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep};
@@ -40,7 +40,7 @@ pub struct EmailConfig {
     pub imap_folder: String,
     /// SMTP server hostname
     pub smtp_host: String,
-    /// SMTP server port (default: 587 for STARTTLS)
+    /// SMTP server port (default: 465 for TLS)
     #[serde(default = "default_smtp_port")]
     pub smtp_port: u16,
     /// Use TLS for SMTP (default: true)
@@ -64,7 +64,7 @@ fn default_imap_port() -> u16 {
     993
 }
 fn default_smtp_port() -> u16 {
-    587
+    465
 }
 fn default_imap_folder() -> String {
     "INBOX".into()
@@ -413,10 +413,7 @@ impl Channel for EmailChannel {
                 Ok(Ok(messages)) => {
                     for (id, sender, content, ts) in messages {
                         {
-                            let mut seen = self
-                                .seen_messages
-                                .lock()
-                                .expect("seen_messages mutex should not be poisoned");
+                            let mut seen = self.seen_messages.lock();
                             if seen.contains(&id) {
                                 continue;
                             }
@@ -428,8 +425,8 @@ impl Channel for EmailChannel {
                         } // MutexGuard dropped before await
                         let msg = ChannelMessage {
                             id,
-                            sender: sender.clone(),
-                            reply_to: sender,
+                            reply_target: sender.clone(),
+                            sender,
                             content,
                             channel: "email".to_string(),
                             timestamp: ts,
@@ -467,6 +464,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn default_smtp_port_uses_tls_port() {
+        assert_eq!(default_smtp_port(), 465);
+    }
+
+    #[test]
+    fn email_config_default_uses_tls_smtp_defaults() {
+        let config = EmailConfig::default();
+        assert_eq!(config.smtp_port, 465);
+        assert!(config.smtp_tls);
+    }
+
+    #[test]
     fn build_imap_tls_config_succeeds() {
         let tls_config =
             EmailChannel::build_imap_tls_config().expect("TLS config construction should succeed");
@@ -476,20 +485,14 @@ mod tests {
     #[test]
     fn seen_messages_starts_empty() {
         let channel = EmailChannel::new(EmailConfig::default());
-        let seen = channel
-            .seen_messages
-            .lock()
-            .expect("seen_messages mutex should not be poisoned");
+        let seen = channel.seen_messages.lock();
         assert!(seen.is_empty());
     }
 
     #[test]
     fn seen_messages_tracks_unique_ids() {
         let channel = EmailChannel::new(EmailConfig::default());
-        let mut seen = channel
-            .seen_messages
-            .lock()
-            .expect("seen_messages mutex should not be poisoned");
+        let mut seen = channel.seen_messages.lock();
 
         assert!(seen.insert("first-id".to_string()));
         assert!(!seen.insert("first-id".to_string()));
@@ -506,7 +509,7 @@ mod tests {
         assert_eq!(config.imap_port, 993);
         assert_eq!(config.imap_folder, "INBOX");
         assert_eq!(config.smtp_host, "");
-        assert_eq!(config.smtp_port, 587);
+        assert_eq!(config.smtp_port, 465);
         assert!(config.smtp_tls);
         assert_eq!(config.username, "");
         assert_eq!(config.password, "");
@@ -564,10 +567,7 @@ mod tests {
         let channel = EmailChannel::new(config.clone());
         assert_eq!(channel.config.imap_host, config.imap_host);
 
-        let seen_guard = channel
-            .seen_messages
-            .lock()
-            .expect("seen_messages mutex should not be poisoned");
+        let seen_guard = channel.seen_messages.lock();
         assert_eq!(seen_guard.len(), 0);
     }
 
@@ -767,8 +767,8 @@ mod tests {
     }
 
     #[test]
-    fn default_smtp_port_returns_587() {
-        assert_eq!(default_smtp_port(), 587);
+    fn default_smtp_port_returns_465() {
+        assert_eq!(default_smtp_port(), 465);
     }
 
     #[test]
@@ -824,7 +824,7 @@ mod tests {
 
         let config: EmailConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.imap_port, 993); // default
-        assert_eq!(config.smtp_port, 587); // default
+        assert_eq!(config.smtp_port, 465); // default
         assert!(config.smtp_tls); // default
         assert_eq!(config.poll_interval_secs, 60); // default
     }

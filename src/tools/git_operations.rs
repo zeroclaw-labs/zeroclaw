@@ -28,11 +28,20 @@ impl GitOperationsTool {
             if arg_lower.starts_with("--exec=")
                 || arg_lower.starts_with("--upload-pack=")
                 || arg_lower.starts_with("--receive-pack=")
+                || arg_lower.starts_with("--pager=")
+                || arg_lower.starts_with("--editor=")
+                || arg_lower == "--no-verify"
                 || arg_lower.contains("$(")
                 || arg_lower.contains('`')
                 || arg.contains('|')
                 || arg.contains(';')
+                || arg.contains('>')
             {
+                anyhow::bail!("Blocked potentially dangerous git argument: {arg}");
+            }
+            // Block `-c` config injection (exact match or `-c=...` prefix).
+            // This must not false-positive on `--cached` or `-cached`.
+            if arg_lower == "-c" || arg_lower.starts_with("-c=") {
                 anyhow::bail!("Blocked potentially dangerous git argument: {arg}");
             }
             result.push(arg.to_string());
@@ -128,6 +137,9 @@ impl GitOperationsTool {
             .get("cached")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+
+        // Validate files argument against injection patterns
+        self.sanitize_git_args(files)?;
 
         let mut git_args = vec!["diff", "--unified=3"];
         if cached {
@@ -267,6 +279,14 @@ impl GitOperationsTool {
         })
     }
 
+    fn truncate_commit_message(message: &str) -> String {
+        if message.chars().count() > 2000 {
+            format!("{}...", message.chars().take(1997).collect::<String>())
+        } else {
+            message.to_string()
+        }
+    }
+
     async fn git_commit(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let message = args
             .get("message")
@@ -286,11 +306,7 @@ impl GitOperationsTool {
         }
 
         // Limit message length
-        let message = if sanitized.len() > 2000 {
-            format!("{}...", &sanitized[..1997])
-        } else {
-            sanitized
-        };
+        let message = Self::truncate_commit_message(&sanitized);
 
         let output = self.run_git_command(&["commit", "-m", &message]).await;
 
@@ -313,6 +329,9 @@ impl GitOperationsTool {
             .get("paths")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'paths' parameter"))?;
+
+        // Validate paths against injection patterns
+        self.sanitize_git_args(paths)?;
 
         let output = self.run_git_command(&["add", "--", paths]).await;
 
@@ -575,6 +594,52 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_git_blocks_pager_editor_injection() {
+        let tmp = TempDir::new().unwrap();
+        let tool = test_tool(tmp.path());
+
+        assert!(tool.sanitize_git_args("--pager=less").is_err());
+        assert!(tool.sanitize_git_args("--editor=vim").is_err());
+    }
+
+    #[test]
+    fn sanitize_git_blocks_config_injection() {
+        let tmp = TempDir::new().unwrap();
+        let tool = test_tool(tmp.path());
+
+        // Exact `-c` flag (config injection)
+        assert!(tool.sanitize_git_args("-c core.sshCommand=evil").is_err());
+        assert!(tool.sanitize_git_args("-c=core.pager=less").is_err());
+    }
+
+    #[test]
+    fn sanitize_git_blocks_no_verify() {
+        let tmp = TempDir::new().unwrap();
+        let tool = test_tool(tmp.path());
+
+        assert!(tool.sanitize_git_args("--no-verify").is_err());
+    }
+
+    #[test]
+    fn sanitize_git_blocks_redirect_in_args() {
+        let tmp = TempDir::new().unwrap();
+        let tool = test_tool(tmp.path());
+
+        assert!(tool.sanitize_git_args("file.txt > /tmp/out").is_err());
+    }
+
+    #[test]
+    fn sanitize_git_cached_not_blocked() {
+        let tmp = TempDir::new().unwrap();
+        let tool = test_tool(tmp.path());
+
+        // --cached must NOT be blocked by the `-c` check
+        assert!(tool.sanitize_git_args("--cached").is_ok());
+        // Other safe flags starting with -c prefix
+        assert!(tool.sanitize_git_args("-cached").is_ok());
+    }
+
+    #[test]
     fn sanitize_git_allows_safe() {
         let tmp = TempDir::new().unwrap();
         let tool = test_tool(tmp.path());
@@ -583,6 +648,8 @@ mod tests {
         assert!(tool.sanitize_git_args("main").is_ok());
         assert!(tool.sanitize_git_args("feature/test-branch").is_ok());
         assert!(tool.sanitize_git_args("--cached").is_ok());
+        assert!(tool.sanitize_git_args("src/main.rs").is_ok());
+        assert!(tool.sanitize_git_args(".").is_ok());
     }
 
     #[test]
@@ -690,5 +757,13 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("Unknown operation"));
+    }
+
+    #[test]
+    fn truncates_multibyte_commit_message_without_panicking() {
+        let long = "🦀".repeat(2500);
+        let truncated = GitOperationsTool::truncate_commit_message(&long);
+
+        assert_eq!(truncated.chars().count(), 2000);
     }
 }

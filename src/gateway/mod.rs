@@ -26,9 +26,10 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
@@ -83,10 +84,7 @@ impl SlidingWindowRateLimiter {
         let now = Instant::now();
         let cutoff = now.checked_sub(self.window).unwrap_or_else(Instant::now);
 
-        let mut guard = self
-            .requests
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = self.requests.lock();
         let (requests, last_sweep) = &mut *guard;
 
         // Periodic sweep: remove IPs with no recent requests
@@ -151,10 +149,7 @@ impl IdempotencyStore {
     /// Returns true if this key is new and is now recorded.
     fn record_if_new(&self, key: &str) -> bool {
         let now = Instant::now();
-        let mut keys = self
-            .keys
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut keys = self.keys.lock();
 
         keys.retain(|_, seen_at| now.duration_since(*seen_at) < self.ttl);
 
@@ -551,7 +546,7 @@ async fn handle_webhook(
         let key = webhook_memory_key();
         let _ = state
             .mem
-            .store(&key, message, MemoryCategory::Conversation)
+            .store(&key, message, MemoryCategory::Conversation, None)
             .await;
     }
 
@@ -704,7 +699,7 @@ async fn handle_whatsapp_message(
             let key = whatsapp_memory_key(msg);
             let _ = state
                 .mem
-                .store(&key, &msg.content, MemoryCategory::Conversation)
+                .store(&key, &msg.content, MemoryCategory::Conversation, None)
                 .await;
         }
 
@@ -716,7 +711,7 @@ async fn handle_whatsapp_message(
         {
             Ok(response) => {
                 // Send reply via WhatsApp
-                if let Err(e) = wa.send(&response, &msg.reply_to).await {
+                if let Err(e) = wa.send(&response, &msg.reply_target).await {
                     tracing::error!("Failed to send WhatsApp reply: {e}");
                 }
             }
@@ -725,7 +720,7 @@ async fn handle_whatsapp_message(
                 let _ = wa
                     .send(
                         "Sorry, I couldn't process your message right now.",
-                        &msg.reply_to,
+                        &msg.reply_target,
                     )
                     .await;
             }
@@ -746,8 +741,8 @@ mod tests {
     use axum::http::HeaderValue;
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
+    use parking_lot::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
 
     #[test]
     fn security_body_limit_is_64kb() {
@@ -804,19 +799,13 @@ mod tests {
         assert!(limiter.allow("ip-3"));
 
         {
-            let guard = limiter
-                .requests
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let guard = limiter.requests.lock();
             assert_eq!(guard.0.len(), 3);
         }
 
         // Force a sweep by backdating last_sweep
         {
-            let mut guard = limiter
-                .requests
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut guard = limiter.requests.lock();
             guard.1 = Instant::now()
                 .checked_sub(Duration::from_secs(RATE_LIMITER_SWEEP_INTERVAL_SECS + 1))
                 .unwrap();
@@ -829,10 +818,7 @@ mod tests {
         assert!(limiter.allow("ip-1"));
 
         {
-            let guard = limiter
-                .requests
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let guard = limiter.requests.lock();
             assert_eq!(guard.0.len(), 1, "Stale entries should have been swept");
             assert!(guard.0.contains_key("ip-1"));
         }
@@ -869,7 +855,7 @@ mod tests {
         let msg = ChannelMessage {
             id: "wamid-123".into(),
             sender: "+1234567890".into(),
-            reply_to: "+1234567890".into(),
+            reply_target: "+1234567890".into(),
             content: "hello".into(),
             channel: "whatsapp".into(),
             timestamp: 1,
@@ -893,11 +879,17 @@ mod tests {
             _key: &str,
             _content: &str,
             _category: MemoryCategory,
+            _session_id: Option<&str>,
         ) -> anyhow::Result<()> {
             Ok(())
         }
 
-        async fn recall(&self, _query: &str, _limit: usize) -> anyhow::Result<Vec<MemoryEntry>> {
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(Vec::new())
         }
 
@@ -908,6 +900,7 @@ mod tests {
         async fn list(
             &self,
             _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(Vec::new())
         }
@@ -960,15 +953,18 @@ mod tests {
             key: &str,
             _content: &str,
             _category: MemoryCategory,
+            _session_id: Option<&str>,
         ) -> anyhow::Result<()> {
-            self.keys
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(key.to_string());
+            self.keys.lock().push(key.to_string());
             Ok(())
         }
 
-        async fn recall(&self, _query: &str, _limit: usize) -> anyhow::Result<Vec<MemoryEntry>> {
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(Vec::new())
         }
 
@@ -979,6 +975,7 @@ mod tests {
         async fn list(
             &self,
             _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(Vec::new())
         }
@@ -988,11 +985,7 @@ mod tests {
         }
 
         async fn count(&self) -> anyhow::Result<usize> {
-            let size = self
-                .keys
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .len();
+            let size = self.keys.lock().len();
             Ok(size)
         }
 
@@ -1087,11 +1080,7 @@ mod tests {
             .into_response();
         assert_eq!(second.status(), StatusCode::OK);
 
-        let keys = tracking_impl
-            .keys
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        let keys = tracking_impl.keys.lock().clone();
         assert_eq!(keys.len(), 2);
         assert_ne!(keys[0], keys[1]);
         assert!(keys[0].starts_with("webhook_msg_"));

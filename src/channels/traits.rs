@@ -5,9 +5,7 @@ use async_trait::async_trait;
 pub struct ChannelMessage {
     pub id: String,
     pub sender: String,
-    /// Channel-specific reply address (e.g. Telegram chat_id, Discord channel_id, Slack channel).
-    /// Used by `Channel::send()` to route the reply to the correct destination.
-    pub reply_to: String,
+    pub reply_target: String,
     pub content: String,
     pub channel: String,
     pub timestamp: u64,
@@ -65,7 +63,7 @@ mod tests {
             tx.send(ChannelMessage {
                 id: "1".into(),
                 sender: "tester".into(),
-                reply_to: "tester".into(),
+                reply_target: "tester".into(),
                 content: "hello".into(),
                 channel: "dummy".into(),
                 timestamp: 123,
@@ -80,7 +78,7 @@ mod tests {
         let message = ChannelMessage {
             id: "42".into(),
             sender: "alice".into(),
-            reply_to: "alice".into(),
+            reply_target: "alice".into(),
             content: "ping".into(),
             channel: "dummy".into(),
             timestamp: 999,
@@ -89,6 +87,7 @@ mod tests {
         let cloned = message.clone();
         assert_eq!(cloned.id, "42");
         assert_eq!(cloned.sender, "alice");
+        assert_eq!(cloned.reply_target, "alice");
         assert_eq!(cloned.content, "ping");
         assert_eq!(cloned.channel, "dummy");
         assert_eq!(cloned.timestamp, 999);
