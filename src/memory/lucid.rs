@@ -24,7 +24,9 @@ pub struct LucidMemory {
 impl LucidMemory {
     const DEFAULT_LUCID_CMD: &'static str = "lucid";
     const DEFAULT_TOKEN_BUDGET: usize = 200;
-    const DEFAULT_RECALL_TIMEOUT_MS: u64 = 120;
+    // Lucid CLI cold start can exceed 120ms on slower machines, which causes
+    // avoidable fallback to local-only memory and premature cooldown.
+    const DEFAULT_RECALL_TIMEOUT_MS: u64 = 500;
     const DEFAULT_STORE_TIMEOUT_MS: u64 = 800;
     const DEFAULT_LOCAL_HIT_THRESHOLD: usize = 3;
     const DEFAULT_FAILURE_COOLDOWN_MS: u64 = 15_000;
@@ -426,6 +428,38 @@ exit 1
         script_path.display().to_string()
     }
 
+    fn write_delayed_lucid_script(dir: &Path) -> String {
+        let script_path = dir.join("delayed-lucid.sh");
+        let script = r#"#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == "store" ]]; then
+  echo '{"success":true,"id":"mem_1"}'
+  exit 0
+fi
+
+if [[ "${1:-}" == "context" ]]; then
+  # Simulate a cold start that is slower than 120ms but below the 500ms timeout.
+  sleep 0.2
+  cat <<'EOF'
+<lucid-context>
+- [decision] Delayed token refresh guidance
+</lucid-context>
+EOF
+  exit 0
+fi
+
+echo "unsupported command" >&2
+exit 1
+"#;
+
+        fs::write(&script_path, script).unwrap();
+        let mut perms = fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).unwrap();
+        script_path.display().to_string()
+    }
+
     fn write_probe_lucid_script(dir: &Path, marker_path: &Path) -> String {
         let script_path = dir.join("probe-lucid.sh");
         let marker = marker_path.display().to_string();
@@ -468,7 +502,7 @@ exit 1
             cmd,
             200,
             3,
-            Duration::from_millis(120),
+            Duration::from_millis(500),
             Duration::from_millis(400),
             Duration::from_secs(2),
         )
@@ -521,6 +555,31 @@ exit 1
     }
 
     #[tokio::test]
+    async fn recall_handles_lucid_cold_start_delay_within_timeout() {
+        let tmp = TempDir::new().unwrap();
+        let delayed_cmd = write_delayed_lucid_script(tmp.path());
+        let memory = test_memory(tmp.path(), delayed_cmd);
+
+        memory
+            .store(
+                "local_note",
+                "Local sqlite auth fallback note",
+                MemoryCategory::Core,
+            )
+            .await
+            .unwrap();
+
+        let entries = memory.recall("auth", 5).await.unwrap();
+
+        assert!(entries
+            .iter()
+            .any(|e| e.content.contains("Local sqlite auth fallback note")));
+        assert!(entries
+            .iter()
+            .any(|e| e.content.contains("Delayed token refresh guidance")));
+    }
+
+    #[tokio::test]
     async fn recall_skips_lucid_when_local_hits_are_enough() {
         let tmp = TempDir::new().unwrap();
         let marker = tmp.path().join("context_calls.log");
@@ -533,7 +592,7 @@ exit 1
             probe_cmd,
             200,
             1,
-            Duration::from_millis(120),
+            Duration::from_millis(500),
             Duration::from_millis(400),
             Duration::from_secs(2),
         );
@@ -603,7 +662,7 @@ exit 1
             failing_cmd,
             200,
             99,
-            Duration::from_millis(120),
+            Duration::from_millis(500),
             Duration::from_millis(400),
             Duration::from_secs(5),
         );
