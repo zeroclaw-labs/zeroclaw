@@ -412,7 +412,10 @@ impl Channel for EmailChannel {
                 Ok(Ok(messages)) => {
                     for (id, sender, content, ts) in messages {
                         {
-                            let mut seen = self.seen_messages.lock().expect("seen_messages mutex should not be poisoned");
+                            let mut seen = self
+                                .seen_messages
+                                .lock()
+                                .expect("seen_messages mutex should not be poisoned");
                             if seen.contains(&id) {
                                 continue;
                             }
@@ -469,63 +472,27 @@ mod tests {
     }
 
     #[test]
-    fn bounded_seen_set_insert_and_contains() {
-        let mut set = BoundedSeenSet::new(10);
-        assert!(set.insert("a".into()));
-        assert!(set.contains("a"));
-        assert!(!set.contains("b"));
+    fn seen_messages_starts_empty() {
+        let channel = EmailChannel::new(EmailConfig::default());
+        let seen = channel
+            .seen_messages
+            .lock()
+            .expect("seen_messages mutex should not be poisoned");
+        assert!(seen.is_empty());
     }
 
     #[test]
-    fn bounded_seen_set_rejects_duplicates() {
-        let mut set = BoundedSeenSet::new(10);
-        assert!(set.insert("a".into()));
-        assert!(!set.insert("a".into()));
-        assert_eq!(set.len(), 1);
-    }
+    fn seen_messages_tracks_unique_ids() {
+        let channel = EmailChannel::new(EmailConfig::default());
+        let mut seen = channel
+            .seen_messages
+            .lock()
+            .expect("seen_messages mutex should not be poisoned");
 
-    #[test]
-    fn bounded_seen_set_evicts_oldest_at_capacity() {
-        let mut set = BoundedSeenSet::new(3);
-        set.insert("a".into());
-        set.insert("b".into());
-        set.insert("c".into());
-        assert_eq!(set.len(), 3);
-
-        set.insert("d".into());
-        assert_eq!(set.len(), 3);
-        assert!(!set.contains("a"), "oldest entry should be evicted");
-        assert!(set.contains("b"));
-        assert!(set.contains("c"));
-        assert!(set.contains("d"));
-    }
-
-    #[test]
-    fn bounded_seen_set_evicts_in_fifo_order() {
-        let mut set = BoundedSeenSet::new(2);
-        set.insert("first".into());
-        set.insert("second".into());
-        set.insert("third".into());
-        assert!(!set.contains("first"));
-        assert!(set.contains("second"));
-        assert!(set.contains("third"));
-
-        set.insert("fourth".into());
-        assert!(!set.contains("second"));
-        assert!(set.contains("third"));
-        assert!(set.contains("fourth"));
-    }
-
-    #[test]
-    fn bounded_seen_set_capacity_one() {
-        let mut set = BoundedSeenSet::new(1);
-        set.insert("a".into());
-        assert!(set.contains("a"));
-
-        set.insert("b".into());
-        assert!(!set.contains("a"));
-        assert!(set.contains("b"));
-        assert_eq!(set.len(), 1);
+        assert!(seen.insert("first-id".to_string()));
+        assert!(!seen.insert("first-id".to_string()));
+        assert!(seen.insert("second-id".to_string()));
+        assert_eq!(seen.len(), 2);
     }
 
     // EmailConfig tests
@@ -753,7 +720,10 @@ mod tests {
     fn strip_html_handles_malformed() {
         assert_eq!(EmailChannel::strip_html("<p>Unclosed"), "Unclosed");
         // The function removes everything between < and >, so "Text>with>brackets" becomes "Textwithbrackets"
-        assert_eq!(EmailChannel::strip_html("Text>with>brackets"), "Textwithbrackets");
+        assert_eq!(
+            EmailChannel::strip_html("Text>with>brackets"),
+            "Textwithbrackets"
+        );
     }
 
     #[test]
