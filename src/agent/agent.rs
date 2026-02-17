@@ -557,6 +557,7 @@ pub async fn run(
     agent.observer.record_event(&ObserverEvent::AgentEnd {
         duration: start.elapsed(),
         tokens_used: None,
+        cost_usd: None,
     });
 
     Ok(())
