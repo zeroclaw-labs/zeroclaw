@@ -24,5 +24,5 @@
 
 # Security / CI-CD governance overrides (last-match wins)
 /SECURITY.md              @willsarg
-/docs/actions-source-policy.md @willsarg
-/docs/ci-map.md           @willsarg
+/docs/actions-source-policy.md @willsarg @chumyin
+/docs/ci-map.md           @willsarg @chumyin
