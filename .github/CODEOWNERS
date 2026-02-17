@@ -10,7 +10,7 @@
 /Cargo.lock @theonlyhennygod
 
 # CI
-/.github/workflows/**  @willsarg
+/.github/workflows/**  @theonlyhennygod @willsarg
 /.github/codeql/**     @willsarg
 /.github/dependabot.yml @willsarg
 

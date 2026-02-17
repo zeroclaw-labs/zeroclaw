@@ -10,6 +10,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 
 - `.github/workflows/ci.yml` (`CI`)
     - Purpose: Rust validation (`cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D clippy::correctness`, strict delta lint gate on changed Rust lines, `test`, release build smoke) + docs quality checks when docs change (`markdownlint` blocks only issues on changed lines; link check scans only links added on changed lines)
+    - Additional behavior: PRs that change `.github/workflows/**` require at least one approving review from a login in `WORKFLOW_OWNER_LOGINS` (repository variable fallback: `theonlyhennygod,willsarg`)
     - Merge gate: `CI Required Gate`
 - `.github/workflows/workflow-sanity.yml` (`Workflow Sanity`)
     - Purpose: lint GitHub workflow files (`actionlint`, tab checks)
@@ -39,7 +40,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
     - Additional behavior: risk + size labels are auto-corrected on manual PR label edits (`labeled`/`unlabeled` events); apply `risk: manual` when maintainers intentionally override automated risk selection
     - High-risk heuristic paths: `src/security/**`, `src/runtime/**`, `src/gateway/**`, `src/tools/**`, `.github/workflows/**`
     - Guardrail: maintainers can apply `risk: manual` to freeze automated risk recalculation
-- `.github/workflows/auto-response.yml` (`Auto Response`)
+- `.github/workflows/auto-response.yml` (`PR Auto Responder`)
     - Purpose: first-time contributor onboarding + label-driven response routing (`r:support`, `r:needs-repro`, etc.)
     - Additional behavior: applies contributor tiers on issues by merged PR count (`trusted` >=5, `experienced` >=10, `principal` >=20, `distinguished` >=50), matching PR tier thresholds exactly
     - Additional behavior: contributor-tier labels are treated as automation-managed (manual add/remove on PR/issue is auto-corrected)
@@ -59,7 +60,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 - `Security Audit`: push to `main`, PRs to `main`, weekly schedule
 - `Workflow Sanity`: PR/push when `.github/workflows/**`, `.github/*.yml`, or `.github/*.yaml` change
 - `PR Labeler`: `pull_request_target` lifecycle events
-- `Auto Response`: issue opened/labeled, `pull_request_target` opened/labeled
+- `PR Auto Responder`: issue opened/labeled, `pull_request_target` opened/labeled
 - `Stale`: daily schedule, manual dispatch
 - `Dependabot`: weekly dependency maintenance windows
 - `PR Hygiene`: every 12 hours schedule, manual dispatch

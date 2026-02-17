@@ -1,4 +1,4 @@
-name: Auto Response
+name: PR Auto Responder
 
 on:
   issues:
