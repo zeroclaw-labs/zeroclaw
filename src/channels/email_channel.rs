@@ -467,6 +467,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn default_smtp_port_uses_tls_port() {
+        assert_eq!(default_smtp_port(), 465);
+    }
+
+    #[test]
+    fn email_config_default_uses_tls_smtp_defaults() {
+        let config = EmailConfig::default();
+        assert_eq!(config.smtp_port, 465);
+        assert!(config.smtp_tls);
+    }
+
+    #[test]
     fn build_imap_tls_config_succeeds() {
         let tls_config =
             EmailChannel::build_imap_tls_config().expect("TLS config construction should succeed");
@@ -506,7 +518,7 @@ mod tests {
         assert_eq!(config.imap_port, 993);
         assert_eq!(config.imap_folder, "INBOX");
         assert_eq!(config.smtp_host, "");
-        assert_eq!(config.smtp_port, 587);
+        assert_eq!(config.smtp_port, 465);
         assert!(config.smtp_tls);
         assert_eq!(config.username, "");
         assert_eq!(config.password, "");
@@ -767,8 +779,8 @@ mod tests {
     }
 
     #[test]
-    fn default_smtp_port_returns_587() {
-        assert_eq!(default_smtp_port(), 587);
+    fn default_smtp_port_returns_465() {
+        assert_eq!(default_smtp_port(), 465);
     }
 
     #[test]
@@ -824,7 +836,7 @@ mod tests {
 
         let config: EmailConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.imap_port, 993); // default
-        assert_eq!(config.smtp_port, 587); // default
+        assert_eq!(config.smtp_port, 465); // default
         assert!(config.smtp_tls); // default
         assert_eq!(config.poll_interval_secs, 60); // default
     }
