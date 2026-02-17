@@ -145,7 +145,7 @@ async fn build_context(mem: &dyn Memory, user_msg: &str) -> String {
     let mut context = String::new();
 
     // Pull relevant memories for this message
-    if let Ok(entries) = mem.recall(user_msg, 5).await {
+    if let Ok(entries) = mem.recall(user_msg, 5, None).await {
         if !entries.is_empty() {
             context.push_str("[Memory context]\n");
             for entry in &entries {
@@ -913,7 +913,7 @@ pub async fn run(
         if config.memory.auto_save {
             let user_key = autosave_memory_key("user_msg");
             let _ = mem
-                .store(&user_key, &msg, MemoryCategory::Conversation)
+                .store(&user_key, &msg, MemoryCategory::Conversation, None)
                 .await;
         }
 
@@ -956,7 +956,7 @@ pub async fn run(
             let summary = truncate_with_ellipsis(&response, 100);
             let response_key = autosave_memory_key("assistant_resp");
             let _ = mem
-                .store(&response_key, &summary, MemoryCategory::Daily)
+                .store(&response_key, &summary, MemoryCategory::Daily, None)
                 .await;
         }
     } else {
@@ -979,7 +979,7 @@ pub async fn run(
             if config.memory.auto_save {
                 let user_key = autosave_memory_key("user_msg");
                 let _ = mem
-                    .store(&user_key, &msg.content, MemoryCategory::Conversation)
+                    .store(&user_key, &msg.content, MemoryCategory::Conversation, None)
                     .await;
             }
 
@@ -1037,7 +1037,7 @@ pub async fn run(
                 let summary = truncate_with_ellipsis(&response, 100);
                 let response_key = autosave_memory_key("assistant_resp");
                 let _ = mem
-                    .store(&response_key, &summary, MemoryCategory::Daily)
+                    .store(&response_key, &summary, MemoryCategory::Daily, None)
                     .await;
             }
         }
@@ -1499,16 +1499,16 @@ I will now call the tool with this payload:
         let key1 = autosave_memory_key("user_msg");
         let key2 = autosave_memory_key("user_msg");
 
-        mem.store(&key1, "I'm Paul", MemoryCategory::Conversation)
+        mem.store(&key1, "I'm Paul", MemoryCategory::Conversation, None)
             .await
             .unwrap();
-        mem.store(&key2, "I'm 45", MemoryCategory::Conversation)
+        mem.store(&key2, "I'm 45", MemoryCategory::Conversation, None)
             .await
             .unwrap();
 
         assert_eq!(mem.count().await.unwrap(), 2);
 
-        let recalled = mem.recall("45", 5).await.unwrap();
+        let recalled = mem.recall("45", 5, None).await.unwrap();
         assert!(recalled.iter().any(|entry| entry.content.contains("45")));
     }
 

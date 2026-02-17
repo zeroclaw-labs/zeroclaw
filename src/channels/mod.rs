@@ -72,7 +72,7 @@ fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
 async fn build_memory_context(mem: &dyn Memory, user_msg: &str) -> String {
     let mut context = String::new();
 
-    if let Ok(entries) = mem.recall(user_msg, 5).await {
+    if let Ok(entries) = mem.recall(user_msg, 5, None).await {
         if !entries.is_empty() {
             context.push_str("[Memory context]\n");
             for entry in &entries {
@@ -158,6 +158,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                 &autosave_key,
                 &msg.content,
                 crate::memory::MemoryCategory::Conversation,
+                None,
             )
             .await;
     }
@@ -1262,6 +1263,7 @@ mod tests {
             _key: &str,
             _content: &str,
             _category: crate::memory::MemoryCategory,
+            _session_id: Option<&str>,
         ) -> anyhow::Result<()> {
             Ok(())
         }
@@ -1270,6 +1272,7 @@ mod tests {
             &self,
             _query: &str,
             _limit: usize,
+            _session_id: Option<&str>,
         ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
             Ok(Vec::new())
         }
@@ -1281,6 +1284,7 @@ mod tests {
         async fn list(
             &self,
             _category: Option<&crate::memory::MemoryCategory>,
+            _session_id: Option<&str>,
         ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
             Ok(Vec::new())
         }
@@ -1638,6 +1642,7 @@ mod tests {
             &conversation_memory_key(&msg1),
             &msg1.content,
             MemoryCategory::Conversation,
+            None,
         )
         .await
         .unwrap();
@@ -1645,13 +1650,14 @@ mod tests {
             &conversation_memory_key(&msg2),
             &msg2.content,
             MemoryCategory::Conversation,
+            None,
         )
         .await
         .unwrap();
 
         assert_eq!(mem.count().await.unwrap(), 2);
 
-        let recalled = mem.recall("45", 5).await.unwrap();
+        let recalled = mem.recall("45", 5, None).await.unwrap();
         assert!(recalled.iter().any(|entry| entry.content.contains("45")));
     }
 
@@ -1659,7 +1665,7 @@ mod tests {
     async fn build_memory_context_includes_recalled_entries() {
         let tmp = TempDir::new().unwrap();
         let mem = SqliteMemory::new(tmp.path()).unwrap();
-        mem.store("age_fact", "Age is 45", MemoryCategory::Conversation)
+        mem.store("age_fact", "Age is 45", MemoryCategory::Conversation, None)
             .await
             .unwrap();
 

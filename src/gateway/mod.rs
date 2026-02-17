@@ -544,7 +544,7 @@ async fn handle_webhook(
         let key = webhook_memory_key();
         let _ = state
             .mem
-            .store(&key, message, MemoryCategory::Conversation)
+            .store(&key, message, MemoryCategory::Conversation, None)
             .await;
     }
 
@@ -697,7 +697,7 @@ async fn handle_whatsapp_message(
             let key = whatsapp_memory_key(msg);
             let _ = state
                 .mem
-                .store(&key, &msg.content, MemoryCategory::Conversation)
+                .store(&key, &msg.content, MemoryCategory::Conversation, None)
                 .await;
         }
 
@@ -810,7 +810,9 @@ mod tests {
                 .requests
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.1 = Instant::now() - Duration::from_secs(RATE_LIMITER_SWEEP_INTERVAL_SECS + 1);
+            guard.1 = Instant::now()
+                .checked_sub(Duration::from_secs(RATE_LIMITER_SWEEP_INTERVAL_SECS + 1))
+                .unwrap();
             // Clear timestamps for ip-2 and ip-3 to simulate stale entries
             guard.0.get_mut("ip-2").unwrap().clear();
             guard.0.get_mut("ip-3").unwrap().clear();
@@ -884,11 +886,17 @@ mod tests {
             _key: &str,
             _content: &str,
             _category: MemoryCategory,
+            _session_id: Option<&str>,
         ) -> anyhow::Result<()> {
             Ok(())
         }
 
-        async fn recall(&self, _query: &str, _limit: usize) -> anyhow::Result<Vec<MemoryEntry>> {
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(Vec::new())
         }
 
@@ -899,6 +907,7 @@ mod tests {
         async fn list(
             &self,
             _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(Vec::new())
         }
@@ -951,6 +960,7 @@ mod tests {
             key: &str,
             _content: &str,
             _category: MemoryCategory,
+            _session_id: Option<&str>,
         ) -> anyhow::Result<()> {
             self.keys
                 .lock()
@@ -959,7 +969,12 @@ mod tests {
             Ok(())
         }
 
-        async fn recall(&self, _query: &str, _limit: usize) -> anyhow::Result<Vec<MemoryEntry>> {
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(Vec::new())
         }
 
@@ -970,6 +985,7 @@ mod tests {
         async fn list(
             &self,
             _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(Vec::new())
         }
