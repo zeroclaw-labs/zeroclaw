@@ -1104,6 +1104,36 @@ impl Channel for TelegramChannel {
                 }
             };
 
+            let ok = data
+                .get("ok")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+            if !ok {
+                let error_code = data
+                    .get("error_code")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or_default();
+                let description = data
+                    .get("description")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown Telegram API error");
+
+                if error_code == 409 {
+                    tracing::warn!(
+                        "Telegram polling conflict (409): {description}. \
+Ensure only one `zeroclaw` process is using this bot token."
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                } else {
+                    tracing::warn!(
+                        "Telegram getUpdates API error (code={}): {description}",
+                        error_code
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+                continue;
+            }
+
             if let Some(results) = data.get("result").and_then(serde_json::Value::as_array) {
                 for update in results {
                     // Advance offset past this update
