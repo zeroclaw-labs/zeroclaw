@@ -136,6 +136,26 @@ jobs:
             - name: Run rust quality gate
               run: ./scripts/ci/rust_quality_gate.sh
 
+    lint-strict-delta:
+        name: Lint Strict Delta
+        needs: [changes]
+        if: needs.changes.outputs.rust_changed == 'true'
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        timeout-minutes: 25
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+              with:
+                  fetch-depth: 0
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+                  components: clippy
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+            - name: Run strict lint delta gate
+              env:
+                  BASE_SHA: ${{ needs.changes.outputs.base_sha }}
+              run: ./scripts/ci/rust_strict_delta_gate.sh
+
     test:
         name: Test
         needs: [changes]
@@ -243,7 +263,7 @@ jobs:
     ci-required:
         name: CI Required Gate
         if: always()
-        needs: [changes, lint, test, build, docs-only, non-rust, docs-quality]
+        needs: [changes, lint, lint-strict-delta, test, build, docs-only, non-rust, docs-quality]
         runs-on: blacksmith-2vcpu-ubuntu-2404
         steps:
             - name: Enforce required status
@@ -277,15 +297,17 @@ jobs:
                   fi
 
                   lint_result="${{ needs.lint.result }}"
+                  lint_strict_delta_result="${{ needs.lint-strict-delta.result }}"
                   test_result="${{ needs.test.result }}"
                   build_result="${{ needs.build.result }}"
 
                   echo "lint=${lint_result}"
+                  echo "lint_strict_delta=${lint_strict_delta_result}"
                   echo "test=${test_result}"
                   echo "build=${build_result}"
                   echo "docs=${docs_result}"
 
-                  if [ "$lint_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ]; then
+                  if [ "$lint_result" != "success" ] || [ "$lint_strict_delta_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ]; then
                     echo "Required CI jobs did not pass."
                     exit 1
                   fi

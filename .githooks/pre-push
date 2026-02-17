@@ -20,6 +20,14 @@ if [ "${ZEROCLAW_STRICT_LINT:-0}" = "1" ]; then
     }
 fi
 
+if [ "${ZEROCLAW_STRICT_DELTA_LINT:-0}" = "1" ]; then
+    echo "==> pre-push: running strict delta lint gate (ZEROCLAW_STRICT_DELTA_LINT=1)..."
+    ./scripts/ci/rust_strict_delta_gate.sh || {
+        echo "FAIL: strict delta lint gate reported issues."
+        exit 1
+    }
+fi
+
 if [ "${ZEROCLAW_DOCS_LINT:-0}" = "1" ]; then
     echo "==> pre-push: running docs quality gate (ZEROCLAW_DOCS_LINT=1)..."
     ./scripts/ci/docs_quality_gate.sh || {
