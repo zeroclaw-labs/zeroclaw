@@ -69,7 +69,13 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Signal",
             description: "Privacy-focused via signal-cli",
             category: IntegrationCategory::Chat,
-            status_fn: |_| IntegrationStatus::ComingSoon,
+            status_fn: |c| {
+                if c.channels_config.signal.is_some() {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
         },
         IntegrationEntry {
             name: "iMessage",
@@ -822,7 +828,7 @@ mod tests {
     fn coming_soon_integrations_stay_coming_soon() {
         let config = Config::default();
         let entries = all_integrations();
-        for name in ["Signal", "Nostr", "Spotify", "Home Assistant"] {
+        for name in ["Nostr", "Spotify", "Home Assistant"] {
             let entry = entries.iter().find(|e| e.name == name).unwrap();
             assert!(
                 matches!((entry.status_fn)(&config), IntegrationStatus::ComingSoon),

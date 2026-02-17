@@ -214,9 +214,12 @@ fn has_supervised_channels(config: &Config) -> bool {
         || config.channels_config.slack.is_some()
         || config.channels_config.imessage.is_some()
         || config.channels_config.matrix.is_some()
+        || config.channels_config.signal.is_some()
         || config.channels_config.whatsapp.is_some()
         || config.channels_config.email.is_some()
+        || config.channels_config.irc.is_some()
         || config.channels_config.lark.is_some()
+        || config.channels_config.dingtalk.is_some()
 }
 
 #[cfg(test)]

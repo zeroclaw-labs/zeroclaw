@@ -1277,6 +1277,7 @@ pub struct ChannelsConfig {
     pub webhook: Option<WebhookConfig>,
     pub imessage: Option<IMessageConfig>,
     pub matrix: Option<MatrixConfig>,
+    pub signal: Option<SignalConfig>,
     pub whatsapp: Option<WhatsAppConfig>,
     pub email: Option<crate::channels::email_channel::EmailConfig>,
     pub irc: Option<IrcConfig>,
@@ -1294,6 +1295,7 @@ impl Default for ChannelsConfig {
             webhook: None,
             imessage: None,
             matrix: None,
+            signal: None,
             whatsapp: None,
             email: None,
             irc: None,
@@ -1351,6 +1353,29 @@ pub struct MatrixConfig {
     pub access_token: String,
     pub room_id: String,
     pub allowed_users: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignalConfig {
+    /// Base URL for the signal-cli HTTP daemon (e.g. "http://127.0.0.1:8686").
+    pub http_url: String,
+    /// E.164 phone number of the signal-cli account (e.g. "+1234567890").
+    pub account: String,
+    /// Optional group ID to filter messages.
+    /// - `None` or omitted: accept all messages (DMs and groups)
+    /// - `"dm"`: only accept direct messages
+    /// - Specific group ID: only accept messages from that group
+    #[serde(default)]
+    pub group_id: Option<String>,
+    /// Allowed sender phone numbers (E.164) or "*" for all.
+    #[serde(default)]
+    pub allowed_from: Vec<String>,
+    /// Skip messages that are attachment-only (no text body).
+    #[serde(default)]
+    pub ignore_attachments: bool,
+    /// Skip incoming story messages.
+    #[serde(default)]
+    pub ignore_stories: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2133,6 +2158,7 @@ default_temperature = 0.7
                 webhook: None,
                 imessage: None,
                 matrix: None,
+                signal: None,
                 whatsapp: None,
                 email: None,
                 irc: None,
@@ -2482,6 +2508,54 @@ tool_dispatcher = "xml"
     }
 
     #[test]
+    fn signal_config_serde() {
+        let sc = SignalConfig {
+            http_url: "http://127.0.0.1:8686".into(),
+            account: "+1234567890".into(),
+            group_id: Some("group123".into()),
+            allowed_from: vec!["+1111111111".into()],
+            ignore_attachments: true,
+            ignore_stories: false,
+        };
+        let json = serde_json::to_string(&sc).unwrap();
+        let parsed: SignalConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.http_url, "http://127.0.0.1:8686");
+        assert_eq!(parsed.account, "+1234567890");
+        assert_eq!(parsed.group_id.as_deref(), Some("group123"));
+        assert_eq!(parsed.allowed_from.len(), 1);
+        assert!(parsed.ignore_attachments);
+        assert!(!parsed.ignore_stories);
+    }
+
+    #[test]
+    fn signal_config_toml_roundtrip() {
+        let sc = SignalConfig {
+            http_url: "http://localhost:8080".into(),
+            account: "+9876543210".into(),
+            group_id: None,
+            allowed_from: vec!["*".into()],
+            ignore_attachments: false,
+            ignore_stories: true,
+        };
+        let toml_str = toml::to_string(&sc).unwrap();
+        let parsed: SignalConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.http_url, "http://localhost:8080");
+        assert_eq!(parsed.account, "+9876543210");
+        assert!(parsed.group_id.is_none());
+        assert!(parsed.ignore_stories);
+    }
+
+    #[test]
+    fn signal_config_defaults() {
+        let json = r#"{"http_url":"http://127.0.0.1:8686","account":"+1234567890"}"#;
+        let parsed: SignalConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.group_id.is_none());
+        assert!(parsed.allowed_from.is_empty());
+        assert!(!parsed.ignore_attachments);
+        assert!(!parsed.ignore_stories);
+    }
+
+    #[test]
     fn channels_config_with_imessage_and_matrix() {
         let c = ChannelsConfig {
             cli: true,
@@ -2498,6 +2572,7 @@ tool_dispatcher = "xml"
                 room_id: "!r:m".into(),
                 allowed_users: vec!["@u:m".into()],
             }),
+            signal: None,
             whatsapp: None,
             email: None,
             irc: None,
@@ -2652,6 +2727,7 @@ channel_id = "C123"
             webhook: None,
             imessage: None,
             matrix: None,
+            signal: None,
             whatsapp: Some(WhatsAppConfig {
                 access_token: "tok".into(),
                 phone_number_id: "123".into(),

@@ -6,6 +6,7 @@ pub mod imessage;
 pub mod irc;
 pub mod lark;
 pub mod matrix;
+pub mod signal;
 pub mod slack;
 pub mod telegram;
 pub mod traits;
@@ -19,6 +20,7 @@ pub use imessage::IMessageChannel;
 pub use irc::IrcChannel;
 pub use lark::LarkChannel;
 pub use matrix::MatrixChannel;
+pub use signal::SignalChannel;
 pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
 pub use traits::Channel;
@@ -579,6 +581,7 @@ pub fn handle_command(command: crate::ChannelCommands, config: &Config) -> Resul
                 ("Webhook", config.channels_config.webhook.is_some()),
                 ("iMessage", config.channels_config.imessage.is_some()),
                 ("Matrix", config.channels_config.matrix.is_some()),
+                ("Signal", config.channels_config.signal.is_some()),
                 ("WhatsApp", config.channels_config.whatsapp.is_some()),
                 ("Email", config.channels_config.email.is_some()),
                 ("IRC", config.channels_config.irc.is_some()),
@@ -676,6 +679,20 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 mx.access_token.clone(),
                 mx.room_id.clone(),
                 mx.allowed_users.clone(),
+            )),
+        ));
+    }
+
+    if let Some(ref sig) = config.channels_config.signal {
+        channels.push((
+            "Signal",
+            Arc::new(SignalChannel::new(
+                sig.http_url.clone(),
+                sig.account.clone(),
+                sig.group_id.clone(),
+                sig.allowed_from.clone(),
+                sig.ignore_attachments,
+                sig.ignore_stories,
             )),
         ));
     }
@@ -954,6 +971,17 @@ pub async fn start_channels(config: Config) -> Result<()> {
             mx.access_token.clone(),
             mx.room_id.clone(),
             mx.allowed_users.clone(),
+        )));
+    }
+
+    if let Some(ref sig) = config.channels_config.signal {
+        channels.push(Arc::new(SignalChannel::new(
+            sig.http_url.clone(),
+            sig.account.clone(),
+            sig.group_id.clone(),
+            sig.allowed_from.clone(),
+            sig.ignore_attachments,
+            sig.ignore_stories,
         )));
     }
 
