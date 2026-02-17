@@ -139,7 +139,9 @@ impl AnthropicProvider {
         credential: &str,
     ) -> reqwest::RequestBuilder {
         if Self::is_setup_token(credential) {
-            request.header("Authorization", format!("Bearer {credential}"))
+            request
+                .header("Authorization", format!("Bearer {credential}"))
+                .header("anthropic-beta", "oauth-2025-04-20")
         } else {
             request.header("x-api-key", credential)
         }
@@ -472,6 +474,56 @@ mod tests {
     fn setup_token_detection_works() {
         assert!(AnthropicProvider::is_setup_token("sk-ant-oat01-abcdef"));
         assert!(!AnthropicProvider::is_setup_token("sk-ant-api-key"));
+    }
+
+    #[test]
+    fn apply_auth_uses_bearer_and_beta_for_setup_tokens() {
+        let provider = AnthropicProvider::new(None);
+        let request = provider
+            .apply_auth(
+                provider.client.get("https://api.anthropic.com/v1/models"),
+                "sk-ant-oat01-test-token",
+            )
+            .build()
+            .expect("request should build");
+
+        assert_eq!(
+            request
+                .headers()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer sk-ant-oat01-test-token")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("anthropic-beta")
+                .and_then(|v| v.to_str().ok()),
+            Some("oauth-2025-04-20")
+        );
+        assert!(request.headers().get("x-api-key").is_none());
+    }
+
+    #[test]
+    fn apply_auth_uses_x_api_key_for_regular_tokens() {
+        let provider = AnthropicProvider::new(None);
+        let request = provider
+            .apply_auth(
+                provider.client.get("https://api.anthropic.com/v1/models"),
+                "sk-ant-api-key",
+            )
+            .build()
+            .expect("request should build");
+
+        assert_eq!(
+            request
+                .headers()
+                .get("x-api-key")
+                .and_then(|v| v.to_str().ok()),
+            Some("sk-ant-api-key")
+        );
+        assert!(request.headers().get("authorization").is_none());
+        assert!(request.headers().get("anthropic-beta").is_none());
     }
 
     #[tokio::test]

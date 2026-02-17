@@ -367,8 +367,14 @@ async fn main() -> Result<()> {
         api_key,
         provider,
         memory,
-    } = cli.command
+    } = &cli.command
     {
+        let interactive = *interactive;
+        let channels_only = *channels_only;
+        let api_key = api_key.clone();
+        let provider = provider.clone();
+        let memory = memory.clone();
+
         if interactive && channels_only {
             bail!("Use either --interactive or --channels-only, not both");
         }
