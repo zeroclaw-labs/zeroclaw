@@ -1731,10 +1731,7 @@ impl Config {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = fs::set_permissions(
-                    &config_path,
-                    fs::Permissions::from_mode(0o600),
-                );
+                let _ = fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600));
             }
 
             config.apply_env_overrides();
@@ -3237,10 +3234,7 @@ default_model = "legacy-model"
         config.save().unwrap();
 
         // Apply the same permission logic as load_or_init
-        let _ = std::fs::set_permissions(
-            &config_path,
-            std::fs::Permissions::from_mode(0o600),
-        );
+        let _ = std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600));
 
         let meta = std::fs::metadata(&config_path).unwrap();
         let mode = meta.permissions().mode() & 0o777;
@@ -3260,11 +3254,7 @@ default_model = "legacy-model"
 
         // Create a config file with intentionally loose permissions
         std::fs::write(&config_path, "# test config").unwrap();
-        std::fs::set_permissions(
-            &config_path,
-            std::fs::Permissions::from_mode(0o644),
-        )
-        .unwrap();
+        std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
         let meta = std::fs::metadata(&config_path).unwrap();
         let mode = meta.permissions().mode();
