@@ -15,8 +15,10 @@ use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 use uuid::Uuid;
 
-/// Maximum agentic tool-use iterations per user message to prevent runaway loops.
-const MAX_TOOL_ITERATIONS: usize = 10;
+/// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
+/// Prefer passing the config-driven value via `run_tool_call_loop`; this constant is only
+/// used when callers omit the parameter.
+const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 
 static SENSITIVE_KEY_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSet::new([
@@ -72,8 +74,10 @@ fn scrub_credentials(input: &str) -> String {
         .to_string()
 }
 
-/// Trigger auto-compaction when non-system message count exceeds this threshold.
-const MAX_HISTORY_MESSAGES: usize = 50;
+/// Default trigger for auto-compaction when non-system message count exceeds this threshold.
+/// Prefer passing the config-driven value via `run_tool_call_loop`; this constant is only
+/// used when callers omit the parameter.
+const DEFAULT_MAX_HISTORY_MESSAGES: usize = 50;
 
 /// Keep this many most-recent non-system messages after compaction.
 const COMPACTION_KEEP_RECENT_MESSAGES: usize = 20;
@@ -107,7 +111,7 @@ fn autosave_memory_key(prefix: &str) -> String {
 
 /// Trim conversation history to prevent unbounded growth.
 /// Preserves the system prompt (first message if role=system) and the most recent messages.
-fn trim_history(history: &mut Vec<ChatMessage>) {
+fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
     // Nothing to trim if within limit
     let has_system = history.first().map_or(false, |m| m.role == "system");
     let non_system_count = if has_system {
@@ -116,12 +120,12 @@ fn trim_history(history: &mut Vec<ChatMessage>) {
         history.len()
     };
 
-    if non_system_count <= MAX_HISTORY_MESSAGES {
+    if non_system_count <= max_history {
         return;
     }
 
     let start = if has_system { 1 } else { 0 };
-    let to_remove = non_system_count - MAX_HISTORY_MESSAGES;
+    let to_remove = non_system_count - max_history;
     history.drain(start..start + to_remove);
 }
 
@@ -153,6 +157,7 @@ async fn auto_compact_history(
     history: &mut Vec<ChatMessage>,
     provider: &dyn Provider,
     model: &str,
+    max_history: usize,
 ) -> Result<bool> {
     let has_system = history.first().map_or(false, |m| m.role == "system");
     let non_system_count = if has_system {
@@ -161,7 +166,7 @@ async fn auto_compact_history(
         history.len()
     };
 
-    if non_system_count <= MAX_HISTORY_MESSAGES {
+    if non_system_count <= max_history {
         return Ok(false);
     }
 
@@ -605,6 +610,7 @@ pub(crate) async fn agent_turn(
         silent,
         None,
         "channel",
+        DEFAULT_MAX_TOOL_ITERATIONS,
     )
     .await
 }
@@ -623,6 +629,7 @@ pub(crate) async fn run_tool_call_loop(
     silent: bool,
     approval: Option<&ApprovalManager>,
     channel_name: &str,
+    max_tool_iterations: usize,
 ) -> Result<String> {
     // Build native tool definitions once if the provider supports them.
     let use_native_tools = provider.supports_native_tools() && !tools_registry.is_empty();
@@ -632,7 +639,7 @@ pub(crate) async fn run_tool_call_loop(
         Vec::new()
     };
 
-    for _iteration in 0..MAX_TOOL_ITERATIONS {
+    for _iteration in 0..max_tool_iterations {
         observer.record_event(&ObserverEvent::LlmRequest {
             provider: provider_name.to_string(),
             model: model.to_string(),
@@ -850,7 +857,7 @@ pub(crate) async fn run_tool_call_loop(
         }
     }
 
-    anyhow::bail!("Agent exceeded maximum tool iterations ({MAX_TOOL_ITERATIONS})")
+    anyhow::bail!("Agent exceeded maximum tool iterations ({max_tool_iterations})")
 }
 
 /// Build the tool instruction block for the system prompt so the LLM knows
@@ -1164,6 +1171,7 @@ pub async fn run(
             false,
             Some(&approval_manager),
             "cli",
+            config.agent.max_tool_iterations,
         )
         .await?;
         final_output = response.clone();
@@ -1288,6 +1296,7 @@ pub async fn run(
                 false,
                 Some(&approval_manager),
                 "cli",
+                config.agent.max_tool_iterations,
             )
             .await
             {
@@ -1309,8 +1318,13 @@ pub async fn run(
             observer.record_event(&ObserverEvent::TurnComplete);
 
             // Auto-compaction before hard trimming to preserve long-context signal.
-            if let Ok(compacted) =
-                auto_compact_history(&mut history, provider.as_ref(), model_name).await
+            if let Ok(compacted) = auto_compact_history(
+                &mut history,
+                provider.as_ref(),
+                model_name,
+                config.agent.max_history_messages,
+            )
+            .await
             {
                 if compacted {
                     println!("🧹 Auto-compaction complete");
@@ -1318,7 +1332,7 @@ pub async fn run(
             }
 
             // Hard cap as a safety net.
-            trim_history(&mut history);
+            trim_history(&mut history, config.agent.max_history_messages);
 
             if config.memory.auto_save {
                 let summary = truncate_with_ellipsis(&response, 100);
@@ -1813,22 +1827,25 @@ Tail"#;
     #[test]
     fn trim_history_preserves_system_prompt() {
         let mut history = vec![ChatMessage::system("system prompt")];
-        for i in 0..MAX_HISTORY_MESSAGES + 20 {
+        for i in 0..DEFAULT_MAX_HISTORY_MESSAGES + 20 {
             history.push(ChatMessage::user(format!("msg {i}")));
         }
         let original_len = history.len();
-        assert!(original_len > MAX_HISTORY_MESSAGES + 1);
+        assert!(original_len > DEFAULT_MAX_HISTORY_MESSAGES + 1);
 
-        trim_history(&mut history);
+        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
 
         // System prompt preserved
         assert_eq!(history[0].role, "system");
         assert_eq!(history[0].content, "system prompt");
         // Trimmed to limit
-        assert_eq!(history.len(), MAX_HISTORY_MESSAGES + 1); // +1 for system
-                                                             // Most recent messages preserved
+        assert_eq!(history.len(), DEFAULT_MAX_HISTORY_MESSAGES + 1); // +1 for system
+                                                                     // Most recent messages preserved
         let last = &history[history.len() - 1];
-        assert_eq!(last.content, format!("msg {}", MAX_HISTORY_MESSAGES + 19));
+        assert_eq!(
+            last.content,
+            format!("msg {}", DEFAULT_MAX_HISTORY_MESSAGES + 19)
+        );
     }
 
     #[test]
@@ -1838,7 +1855,7 @@ Tail"#;
             ChatMessage::user("hello"),
             ChatMessage::assistant("hi"),
         ];
-        trim_history(&mut history);
+        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
         assert_eq!(history.len(), 3);
     }
 
@@ -1962,22 +1979,22 @@ Done."#;
     fn trim_history_with_no_system_prompt() {
         // Recovery: History without system prompt should trim correctly
         let mut history = vec![];
-        for i in 0..MAX_HISTORY_MESSAGES + 20 {
+        for i in 0..DEFAULT_MAX_HISTORY_MESSAGES + 20 {
             history.push(ChatMessage::user(format!("msg {i}")));
         }
-        trim_history(&mut history);
-        assert_eq!(history.len(), MAX_HISTORY_MESSAGES);
+        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
+        assert_eq!(history.len(), DEFAULT_MAX_HISTORY_MESSAGES);
     }
 
     #[test]
     fn trim_history_preserves_role_ordering() {
         // Recovery: After trimming, role ordering should remain consistent
         let mut history = vec![ChatMessage::system("system")];
-        for i in 0..MAX_HISTORY_MESSAGES + 10 {
+        for i in 0..DEFAULT_MAX_HISTORY_MESSAGES + 10 {
             history.push(ChatMessage::user(format!("user {i}")));
             history.push(ChatMessage::assistant(format!("assistant {i}")));
         }
-        trim_history(&mut history);
+        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
         assert_eq!(history[0].role, "system");
         assert_eq!(history[history.len() - 1].role, "assistant");
     }
@@ -1986,7 +2003,7 @@ Done."#;
     fn trim_history_with_only_system_prompt() {
         // Recovery: Only system prompt should not be trimmed
         let mut history = vec![ChatMessage::system("system prompt")];
-        trim_history(&mut history);
+        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
         assert_eq!(history.len(), 1);
     }
 
@@ -2050,10 +2067,10 @@ Done."#;
     // ═══════════════════════════════════════════════════════════════════════
 
     const _: () = {
-        assert!(MAX_TOOL_ITERATIONS > 0);
-        assert!(MAX_TOOL_ITERATIONS <= 100);
-        assert!(MAX_HISTORY_MESSAGES > 0);
-        assert!(MAX_HISTORY_MESSAGES <= 1000);
+        assert!(DEFAULT_MAX_TOOL_ITERATIONS > 0);
+        assert!(DEFAULT_MAX_TOOL_ITERATIONS <= 100);
+        assert!(DEFAULT_MAX_HISTORY_MESSAGES > 0);
+        assert!(DEFAULT_MAX_HISTORY_MESSAGES <= 1000);
     };
 
     #[test]
