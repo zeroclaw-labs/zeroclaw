@@ -10,6 +10,14 @@ readme = "README.md"
 keywords = ["ai", "agent", "cli", "assistant", "chatbot"]
 categories = ["command-line-utilities", "api-bindings"]
 
+[[bin]]
+name = "zeroclaw"
+path = "src/main.rs"
+
+[[bin]]
+name = "zeroclaw-cp"
+path = "src/bin/zeroclaw_cp.rs"
+
 [dependencies]
 # CLI - minimal and fast
 clap = { version = "4.5", features = ["derive"] }
@@ -27,6 +35,7 @@ serde_json = { version = "1.0", default-features = false, features = ["std"] }
 # Config
 directories = "5.0"
 toml = "0.8"
+toml_edit = "0.22"
 shellexpand = "3.1"
 
 # Logging - minimal
@@ -56,6 +65,9 @@ hex = "0.4"
 
 # Async traits
 async-trait = "0.1"
+
+# Unix file locking (migration lock)
+libc = "0.2"
 
 # Memory / persistence
 rusqlite = { version = "0.32", features = ["bundled"] }
