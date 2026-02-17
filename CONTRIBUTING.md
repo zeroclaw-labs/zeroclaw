@@ -142,7 +142,6 @@ If `gitleaks` is not installed, the hook prints a warning and allows the commit.
 
 Reference: [GitHub's guide to removing sensitive data](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/removing-sensitive-data-from-a-repository)
 
-
 ## Collaboration Tracks (Risk-Based)
 
 To keep review throughput high without lowering quality, every PR should map to one track:
