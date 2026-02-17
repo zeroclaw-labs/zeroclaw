@@ -220,7 +220,7 @@ jobs:
             - name: Require owner approval for workflow file changes
               uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
               env:
-                  WORKFLOW_OWNER_LOGINS: ${{ vars.WORKFLOW_OWNER_LOGINS || 'theonlyhennygod,willsarg' }}
+                  WORKFLOW_OWNER_LOGINS: ${{ vars.WORKFLOW_OWNER_LOGINS }}
               with:
                   script: |
                       const owner = context.repo.owner;
@@ -231,15 +231,19 @@ jobs:
                         return;
                       }
 
-                      const ownerAllowlist = (process.env.WORKFLOW_OWNER_LOGINS || "")
+                      const baseOwners = ["theonlyhennygod", "willsarg"];
+                      const configuredOwners = (process.env.WORKFLOW_OWNER_LOGINS || "")
                         .split(",")
                         .map((login) => login.trim().toLowerCase())
                         .filter(Boolean);
+                      const ownerAllowlist = [...new Set([...baseOwners, ...configuredOwners])];
 
                       if (ownerAllowlist.length === 0) {
-                        core.setFailed("WORKFLOW_OWNER_LOGINS is empty. Set a repository variable or use a fallback value.");
+                        core.setFailed("Workflow owner allowlist is empty.");
                         return;
                       }
+
+                      core.info(`Workflow owner allowlist: ${ownerAllowlist.join(", ")}`);
 
                       const files = await github.paginate(github.rest.pulls.listFiles, {
                         owner,
