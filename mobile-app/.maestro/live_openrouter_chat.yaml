@@ -1,0 +1,42 @@
+appId: com.mobileclaw.app
+---
+- launchApp:
+    clearState: true
+- extendedWaitUntil:
+    visible: "MobileClaw agent chat with voice mode."
+    timeout: 30000
+- tapOn:
+    id: "dock-tab-settings"
+- tapOn:
+    id: "dock-tab-settings"
+- extendedWaitUntil:
+    visible:
+      id: "screen-settings"
+    timeout: 10000
+- scrollUntilVisible:
+    element:
+      id: "settings-api-key"
+    direction: DOWN
+- tapOn:
+    id: "settings-api-key"
+- eraseText
+- inputText: "${OPENROUTER_TOKEN}"
+- extendedWaitUntil:
+    visible: "Saved locally"
+    timeout: 10000
+- tapOn:
+    id: "dock-tab-chat"
+- extendedWaitUntil:
+    visible:
+      id: "screen-chat"
+    timeout: 10000
+- tapOn:
+    id: "chat-input"
+- inputText: "hello"
+- tapOn:
+    id: "chat-send-or-voice"
+- tapOn:
+    id: "dock-tab-activity"
+- extendedWaitUntil:
+    visible: "Agent response"
+    timeout: 120000

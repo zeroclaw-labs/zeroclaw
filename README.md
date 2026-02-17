@@ -209,12 +209,13 @@ Every subsystem is a **trait** — swap implementations with a config change, ze
 ### Runtime support (current)
 
 - ✅ Supported today: `runtime.kind = "native"` or `runtime.kind = "docker"`
-- ✅ Mobile-hosted support: `runtime.kind = "android"` (with `android-app/` host)
+- ✅ Mobile-hosted support: `runtime.kind = "android"` (with React Native host in `mobile-app/`)
 - 🚧 Planned, not implemented yet: WASM / edge runtimes
 
 When an unsupported `runtime.kind` is configured, ZeroClaw now exits with a clear error instead of silently falling back to native.
 
 Android deployment guide: `docs/android-deployment.md`
+React Native mobile app guide: `docs/mobile-app-react-native.md`
 
 ### Memory System (Full-Stack Search Engine)
 

@@ -24,6 +24,18 @@ android-app/**/build/
 android-app/local.properties
 android-app/**/*.iml
 
+# React Native mobile app artifacts
+mobile-app/node_modules/
+mobile-app/.expo/
+mobile-app/.expo-shared/
+mobile-app/android/
+mobile-app/ios/
+mobile-app/dist/
+mobile-app/.maestro/screenshots/
+mobile-app/.maestro/reports/
+mobile-app/*.log
+mobile-app/npm-debug.log*
+
 # Environment files (may contain secrets)
 .env
 .env.local

@@ -1,0 +1,15 @@
+appId: com.mobileclaw.app
+---
+- launchApp
+- extendedWaitUntil:
+    visible: "MobileClaw agent chat with voice mode."
+    timeout: 30000
+- tapOn:
+    id: "chat-input"
+- inputText: "Say hello from Maestro"
+- tapOn:
+    id: "chat-send-or-voice"
+- tapOn:
+    id: "dock-tab-activity"
+- assertVisible: "Activity"
+- assertVisible: "User message"
