@@ -23,7 +23,7 @@ services:
       - API_KEY
       - PROVIDER
       - ZEROCLAW_MODEL
-      - ZEROCLAW_GATEWAY_PORT=28800
+      - ZEROCLAW_GATEWAY_PORT=3000
       - SANDBOX_HOST=zeroclaw-sandbox
     volumes:
       # Mount single config file (avoids shadowing other files in .zeroclaw)
@@ -31,7 +31,7 @@ services:
       # Mount shared workspace
       - ../playground:/zeroclaw-data/workspace
     ports:
-      - "127.0.0.1:28800:28800"
+      - "127.0.0.1:3000:3000"
     networks:
       - dev-net
 
