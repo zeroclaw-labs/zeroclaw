@@ -12,15 +12,18 @@
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" /></a>
   <a href="NOTICE"><img src="https://img.shields.io/badge/contributors-27+-green.svg" alt="Contributors" /></a>
+  <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=flat&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
 </p>
 <p align="center">
-Built By Students and Members of the Harvard - MIT - Sundai.Club Communities.
+Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 </p>
-Fast, small, and fully autonomous AI assistant infrastructure — deploy anywhere, swap anything.
 
-```
-~3.4MB binary · <10ms startup · 1,017 tests · 23+ providers · 8 traits · Pluggable everything
-```
+<p align="center">
+  <strong>Fast, small, and fully autonomous AI assistant infrastructure</strong><br />
+  Deploy anywhere. Swap anything.
+</p>
+
+<p align="center"><code>~3.4MB binary · &lt;10ms startup · 1,017 tests · 23+ providers · 8 traits · Pluggable everything</code></p>
 
 ### ✨ Features
 
@@ -651,6 +654,12 @@ For high-throughput collaboration and consistent reviews:
 - Reviewer playbook (triage + deep review): [docs/reviewer-playbook.md](docs/reviewer-playbook.md)
 - CI ownership and triage map: [docs/ci-map.md](docs/ci-map.md)
 - Security disclosure policy: [SECURITY.md](SECURITY.md)
+
+## Support ZeroClaw
+
+If ZeroClaw helps your work and you want to support ongoing development, you can donate here:
+
+<a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=for-the-badge&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
 
 ### 🙏 Special Thanks
 
