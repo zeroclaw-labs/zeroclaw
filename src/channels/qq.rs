@@ -11,7 +11,7 @@ use uuid::Uuid;
 const QQ_API_BASE: &str = "https://api.sgroup.qq.com";
 const QQ_AUTH_URL: &str = "https://bots.qq.com/app/getAppAccessToken";
 
-/// Deduplication set capacity — evict oldest half when full.
+/// Deduplication set capacity — evict half of entries when full.
 const DEDUP_CAPACITY: usize = 10_000;
 
 /// QQ Official Bot channel — uses Tencent's official QQ Bot API with
@@ -257,41 +257,6 @@ impl Channel for QQChannel {
                 interval.tick().await;
                 if hb_tx.send(()).await.is_err() {
                     break;
-                }
-            }
-        });
-
-        // Spawn token refresh task
-        let token_cache = Arc::clone(&self.token_cache);
-        let app_id = self.app_id.clone();
-        let app_secret = self.app_secret.clone();
-        let client = self.client.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(6000)); // ~100 min
-            loop {
-                interval.tick().await;
-                let body = json!({
-                    "appId": app_id,
-                    "clientSecret": app_secret,
-                });
-                if let Ok(resp) = client.post(QQ_AUTH_URL).json(&body).send().await {
-                    if let Ok(data) = resp.json::<serde_json::Value>().await {
-                        if let Some(new_token) = data.get("access_token").and_then(|t| t.as_str()) {
-                            let expires_in = data
-                                .get("expires_in")
-                                .and_then(|e| e.as_str())
-                                .and_then(|e| e.parse::<u64>().ok())
-                                .unwrap_or(7200);
-                            let now = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs();
-                            let mut cache = token_cache.write().await;
-                            *cache =
-                                Some((new_token.to_string(), now + expires_in.saturating_sub(60)));
-                            tracing::debug!("QQ: token refreshed");
-                        }
-                    }
                 }
             }
         });
