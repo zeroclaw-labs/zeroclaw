@@ -3,7 +3,7 @@ LangGraph-based agent factory for consistent tool calling.
 """
 
 import os
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import BaseTool
@@ -14,6 +14,7 @@ from langgraph.prebuilt import ToolNode
 
 SYSTEM_PROMPT = """You are ZeroClaw, an AI assistant with tool access. Use tools to accomplish tasks.
 Be concise and helpful. Execute tools directly when needed without excessive explanation."""
+GLM_DEFAULT_BASE_URL = "https://api.z.ai/api/coding/paas/v4"
 
 
 class ZeroclawAgent:
@@ -40,7 +41,10 @@ class ZeroclawAgent:
         self.system_prompt = system_prompt or SYSTEM_PROMPT
 
         api_key = api_key or os.environ.get("API_KEY") or os.environ.get("GLM_API_KEY")
-        base_url = base_url or os.environ.get("API_BASE", "https://api.z.ai/api/coding/paas/v4")
+        base_url = base_url or os.environ.get("API_BASE")
+
+        if base_url is None and model.lower().startswith(("glm", "zhipu")):
+            base_url = GLM_DEFAULT_BASE_URL
 
         if not api_key:
             raise ValueError(
@@ -105,7 +109,15 @@ class ZeroclawAgent:
         """
         import asyncio
 
-        return asyncio.run(self.ainvoke(input, config))
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.ainvoke(input, config))
+
+        raise RuntimeError(
+            "ZeroclawAgent.invoke() cannot be called inside an active event loop. "
+            "Use 'await ZeroclawAgent.ainvoke(...)' instead."
+        )
 
 
 def create_agent(

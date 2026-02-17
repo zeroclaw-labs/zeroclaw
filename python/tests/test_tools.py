@@ -27,6 +27,18 @@ def test_import_tool_decorator():
     assert hasattr(test_func, "invoke")
 
 
+def test_tool_decorator_custom_metadata():
+    """Test that custom tool metadata is preserved."""
+    from zeroclaw_tools import tool
+
+    @tool(name="echo_tool", description="Echo input back")
+    def echo(value: str) -> str:
+        return value
+
+    assert echo.name == "echo_tool"
+    assert "Echo input back" in echo.description
+
+
 def test_agent_creation():
     """Test that agent can be created with default tools."""
     from zeroclaw_tools import create_agent, shell, file_read, file_write
@@ -37,6 +49,35 @@ def test_agent_creation():
 
     assert agent is not None
     assert agent.model == "test-model"
+
+
+def test_cli_allows_interactive_without_message():
+    """Interactive mode should not require positional message."""
+    from zeroclaw_tools.__main__ import parse_args
+
+    args = parse_args(["-i"])
+
+    assert args.interactive is True
+    assert args.message == []
+
+
+def test_cli_requires_message_when_not_interactive():
+    """Non-interactive mode requires at least one message token."""
+    from zeroclaw_tools.__main__ import parse_args
+
+    with pytest.raises(SystemExit):
+        parse_args([])
+
+
+@pytest.mark.asyncio
+async def test_invoke_in_event_loop_raises():
+    """invoke() should fail fast when called from an active event loop."""
+    from zeroclaw_tools import create_agent, shell
+
+    agent = create_agent(tools=[shell], model="test-model", api_key="test-key")
+
+    with pytest.raises(RuntimeError, match="ainvoke"):
+        agent.invoke({"messages": []})
 
 
 @pytest.mark.asyncio

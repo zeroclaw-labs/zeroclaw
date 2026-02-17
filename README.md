@@ -447,7 +447,7 @@ print(result["messages"][-1].content)
 - **Consistent tool calling** across all providers (even those with poor native support)
 - **Automatic tool loop** — keeps calling tools until the task is complete
 - **Easy extensibility** — add custom tools with `@tool` decorator
-- **Discord/Telegram bots** included
+- **Discord bot integration** included (Telegram planned)
 
 See [`python/README.md`](python/README.md) for full documentation.
 
