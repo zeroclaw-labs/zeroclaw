@@ -26,7 +26,9 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 - `.github/workflows/release.yml` (`Release`)
     - Purpose: build tagged release artifacts and publish GitHub releases
 - `.github/workflows/label-policy-sanity.yml` (`Label Policy Sanity`)
-    - Purpose: enforce contributor-tier rule/color parity between `labeler.yml` and `auto-response.yml`
+    - Purpose: validate shared contributor-tier policy in `.github/label-policy.json` and ensure label workflows consume that policy
+- `.github/workflows/rust-reusable.yml` (`Rust Reusable Job`)
+    - Purpose: reusable Rust setup/cache + command runner for workflow-call consumers
 
 ### Optional Repository Automation
 
@@ -62,7 +64,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 - `Release`: tag push (`v*`)
 - `Security Audit`: push to `main`, PRs to `main`, weekly schedule
 - `Workflow Sanity`: PR/push when `.github/workflows/**`, `.github/*.yml`, or `.github/*.yaml` change
-- `Label Policy Sanity`: PR/push when `.github/workflows/labeler.yml` or `.github/workflows/auto-response.yml` changes
+- `Label Policy Sanity`: PR/push when `.github/label-policy.json`, `.github/workflows/labeler.yml`, or `.github/workflows/auto-response.yml` changes
 - `PR Labeler`: `pull_request_target` lifecycle events
 - `PR Auto Responder`: issue opened/labeled, `pull_request_target` opened/labeled
 - `Stale`: daily schedule, manual dispatch
