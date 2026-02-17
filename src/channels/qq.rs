@@ -349,6 +349,7 @@ impl Channel for QQChannel {
                             let channel_msg = ChannelMessage {
                                 id: Uuid::new_v4().to_string(),
                                 sender: user_openid.to_string(),
+                                reply_target: chat_id,
                                 content: content.to_string(),
                                 channel: "qq".to_string(),
                                 timestamp: std::time::SystemTime::now()
@@ -357,11 +358,7 @@ impl Channel for QQChannel {
                                     .as_secs(),
                             };
 
-                            // Override the channel message chat_id via sender field
-                            let mut msg = channel_msg;
-                            msg.sender = chat_id;
-
-                            if tx.send(msg).await.is_err() {
+                            if tx.send(channel_msg).await.is_err() {
                                 tracing::warn!("QQ: message channel closed");
                                 break;
                             }
@@ -389,7 +386,8 @@ impl Channel for QQChannel {
 
                             let channel_msg = ChannelMessage {
                                 id: Uuid::new_v4().to_string(),
-                                sender: chat_id,
+                                sender: author_id.to_string(),
+                                reply_target: chat_id,
                                 content: content.to_string(),
                                 channel: "qq".to_string(),
                                 timestamp: std::time::SystemTime::now()
