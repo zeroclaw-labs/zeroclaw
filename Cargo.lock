@@ -4862,6 +4862,7 @@ dependencies = [
  "dialoguer",
  "directories",
  "fantoccini",
+ "futures",
  "futures-util",
  "glob",
  "hex",

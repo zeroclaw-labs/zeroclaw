@@ -1,6 +1,7 @@
-use super::traits::ChatMessage;
+use super::traits::{ChatMessage, StreamChunk, StreamOptions, StreamResult};
 use super::Provider;
 use async_trait::async_trait;
+use futures_util::{stream, StreamExt};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -336,6 +337,82 @@ impl Provider for ReliableProvider {
             "All providers/models failed. Attempts:\n{}",
             failures.join("\n")
         )
+    }
+
+    fn supports_streaming(&self) -> bool {
+        self.providers.iter().any(|(_, p)| p.supports_streaming())
+    }
+
+    fn stream_chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        // Try each provider/model combination for streaming
+        // For streaming, we use the first provider that supports it and has streaming enabled
+        for (provider_name, provider) in &self.providers {
+            if !provider.supports_streaming() || !options.enabled {
+                continue;
+            }
+
+            // Clone provider data for the stream
+            let provider_clone = provider_name.clone();
+
+            // Try the first model in the chain for streaming
+            let current_model = match self.model_chain(model).first() {
+                Some(m) => m.to_string(),
+                None => model.to_string(),
+            };
+
+            // For streaming, we attempt once and propagate errors
+            // The caller can retry the entire request if needed
+            let stream = provider.stream_chat_with_system(
+                system_prompt,
+                message,
+                &current_model,
+                temperature,
+                options,
+            );
+
+            // Use a channel to bridge the stream with logging
+            let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
+
+            tokio::spawn(async move {
+                let mut stream = stream;
+                while let Some(chunk) = stream.next().await {
+                    if let Err(ref e) = chunk {
+                        tracing::warn!(
+                            provider = provider_clone,
+                            model = current_model,
+                            "Streaming error: {e}"
+                        );
+                    }
+                    if tx.send(chunk).await.is_err() {
+                        break; // Receiver dropped
+                    }
+                }
+            });
+
+            // Convert channel receiver to stream
+            return stream::unfold(rx, |mut rx| async move {
+                match rx.recv().await {
+                    Some(chunk) => Some((chunk, rx)),
+                    None => None,
+                }
+            })
+            .boxed();
+        }
+
+        // No streaming support available
+        stream::once(async move {
+            Err(super::traits::StreamError::Provider(
+                "No provider supports streaming".to_string(),
+            ))
+        })
+        .boxed()
     }
 }
 
