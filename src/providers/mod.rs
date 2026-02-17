@@ -130,6 +130,7 @@ fn resolve_api_key(name: &str, api_key: Option<&str>) -> Option<String> {
             vec!["DASHSCOPE_API_KEY"]
         }
         "zai" | "z.ai" => vec!["ZAI_API_KEY"],
+        "nvidia" | "nvidia-nim" | "build.nvidia.com" => vec!["NVIDIA_API_KEY"],
         "synthetic" => vec!["SYNTHETIC_API_KEY"],
         "opencode" | "opencode-zen" => vec!["OPENCODE_API_KEY"],
         "vercel" | "vercel-ai" => vec!["VERCEL_API_KEY"],
@@ -278,6 +279,9 @@ pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<
         ))),
         "copilot" | "github-copilot" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "GitHub Copilot", "https://api.githubcopilot.com", key, AuthStyle::Bearer,
+        ))),
+        "nvidia" | "nvidia-nim" | "build.nvidia.com" => Ok(Box::new(OpenAiCompatibleProvider::new(
+            "NVIDIA NIM", "https://integrate.api.nvidia.com/v1", key, AuthStyle::Bearer,
         ))),
 
         // ── Bring Your Own Provider (custom URL) ───────────
@@ -603,6 +607,13 @@ mod tests {
         assert!(create_provider("github-copilot", Some("key")).is_ok());
     }
 
+    #[test]
+    fn factory_nvidia() {
+        assert!(create_provider("nvidia", Some("nvapi-test")).is_ok());
+        assert!(create_provider("nvidia-nim", Some("nvapi-test")).is_ok());
+        assert!(create_provider("build.nvidia.com", Some("nvapi-test")).is_ok());
+    }
+
     // ── Custom / BYOP provider ─────────────────────────────
 
     #[test]
@@ -792,6 +803,7 @@ mod tests {
             "perplexity",
             "cohere",
             "copilot",
+            "nvidia",
         ];
         for name in providers {
             assert!(
