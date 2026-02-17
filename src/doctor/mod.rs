@@ -65,6 +65,7 @@ pub fn run(config: &Config) -> Result<()> {
     check_workspace(config, &mut items);
     check_daemon_state(config, &mut items);
     check_environment(&mut items);
+    check_update(config, &mut items);
 
     // Print report
     println!("🩺 ZeroClaw Doctor (enhanced)");
@@ -515,6 +516,43 @@ fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
 }
 
 // ── Environment checks ───────────────────────────────────────────
+
+fn check_update(config: &Config, items: &mut Vec<DiagItem>) {
+    use crate::update;
+
+    let cat = "update";
+
+    if !config.update.enabled || update::is_update_disabled_by_env() {
+        items.push(DiagItem::warn(cat, "auto-update checks disabled"));
+        return;
+    }
+
+    match update::read_cache(config) {
+        Some(cached) => match cached.status {
+            update::UpdateStatus::UpToDate => {
+                items.push(DiagItem::ok(
+                    cat,
+                    format!("up to date (v{})", cached.current_version),
+                ));
+            }
+            update::UpdateStatus::UpdateAvailable => {
+                items.push(DiagItem::warn(
+                    cat,
+                    format!(
+                        "update available: v{} (you have v{})",
+                        cached.latest_version, cached.current_version
+                    ),
+                ));
+            }
+            update::UpdateStatus::CheckFailed => {
+                items.push(DiagItem::error(cat, "last update check failed"));
+            }
+        },
+        None => {
+            items.push(DiagItem::warn(cat, "update check has not run yet"));
+        }
+    }
+}
 
 fn check_environment(items: &mut Vec<DiagItem>) {
     let cat = "environment";

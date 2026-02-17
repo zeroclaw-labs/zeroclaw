@@ -70,6 +70,12 @@ parking_lot = "0.12"
 # Async traits
 async-trait = "0.1"
 
+# Semantic version parsing and comparison (auto-update)
+semver = "1.0"
+
+# Atomic binary self-replacement (auto-update, critical for Windows)
+self-replace = "1.0"
+
 # Protobuf encode/decode (Feishu WS long-connection frame codec)
 prost = { version = "0.14", default-features = false }
 

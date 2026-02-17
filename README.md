@@ -452,6 +452,25 @@ format = "openclaw"             # "openclaw" (default, markdown files) or "aieos
 # aieos_inline = '{"identity":{"names":{"first":"Nova"}}}'  # inline AIEOS JSON
 ```
 
+### Auto-Update
+
+ZeroClaw checks for updates automatically on each CLI invocation (non-blocking background check). When a new version is available, a one-line notification appears on stderr.
+
+```toml
+[update]
+enabled = true                # Set to false to disable auto-update checks
+check_interval_hours = 24     # How often to check (0 = every run)
+channel = "stable"            # "stable" or "pre-release"
+```
+
+Disable via environment variable (recommended for CI/Docker):
+
+```bash
+export ZEROCLAW_UPDATE_ENABLED=0
+```
+
+Run `zeroclaw update` to download, verify (SHA256 + cosign), and install the latest version. See [docs/feature-request-updater.md](docs/feature-request-updater.md) for the full design.
+
 ### Ollama Local and Remote Endpoints
 
 ZeroClaw uses one provider key (`ollama`) for both local and remote Ollama deployments:
@@ -599,6 +618,8 @@ See [aieos.org](https://aieos.org) for the full schema and live examples.
 | `channel doctor` | Run health checks for configured channels |
 | `channel bind-telegram <IDENTITY>` | Add one Telegram username/user ID to allowlist |
 | `integrations info <name>` | Show setup/status details for one integration |
+| `update` | Check for updates and install the latest version |
+| `update --check-only` | Check for updates without installing |
 
 ## Development
 

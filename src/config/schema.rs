@@ -93,6 +93,10 @@ pub struct Config {
     /// Hardware configuration (wizard-driven physical world setup).
     #[serde(default)]
     pub hardware: HardwareConfig,
+
+    /// Auto-update configuration.
+    #[serde(default)]
+    pub update: UpdateConfig,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -1662,6 +1666,44 @@ pub struct QQConfig {
     pub allowed_users: Vec<String>,
 }
 
+// ── Auto-update ─────────────────────────────────────────────────
+
+/// Auto-update configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateConfig {
+    /// Whether automatic update checks are enabled.
+    #[serde(default = "default_update_enabled")]
+    pub enabled: bool,
+
+    /// How often to check for updates, in hours (0 = every run).
+    #[serde(default = "default_check_interval_hours")]
+    pub check_interval_hours: u64,
+
+    /// Release channel: "stable" or "pre-release".
+    #[serde(default = "default_update_channel")]
+    pub channel: String,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_update_enabled(),
+            check_interval_hours: default_check_interval_hours(),
+            channel: default_update_channel(),
+        }
+    }
+}
+
+fn default_update_enabled() -> bool {
+    true
+}
+fn default_check_interval_hours() -> u64 {
+    24
+}
+fn default_update_channel() -> String {
+    "stable".into()
+}
+
 // ── Config impl ──────────────────────────────────────────────────
 
 impl Default for Config {
@@ -1700,6 +1742,7 @@ impl Default for Config {
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            update: UpdateConfig::default(),
         }
     }
 }
@@ -2338,6 +2381,7 @@ default_temperature = 0.7
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            update: UpdateConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -2447,6 +2491,7 @@ tool_dispatcher = "xml"
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            update: UpdateConfig::default(),
         };
 
         config.save().unwrap();

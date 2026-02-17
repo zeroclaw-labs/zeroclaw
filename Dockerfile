@@ -82,6 +82,8 @@ ENV HOME=/zeroclaw-data
 ENV PROVIDER="ollama"
 ENV ZEROCLAW_MODEL="llama3.2"
 ENV ZEROCLAW_GATEWAY_PORT=3000
+# Disable auto-update checks inside containers
+ENV ZEROCLAW_UPDATE_ENABLED=0
 
 # Note: API_KEY is intentionally NOT set here to avoid confusion.
 # It is set in config.toml as the Ollama URL.
@@ -105,6 +107,8 @@ ENV HOME=/zeroclaw-data
 # so config file edits are not silently overridden)
 ENV PROVIDER="openrouter"
 ENV ZEROCLAW_GATEWAY_PORT=3000
+# Disable auto-update checks inside containers
+ENV ZEROCLAW_UPDATE_ENABLED=0
 
 # API_KEY must be provided at runtime!
 

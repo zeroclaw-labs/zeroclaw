@@ -66,6 +66,7 @@ mod skillforge;
 mod skills;
 mod tools;
 mod tunnel;
+mod update;
 mod util;
 
 use config::Config;
@@ -77,7 +78,7 @@ pub use zeroclaw::{HardwareCommands, PeripheralCommands};
 #[derive(Parser, Debug)]
 #[command(name = "zeroclaw")]
 #[command(author = "theonlyhennygod")]
-#[command(version = "0.1.0")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "The fastest, smallest AI assistant.", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -229,6 +230,17 @@ enum Commands {
     Peripheral {
         #[command(subcommand)]
         peripheral_command: zeroclaw::PeripheralCommands,
+    },
+
+    /// Check for updates and optionally install the latest version
+    Update {
+        /// Only check for updates, don't install
+        #[arg(long)]
+        check_only: bool,
+
+        /// Force update even if already on the latest version
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -431,6 +443,29 @@ async fn main() -> Result<()> {
     let mut config = Config::load_or_init()?;
     config.apply_env_overrides();
 
+    // ── Auto-update: notify from cache + background refresh ──
+    if config.update.enabled && !update::is_update_disabled_by_env() {
+        // Show notification from cached check (non-blocking read)
+        if let Some(cached) = update::read_cache(&config) {
+            if cached.status == update::UpdateStatus::UpdateAvailable {
+                eprintln!(
+                    "💡 ZeroClaw v{} is available (you have v{}). Run 'zeroclaw update' to upgrade.",
+                    cached.latest_version,
+                    env!("CARGO_PKG_VERSION")
+                );
+            }
+        }
+        // Spawn background check if cache is stale (never blocks CLI)
+        if update::should_check(&config) {
+            let bg_config = config.clone();
+            tokio::spawn(async move {
+                if let Ok(result) = update::check_latest(&bg_config).await {
+                    let _ = update::write_cache(&bg_config, &result);
+                }
+            });
+        }
+    }
+
     match cli.command {
         Commands::Onboard { .. } => unreachable!(),
 
@@ -470,6 +505,15 @@ async fn main() -> Result<()> {
             println!("🦀 ZeroClaw Status");
             println!();
             println!("Version:     {}", env!("CARGO_PKG_VERSION"));
+            if let Some(cached) = update::read_cache(&config) {
+                println!("Latest:      v{}", cached.latest_version);
+                println!("Checked:     {}", cached.checked_at);
+                if cached.status == update::UpdateStatus::UpdateAvailable {
+                    println!("⬆️  Update available! Run 'zeroclaw update'");
+                }
+            } else {
+                println!("Latest:      (not checked yet)");
+            }
             println!("Workspace:   {}", config.workspace_dir.display());
             println!("Config:      {}", config.config_path.display());
             println!();
@@ -615,6 +659,10 @@ async fn main() -> Result<()> {
 
         Commands::Peripheral { peripheral_command } => {
             peripherals::handle_command(peripheral_command.clone(), &config)
+        }
+
+        Commands::Update { check_only, force } => {
+            update::run_update(&config, force, check_only).await
         }
     }
 }
