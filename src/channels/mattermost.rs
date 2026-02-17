@@ -203,14 +203,14 @@ impl MattermostChannel {
         }
 
         // If it's a thread, include root_id in reply_to so we reply in the same thread
-        let reply_target = if !root_id.is_empty() {
-            format!("{}:{}", channel_id, root_id)
-        } else {
+        let reply_target = if root_id.is_empty() {
             // Or if it's a top-level message that WE want to start a thread on,
             // the next reply will use THIS post's ID as root_id.
             // But for now, we follow Mattermost's 'reply' convention where
             // replying to a post uses its ID as root_id.
             format!("{}:{}", channel_id, id)
+        } else {
+            format!("{}:{}", channel_id, root_id)
         };
 
         Some(ChannelMessage {
