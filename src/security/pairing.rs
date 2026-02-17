@@ -127,6 +127,21 @@ impl PairingGuard {
         Ok(None)
     }
 
+    /// Roll back a token that was generated but could not be durably persisted.
+    ///
+    /// If this removes the last paired token while pairing is required, a new
+    /// one-time pairing code is generated so clients can retry pairing safely.
+    pub fn rollback_pairing_token(&self, token: &str) {
+        let token_hash = hash_token(token);
+        let mut pairing_code = self.pairing_code.lock();
+        let mut tokens = self.paired_tokens.lock();
+
+        tokens.remove(&token_hash);
+        if self.require_pairing && tokens.is_empty() && pairing_code.is_none() {
+            *pairing_code = Some(generate_code());
+        }
+    }
+
     /// Check if a bearer token is valid (compares against stored hashes).
     pub fn is_authenticated(&self, token: &str) -> bool {
         if !self.require_pairing {
@@ -328,6 +343,40 @@ mod tests {
         let token = guard.try_pair(&code).unwrap().unwrap();
         assert!(guard.is_authenticated(&token));
         assert!(!guard.is_authenticated("wrong"));
+    }
+
+    #[test]
+    fn rollback_generated_token_removes_auth_and_restores_pairing_code() {
+        let guard = PairingGuard::new(true, &[]);
+        let code = guard.pairing_code().unwrap().to_string();
+        let token = guard.try_pair(&code).unwrap().unwrap();
+
+        assert!(guard.pairing_code().is_none());
+        assert!(guard.is_authenticated(&token));
+
+        guard.rollback_pairing_token(&token);
+
+        assert!(!guard.is_authenticated(&token));
+        assert!(guard.pairing_code().is_some());
+        assert!(!guard.is_paired());
+    }
+
+    #[test]
+    fn rollback_generated_token_keeps_pairing_code_consumed_if_other_tokens_exist() {
+        let guard = PairingGuard::new(true, &[]);
+        let code = guard.pairing_code().unwrap().to_string();
+        let token = guard.try_pair(&code).unwrap().unwrap();
+
+        {
+            let mut tokens = guard.paired_tokens.lock();
+            tokens.insert(hash_token("zc_extra"));
+        }
+
+        guard.rollback_pairing_token(&token);
+
+        assert!(guard.is_authenticated("zc_extra"));
+        assert!(guard.pairing_code().is_none());
+        assert!(guard.is_paired());
     }
 
     // ── Token hashing ────────────────────────────────────────

@@ -426,14 +426,16 @@ async fn handle_pair(State(state): State<AppState>, headers: HeaderMap) -> impl 
         Ok(Some(token)) => {
             tracing::info!("🔐 New client paired successfully");
             if let Err(err) = persist_pairing_tokens(&state.config, &state.pairing) {
-                tracing::error!("🔐 Pairing succeeded but token persistence failed: {err:#}");
+                state.pairing.rollback_pairing_token(&token);
+                tracing::error!(
+                    "🔐 Pairing persistence failed; rolled back issued token and restored pairing state: {err:#}"
+                );
                 let body = serde_json::json!({
-                    "paired": true,
+                    "paired": false,
                     "persisted": false,
-                    "token": token,
-                    "message": "Paired for this process, but failed to persist token to config.toml. Check config path and write permissions.",
+                    "error": "Pairing failed to persist token to config.toml. No token was issued. Retry pairing.",
                 });
-                return (StatusCode::OK, Json(body));
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(body));
             }
 
             let body = serde_json::json!({
@@ -1038,6 +1040,52 @@ mod tests {
         async fn health_check(&self) -> bool {
             true
         }
+    }
+
+    #[tokio::test]
+    async fn handle_pair_rolls_back_token_when_persistence_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.config_path = temp.path().join("missing-dir").join("config.toml");
+        config.workspace_dir = temp.path().join("workspace");
+
+        let pairing = Arc::new(PairingGuard::new(true, &[]));
+        let code = pairing.pairing_code().unwrap();
+
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider::default());
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(config)),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: pairing.clone(),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Pairing-Code", HeaderValue::from_str(&code).unwrap());
+        let response = handle_pair(State(state), headers).await.into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["paired"], false);
+        assert_eq!(parsed["persisted"], false);
+        assert!(
+            parsed.get("token").is_none(),
+            "Token must not be returned when persistence fails"
+        );
+
+        assert!(!pairing.is_paired());
+        assert!(pairing.pairing_code().is_some());
     }
 
     #[tokio::test]
