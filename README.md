@@ -92,6 +92,14 @@ ls -lh target/release/zeroclaw
    cargo --version
    ```
 
+#### One-Line Installer
+
+Or skip the steps above and install everything (system deps, Rust, ZeroClaw) in a single command:
+
+```bash
+curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/scripts/install.sh | bash
+```
+
 #### Optional
 
 - **Docker Desktop** — required only if using the [Docker sandboxed runtime](#runtime-support-current) (`runtime.kind = "docker"`). Install via `winget install Docker.DockerDesktop`.
