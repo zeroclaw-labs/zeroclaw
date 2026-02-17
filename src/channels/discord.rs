@@ -11,6 +11,7 @@ pub struct DiscordChannel {
     guild_id: Option<String>,
     allowed_users: Vec<String>,
     listen_to_bots: bool,
+    mention_only: bool,
     client: reqwest::Client,
     typing_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -21,12 +22,14 @@ impl DiscordChannel {
         guild_id: Option<String>,
         allowed_users: Vec<String>,
         listen_to_bots: bool,
+        mention_only: bool,
     ) -> Self {
         Self {
             bot_token,
             guild_id,
             allowed_users,
             listen_to_bots,
+            mention_only,
             client: reqwest::Client::new(),
             typing_handle: std::sync::Mutex::new(None),
         }
@@ -343,6 +346,22 @@ impl Channel for DiscordChannel {
                         continue;
                     }
 
+                    // Skip messages that don't @-mention the bot (when mention_only is enabled)
+                    if self.mention_only {
+                        let mention_tag = format!("<@{bot_user_id}>");
+                        if !content.contains(&mention_tag) {
+                            continue;
+                        }
+                    }
+
+                    // Strip the bot mention from content so the agent sees clean text
+                    let clean_content = if self.mention_only {
+                        let mention_tag = format!("<@{bot_user_id}>");
+                        content.replace(&mention_tag, "").trim().to_string()
+                    } else {
+                        content.to_string()
+                    };
+
                     let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
                     let channel_id = d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("").to_string();
 
@@ -353,6 +372,11 @@ impl Channel for DiscordChannel {
                             format!("discord_{message_id}")
                         },
                         sender: author_id.to_string(),
+                        reply_target: if channel_id.is_empty() {
+                            author_id.to_string()
+                        } else {
+                            channel_id
+                        },
                         content: content.to_string(),
                         channel: channel_id,
                         timestamp: std::time::SystemTime::now()
@@ -423,7 +447,7 @@ mod tests {
 
     #[test]
     fn discord_channel_name() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false);
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
         assert_eq!(ch.name(), "discord");
     }
 
@@ -444,21 +468,27 @@ mod tests {
 
     #[test]
     fn empty_allowlist_denies_everyone() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false);
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
         assert!(!ch.is_user_allowed("12345"));
         assert!(!ch.is_user_allowed("anyone"));
     }
 
     #[test]
     fn wildcard_allows_everyone() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["*".into()], false);
+        let ch = DiscordChannel::new("fake".into(), None, vec!["*".into()], false, false);
         assert!(ch.is_user_allowed("12345"));
         assert!(ch.is_user_allowed("anyone"));
     }
 
     #[test]
     fn specific_allowlist_filters() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["111".into(), "222".into()], false);
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            None,
+            vec!["111".into(), "222".into()],
+            false,
+            false,
+        );
         assert!(ch.is_user_allowed("111"));
         assert!(ch.is_user_allowed("222"));
         assert!(!ch.is_user_allowed("333"));
@@ -467,7 +497,7 @@ mod tests {
 
     #[test]
     fn allowlist_is_exact_match_not_substring() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["111".into()], false);
+        let ch = DiscordChannel::new("fake".into(), None, vec!["111".into()], false, false);
         assert!(!ch.is_user_allowed("1111"));
         assert!(!ch.is_user_allowed("11"));
         assert!(!ch.is_user_allowed("0111"));
@@ -475,20 +505,26 @@ mod tests {
 
     #[test]
     fn allowlist_empty_string_user_id() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["111".into()], false);
+        let ch = DiscordChannel::new("fake".into(), None, vec!["111".into()], false, false);
         assert!(!ch.is_user_allowed(""));
     }
 
     #[test]
     fn allowlist_with_wildcard_and_specific() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["111".into(), "*".into()], false);
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            None,
+            vec!["111".into(), "*".into()],
+            false,
+            false,
+        );
         assert!(ch.is_user_allowed("111"));
         assert!(ch.is_user_allowed("anyone_else"));
     }
 
     #[test]
     fn allowlist_case_sensitive() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["ABC".into()], false);
+        let ch = DiscordChannel::new("fake".into(), None, vec!["ABC".into()], false, false);
         assert!(ch.is_user_allowed("ABC"));
         assert!(!ch.is_user_allowed("abc"));
         assert!(!ch.is_user_allowed("Abc"));
@@ -663,14 +699,14 @@ mod tests {
 
     #[test]
     fn typing_handle_starts_as_none() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false);
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
         let guard = ch.typing_handle.lock().unwrap();
         assert!(guard.is_none());
     }
 
     #[tokio::test]
     async fn start_typing_sets_handle() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false);
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
         let _ = ch.start_typing("123456").await;
         let guard = ch.typing_handle.lock().unwrap();
         assert!(guard.is_some());
@@ -678,7 +714,7 @@ mod tests {
 
     #[tokio::test]
     async fn stop_typing_clears_handle() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false);
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
         let _ = ch.start_typing("123456").await;
         let _ = ch.stop_typing("123456").await;
         let guard = ch.typing_handle.lock().unwrap();
@@ -687,14 +723,14 @@ mod tests {
 
     #[tokio::test]
     async fn stop_typing_is_idempotent() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false);
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
         assert!(ch.stop_typing("123456").await.is_ok());
         assert!(ch.stop_typing("123456").await.is_ok());
     }
 
     #[tokio::test]
     async fn start_typing_replaces_existing_task() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false);
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
         let _ = ch.start_typing("111").await;
         let _ = ch.start_typing("222").await;
         let guard = ch.typing_handle.lock().unwrap();

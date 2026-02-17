@@ -157,7 +157,7 @@ impl ResponseCache {
             |row| row.get(0),
         )?;
 
-        #[allow(clippy::cast_sign_loss)]
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         Ok((count as usize, hits as u64, tokens_saved as u64))
     }
 

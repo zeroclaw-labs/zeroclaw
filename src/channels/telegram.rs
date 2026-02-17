@@ -51,6 +51,133 @@ fn split_message_for_telegram(message: &str) -> Vec<String> {
     chunks
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TelegramAttachmentKind {
+    Image,
+    Document,
+    Video,
+    Audio,
+    Voice,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TelegramAttachment {
+    kind: TelegramAttachmentKind,
+    target: String,
+}
+
+impl TelegramAttachmentKind {
+    fn from_marker(marker: &str) -> Option<Self> {
+        match marker.trim().to_ascii_uppercase().as_str() {
+            "IMAGE" | "PHOTO" => Some(Self::Image),
+            "DOCUMENT" | "FILE" => Some(Self::Document),
+            "VIDEO" => Some(Self::Video),
+            "AUDIO" => Some(Self::Audio),
+            "VOICE" => Some(Self::Voice),
+            _ => None,
+        }
+    }
+}
+
+fn is_http_url(target: &str) -> bool {
+    target.starts_with("http://") || target.starts_with("https://")
+}
+
+fn infer_attachment_kind_from_target(target: &str) -> Option<TelegramAttachmentKind> {
+    let normalized = target
+        .split('?')
+        .next()
+        .unwrap_or(target)
+        .split('#')
+        .next()
+        .unwrap_or(target);
+
+    let extension = Path::new(normalized)
+        .extension()
+        .and_then(|ext| ext.to_str())?
+        .to_ascii_lowercase();
+
+    match extension.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" => Some(TelegramAttachmentKind::Image),
+        "mp4" | "mov" | "mkv" | "avi" | "webm" => Some(TelegramAttachmentKind::Video),
+        "mp3" | "m4a" | "wav" | "flac" => Some(TelegramAttachmentKind::Audio),
+        "ogg" | "oga" | "opus" => Some(TelegramAttachmentKind::Voice),
+        "pdf" | "txt" | "md" | "csv" | "json" | "zip" | "tar" | "gz" | "doc" | "docx" | "xls"
+        | "xlsx" | "ppt" | "pptx" => Some(TelegramAttachmentKind::Document),
+        _ => None,
+    }
+}
+
+fn parse_path_only_attachment(message: &str) -> Option<TelegramAttachment> {
+    let trimmed = message.trim();
+    if trimmed.is_empty() || trimmed.contains('\n') {
+        return None;
+    }
+
+    let candidate = trimmed.trim_matches(|c| matches!(c, '`' | '"' | '\''));
+    if candidate.chars().any(char::is_whitespace) {
+        return None;
+    }
+
+    let candidate = candidate.strip_prefix("file://").unwrap_or(candidate);
+    let kind = infer_attachment_kind_from_target(candidate)?;
+
+    if !is_http_url(candidate) && !Path::new(candidate).exists() {
+        return None;
+    }
+
+    Some(TelegramAttachment {
+        kind,
+        target: candidate.to_string(),
+    })
+}
+
+fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) {
+    let mut cleaned = String::with_capacity(message.len());
+    let mut attachments = Vec::new();
+    let mut cursor = 0;
+
+    while cursor < message.len() {
+        let Some(open_rel) = message[cursor..].find('[') else {
+            cleaned.push_str(&message[cursor..]);
+            break;
+        };
+
+        let open = cursor + open_rel;
+        cleaned.push_str(&message[cursor..open]);
+
+        let Some(close_rel) = message[open..].find(']') else {
+            cleaned.push_str(&message[open..]);
+            break;
+        };
+
+        let close = open + close_rel;
+        let marker = &message[open + 1..close];
+
+        let parsed = marker.split_once(':').and_then(|(kind, target)| {
+            let kind = TelegramAttachmentKind::from_marker(kind)?;
+            let target = target.trim();
+            if target.is_empty() {
+                return None;
+            }
+            Some(TelegramAttachment {
+                kind,
+                target: target.to_string(),
+            })
+        });
+
+        if let Some(attachment) = parsed {
+            attachments.push(attachment);
+        } else {
+            cleaned.push_str(&message[open..=close]);
+        }
+
+        cursor = close + 1;
+    }
+
+    (cleaned.trim().to_string(), attachments)
+}
+
 /// Telegram channel — long-polls the Bot API for updates
 pub struct TelegramChannel {
     bot_token: String,
@@ -80,6 +207,216 @@ impl TelegramChannel {
         I: IntoIterator<Item = &'a str>,
     {
         identities.into_iter().any(|id| self.is_user_allowed(id))
+    }
+
+    fn parse_update_message(&self, update: &serde_json::Value) -> Option<ChannelMessage> {
+        let message = update.get("message")?;
+
+        let text = message.get("text").and_then(serde_json::Value::as_str)?;
+
+        let username = message
+            .get("from")
+            .and_then(|from| from.get("username"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+
+        let user_id = message
+            .get("from")
+            .and_then(|from| from.get("id"))
+            .and_then(serde_json::Value::as_i64)
+            .map(|id| id.to_string());
+
+        let sender_identity = if username == "unknown" {
+            user_id.clone().unwrap_or_else(|| "unknown".to_string())
+        } else {
+            username.clone()
+        };
+
+        let mut identities = vec![username.as_str()];
+        if let Some(id) = user_id.as_deref() {
+            identities.push(id);
+        }
+
+        if !self.is_any_user_allowed(identities.iter().copied()) {
+            tracing::warn!(
+                "Telegram: ignoring message from unauthorized user: username={username}, user_id={}. \
+Allowlist Telegram @username or numeric user ID, then run `zeroclaw onboard --channels-only`.",
+                user_id.as_deref().unwrap_or("unknown")
+            );
+            return None;
+        }
+
+        let chat_id = message
+            .get("chat")
+            .and_then(|chat| chat.get("id"))
+            .and_then(serde_json::Value::as_i64)
+            .map(|id| id.to_string())?;
+
+        let message_id = message
+            .get("message_id")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+
+        Some(ChannelMessage {
+            id: format!("telegram_{chat_id}_{message_id}"),
+            sender: sender_identity,
+            reply_target: chat_id,
+            content: text.to_string(),
+            channel: "telegram".to_string(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        })
+    }
+
+    async fn send_text_chunks(&self, message: &str, chat_id: &str) -> anyhow::Result<()> {
+        let chunks = split_message_for_telegram(message);
+
+        for (index, chunk) in chunks.iter().enumerate() {
+            let text = if chunks.len() > 1 {
+                if index == 0 {
+                    format!("{chunk}\n\n(continues...)")
+                } else if index == chunks.len() - 1 {
+                    format!("(continued)\n\n{chunk}")
+                } else {
+                    format!("(continued)\n\n{chunk}\n\n(continues...)")
+                }
+            } else {
+                chunk.to_string()
+            };
+
+            let markdown_body = serde_json::json!({
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "Markdown"
+            });
+
+            let markdown_resp = self
+                .client
+                .post(self.api_url("sendMessage"))
+                .json(&markdown_body)
+                .send()
+                .await?;
+
+            if markdown_resp.status().is_success() {
+                if index < chunks.len() - 1 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                continue;
+            }
+
+            let markdown_status = markdown_resp.status();
+            let markdown_err = markdown_resp.text().await.unwrap_or_default();
+            tracing::warn!(
+                status = ?markdown_status,
+                "Telegram sendMessage with Markdown failed; retrying without parse_mode"
+            );
+
+            let plain_body = serde_json::json!({
+                "chat_id": chat_id,
+                "text": text,
+            });
+            let plain_resp = self
+                .client
+                .post(self.api_url("sendMessage"))
+                .json(&plain_body)
+                .send()
+                .await?;
+
+            if !plain_resp.status().is_success() {
+                let plain_status = plain_resp.status();
+                let plain_err = plain_resp.text().await.unwrap_or_default();
+                anyhow::bail!(
+                    "Telegram sendMessage failed (markdown {}: {}; plain {}: {})",
+                    markdown_status,
+                    markdown_err,
+                    plain_status,
+                    plain_err
+                );
+            }
+
+            if index < chunks.len() - 1 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn send_media_by_url(
+        &self,
+        method: &str,
+        media_field: &str,
+        chat_id: &str,
+        url: &str,
+        caption: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let mut body = serde_json::json!({
+            "chat_id": chat_id,
+        });
+        body[media_field] = serde_json::Value::String(url.to_string());
+
+        if let Some(cap) = caption {
+            body["caption"] = serde_json::Value::String(cap.to_string());
+        }
+
+        let resp = self
+            .client
+            .post(self.api_url(method))
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let err = resp.text().await?;
+            anyhow::bail!("Telegram {method} by URL failed: {err}");
+        }
+
+        tracing::info!("Telegram {method} sent to {chat_id}: {url}");
+        Ok(())
+    }
+
+    async fn send_attachment(
+        &self,
+        chat_id: &str,
+        attachment: &TelegramAttachment,
+    ) -> anyhow::Result<()> {
+        let target = attachment.target.trim();
+
+        if is_http_url(target) {
+            return match attachment.kind {
+                TelegramAttachmentKind::Image => {
+                    self.send_photo_by_url(chat_id, target, None).await
+                }
+                TelegramAttachmentKind::Document => {
+                    self.send_document_by_url(chat_id, target, None).await
+                }
+                TelegramAttachmentKind::Video => {
+                    self.send_video_by_url(chat_id, target, None).await
+                }
+                TelegramAttachmentKind::Audio => {
+                    self.send_audio_by_url(chat_id, target, None).await
+                }
+                TelegramAttachmentKind::Voice => {
+                    self.send_voice_by_url(chat_id, target, None).await
+                }
+            };
+        }
+
+        let path = Path::new(target);
+        if !path.exists() {
+            anyhow::bail!("Telegram attachment path not found: {target}");
+        }
+
+        match attachment.kind {
+            TelegramAttachmentKind::Image => self.send_photo(chat_id, path, None).await,
+            TelegramAttachmentKind::Document => self.send_document(chat_id, path, None).await,
+            TelegramAttachmentKind::Video => self.send_video(chat_id, path, None).await,
+            TelegramAttachmentKind::Audio => self.send_audio(chat_id, path, None).await,
+            TelegramAttachmentKind::Voice => self.send_voice(chat_id, path, None).await,
+        }
     }
 
     /// Send a document/file to a Telegram chat
@@ -408,6 +745,39 @@ impl TelegramChannel {
         tracing::info!("Telegram photo (URL) sent to {chat_id}: {url}");
         Ok(())
     }
+
+    /// Send a video by URL (Telegram will download it)
+    pub async fn send_video_by_url(
+        &self,
+        chat_id: &str,
+        url: &str,
+        caption: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.send_media_by_url("sendVideo", "video", chat_id, url, caption)
+            .await
+    }
+
+    /// Send an audio file by URL (Telegram will download it)
+    pub async fn send_audio_by_url(
+        &self,
+        chat_id: &str,
+        url: &str,
+        caption: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.send_media_by_url("sendAudio", "audio", chat_id, url, caption)
+            .await
+    }
+
+    /// Send a voice message by URL (Telegram will download it)
+    pub async fn send_voice_by_url(
+        &self,
+        chat_id: &str,
+        url: &str,
+        caption: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.send_media_by_url("sendVoice", "voice", chat_id, url, caption)
+            .await
+    }
 }
 
 #[async_trait]
@@ -417,82 +787,27 @@ impl Channel for TelegramChannel {
     }
 
     async fn send(&self, message: &str, chat_id: &str) -> anyhow::Result<()> {
-        // Split message if it exceeds Telegram's 4096 character limit
-        let chunks = split_message_for_telegram(message);
+        let (text_without_markers, attachments) = parse_attachment_markers(message);
 
-        for (i, chunk) in chunks.iter().enumerate() {
-            // Add continuation marker for multi-part messages
-            let text = if chunks.len() > 1 {
-                if i == 0 {
-                    format!("{chunk}\n\n(continues...)")
-                } else if i == chunks.len() - 1 {
-                    format!("(continued)\n\n{chunk}")
-                } else {
-                    format!("(continued)\n\n{chunk}\n\n(continues...)")
-                }
-            } else {
-                chunk.to_string()
-            };
-
-            let markdown_body = serde_json::json!({
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": "Markdown"
-            });
-
-            let markdown_resp = self
-                .client
-                .post(self.api_url("sendMessage"))
-                .json(&markdown_body)
-                .send()
-                .await?;
-
-            if markdown_resp.status().is_success() {
-                // Small delay between chunks to avoid rate limiting
-                if i < chunks.len() - 1 {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                continue;
+        if !attachments.is_empty() {
+            if !text_without_markers.is_empty() {
+                self.send_text_chunks(&text_without_markers, chat_id)
+                    .await?;
             }
 
-            let markdown_status = markdown_resp.status();
-            let markdown_err = markdown_resp.text().await.unwrap_or_default();
-            tracing::warn!(
-                status = ?markdown_status,
-                "Telegram sendMessage with Markdown failed; retrying without parse_mode"
-            );
-
-            // Retry without parse_mode as a compatibility fallback.
-            let plain_body = serde_json::json!({
-                "chat_id": chat_id,
-                "text": text,
-            });
-            let plain_resp = self
-                .client
-                .post(self.api_url("sendMessage"))
-                .json(&plain_body)
-                .send()
-                .await?;
-
-            if !plain_resp.status().is_success() {
-                let plain_status = plain_resp.status();
-                let plain_err = plain_resp.text().await.unwrap_or_default();
-                anyhow::bail!(
-                    "Telegram sendMessage failed (markdown {}: {}; plain {}: {})",
-                    markdown_status,
-                    markdown_err,
-                    plain_status,
-                    plain_err
-                );
+            for attachment in &attachments {
+                self.send_attachment(chat_id, attachment).await?;
             }
 
-            // Small delay between chunks to avoid rate limiting
-            if i < chunks.len() - 1 {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
+            return Ok(());
         }
 
-        Ok(())
+        if let Some(attachment) = parse_path_only_attachment(message) {
+            self.send_attachment(chat_id, &attachment).await?;
+            return Ok(());
+        }
+
+        self.send_text_chunks(message, chat_id).await
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
@@ -533,59 +848,13 @@ impl Channel for TelegramChannel {
                         offset = uid + 1;
                     }
 
-                    let Some(message) = update.get("message") else {
+                    let Some(msg) = self.parse_update_message(update) else {
                         continue;
                     };
-
-                    let Some(text) = message.get("text").and_then(serde_json::Value::as_str) else {
-                        continue;
-                    };
-
-                    let username_opt = message
-                        .get("from")
-                        .and_then(|f| f.get("username"))
-                        .and_then(|u| u.as_str());
-                    let username = username_opt.unwrap_or("unknown");
-
-                    let user_id = message
-                        .get("from")
-                        .and_then(|f| f.get("id"))
-                        .and_then(serde_json::Value::as_i64);
-                    let user_id_str = user_id.map(|id| id.to_string());
-
-                    let mut identities = vec![username];
-                    if let Some(ref id) = user_id_str {
-                        identities.push(id.as_str());
-                    }
-
-                    if !self.is_any_user_allowed(identities.iter().copied()) {
-                        tracing::warn!(
-                            "Telegram: ignoring message from unauthorized user: username={username}, user_id={}. \
-Allowlist Telegram @username or numeric user ID, then run `zeroclaw onboard --channels-only`.",
-                            user_id_str.as_deref().unwrap_or("unknown")
-                        );
-                        continue;
-                    }
-
-                    let chat_id = message
-                        .get("chat")
-                        .and_then(|c| c.get("id"))
-                        .and_then(serde_json::Value::as_i64)
-                        .map(|id| id.to_string());
-
-                    let Some(chat_id) = chat_id else {
-                        tracing::warn!("Telegram: missing chat_id in message, skipping");
-                        continue;
-                    };
-
-                    let message_id = message
-                        .get("message_id")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0);
 
                     // Send "typing" indicator immediately when we receive a message
                     let typing_body = serde_json::json!({
-                        "chat_id": &chat_id,
+                        "chat_id": &msg.reply_target,
                         "action": "typing"
                     });
                     let _ = self
@@ -594,17 +863,6 @@ Allowlist Telegram @username or numeric user ID, then run `zeroclaw onboard --ch
                         .json(&typing_body)
                         .send()
                         .await; // Ignore errors for typing indicator
-
-                    let msg = ChannelMessage {
-                        id: format!("telegram_{chat_id}_{message_id}"),
-                        sender: username.to_string(),
-                        content: text.to_string(),
-                        channel: "telegram".to_string(),
-                        timestamp: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs(),
-                    };
 
                     if tx.send(msg).await.is_err() {
                         return Ok(());
@@ -714,6 +972,107 @@ mod tests {
     fn telegram_user_denied_when_none_of_identities_match() {
         let ch = TelegramChannel::new("t".into(), vec!["alice".into(), "987654321".into()]);
         assert!(!ch.is_any_user_allowed(["unknown", "123456789"]));
+    }
+
+    #[test]
+    fn parse_attachment_markers_extracts_multiple_types() {
+        let message = "Here are files [IMAGE:/tmp/a.png] and [DOCUMENT:https://example.com/a.pdf]";
+        let (cleaned, attachments) = parse_attachment_markers(message);
+
+        assert_eq!(cleaned, "Here are files  and");
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(attachments[0].kind, TelegramAttachmentKind::Image);
+        assert_eq!(attachments[0].target, "/tmp/a.png");
+        assert_eq!(attachments[1].kind, TelegramAttachmentKind::Document);
+        assert_eq!(attachments[1].target, "https://example.com/a.pdf");
+    }
+
+    #[test]
+    fn parse_attachment_markers_keeps_invalid_markers_in_text() {
+        let message = "Report [UNKNOWN:/tmp/a.bin]";
+        let (cleaned, attachments) = parse_attachment_markers(message);
+
+        assert_eq!(cleaned, "Report [UNKNOWN:/tmp/a.bin]");
+        assert!(attachments.is_empty());
+    }
+
+    #[test]
+    fn parse_path_only_attachment_detects_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let image_path = dir.path().join("snap.png");
+        std::fs::write(&image_path, b"fake-png").unwrap();
+
+        let parsed = parse_path_only_attachment(image_path.to_string_lossy().as_ref())
+            .expect("expected attachment");
+
+        assert_eq!(parsed.kind, TelegramAttachmentKind::Image);
+        assert_eq!(parsed.target, image_path.to_string_lossy());
+    }
+
+    #[test]
+    fn parse_path_only_attachment_rejects_sentence_text() {
+        assert!(parse_path_only_attachment("Screenshot saved to /tmp/snap.png").is_none());
+    }
+
+    #[test]
+    fn infer_attachment_kind_from_target_detects_document_extension() {
+        assert_eq!(
+            infer_attachment_kind_from_target("https://example.com/files/specs.pdf?download=1"),
+            Some(TelegramAttachmentKind::Document)
+        );
+    }
+
+    #[test]
+    fn parse_update_message_uses_chat_id_as_reply_target() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()]);
+        let update = serde_json::json!({
+            "update_id": 1,
+            "message": {
+                "message_id": 33,
+                "text": "hello",
+                "from": {
+                    "id": 555,
+                    "username": "alice"
+                },
+                "chat": {
+                    "id": -100200300
+                }
+            }
+        });
+
+        let msg = ch
+            .parse_update_message(&update)
+            .expect("message should parse");
+
+        assert_eq!(msg.sender, "alice");
+        assert_eq!(msg.reply_target, "-100200300");
+        assert_eq!(msg.content, "hello");
+        assert_eq!(msg.id, "telegram_-100200300_33");
+    }
+
+    #[test]
+    fn parse_update_message_allows_numeric_id_without_username() {
+        let ch = TelegramChannel::new("token".into(), vec!["555".into()]);
+        let update = serde_json::json!({
+            "update_id": 2,
+            "message": {
+                "message_id": 9,
+                "text": "ping",
+                "from": {
+                    "id": 555
+                },
+                "chat": {
+                    "id": 12345
+                }
+            }
+        });
+
+        let msg = ch
+            .parse_update_message(&update)
+            .expect("numeric allowlist should pass");
+
+        assert_eq!(msg.sender, "555");
+        assert_eq!(msg.reply_target, "12345");
     }
 
     // ── File sending API URL tests ──────────────────────────────────

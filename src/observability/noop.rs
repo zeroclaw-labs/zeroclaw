@@ -48,10 +48,12 @@ mod tests {
         obs.record_event(&ObserverEvent::AgentEnd {
             duration: Duration::from_millis(100),
             tokens_used: Some(42),
+            cost_usd: Some(0.001),
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             duration: Duration::ZERO,
             tokens_used: None,
+            cost_usd: None,
         });
         obs.record_event(&ObserverEvent::ToolCallStart {
             tool: "shell".into(),

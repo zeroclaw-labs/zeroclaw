@@ -161,6 +161,7 @@ impl Channel for SlackChannel {
                     let channel_msg = ChannelMessage {
                         id: format!("slack_{channel_id}_{ts}"),
                         sender: user.to_string(),
+                        reply_target: channel_id.clone(),
                         content: text.to_string(),
                         channel: "slack".to_string(),
                         timestamp: std::time::SystemTime::now()

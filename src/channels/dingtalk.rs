@@ -7,7 +7,7 @@ use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
-/// DingTalk (钉钉) channel — connects via Stream Mode WebSocket for real-time messages.
+/// DingTalk channel — connects via Stream Mode WebSocket for real-time messages.
 /// Replies are sent through per-message session webhook URLs.
 pub struct DingTalkChannel {
     client_id: String,
@@ -63,6 +63,18 @@ impl DingTalkChannel {
 
         let gw: GatewayResponse = resp.json().await?;
         Ok(gw)
+    }
+
+    fn resolve_reply_target(
+        sender_id: &str,
+        conversation_type: &str,
+        conversation_id: Option<&str>,
+    ) -> String {
+        if conversation_type == "1" {
+            sender_id.to_string()
+        } else {
+            conversation_id.unwrap_or(sender_id).to_string()
+        }
     }
 }
 
@@ -193,14 +205,11 @@ impl Channel for DingTalkChannel {
                         .unwrap_or("1");
 
                     // Private chat uses sender ID, group chat uses conversation ID
-                    let chat_id = if conversation_type == "1" {
-                        sender_id.to_string()
-                    } else {
-                        data.get("conversationId")
-                            .and_then(|c| c.as_str())
-                            .unwrap_or(sender_id)
-                            .to_string()
-                    };
+                    let chat_id = Self::resolve_reply_target(
+                        sender_id,
+                        conversation_type,
+                        data.get("conversationId").and_then(|c| c.as_str()),
+                    );
 
                     // Store session webhook for later replies
                     if let Some(webhook) = data.get("sessionWebhook").and_then(|w| w.as_str()) {
@@ -229,6 +238,7 @@ impl Channel for DingTalkChannel {
                     let channel_msg = ChannelMessage {
                         id: Uuid::new_v4().to_string(),
                         sender: sender_id.to_string(),
+                        reply_target: chat_id,
                         content: content.to_string(),
                         channel: "dingtalk".to_string(),
                         timestamp: std::time::SystemTime::now()
@@ -304,5 +314,23 @@ client_secret = "secret"
 "#;
         let config: crate::config::schema::DingTalkConfig = toml::from_str(toml_str).unwrap();
         assert!(config.allowed_users.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_reply_target_private_chat_uses_sender_id() {
+        let target = DingTalkChannel::resolve_reply_target("staff_1", "1", Some("conv_1"));
+        assert_eq!(target, "staff_1");
+    }
+
+    #[test]
+    fn test_resolve_reply_target_group_chat_uses_conversation_id() {
+        let target = DingTalkChannel::resolve_reply_target("staff_1", "2", Some("conv_1"));
+        assert_eq!(target, "conv_1");
+    }
+
+    #[test]
+    fn test_resolve_reply_target_group_chat_falls_back_to_sender_id() {
+        let target = DingTalkChannel::resolve_reply_target("staff_1", "2", None);
+        assert_eq!(target, "staff_1");
     }
 }

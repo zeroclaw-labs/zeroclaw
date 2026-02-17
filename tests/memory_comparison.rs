@@ -36,6 +36,7 @@ async fn compare_store_speed() {
             &format!("key_{i}"),
             &format!("Memory entry number {i} about Rust programming"),
             MemoryCategory::Core,
+            None,
         )
         .await
         .unwrap();
@@ -49,6 +50,7 @@ async fn compare_store_speed() {
             &format!("key_{i}"),
             &format!("Memory entry number {i} about Rust programming"),
             MemoryCategory::Core,
+            None,
         )
         .await
         .unwrap();
@@ -127,8 +129,8 @@ async fn compare_recall_quality() {
     ];
 
     for (key, content, cat) in &entries {
-        sq.store(key, content, cat.clone()).await.unwrap();
-        md.store(key, content, cat.clone()).await.unwrap();
+        sq.store(key, content, cat.clone(), None).await.unwrap();
+        md.store(key, content, cat.clone(), None).await.unwrap();
     }
 
     // Test queries and compare results
@@ -145,8 +147,8 @@ async fn compare_recall_quality() {
     println!("RECALL QUALITY (10 entries seeded):\n");
 
     for (query, desc) in &queries {
-        let sq_results = sq.recall(query, 10).await.unwrap();
-        let md_results = md.recall(query, 10).await.unwrap();
+        let sq_results = sq.recall(query, 10, None).await.unwrap();
+        let md_results = md.recall(query, 10, None).await.unwrap();
 
         println!("  Query: \"{query}\" — {desc}");
         println!("    SQLite:   {} results", sq_results.len());
@@ -190,21 +192,21 @@ async fn compare_recall_speed() {
         } else {
             format!("TypeScript powers modern web apps, entry {i}")
         };
-        sq.store(&format!("e{i}"), &content, MemoryCategory::Core)
+        sq.store(&format!("e{i}"), &content, MemoryCategory::Core, None)
             .await
             .unwrap();
-        md.store(&format!("e{i}"), &content, MemoryCategory::Daily)
+        md.store(&format!("e{i}"), &content, MemoryCategory::Daily, None)
             .await
             .unwrap();
     }
 
     // Benchmark recall
     let start = Instant::now();
-    let sq_results = sq.recall("Rust systems", 10).await.unwrap();
+    let sq_results = sq.recall("Rust systems", 10, None).await.unwrap();
     let sq_dur = start.elapsed();
 
     let start = Instant::now();
-    let md_results = md.recall("Rust systems", 10).await.unwrap();
+    let md_results = md.recall("Rust systems", 10, None).await.unwrap();
     let md_dur = start.elapsed();
 
     println!("\n============================================================");
@@ -227,15 +229,25 @@ async fn compare_persistence() {
     // Store in both, then drop and re-open
     {
         let sq = sqlite_backend(tmp_sq.path());
-        sq.store("persist_test", "I should survive", MemoryCategory::Core)
-            .await
-            .unwrap();
+        sq.store(
+            "persist_test",
+            "I should survive",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
     }
     {
         let md = markdown_backend(tmp_md.path());
-        md.store("persist_test", "I should survive", MemoryCategory::Core)
-            .await
-            .unwrap();
+        md.store(
+            "persist_test",
+            "I should survive",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
     }
 
     // Re-open
@@ -282,17 +294,17 @@ async fn compare_upsert() {
     let md = markdown_backend(tmp_md.path());
 
     // Store twice with same key, different content
-    sq.store("pref", "likes Rust", MemoryCategory::Core)
+    sq.store("pref", "likes Rust", MemoryCategory::Core, None)
         .await
         .unwrap();
-    sq.store("pref", "loves Rust", MemoryCategory::Core)
+    sq.store("pref", "loves Rust", MemoryCategory::Core, None)
         .await
         .unwrap();
 
-    md.store("pref", "likes Rust", MemoryCategory::Core)
+    md.store("pref", "likes Rust", MemoryCategory::Core, None)
         .await
         .unwrap();
-    md.store("pref", "loves Rust", MemoryCategory::Core)
+    md.store("pref", "loves Rust", MemoryCategory::Core, None)
         .await
         .unwrap();
 
@@ -300,7 +312,7 @@ async fn compare_upsert() {
     let md_count = md.count().await.unwrap();
 
     let sq_entry = sq.get("pref").await.unwrap();
-    let md_results = md.recall("loves Rust", 5).await.unwrap();
+    let md_results = md.recall("loves Rust", 5, None).await.unwrap();
 
     println!("\n============================================================");
     println!("UPSERT (store same key twice):");
@@ -328,10 +340,10 @@ async fn compare_forget() {
     let sq = sqlite_backend(tmp_sq.path());
     let md = markdown_backend(tmp_md.path());
 
-    sq.store("secret", "API key: sk-1234", MemoryCategory::Core)
+    sq.store("secret", "API key: sk-1234", MemoryCategory::Core, None)
         .await
         .unwrap();
-    md.store("secret", "API key: sk-1234", MemoryCategory::Core)
+    md.store("secret", "API key: sk-1234", MemoryCategory::Core, None)
         .await
         .unwrap();
 
@@ -372,37 +384,40 @@ async fn compare_category_filter() {
     let md = markdown_backend(tmp_md.path());
 
     // Mix of categories
-    sq.store("a", "core fact 1", MemoryCategory::Core)
+    sq.store("a", "core fact 1", MemoryCategory::Core, None)
         .await
         .unwrap();
-    sq.store("b", "core fact 2", MemoryCategory::Core)
+    sq.store("b", "core fact 2", MemoryCategory::Core, None)
         .await
         .unwrap();
-    sq.store("c", "daily note", MemoryCategory::Daily)
+    sq.store("c", "daily note", MemoryCategory::Daily, None)
         .await
         .unwrap();
-    sq.store("d", "convo msg", MemoryCategory::Conversation)
-        .await
-        .unwrap();
-
-    md.store("a", "core fact 1", MemoryCategory::Core)
-        .await
-        .unwrap();
-    md.store("b", "core fact 2", MemoryCategory::Core)
-        .await
-        .unwrap();
-    md.store("c", "daily note", MemoryCategory::Daily)
+    sq.store("d", "convo msg", MemoryCategory::Conversation, None)
         .await
         .unwrap();
 
-    let sq_core = sq.list(Some(&MemoryCategory::Core)).await.unwrap();
-    let sq_daily = sq.list(Some(&MemoryCategory::Daily)).await.unwrap();
-    let sq_conv = sq.list(Some(&MemoryCategory::Conversation)).await.unwrap();
-    let sq_all = sq.list(None).await.unwrap();
+    md.store("a", "core fact 1", MemoryCategory::Core, None)
+        .await
+        .unwrap();
+    md.store("b", "core fact 2", MemoryCategory::Core, None)
+        .await
+        .unwrap();
+    md.store("c", "daily note", MemoryCategory::Daily, None)
+        .await
+        .unwrap();
 
-    let md_core = md.list(Some(&MemoryCategory::Core)).await.unwrap();
-    let md_daily = md.list(Some(&MemoryCategory::Daily)).await.unwrap();
-    let md_all = md.list(None).await.unwrap();
+    let sq_core = sq.list(Some(&MemoryCategory::Core), None).await.unwrap();
+    let sq_daily = sq.list(Some(&MemoryCategory::Daily), None).await.unwrap();
+    let sq_conv = sq
+        .list(Some(&MemoryCategory::Conversation), None)
+        .await
+        .unwrap();
+    let sq_all = sq.list(None, None).await.unwrap();
+
+    let md_core = md.list(Some(&MemoryCategory::Core), None).await.unwrap();
+    let md_daily = md.list(Some(&MemoryCategory::Daily), None).await.unwrap();
+    let md_all = md.list(None, None).await.unwrap();
 
     println!("\n============================================================");
     println!("CATEGORY FILTERING:");

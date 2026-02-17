@@ -1,3 +1,7 @@
+[workspace]
+members = ["."]
+resolver = "2"
+
 [package]
 name = "zeroclaw"
 version = "0.1.0"
@@ -31,7 +35,7 @@ shellexpand = "3.1"
 
 # Logging - minimal
 tracing = { version = "0.1", default-features = false }
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }
 
 # Observability - Prometheus metrics
 prometheus = { version = "0.14", default-features = false }
@@ -63,11 +67,11 @@ rand = "0.8"
 # Fast mutexes that don't poison on panic
 parking_lot = "0.12"
 
-# Landlock (Linux sandbox) - optional dependency
-landlock = { version = "0.4", optional = true }
-
 # Async traits
 async-trait = "0.1"
+
+# Protobuf encode/decode (Feishu WS long-connection frame codec)
+prost = { version = "0.14", default-features = false }
 
 # Memory / persistence
 rusqlite = { version = "0.38", features = ["bundled"] }
@@ -86,6 +90,7 @@ glob = "0.3"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 futures = "0.3"
+regex = "1.10"
 hostname = "0.4.2"
 lettre = { version = "0.11.19", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }
 mail-parser = "0.11.2"
@@ -95,7 +100,7 @@ tokio-rustls = "0.26.4"
 webpki-roots = "1.0.6"
 
 # HTTP server (gateway) — replaces raw TCP for proper HTTP/1.1 compliance
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "ws"] }
 tower = { version = "0.5", default-features = false }
 tower-http = { version = "0.6", default-features = false, features = ["limit", "timeout"] }
 http-body-util = "0.1"
@@ -117,19 +122,28 @@ probe-rs = { version = "0.30", optional = true }
 # PDF extraction for datasheet RAG (optional, enable with --features rag-pdf)
 pdf-extract = { version = "0.10", optional = true }
 
-# Raspberry Pi GPIO (Linux/RPi only) — target-specific to avoid compile failure on macOS
+# Raspberry Pi GPIO / Landlock (Linux only) — target-specific to avoid compile failure on macOS
 [target.'cfg(target_os = "linux")'.dependencies]
 rppal = { version = "0.14", optional = true }
+landlock = { version = "0.4", optional = true }
 
 [features]
 default = ["hardware"]
 hardware = ["nusb", "tokio-serial"]
 peripheral-rpi = ["rppal"]
+# Browser backend feature alias used by cfg(feature = "browser-native")
+browser-native = ["dep:fantoccini"]
+# Backward-compatible alias for older invocations
+fantoccini = ["browser-native"]
+# Sandbox feature aliases used by cfg(feature = "sandbox-*")
+sandbox-landlock = ["dep:landlock"]
+sandbox-bubblewrap = []
+# Backward-compatible alias for older invocations
+landlock = ["sandbox-landlock"]
 # probe = probe-rs for Nucleo memory read (adds ~50 deps; optional)
 probe = ["dep:probe-rs"]
 # rag-pdf = PDF ingestion for datasheet RAG
 rag-pdf = ["dep:pdf-extract"]
-
 [profile.release]
 opt-level = "z"      # Optimize for size
 lto = "thin"         # Lower memory use during release builds

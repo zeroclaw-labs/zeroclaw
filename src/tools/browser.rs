@@ -854,7 +854,6 @@ impl BrowserTool {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 #[async_trait]
 impl Tool for BrowserTool {
     fn name(&self) -> &str {
@@ -1031,165 +1030,21 @@ impl Tool for BrowserTool {
             return self.execute_computer_use_action(action_str, &args).await;
         }
 
-        let action = match action_str {
-            "open" => {
-                let url = args
-                    .get("url")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("Missing 'url' for open action"))?;
-                BrowserAction::Open { url: url.into() }
-            }
-            "snapshot" => BrowserAction::Snapshot {
-                interactive_only: args
-                    .get("interactive_only")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(true), // Default to interactive for AI
-                compact: args
-                    .get("compact")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(true),
-                depth: args
-                    .get("depth")
-                    .and_then(serde_json::Value::as_u64)
-                    .map(|d| u32::try_from(d).unwrap_or(u32::MAX)),
-            },
-            "click" => {
-                let selector = args
-                    .get("selector")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for click"))?;
-                BrowserAction::Click {
-                    selector: selector.into(),
-                }
-            }
-            "fill" => {
-                let selector = args
-                    .get("selector")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for fill"))?;
-                let value = args
-                    .get("value")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("Missing 'value' for fill"))?;
-                BrowserAction::Fill {
-                    selector: selector.into(),
-                    value: value.into(),
-                }
-            }
-            "type" => {
-                let selector = args
-                    .get("selector")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for type"))?;
-                let text = args
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("Missing 'text' for type"))?;
-                BrowserAction::Type {
-                    selector: selector.into(),
-                    text: text.into(),
-                }
-            }
-            "get_text" => {
-                let selector = args
-                    .get("selector")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for get_text"))?;
-                BrowserAction::GetText {
-                    selector: selector.into(),
-                }
-            }
-            "get_title" => BrowserAction::GetTitle,
-            "get_url" => BrowserAction::GetUrl,
-            "screenshot" => BrowserAction::Screenshot {
-                path: args.get("path").and_then(|v| v.as_str()).map(String::from),
-                full_page: args
-                    .get("full_page")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false),
-            },
-            "wait" => BrowserAction::Wait {
-                selector: args
-                    .get("selector")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-                ms: args.get("ms").and_then(serde_json::Value::as_u64),
-                text: args.get("text").and_then(|v| v.as_str()).map(String::from),
-            },
-            "press" => {
-                let key = args
-                    .get("key")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("Missing 'key' for press"))?;
-                BrowserAction::Press { key: key.into() }
-            }
-            "hover" => {
-                let selector = args
-                    .get("selector")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for hover"))?;
-                BrowserAction::Hover {
-                    selector: selector.into(),
-                }
-            }
-            "scroll" => {
-                let direction = args
-                    .get("direction")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("Missing 'direction' for scroll"))?;
-                BrowserAction::Scroll {
-                    direction: direction.into(),
-                    pixels: args
-                        .get("pixels")
-                        .and_then(serde_json::Value::as_u64)
-                        .map(|p| u32::try_from(p).unwrap_or(u32::MAX)),
-                }
-            }
-            "is_visible" => {
-                let selector = args
-                    .get("selector")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for is_visible"))?;
-                BrowserAction::IsVisible {
-                    selector: selector.into(),
-                }
-            }
-            "close" => BrowserAction::Close,
-            "find" => {
-                let by = args
-                    .get("by")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("Missing 'by' for find"))?;
-                let value = args
-                    .get("value")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("Missing 'value' for find"))?;
-                let action = args
-                    .get("find_action")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("Missing 'find_action' for find"))?;
-                BrowserAction::Find {
-                    by: by.into(),
-                    value: value.into(),
-                    action: action.into(),
-                    fill_value: args
-                        .get("fill_value")
-                        .and_then(|v| v.as_str())
-                        .map(String::from),
-                }
-            }
-            _ => {
+        if is_computer_use_only_action(action_str) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(unavailable_action_for_backend_error(action_str, backend)),
+            });
+        }
+
+        let action = match parse_browser_action(action_str, &args) {
+            Ok(a) => a,
+            Err(e) => {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(format!(
-                        "Action '{action_str}' is unavailable for backend '{}'",
-                        match backend {
-                            ResolvedBackend::AgentBrowser => "agent_browser",
-                            ResolvedBackend::RustNative => "rust_native",
-                            ResolvedBackend::ComputerUse => "computer_use",
-                        }
-                    )),
+                    error: Some(e.to_string()),
                 });
             }
         };
@@ -1871,6 +1726,161 @@ mod native_backend {
     }
 }
 
+// ── Action parsing ──────────────────────────────────────────────
+
+/// Parse a JSON `args` object into a typed `BrowserAction`.
+fn parse_browser_action(action_str: &str, args: &Value) -> anyhow::Result<BrowserAction> {
+    match action_str {
+        "open" => {
+            let url = args
+                .get("url")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'url' for open action"))?;
+            Ok(BrowserAction::Open { url: url.into() })
+        }
+        "snapshot" => Ok(BrowserAction::Snapshot {
+            interactive_only: args
+                .get("interactive_only")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true),
+            compact: args
+                .get("compact")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true),
+            depth: args
+                .get("depth")
+                .and_then(serde_json::Value::as_u64)
+                .map(|d| u32::try_from(d).unwrap_or(u32::MAX)),
+        }),
+        "click" => {
+            let selector = args
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for click"))?;
+            Ok(BrowserAction::Click {
+                selector: selector.into(),
+            })
+        }
+        "fill" => {
+            let selector = args
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for fill"))?;
+            let value = args
+                .get("value")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'value' for fill"))?;
+            Ok(BrowserAction::Fill {
+                selector: selector.into(),
+                value: value.into(),
+            })
+        }
+        "type" => {
+            let selector = args
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for type"))?;
+            let text = args
+                .get("text")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'text' for type"))?;
+            Ok(BrowserAction::Type {
+                selector: selector.into(),
+                text: text.into(),
+            })
+        }
+        "get_text" => {
+            let selector = args
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for get_text"))?;
+            Ok(BrowserAction::GetText {
+                selector: selector.into(),
+            })
+        }
+        "get_title" => Ok(BrowserAction::GetTitle),
+        "get_url" => Ok(BrowserAction::GetUrl),
+        "screenshot" => Ok(BrowserAction::Screenshot {
+            path: args.get("path").and_then(|v| v.as_str()).map(String::from),
+            full_page: args
+                .get("full_page")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        }),
+        "wait" => Ok(BrowserAction::Wait {
+            selector: args
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            ms: args.get("ms").and_then(serde_json::Value::as_u64),
+            text: args.get("text").and_then(|v| v.as_str()).map(String::from),
+        }),
+        "press" => {
+            let key = args
+                .get("key")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'key' for press"))?;
+            Ok(BrowserAction::Press { key: key.into() })
+        }
+        "hover" => {
+            let selector = args
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for hover"))?;
+            Ok(BrowserAction::Hover {
+                selector: selector.into(),
+            })
+        }
+        "scroll" => {
+            let direction = args
+                .get("direction")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'direction' for scroll"))?;
+            Ok(BrowserAction::Scroll {
+                direction: direction.into(),
+                pixels: args
+                    .get("pixels")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|p| u32::try_from(p).unwrap_or(u32::MAX)),
+            })
+        }
+        "is_visible" => {
+            let selector = args
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for is_visible"))?;
+            Ok(BrowserAction::IsVisible {
+                selector: selector.into(),
+            })
+        }
+        "close" => Ok(BrowserAction::Close),
+        "find" => {
+            let by = args
+                .get("by")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'by' for find"))?;
+            let value = args
+                .get("value")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'value' for find"))?;
+            let action = args
+                .get("find_action")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'find_action' for find"))?;
+            Ok(BrowserAction::Find {
+                by: by.into(),
+                value: value.into(),
+                action: action.into(),
+                fill_value: args
+                    .get("fill_value")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+            })
+        }
+        other => anyhow::bail!("Unsupported browser action: {other}"),
+    }
+}
+
 // ── Helper functions ─────────────────────────────────────────────
 
 fn is_supported_browser_action(action: &str) -> bool {
@@ -1898,6 +1908,28 @@ fn is_supported_browser_action(action: &str) -> bool {
             | "key_type"
             | "key_press"
             | "screen_capture"
+    )
+}
+
+fn is_computer_use_only_action(action: &str) -> bool {
+    matches!(
+        action,
+        "mouse_move" | "mouse_click" | "mouse_drag" | "key_type" | "key_press" | "screen_capture"
+    )
+}
+
+fn backend_name(backend: ResolvedBackend) -> &'static str {
+    match backend {
+        ResolvedBackend::AgentBrowser => "agent_browser",
+        ResolvedBackend::RustNative => "rust_native",
+        ResolvedBackend::ComputerUse => "computer_use",
+    }
+}
+
+fn unavailable_action_for_backend_error(action: &str, backend: ResolvedBackend) -> String {
+    format!(
+        "Action '{action}' is unavailable for backend '{}'",
+        backend_name(backend)
     )
 }
 
@@ -2341,5 +2373,29 @@ mod tests {
         let security = Arc::new(SecurityPolicy::default());
         let tool = BrowserTool::new(security, vec![], None);
         assert!(tool.validate_url("https://example.com").is_err());
+    }
+
+    #[test]
+    fn computer_use_only_action_detection_is_correct() {
+        assert!(is_computer_use_only_action("mouse_move"));
+        assert!(is_computer_use_only_action("mouse_click"));
+        assert!(is_computer_use_only_action("mouse_drag"));
+        assert!(is_computer_use_only_action("key_type"));
+        assert!(is_computer_use_only_action("key_press"));
+        assert!(is_computer_use_only_action("screen_capture"));
+        assert!(!is_computer_use_only_action("open"));
+        assert!(!is_computer_use_only_action("snapshot"));
+    }
+
+    #[test]
+    fn unavailable_action_error_preserves_backend_context() {
+        assert_eq!(
+            unavailable_action_for_backend_error("mouse_move", ResolvedBackend::AgentBrowser),
+            "Action 'mouse_move' is unavailable for backend 'agent_browser'"
+        );
+        assert_eq!(
+            unavailable_action_for_backend_error("mouse_move", ResolvedBackend::RustNative),
+            "Action 'mouse_move' is unavailable for backend 'rust_native'"
+        );
     }
 }

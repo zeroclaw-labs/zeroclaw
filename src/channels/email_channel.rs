@@ -10,6 +10,7 @@
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use lettre::message::SinglePart;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
 use mail_parser::{MessageParser, MimeHeaders};
@@ -39,7 +40,7 @@ pub struct EmailConfig {
     pub imap_folder: String,
     /// SMTP server hostname
     pub smtp_host: String,
-    /// SMTP server port (default: 587 for STARTTLS)
+    /// SMTP server port (default: 465 for TLS)
     #[serde(default = "default_smtp_port")]
     pub smtp_port: u16,
     /// Use TLS for SMTP (default: true)
@@ -63,7 +64,7 @@ fn default_imap_port() -> u16 {
     993
 }
 fn default_smtp_port() -> u16 {
-    587
+    465
 }
 fn default_imap_folder() -> String {
     "INBOX".into()
@@ -389,7 +390,7 @@ impl Channel for EmailChannel {
             .from(self.config.from_address.parse()?)
             .to(recipient.parse()?)
             .subject(subject)
-            .body(body.to_string())?;
+            .singlepart(SinglePart::plain(body.to_string()))?;
 
         let transport = self.create_smtp_transport()?;
         transport.send(&email)?;
@@ -427,6 +428,7 @@ impl Channel for EmailChannel {
                         } // MutexGuard dropped before await
                         let msg = ChannelMessage {
                             id,
+                            reply_target: sender.clone(),
                             sender,
                             content,
                             channel: "email".to_string(),
@@ -463,6 +465,18 @@ impl Channel for EmailChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_smtp_port_uses_tls_port() {
+        assert_eq!(default_smtp_port(), 465);
+    }
+
+    #[test]
+    fn email_config_default_uses_tls_smtp_defaults() {
+        let config = EmailConfig::default();
+        assert_eq!(config.smtp_port, 465);
+        assert!(config.smtp_tls);
+    }
 
     #[test]
     fn build_imap_tls_config_succeeds() {
@@ -504,7 +518,7 @@ mod tests {
         assert_eq!(config.imap_port, 993);
         assert_eq!(config.imap_folder, "INBOX");
         assert_eq!(config.smtp_host, "");
-        assert_eq!(config.smtp_port, 587);
+        assert_eq!(config.smtp_port, 465);
         assert!(config.smtp_tls);
         assert_eq!(config.username, "");
         assert_eq!(config.password, "");
@@ -765,8 +779,8 @@ mod tests {
     }
 
     #[test]
-    fn default_smtp_port_returns_587() {
-        assert_eq!(default_smtp_port(), 587);
+    fn default_smtp_port_returns_465() {
+        assert_eq!(default_smtp_port(), 465);
     }
 
     #[test]
@@ -822,7 +836,7 @@ mod tests {
 
         let config: EmailConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.imap_port, 993); // default
-        assert_eq!(config.smtp_port, 587); // default
+        assert_eq!(config.smtp_port, 465); // default
         assert!(config.smtp_tls); // default
         assert_eq!(config.poll_interval_secs, 60); // default
     }

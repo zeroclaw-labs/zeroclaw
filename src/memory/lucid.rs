@@ -24,7 +24,9 @@ pub struct LucidMemory {
 impl LucidMemory {
     const DEFAULT_LUCID_CMD: &'static str = "lucid";
     const DEFAULT_TOKEN_BUDGET: usize = 200;
-    const DEFAULT_RECALL_TIMEOUT_MS: u64 = 120;
+    // Lucid CLI cold start can exceed 120ms on slower machines, which causes
+    // avoidable fallback to local-only memory and premature cooldown.
+    const DEFAULT_RECALL_TIMEOUT_MS: u64 = 500;
     const DEFAULT_STORE_TIMEOUT_MS: u64 = 800;
     const DEFAULT_LOCAL_HIT_THRESHOLD: usize = 3;
     const DEFAULT_FAILURE_COOLDOWN_MS: u64 = 15_000;
@@ -74,6 +76,7 @@ impl LucidMemory {
     }
 
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     fn with_options(
         workspace_dir: &Path,
         local: SqliteMemory,
@@ -307,14 +310,22 @@ impl Memory for LucidMemory {
         key: &str,
         content: &str,
         category: MemoryCategory,
+        session_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        self.local.store(key, content, category.clone()).await?;
+        self.local
+            .store(key, content, category.clone(), session_id)
+            .await?;
         self.sync_to_lucid_async(key, content, &category).await;
         Ok(())
     }
 
-    async fn recall(&self, query: &str, limit: usize) -> anyhow::Result<Vec<MemoryEntry>> {
-        let local_results = self.local.recall(query, limit).await?;
+    async fn recall(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let local_results = self.local.recall(query, limit, session_id).await?;
         if limit == 0
             || local_results.len() >= limit
             || local_results.len() >= self.local_hit_threshold
@@ -351,8 +362,12 @@ impl Memory for LucidMemory {
         self.local.get(key).await
     }
 
-    async fn list(&self, category: Option<&MemoryCategory>) -> anyhow::Result<Vec<MemoryEntry>> {
-        self.local.list(category).await
+    async fn list(
+        &self,
+        category: Option<&MemoryCategory>,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.local.list(category, session_id).await
     }
 
     async fn forget(&self, key: &str) -> anyhow::Result<bool> {
@@ -391,6 +406,38 @@ if [[ "${1:-}" == "context" ]]; then
 Auth context snapshot
 - [decision] Use token refresh middleware
 - [context] Working in src/auth.rs
+</lucid-context>
+EOF
+  exit 0
+fi
+
+echo "unsupported command" >&2
+exit 1
+"#;
+
+        fs::write(&script_path, script).unwrap();
+        let mut perms = fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).unwrap();
+        script_path.display().to_string()
+    }
+
+    fn write_delayed_lucid_script(dir: &Path) -> String {
+        let script_path = dir.join("delayed-lucid.sh");
+        let script = r#"#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == "store" ]]; then
+  echo '{"success":true,"id":"mem_1"}'
+  exit 0
+fi
+
+if [[ "${1:-}" == "context" ]]; then
+  # Simulate a cold start that is slower than 120ms but below the 500ms timeout.
+  sleep 0.2
+  cat <<'EOF'
+<lucid-context>
+- [decision] Delayed token refresh guidance
 </lucid-context>
 EOF
   exit 0
@@ -449,7 +496,7 @@ exit 1
             cmd,
             200,
             3,
-            Duration::from_millis(120),
+            Duration::from_millis(500),
             Duration::from_millis(400),
             Duration::from_secs(2),
         )
@@ -468,7 +515,7 @@ exit 1
         let memory = test_memory(tmp.path(), "nonexistent-lucid-binary".to_string());
 
         memory
-            .store("lang", "User prefers Rust", MemoryCategory::Core)
+            .store("lang", "User prefers Rust", MemoryCategory::Core, None)
             .await
             .unwrap();
 
@@ -488,6 +535,30 @@ exit 1
                 "local_note",
                 "Local sqlite auth fallback note",
                 MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let entries = memory.recall("auth", 5, None).await.unwrap();
+
+        assert!(entries
+            .iter()
+            .any(|e| e.content.contains("Local sqlite auth fallback note")));
+        assert!(entries.iter().any(|e| e.content.contains("token refresh")));
+    }
+
+    #[tokio::test]
+    async fn recall_handles_lucid_cold_start_delay_within_timeout() {
+        let tmp = TempDir::new().unwrap();
+        let delayed_cmd = write_delayed_lucid_script(tmp.path());
+        let memory = test_memory(tmp.path(), delayed_cmd);
+
+        memory
+            .store(
+                "local_note",
+                "Local sqlite auth fallback note",
+                MemoryCategory::Core,
             )
             .await
             .unwrap();
@@ -497,7 +568,9 @@ exit 1
         assert!(entries
             .iter()
             .any(|e| e.content.contains("Local sqlite auth fallback note")));
-        assert!(entries.iter().any(|e| e.content.contains("token refresh")));
+        assert!(entries
+            .iter()
+            .any(|e| e.content.contains("Delayed token refresh guidance")));
     }
 
     #[tokio::test]
@@ -513,17 +586,22 @@ exit 1
             probe_cmd,
             200,
             1,
-            Duration::from_millis(120),
+            Duration::from_millis(500),
             Duration::from_millis(400),
             Duration::from_secs(2),
         );
 
         memory
-            .store("pref", "Rust should stay local-first", MemoryCategory::Core)
+            .store(
+                "pref",
+                "Rust should stay local-first",
+                MemoryCategory::Core,
+                None,
+            )
             .await
             .unwrap();
 
-        let entries = memory.recall("rust", 5).await.unwrap();
+        let entries = memory.recall("rust", 5, None).await.unwrap();
         assert!(entries
             .iter()
             .any(|e| e.content.contains("Rust should stay local-first")));
@@ -578,13 +656,13 @@ exit 1
             failing_cmd,
             200,
             99,
-            Duration::from_millis(120),
+            Duration::from_millis(500),
             Duration::from_millis(400),
             Duration::from_secs(5),
         );
 
-        let first = memory.recall("auth", 5).await.unwrap();
-        let second = memory.recall("auth", 5).await.unwrap();
+        let first = memory.recall("auth", 5, None).await.unwrap();
+        let second = memory.recall("auth", 5, None).await.unwrap();
 
         assert!(first.is_empty());
         assert!(second.is_empty());

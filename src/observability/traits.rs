@@ -27,6 +27,7 @@ pub enum ObserverEvent {
     AgentEnd {
         duration: Duration,
         tokens_used: Option<u64>,
+        cost_usd: Option<f64>,
     },
     /// A tool call is about to be executed.
     ToolCallStart {

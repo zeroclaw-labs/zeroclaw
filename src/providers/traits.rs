@@ -193,6 +193,13 @@ pub enum StreamError {
 
 #[async_trait]
 pub trait Provider: Send + Sync {
+    /// Query provider capabilities.
+    ///
+    /// Default implementation returns minimal capabilities (no native tool calling).
+    /// Providers should override this to declare their actual capabilities.
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities::default()
+    }
     /// Simple one-shot chat (single user message, no explicit system prompt).
     ///
     /// This is the preferred API for non-agentic direct interactions.
@@ -256,7 +263,7 @@ pub trait Provider: Send + Sync {
 
     /// Whether provider supports native tool calls over API.
     fn supports_native_tools(&self) -> bool {
-        false
+        self.capabilities().native_tool_calling
     }
 
     /// Warm up the HTTP connection pool (TLS handshake, DNS, HTTP/2 setup).
@@ -336,6 +343,27 @@ pub trait Provider: Send + Sync {
 mod tests {
     use super::*;
 
+    struct CapabilityMockProvider;
+
+    #[async_trait]
+    impl Provider for CapabilityMockProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: true,
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("ok".into())
+        }
+    }
+
     #[test]
     fn chat_message_constructors() {
         let sys = ChatMessage::system("Be helpful");
@@ -397,5 +425,33 @@ mod tests {
         }]);
         let json = serde_json::to_string(&tool_result).unwrap();
         assert!(json.contains("\"type\":\"ToolResults\""));
+    }
+
+    #[test]
+    fn provider_capabilities_default() {
+        let caps = ProviderCapabilities::default();
+        assert!(!caps.native_tool_calling);
+    }
+
+    #[test]
+    fn provider_capabilities_equality() {
+        let caps1 = ProviderCapabilities {
+            native_tool_calling: true,
+        };
+        let caps2 = ProviderCapabilities {
+            native_tool_calling: true,
+        };
+        let caps3 = ProviderCapabilities {
+            native_tool_calling: false,
+        };
+
+        assert_eq!(caps1, caps2);
+        assert_ne!(caps1, caps3);
+    }
+
+    #[test]
+    fn supports_native_tools_reflects_capabilities_default_mapping() {
+        let provider = CapabilityMockProvider;
+        assert!(provider.supports_native_tools());
     }
 }

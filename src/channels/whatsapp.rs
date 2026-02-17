@@ -10,7 +10,7 @@ use uuid::Uuid;
 /// happens in the gateway when Meta sends webhook events.
 pub struct WhatsAppChannel {
     access_token: String,
-    phone_number_id: String,
+    endpoint_id: String,
     verify_token: String,
     allowed_numbers: Vec<String>,
     client: reqwest::Client,
@@ -19,13 +19,13 @@ pub struct WhatsAppChannel {
 impl WhatsAppChannel {
     pub fn new(
         access_token: String,
-        phone_number_id: String,
+        endpoint_id: String,
         verify_token: String,
         allowed_numbers: Vec<String>,
     ) -> Self {
         Self {
             access_token,
-            phone_number_id,
+            endpoint_id,
             verify_token,
             allowed_numbers,
             client: reqwest::Client::new(),
@@ -119,6 +119,7 @@ impl WhatsAppChannel {
 
                     messages.push(ChannelMessage {
                         id: Uuid::new_v4().to_string(),
+                        reply_target: normalized_from.clone(),
                         sender: normalized_from,
                         content,
                         channel: "whatsapp".to_string(),
@@ -142,7 +143,7 @@ impl Channel for WhatsAppChannel {
         // WhatsApp Cloud API: POST to /v18.0/{phone_number_id}/messages
         let url = format!(
             "https://graph.facebook.com/v18.0/{}/messages",
-            self.phone_number_id
+            self.endpoint_id
         );
 
         // Normalize recipient (remove leading + if present for API)
@@ -162,7 +163,7 @@ impl Channel for WhatsAppChannel {
         let resp = self
             .client
             .post(&url)
-            .header("Authorization", format!("Bearer {}", self.access_token))
+            .bearer_auth(&self.access_token)
             .header("Content-Type", "application/json")
             .json(&body)
             .send()
@@ -195,11 +196,11 @@ impl Channel for WhatsAppChannel {
 
     async fn health_check(&self) -> bool {
         // Check if we can reach the WhatsApp API
-        let url = format!("https://graph.facebook.com/v18.0/{}", self.phone_number_id);
+        let url = format!("https://graph.facebook.com/v18.0/{}", self.endpoint_id);
 
         self.client
             .get(&url)
-            .header("Authorization", format!("Bearer {}", self.access_token))
+            .bearer_auth(&self.access_token)
             .send()
             .await
             .map(|r| r.status().is_success())

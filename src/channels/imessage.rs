@@ -172,6 +172,7 @@ end tell"#
                         let msg = ChannelMessage {
                             id: rowid.to_string(),
                             sender: sender.clone(),
+                            reply_target: sender.clone(),
                             content: text,
                             channel: "imessage".to_string(),
                             timestamp: std::time::SystemTime::now()

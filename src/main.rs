@@ -34,8 +34,8 @@
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use tracing::{info, Level};
-use tracing_subscriber::FmtSubscriber;
+use tracing::info;
+use tracing_subscriber::{fmt, EnvFilter};
 
 mod agent;
 mod channels;
@@ -147,24 +147,24 @@ enum Commands {
 
     /// Start the gateway server (webhooks, websockets)
     Gateway {
-        /// Port to listen on (use 0 for random available port)
-        #[arg(short, long, default_value = "8080")]
-        port: u16,
+        /// Port to listen on (use 0 for random available port); defaults to config gateway.port
+        #[arg(short, long)]
+        port: Option<u16>,
 
-        /// Host to bind to
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
+        /// Host to bind to; defaults to config gateway.host
+        #[arg(long)]
+        host: Option<String>,
     },
 
     /// Start long-running autonomous runtime (gateway + channels + heartbeat + scheduler)
     Daemon {
-        /// Port to listen on (use 0 for random available port)
-        #[arg(short, long, default_value = "8080")]
-        port: u16,
+        /// Port to listen on (use 0 for random available port); defaults to config gateway.port
+        #[arg(short, long)]
+        port: Option<u16>,
 
-        /// Host to bind to
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
+        /// Host to bind to; defaults to config gateway.host
+        #[arg(long)]
+        host: Option<String>,
     },
 
     /// Manage OS service lifecycle (launchd/systemd user service)
@@ -367,9 +367,11 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Initialize logging
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
+    // Initialize logging - respects RUST_LOG env var, defaults to INFO
+    let subscriber = fmt::Subscriber::builder()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .finish();
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
@@ -434,6 +436,8 @@ async fn main() -> Result<()> {
             .map(|_| ()),
 
         Commands::Gateway { port, host } => {
+            let port = port.unwrap_or(config.gateway.port);
+            let host = host.unwrap_or_else(|| config.gateway.host.clone());
             if port == 0 {
                 info!("🚀 Starting ZeroClaw Gateway on {host} (random port)");
             } else {
@@ -443,6 +447,8 @@ async fn main() -> Result<()> {
         }
 
         Commands::Daemon { port, host } => {
+            let port = port.unwrap_or(config.gateway.port);
+            let host = host.unwrap_or_else(|| config.gateway.host.clone());
             if port == 0 {
                 info!("🧠 Starting ZeroClaw Daemon on {host} (random port)");
             } else {

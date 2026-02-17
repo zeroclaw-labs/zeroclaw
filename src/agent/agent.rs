@@ -251,6 +251,7 @@ impl Agent {
         let provider: Box<dyn Provider> = providers::create_routed_provider(
             provider_name,
             config.api_key.as_deref(),
+            config.api_url.as_deref(),
             &config.reliability,
             &config.model_routes,
             &model_name,
@@ -388,7 +389,7 @@ impl Agent {
         if self.auto_save {
             let _ = self
                 .memory
-                .store("user_msg", user_message, MemoryCategory::Conversation)
+                .store("user_msg", user_message, MemoryCategory::Conversation, None)
                 .await;
         }
 
@@ -447,7 +448,7 @@ impl Agent {
                     let summary = truncate_with_ellipsis(&final_text, 100);
                     let _ = self
                         .memory
-                        .store("assistant_resp", &summary, MemoryCategory::Daily)
+                        .store("assistant_resp", &summary, MemoryCategory::Daily, None)
                         .await;
                 }
 
@@ -557,6 +558,7 @@ pub async fn run(
     agent.observer.record_event(&ObserverEvent::AgentEnd {
         duration: start.elapsed(),
         tokens_used: None,
+        cost_usd: None,
     });
 
     Ok(())

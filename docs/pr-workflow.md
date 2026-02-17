@@ -244,7 +244,7 @@ Label discipline:
 - Path labels identify subsystem ownership quickly.
 - Size labels drive batching strategy.
 - Risk labels drive review depth (`risk: low/medium/high`).
-- Module labels (`<module>:<component>`) improve reviewer routing for integration-specific changes and future newly-added modules.
+- Module labels (`<module>: <component>`) improve reviewer routing for integration-specific changes and future newly-added modules.
 - `risk: manual` allows maintainers to preserve a human risk judgment when automation lacks context.
 - `no-stale` is reserved for accepted-but-blocked work.
 

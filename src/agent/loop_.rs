@@ -7,13 +7,69 @@ use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
+use regex::{Regex, RegexSet};
 use std::fmt::Write;
 use std::io::Write as _;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 use uuid::Uuid;
+
 /// Maximum agentic tool-use iterations per user message to prevent runaway loops.
 const MAX_TOOL_ITERATIONS: usize = 10;
+
+static SENSITIVE_KEY_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
+    RegexSet::new([
+        r"(?i)token",
+        r"(?i)api[_-]?key",
+        r"(?i)password",
+        r"(?i)secret",
+        r"(?i)user[_-]?key",
+        r"(?i)bearer",
+        r"(?i)credential",
+    ])
+    .unwrap()
+});
+
+static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)(token|api[_-]?key|password|secret|user[_-]?key|bearer|credential)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\.]{8,}))"#).unwrap()
+});
+
+/// Scrub credentials from tool output to prevent accidental exfiltration.
+/// Replaces known credential patterns with a redacted placeholder while preserving
+/// a small prefix for context.
+fn scrub_credentials(input: &str) -> String {
+    SENSITIVE_KV_REGEX
+        .replace_all(input, |caps: &regex::Captures| {
+            let full_match = &caps[0];
+            let key = &caps[1];
+            let val = caps
+                .get(2)
+                .or(caps.get(3))
+                .or(caps.get(4))
+                .map(|m| m.as_str())
+                .unwrap_or("");
+
+            // Preserve first 4 chars for context, then redact
+            let prefix = if val.len() > 4 { &val[..4] } else { "" };
+
+            if full_match.contains(':') {
+                if full_match.contains('"') {
+                    format!("\"{}\": \"{}*[REDACTED]\"", key, prefix)
+                } else {
+                    format!("{}: {}*[REDACTED]", key, prefix)
+                }
+            } else if full_match.contains('=') {
+                if full_match.contains('"') {
+                    format!("{}=\"{}*[REDACTED]\"", key, prefix)
+                } else {
+                    format!("{}={}*[REDACTED]", key, prefix)
+                }
+            } else {
+                format!("{}: {}*[REDACTED]", key, prefix)
+            }
+        })
+        .to_string()
+}
 
 /// Trigger auto-compaction when non-system message count exceeds this threshold.
 const MAX_HISTORY_MESSAGES: usize = 50;
@@ -145,7 +201,7 @@ async fn build_context(mem: &dyn Memory, user_msg: &str) -> String {
     let mut context = String::new();
 
     // Pull relevant memories for this message
-    if let Ok(entries) = mem.recall(user_msg, 5).await {
+    if let Ok(entries) = mem.recall(user_msg, 5, None).await {
         if !entries.is_empty() {
             context.push_str("[Memory context]\n");
             for entry in &entries {
@@ -436,6 +492,7 @@ struct ParsedToolCall {
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
 /// When `silent` is true, suppresses stdout (for channel use).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn agent_turn(
     provider: &dyn Provider,
     history: &mut Vec<ChatMessage>,
@@ -461,6 +518,7 @@ pub(crate) async fn agent_turn(
 
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_tool_call_loop(
     provider: &dyn Provider,
     history: &mut Vec<ChatMessage>,
@@ -606,7 +664,7 @@ pub(crate) async fn run_tool_call_loop(
                             success: r.success,
                         });
                         if r.success {
-                            r.output
+                            scrub_credentials(&r.output)
                         } else {
                             format!("Error: {}", r.error.unwrap_or_else(|| r.output))
                         }
@@ -749,6 +807,7 @@ pub async fn run(
     let provider: Box<dyn Provider> = providers::create_routed_provider(
         provider_name,
         config.api_key.as_deref(),
+        config.api_url.as_deref(),
         &config.reliability,
         &config.model_routes,
         model_name,
@@ -912,7 +971,7 @@ pub async fn run(
         if config.memory.auto_save {
             let user_key = autosave_memory_key("user_msg");
             let _ = mem
-                .store(&user_key, &msg, MemoryCategory::Conversation)
+                .store(&user_key, &msg, MemoryCategory::Conversation, None)
                 .await;
         }
 
@@ -955,7 +1014,7 @@ pub async fn run(
             let summary = truncate_with_ellipsis(&response, 100);
             let response_key = autosave_memory_key("assistant_resp");
             let _ = mem
-                .store(&response_key, &summary, MemoryCategory::Daily)
+                .store(&response_key, &summary, MemoryCategory::Daily, None)
                 .await;
         }
     } else {
@@ -978,7 +1037,7 @@ pub async fn run(
             if config.memory.auto_save {
                 let user_key = autosave_memory_key("user_msg");
                 let _ = mem
-                    .store(&user_key, &msg.content, MemoryCategory::Conversation)
+                    .store(&user_key, &msg.content, MemoryCategory::Conversation, None)
                     .await;
             }
 
@@ -1036,7 +1095,7 @@ pub async fn run(
                 let summary = truncate_with_ellipsis(&response, 100);
                 let response_key = autosave_memory_key("assistant_resp");
                 let _ = mem
-                    .store(&response_key, &summary, MemoryCategory::Daily)
+                    .store(&response_key, &summary, MemoryCategory::Daily, None)
                     .await;
             }
         }
@@ -1048,6 +1107,7 @@ pub async fn run(
     observer.record_event(&ObserverEvent::AgentEnd {
         duration,
         tokens_used: None,
+        cost_usd: None,
     });
 
     Ok(final_output)
@@ -1104,6 +1164,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     let provider: Box<dyn Provider> = providers::create_routed_provider(
         provider_name,
         config.api_key.as_deref(),
+        config.api_url.as_deref(),
         &config.reliability,
         &config.model_routes,
         &model_name,
@@ -1217,6 +1278,25 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_scrub_credentials() {
+        let input = "API_KEY=sk-1234567890abcdef; token: 1234567890; password=\"secret123456\"";
+        let scrubbed = scrub_credentials(input);
+        assert!(scrubbed.contains("API_KEY=sk-1*[REDACTED]"));
+        assert!(scrubbed.contains("token: 1234*[REDACTED]"));
+        assert!(scrubbed.contains("password=\"secr*[REDACTED]\""));
+        assert!(!scrubbed.contains("abcdef"));
+        assert!(!scrubbed.contains("secret123456"));
+    }
+
+    #[test]
+    fn test_scrub_credentials_json() {
+        let input = r#"{"api_key": "sk-1234567890", "other": "public"}"#;
+        let scrubbed = scrub_credentials(input);
+        assert!(scrubbed.contains("\"api_key\": \"sk-1*[REDACTED]\""));
+        assert!(scrubbed.contains("public"));
+    }
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use tempfile::TempDir;
 
@@ -1496,16 +1576,16 @@ I will now call the tool with this payload:
         let key1 = autosave_memory_key("user_msg");
         let key2 = autosave_memory_key("user_msg");
 
-        mem.store(&key1, "I'm Paul", MemoryCategory::Conversation)
+        mem.store(&key1, "I'm Paul", MemoryCategory::Conversation, None)
             .await
             .unwrap();
-        mem.store(&key2, "I'm 45", MemoryCategory::Conversation)
+        mem.store(&key2, "I'm 45", MemoryCategory::Conversation, None)
             .await
             .unwrap();
 
         assert_eq!(mem.count().await.unwrap(), 2);
 
-        let recalled = mem.recall("45", 5).await.unwrap();
+        let recalled = mem.recall("45", 5, None).await.unwrap();
         assert!(recalled.iter().any(|entry| entry.content.contains("45")));
     }
 

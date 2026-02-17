@@ -4,6 +4,26 @@ firmware/*/target
 *.db-journal
 .DS_Store
 .wt-pr37/
-.env
 __pycache__/
 *.pyc
+docker-compose.override.yml
+
+# Environment files (may contain secrets)
+.env
+
+# Python virtual environments
+
+.venv/
+venv/
+
+# ESP32 build cache (esp-idf-sys managed)
+
+.embuild/
+.env.local
+.env.*.local
+
+# Secret keys and credentials
+.secret_key
+*.key
+*.pem
+credentials.json

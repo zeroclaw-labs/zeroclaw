@@ -10,14 +10,14 @@
 </p>
 
 <p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License: Apache 2.0" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" /></a>
   <a href="NOTICE"><img src="https://img.shields.io/badge/contributors-27+-green.svg" alt="Contributors" /></a>
 </p>
 
 Fast, small, and fully autonomous AI assistant infrastructure — deploy anywhere, swap anything.
 
 ```
-~3.4MB binary · <10ms startup · 1,017 tests · 22+ providers · 8 traits · Pluggable everything
+~3.4MB binary · <10ms startup · 1,017 tests · 23+ providers · 8 traits · Pluggable everything
 ```
 
 ### ✨ Features
@@ -132,6 +132,9 @@ cd zeroclaw
 cargo build --release --locked
 cargo install --path . --force --locked
 
+# Ensure ~/.cargo/bin is in your PATH
+export PATH="$HOME/.cargo/bin:$PATH"
+
 # Quick setup (no prompts)
 zeroclaw onboard --api-key sk-... --provider openrouter
 
@@ -187,7 +190,7 @@ Every subsystem is a **trait** — swap implementations with a config change, ze
 
 | Subsystem | Trait | Ships with | Extend |
 |-----------|-------|------------|--------|
-| **AI Models** | `Provider` | 22+ providers (OpenRouter, Anthropic, OpenAI, Ollama, Venice, Groq, Mistral, xAI, DeepSeek, Together, Fireworks, Perplexity, Cohere, Bedrock, etc.) | `custom:https://your-api.com` — any OpenAI-compatible API |
+| **AI Models** | `Provider` | 23+ providers (OpenRouter, Anthropic, OpenAI, Ollama, Venice, Groq, Mistral, xAI, DeepSeek, Together, Fireworks, Perplexity, Cohere, Bedrock, Astrai, etc.) | `custom:https://your-api.com` — any OpenAI-compatible API |
 | **Channels** | `Channel` | CLI, Telegram, Discord, Slack, iMessage, Matrix, WhatsApp, Webhook | Any messaging API |
 | **Memory** | `Memory` | SQLite with hybrid search (FTS5 + vector cosine similarity), Lucid bridge (CLI sync + SQLite fallback), Markdown | Any persistence backend |
 | **Tools** | `Tool` | shell, file_read, file_write, memory_store, memory_recall, memory_forget, browser_open (Brave + allowlist), browser (agent-browser / rust-native), composio (optional) | Any capability |
@@ -286,6 +289,21 @@ rerun channel setup only:
 ```bash
 zeroclaw onboard --channels-only
 ```
+
+### Telegram media replies
+
+Telegram routing now replies to the source **chat ID** from incoming updates (instead of usernames),
+which avoids `Bad Request: chat not found` failures.
+
+For non-text replies, ZeroClaw can send Telegram attachments when the assistant includes markers:
+
+- `[IMAGE:<path-or-url>]`
+- `[DOCUMENT:<path-or-url>]`
+- `[VIDEO:<path-or-url>]`
+- `[AUDIO:<path-or-url>]`
+- `[VOICE:<path-or-url>]`
+
+Paths can be local files (for example `/tmp/screenshot.png`) or HTTPS URLs.
 
 ### WhatsApp Business Cloud API Setup
 
@@ -610,7 +628,7 @@ We're building in the open because the best ideas come from everywhere. If you'r
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE) for contributor attribution
+MIT — see [LICENSE](LICENSE) and [NOTICE](NOTICE) for contributor attribution
 
 ## Contributing
 
@@ -623,7 +641,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Implement a trait, submit a PR:
 - New `Memory` → `src/memory/`
 - New `Tunnel` → `src/tunnel/`
 - New `Skill` → `~/.zeroclaw/workspace/skills/<name>/`
-
 
 ---
 
