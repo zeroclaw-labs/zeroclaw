@@ -2422,6 +2422,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
         telegram: None,
         discord: None,
         slack: None,
+        mattermost: None,
         webhook: None,
         imessage: None,
         matrix: None,
