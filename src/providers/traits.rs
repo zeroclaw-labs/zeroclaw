@@ -329,21 +329,11 @@ pub trait Provider: Send + Sync {
     /// Default implementation falls back to stream_chat_with_system with last user message.
     fn stream_chat_with_history(
         &self,
-        messages: &[ChatMessage],
-        model: &str,
-        temperature: f64,
-        options: StreamOptions,
+        _messages: &[ChatMessage],
+        _model: &str,
+        _temperature: f64,
+        _options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
-        let system = messages
-            .iter()
-            .find(|m| m.role == "system")
-            .map(|m| m.content.clone());
-        let last_user = messages
-            .iter()
-            .rfind(|m| m.role == "user")
-            .map(|m| m.content.clone())
-            .unwrap_or_default();
-
         // For default implementation, we need to convert to owned strings
         // This is a limitation of the default implementation
         let provider_name = "unknown".to_string();
