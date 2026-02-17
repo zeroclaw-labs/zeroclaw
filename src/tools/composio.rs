@@ -137,9 +137,10 @@ impl ComposioTool {
         connected_account_ref: Option<&str>,
     ) -> (String, serde_json::Value) {
         let url = format!("{COMPOSIO_API_BASE_V3}/tools/{tool_slug}/execute");
-        let account_ref = connected_account_ref
-            .map(str::trim)
-            .filter(|id| !id.is_empty());
+        let account_ref = connected_account_ref.and_then(|candidate| {
+            let trimmed_candidate = candidate.trim();
+            (!trimmed_candidate.is_empty()).then_some(trimmed_candidate)
+        });
 
         let mut body = json!({
             "arguments": params,
@@ -609,9 +610,38 @@ async fn response_error(resp: reqwest::Response) -> String {
     }
 
     if let Some(api_error) = extract_api_error_message(&body) {
-        format!("HTTP {}: {api_error}", status.as_u16())
+        return format!(
+            "HTTP {}: {}",
+            status.as_u16(),
+            sanitize_error_message(&api_error)
+        );
+    }
+
+    format!("HTTP {}", status.as_u16())
+}
+
+fn sanitize_error_message(message: &str) -> String {
+    let mut sanitized = message.replace('\n', " ");
+    for marker in [
+        "connected_account_id",
+        "connectedAccountId",
+        "entity_id",
+        "entityId",
+        "user_id",
+        "userId",
+    ] {
+        sanitized = sanitized.replace(marker, "[redacted]");
+    }
+
+    let max_chars = 240;
+    if sanitized.chars().count() <= max_chars {
+        sanitized
     } else {
-        format!("HTTP {}: {body}", status.as_u16())
+        let mut end = max_chars;
+        while end > 0 && !sanitized.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &sanitized[..end])
     }
 }
 

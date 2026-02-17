@@ -195,9 +195,13 @@ pub fn all_tools_with_runtime(
             .iter()
             .map(|(name, cfg)| (name.clone(), cfg.clone()))
             .collect();
+        let delegate_fallback_credential = fallback_api_key.and_then(|value| {
+            let trimmed_value = value.trim();
+            (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
+        });
         tools.push(Box::new(DelegateTool::new(
             delegate_agents,
-            fallback_api_key.map(String::from),
+            delegate_fallback_credential,
         )));
     }
 
