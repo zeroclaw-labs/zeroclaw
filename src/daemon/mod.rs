@@ -299,4 +299,15 @@ mod tests {
         });
         assert!(has_supervised_channels(&config));
     }
+
+    #[test]
+    fn detects_dingtalk_as_supervised_channel() {
+        let mut config = Config::default();
+        config.channels_config.dingtalk = Some(crate::config::schema::DingTalkConfig {
+            client_id: "client_id".into(),
+            client_secret: "client_secret".into(),
+            allowed_users: vec!["*".into()],
+        });
+        assert!(has_supervised_channels(&config));
+    }
 }
