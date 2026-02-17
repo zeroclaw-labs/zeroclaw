@@ -119,8 +119,8 @@ impl WhatsAppChannel {
 
                     messages.push(ChannelMessage {
                         id: Uuid::new_v4().to_string(),
-                        sender: normalized_from.clone(),
-                        reply_to: normalized_from,
+                        reply_target: normalized_from.clone(),
+                        sender: normalized_from,
                         content,
                         channel: "whatsapp".to_string(),
                         timestamp,

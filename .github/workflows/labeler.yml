@@ -325,13 +325,18 @@ jobs:
                         return pattern.test(text);
                       }
 
+                      function formatModuleLabel(prefix, segment) {
+                        return `${prefix}: ${segment}`;
+                      }
+
                       function parseModuleLabel(label) {
-                        const separatorIndex = label.indexOf(":");
-                        if (separatorIndex <= 0 || separatorIndex >= label.length - 1) return null;
-                        return {
-                          prefix: label.slice(0, separatorIndex),
-                          segment: label.slice(separatorIndex + 1),
-                        };
+                        if (typeof label !== "string") return null;
+                        const match = label.match(/^([^:]+):\s*(.+)$/);
+                        if (!match) return null;
+                        const prefix = match[1].trim().toLowerCase();
+                        const segment = (match[2] || "").trim().toLowerCase();
+                        if (!prefix || !segment) return null;
+                        return { prefix, segment };
                       }
 
                       function sortByPriority(labels, priorityIndex) {
@@ -389,7 +394,7 @@ jobs:
                         for (const [prefix, segments] of segmentsByPrefix) {
                           const hasSpecificSegment = [...segments].some((segment) => segment !== "core");
                           if (hasSpecificSegment) {
-                            refined.delete(`${prefix}:core`);
+                            refined.delete(formatModuleLabel(prefix, "core"));
                           }
                         }
 
@@ -418,7 +423,7 @@ jobs:
                           if (uniqueSegments.length === 0) continue;
 
                           if (uniqueSegments.length === 1) {
-                            compactedModuleLabels.add(`${prefix}:${uniqueSegments[0]}`);
+                            compactedModuleLabels.add(formatModuleLabel(prefix, uniqueSegments[0]));
                           } else {
                             forcePathPrefixes.add(prefix);
                           }
@@ -609,7 +614,7 @@ jobs:
                           segment = normalizeLabelSegment(segment);
                           if (!segment) continue;
 
-                          detectedModuleLabels.add(`${rule.prefix}:${segment}`);
+                          detectedModuleLabels.add(formatModuleLabel(rule.prefix, segment));
                         }
                       }
 
@@ -635,7 +640,7 @@ jobs:
 
                         for (const keyword of providerKeywordHints) {
                           if (containsKeyword(searchableText, keyword)) {
-                            detectedModuleLabels.add(`provider:${keyword}`);
+                            detectedModuleLabels.add(formatModuleLabel("provider", keyword));
                           }
                         }
                       }
@@ -661,7 +666,7 @@ jobs:
 
                         for (const keyword of channelKeywordHints) {
                           if (containsKeyword(searchableText, keyword)) {
-                            detectedModuleLabels.add(`channel:${keyword}`);
+                            detectedModuleLabels.add(formatModuleLabel("channel", keyword));
                           }
                         }
                       }

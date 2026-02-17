@@ -389,7 +389,7 @@ impl Agent {
         if self.auto_save {
             let _ = self
                 .memory
-                .store("user_msg", user_message, MemoryCategory::Conversation)
+                .store("user_msg", user_message, MemoryCategory::Conversation, None)
                 .await;
         }
 
@@ -448,7 +448,7 @@ impl Agent {
                     let summary = truncate_with_ellipsis(&final_text, 100);
                     let _ = self
                         .memory
-                        .store("assistant_resp", &summary, MemoryCategory::Daily)
+                        .store("assistant_resp", &summary, MemoryCategory::Daily, None)
                         .await;
                 }
 

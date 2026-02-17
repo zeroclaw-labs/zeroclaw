@@ -544,7 +544,7 @@ async fn handle_webhook(
         let key = webhook_memory_key();
         let _ = state
             .mem
-            .store(&key, message, MemoryCategory::Conversation)
+            .store(&key, message, MemoryCategory::Conversation, None)
             .await;
     }
 
@@ -697,7 +697,7 @@ async fn handle_whatsapp_message(
             let key = whatsapp_memory_key(msg);
             let _ = state
                 .mem
-                .store(&key, &msg.content, MemoryCategory::Conversation)
+                .store(&key, &msg.content, MemoryCategory::Conversation, None)
                 .await;
         }
 
@@ -862,7 +862,7 @@ mod tests {
         let msg = ChannelMessage {
             id: "wamid-123".into(),
             sender: "+1234567890".into(),
-            reply_to: "+1234567890".into(),
+            reply_target: "+1234567890".into(),
             content: "hello".into(),
             channel: "whatsapp".into(),
             timestamp: 1,
@@ -886,11 +886,17 @@ mod tests {
             _key: &str,
             _content: &str,
             _category: MemoryCategory,
+            _session_id: Option<&str>,
         ) -> anyhow::Result<()> {
             Ok(())
         }
 
-        async fn recall(&self, _query: &str, _limit: usize) -> anyhow::Result<Vec<MemoryEntry>> {
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(Vec::new())
         }
 
@@ -901,6 +907,7 @@ mod tests {
         async fn list(
             &self,
             _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(Vec::new())
         }
@@ -953,6 +960,7 @@ mod tests {
             key: &str,
             _content: &str,
             _category: MemoryCategory,
+            _session_id: Option<&str>,
         ) -> anyhow::Result<()> {
             self.keys
                 .lock()
@@ -961,7 +969,12 @@ mod tests {
             Ok(())
         }
 
-        async fn recall(&self, _query: &str, _limit: usize) -> anyhow::Result<Vec<MemoryEntry>> {
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(Vec::new())
         }
 
@@ -972,6 +985,7 @@ mod tests {
         async fn list(
             &self,
             _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(Vec::new())
         }

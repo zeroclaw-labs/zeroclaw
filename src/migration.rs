@@ -95,7 +95,9 @@ async fn migrate_openclaw_memory(
             stats.renamed_conflicts += 1;
         }
 
-        memory.store(&key, &entry.content, entry.category).await?;
+        memory
+            .store(&key, &entry.content, entry.category, None)
+            .await?;
         stats.imported += 1;
     }
 
@@ -488,7 +490,7 @@ mod tests {
         // Existing target memory
         let target_mem = SqliteMemory::new(target.path()).unwrap();
         target_mem
-            .store("k", "new value", MemoryCategory::Core)
+            .store("k", "new value", MemoryCategory::Core, None)
             .await
             .unwrap();
 
@@ -510,7 +512,7 @@ mod tests {
             .await
             .unwrap();
 
-        let all = target_mem.list(None).await.unwrap();
+        let all = target_mem.list(None, None).await.unwrap();
         assert!(all.iter().any(|e| e.key == "k" && e.content == "new value"));
         assert!(all
             .iter()

@@ -33,7 +33,7 @@ impl MemoryLoader for DefaultMemoryLoader {
         memory: &dyn Memory,
         user_message: &str,
     ) -> anyhow::Result<String> {
-        let entries = memory.recall(user_message, self.limit).await?;
+        let entries = memory.recall(user_message, self.limit, None).await?;
         if entries.is_empty() {
             return Ok(String::new());
         }
@@ -61,11 +61,17 @@ mod tests {
             _key: &str,
             _content: &str,
             _category: MemoryCategory,
+            _session_id: Option<&str>,
         ) -> anyhow::Result<()> {
             Ok(())
         }
 
-        async fn recall(&self, _query: &str, limit: usize) -> anyhow::Result<Vec<MemoryEntry>> {
+        async fn recall(
+            &self,
+            _query: &str,
+            limit: usize,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
             if limit == 0 {
                 return Ok(vec![]);
             }
@@ -87,6 +93,7 @@ mod tests {
         async fn list(
             &self,
             _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(vec![])
         }
