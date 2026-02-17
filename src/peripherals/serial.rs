@@ -76,7 +76,7 @@ impl SerialTransport {
         let mut port = self.port.lock().await;
         let resp = tokio::time::timeout(
             std::time::Duration::from_secs(SERIAL_TIMEOUT_SECS),
-            send_request(&mut *port, cmd, args),
+            send_request(&mut port, cmd, args),
         )
         .await
         .map_err(|_| {

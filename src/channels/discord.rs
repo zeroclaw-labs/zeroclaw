@@ -723,8 +723,8 @@ mod tests {
     #[test]
     fn discord_message_id_different_message_different_id() {
         // Different message IDs produce different IDs
-        let id1 = format!("discord_123456789012345678");
-        let id2 = format!("discord_987654321098765432");
+        let id1 = "discord_123456789012345678".to_string();
+        let id2 = "discord_987654321098765432".to_string();
         assert_ne!(id1, id2);
     }
 

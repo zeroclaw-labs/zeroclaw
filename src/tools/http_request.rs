@@ -428,7 +428,7 @@ fn is_non_global_v6(v6: std::net::Ipv6Addr) -> bool {
         || (segs[0] & 0xfe00) == 0xfc00   // Unique-local (fc00::/7)
         || (segs[0] & 0xffc0) == 0xfe80   // Link-local (fe80::/10)
         || (segs[0] == 0x2001 && segs[1] == 0x0db8) // Documentation (2001:db8::/32)
-        || v6.to_ipv4_mapped().is_some_and(|v4| is_non_global_v4(v4))
+        || v6.to_ipv4_mapped().is_some_and(is_non_global_v4)
 }
 
 #[cfg(test)]
