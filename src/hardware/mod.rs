@@ -96,6 +96,7 @@ pub fn config_from_wizard_choice(choice: usize, devices: &[DiscoveredDevice]) ->
 pub fn handle_command(cmd: crate::HardwareCommands, _config: &Config) -> Result<()> {
     #[cfg(not(feature = "hardware"))]
     {
+        let _ = &cmd;
         println!("Hardware discovery requires the 'hardware' feature.");
         println!("Build with: cargo build --features hardware");
         return Ok(());

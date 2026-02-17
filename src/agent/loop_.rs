@@ -329,6 +329,23 @@ fn parse_tool_calls_from_json_value(value: &serde_json::Value) -> Vec<ParsedTool
     calls
 }
 
+const TOOL_CALL_OPEN_TAGS: [&str; 3] = ["<tool_call>", "<toolcall>", "<tool-call>"];
+
+fn find_first_tag<'a>(haystack: &str, tags: &'a [&'a str]) -> Option<(usize, &'a str)> {
+    tags.iter()
+        .filter_map(|tag| haystack.find(tag).map(|idx| (idx, *tag)))
+        .min_by_key(|(idx, _)| *idx)
+}
+
+fn matching_tool_call_close_tag(open_tag: &str) -> Option<&'static str> {
+    match open_tag {
+        "<tool_call>" => Some("</tool_call>"),
+        "<toolcall>" => Some("</toolcall>"),
+        "<tool-call>" => Some("</tool-call>"),
+        _ => None,
+    }
+}
+
 /// Extract JSON values from a string.
 ///
 /// # Security Warning
@@ -385,6 +402,9 @@ fn extract_json_values(input: &str) -> Vec<serde_json::Value> {
 /// </tool_call>
 /// ```
 ///
+/// Also accepts common tag variants (`<toolcall>`, `<tool-call>`) for model
+/// compatibility.
+///
 /// Also supports JSON with `tool_calls` array from OpenAI-format responses.
 fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     let mut text_parts = Vec::new();
@@ -406,16 +426,21 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         }
     }
 
-    // Fall back to XML-style <invoke> tag parsing (ZeroClaw's original format)
-    while let Some(start) = remaining.find("<tool_call>") {
+    // Fall back to XML-style tool-call tag parsing.
+    while let Some((start, open_tag)) = find_first_tag(remaining, &TOOL_CALL_OPEN_TAGS) {
         // Everything before the tag is text
         let before = &remaining[..start];
         if !before.trim().is_empty() {
             text_parts.push(before.trim().to_string());
         }
 
-        if let Some(end) = remaining[start..].find("</tool_call>") {
-            let inner = &remaining[start + 11..start + end];
+        let Some(close_tag) = matching_tool_call_close_tag(open_tag) else {
+            break;
+        };
+
+        let after_open = &remaining[start + open_tag.len()..];
+        if let Some(close_idx) = after_open.find(close_tag) {
+            let inner = &after_open[..close_idx];
             let mut parsed_any = false;
             let json_values = extract_json_values(inner);
             for value in json_values {
@@ -430,7 +455,7 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                 tracing::warn!("Malformed <tool_call> JSON: expected tool-call object in tag body");
             }
 
-            remaining = &remaining[start + end + 12..];
+            remaining = &after_open[close_idx + close_tag.len()..];
         } else {
             break;
         }
@@ -441,7 +466,7 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     // (e.g., in emails, files, or web pages) could include JSON that mimics a
     // tool call. Tool calls MUST be explicitly wrapped in either:
     // 1. OpenAI-style JSON with a "tool_calls" array
-    // 2. ZeroClaw <invoke>...</invoke> tags
+    // 2. ZeroClaw tool-call tags (<tool_call>, <toolcall>, <tool-call>)
     // This ensures only the LLM's intentional tool calls are executed.
 
     // Remaining text after last tool call
@@ -1494,6 +1519,50 @@ I will now call the tool with this payload:
             calls[0].arguments.get("command").unwrap().as_str().unwrap(),
             "pwd"
         );
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_toolcall_tag_alias() {
+        let response = r#"<toolcall>
+{"name": "shell", "arguments": {"command": "date"}}
+</toolcall>"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "date"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_tool_dash_call_tag_alias() {
+        let response = r#"<tool-call>
+{"name": "shell", "arguments": {"command": "whoami"}}
+</tool-call>"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "whoami"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_does_not_cross_match_alias_tags() {
+        let response = r#"<toolcall>
+{"name": "shell", "arguments": {"command": "date"}}
+</tool_call>"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(calls.is_empty());
+        assert!(text.contains("<toolcall>"));
+        assert!(text.contains("</tool_call>"));
     }
 
     #[test]
