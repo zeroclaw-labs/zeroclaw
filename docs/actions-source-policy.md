@@ -19,6 +19,7 @@ Selected allowlist patterns:
 - `DavidAnson/markdownlint-cli2-action@*`
 - `lycheeverse/lychee-action@*`
 - `EmbarkStudios/cargo-deny-action@*`
+- `rustsec/audit-check@*`
 - `rhysd/actionlint@*`
 - `softprops/action-gh-release@*`
 - `sigstore/cosign-installer@*`
@@ -79,6 +80,10 @@ Latest sweep notes:
 - 2026-02-16: Blacksmith migration blocked workflow execution
     - Added allowlist pattern: `useblacksmith/*` for self-hosted runner infrastructure
     - Actions: `useblacksmith/setup-docker-builder@v1`, `useblacksmith/build-push-action@v2`
+- 2026-02-17: Security audit reproducibility/freshness balance update
+    - Added allowlist pattern: `rustsec/audit-check@*`
+    - Replaced inline `cargo install cargo-audit` execution with pinned `rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998` in `security.yml`
+    - Supersedes floating-version proposal in #588 while keeping action source policy explicit
 
 ## Rollback
 

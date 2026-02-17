@@ -16,6 +16,7 @@ permissions:
     contents: read
     security-events: write
     actions: read
+    checks: write
 
 env:
     CARGO_TERM_COLOR: always
@@ -23,13 +24,14 @@ env:
 jobs:
     audit:
         name: Security Audit
-        uses: ./.github/workflows/rust-reusable.yml
-        with:
-            timeout_minutes: 20
-            toolchain: stable
-            run_command: |
-                cargo install --locked cargo-audit --version 0.22.1
-                cargo audit
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        timeout-minutes: 20
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+              with:
+                  token: ${{ secrets.GITHUB_TOKEN }}
 
     deny:
         name: License & Supply Chain
