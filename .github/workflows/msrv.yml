@@ -1,0 +1,55 @@
+name: MSRV Check
+
+on:
+    push:
+        branches: [main]
+        paths:
+            - "Cargo.toml"
+            - "Cargo.lock"
+            - "src/**"
+            - "rust-toolchain.toml"
+            - ".github/workflows/msrv.yml"
+    pull_request:
+        branches: [main]
+        paths:
+            - "Cargo.toml"
+            - "Cargo.lock"
+            - "src/**"
+            - "rust-toolchain.toml"
+            - ".github/workflows/msrv.yml"
+    schedule:
+        - cron: "0 6 * * 1" # Weekly on Monday 6am UTC
+
+concurrency:
+    group: msrv-${{ github.event.pull_request.number || github.sha }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+
+env:
+    CARGO_TERM_COLOR: always
+
+jobs:
+    msrv:
+        name: MSRV Compile Check
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        timeout-minutes: 25
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - name: Read MSRV from Cargo.toml
+              id: msrv
+              run: |
+                  MSRV=$(grep '^rust-version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+                  echo "version=${MSRV}" >> "$GITHUB_OUTPUT"
+                  echo "MSRV: ${MSRV}"
+
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: ${{ steps.msrv.outputs.version }}
+
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+
+            - name: Check MSRV compilation
+              run: cargo check --locked --all-targets

@@ -6,6 +6,7 @@ resolver = "2"
 name = "zeroclaw"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.92.0"
 authors = ["theonlyhennygod"]
 license = "Apache-2.0"
 description = "Zero overhead. Zero compromise. 100% Rust. The fastest, smallest AI assistant."
