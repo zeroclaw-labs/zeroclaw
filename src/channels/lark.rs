@@ -417,9 +417,15 @@ impl LarkChannel {
                                 Ok(v) => v,
                                 Err(_) => continue,
                             };
-                            v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string()
+                            match v.get("text").and_then(|t| t.as_str()).filter(|s| !s.is_empty()) {
+                                Some(t) => t.to_string(),
+                                None => continue,
+                            }
                         }
-                        "post" => parse_post_content(&lark_msg.content),
+                        "post" => match parse_post_content(&lark_msg.content) {
+                            Some(t) => t,
+                            None => continue,
+                        },
                         _ => { tracing::debug!("Lark WS: skipping unsupported type '{}'", lark_msg.message_type); continue; }
                     };
 
@@ -542,31 +548,41 @@ impl LarkChannel {
             return messages;
         }
 
-        // Extract message content (text only)
+        // Extract message content (text and post supported)
         let msg_type = event
             .pointer("/message/message_type")
             .and_then(|t| t.as_str())
             .unwrap_or("");
-
-        if msg_type != "text" {
-            tracing::debug!("Lark: skipping non-text message type: {msg_type}");
-            return messages;
-        }
 
         let content_str = event
             .pointer("/message/content")
             .and_then(|c| c.as_str())
             .unwrap_or("");
 
-        // content is a JSON string like "{\"text\":\"hello\"}"
-        let text = serde_json::from_str::<serde_json::Value>(content_str)
-            .ok()
-            .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(String::from))
-            .unwrap_or_default();
-
-        if text.is_empty() {
-            return messages;
-        }
+        let text: String = match msg_type {
+            "text" => {
+                let extracted = serde_json::from_str::<serde_json::Value>(content_str)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("text")
+                            .and_then(|t| t.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(String::from)
+                    });
+                match extracted {
+                    Some(t) => t,
+                    None => return messages,
+                }
+            }
+            "post" => match parse_post_content(content_str) {
+                Some(t) => t,
+                None => return messages,
+            },
+            _ => {
+                tracing::debug!("Lark: skipping unsupported message type: {msg_type}");
+                return messages;
+            }
+        };
 
         let timestamp = event
             .pointer("/message/create_time")
@@ -751,10 +767,12 @@ impl LarkChannel {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Flatten a Feishu `post` rich-text message to plain text.
-fn parse_post_content(content: &str) -> String {
-    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content) else {
-        return "[富文本消息]".to_string();
-    };
+///
+/// Returns `None` when the content cannot be parsed or yields no usable text,
+/// so callers can simply `continue` rather than forwarding a meaningless
+/// placeholder string to the agent.
+fn parse_post_content(content: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<serde_json::Value>(content).ok()?;
     let locale = parsed
         .get("zh_cn")
         .or_else(|| parsed.get("en_us"))
@@ -762,11 +780,19 @@ fn parse_post_content(content: &str) -> String {
             parsed
                 .as_object()
                 .and_then(|m| m.values().find(|v| v.is_object()))
-        });
-    let Some(locale) = locale else {
-        return "[富文本消息]".to_string();
-    };
+        })?;
+
     let mut text = String::new();
+
+    if let Some(title) = locale
+        .get("title")
+        .and_then(|t| t.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        text.push_str(title);
+        text.push_str("\n\n");
+    }
+
     if let Some(paragraphs) = locale.get("content").and_then(|c| c.as_array()) {
         for para in paragraphs {
             if let Some(elements) = para.as_array() {
@@ -795,9 +821,6 @@ fn parse_post_content(content: &str) -> String {
                             text.push('@');
                             text.push_str(n);
                         }
-                        "img" => {
-                            text.push_str("[图片]");
-                        }
                         _ => {}
                     }
                 }
@@ -805,11 +828,12 @@ fn parse_post_content(content: &str) -> String {
             }
         }
     }
+
     let result = text.trim().to_string();
     if result.is_empty() {
-        "[富文本消息]".to_string()
+        None
     } else {
-        result
+        Some(result)
     }
 }
 
