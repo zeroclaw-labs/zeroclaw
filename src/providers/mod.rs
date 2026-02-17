@@ -198,11 +198,8 @@ pub fn create_provider_with_url(
     api_url: Option<&str>,
 ) -> anyhow::Result<Box<dyn Provider>> {
     let resolved_credential = resolve_provider_credential(name, api_key);
-    let key = if let Some(value) = resolved_credential.as_ref() {
-        Some(value.as_str())
-    } else {
-        None
-    };
+    #[allow(clippy::option_as_ref_deref)]
+    let key = resolved_credential.as_ref().map(String::as_str);
     match name {
         // ── Primary providers (custom implementations) ───────
         "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(key))),

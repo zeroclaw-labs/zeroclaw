@@ -169,11 +169,8 @@ impl Tool for DelegateTool {
             .api_key
             .clone()
             .or_else(|| self.fallback_credential.clone());
-        let provider_credential = if let Some(value) = provider_credential_owned.as_ref() {
-            Some(value.as_str())
-        } else {
-            None
-        };
+        #[allow(clippy::option_as_ref_deref)]
+        let provider_credential = provider_credential_owned.as_ref().map(String::as_str);
 
         let provider: Box<dyn Provider> =
             match providers::create_provider(&agent_config.provider, provider_credential) {
