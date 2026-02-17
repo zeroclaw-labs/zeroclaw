@@ -301,6 +301,74 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
     Some(ParsedToolCall { name, arguments })
 }
 
+fn is_valid_tool_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c == '_' || c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c == '_' || c == '-' || c == ':' || c.is_ascii_alphanumeric())
+}
+
+fn parse_legacy_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
+    let object = value.as_object()?;
+
+    // Legacy shorthand: {"schedule": {...args...}}
+    if object.len() == 1 {
+        let (name, arguments) = object.iter().next()?;
+        if is_valid_tool_name(name) && arguments.is_object() {
+            return Some(ParsedToolCall {
+                name: name.to_string(),
+                arguments: arguments.clone(),
+            });
+        }
+    }
+
+    // Legacy shorthand used by some models:
+    // <tool_call>{"action":"create","expression":"...","command":"..."}</tool_call>
+    // Infer "schedule" when payload matches schedule tool schema.
+    let Some(action) = object.get("action").and_then(serde_json::Value::as_str) else {
+        return None;
+    };
+    let schedule_action = matches!(
+        action,
+        "create" | "add" | "once" | "list" | "get" | "cancel" | "remove" | "pause" | "resume"
+    );
+    if !schedule_action {
+        return None;
+    }
+    let looks_like_schedule_payload = object.contains_key("expression")
+        || object.contains_key("delay")
+        || object.contains_key("run_at")
+        || object.contains_key("command")
+        || object.contains_key("id")
+        || action == "list";
+    if !looks_like_schedule_payload {
+        return None;
+    }
+
+    Some(ParsedToolCall {
+        name: "schedule".to_string(),
+        arguments: value.clone(),
+    })
+}
+
+fn parse_prefixed_tool_name_with_json(inner: &str) -> Option<ParsedToolCall> {
+    let trimmed = inner.trim();
+    let first_json_start = trimmed.find('{')?;
+    let name = trimmed[..first_json_start].trim();
+    if !is_valid_tool_name(name) {
+        return None;
+    }
+    let payload = trimmed[first_json_start..].trim();
+    let json = serde_json::from_str::<serde_json::Value>(payload).ok()?;
+
+    Some(ParsedToolCall {
+        name: name.to_string(),
+        arguments: json,
+    })
+}
+
 fn parse_tool_calls_from_json_value(value: &serde_json::Value) -> Vec<ParsedToolCall> {
     let mut calls = Vec::new();
 
@@ -326,6 +394,8 @@ fn parse_tool_calls_from_json_value(value: &serde_json::Value) -> Vec<ParsedTool
     }
 
     if let Some(parsed) = parse_tool_call_value(value) {
+        calls.push(parsed);
+    } else if let Some(parsed) = parse_legacy_tool_call_value(value) {
         calls.push(parsed);
     }
 
@@ -452,6 +522,13 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>, bool) {
                 if !parsed_calls.is_empty() {
                     parsed_any = true;
                     calls.extend(parsed_calls);
+                }
+            }
+
+            if !parsed_any {
+                if let Some(parsed) = parse_prefixed_tool_name_with_json(inner) {
+                    parsed_any = true;
+                    calls.push(parsed);
                 }
             }
 
@@ -1497,16 +1574,56 @@ Some text after."#;
     }
 
     #[test]
-    fn parse_tool_calls_marks_malformed_when_text_precedes_invalid_tool_call() {
+    fn parse_tool_calls_infers_schedule_when_text_precedes_schedule_arguments() {
         let response = r#"I will schedule a 3AM update task. First, I will inspect existing tasks:
 <tool_call>
 {"action":"create","command":"nova update","expression":"0 3 * * *","id":"nova-self-update"}
 </tool_call>"#;
 
         let (text, calls, malformed) = parse_tool_calls(response);
-        assert!(calls.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "schedule");
         assert!(text.contains("I will schedule a 3AM update task"));
+        assert!(!malformed);
+    }
+
+    #[test]
+    fn parse_tool_calls_marks_malformed_when_text_precedes_invalid_tool_call() {
+        let response = r#"I will inspect existing tasks:
+<tool_call>
+{"invalid":[1,2,3]}
+</tool_call>"#;
+
+        let (text, calls, malformed) = parse_tool_calls(response);
+        assert!(calls.is_empty());
+        assert!(text.contains("I will inspect existing tasks"));
         assert!(malformed);
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_prefixed_tool_name_inside_tag() {
+        let response = r#"<tool_call>
+schedule {"action":"list"}
+</tool_call>"#;
+
+        let (_, calls, malformed) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "schedule");
+        assert_eq!(calls[0].arguments["action"], "list");
+        assert!(!malformed);
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_single_key_legacy_wrapper() {
+        let response = r#"<tool_call>
+{"schedule":{"action":"list"}}
+</tool_call>"#;
+
+        let (_, calls, malformed) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "schedule");
+        assert_eq!(calls[0].arguments["action"], "list");
+        assert!(!malformed);
     }
 
     #[test]
@@ -2172,7 +2289,7 @@ Done."#;
             Ok(
                 r#"I will schedule a 3AM update task. First, I will inspect existing tasks:
 <tool_call>
-{"action":"create","command":"nova update","expression":"0 3 * * *","id":"nova-self-update"}
+{"invalid":[1,2,3]}
 </tool_call>"#
                     .to_string(),
             )
