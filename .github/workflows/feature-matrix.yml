@@ -1,0 +1,61 @@
+name: Feature Matrix
+
+on:
+    push:
+        branches: [main]
+        paths:
+            - "Cargo.toml"
+            - "Cargo.lock"
+            - "src/**"
+    pull_request:
+        branches: [main]
+        paths:
+            - "Cargo.toml"
+            - "Cargo.lock"
+            - "src/**"
+    schedule:
+        - cron: "30 4 * * 1" # Weekly Monday 4:30am UTC
+
+concurrency:
+    group: feature-matrix-${{ github.event.pull_request.number || github.sha }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+
+env:
+    CARGO_TERM_COLOR: always
+
+jobs:
+    feature-check:
+        name: Check (${{ matrix.name }})
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        timeout-minutes: 30
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - name: no-default-features
+                      args: --no-default-features
+                    - name: all-features
+                      args: --all-features
+                    - name: hardware-only
+                      args: --no-default-features --features hardware
+                    - name: browser-native
+                      args: --no-default-features --features browser-native
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+              with:
+                  key: features-${{ matrix.name }}
+
+            - name: Check feature combination
+              run: cargo check --locked ${{ matrix.args }}
+
+            - name: Test feature combination
+              run: cargo test --locked ${{ matrix.args }}
