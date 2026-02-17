@@ -101,7 +101,6 @@ impl DingTalkChannel {
         let gw: GatewayResponse = resp.json().await?;
         Ok(gw)
     }
-
 }
 
 #[async_trait]
