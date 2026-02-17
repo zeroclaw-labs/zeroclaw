@@ -194,7 +194,7 @@ impl Provider for ReliableProvider {
                                 "retryable"
                             };
                             failures.push(format!(
-                                "{provider_name}/{current_model} attempt {}/{}: {failure_reason}",
+                                "provider={provider_name} model={current_model} attempt {}/{}: {failure_reason}",
                                 attempt + 1,
                                 self.max_retries + 1
                             ));
@@ -299,7 +299,7 @@ impl Provider for ReliableProvider {
                                 "retryable"
                             };
                             failures.push(format!(
-                                "{provider_name}/{current_model} attempt {}/{}: {failure_reason}",
+                                "provider={provider_name} model={current_model} attempt {}/{}: {failure_reason}",
                                 attempt + 1,
                                 self.max_retries + 1
                             ));
@@ -610,8 +610,8 @@ mod tests {
             .expect_err("all providers should fail");
         let msg = err.to_string();
         assert!(msg.contains("All providers/models failed"));
-        assert!(msg.contains("p1"));
-        assert!(msg.contains("p2"));
+        assert!(msg.contains("provider=p1 model=test"));
+        assert!(msg.contains("provider=p2 model=test"));
     }
 
     #[test]
