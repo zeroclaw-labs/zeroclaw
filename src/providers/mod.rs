@@ -788,8 +788,7 @@ mod tests {
 
     #[test]
     fn ollama_with_custom_url() {
-        let provider =
-            create_provider_with_url("ollama", None, Some("http://10.100.2.32:11434"));
+        let provider = create_provider_with_url("ollama", None, Some("http://10.100.2.32:11434"));
         assert!(provider.is_ok());
     }
 
