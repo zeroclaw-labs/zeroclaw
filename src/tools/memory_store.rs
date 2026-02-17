@@ -61,7 +61,14 @@ impl Tool for MemoryStoreTool {
         let category = match args.get("category").and_then(|v| v.as_str()) {
             Some("daily") => MemoryCategory::Daily,
             Some("conversation") => MemoryCategory::Conversation,
-            _ => MemoryCategory::Core,
+            Some("core") | None => MemoryCategory::Core,
+            Some(other) => {
+                tracing::warn!(
+                    category = other,
+                    "Unknown memory category; defaulting to 'core'"
+                );
+                MemoryCategory::Core
+            }
         };
 
         match self.memory.store(key, content, category, None).await {
