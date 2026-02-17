@@ -16,6 +16,8 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 - `.github/workflows/workflow-sanity.yml` (`Workflow Sanity`)
     - Purpose: lint GitHub workflow files (`actionlint`, tab checks)
     - Recommended for workflow-changing PRs
+- `.github/workflows/pr-intake-sanity.yml` (`PR Intake Sanity`)
+    - Purpose: safe pre-CI PR checks (template completeness, added-line tabs/trailing-whitespace/conflict markers) with immediate sticky feedback comment
 
 ### Non-Blocking but Important
 
@@ -64,6 +66,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 - `Release`: tag push (`v*`)
 - `Security Audit`: push to `main`, PRs to `main`, weekly schedule
 - `Workflow Sanity`: PR/push when `.github/workflows/**`, `.github/*.yml`, or `.github/*.yaml` change
+- `PR Intake Sanity`: `pull_request_target` on opened/reopened/synchronize/edited/ready_for_review
 - `Label Policy Sanity`: PR/push when `.github/label-policy.json`, `.github/workflows/labeler.yml`, or `.github/workflows/auto-response.yml` changes
 - `PR Labeler`: `pull_request_target` lifecycle events
 - `PR Auto Responder`: issue opened/labeled, `pull_request_target` opened/labeled
@@ -78,9 +81,10 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 3. Release failures on tags: inspect `.github/workflows/release.yml`.
 4. Security failures: inspect `.github/workflows/security.yml` and `deny.toml`.
 5. Workflow syntax/lint failures: inspect `.github/workflows/workflow-sanity.yml`.
-6. Label policy parity failures: inspect `.github/workflows/label-policy-sanity.yml`.
-7. Docs failures in CI: inspect `docs-quality` job logs in `.github/workflows/ci.yml`.
-8. Strict delta lint failures in CI: inspect `lint-strict-delta` job logs and compare with `BASE_SHA` diff scope.
+6. PR intake failures: inspect `.github/workflows/pr-intake-sanity.yml` sticky comment and run logs.
+7. Label policy parity failures: inspect `.github/workflows/label-policy-sanity.yml`.
+8. Docs failures in CI: inspect `docs-quality` job logs in `.github/workflows/ci.yml`.
+9. Strict delta lint failures in CI: inspect `lint-strict-delta` job logs and compare with `BASE_SHA` diff scope.
 
 ## Maintenance Rules
 
