@@ -13,7 +13,7 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use std::sync::{Arc, Mutex};
 
 use zeroclaw::agent::agent::Agent;
-use zeroclaw::agent::dispatcher::{NativeToolDispatcher, XmlToolDispatcher, ToolDispatcher};
+use zeroclaw::agent::dispatcher::{NativeToolDispatcher, ToolDispatcher, XmlToolDispatcher};
 use zeroclaw::config::MemoryConfig;
 use zeroclaw::memory;
 use zeroclaw::memory::{Memory, MemoryCategory};
