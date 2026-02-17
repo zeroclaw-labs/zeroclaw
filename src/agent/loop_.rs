@@ -829,7 +829,9 @@ pub(crate) async fn run_tool_call_loop(
         // reconstruct proper OpenAI-format tool_calls and tool result messages.
         // Prompt mode: use XML-based text format as before.
         history.push(ChatMessage::assistant(assistant_history_content));
-        if !native_tool_calls.is_empty() {
+        if native_tool_calls.is_empty() {
+            history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
+        } else {
             for (native_call, result) in native_tool_calls.iter().zip(individual_results.iter()) {
                 let tool_msg = serde_json::json!({
                     "tool_call_id": native_call.id,
@@ -837,8 +839,6 @@ pub(crate) async fn run_tool_call_loop(
                 });
                 history.push(ChatMessage::tool(tool_msg.to_string()));
             }
-        } else {
-            history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
         }
     }
 
