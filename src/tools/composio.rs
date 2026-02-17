@@ -112,12 +112,12 @@ impl ComposioTool {
         action_name: &str,
         params: serde_json::Value,
         entity_id: Option<&str>,
-        connected_account_id: Option<&str>,
+        connected_account_ref: Option<&str>,
     ) -> anyhow::Result<serde_json::Value> {
         let tool_slug = normalize_tool_slug(action_name);
 
         match self
-            .execute_action_v3(&tool_slug, params.clone(), entity_id, connected_account_id)
+            .execute_action_v3(&tool_slug, params.clone(), entity_id, connected_account_ref)
             .await
         {
             Ok(result) => Ok(result),
@@ -130,21 +130,16 @@ impl ComposioTool {
         }
     }
 
-    async fn execute_action_v3(
-        &self,
+    fn build_execute_action_v3_request(
         tool_slug: &str,
         params: serde_json::Value,
         entity_id: Option<&str>,
-        connected_account_id: Option<&str>,
-    ) -> anyhow::Result<serde_json::Value> {
-        let url = if let Some(connected_account_id) = connected_account_id
+        connected_account_ref: Option<&str>,
+    ) -> (String, serde_json::Value) {
+        let url = format!("{COMPOSIO_API_BASE_V3}/tools/{tool_slug}/execute");
+        let account_ref = connected_account_ref
             .map(str::trim)
-            .filter(|id| !id.is_empty())
-        {
-            format!("{COMPOSIO_API_BASE_V3}/tools/{tool_slug}/execute/{connected_account_id}")
-        } else {
-            format!("{COMPOSIO_API_BASE_V3}/tools/{tool_slug}/execute")
-        };
+            .filter(|id| !id.is_empty());
 
         let mut body = json!({
             "arguments": params,
@@ -153,6 +148,26 @@ impl ComposioTool {
         if let Some(entity) = entity_id {
             body["user_id"] = json!(entity);
         }
+        if let Some(account_ref) = account_ref {
+            body["connected_account_id"] = json!(account_ref);
+        }
+
+        (url, body)
+    }
+
+    async fn execute_action_v3(
+        &self,
+        tool_slug: &str,
+        params: serde_json::Value,
+        entity_id: Option<&str>,
+        connected_account_ref: Option<&str>,
+    ) -> anyhow::Result<serde_json::Value> {
+        let (url, body) = Self::build_execute_action_v3_request(
+            tool_slug,
+            params,
+            entity_id,
+            connected_account_ref,
+        );
 
         let resp = self
             .client
@@ -474,11 +489,11 @@ impl Tool for ComposioTool {
                     })?;
 
                 let params = args.get("params").cloned().unwrap_or(json!({}));
-                let connected_account_id =
+                let connected_account_ref =
                     args.get("connected_account_id").and_then(|v| v.as_str());
 
                 match self
-                    .execute_action(action_name, params, Some(entity_id), connected_account_id)
+                    .execute_action(action_name, params, Some(entity_id), connected_account_ref)
                     .await
                 {
                     Ok(result) => {
@@ -947,5 +962,41 @@ mod tests {
     #[test]
     fn composio_api_base_url_is_v3() {
         assert_eq!(COMPOSIO_API_BASE_V3, "https://backend.composio.dev/api/v3");
+    }
+
+    #[test]
+    fn build_execute_action_v3_request_uses_fixed_endpoint_and_body_account_id() {
+        let (url, body) = ComposioTool::build_execute_action_v3_request(
+            "gmail-send-email",
+            json!({"to": "test@example.com"}),
+            Some("workspace-user"),
+            Some("account-42"),
+        );
+
+        assert_eq!(
+            url,
+            "https://backend.composio.dev/api/v3/tools/gmail-send-email/execute"
+        );
+        assert_eq!(body["arguments"]["to"], json!("test@example.com"));
+        assert_eq!(body["user_id"], json!("workspace-user"));
+        assert_eq!(body["connected_account_id"], json!("account-42"));
+    }
+
+    #[test]
+    fn build_execute_action_v3_request_drops_blank_optional_fields() {
+        let (url, body) = ComposioTool::build_execute_action_v3_request(
+            "github-list-repos",
+            json!({}),
+            None,
+            Some("   "),
+        );
+
+        assert_eq!(
+            url,
+            "https://backend.composio.dev/api/v3/tools/github-list-repos/execute"
+        );
+        assert_eq!(body["arguments"], json!({}));
+        assert!(body.get("connected_account_id").is_none());
+        assert!(body.get("user_id").is_none());
     }
 }

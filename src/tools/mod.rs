@@ -432,7 +432,7 @@ mod tests {
             &http,
             tmp.path(),
             &agents,
-            Some("sk-test"),
+            Some("delegate-test-credential"),
             &cfg,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();

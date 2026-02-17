@@ -106,17 +106,17 @@ struct NativeContentIn {
 }
 
 impl AnthropicProvider {
-    pub fn new(api_key: Option<&str>) -> Self {
-        Self::with_base_url(api_key, None)
+    pub fn new(credential: Option<&str>) -> Self {
+        Self::with_base_url(credential, None)
     }
 
-    pub fn with_base_url(api_key: Option<&str>, base_url: Option<&str>) -> Self {
+    pub fn with_base_url(credential: Option<&str>, base_url: Option<&str>) -> Self {
         let base_url = base_url
             .map(|u| u.trim_end_matches('/'))
             .unwrap_or("https://api.anthropic.com")
             .to_string();
         Self {
-            credential: api_key
+            credential: credential
                 .map(str::trim)
                 .filter(|k| !k.is_empty())
                 .map(ToString::to_string),
@@ -410,9 +410,9 @@ mod tests {
 
     #[test]
     fn creates_with_key() {
-        let p = AnthropicProvider::new(Some("sk-ant-test123"));
+        let p = AnthropicProvider::new(Some("anthropic-test-credential"));
         assert!(p.credential.is_some());
-        assert_eq!(p.credential.as_deref(), Some("sk-ant-test123"));
+        assert_eq!(p.credential.as_deref(), Some("anthropic-test-credential"));
         assert_eq!(p.base_url, "https://api.anthropic.com");
     }
 
@@ -431,17 +431,19 @@ mod tests {
 
     #[test]
     fn creates_with_whitespace_key() {
-        let p = AnthropicProvider::new(Some("  sk-ant-test123  "));
+        let p = AnthropicProvider::new(Some("  anthropic-test-credential  "));
         assert!(p.credential.is_some());
-        assert_eq!(p.credential.as_deref(), Some("sk-ant-test123"));
+        assert_eq!(p.credential.as_deref(), Some("anthropic-test-credential"));
     }
 
     #[test]
     fn creates_with_custom_base_url() {
-        let p =
-            AnthropicProvider::with_base_url(Some("sk-ant-test"), Some("https://api.example.com"));
+        let p = AnthropicProvider::with_base_url(
+            Some("anthropic-credential"),
+            Some("https://api.example.com"),
+        );
         assert_eq!(p.base_url, "https://api.example.com");
-        assert_eq!(p.credential.as_deref(), Some("sk-ant-test"));
+        assert_eq!(p.credential.as_deref(), Some("anthropic-credential"));
     }
 
     #[test]

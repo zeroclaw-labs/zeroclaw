@@ -8,7 +8,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 pub struct OpenAiProvider {
-    api_key: Option<String>,
+    credential: Option<String>,
     client: Client,
 }
 
@@ -110,9 +110,9 @@ struct NativeResponseMessage {
 }
 
 impl OpenAiProvider {
-    pub fn new(api_key: Option<&str>) -> Self {
+    pub fn new(credential: Option<&str>) -> Self {
         Self {
-            api_key: api_key.map(ToString::to_string),
+            credential: credential.map(ToString::to_string),
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
                 .connect_timeout(std::time::Duration::from_secs(10))
@@ -232,7 +232,7 @@ impl Provider for OpenAiProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let api_key = self.api_key.as_ref().ok_or_else(|| {
+        let credential = self.credential.as_ref().ok_or_else(|| {
             anyhow::anyhow!("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
         })?;
 
@@ -259,7 +259,7 @@ impl Provider for OpenAiProvider {
         let response = self
             .client
             .post("https://api.openai.com/v1/chat/completions")
-            .header("Authorization", format!("Bearer {api_key}"))
+            .header("Authorization", format!("Bearer {credential}"))
             .json(&request)
             .send()
             .await?;
@@ -284,7 +284,7 @@ impl Provider for OpenAiProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let api_key = self.api_key.as_ref().ok_or_else(|| {
+        let credential = self.credential.as_ref().ok_or_else(|| {
             anyhow::anyhow!("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
         })?;
 
@@ -300,7 +300,7 @@ impl Provider for OpenAiProvider {
         let response = self
             .client
             .post("https://api.openai.com/v1/chat/completions")
-            .header("Authorization", format!("Bearer {api_key}"))
+            .header("Authorization", format!("Bearer {credential}"))
             .json(&native_request)
             .send()
             .await?;
@@ -330,20 +330,20 @@ mod tests {
 
     #[test]
     fn creates_with_key() {
-        let p = OpenAiProvider::new(Some("sk-proj-abc123"));
-        assert_eq!(p.api_key.as_deref(), Some("sk-proj-abc123"));
+        let p = OpenAiProvider::new(Some("openai-test-credential"));
+        assert_eq!(p.credential.as_deref(), Some("openai-test-credential"));
     }
 
     #[test]
     fn creates_without_key() {
         let p = OpenAiProvider::new(None);
-        assert!(p.api_key.is_none());
+        assert!(p.credential.is_none());
     }
 
     #[test]
     fn creates_with_empty_key() {
         let p = OpenAiProvider::new(Some(""));
-        assert_eq!(p.api_key.as_deref(), Some(""));
+        assert_eq!(p.credential.as_deref(), Some(""));
     }
 
     #[tokio::test]
