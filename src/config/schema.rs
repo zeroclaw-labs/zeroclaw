@@ -128,7 +128,7 @@ pub struct GatewayConfig {
 }
 
 fn default_gateway_port() -> u16 {
-    3000
+    28800
 }
 
 fn default_gateway_host() -> String {
@@ -1646,7 +1646,7 @@ channel_id = "C123"
     #[test]
     fn checklist_gateway_serde_roundtrip() {
         let g = GatewayConfig {
-            port: 3000,
+            port: 28800,
             host: "127.0.0.1".into(),
             require_pairing: true,
             allow_public_bind: false,
@@ -1915,7 +1915,7 @@ default_temperature = 0.7
     #[test]
     fn env_override_gateway_port() {
         let mut config = Config::default();
-        assert_eq!(config.gateway.port, 3000);
+        assert_eq!(config.gateway.port, 28800);
 
         std::env::set_var("ZEROCLAW_GATEWAY_PORT", "8080");
         config.apply_env_overrides();
@@ -2005,7 +2005,7 @@ default_temperature = 0.7
     #[test]
     fn gateway_config_default_values() {
         let g = GatewayConfig::default();
-        assert_eq!(g.port, 3000);
+        assert_eq!(g.port, 28800);
         assert_eq!(g.host, "127.0.0.1");
         assert!(g.require_pairing);
         assert!(!g.allow_public_bind);
