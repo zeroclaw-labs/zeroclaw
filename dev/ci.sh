@@ -54,11 +54,11 @@ case "$1" in
     ;;
 
   lint)
-    run_in_ci "cargo fmt --all -- --check && cargo clippy --locked --all-targets -- -D clippy::correctness"
+    run_in_ci "./scripts/ci/rust_quality_gate.sh"
     ;;
 
   lint-strict)
-    run_in_ci "cargo fmt --all -- --check && cargo clippy --locked --all-targets -- -D warnings"
+    run_in_ci "./scripts/ci/rust_quality_gate.sh --strict"
     ;;
 
   test)
@@ -88,7 +88,7 @@ case "$1" in
     ;;
 
   all)
-    run_in_ci "cargo fmt --all -- --check && cargo clippy --locked --all-targets -- -D clippy::correctness"
+    run_in_ci "./scripts/ci/rust_quality_gate.sh"
     run_in_ci "cargo test --locked --verbose"
     run_in_ci "cargo build --release --locked --verbose"
     run_in_ci "cargo deny check licenses sources"
