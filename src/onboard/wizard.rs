@@ -467,7 +467,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "groq" => "llama-3.3-70b-versatile".into(),
         "deepseek" => "deepseek-chat".into(),
         "gemini" => "gemini-2.5-pro".into(),
-        _ => "anthropic/claude-sonnet-4-5".into(),
+        _ => "anthropic/claude-sonnet-4.5".into(),
     }
 }
 
@@ -475,7 +475,7 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
     match canonical_provider_name(provider_name) {
         "openrouter" => vec![
             (
-                "anthropic/claude-sonnet-4-5".to_string(),
+                "anthropic/claude-sonnet-4.5".to_string(),
                 "Claude Sonnet 4.5 (balanced, recommended)".to_string(),
             ),
             (
@@ -4343,6 +4343,16 @@ mod tests {
 
         assert!(ids.contains(&"gpt-5.2".to_string()));
         assert!(ids.contains(&"gpt-5-mini".to_string()));
+    }
+
+    #[test]
+    fn curated_models_for_openrouter_use_valid_anthropic_id() {
+        let ids: Vec<String> = curated_models_for_provider("openrouter")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+
+        assert!(ids.contains(&"anthropic/claude-sonnet-4.5".to_string()));
     }
 
     #[test]
