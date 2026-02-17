@@ -292,9 +292,26 @@ pub fn create_provider_with_url(
         "copilot" | "github-copilot" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "GitHub Copilot", "https://api.githubcopilot.com", key, AuthStyle::Bearer,
         ))),
-        "nvidia" | "nvidia-nim" | "build.nvidia.com" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "NVIDIA NIM", "https://integrate.api.nvidia.com/v1", key, AuthStyle::Bearer,
-        ))),
+        "lmstudio" | "lm-studio" => {
+            let lm_studio_key = api_key
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("lm-studio");
+            Ok(Box::new(OpenAiCompatibleProvider::new(
+                "LM Studio",
+                "http://localhost:1234/v1",
+                Some(lm_studio_key),
+                AuthStyle::Bearer,
+            )))
+        }
+        "nvidia" | "nvidia-nim" | "build.nvidia.com" => Ok(Box::new(
+            OpenAiCompatibleProvider::new(
+                "NVIDIA NIM",
+                "https://integrate.api.nvidia.com/v1",
+                key,
+                AuthStyle::Bearer,
+            ),
+        )),
 
         // ── Bring Your Own Provider (custom URL) ───────────
         // Format: "custom:https://your-api.com" or "custom:http://localhost:1234"
@@ -569,6 +586,13 @@ mod tests {
         assert!(create_provider("dashscope-us", Some("key")).is_ok());
     }
 
+    #[test]
+    fn factory_lmstudio() {
+        assert!(create_provider("lmstudio", Some("key")).is_ok());
+        assert!(create_provider("lm-studio", Some("key")).is_ok());
+        assert!(create_provider("lmstudio", None).is_ok());
+    }
+
     // ── Extended ecosystem ───────────────────────────────────
 
     #[test]
@@ -823,6 +847,7 @@ mod tests {
             "qwen",
             "qwen-intl",
             "qwen-us",
+            "lmstudio",
             "groq",
             "mistral",
             "xai",
