@@ -803,13 +803,30 @@ fn default_irc_port() -> u16 {
     6697
 }
 
+// ── Instance home resolution ─────────────────────────────────────
+
+/// Returns the ZeroClaw root directory for this instance.
+///
+/// Resolution order:
+/// 1. `ZEROCLAW_HOME` environment variable (if set and non-empty)
+/// 2. `~/.zeroclaw` (default)
+pub fn zeroclaw_home() -> PathBuf {
+    if let Ok(home) = std::env::var("ZEROCLAW_HOME") {
+        if !home.is_empty() {
+            return PathBuf::from(home);
+        }
+    }
+    UserDirs::new().map_or_else(
+        || PathBuf::from(".zeroclaw"),
+        |u| u.home_dir().join(".zeroclaw"),
+    )
+}
+
 // ── Config impl ──────────────────────────────────────────────────
 
 impl Default for Config {
     fn default() -> Self {
-        let home =
-            UserDirs::new().map_or_else(|| PathBuf::from("."), |u| u.home_dir().to_path_buf());
-        let zeroclaw_dir = home.join(".zeroclaw");
+        let zeroclaw_dir = zeroclaw_home();
 
         Self {
             workspace_dir: zeroclaw_dir.join("workspace"),
@@ -838,10 +855,7 @@ impl Default for Config {
 
 impl Config {
     pub fn load_or_init() -> Result<Self> {
-        let home = UserDirs::new()
-            .map(|u| u.home_dir().to_path_buf())
-            .context("Could not find home directory")?;
-        let zeroclaw_dir = home.join(".zeroclaw");
+        let zeroclaw_dir = zeroclaw_home();
         let config_path = zeroclaw_dir.join("config.toml");
 
         if !zeroclaw_dir.exists() {
@@ -1013,6 +1027,36 @@ fn sync_directory(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    // ── zeroclaw_home ─────────────────────────────────────────
+
+    #[test]
+    fn zeroclaw_home_uses_env_when_set() {
+        std::env::set_var("ZEROCLAW_HOME", "/tmp/zc-test-home");
+        let home = zeroclaw_home();
+        std::env::remove_var("ZEROCLAW_HOME");
+        assert_eq!(home, PathBuf::from("/tmp/zc-test-home"));
+    }
+
+    #[test]
+    fn zeroclaw_home_ignores_empty_env() {
+        std::env::set_var("ZEROCLAW_HOME", "");
+        let home = zeroclaw_home();
+        std::env::remove_var("ZEROCLAW_HOME");
+        assert!(home.to_string_lossy().contains("zeroclaw"));
+        assert_ne!(home, PathBuf::from(""));
+    }
+
+    #[test]
+    fn zeroclaw_home_defaults_without_env() {
+        std::env::remove_var("ZEROCLAW_HOME");
+        let home = zeroclaw_home();
+        assert!(
+            home.to_string_lossy().contains(".zeroclaw"),
+            "Default home should contain .zeroclaw, got: {}",
+            home.display()
+        );
+    }
 
     // ── Defaults ─────────────────────────────────────────────
 

@@ -234,10 +234,7 @@ pub fn run_quick_setup(
     );
     println!();
 
-    let home = directories::UserDirs::new()
-        .map(|u| u.home_dir().to_path_buf())
-        .context("Could not find home directory")?;
-    let zeroclaw_dir = home.join(".zeroclaw");
+    let zeroclaw_dir = crate::config::zeroclaw_home();
     let workspace_dir = zeroclaw_dir.join("workspace");
     let config_path = zeroclaw_dir.join("config.toml");
 
@@ -427,10 +424,7 @@ fn print_bullet(text: &str) {
 // ── Step 1: Workspace ────────────────────────────────────────────
 
 fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
-    let home = directories::UserDirs::new()
-        .map(|u| u.home_dir().to_path_buf())
-        .context("Could not find home directory")?;
-    let default_dir = home.join(".zeroclaw");
+    let default_dir = crate::config::zeroclaw_home();
 
     print_bullet(&format!(
         "Default location: {}",
