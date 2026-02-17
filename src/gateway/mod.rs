@@ -274,6 +274,8 @@ pub struct AppState {
     pub whatsapp: Option<Arc<WhatsAppChannel>>,
     /// `WhatsApp` app secret for webhook signature verification (`X-Hub-Signature-256`)
     pub whatsapp_app_secret: Option<Arc<str>>,
+    /// Observability backend for metrics scraping
+    pub observer: Arc<dyn crate::observability::Observer>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -433,6 +435,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         println!("  POST /whatsapp  — WhatsApp message webhook");
     }
     println!("  GET  /health    — health check");
+    println!("  GET  /metrics   — Prometheus metrics");
     if let Some(code) = pairing.pairing_code() {
         println!();
         println!("  🔐 PAIRING REQUIRED — use this one-time code:");
@@ -450,6 +453,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     crate::health::mark_component_ok("gateway");
 
     // Build shared state
+    let observer: Arc<dyn crate::observability::Observer> =
+        Arc::from(crate::observability::create_observer(&config.observability));
+
     let state = AppState {
         config: config_state,
         provider,
@@ -464,11 +470,13 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         idempotency_store,
         whatsapp: whatsapp_channel,
         whatsapp_app_secret,
+        observer,
     };
 
     // Build router with middleware
     let app = Router::new()
         .route("/health", get(handle_health))
+        .route("/metrics", get(handle_metrics))
         .route("/pair", post(handle_pair))
         .route("/webhook", post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
@@ -502,6 +510,29 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
         "runtime": crate::health::snapshot_json(),
     });
     Json(body)
+}
+
+/// Prometheus content type for text exposition format.
+const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+
+/// GET /metrics — Prometheus text exposition format
+async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let body = if let Some(prom) = state
+        .observer
+        .as_ref()
+        .as_any()
+        .downcast_ref::<crate::observability::PrometheusObserver>()
+    {
+        prom.encode()
+    } else {
+        String::from("# Prometheus backend not enabled. Set [observability] backend = \"prometheus\" in config.\n")
+    };
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)],
+        body,
+    )
 }
 
 /// POST /pair — exchange one-time code for bearer token
@@ -1247,6 +1278,7 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            observer: Arc::new(crate::observability::NoopObserver),
         };
 
         let mut headers = HeaderMap::new();
@@ -1302,6 +1334,7 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            observer: Arc::new(crate::observability::NoopObserver),
         };
 
         let headers = HeaderMap::new();
@@ -1366,6 +1399,7 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            observer: Arc::new(crate::observability::NoopObserver),
         };
 
         let response = handle_webhook(
@@ -1403,6 +1437,7 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            observer: Arc::new(crate::observability::NoopObserver),
         };
 
         let mut headers = HeaderMap::new();
@@ -1443,6 +1478,7 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            observer: Arc::new(crate::observability::NoopObserver),
         };
 
         let mut headers = HeaderMap::new();

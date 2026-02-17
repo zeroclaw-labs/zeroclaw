@@ -1129,4 +1129,40 @@ mod tests {
             "https://opencode.ai/zen/v1/chat/completions"
         );
     }
+
+    // ══════════════════════════════════════════════════════════
+    // Issue #580: Custom provider URL construction tests
+    // ══════════════════════════════════════════════════════════
+
+    #[test]
+    fn chat_completions_url_custom_provider_opencode_issue_580() {
+        // Issue #580: Custom provider should correctly append /chat/completions
+        // The error log format "{provider_name}/{current_model}" was confusing
+        // but the actual URL construction was always correct.
+        let p = make_provider("custom", "https://opencode.ai/zen/v1", None);
+        assert_eq!(
+            p.chat_completions_url(),
+            "https://opencode.ai/zen/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn chat_completions_url_custom_provider_standard() {
+        // Standard custom provider without /v1 path
+        let p = make_provider("custom", "https://my-api.example.com", None);
+        assert_eq!(
+            p.chat_completions_url(),
+            "https://my-api.example.com/chat/completions"
+        );
+    }
+
+    #[test]
+    fn chat_completions_url_custom_provider_with_v1() {
+        // Custom provider with /v1 path
+        let p = make_provider("custom", "https://my-api.example.com/v1", None);
+        assert_eq!(
+            p.chat_completions_url(),
+            "https://my-api.example.com/v1/chat/completions"
+        );
+    }
 }
