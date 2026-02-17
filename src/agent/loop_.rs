@@ -1082,7 +1082,7 @@ pub async fn run(
         }
     } else {
         println!("🦀 ZeroClaw Interactive Mode");
-        println!("Type /quit to exit.\n");
+        println!("Type /help for commands.\n");
         let cli = crate::channels::CliChannel::new();
 
         // Persistent conversation history across turns
@@ -1106,8 +1106,53 @@ pub async fn run(
             if user_input.is_empty() {
                 continue;
             }
-            if user_input == "/quit" || user_input == "/exit" {
-                break;
+            match user_input.as_str() {
+                "/quit" | "/exit" => break,
+                "/help" => {
+                    println!("Available commands:");
+                    println!("  /help        Show this help message");
+                    println!("  /clear /new  Clear conversation history");
+                    println!("  /quit /exit  Exit interactive mode\n");
+                    continue;
+                }
+                "/clear" | "/new" => {
+                    println!("This will clear the current conversation and delete all session memory.");
+                    println!("Core memories (long-term facts/preferences) will be preserved.");
+                    print!("Continue? [y/N] ");
+                    let _ = std::io::stdout().flush();
+
+                    let mut confirm = String::new();
+                    if std::io::stdin().read_line(&mut confirm).is_err() {
+                        continue;
+                    }
+                    if !matches!(confirm.trim().to_lowercase().as_str(), "y" | "yes") {
+                        println!("Cancelled.\n");
+                        continue;
+                    }
+
+                    history.clear();
+                    history.push(ChatMessage::system(&system_prompt));
+                    // Clear conversation and daily memory
+                    let mut cleared = 0;
+                    for category in [MemoryCategory::Conversation, MemoryCategory::Daily] {
+                        let entries = mem
+                            .list(Some(&category), None)
+                            .await
+                            .unwrap_or_default();
+                        for entry in entries {
+                            if mem.forget(&entry.key).await.unwrap_or(false) {
+                                cleared += 1;
+                            }
+                        }
+                    }
+                    if cleared > 0 {
+                        println!("Conversation cleared ({cleared} memory entries removed).\n");
+                    } else {
+                        println!("Conversation cleared.\n");
+                    }
+                    continue;
+                }
+                _ => {}
             }
 
             // Auto-save conversation turns
