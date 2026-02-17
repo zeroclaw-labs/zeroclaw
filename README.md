@@ -120,7 +120,7 @@ ls -lh target/release/zeroclaw
 
 - **Docker** — required only if using the [Docker sandboxed runtime](#runtime-support-current) (`runtime.kind = "docker"`). Install via your package manager or [docker.com](https://docs.docker.com/engine/install/).
 
-> **Low-memory boards (e.g., Raspberry Pi 3, 1GB RAM):** see [Build troubleshooting](#build-troubleshooting-linux-openssl-errors) and use `CARGO_BUILD_JOBS=1 cargo build --release` if the kernel kills rustc during compilation.
+> **Note:** The default `cargo build --release` uses `codegen-units=1` for compatibility with low-memory devices (e.g., Raspberry Pi 3 with 1GB RAM). For faster builds on powerful machines, use `cargo build --profile release-fast`.
 
 </details>
 
@@ -552,8 +552,8 @@ See [aieos.org](https://aieos.org) for the full schema and live examples.
 
 ```bash
 cargo build              # Dev build
-cargo build --release    # Release build (~3.4MB)
-CARGO_BUILD_JOBS=1 cargo build --release    # Low-memory fallback (Raspberry Pi 3, 1GB RAM)
+cargo build --release    # Release build (codegen-units=1, works on all devices including Raspberry Pi)
+cargo build --profile release-fast    # Faster build (codegen-units=8, requires 16GB+ RAM)
 cargo test               # 1,017 tests
 cargo clippy             # Lint (0 warnings)
 cargo fmt                # Format

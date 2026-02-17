@@ -136,6 +136,11 @@ codegen-units = 1    # Serialized codegen for low-memory devices (e.g., Raspberr
 strip = true          # Remove debug symbols
 panic = "abort"      # Reduce binary size
 
+[profile.release-fast]
+inherits = "release"
+codegen-units = 8    # Parallel codegen for faster builds on powerful machines (16GB+ RAM recommended)
+                     # Use: cargo build --profile release-fast
+
 [profile.dist]
 inherits = "release"
 opt-level = "z"
