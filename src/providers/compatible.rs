@@ -281,7 +281,7 @@ fn parse_sse_line(line: &str) -> StreamResult<Option<String>> {
 }
 
 /// Convert SSE byte stream to text chunks.
-async fn sse_bytes_to_chunks(
+fn sse_bytes_to_chunks(
     response: reqwest::Response,
     count_tokens: bool,
 ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
@@ -337,10 +337,7 @@ async fn sse_bytes_to_chunks(
                                     return; // Receiver dropped
                                 }
                             }
-                            Ok(None) => {
-                                // Empty line or [DONE] sentinel - continue
-                                continue;
-                            }
+                            Ok(None) => {}
                             Err(e) => {
                                 let _ = tx.send(Err(e)).await;
                                 return;
@@ -361,10 +358,7 @@ async fn sse_bytes_to_chunks(
 
     // Convert channel receiver to stream
     stream::unfold(rx, |mut rx| async {
-        match rx.recv().await {
-            Some(chunk) => Some((chunk, rx)),
-            None => None,
-        }
+        rx.recv().await.map(|chunk| (chunk, rx))
     })
     .boxed()
 }
@@ -767,7 +761,7 @@ impl Provider for OpenAiCompatibleProvider {
             }
 
             // Convert to chunk stream and forward to channel
-            let mut chunk_stream = sse_bytes_to_chunks(response, options.count_tokens).await;
+            let mut chunk_stream = sse_bytes_to_chunks(response, options.count_tokens);
             while let Some(chunk) = chunk_stream.next().await {
                 if tx.send(chunk).await.is_err() {
                     break; // Receiver dropped
@@ -777,10 +771,7 @@ impl Provider for OpenAiCompatibleProvider {
 
         // Convert channel receiver to stream
         stream::unfold(rx, |mut rx| async move {
-            match rx.recv().await {
-                Some(chunk) => Some((chunk, rx)),
-                None => None,
-            }
+            rx.recv().await.map(|chunk| (chunk, rx))
         })
         .boxed()
     }
