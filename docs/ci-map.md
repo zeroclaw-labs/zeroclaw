@@ -24,7 +24,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 - `.github/workflows/docker.yml` (`Docker`)
     - Purpose: PR docker smoke check and publish images on `main`/tag pushes
 - `.github/workflows/security.yml` (`Security Audit`)
-    - Purpose: dependency advisories (`cargo audit`) and policy/license checks (`cargo deny`)
+    - Purpose: dependency advisories (`rustsec/audit-check`, pinned SHA) and policy/license checks (`cargo deny`)
 - `.github/workflows/release.yml` (`Release`)
     - Purpose: build tagged release artifacts and publish GitHub releases
 - `.github/workflows/label-policy-sanity.yml` (`Label Policy Sanity`)
