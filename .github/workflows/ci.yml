@@ -226,6 +226,7 @@ jobs:
                       const owner = context.repo.owner;
                       const repo = context.repo.repo;
                       const prNumber = context.payload.pull_request?.number;
+                      const prAuthor = context.payload.pull_request?.user?.login?.toLowerCase() || "";
                       if (!prNumber) {
                         core.setFailed("Missing pull_request context.");
                         return;
@@ -263,6 +264,11 @@ jobs:
 
                       core.info(`Workflow files changed:\n- ${workflowFiles.join("\n- ")}`);
 
+                      if (prAuthor && ownerAllowlist.includes(prAuthor)) {
+                        core.info(`Workflow PR authored by allowlisted owner: @${prAuthor}`);
+                        return;
+                      }
+
                       const reviews = await github.paginate(github.rest.pulls.listReviews, {
                         owner,
                         repo,
@@ -289,7 +295,7 @@ jobs:
                       const ownerApprover = approvedUsers.find((login) => ownerAllowlist.includes(login));
                       if (!ownerApprover) {
                         core.setFailed(
-                          `Workflow files changed. Approvals found (${approvedUsers.join(", ")}), but none match WORKFLOW_OWNER_LOGINS.`,
+                          `Workflow files changed. Approvals found (${approvedUsers.join(", ")}), but none match workflow owner allowlist.`,
                         );
                         return;
                       }
