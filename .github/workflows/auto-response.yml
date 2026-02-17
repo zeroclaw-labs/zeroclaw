@@ -28,7 +28,6 @@ jobs:
             const issue = context.payload.issue;
             const pullRequest = context.payload.pull_request;
             const target = issue ?? pullRequest;
-            const legacyTrustedContributorLabel = "trusted contributor";
             const contributorTierRules = [
               { label: "distinguished contributor", minMergedPRs: 50 },
               { label: "principal contributor", minMergedPRs: 20 },
@@ -37,10 +36,7 @@ jobs:
             ];
             const contributorTierLabels = contributorTierRules.map((rule) => rule.label);
             const contributorTierColor = "2ED9FF"; // Keep in sync with .github/workflows/labeler.yml
-            const managedContributorLabels = new Set([
-              legacyTrustedContributorLabel,
-              ...contributorTierLabels,
-            ]);
+            const managedContributorLabels = new Set(contributorTierLabels);
             const action = context.payload.action;
             const changedLabel = context.payload.label?.name;
 
@@ -52,18 +48,26 @@ jobs:
             const author = target.user;
             if (!author || author.type === "Bot") return;
 
+            function contributorTierDescription(rule) {
+              return `Contributor with ${rule.minMergedPRs}+ merged PRs.`;
+            }
+
             async function ensureContributorTierLabels() {
-              for (const label of contributorTierLabels) {
+              for (const rule of contributorTierRules) {
+                const label = rule.label;
+                const expectedDescription = contributorTierDescription(rule);
                 try {
                   const { data: existing } = await github.rest.issues.getLabel({ owner, repo, name: label });
                   const currentColor = (existing.color || "").toUpperCase();
-                  if (currentColor !== contributorTierColor) {
+                  const currentDescription = (existing.description || "").trim();
+                  if (currentColor !== contributorTierColor || currentDescription !== expectedDescription) {
                     await github.rest.issues.updateLabel({
                       owner,
                       repo,
                       name: label,
                       new_name: label,
                       color: contributorTierColor,
+                      description: expectedDescription,
                     });
                   }
                 } catch (error) {
@@ -73,6 +77,7 @@ jobs:
                     repo,
                     name: label,
                     color: contributorTierColor,
+                    description: expectedDescription,
                   });
                 }
               }
@@ -105,7 +110,7 @@ jobs:
             });
             const keepLabels = currentLabels
               .map((label) => label.name)
-              .filter((label) => label !== legacyTrustedContributorLabel && !contributorTierLabels.includes(label));
+              .filter((label) => !contributorTierLabels.includes(label));
 
             if (contributorTierLabel) {
               keepLabels.push(contributorTierLabel);
