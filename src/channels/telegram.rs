@@ -139,6 +139,50 @@ fn parse_path_only_attachment(message: &str) -> Option<TelegramAttachment> {
     })
 }
 
+/// Strip tool_call XML-style tags from message text.
+/// These tags are used internally but must not be sent to Telegram as raw markup,
+/// since Telegram's Markdown parser will reject them (causing status 400 errors).
+fn strip_tool_call_tags(message: &str) -> String {
+    let mut result = message.to_string();
+
+    // Strip <tool>...</tool>
+    while let Some(start) = result.find("<tool>") {
+        if let Some(end) = result[start..].find("</tool>") {
+            let end = start + end + "</tool>".len();
+            result = format!("{}{}", &result[..start], &result[end..]);
+        } else {
+            break;
+        }
+    }
+
+    // Strip <toolcall>...</toolcall>
+    while let Some(start) = result.find("<toolcall>") {
+        if let Some(end) = result[start..].find("</toolcall>") {
+            let end = start + end + "</toolcall>".len();
+            result = format!("{}{}", &result[..start], &result[end..]);
+        } else {
+            break;
+        }
+    }
+
+    // Strip <tool-call>...</tool-call>
+    while let Some(start) = result.find("<tool-call>") {
+        if let Some(end) = result[start..].find("</tool-call>") {
+            let end = start + end + "</tool-call>".len();
+            result = format!("{}{}", &result[..start], &result[end..]);
+        } else {
+            break;
+        }
+    }
+
+    // Clean up any resulting blank lines (but preserve paragraphs)
+    while result.contains("\n\n\n") {
+        result = result.replace("\n\n\n", "\n\n");
+    }
+
+    result.trim().to_string()
+}
+
 fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) {
     let mut cleaned = String::with_capacity(message.len());
     let mut attachments = Vec::new();
@@ -1047,7 +1091,10 @@ impl Channel for TelegramChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        let (text_without_markers, attachments) = parse_attachment_markers(&message.content);
+        // Strip tool_call tags before processing to prevent Markdown parsing failures
+        let content = strip_tool_call_tags(&message.content);
+
+        let (text_without_markers, attachments) = parse_attachment_markers(&content);
 
         if !attachments.is_empty() {
             if !text_without_markers.is_empty() {
@@ -1062,13 +1109,13 @@ impl Channel for TelegramChannel {
             return Ok(());
         }
 
-        if let Some(attachment) = parse_path_only_attachment(&message.content) {
+        if let Some(attachment) = parse_path_only_attachment(&content) {
             self.send_attachment(&message.recipient, &attachment)
                 .await?;
             return Ok(());
         }
 
-        self.send_text_chunks(&message.content, &message.recipient)
+        self.send_text_chunks(&content, &message.recipient)
             .await
     }
 
@@ -1785,5 +1832,78 @@ mod tests {
         let message_id = 0;
         let id = format!("telegram_{chat_id}_{message_id}");
         assert_eq!(id, "telegram_123456_0");
+    }
+
+    // ── Tool call tag stripping tests ───────────────────────────────────
+
+    #[test]
+    fn strip_tool_call_tags_removes_standard_tags() {
+        let input = "Hello <tool>{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}</tool> world";
+        let result = strip_tool_call_tags(input);
+        assert_eq!(result, "Hello  world");
+    }
+
+    #[test]
+    fn strip_tool_call_tags_removes_alias_tags() {
+        let input = "Hello <toolcall>{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}</toolcall> world";
+        let result = strip_tool_call_tags(input);
+        assert_eq!(result, "Hello  world");
+    }
+
+    #[test]
+    fn strip_tool_call_tags_removes_dash_tags() {
+        let input = "Hello <tool-call>{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}</tool-call> world";
+        let result = strip_tool_call_tags(input);
+        assert_eq!(result, "Hello  world");
+    }
+
+    #[test]
+    fn strip_tool_call_tags_handles_multiple_tags() {
+        let input = "Start <tool>a</tool> middle <tool>b</tool> end";
+        let result = strip_tool_call_tags(input);
+        assert_eq!(result, "Start  middle  end");
+    }
+
+    #[test]
+    fn strip_tool_call_tags_handles_mixed_tags() {
+        let input =
+            "A <tool>a</tool> B <toolcall>b</toolcall> C <tool-call>c</tool-call> D";
+        let result = strip_tool_call_tags(input);
+        assert_eq!(result, "A  B  C  D");
+    }
+
+    #[test]
+    fn strip_tool_call_tags_preserves_normal_text() {
+        let input = "Hello world! This is a test.";
+        let result = strip_tool_call_tags(input);
+        assert_eq!(result, "Hello world! This is a test.");
+    }
+
+    #[test]
+    fn strip_tool_call_tags_handles_unclosed_tags() {
+        let input = "Hello <tool>world";
+        let result = strip_tool_call_tags(input);
+        assert_eq!(result, "Hello <tool>world");
+    }
+
+    #[test]
+    fn strip_tool_call_tags_cleans_extra_newlines() {
+        let input = "Hello\n\n<tool>\ntest\n</tool>\n\n\nworld";
+        let result = strip_tool_call_tags(input);
+        assert_eq!(result, "Hello\n\nworld");
+    }
+
+    #[test]
+    fn strip_tool_call_tags_handles_empty_input() {
+        let input = "";
+        let result = strip_tool_call_tags(input);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn strip_tool_call_tags_handles_only_tags() {
+        let input = "<tool>{\"name\":\"test\"}</tool>";
+        let result = strip_tool_call_tags(input);
+        assert_eq!(result, "");
     }
 }
