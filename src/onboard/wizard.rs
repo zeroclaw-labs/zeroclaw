@@ -73,7 +73,7 @@ pub fn run_wizard() -> Result<Config> {
     let (workspace_dir, config_path) = setup_workspace()?;
 
     print_step(2, 9, "AI Provider & API Key");
-    let (provider, api_key, model) = setup_provider(&workspace_dir)?;
+    let (provider, api_key, model, provider_api_url) = setup_provider(&workspace_dir)?;
 
     print_step(3, 9, "Channels (How You Talk to ZeroClaw)");
     let channels_config = setup_channels()?;
@@ -106,7 +106,7 @@ pub fn run_wizard() -> Result<Config> {
         } else {
             Some(api_key)
         },
-        api_url: None,
+        api_url: provider_api_url,
         default_provider: Some(provider),
         default_model: Some(model),
         default_temperature: 0.7,
@@ -1329,7 +1329,7 @@ fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
 // ── Step 2: Provider & API Key ───────────────────────────────────
 
 #[allow(clippy::too_many_lines)]
-fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
+fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Option<String>)> {
     // ── Tier selection ──
     let tiers = vec![
         "⭐ Recommended (OpenRouter, Venice, Anthropic, OpenAI, Gemini)",
@@ -1441,7 +1441,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
             style(&model).green()
         );
 
-        return Ok((provider_name, api_key, model));
+        return Ok((provider_name, api_key, model, None));
     }
 
     let provider_labels: Vec<&str> = providers.iter().map(|(_, label)| *label).collect();
@@ -1454,10 +1454,53 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
 
     let provider_name = providers[provider_idx].0;
 
-    // ── API key ──
+    // ── API key / endpoint ──
+    let mut provider_api_url: Option<String> = None;
     let api_key = if provider_name == "ollama" {
-        print_bullet("Ollama runs locally — no API key needed!");
-        String::new()
+        let use_remote_ollama = Confirm::new()
+            .with_prompt("  Use a remote Ollama endpoint (for example Ollama Cloud)?")
+            .default(false)
+            .interact()?;
+
+        if use_remote_ollama {
+            let raw_url: String = Input::new()
+                .with_prompt("  Remote Ollama endpoint URL")
+                .default("https://ollama.com".into())
+                .interact_text()?;
+
+            let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
+            if normalized_url.is_empty() {
+                anyhow::bail!("Remote Ollama endpoint URL cannot be empty.");
+            }
+
+            provider_api_url = Some(normalized_url.clone());
+
+            print_bullet(&format!(
+                "Remote endpoint configured: {}",
+                style(&normalized_url).cyan()
+            ));
+            print_bullet(&format!(
+                "If you use cloud-only models, append {} to the model ID.",
+                style(":cloud").yellow()
+            ));
+
+            let key: String = Input::new()
+                .with_prompt("  API key for remote Ollama endpoint (or Enter to skip)")
+                .allow_empty(true)
+                .interact_text()?;
+
+            if key.trim().is_empty() {
+                print_bullet(&format!(
+                    "No API key provided. Set {} later if required by your endpoint.",
+                    style("OLLAMA_API_KEY").yellow()
+                ));
+            }
+
+            key
+        } else {
+            print_bullet("Using local Ollama at http://localhost:11434 (no API key needed).");
+            String::new()
+        }
     } else if canonical_provider_name(provider_name) == "gemini" {
         // Special handling for Gemini: check for CLI auth first
         if crate::providers::gemini::GeminiProvider::has_cli_credentials() {
@@ -1751,7 +1794,11 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
         .collect();
     let mut live_options: Option<Vec<(String, String)>> = None;
 
-    if supports_live_model_fetch(provider_name) {
+    if provider_name == "ollama" && provider_api_url.is_some() {
+        print_bullet(
+            "Skipping local Ollama model discovery because a remote endpoint is configured.",
+        );
+    } else if supports_live_model_fetch(provider_name) {
         let can_fetch_without_key = matches!(provider_name, "openrouter" | "ollama");
         let has_api_key = !api_key.trim().is_empty()
             || std::env::var(provider_env_var(provider_name))
@@ -1907,7 +1954,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
         style(&model).green()
     );
 
-    Ok((provider_name.to_string(), api_key, model))
+    Ok((provider_name.to_string(), api_key, model, provider_api_url))
 }
 
 /// Map provider name to its conventional env var
@@ -1916,6 +1963,7 @@ fn provider_env_var(name: &str) -> &'static str {
         "openrouter" => "OPENROUTER_API_KEY",
         "anthropic" => "ANTHROPIC_API_KEY",
         "openai" => "OPENAI_API_KEY",
+        "ollama" => "OLLAMA_API_KEY",
         "venice" => "VENICE_API_KEY",
         "groq" => "GROQ_API_KEY",
         "mistral" => "MISTRAL_API_KEY",
@@ -4614,7 +4662,7 @@ mod tests {
         assert_eq!(provider_env_var("openrouter"), "OPENROUTER_API_KEY");
         assert_eq!(provider_env_var("anthropic"), "ANTHROPIC_API_KEY");
         assert_eq!(provider_env_var("openai"), "OPENAI_API_KEY");
-        assert_eq!(provider_env_var("ollama"), "API_KEY"); // fallback
+        assert_eq!(provider_env_var("ollama"), "OLLAMA_API_KEY");
         assert_eq!(provider_env_var("xai"), "XAI_API_KEY");
         assert_eq!(provider_env_var("grok"), "XAI_API_KEY"); // alias
         assert_eq!(provider_env_var("together"), "TOGETHER_API_KEY"); // alias

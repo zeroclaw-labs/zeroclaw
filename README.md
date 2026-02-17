@@ -451,6 +451,23 @@ format = "openclaw"             # "openclaw" (default, markdown files) or "aieos
 # aieos_inline = '{"identity":{"names":{"first":"Nova"}}}'  # inline AIEOS JSON
 ```
 
+### Ollama Local and Remote Endpoints
+
+ZeroClaw uses one provider key (`ollama`) for both local and remote Ollama deployments:
+
+- Local Ollama: keep `api_url` unset, run `ollama serve`, and use models like `llama3.2`.
+- Remote Ollama endpoint (including Ollama Cloud): set `api_url` to the remote endpoint and set `api_key` (or `OLLAMA_API_KEY`) when required.
+- Optional `:cloud` suffix: model IDs like `qwen3:cloud` are normalized to `qwen3` before the request.
+
+Example remote configuration:
+
+```toml
+default_provider = "ollama"
+default_model = "qwen3:cloud"
+api_url = "https://ollama.com"
+api_key = "ollama_api_key_here"
+```
+
 ## Python Companion Package (`zeroclaw-tools`)
 
 For LLM providers with inconsistent native tool calling (e.g., GLM-5/Zhipu), ZeroClaw ships a Python companion package with **LangGraph-based tool calling** for guaranteed consistency:

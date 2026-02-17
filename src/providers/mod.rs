@@ -172,6 +172,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "anthropic" => vec!["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
         "openrouter" => vec!["OPENROUTER_API_KEY"],
         "openai" => vec!["OPENAI_API_KEY"],
+        "ollama" => vec!["OLLAMA_API_KEY"],
         "venice" => vec!["VENICE_API_KEY"],
         "groq" => vec!["GROQ_API_KEY"],
         "mistral" => vec!["MISTRAL_API_KEY"],
@@ -274,7 +275,7 @@ pub fn create_provider_with_url(
         "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(key))),
         "openai" => Ok(Box::new(openai::OpenAiProvider::new(key))),
         // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)
-        "ollama" => Ok(Box::new(ollama::OllamaProvider::new(api_url))),
+        "ollama" => Ok(Box::new(ollama::OllamaProvider::new(api_url, key))),
         "gemini" | "google" | "google-gemini" => {
             Ok(Box::new(gemini::GeminiProvider::new(key)))
         }
@@ -600,7 +601,7 @@ mod tests {
     #[test]
     fn factory_ollama() {
         assert!(create_provider("ollama", None).is_ok());
-        // Ollama ignores the api_key parameter since it's a local service
+        // Ollama may use API key when a remote endpoint is configured.
         assert!(create_provider("ollama", Some("dummy")).is_ok());
         assert!(create_provider("ollama", Some("any-value-here")).is_ok());
     }
@@ -948,6 +949,13 @@ mod tests {
     #[test]
     fn ollama_with_custom_url() {
         let provider = create_provider_with_url("ollama", None, Some("http://10.100.2.32:11434"));
+        assert!(provider.is_ok());
+    }
+
+    #[test]
+    fn ollama_cloud_with_custom_url() {
+        let provider =
+            create_provider_with_url("ollama", Some("ollama-key"), Some("https://ollama.com"));
         assert!(provider.is_ok());
     }
 
