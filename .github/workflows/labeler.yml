@@ -57,7 +57,7 @@ jobs:
                         { label: "experienced contributor", minMergedPRs: 10 },
                       ];
                       const contributorTierLabels = contributorTierRules.map((rule) => rule.label);
-                      const contributorTierColor = "2ED9FF";
+                      const contributorTierColor = "2ED9FF"; // Keep in sync with .github/workflows/auto-response.yml
 
                       const managedPathLabels = [
                         "docs",
