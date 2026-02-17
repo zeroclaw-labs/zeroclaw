@@ -1065,7 +1065,7 @@ mod tests {
     use super::*;
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;
-    use crate::providers::{ChatMessage, ChatResponse, Provider, ToolCall};
+    use crate::providers::{ChatMessage, Provider};
     use crate::tools::{Tool, ToolResult};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};

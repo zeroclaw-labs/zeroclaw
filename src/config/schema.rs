@@ -1810,7 +1810,6 @@ fn sync_directory(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use tempfile::TempDir;
 
     // ── Defaults ─────────────────────────────────────────────
 

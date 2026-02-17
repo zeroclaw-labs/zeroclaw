@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
 
-const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
+const OPEN_SKILLS_REPO_URL: &str = "https://github.com/AlphaCore-Network-Dev/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
 const OPEN_SKILLS_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24 * 7;
 
@@ -337,7 +337,7 @@ fn load_open_skill_md(path: &Path) -> Result<Skill> {
         name,
         description: extract_description(&content),
         version: "open-skills".to_string(),
-        author: Some("besoeasy/open-skills".to_string()),
+        author: Some("AlphaCore-Network-Dev/open-skills".to_string()),
         tags: vec!["open-skills".to_string()],
         tools: Vec::new(),
         prompts: vec![content],

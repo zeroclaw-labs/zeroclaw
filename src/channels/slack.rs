@@ -1,6 +1,5 @@
 use super::traits::{Channel, ChannelMessage};
 use async_trait::async_trait;
-use uuid::Uuid;
 
 /// Slack channel — polls conversations.history via Web API
 pub struct SlackChannel {

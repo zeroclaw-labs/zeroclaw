@@ -1321,7 +1321,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
         3 => vec![
             ("moonshot", "Moonshot — Kimi & Kimi Coding"),
             ("glm", "GLM — ChatGLM / Zhipu models"),
-            ("minimax", "MiniMax — MiniMax AI models"),
+            ("minimax", "MiniMax — OAuth login"),
             ("qianfan", "Qianfan — Baidu AI models"),
             ("zai", "Z.AI — Z.AI inference"),
             ("synthetic", "Synthetic — Synthetic AI models"),
@@ -1432,6 +1432,55 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
                 .with_prompt("  Paste your Gemini API key (or press Enter to skip)")
                 .allow_empty(true)
                 .interact_text()?
+        }
+    } else if provider_name == "minimax" {
+        // Special handling for MiniMax: run OAuth during onboarding.
+        print_bullet("MiniMax uses OAuth login — no API key needed.");
+        print_bullet("You can authenticate now in this onboarding flow.");
+        print_bullet("Or set MINIMAX_PORTAL_ACCESS_TOKEN env var if you already have a token.");
+        println!();
+
+        let env_token = std::env::var("MINIMAX_PORTAL_ACCESS_TOKEN")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+
+        if let Some(token) = env_token {
+            print_bullet(&format!(
+                "{} MINIMAX_PORTAL_ACCESS_TOKEN detected!",
+                style("✓").green().bold()
+            ));
+            token
+        } else {
+            let login_now = Confirm::new()
+                .with_prompt("  Start MiniMax Portal OAuth login now?")
+                .default(true)
+                .interact()?;
+
+            if login_now {
+                let token = std::thread::spawn(|| -> Result<_> {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .context("failed to initialize runtime for MiniMax OAuth")?;
+                    rt.block_on(
+                        crate::providers::minimax_portal_oauth::login_minimax_portal_oauth(),
+                    )
+                })
+                .join()
+                .map_err(|_| anyhow::anyhow!("MiniMax OAuth thread panicked"))??;
+
+                print_bullet(&format!(
+                    "{} MiniMax OAuth completed.",
+                    style("✓").green().bold()
+                ));
+                token.access_token
+            } else {
+                print_bullet(
+                    "Skipped OAuth login. Set MINIMAX_PORTAL_ACCESS_TOKEN later or rerun onboarding.",
+                );
+                String::new()
+            }
         }
     } else {
         let key_url = match provider_name {
@@ -1795,7 +1844,7 @@ fn provider_env_var(name: &str) -> &'static str {
         "cohere" => "COHERE_API_KEY",
         "moonshot" | "kimi" => "MOONSHOT_API_KEY",
         "glm" | "zhipu" => "GLM_API_KEY",
-        "minimax" => "MINIMAX_API_KEY",
+        "minimax" => "MINIMAX_PORTAL_ACCESS_TOKEN",
         "qianfan" | "baidu" => "QIANFAN_API_KEY",
         "zai" | "z.ai" => "ZAI_API_KEY",
         "synthetic" => "SYNTHETIC_API_KEY",
@@ -4267,6 +4316,7 @@ mod tests {
         );
         assert_eq!(default_model_for_provider("gemini"), "gemini-2.5-pro");
         assert_eq!(default_model_for_provider("google"), "gemini-2.5-pro");
+        assert_eq!(default_model_for_provider("minimax"), "MiniMax-M2.5");
         assert_eq!(
             default_model_for_provider("google-gemini"),
             "gemini-2.5-pro"
@@ -4469,6 +4519,7 @@ mod tests {
         assert_eq!(provider_env_var("google"), "GEMINI_API_KEY"); // alias
         assert_eq!(provider_env_var("google-gemini"), "GEMINI_API_KEY"); // alias
         assert_eq!(provider_env_var("gemini"), "GEMINI_API_KEY");
+        assert_eq!(provider_env_var("minimax"), "MINIMAX_PORTAL_ACCESS_TOKEN");
         assert_eq!(provider_env_var("nvidia"), "NVIDIA_API_KEY");
         assert_eq!(provider_env_var("nvidia-nim"), "NVIDIA_API_KEY"); // alias
         assert_eq!(provider_env_var("build.nvidia.com"), "NVIDIA_API_KEY"); // alias
