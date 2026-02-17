@@ -27,7 +27,9 @@ pub mod rpi;
 pub use traits::Peripheral;
 
 use crate::config::{Config, PeripheralBoardConfig, PeripheralsConfig};
-use crate::tools::{HardwareMemoryMapTool, Tool};
+#[cfg(feature = "hardware")]
+use crate::tools::HardwareMemoryMapTool;
+use crate::tools::Tool;
 use anyhow::Result;
 
 /// List configured boards from config (no connection yet).

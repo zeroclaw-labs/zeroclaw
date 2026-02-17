@@ -1370,6 +1370,13 @@ mod tests {
             .to_string()
     }
 
+    fn tool_call_payload_with_alias_tag() -> String {
+        r#"<toolcall>
+{"name":"mock_price","arguments":{"symbol":"BTC"}}
+</toolcall>"#
+            .to_string()
+    }
+
     #[async_trait::async_trait]
     impl Provider for ToolCallingProvider {
         async fn chat_with_system(
@@ -1395,6 +1402,37 @@ mod tests {
                 Ok("BTC is currently around $65,000 based on latest tool output.".to_string())
             } else {
                 Ok(tool_call_payload())
+            }
+        }
+    }
+
+    struct ToolCallingAliasProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for ToolCallingAliasProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(tool_call_payload_with_alias_tag())
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            let has_tool_results = messages
+                .iter()
+                .any(|msg| msg.role == "user" && msg.content.contains("[Tool results]"));
+            if has_tool_results {
+                Ok("BTC alias-tag flow resolved to final text output.".to_string())
+            } else {
+                Ok(tool_call_payload_with_alias_tag())
             }
         }
     }
@@ -1477,6 +1515,47 @@ mod tests {
         assert!(sent_messages[0].starts_with("chat-42:"));
         assert!(sent_messages[0].contains("BTC is currently around"));
         assert!(!sent_messages[0].contains("\"tool_calls\""));
+        assert!(!sent_messages[0].contains("mock_price"));
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_executes_tool_calls_with_alias_tags() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(ToolCallingAliasProvider),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-2".to_string(),
+                sender: "bob".to_string(),
+                reply_target: "chat-84".to_string(),
+                content: "What is the BTC price now?".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 2,
+            },
+        )
+        .await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent_messages.len(), 1);
+        assert!(sent_messages[0].starts_with("chat-84:"));
+        assert!(sent_messages[0].contains("alias-tag flow resolved"));
+        assert!(!sent_messages[0].contains("<toolcall>"));
         assert!(!sent_messages[0].contains("mock_price"));
     }
 
