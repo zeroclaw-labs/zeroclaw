@@ -1879,6 +1879,18 @@ impl Config {
             }
         }
 
+        // API Key: ZAI_API_KEY overrides when provider is a Z.AI variant.
+        if matches!(
+            self.default_provider.as_deref(),
+            Some("zai" | "z.ai" | "zai-global" | "z.ai-global" | "zai-cn" | "z.ai-cn")
+        ) {
+            if let Ok(key) = std::env::var("ZAI_API_KEY") {
+                if !key.is_empty() {
+                    self.api_key = Some(key);
+                }
+            }
+        }
+
         // Provider: ZEROCLAW_PROVIDER or PROVIDER
         if let Ok(provider) =
             std::env::var("ZEROCLAW_PROVIDER").or_else(|_| std::env::var("PROVIDER"))
@@ -3145,6 +3157,21 @@ default_temperature = 0.7
         assert_eq!(config.api_key.as_deref(), Some("glm-regional-key"));
 
         std::env::remove_var("GLM_API_KEY");
+    }
+
+    #[test]
+    fn env_override_zai_api_key_for_regional_aliases() {
+        let _env_guard = env_override_test_guard();
+        let mut config = Config {
+            default_provider: Some("zai-cn".to_string()),
+            ..Config::default()
+        };
+
+        std::env::set_var("ZAI_API_KEY", "zai-regional-key");
+        config.apply_env_overrides();
+        assert_eq!(config.api_key.as_deref(), Some("zai-regional-key"));
+
+        std::env::remove_var("ZAI_API_KEY");
     }
 
     #[test]

@@ -377,7 +377,10 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Z.AI inference",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.default_provider.as_deref() == Some("zai") {
+                if matches!(
+                    c.default_provider.as_deref(),
+                    Some("zai" | "z.ai" | "zai-global" | "z.ai-global" | "zai-cn" | "z.ai-cn")
+                ) {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -472,7 +475,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Baidu AI models",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.default_provider.as_deref() == Some("qianfan") {
+                if matches!(c.default_provider.as_deref(), Some("qianfan" | "baidu")) {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -1009,6 +1012,20 @@ mod tests {
         let qwen = entries.iter().find(|e| e.name == "Qwen").unwrap();
         assert!(matches!(
             (qwen.status_fn)(&config),
+            IntegrationStatus::Active
+        ));
+
+        config.default_provider = Some("zai-cn".to_string());
+        let zai = entries.iter().find(|e| e.name == "Z.AI").unwrap();
+        assert!(matches!(
+            (zai.status_fn)(&config),
+            IntegrationStatus::Active
+        ));
+
+        config.default_provider = Some("baidu".to_string());
+        let qianfan = entries.iter().find(|e| e.name == "Qianfan").unwrap();
+        assert!(matches!(
+            (qianfan.status_fn)(&config),
             IntegrationStatus::Active
         ));
     }
