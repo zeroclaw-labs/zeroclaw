@@ -1,0 +1,100 @@
+name: Coverage Reporting
+
+on:
+    push:
+        branches: [main]
+    pull_request:
+        branches: [main]
+    workflow_dispatch:
+
+concurrency:
+    group: coverage-${{ github.event.pull_request.number || github.sha }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+    pull-requests: write
+
+env:
+    CARGO_TERM_COLOR: always
+
+jobs:
+    coverage:
+        name: Test Coverage (cargo-llvm-cov)
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        timeout-minutes: 30
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+                  components: llvm-tools-preview
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+
+            - name: Install cargo-llvm-cov
+              run: cargo install cargo-llvm-cov --locked
+
+            - name: Generate coverage report
+              run: |
+                  cargo llvm-cov --locked --lcov --output-path lcov.info
+                  cargo llvm-cov report --locked --summary-only 2>&1 | tee coverage_summary.txt
+
+            - name: Upload coverage artifact
+              if: always()
+              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+              with:
+                  name: coverage-report
+                  path: |
+                      lcov.info
+                      coverage_summary.txt
+                  retention-days: 30
+
+            - name: Post coverage summary on PR
+              if: github.event_name == 'pull_request'
+              uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+              with:
+                  script: |
+                      const fs = require('fs');
+                      let summary = '';
+                      try {
+                        summary = fs.readFileSync('coverage_summary.txt', 'utf8');
+                      } catch {
+                        core.info('No coverage summary found.');
+                        return;
+                      }
+
+                      const body = [
+                        '## 📈 Test Coverage Report',
+                        '',
+                        '```',
+                        summary.trim(),
+                        '```',
+                        '',
+                        '> Coverage is informational and not a merge gate.',
+                        '> Full LCOV report available as a build artifact.',
+                      ].join('\n');
+
+                      const { data: comments } = await github.rest.issues.listComments({
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        issue_number: context.payload.pull_request.number,
+                      });
+
+                      const marker = '## 📈 Test Coverage Report';
+                      const existing = comments.find(c => c.body && c.body.startsWith(marker));
+
+                      if (existing) {
+                        await github.rest.issues.updateComment({
+                          owner: context.repo.owner,
+                          repo: context.repo.repo,
+                          comment_id: existing.id,
+                          body,
+                        });
+                      } else {
+                        await github.rest.issues.createComment({
+                          owner: context.repo.owner,
+                          repo: context.repo.repo,
+                          issue_number: context.payload.pull_request.number,
+                          body,
+                        });
+                      }
