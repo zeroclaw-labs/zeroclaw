@@ -1,0 +1,157 @@
+name: PR Size Check
+
+on:
+    pull_request:
+        types: [opened, synchronize, reopened]
+
+concurrency:
+    group: pr-size-check-${{ github.event.pull_request.number }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+    pull-requests: write
+
+env:
+    # Configurable size thresholds (lines changed, excluding docs and lockfiles).
+    # Adjust these to tune when advisory comments appear.
+    SIZE_THRESHOLD_M: "101"
+    SIZE_THRESHOLD_L: "501"
+    SIZE_THRESHOLD_XL: "1001"
+
+jobs:
+    size-check:
+        name: PR Size Advisory
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        timeout-minutes: 5
+        steps:
+            - name: Check PR size and post advisory
+              uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+              env:
+                  THRESHOLD_M: ${{ env.SIZE_THRESHOLD_M }}
+                  THRESHOLD_L: ${{ env.SIZE_THRESHOLD_L }}
+                  THRESHOLD_XL: ${{ env.SIZE_THRESHOLD_XL }}
+              with:
+                  script: |
+                      const owner = context.repo.owner;
+                      const repo = context.repo.repo;
+                      const pr = context.payload.pull_request;
+                      if (!pr) return;
+
+                      const marker = "<!-- pr-size-check -->";
+                      const thresholdM = Number(process.env.THRESHOLD_M || "101");
+                      const thresholdL = Number(process.env.THRESHOLD_L || "501");
+                      const thresholdXL = Number(process.env.THRESHOLD_XL || "1001");
+
+                      const files = await github.paginate(github.rest.pulls.listFiles, {
+                        owner,
+                        repo,
+                        pull_number: pr.number,
+                        per_page: 100,
+                      });
+
+                      const excludedLockfiles = new Set(["Cargo.lock"]);
+                      function isDocsLike(path) {
+                        return (
+                          path.startsWith("docs/") ||
+                          path.endsWith(".md") ||
+                          path.endsWith(".mdx") ||
+                          path === "LICENSE" ||
+                          path === ".markdownlint-cli2.yaml" ||
+                          path === ".github/pull_request_template.md" ||
+                          path.startsWith(".github/ISSUE_TEMPLATE/")
+                        );
+                      }
+
+                      const changedLines = files.reduce((total, file) => {
+                        const path = file.filename || "";
+                        if (isDocsLike(path) || excludedLockfiles.has(path)) {
+                          return total;
+                        }
+                        return total + (file.additions || 0) + (file.deletions || 0);
+                      }, 0);
+
+                      let sizeCategory;
+                      let emoji;
+                      let advisory;
+                      if (changedLines >= thresholdXL) {
+                        sizeCategory = "XL";
+                        emoji = "🔴";
+                        advisory = "This PR is very large. Consider splitting it into smaller, focused PRs to ease review and reduce rollback risk.";
+                      } else if (changedLines >= thresholdL) {
+                        sizeCategory = "L";
+                        emoji = "🟠";
+                        advisory = "This PR is large. If possible, consider splitting it to keep changes reviewable and easy to revert.";
+                      } else if (changedLines >= thresholdM) {
+                        sizeCategory = "M";
+                        emoji = "🟡";
+                        advisory = "Medium-sized PR. No action needed, but keep an eye on scope creep.";
+                      } else {
+                        sizeCategory = "XS/S";
+                        emoji = "🟢";
+                        advisory = null;
+                      }
+
+                      core.info(`PR #${pr.number}: ${changedLines} non-doc lines changed → size: ${sizeCategory}`);
+
+                      const comments = await github.paginate(github.rest.issues.listComments, {
+                        owner,
+                        repo,
+                        issue_number: pr.number,
+                        per_page: 100,
+                      });
+                      const existing = comments.find(
+                        (comment) => comment.user?.type === "Bot" && (comment.body || "").includes(marker)
+                      );
+
+                      if (!advisory) {
+                        if (existing) {
+                          await github.rest.issues.deleteComment({
+                            owner,
+                            repo,
+                            comment_id: existing.id,
+                          });
+                          core.info("Removed previous size advisory comment (PR is now small).");
+                        }
+                        core.info("PR size is XS/S. No advisory needed.");
+                        return;
+                      }
+
+                      const body = [
+                        marker,
+                        `### ${emoji} PR Size: \`${sizeCategory}\` — ${changedLines} lines changed (excluding docs/lockfiles)`,
+                        "",
+                        advisory,
+                        "",
+                        "| Threshold | Size | Status |",
+                        "|-----------|------|--------|",
+                        `| ≤${thresholdM - 1} lines | XS/S | ${sizeCategory === "XS/S" ? "✅ Current" : "—"} |`,
+                        `| ${thresholdM}–${thresholdL - 1} lines | M | ${sizeCategory === "M" ? "⚠️ Current" : "—"} |`,
+                        `| ${thresholdL}–${thresholdXL - 1} lines | L | ${sizeCategory === "L" ? "⚠️ Current" : "—"} |`,
+                        `| ≥${thresholdXL} lines | XL | ${sizeCategory === "XL" ? "🚨 Current" : "—"} |`,
+                        "",
+                        "> This check is advisory only and does not block merge. Some large PRs (lockfile updates, generated code) are expected.",
+                        "> See [CONTRIBUTING.md](../CONTRIBUTING.md) and [AGENTS.md](../AGENTS.md) §3.8 for small-PR guidance.",
+                      ].join("\n");
+
+                      if (existing) {
+                        if (existing.body === body) {
+                          core.info("Size advisory comment unchanged.");
+                          return;
+                        }
+                        await github.rest.issues.updateComment({
+                          owner,
+                          repo,
+                          comment_id: existing.id,
+                          body,
+                        });
+                        core.info("Updated size advisory comment.");
+                      } else {
+                        await github.rest.issues.createComment({
+                          owner,
+                          repo,
+                          issue_number: pr.number,
+                          body,
+                        });
+                        core.info("Posted size advisory comment.");
+                      }
