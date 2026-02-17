@@ -59,18 +59,27 @@ fn hash_webhook_secret(value: &str) -> String {
 /// How often the rate limiter sweeps stale IP entries from its map.
 const RATE_LIMITER_SWEEP_INTERVAL_SECS: u64 = 300; // 5 minutes
 
+/// Hard cap on distinct client keys tracked by rate limiters and
+/// idempotency stores. Prevents memory-pressure DoS from a flood of
+/// unique keys. Oldest entries are evicted when this limit is reached.
+const MAX_RATE_LIMIT_KEYS: usize = 10_000;
+/// Hard cap on distinct keys tracked by the idempotency store.
+const MAX_IDEMPOTENCY_KEYS: usize = 50_000;
+
 #[derive(Debug)]
 struct SlidingWindowRateLimiter {
     limit_per_window: u32,
     window: Duration,
+    max_keys: usize,
     requests: Mutex<(HashMap<String, Vec<Instant>>, Instant)>,
 }
 
 impl SlidingWindowRateLimiter {
-    fn new(limit_per_window: u32, window: Duration) -> Self {
+    fn new(limit_per_window: u32, window: Duration, max_keys: usize) -> Self {
         Self {
             limit_per_window,
             window,
+            max_keys,
             requests: Mutex::new((HashMap::new(), Instant::now())),
         }
     }
@@ -95,6 +104,20 @@ impl SlidingWindowRateLimiter {
             *last_sweep = now;
         }
 
+        // Evict oldest entries if cardinality exceeds bound
+        while requests.len() >= self.max_keys && !requests.contains_key(key) {
+            // Find the key with the oldest most-recent timestamp
+            if let Some(oldest_key) = requests
+                .iter()
+                .min_by_key(|(_, ts)| ts.last().copied().unwrap_or(now))
+                .map(|(k, _)| k.clone())
+            {
+                requests.remove(&oldest_key);
+            } else {
+                break;
+            }
+        }
+
         let entry = requests.entry(key.to_owned()).or_default();
         entry.retain(|instant| *instant > cutoff);
 
@@ -117,8 +140,8 @@ impl GatewayRateLimiter {
     fn new(pair_per_minute: u32, webhook_per_minute: u32) -> Self {
         let window = Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
         Self {
-            pair: SlidingWindowRateLimiter::new(pair_per_minute, window),
-            webhook: SlidingWindowRateLimiter::new(webhook_per_minute, window),
+            pair: SlidingWindowRateLimiter::new(pair_per_minute, window, MAX_RATE_LIMIT_KEYS),
+            webhook: SlidingWindowRateLimiter::new(webhook_per_minute, window, MAX_RATE_LIMIT_KEYS),
         }
     }
 
@@ -134,6 +157,7 @@ impl GatewayRateLimiter {
 #[derive(Debug)]
 pub struct IdempotencyStore {
     ttl: Duration,
+    max_keys: usize,
     keys: Mutex<HashMap<String, Instant>>,
 }
 
@@ -141,6 +165,7 @@ impl IdempotencyStore {
     fn new(ttl: Duration) -> Self {
         Self {
             ttl,
+            max_keys: MAX_IDEMPOTENCY_KEYS,
             keys: Mutex::new(HashMap::new()),
         }
     }
@@ -156,20 +181,30 @@ impl IdempotencyStore {
             return false;
         }
 
+        // Evict oldest entry if at capacity
+        if keys.len() >= self.max_keys {
+            if let Some(oldest_key) = keys
+                .iter()
+                .min_by_key(|(_, ts)| *ts)
+                .map(|(k, _)| k.clone())
+            {
+                keys.remove(&oldest_key);
+            }
+        }
+
         keys.insert(key.to_owned(), now);
         true
     }
 }
 
-fn client_key_from_headers(headers: &HeaderMap) -> String {
-    for header_name in ["X-Forwarded-For", "X-Real-IP"] {
-        if let Some(value) = headers.get(header_name).and_then(|v| v.to_str().ok()) {
-            let first = value.split(',').next().unwrap_or("").trim();
-            if !first.is_empty() {
-                return first.to_owned();
-            }
-        }
-    }
+/// Derive the rate-limit identity key from request context.
+///
+/// Uses "unknown" as the default identity. Forwarded headers
+/// (`X-Forwarded-For`, `X-Real-IP`) are **not** trusted by default
+/// because they are client-spoofable. A future `trust_proxy` config
+/// option can re-enable them for deployments behind trusted reverse
+/// proxies.
+fn client_key_from_headers(_headers: &HeaderMap) -> String {
     "unknown".into()
 }
 
