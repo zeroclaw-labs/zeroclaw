@@ -16,8 +16,6 @@ permissions:
     contents: read
     security-events: write
     actions: read
-    security-events: write
-    actions: read
 
 env:
     CARGO_TERM_COLOR: always
