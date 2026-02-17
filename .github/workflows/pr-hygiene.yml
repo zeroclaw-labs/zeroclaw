@@ -26,7 +26,7 @@ jobs:
         with:
           script: |
             const staleHours = Number(process.env.STALE_HOURS || "48");
-            const ignoreLabels = new Set(["no-stale", "maintainer", "no-pr-hygiene"]);
+            const ignoreLabels = new Set(["no-stale", "stale", "maintainer", "no-pr-hygiene"]);
             const marker = "<!-- pr-hygiene-nudge -->";
             const owner = context.repo.owner;
             const repo = context.repo.repo;

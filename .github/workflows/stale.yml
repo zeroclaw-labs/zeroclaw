@@ -24,8 +24,8 @@ jobs:
           days-before-pr-close: 7
           stale-issue-label: stale
           stale-pr-label: stale
-          exempt-issue-labels: security,pinned,no-stale,maintainer
-          exempt-pr-labels: no-stale,maintainer
+          exempt-issue-labels: security,pinned,no-stale,no-pr-hygiene,maintainer
+          exempt-pr-labels: no-stale,no-pr-hygiene,maintainer
           remove-stale-when-updated: true
           exempt-all-assignees: true
           operations-per-run: 300
