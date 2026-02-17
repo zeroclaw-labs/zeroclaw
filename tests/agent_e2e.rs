@@ -107,7 +107,12 @@ struct CountingTool {
 impl CountingTool {
     fn new() -> (Self, Arc<Mutex<usize>>) {
         let count = Arc::new(Mutex::new(0));
-        (Self { count: count.clone() }, count)
+        (
+            Self {
+                count: count.clone(),
+            },
+            count,
+        )
     }
 }
 
@@ -163,10 +168,7 @@ fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
     }
 }
 
-fn build_agent(
-    provider: Box<dyn Provider>,
-    tools: Vec<Box<dyn Tool>>,
-) -> Agent {
+fn build_agent(provider: Box<dyn Provider>, tools: Vec<Box<dyn Tool>>) -> Agent {
     Agent::builder()
         .provider(provider)
         .tools(tools)
@@ -178,10 +180,7 @@ fn build_agent(
         .unwrap()
 }
 
-fn build_agent_xml(
-    provider: Box<dyn Provider>,
-    tools: Vec<Box<dyn Tool>>,
-) -> Agent {
+fn build_agent_xml(provider: Box<dyn Provider>, tools: Vec<Box<dyn Tool>>) -> Agent {
     Agent::builder()
         .provider(provider)
         .tools(tools)

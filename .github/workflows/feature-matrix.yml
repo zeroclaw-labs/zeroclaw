@@ -37,12 +37,16 @@ jobs:
                 include:
                     - name: no-default-features
                       args: --no-default-features
+                      install_libudev: false
                     - name: all-features
                       args: --all-features
+                      install_libudev: true
                     - name: hardware-only
                       args: --no-default-features --features hardware
+                      install_libudev: false
                     - name: browser-native
                       args: --no-default-features --features browser-native
+                      install_libudev: false
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -53,6 +57,12 @@ jobs:
             - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
               with:
                   key: features-${{ matrix.name }}
+
+            - name: Install Linux system dependencies for all-features
+              if: matrix.install_libudev
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y --no-install-recommends libudev-dev pkg-config
 
             - name: Check feature combination
               run: cargo check --locked ${{ matrix.args }}

@@ -69,8 +69,9 @@ impl ScreenshotTool {
         );
 
         // Reject filenames with shell-breaking characters to prevent injection in sh -c
-        const SHELL_UNSAFE: &[char] =
-            &['\'', '"', '`', '$', '\\', ';', '|', '&', '\n', '\0', '(', ')'];
+        const SHELL_UNSAFE: &[char] = &[
+            '\'', '"', '`', '$', '\\', ';', '|', '&', '\n', '\0', '(', ')',
+        ];
         if safe_name.contains(SHELL_UNSAFE) {
             return Ok(ToolResult {
                 success: false,
@@ -307,10 +308,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .unwrap()
-            .contains("unsafe for shell execution"));
+        assert!(result.error.unwrap().contains("unsafe for shell execution"));
     }
 
     #[test]
