@@ -14,15 +14,21 @@ edition = "2021"
 license = "MIT"
 description = "ZeroClaw ESP32 peripheral firmware — GPIO over JSON serial"
 
+[patch.crates-io]
+# Use latest esp-rs crates to fix u8/i8 char pointer compatibility with ESP-IDF 5.x
+esp-idf-sys = { git = "https://github.com/esp-rs/esp-idf-sys" }
+esp-idf-hal = { git = "https://github.com/esp-rs/esp-idf-hal" }
+esp-idf-svc = { git = "https://github.com/esp-rs/esp-idf-svc" }
+
 [dependencies]
-esp-idf-svc = "0.48"
+esp-idf-svc = { git = "https://github.com/esp-rs/esp-idf-svc" }
 log = "0.4"
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 [build-dependencies]
-embuild = "0.31"
+embuild = { version = "0.33", features = ["espidf"] }
 
 [profile.release]
 opt-level = "s"

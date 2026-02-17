@@ -6,8 +6,9 @@
 //! Protocol: same as STM32 — see docs/hardware-peripherals-design.md
 
 use esp_idf_svc::hal::gpio::PinDriver;
-use esp_idf_svc::hal::prelude::*;
-use esp_idf_svc::hal::uart::*;
+use esp_idf_svc::hal::peripherals::Peripherals;
+use esp_idf_svc::hal::uart::{UartConfig, UartDriver};
+use esp_idf_svc::hal::units::Hertz;
 use log::info;
 use serde::{Deserialize, Serialize};
 
@@ -36,9 +37,13 @@ fn main() -> anyhow::Result<()> {
     let peripherals = Peripherals::take()?;
     let pins = peripherals.pins;
 
+    // Create GPIO output drivers first (they take ownership of pins)
+    let mut gpio2 = PinDriver::output(pins.gpio2)?;
+    let mut gpio13 = PinDriver::output(pins.gpio13)?;
+
     // UART0: TX=21, RX=20 (ESP32) — ESP32-C3 may use different pins; adjust for your board
     let config = UartConfig::new().baudrate(Hertz(115_200));
-    let mut uart = UartDriver::new(
+    let uart = UartDriver::new(
         peripherals.uart0,
         pins.gpio21,
         pins.gpio20,
@@ -60,7 +65,8 @@ fn main() -> anyhow::Result<()> {
                     if b == b'\n' {
                         if !line.is_empty() {
                             if let Ok(line_str) = std::str::from_utf8(&line) {
-                                if let Ok(resp) = handle_request(line_str, &peripherals) {
+                                if let Ok(resp) = handle_request(line_str, &mut gpio2, &mut gpio13)
+                                {
                                     let out = serde_json::to_string(&resp).unwrap_or_default();
                                     let _ = uart.write(format!("{}\n", out).as_bytes());
                                 }
@@ -80,10 +86,15 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-fn handle_request(
+fn handle_request<G2, G13>(
     line: &str,
-    peripherals: &esp_idf_svc::hal::peripherals::Peripherals,
-) -> anyhow::Result<Response> {
+    gpio2: &mut PinDriver<'_, G2>,
+    gpio13: &mut PinDriver<'_, G13>,
+) -> anyhow::Result<Response>
+where
+    G2: esp_idf_svc::hal::gpio::OutputMode,
+    G13: esp_idf_svc::hal::gpio::OutputMode,
+{
     let req: Request = serde_json::from_str(line.trim())?;
     let id = req.id.clone();
 
@@ -98,13 +109,13 @@ fn handle_request(
         }
         "gpio_read" => {
             let pin_num = req.args.get("pin").and_then(|v| v.as_u64()).unwrap_or(0) as i32;
-            let value = gpio_read(peripherals, pin_num)?;
+            let value = gpio_read(pin_num)?;
             Ok(value.to_string())
         }
         "gpio_write" => {
             let pin_num = req.args.get("pin").and_then(|v| v.as_u64()).unwrap_or(0) as i32;
             let value = req.args.get("value").and_then(|v| v.as_u64()).unwrap_or(0);
-            gpio_write(peripherals, pin_num, value)?;
+            gpio_write(gpio2, gpio13, pin_num, value)?;
             Ok("done".into())
         }
         _ => Err(anyhow::anyhow!("Unknown command: {}", req.cmd)),
@@ -126,28 +137,26 @@ fn handle_request(
     }
 }
 
-fn gpio_read(_peripherals: &esp_idf_svc::hal::peripherals::Peripherals, _pin: i32) -> anyhow::Result<u8> {
+fn gpio_read(_pin: i32) -> anyhow::Result<u8> {
     // TODO: implement input pin read — requires storing InputPin drivers per pin
     Ok(0)
 }
 
-fn gpio_write(
-    peripherals: &esp_idf_svc::hal::peripherals::Peripherals,
+fn gpio_write<G2, G13>(
+    gpio2: &mut PinDriver<'_, G2>,
+    gpio13: &mut PinDriver<'_, G13>,
     pin: i32,
     value: u64,
-) -> anyhow::Result<()> {
-    let pins = peripherals.pins;
-    let level = value != 0;
+) -> anyhow::Result<()>
+where
+    G2: esp_idf_svc::hal::gpio::OutputMode,
+    G13: esp_idf_svc::hal::gpio::OutputMode,
+{
+    let level = esp_idf_svc::hal::gpio::Level::from(value != 0);
 
     match pin {
-        2 => {
-            let mut out = PinDriver::output(pins.gpio2)?;
-            out.set_level(esp_idf_svc::hal::gpio::Level::from(level))?;
-        }
-        13 => {
-            let mut out = PinDriver::output(pins.gpio13)?;
-            out.set_level(esp_idf_svc::hal::gpio::Level::from(level))?;
-        }
+        2 => gpio2.set_level(level)?,
+        13 => gpio13.set_level(level)?,
         _ => anyhow::bail!("Pin {} not configured (add to gpio_write)", pin),
     }
     Ok(())
