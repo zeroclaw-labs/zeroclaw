@@ -1,4 +1,4 @@
-use super::traits::{Channel, ChannelMessage};
+use super::traits::{Channel, ChannelMessage, SendMessage};
 use crate::config::Config;
 use crate::security::pairing::PairingGuard;
 use anyhow::Context;
@@ -1049,28 +1049,29 @@ impl Channel for TelegramChannel {
         "telegram"
     }
 
-    async fn send(&self, message: &str, chat_id: &str) -> anyhow::Result<()> {
-        let (text_without_markers, attachments) = parse_attachment_markers(message);
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        let (text_without_markers, attachments) = parse_attachment_markers(&message.content);
 
         if !attachments.is_empty() {
             if !text_without_markers.is_empty() {
-                self.send_text_chunks(&text_without_markers, chat_id)
+                self.send_text_chunks(&text_without_markers, &message.recipient)
                     .await?;
             }
 
             for attachment in &attachments {
-                self.send_attachment(chat_id, attachment).await?;
+                self.send_attachment(&message.recipient, attachment).await?;
             }
 
             return Ok(());
         }
 
-        if let Some(attachment) = parse_path_only_attachment(message) {
-            self.send_attachment(chat_id, &attachment).await?;
+        if let Some(attachment) = parse_path_only_attachment(&message.content) {
+            self.send_attachment(&message.recipient, &attachment).await?;
             return Ok(());
         }
 
-        self.send_text_chunks(message, chat_id).await
+        self.send_text_chunks(&message.content, &message.recipient)
+            .await
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {

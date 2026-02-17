@@ -1,4 +1,4 @@
-use super::traits::{Channel, ChannelMessage};
+use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
@@ -84,20 +84,22 @@ impl Channel for DingTalkChannel {
         "dingtalk"
     }
 
-    async fn send(&self, message: &str, recipient: &str) -> anyhow::Result<()> {
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let webhooks = self.session_webhooks.read().await;
-        let webhook_url = webhooks.get(recipient).ok_or_else(|| {
+        let webhook_url = webhooks.get(&message.recipient).ok_or_else(|| {
             anyhow::anyhow!(
-                "No session webhook found for chat {recipient}. \
-                 The user must send a message first to establish a session."
+                "No session webhook found for chat {}. \
+                 The user must send a message first to establish a session.",
+                message.recipient
             )
         })?;
 
+        let title = message.subject.as_deref().unwrap_or("ZeroClaw");
         let body = serde_json::json!({
             "msgtype": "markdown",
             "markdown": {
-                "title": "ZeroClaw",
-                "text": message,
+                "title": title,
+                "text": message.content,
             }
         });
 

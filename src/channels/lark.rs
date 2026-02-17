@@ -1,4 +1,4 @@
-use super::traits::{Channel, ChannelMessage};
+use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
@@ -630,13 +630,13 @@ impl Channel for LarkChannel {
         "lark"
     }
 
-    async fn send(&self, message: &str, recipient: &str) -> anyhow::Result<()> {
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let token = self.get_tenant_access_token().await?;
         let url = self.send_message_url();
 
-        let content = serde_json::json!({ "text": message }).to_string();
+        let content = serde_json::json!({ "text": message.content }).to_string();
         let body = serde_json::json!({
-            "receive_id": recipient,
+            "receive_id": message.recipient,
             "msg_type": "text",
             "content": content,
         });
