@@ -1,4 +1,4 @@
-# ZeroClaw Code Style Guide
+# Zero Claw Code Style Guide
 
 This style guide provides instructions for Gemini Code Assist when reviewing pull requests for the ZeroClaw project.
 
