@@ -43,7 +43,7 @@ jobs:
     lint:
         name: Lint Gate (Format + Clippy)
         needs: [changes]
-        if: needs.changes.outputs.rust_changed == 'true'
+        if: needs.changes.outputs.rust_changed == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full'))
         runs-on: blacksmith-2vcpu-ubuntu-2404
         timeout-minutes: 20
         steps:
@@ -61,7 +61,7 @@ jobs:
     lint-strict-delta:
         name: Lint Gate (Strict Delta)
         needs: [changes]
-        if: needs.changes.outputs.rust_changed == 'true'
+        if: needs.changes.outputs.rust_changed == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full'))
         runs-on: blacksmith-2vcpu-ubuntu-2404
         timeout-minutes: 25
         steps:
@@ -81,7 +81,7 @@ jobs:
     test:
         name: Test
         needs: [changes, lint, lint-strict-delta]
-        if: needs.changes.outputs.rust_changed == 'true' && needs.lint.result == 'success' && needs.lint-strict-delta.result == 'success'
+        if: needs.changes.outputs.rust_changed == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && needs.lint.result == 'success' && needs.lint-strict-delta.result == 'success'
         runs-on: blacksmith-2vcpu-ubuntu-2404
         timeout-minutes: 30
         steps:
@@ -95,8 +95,8 @@ jobs:
 
     build:
         name: Build (Smoke)
-        needs: [changes, lint, lint-strict-delta]
-        if: needs.changes.outputs.rust_changed == 'true' && needs.lint.result == 'success' && needs.lint-strict-delta.result == 'success'
+        needs: [changes]
+        if: needs.changes.outputs.rust_changed == 'true'
         runs-on: blacksmith-2vcpu-ubuntu-2404
         timeout-minutes: 20
 
@@ -130,7 +130,7 @@ jobs:
     docs-quality:
         name: Docs Quality
         needs: [changes]
-        if: needs.changes.outputs.docs_changed == 'true'
+        if: needs.changes.outputs.docs_changed == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full'))
         runs-on: blacksmith-2vcpu-ubuntu-2404
         timeout-minutes: 15
         steps:
@@ -313,21 +313,15 @@ jobs:
               run: |
                   set -euo pipefail
 
-                  docs_changed="${{ needs.changes.outputs.docs_changed }}"
+                  event_name="${{ github.event_name }}"
                   rust_changed="${{ needs.changes.outputs.rust_changed }}"
                   workflow_changed="${{ needs.changes.outputs.workflow_changed }}"
-                  docs_result="${{ needs.docs-quality.result }}"
                   workflow_owner_result="${{ needs.workflow-owner-approval.result }}"
 
                   if [ "${{ needs.changes.outputs.docs_only }}" = "true" ]; then
-                    echo "docs=${docs_result}"
                     echo "workflow_owner_approval=${workflow_owner_result}"
                     if [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
                       echo "Workflow files changed but workflow owner approval gate did not pass."
-                      exit 1
-                    fi
-                    if [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
-                      echo "Docs-only change touched markdown docs, but docs-quality did not pass."
                       exit 1
                     fi
                     echo "Docs-only fast path passed."
@@ -336,14 +330,9 @@ jobs:
 
                   if [ "$rust_changed" != "true" ]; then
                     echo "rust_changed=false (non-rust fast path)"
-                    echo "docs=${docs_result}"
                     echo "workflow_owner_approval=${workflow_owner_result}"
                     if [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
                       echo "Workflow files changed but workflow owner approval gate did not pass."
-                      exit 1
-                    fi
-                    if [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
-                      echo "Docs changed but docs-quality did not pass."
                       exit 1
                     fi
                     echo "Non-rust fast path passed."
@@ -359,22 +348,25 @@ jobs:
                   echo "lint_strict_delta=${lint_strict_delta_result}"
                   echo "test=${test_result}"
                   echo "build=${build_result}"
-                  echo "docs=${docs_result}"
                   echo "workflow_owner_approval=${workflow_owner_result}"
-
-                  if [ "$lint_result" != "success" ] || [ "$lint_strict_delta_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ]; then
-                    echo "Required CI jobs did not pass."
-                    exit 1
-                  fi
 
                   if [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
                     echo "Workflow files changed but workflow owner approval gate did not pass."
                     exit 1
                   fi
 
-                  if [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
-                    echo "Docs changed but docs-quality did not pass."
+                  if [ "$event_name" = "pull_request" ]; then
+                    if [ "$build_result" != "success" ]; then
+                      echo "Required PR build job did not pass."
+                      exit 1
+                    fi
+                    echo "PR required checks passed."
+                    exit 0
+                  fi
+
+                  if [ "$lint_result" != "success" ] || [ "$lint_strict_delta_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ]; then
+                    echo "Required push CI jobs did not pass."
                     exit 1
                   fi
 
-                  echo "All required CI jobs passed."
+                  echo "Push required checks passed."

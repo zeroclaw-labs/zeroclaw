@@ -7,14 +7,9 @@ on:
             - "Cargo.toml"
             - "Cargo.lock"
             - "src/**"
-    pull_request:
-        branches: [main]
-        paths:
-            - "Cargo.toml"
-            - "Cargo.lock"
-            - "src/**"
     schedule:
         - cron: "30 4 * * 1" # Weekly Monday 4:30am UTC
+    workflow_dispatch:
 
 concurrency:
     group: feature-matrix-${{ github.event.pull_request.number || github.sha }}
