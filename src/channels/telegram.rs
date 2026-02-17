@@ -380,10 +380,10 @@ impl TelegramChannel {
                             match self.persist_allowed_identity(&identity).await {
                                 Ok(()) => {
                                     let _ = self
-                                        .send(
+                                        .send(&SendMessage::new(
                                             "✅ Telegram account bound successfully. You can talk to ZeroClaw now.",
                                             &chat_id,
-                                        )
+                                        ))
                                         .await;
                                     tracing::info!(
                                         "Telegram: paired and allowlisted identity={identity}"
@@ -394,45 +394,45 @@ impl TelegramChannel {
                                         "Telegram: failed to persist allowlist after bind: {e}"
                                     );
                                     let _ = self
-                                        .send(
+                                        .send(&SendMessage::new(
                                             "⚠️ Bound for this runtime, but failed to persist config. Access may be lost after restart; check config file permissions.",
                                             &chat_id,
-                                        )
+                                        ))
                                         .await;
                                 }
                             }
                         } else {
                             let _ = self
-                                .send(
+                                .send(&SendMessage::new(
                                     "❌ Could not identify your Telegram account. Ensure your account has a username or stable user ID, then retry.",
                                     &chat_id,
-                                )
+                                ))
                                 .await;
                         }
                     }
                     Ok(None) => {
                         let _ = self
-                            .send(
+                            .send(&SendMessage::new(
                                 "❌ Invalid binding code. Ask operator for the latest code and retry.",
                                 &chat_id,
-                            )
+                            ))
                             .await;
                     }
                     Err(lockout_secs) => {
                         let _ = self
-                            .send(
-                                &format!("⏳ Too many invalid attempts. Retry in {lockout_secs}s."),
+                            .send(&SendMessage::new(
+                                format!("⏳ Too many invalid attempts. Retry in {lockout_secs}s."),
                                 &chat_id,
-                            )
+                            ))
                             .await;
                     }
                 }
             } else {
                 let _ = self
-                    .send(
+                    .send(&SendMessage::new(
                         "ℹ️ Telegram pairing is not active. Ask operator to update allowlist in config.toml.",
                         &chat_id,
-                    )
+                    ))
                     .await;
             }
             return;
@@ -456,23 +456,20 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .unwrap_or_else(|| "YOUR_TELEGRAM_ID".to_string());
 
         let _ = self
-            .send(
-                &format!(
-                    "🔐 This bot requires operator approval.\n\n\
-Copy this command to operator terminal:\n\
-`zeroclaw channel bind-telegram {suggested_identity}`\n\n\
-After operator runs it, send your message again."
+            .send(&SendMessage::new(
+                format!(
+                    "🔐 This bot requires operator approval.\n\nCopy this command to operator terminal:\n`zeroclaw channel bind-telegram {suggested_identity}`\n\nAfter operator runs it, send your message again."
                 ),
                 &chat_id,
-            )
+            ))
             .await;
 
         if self.pairing_code_active() {
             let _ = self
-                .send(
+                .send(&SendMessage::new(
                     "ℹ️ If operator provides a one-time pairing code, you can also run `/bind <code>`.",
                     &chat_id,
-                )
+                ))
                 .await;
         }
     }
@@ -1066,7 +1063,8 @@ impl Channel for TelegramChannel {
         }
 
         if let Some(attachment) = parse_path_only_attachment(&message.content) {
-            self.send_attachment(&message.recipient, &attachment).await?;
+            self.send_attachment(&message.recipient, &attachment)
+                .await?;
             return Ok(());
         }
 
@@ -1369,7 +1367,7 @@ mod tests {
                     "username": "alice"
                 },
                 "chat": {
-                    "id": -100200300
+                    "id": -100_200_300
                 }
             }
         });

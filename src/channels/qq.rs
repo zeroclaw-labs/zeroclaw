@@ -1,4 +1,4 @@
-use super::traits::{Channel, ChannelMessage};
+use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
@@ -162,25 +162,28 @@ impl Channel for QQChannel {
         "qq"
     }
 
-    async fn send(&self, message: &str, recipient: &str) -> anyhow::Result<()> {
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let token = self.get_token().await?;
 
         // Determine if this is a group or private message based on recipient format
         // Format: "user:{openid}" or "group:{group_openid}"
-        let (url, body) = if let Some(group_id) = recipient.strip_prefix("group:") {
+        let (url, body) = if let Some(group_id) = message.recipient.strip_prefix("group:") {
             (
                 format!("{QQ_API_BASE}/v2/groups/{group_id}/messages"),
                 json!({
-                    "content": message,
+                    "content": &message.content,
                     "msg_type": 0,
                 }),
             )
         } else {
-            let user_id = recipient.strip_prefix("user:").unwrap_or(recipient);
+            let user_id = message
+                .recipient
+                .strip_prefix("user:")
+                .unwrap_or(&message.recipient);
             (
                 format!("{QQ_API_BASE}/v2/users/{user_id}/messages"),
                 json!({
-                    "content": message,
+                    "content": &message.content,
                     "msg_type": 0,
                 }),
             )

@@ -704,7 +704,10 @@ async fn handle_whatsapp_message(
         {
             Ok(response) => {
                 // Send reply via WhatsApp
-                if let Err(e) = wa.send(&SendMessage::new(response, &msg.reply_target)).await {
+                if let Err(e) = wa
+                    .send(&SendMessage::new(response, &msg.reply_target))
+                    .await
+                {
                     tracing::error!("Failed to send WhatsApp reply: {e}");
                 }
             }
