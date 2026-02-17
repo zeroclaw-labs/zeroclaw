@@ -32,7 +32,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
     - Additional behavior: provider-related keywords in provider/config/onboard/integration changes are promoted to `provider:*` labels (for example `provider:kimi`, `provider:deepseek`)
     - Additional behavior: hierarchical de-duplication keeps only the most specific scope labels (for example `tool:composio` suppresses `tool:core` and `tool`)
     - Additional behavior: module namespaces are compacted — one specific module keeps `prefix:component`; multiple specifics collapse to just `prefix`
-    - Additional behavior: applies contributor tiers on PRs by merged PR count (`experienced` >=10, `principal` >=20, `distinguished` >=50)
+    - Additional behavior: applies contributor tiers on PRs by merged PR count (`trusted` >=5, `experienced` >=10, `principal` >=20, `distinguished` >=50)
     - Additional behavior: final label set is priority-sorted (`risk:*` first, then `size:*`, then contributor tier, then module/path labels)
     - Additional behavior: managed label colors follow display order to produce a smooth left-to-right gradient when many labels are present
     - Additional behavior: risk + size labels are auto-corrected on manual PR label edits (`labeled`/`unlabeled` events); apply `risk: manual` when maintainers intentionally override automated risk selection
@@ -40,7 +40,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
     - Guardrail: maintainers can apply `risk: manual` to freeze automated risk recalculation
 - `.github/workflows/auto-response.yml` (`Auto Response`)
     - Purpose: first-time contributor onboarding + label-driven response routing (`r:support`, `r:needs-repro`, etc.)
-    - Additional behavior: applies contributor tiers on issues by merged PR count (`experienced` >=10, `principal` >=20, `distinguished` >=50)
+    - Additional behavior: applies contributor tiers on issues by merged PR count (`trusted` >=5, `experienced` >=10, `principal` >=20, `distinguished` >=50)
     - Additional behavior: contributor-tier labels are treated as automation-managed (manual add/remove on PR/issue is auto-corrected)
     - Guardrail: label-based close routes are issue-only; PRs are never auto-closed by route labels
 - `.github/workflows/stale.yml` (`Stale`)

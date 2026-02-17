@@ -55,6 +55,7 @@ jobs:
                         { label: "distinguished contributor", minMergedPRs: 50 },
                         { label: "principal contributor", minMergedPRs: 20 },
                         { label: "experienced contributor", minMergedPRs: 10 },
+                        { label: "trusted contributor", minMergedPRs: 5 },
                       ];
                       const contributorTierLabels = contributorTierRules.map((rule) => rule.label);
                       const contributorTierColor = "2ED9FF"; // Keep in sync with .github/workflows/auto-response.yml
@@ -155,6 +156,7 @@ jobs:
                         "distinguished contributor",
                         "principal contributor",
                         "experienced contributor",
+                        "trusted contributor",
                       ];
                       const modulePrefixPriorityIndex = new Map(
                         modulePrefixPriority.map((prefix, index) => [prefix, index])
