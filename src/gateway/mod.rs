@@ -709,7 +709,7 @@ async fn handle_whatsapp_message(
         {
             Ok(response) => {
                 // Send reply via WhatsApp
-                if let Err(e) = wa.send(&response, &msg.sender).await {
+                if let Err(e) = wa.send(&response, &msg.reply_to).await {
                     tracing::error!("Failed to send WhatsApp reply: {e}");
                 }
             }
@@ -718,7 +718,7 @@ async fn handle_whatsapp_message(
                 let _ = wa
                     .send(
                         "Sorry, I couldn't process your message right now.",
-                        &msg.sender,
+                        &msg.reply_to,
                     )
                     .await;
             }
@@ -860,6 +860,7 @@ mod tests {
         let msg = ChannelMessage {
             id: "wamid-123".into(),
             sender: "+1234567890".into(),
+            reply_to: "+1234567890".into(),
             content: "hello".into(),
             channel: "whatsapp".into(),
             timestamp: 1,

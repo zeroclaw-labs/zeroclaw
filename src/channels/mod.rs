@@ -171,7 +171,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
     let target_channel = ctx.channels_by_name.get(&msg.channel).cloned();
 
     if let Some(channel) = target_channel.as_ref() {
-        if let Err(e) = channel.start_typing(&msg.sender).await {
+        if let Err(e) = channel.start_typing(&msg.reply_to).await {
             tracing::debug!("Failed to start typing on {}: {e}", channel.name());
         }
     }
@@ -200,7 +200,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
     .await;
 
     if let Some(channel) = target_channel.as_ref() {
-        if let Err(e) = channel.stop_typing(&msg.sender).await {
+        if let Err(e) = channel.stop_typing(&msg.reply_to).await {
             tracing::debug!("Failed to stop typing on {}: {e}", channel.name());
         }
     }
@@ -213,7 +213,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                 truncate_with_ellipsis(&response, 80)
             );
             if let Some(channel) = target_channel.as_ref() {
-                if let Err(e) = channel.send(&response, &msg.sender).await {
+                if let Err(e) = channel.send(&response, &msg.reply_to).await {
                     eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
                 }
             }
@@ -224,7 +224,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                 started_at.elapsed().as_millis()
             );
             if let Some(channel) = target_channel.as_ref() {
-                let _ = channel.send(&format!("⚠️ Error: {e}"), &msg.sender).await;
+                let _ = channel.send(&format!("⚠️ Error: {e}"), &msg.reply_to).await;
             }
         }
         Err(_) => {
@@ -241,7 +241,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                 let _ = channel
                     .send(
                         "⚠️ Request timed out while waiting for the model. Please try again.",
-                        &msg.sender,
+                        &msg.reply_to,
                     )
                     .await;
             }
@@ -1232,6 +1232,7 @@ mod tests {
             traits::ChannelMessage {
                 id: "msg-1".to_string(),
                 sender: "alice".to_string(),
+                reply_to: "alice".to_string(),
                 content: "What is the BTC price now?".to_string(),
                 channel: "test-channel".to_string(),
                 timestamp: 1,
@@ -1321,6 +1322,7 @@ mod tests {
         tx.send(traits::ChannelMessage {
             id: "1".to_string(),
             sender: "alice".to_string(),
+            reply_to: "alice".to_string(),
             content: "hello".to_string(),
             channel: "test-channel".to_string(),
             timestamp: 1,
@@ -1330,6 +1332,7 @@ mod tests {
         tx.send(traits::ChannelMessage {
             id: "2".to_string(),
             sender: "bob".to_string(),
+            reply_to: "bob".to_string(),
             content: "world".to_string(),
             channel: "test-channel".to_string(),
             timestamp: 2,
@@ -1573,6 +1576,7 @@ mod tests {
         let msg = traits::ChannelMessage {
             id: "msg_abc123".into(),
             sender: "U123".into(),
+            reply_to: "U123".into(),
             content: "hello".into(),
             channel: "slack".into(),
             timestamp: 1,
@@ -1586,6 +1590,7 @@ mod tests {
         let msg1 = traits::ChannelMessage {
             id: "msg_1".into(),
             sender: "U123".into(),
+            reply_to: "U123".into(),
             content: "first".into(),
             channel: "slack".into(),
             timestamp: 1,
@@ -1593,6 +1598,7 @@ mod tests {
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
             sender: "U123".into(),
+            reply_to: "U123".into(),
             content: "second".into(),
             channel: "slack".into(),
             timestamp: 2,
@@ -1612,6 +1618,7 @@ mod tests {
         let msg1 = traits::ChannelMessage {
             id: "msg_1".into(),
             sender: "U123".into(),
+            reply_to: "U123".into(),
             content: "I'm Paul".into(),
             channel: "slack".into(),
             timestamp: 1,
@@ -1619,6 +1626,7 @@ mod tests {
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
             sender: "U123".into(),
+            reply_to: "U123".into(),
             content: "I'm 45".into(),
             channel: "slack".into(),
             timestamp: 2,
