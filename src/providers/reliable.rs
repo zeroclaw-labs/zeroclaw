@@ -144,8 +144,8 @@ impl Provider for ReliableProvider {
     async fn warmup(&self) -> anyhow::Result<()> {
         for (name, provider) in &self.providers {
             tracing::info!(provider = name, "Warming up provider connection pool");
-            if let Err(e) = provider.warmup().await {
-                tracing::warn!(provider = name, "Warmup failed (non-fatal): {e}");
+            if provider.warmup().await.is_err() {
+                tracing::warn!(provider = name, "Warmup failed (non-fatal)");
             }
         }
         Ok(())
@@ -186,8 +186,15 @@ impl Provider for ReliableProvider {
                             let non_retryable = is_non_retryable(&e);
                             let rate_limited = is_rate_limited(&e);
 
+                            let failure_reason = if rate_limited {
+                                "rate_limited"
+                            } else if non_retryable {
+                                "non_retryable"
+                            } else {
+                                "retryable"
+                            };
                             failures.push(format!(
-                                "{provider_name}/{current_model} attempt {}/{}: {e}",
+                                "{provider_name}/{current_model} attempt {}/{}: {failure_reason}",
                                 attempt + 1,
                                 self.max_retries + 1
                             ));
@@ -284,8 +291,15 @@ impl Provider for ReliableProvider {
                             let non_retryable = is_non_retryable(&e);
                             let rate_limited = is_rate_limited(&e);
 
+                            let failure_reason = if rate_limited {
+                                "rate_limited"
+                            } else if non_retryable {
+                                "non_retryable"
+                            } else {
+                                "retryable"
+                            };
                             failures.push(format!(
-                                "{provider_name}/{current_model} attempt {}/{}: {e}",
+                                "{provider_name}/{current_model} attempt {}/{}: {failure_reason}",
                                 attempt + 1,
                                 self.max_retries + 1
                             ));

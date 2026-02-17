@@ -105,11 +105,11 @@ pub async fn api_error(provider: &str, response: reqwest::Response) -> anyhow::E
 /// For Anthropic, the provider-specific env var is `ANTHROPIC_OAUTH_TOKEN` (for setup-tokens)
 /// followed by `ANTHROPIC_API_KEY` (for regular API keys).
 fn resolve_provider_credential(name: &str, credential_override: Option<&str>) -> Option<String> {
-    if let Some(credential_value) = credential_override
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return Some(credential_value.to_string());
+    if let Some(raw_override) = credential_override {
+        let trimmed_override = raw_override.trim();
+        if !trimmed_override.is_empty() {
+            return Some(trimmed_override.to_owned());
+        }
     }
 
     let provider_env_candidates: Vec<&str> = match name {
@@ -402,11 +402,16 @@ pub fn create_routed_provider(
     // Create each provider (with its own resilience wrapper)
     let mut providers: Vec<(String, Box<dyn Provider>)> = Vec::new();
     for name in &needed {
-        let key = model_routes
+        let routed_credential = model_routes
             .iter()
             .find(|r| &r.provider == name)
-            .and_then(|r| r.api_key.as_deref())
-            .or(api_key);
+            .and_then(|r| {
+                r.api_key.as_ref().and_then(|raw_key| {
+                    let trimmed_key = raw_key.trim();
+                    (!trimmed_key.is_empty()).then_some(trimmed_key)
+                })
+            });
+        let key = routed_credential.or(api_key);
         // Only use api_url for the primary provider
         let url = if name == primary_name { api_url } else { None };
         match create_resilient_provider(name, key, url, reliability) {
@@ -451,7 +456,7 @@ mod tests {
     #[test]
     fn resolve_provider_credential_prefers_explicit_argument() {
         let resolved = resolve_provider_credential("openrouter", Some("  explicit-key  "));
-        assert_eq!(resolved.as_deref(), Some("explicit-key"));
+        assert_eq!(resolved, Some("explicit-key".to_string()));
     }
 
     // ── Primary providers ────────────────────────────────────
