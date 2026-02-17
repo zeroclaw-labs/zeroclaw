@@ -1,54 +1,13 @@
 use crate::config::Config;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use std::io::Write;
 use std::path::Path;
 
 const DAEMON_STALE_SECONDS: i64 = 30;
 const SCHEDULER_STALE_SECONDS: i64 = 120;
 const CHANNEL_STALE_SECONDS: i64 = 300;
-
-/// Known built-in provider names (must stay in sync with `create_provider`).
-const KNOWN_PROVIDERS: &[&str] = &[
-    "openrouter",
-    "anthropic",
-    "openai",
-    "ollama",
-    "gemini",
-    "google",
-    "google-gemini",
-    "venice",
-    "vercel",
-    "vercel-ai",
-    "cloudflare",
-    "cloudflare-ai",
-    "moonshot",
-    "kimi",
-    "synthetic",
-    "opencode",
-    "opencode-zen",
-    "zai",
-    "z.ai",
-    "glm",
-    "zhipu",
-    "minimax",
-    "bedrock",
-    "aws-bedrock",
-    "qianfan",
-    "baidu",
-    "groq",
-    "mistral",
-    "xai",
-    "grok",
-    "deepseek",
-    "together",
-    "together-ai",
-    "fireworks",
-    "fireworks-ai",
-    "perplexity",
-    "cohere",
-    "copilot",
-    "github-copilot",
-];
+const COMMAND_VERSION_PREVIEW_CHARS: usize = 60;
 
 // ── Diagnostic item ──────────────────────────────────────────────
 
@@ -160,17 +119,15 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
 
     // Provider validity
     if let Some(ref provider) = config.default_provider {
-        if is_known_provider(provider) {
+        if let Some(reason) = provider_validation_error(provider) {
+            items.push(DiagItem::error(
+                cat,
+                format!("default provider \"{provider}\" is invalid: {reason}"),
+            ));
+        } else {
             items.push(DiagItem::ok(
                 cat,
                 format!("provider \"{provider}\" is valid"),
-            ));
-        } else {
-            items.push(DiagItem::error(
-                cat,
-                format!(
-                    "unknown provider \"{provider}\". Use a known name or \"custom:<url>\" / \"anthropic-custom:<url>\""
-                ),
             ));
         }
     } else {
@@ -231,10 +188,10 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
 
     // Reliability: fallback providers
     for fb in &config.reliability.fallback_providers {
-        if !is_known_provider(fb) {
+        if let Some(reason) = provider_validation_error(fb) {
             items.push(DiagItem::warn(
                 cat,
-                format!("fallback provider \"{fb}\" is not a known provider name"),
+                format!("fallback provider \"{fb}\" is invalid: {reason}"),
             ));
         }
     }
@@ -244,12 +201,12 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         if route.hint.is_empty() {
             items.push(DiagItem::warn(cat, "model route with empty hint"));
         }
-        if !is_known_provider(&route.provider) {
+        if let Some(reason) = provider_validation_error(&route.provider) {
             items.push(DiagItem::warn(
                 cat,
                 format!(
-                    "model route \"{}\" references unknown provider \"{}\"",
-                    route.hint, route.provider
+                    "model route \"{}\" uses invalid provider \"{}\": {}",
+                    route.hint, route.provider, reason
                 ),
             ));
         }
@@ -285,22 +242,29 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
 
     // Delegate agents: provider validity
     for (name, agent) in &config.agents {
-        if !is_known_provider(&agent.provider) {
+        if let Some(reason) = provider_validation_error(&agent.provider) {
             items.push(DiagItem::warn(
                 cat,
                 format!(
-                    "agent \"{name}\" uses unknown provider \"{}\"",
-                    agent.provider
+                    "agent \"{name}\" uses invalid provider \"{}\": {}",
+                    agent.provider, reason
                 ),
             ));
         }
     }
 }
 
-fn is_known_provider(name: &str) -> bool {
-    KNOWN_PROVIDERS.contains(&name)
-        || name.starts_with("custom:")
-        || name.starts_with("anthropic-custom:")
+fn provider_validation_error(name: &str) -> Option<String> {
+    match crate::providers::create_provider(name, None) {
+        Ok(_) => None,
+        Err(err) => Some(
+            err.to_string()
+                .lines()
+                .next()
+                .unwrap_or("invalid provider")
+                .into(),
+        ),
+    }
 }
 
 // ── Workspace integrity ──────────────────────────────────────────
@@ -323,11 +287,23 @@ fn check_workspace(config: &Config, items: &mut Vec<DiagItem>) {
     }
 
     // Writable check
-    let probe = ws.join(".zeroclaw_doctor_probe");
-    match std::fs::write(&probe, b"probe") {
-        Ok(()) => {
+    let probe = workspace_probe_path(ws);
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(mut probe_file) => {
+            let write_result = probe_file.write_all(b"probe");
+            drop(probe_file);
             let _ = std::fs::remove_file(&probe);
-            items.push(DiagItem::ok(cat, "directory is writable"));
+            match write_result {
+                Ok(()) => items.push(DiagItem::ok(cat, "directory is writable")),
+                Err(e) => items.push(DiagItem::error(
+                    cat,
+                    format!("directory write probe failed: {e}"),
+                )),
+            }
         }
         Err(e) => {
             items.push(DiagItem::error(
@@ -365,7 +341,7 @@ fn check_file_exists(
     items: &mut Vec<DiagItem>,
 ) {
     let path = base.join(name);
-    if path.exists() {
+    if path.is_file() {
         items.push(DiagItem::ok(cat, format!("{name} present")));
     } else if required {
         items.push(DiagItem::error(cat, format!("{name} missing")));
@@ -384,10 +360,24 @@ fn disk_available_mb(path: &Path) -> Option<u64> {
         return None;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // Second line, 4th column is "Available" in `df -m`
-    let line = stdout.lines().nth(1)?;
+    parse_df_available_mb(&stdout)
+}
+
+fn parse_df_available_mb(stdout: &str) -> Option<u64> {
+    let line = stdout.lines().rev().find(|line| !line.trim().is_empty())?;
     let avail = line.split_whitespace().nth(3)?;
     avail.parse::<u64>().ok()
+}
+
+fn workspace_probe_path(workspace_dir: &Path) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    workspace_dir.join(format!(
+        ".zeroclaw_doctor_probe_{}_{}",
+        std::process::id(),
+        nanos
+    ))
 }
 
 // ── Daemon state (original logic, preserved) ─────────────────────
@@ -534,10 +524,10 @@ fn check_environment(items: &mut Vec<DiagItem>) {
 
     // Shell
     let shell = std::env::var("SHELL").unwrap_or_default();
-    if !shell.is_empty() {
-        items.push(DiagItem::ok(cat, format!("shell: {shell}")));
-    } else {
+    if shell.is_empty() {
         items.push(DiagItem::warn(cat, "$SHELL not set"));
+    } else {
+        items.push(DiagItem::ok(cat, format!("shell: {shell}")));
     }
 
     // HOME
@@ -564,11 +554,7 @@ fn check_command_available(cmd: &str, args: &[&str], cat: &'static str, items: &
         Ok(output) if output.status.success() => {
             let ver = String::from_utf8_lossy(&output.stdout);
             let first_line = ver.lines().next().unwrap_or("").trim();
-            let display = if first_line.len() > 60 {
-                format!("{}…", &first_line[..60])
-            } else {
-                first_line.to_string()
-            };
+            let display = truncate_for_display(first_line, COMMAND_VERSION_PREVIEW_CHARS);
             items.push(DiagItem::ok(cat, format!("{cmd}: {display}")));
         }
         Ok(_) => {
@@ -583,6 +569,16 @@ fn check_command_available(cmd: &str, args: &[&str], cat: &'static str, items: &
     }
 }
 
+fn truncate_for_display(input: &str, max_chars: usize) -> String {
+    let mut chars = input.chars();
+    let preview: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{preview}…")
+    } else {
+        preview
+    }
+}
+
 // ── Helpers ──────────────────────────────────────────────────────
 
 fn parse_rfc3339(raw: &str) -> Option<DateTime<Utc>> {
@@ -594,17 +590,19 @@ fn parse_rfc3339(raw: &str) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
-    fn known_providers_recognized() {
-        assert!(is_known_provider("openrouter"));
-        assert!(is_known_provider("anthropic"));
-        assert!(is_known_provider("ollama"));
-        assert!(is_known_provider("gemini"));
-        assert!(is_known_provider("custom:https://example.com"));
-        assert!(is_known_provider("anthropic-custom:https://example.com"));
-        assert!(!is_known_provider("nonexistent-provider"));
-        assert!(!is_known_provider(""));
+    fn provider_validation_checks_custom_url_shape() {
+        assert!(provider_validation_error("openrouter").is_none());
+        assert!(provider_validation_error("custom:https://example.com").is_none());
+        assert!(provider_validation_error("anthropic-custom:https://example.com").is_none());
+
+        let invalid_custom = provider_validation_error("custom:").unwrap_or_default();
+        assert!(invalid_custom.contains("requires a URL"));
+
+        let invalid_unknown = provider_validation_error("totally-fake").unwrap_or_default();
+        assert!(invalid_unknown.contains("Unknown provider"));
     }
 
     #[test]
@@ -654,7 +652,22 @@ mod tests {
         check_config_semantics(&config, &mut items);
         let prov_item = items
             .iter()
-            .find(|i| i.message.contains("unknown provider"));
+            .find(|i| i.message.contains("default provider"));
+        assert!(prov_item.is_some());
+        assert_eq!(prov_item.unwrap().severity, Severity::Error);
+    }
+
+    #[test]
+    fn config_validation_catches_malformed_custom_provider() {
+        let mut config = Config::default();
+        config.default_provider = Some("custom:".into());
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+
+        let prov_item = items.iter().find(|item| {
+            item.message
+                .contains("default provider \"custom:\" is invalid")
+        });
         assert!(prov_item.is_some());
         assert_eq!(prov_item.unwrap().severity, Severity::Error);
     }
@@ -684,6 +697,21 @@ mod tests {
     }
 
     #[test]
+    fn config_validation_warns_bad_custom_fallback() {
+        let mut config = Config::default();
+        config.reliability.fallback_providers = vec!["custom:".into()];
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+
+        let fb_item = items.iter().find(|item| {
+            item.message
+                .contains("fallback provider \"custom:\" is invalid")
+        });
+        assert!(fb_item.is_some());
+        assert_eq!(fb_item.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
     fn config_validation_warns_empty_model_route() {
         let mut config = Config::default();
         config.model_routes = vec![crate::config::ModelRouteConfig {
@@ -707,5 +735,31 @@ mod tests {
         // git should be available in any CI/dev environment
         assert!(git_item.is_some());
         assert_eq!(git_item.unwrap().severity, Severity::Ok);
+    }
+
+    #[test]
+    fn parse_df_available_mb_uses_last_data_line() {
+        let stdout =
+            "Filesystem 1M-blocks Used Available Use% Mounted on\n/dev/sda1 1000 500 500 50% /\n";
+        assert_eq!(parse_df_available_mb(stdout), Some(500));
+    }
+
+    #[test]
+    fn truncate_for_display_preserves_utf8_boundaries() {
+        let preview = truncate_for_display("版本号-alpha-build", 3);
+        assert_eq!(preview, "版本号…");
+    }
+
+    #[test]
+    fn workspace_probe_path_is_hidden_and_unique() {
+        let tmp = TempDir::new().unwrap();
+        let first = workspace_probe_path(tmp.path());
+        let second = workspace_probe_path(tmp.path());
+
+        assert_ne!(first, second);
+        assert!(first
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(".zeroclaw_doctor_probe_")));
     }
 }
