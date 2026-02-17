@@ -27,6 +27,7 @@ jobs:
               uses: github/codeql-action/init@v4
               with:
                   languages: rust
+                  config-file: ./.github/codeql/codeql-config.yml
 
             - name: Set up Rust
               uses: dtolnay/rust-toolchain@stable
