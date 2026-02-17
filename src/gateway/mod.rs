@@ -10,12 +10,11 @@
 use crate::channels::{Channel, WhatsAppChannel};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
-use crate::observability::{self, Observer};
 use crate::providers::{self, Provider};
 use crate::runtime;
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::security::SecurityPolicy;
-use crate::tools::{self, Tool};
+use crate::tools;
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use axum::{
@@ -222,8 +221,6 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         &config.workspace_dir,
         config.api_key.as_deref(),
     )?);
-    let observer: Arc<dyn Observer> =
-        Arc::from(observability::create_observer(&config.observability));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(
@@ -240,7 +237,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         (None, None)
     };
 
-    let tools_registry = Arc::new(tools::all_tools_with_runtime(
+    let _tools_registry = Arc::new(tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -254,25 +251,6 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         config.api_key.as_deref(),
         &config,
     ));
-    let skills = crate::skills::load_skills(&config.workspace_dir);
-    let tool_descs: Vec<(&str, &str)> = tools_registry
-        .iter()
-        .map(|tool| (tool.name(), tool.description()))
-        .collect();
-
-    let mut system_prompt = crate::channels::build_system_prompt(
-        &config.workspace_dir,
-        &model,
-        &tool_descs,
-        &skills,
-        Some(&config.identity),
-        None, // bootstrap_max_chars — no compact context for gateway
-    );
-    system_prompt.push_str(&crate::agent::loop_::build_tool_instructions(
-        tools_registry.as_ref(),
-    ));
-    let system_prompt = Arc::new(system_prompt);
-
     // Extract webhook secret for authentication
     let webhook_secret: Option<Arc<str>> = config
         .channels_config
