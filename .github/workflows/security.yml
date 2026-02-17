@@ -3,6 +3,8 @@ name: Security Audit
 on:
     push:
         branches: [main]
+    pull_request:
+        branches: [main]
     schedule:
         - cron: "0 6 * * 1" # Weekly on Monday 6am UTC
 
@@ -46,7 +48,8 @@ jobs:
               with:
                   command: check advisories licenses sources
 
-    codeql:
+    codeif: github.event_name != 'pull_request'
+        ql:
         name: CodeQL Analysis
         runs-on: blacksmith-2vcpu-ubuntu-2404
         timeout-minutes: 30
