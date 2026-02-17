@@ -3,7 +3,6 @@ use async_trait::async_trait;
 use reqwest::multipart::{Form, Part};
 use std::path::Path;
 use std::time::Duration;
-use uuid::Uuid;
 
 /// Telegram's maximum message length for text messages
 const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
