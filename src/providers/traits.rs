@@ -170,6 +170,23 @@ pub trait Provider: Send + Sync {
     async fn warmup(&self) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// Chat with tool definitions for native function calling support.
+    /// The default implementation falls back to chat_with_history and returns
+    /// an empty tool_calls vector (prompt-based tool use only).
+    async fn chat_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        _tools: &[serde_json::Value],
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ChatResponse> {
+        let text = self.chat_with_history(messages, model, temperature).await?;
+        Ok(ChatResponse {
+            text: Some(text),
+            tool_calls: Vec::new(),
+        })
+    }
 }
 
 #[cfg(test)]

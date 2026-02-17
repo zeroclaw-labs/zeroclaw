@@ -401,6 +401,90 @@ impl Provider for OpenRouterProvider {
     fn supports_native_tools(&self) -> bool {
         true
     }
+
+    async fn chat_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        let api_key = self.api_key.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var."
+            )
+        })?;
+
+        // Convert tool JSON values to NativeToolSpec
+        let native_tools: Option<Vec<NativeToolSpec>> = if tools.is_empty() {
+            None
+        } else {
+            let specs: Vec<NativeToolSpec> = tools
+                .iter()
+                .filter_map(|t| {
+                    let func = t.get("function")?;
+                    Some(NativeToolSpec {
+                        kind: "function".to_string(),
+                        function: NativeToolFunctionSpec {
+                            name: func.get("name")?.as_str()?.to_string(),
+                            description: func
+                                .get("description")
+                                .and_then(|d| d.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            parameters: func
+                                .get("parameters")
+                                .cloned()
+                                .unwrap_or(serde_json::json!({})),
+                        },
+                    })
+                })
+                .collect();
+            if specs.is_empty() {
+                None
+            } else {
+                Some(specs)
+            }
+        };
+
+        // Convert ChatMessage to NativeMessage, preserving structured assistant/tool entries
+        // when history contains native tool-call metadata.
+        let native_messages = Self::convert_messages(messages);
+
+        let native_request = NativeChatRequest {
+            model: model.to_string(),
+            messages: native_messages,
+            temperature,
+            tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
+            tools: native_tools,
+        };
+
+        let response = self
+            .client
+            .post("https://openrouter.ai/api/v1/chat/completions")
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header(
+                "HTTP-Referer",
+                "https://github.com/theonlyhennygod/zeroclaw",
+            )
+            .header("X-Title", "ZeroClaw")
+            .json(&native_request)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(super::api_error("OpenRouter", response).await);
+        }
+
+        let native_response: NativeChatResponse = response.json().await?;
+        let message = native_response
+            .choices
+            .into_iter()
+            .next()
+            .map(|c| c.message)
+            .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))?;
+        Ok(Self::parse_native_response(message))
+    }
 }
 
 #[cfg(test)]
@@ -533,5 +617,99 @@ mod tests {
         let response: ApiChatResponse = serde_json::from_str(json).unwrap();
 
         assert!(response.choices.is_empty());
+    }
+
+    #[tokio::test]
+    async fn chat_with_tools_fails_without_key() {
+        let provider = OpenRouterProvider::new(None);
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "What is the date?".into(),
+        }];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "shell",
+                "description": "Run a shell command",
+                "parameters": {"type": "object", "properties": {"command": {"type": "string"}}}
+            }
+        })];
+
+        let result = provider
+            .chat_with_tools(&messages, &tools, "deepseek/deepseek-chat", 0.5)
+            .await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("API key not set"));
+    }
+
+    #[test]
+    fn native_response_deserializes_with_tool_calls() {
+        let json = r#"{
+            "choices":[{
+                "message":{
+                    "content":null,
+                    "tool_calls":[
+                        {"id":"call_123","type":"function","function":{"name":"get_price","arguments":"{\"symbol\":\"BTC\"}"}}
+                    ]
+                }
+            }]
+        }"#;
+
+        let response: NativeChatResponse = serde_json::from_str(json).unwrap();
+
+        assert_eq!(response.choices.len(), 1);
+        let message = &response.choices[0].message;
+        assert!(message.content.is_none());
+        let tool_calls = message.tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id.as_deref(), Some("call_123"));
+        assert_eq!(tool_calls[0].function.name, "get_price");
+        assert_eq!(tool_calls[0].function.arguments, "{\"symbol\":\"BTC\"}");
+    }
+
+    #[test]
+    fn native_response_deserializes_with_text_and_tool_calls() {
+        let json = r#"{
+            "choices":[{
+                "message":{
+                    "content":"I'll get that for you.",
+                    "tool_calls":[
+                        {"id":"call_456","type":"function","function":{"name":"shell","arguments":"{\"command\":\"date\"}"}}
+                    ]
+                }
+            }]
+        }"#;
+
+        let response: NativeChatResponse = serde_json::from_str(json).unwrap();
+
+        assert_eq!(response.choices.len(), 1);
+        let message = &response.choices[0].message;
+        assert_eq!(message.content.as_deref(), Some("I'll get that for you."));
+        let tool_calls = message.tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].function.name, "shell");
+    }
+
+    #[test]
+    fn parse_native_response_converts_to_chat_response() {
+        let message = NativeResponseMessage {
+            content: Some("Here you go.".into()),
+            tool_calls: Some(vec![NativeToolCall {
+                id: Some("call_789".into()),
+                kind: Some("function".into()),
+                function: NativeFunctionCall {
+                    name: "file_read".into(),
+                    arguments: r#"{"path":"test.txt"}"#.into(),
+                },
+            }]),
+        };
+
+        let response = OpenRouterProvider::parse_native_response(message);
+
+        assert_eq!(response.text.as_deref(), Some("Here you go."));
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].id, "call_789");
+        assert_eq!(response.tool_calls[0].name, "file_read");
     }
 }

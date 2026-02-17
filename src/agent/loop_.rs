@@ -27,6 +27,23 @@ const COMPACTION_MAX_SOURCE_CHARS: usize = 12_000;
 /// Max characters retained in stored compaction summary.
 const COMPACTION_MAX_SUMMARY_CHARS: usize = 2_000;
 
+/// Convert a tool registry to OpenAI function-calling format for native tool support.
+fn tools_to_openai_format(tools_registry: &[Box<dyn Tool>]) -> Vec<serde_json::Value> {
+    tools_registry
+        .iter()
+        .map(|tool| {
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": tool.name(),
+                    "description": tool.description(),
+                    "parameters": tool.parameters_schema()
+                }
+            })
+        })
+        .collect()
+}
+
 fn autosave_memory_key(prefix: &str) -> String {
     format!("{prefix}_{}", Uuid::new_v4())
 }
@@ -454,6 +471,14 @@ pub(crate) async fn run_tool_call_loop(
     temperature: f64,
     silent: bool,
 ) -> Result<String> {
+    // Build native tool definitions once if the provider supports them.
+    let use_native_tools = provider.supports_native_tools() && !tools_registry.is_empty();
+    let tool_definitions = if use_native_tools {
+        tools_to_openai_format(tools_registry)
+    } else {
+        Vec::new()
+    };
+
     for _iteration in 0..MAX_TOOL_ITERATIONS {
         observer.record_event(&ObserverEvent::LlmRequest {
             provider: provider_name.to_string(),
@@ -462,49 +487,95 @@ pub(crate) async fn run_tool_call_loop(
         });
 
         let llm_started_at = Instant::now();
-        let response = match provider
-            .chat_with_history(history, model, temperature)
-            .await
-        {
-            Ok(resp) => {
-                observer.record_event(&ObserverEvent::LlmResponse {
-                    provider: provider_name.to_string(),
-                    model: model.to_string(),
-                    duration: llm_started_at.elapsed(),
-                    success: true,
-                    error_message: None,
-                });
-                resp
+
+        // Choose between native tool-call API and prompt-based tool use.
+        let (response_text, parsed_text, tool_calls, assistant_history_content) = if use_native_tools {
+            match provider
+                .chat_with_tools(history, &tool_definitions, model, temperature)
+                .await
+            {
+                Ok(resp) => {
+                    observer.record_event(&ObserverEvent::LlmResponse {
+                        provider: provider_name.to_string(),
+                        model: model.to_string(),
+                        duration: llm_started_at.elapsed(),
+                        success: true,
+                        error_message: None,
+                    });
+                    let response_text = resp.text_or_empty().to_string();
+                    let mut calls = parse_structured_tool_calls(&resp.tool_calls);
+                    let mut parsed_text = String::new();
+
+                    if calls.is_empty() {
+                        let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
+                        if !fallback_text.is_empty() {
+                            parsed_text = fallback_text;
+                        }
+                        calls = fallback_calls;
+                    }
+
+                    let assistant_history_content = if resp.tool_calls.is_empty() {
+                        response_text.clone()
+                    } else {
+                        build_assistant_history_with_tool_calls(&response_text, &resp.tool_calls)
+                    };
+
+                    (response_text, parsed_text, calls, assistant_history_content)
+                }
+                Err(e) => {
+                    observer.record_event(&ObserverEvent::LlmResponse {
+                        provider: provider_name.to_string(),
+                        model: model.to_string(),
+                        duration: llm_started_at.elapsed(),
+                        success: false,
+                        error_message: Some(crate::providers::sanitize_api_error(&e.to_string())),
+                    });
+                    return Err(e);
+                }
             }
-            Err(e) => {
-                observer.record_event(&ObserverEvent::LlmResponse {
-                    provider: provider_name.to_string(),
-                    model: model.to_string(),
-                    duration: llm_started_at.elapsed(),
-                    success: false,
-                    error_message: Some(crate::providers::sanitize_api_error(&e.to_string())),
-                });
-                return Err(e);
+        } else {
+            match provider.chat_with_history(history, model, temperature).await {
+                Ok(resp) => {
+                    observer.record_event(&ObserverEvent::LlmResponse {
+                        provider: provider_name.to_string(),
+                        model: model.to_string(),
+                        duration: llm_started_at.elapsed(),
+                        success: true,
+                        error_message: None,
+                    });
+                    let response_text = resp;
+                    let assistant_history_content = response_text.clone();
+                    let (parsed_text, calls) = parse_tool_calls(&response_text);
+                    (response_text, parsed_text, calls, assistant_history_content)
+                }
+                Err(e) => {
+                    observer.record_event(&ObserverEvent::LlmResponse {
+                        provider: provider_name.to_string(),
+                        model: model.to_string(),
+                        duration: llm_started_at.elapsed(),
+                        success: false,
+                        error_message: Some(crate::providers::sanitize_api_error(&e.to_string())),
+                    });
+                    return Err(e);
+                }
             }
         };
 
-        let response_text = response;
-        let assistant_history_content = response_text.clone();
-        let (parsed_text, tool_calls) = parse_tool_calls(&response_text);
+        let display_text = if parsed_text.is_empty() {
+            response_text.clone()
+        } else {
+            parsed_text
+        };
 
         if tool_calls.is_empty() {
             // No tool calls — this is the final response
             history.push(ChatMessage::assistant(response_text.clone()));
-            return Ok(if parsed_text.is_empty() {
-                response_text
-            } else {
-                parsed_text
-            });
+            return Ok(display_text);
         }
 
         // Print any text the LLM produced alongside tool calls (unless silent)
-        if !silent && !parsed_text.is_empty() {
-            print!("{parsed_text}");
+        if !silent && !display_text.is_empty() {
+            print!("{display_text}");
             let _ = std::io::stdout().flush();
         }
 
@@ -550,7 +621,7 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         // Add assistant message with tool calls + tool results to history
-        history.push(ChatMessage::assistant(assistant_history_content.clone()));
+        history.push(ChatMessage::assistant(assistant_history_content));
         history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
     }
 
@@ -1307,6 +1378,32 @@ I will now call the tool with this payload:
         assert!(instructions.contains("shell"));
         assert!(instructions.contains("file_read"));
         assert!(instructions.contains("file_write"));
+    }
+
+    #[test]
+    fn tools_to_openai_format_produces_valid_schema() {
+        use crate::security::SecurityPolicy;
+        let security = Arc::new(SecurityPolicy::from_config(
+            &crate::config::AutonomyConfig::default(),
+            std::path::Path::new("/tmp"),
+        ));
+        let tools = tools::default_tools(security);
+        let formatted = tools_to_openai_format(&tools);
+
+        assert!(!formatted.is_empty());
+        for tool_json in &formatted {
+            assert_eq!(tool_json["type"], "function");
+            assert!(tool_json["function"]["name"].is_string());
+            assert!(tool_json["function"]["description"].is_string());
+            assert!(!tool_json["function"]["name"].as_str().unwrap().is_empty());
+        }
+        // Verify known tools are present
+        let names: Vec<&str> = formatted
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str())
+            .collect();
+        assert!(names.contains(&"shell"));
+        assert!(names.contains(&"file_read"));
     }
 
     #[test]
