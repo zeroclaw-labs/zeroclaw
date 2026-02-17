@@ -94,10 +94,14 @@ impl Tool for HardwareMemoryReadTool {
             .get("address")
             .and_then(|v| v.as_str())
             .unwrap_or("0x20000000");
+        #[allow(unused_variables)]
         let address = parse_hex_address(address_str).unwrap_or(NUCLEO_RAM_BASE);
 
-        let length = args.get("length").and_then(|v| v.as_u64()).unwrap_or(128) as usize;
-        let length = length.min(256).max(1);
+        let _length: usize = args
+            .get("length")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(64)
+            .clamp(1, 256) as usize;
 
         #[cfg(feature = "probe")]
         {

@@ -76,7 +76,7 @@ impl SerialTransport {
         let mut port = self.port.lock().await;
         let resp = tokio::time::timeout(
             std::time::Duration::from_secs(SERIAL_TIMEOUT_SECS),
-            send_request(&mut *port, cmd, args),
+            send_request(&mut port, cmd, args),
         )
         .await
         .map_err(|_| {
@@ -112,7 +112,7 @@ pub struct SerialPeripheral {
 
 impl SerialPeripheral {
     /// Create and connect to a serial peripheral.
-    pub async fn connect(config: &PeripheralBoardConfig) -> anyhow::Result<Self> {
+    pub fn connect(config: &PeripheralBoardConfig) -> anyhow::Result<Self> {
         let path = config
             .path
             .as_deref()

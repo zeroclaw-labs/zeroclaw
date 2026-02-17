@@ -55,10 +55,13 @@ pub fn ensure_arduino_cli() -> Result<()> {
         anyhow::bail!("arduino-cli not installed.");
     }
 
+    #[cfg(target_os = "macos")]
     if !arduino_cli_available() {
         anyhow::bail!("arduino-cli still not found after install. Ensure it's in PATH.");
     }
-    Ok(())
+    #[cfg(not(target_os = "macos"))]
+    #[allow(unreachable_code)]
+    return Ok(());
 }
 
 /// Ensure arduino:avr core is installed.

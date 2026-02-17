@@ -91,7 +91,7 @@ pub fn handle_command(cmd: crate::PeripheralCommands, config: &Config) -> Result
                 board: board.clone(),
                 transport: transport.to_string(),
                 path: path_opt,
-                baud: 115200,
+                baud: 115_200,
             });
             cfg.save()?;
             println!("Added {} at {}. Restart daemon to apply.", board, path);
@@ -179,7 +179,7 @@ pub async fn create_peripheral_tools(config: &PeripheralsConfig) -> Result<Vec<B
             continue;
         }
 
-        match serial::SerialPeripheral::connect(board).await {
+        match serial::SerialPeripheral::connect(board) {
             Ok(peripheral) => {
                 let mut p = peripheral;
                 if p.connect().await.is_err() {

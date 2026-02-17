@@ -2206,13 +2206,13 @@ fn setup_memory() -> Result<MemoryConfig> {
     let backend = backend_key_from_choice(choice);
     let profile = memory_backend_profile(backend);
 
-    let auto_save = if !profile.auto_save_default {
-        false
-    } else {
+    let auto_save = if profile.auto_save_default {
         Confirm::new()
             .with_prompt("  Auto-save conversations to memory?")
             .default(true)
             .interact()?
+    } else {
+        false
     };
 
     println!(

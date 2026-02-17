@@ -127,6 +127,7 @@ pub enum HardwareTransport {
     Probe,
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for HardwareTransport {
     fn default() -> Self {
         Self::None
@@ -168,7 +169,7 @@ pub struct HardwareConfig {
 }
 
 fn default_baud_rate() -> u32 {
-    115200
+    115_200
 }
 
 impl HardwareConfig {
@@ -402,7 +403,7 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
 
 // ── Peripherals (hardware: STM32, RPi GPIO, etc.) ────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PeripheralsConfig {
     /// Enable peripheral support (boards become agent tools)
     #[serde(default)]
@@ -436,17 +437,7 @@ fn default_peripheral_transport() -> String {
 }
 
 fn default_peripheral_baud() -> u32 {
-    115200
-}
-
-impl Default for PeripheralsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            boards: Vec::new(),
-            datasheet_dir: None,
-        }
-    }
+    115_200
 }
 
 impl Default for PeripheralBoardConfig {
@@ -705,6 +696,7 @@ fn default_http_timeout_secs() -> u64 {
 // ── Memory ───────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct MemoryConfig {
     /// "sqlite" | "lucid" | "markdown" | "none" (`none` = explicit no-op memory)
     pub backend: String,
@@ -1810,7 +1802,6 @@ fn sync_directory(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use tempfile::TempDir;
 
     // ── Defaults ─────────────────────────────────────────────
 
@@ -2893,7 +2884,7 @@ default_temperature = 0.7
         assert!(b.board.is_empty());
         assert_eq!(b.transport, "serial");
         assert!(b.path.is_none());
-        assert_eq!(b.baud, 115200);
+        assert_eq!(b.baud, 115_200);
     }
 
     #[test]
@@ -2904,7 +2895,7 @@ default_temperature = 0.7
                 board: "nucleo-f401re".into(),
                 transport: "serial".into(),
                 path: Some("/dev/ttyACM0".into()),
-                baud: 115200,
+                baud: 115_200,
             }],
             datasheet_dir: None,
         };
