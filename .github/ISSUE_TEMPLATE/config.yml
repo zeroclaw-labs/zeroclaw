@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability report
+    url: https://github.com/zeroclaw-labs/zeroclaw/security/policy
+    about: Please report security vulnerabilities privately via SECURITY.md policy.
+  - name: Contribution guide
+    url: https://github.com/zeroclaw-labs/zeroclaw/blob/main/CONTRIBUTING.md
+    about: Please read contribution and PR requirements before opening an issue.
+  - name: PR workflow & reviewer expectations
+    url: https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/pr-workflow.md
+    about: Read risk-based PR tracks, CI gates, and merge criteria before filing feature requests.

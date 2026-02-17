@@ -1,0 +1,12 @@
+workspace_dir = "/zeroclaw-data/workspace"
+config_path = "/zeroclaw-data/.zeroclaw/config.toml"
+# This is the Ollama Base URL, not a secret key
+api_key = "http://host.docker.internal:11434"
+default_provider = "ollama"
+default_model = "llama3.2"
+default_temperature = 0.7
+
+[gateway]
+port = 3000
+host = "[::]"
+allow_public_bind = true

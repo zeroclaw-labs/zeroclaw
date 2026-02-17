@@ -3,9 +3,10 @@ use super::traits::{Memory, MemoryCategory, MemoryEntry};
 use super::vector;
 use async_trait::async_trait;
 use chrono::Local;
+use parking_lot::Mutex;
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// SQLite-backed persistent memory — the brain
@@ -50,6 +51,21 @@ impl SqliteMemory {
         }
 
         let conn = Connection::open(&db_path)?;
+
+        // ── Production-grade PRAGMA tuning ──────────────────────
+        // WAL mode: concurrent reads during writes, crash-safe
+        // normal sync: 2× write speed, still durable on WAL
+        // mmap 8 MB: let the OS page-cache serve hot reads
+        // cache 2 MB: keep ~500 hot pages in-process
+        // temp_store memory: temp tables never hit disk
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous  = NORMAL;
+             PRAGMA mmap_size    = 8388608;
+             PRAGMA cache_size   = -2000;
+             PRAGMA temp_store   = MEMORY;",
+        )?;
+
         Self::init_schema(&conn)?;
 
         Ok(Self {
@@ -108,6 +124,19 @@ impl SqliteMemory {
             );
             CREATE INDEX IF NOT EXISTS idx_cache_accessed ON embedding_cache(accessed_at);",
         )?;
+
+        // Migration: add session_id column if not present (safe to run repeatedly)
+        let has_session_id: bool = conn
+            .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='memories'")?
+            .query_row([], |row| row.get::<_, String>(0))?
+            .contains("session_id");
+        if !has_session_id {
+            conn.execute_batch(
+                "ALTER TABLE memories ADD COLUMN session_id TEXT;
+                 CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id);",
+            )?;
+        }
+
         Ok(())
     }
 
@@ -129,13 +158,21 @@ impl SqliteMemory {
         }
     }
 
-    /// Simple content hash for embedding cache
+    /// Deterministic content hash for embedding cache.
+    /// Uses SHA-256 (truncated) instead of DefaultHasher, which is
+    /// explicitly documented as unstable across Rust versions.
     fn content_hash(text: &str) -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        text.hash(&mut hasher);
-        format!("{:016x}", hasher.finish())
+        use sha2::{Digest, Sha256};
+        let hash = Sha256::digest(text.as_bytes());
+        // First 8 bytes → 16 hex chars, matching previous format length
+        format!(
+            "{:016x}",
+            u64::from_be_bytes(
+                hash[..8]
+                    .try_into()
+                    .expect("SHA-256 always produces >= 8 bytes")
+            )
+        )
     }
 
     /// Get embedding from cache, or compute + cache it
@@ -149,10 +186,7 @@ impl SqliteMemory {
 
         // Check cache
         {
-            let conn = self
-                .conn
-                .lock()
-                .map_err(|e| anyhow::anyhow!("Lock error: {e}"))?;
+            let conn = self.conn.lock();
 
             let mut stmt =
                 conn.prepare("SELECT embedding FROM embedding_cache WHERE content_hash = ?1")?;
@@ -174,10 +208,7 @@ impl SqliteMemory {
 
         // Store in cache + LRU eviction
         {
-            let conn = self
-                .conn
-                .lock()
-                .map_err(|e| anyhow::anyhow!("Lock error: {e}"))?;
+            let conn = self.conn.lock();
 
             conn.execute(
                 "INSERT OR REPLACE INTO embedding_cache (content_hash, embedding, created_at, accessed_at)
@@ -279,10 +310,7 @@ impl SqliteMemory {
     pub async fn reindex(&self) -> anyhow::Result<usize> {
         // Step 1: Rebuild FTS5
         {
-            let conn = self
-                .conn
-                .lock()
-                .map_err(|e| anyhow::anyhow!("Lock error: {e}"))?;
+            let conn = self.conn.lock();
 
             conn.execute_batch("INSERT INTO memories_fts(memories_fts) VALUES('rebuild');")?;
         }
@@ -293,10 +321,7 @@ impl SqliteMemory {
         }
 
         let entries: Vec<(String, String)> = {
-            let conn = self
-                .conn
-                .lock()
-                .map_err(|e| anyhow::anyhow!("Lock error: {e}"))?;
+            let conn = self.conn.lock();
 
             let mut stmt =
                 conn.prepare("SELECT id, content FROM memories WHERE embedding IS NULL")?;
@@ -310,10 +335,7 @@ impl SqliteMemory {
         for (id, content) in &entries {
             if let Ok(Some(emb)) = self.get_or_compute_embedding(content).await {
                 let bytes = vector::vec_to_bytes(&emb);
-                let conn = self
-                    .conn
-                    .lock()
-                    .map_err(|e| anyhow::anyhow!("Lock error: {e}"))?;
+                let conn = self.conn.lock();
                 conn.execute(
                     "UPDATE memories SET embedding = ?1 WHERE id = ?2",
                     params![bytes, id],
@@ -337,6 +359,7 @@ impl Memory for SqliteMemory {
         key: &str,
         content: &str,
         category: MemoryCategory,
+        session_id: Option<&str>,
     ) -> anyhow::Result<()> {
         // Compute embedding (async, before lock)
         let embedding_bytes = self
@@ -344,29 +367,32 @@ impl Memory for SqliteMemory {
             .await?
             .map(|emb| vector::vec_to_bytes(&emb));
 
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock error: {e}"))?;
+        let conn = self.conn.lock();
         let now = Local::now().to_rfc3339();
         let cat = Self::category_to_str(&category);
         let id = Uuid::new_v4().to_string();
 
         conn.execute(
-            "INSERT INTO memories (id, key, content, category, embedding, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO memories (id, key, content, category, embedding, created_at, updated_at, session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(key) DO UPDATE SET
                 content = excluded.content,
                 category = excluded.category,
                 embedding = excluded.embedding,
-                updated_at = excluded.updated_at",
-            params![id, key, content, cat, embedding_bytes, now, now],
+                updated_at = excluded.updated_at,
+                session_id = excluded.session_id",
+            params![id, key, content, cat, embedding_bytes, now, now, session_id],
         )?;
 
         Ok(())
     }
 
-    async fn recall(&self, query: &str, limit: usize) -> anyhow::Result<Vec<MemoryEntry>> {
+    async fn recall(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
         if query.trim().is_empty() {
             return Ok(Vec::new());
         }
@@ -374,10 +400,7 @@ impl Memory for SqliteMemory {
         // Compute query embedding (async, before lock)
         let query_embedding = self.get_or_compute_embedding(query).await?;
 
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock error: {e}"))?;
+        let conn = self.conn.lock();
 
         // FTS5 BM25 keyword search
         let keyword_results = Self::fts5_search(&conn, query, limit * 2).unwrap_or_default();
@@ -415,7 +438,7 @@ impl Memory for SqliteMemory {
         let mut results = Vec::new();
         for scored in &merged {
             let mut stmt = conn.prepare(
-                "SELECT id, key, content, category, created_at FROM memories WHERE id = ?1",
+                "SELECT id, key, content, category, created_at, session_id FROM memories WHERE id = ?1",
             )?;
             if let Ok(entry) = stmt.query_row(params![scored.id], |row| {
                 Ok(MemoryEntry {
@@ -424,10 +447,16 @@ impl Memory for SqliteMemory {
                     content: row.get(2)?,
                     category: Self::str_to_category(&row.get::<_, String>(3)?),
                     timestamp: row.get(4)?,
-                    session_id: None,
+                    session_id: row.get(5)?,
                     score: Some(f64::from(scored.final_score)),
                 })
             }) {
+                // Filter by session_id if requested
+                if let Some(sid) = session_id {
+                    if entry.session_id.as_deref() != Some(sid) {
+                        continue;
+                    }
+                }
                 results.push(entry);
             }
         }
@@ -446,7 +475,7 @@ impl Memory for SqliteMemory {
                     .collect();
                 let where_clause = conditions.join(" OR ");
                 let sql = format!(
-                    "SELECT id, key, content, category, created_at FROM memories
+                    "SELECT id, key, content, category, created_at, session_id FROM memories
                      WHERE {where_clause}
                      ORDER BY updated_at DESC
                      LIMIT ?{}",
@@ -469,12 +498,18 @@ impl Memory for SqliteMemory {
                         content: row.get(2)?,
                         category: Self::str_to_category(&row.get::<_, String>(3)?),
                         timestamp: row.get(4)?,
-                        session_id: None,
+                        session_id: row.get(5)?,
                         score: Some(1.0),
                     })
                 })?;
                 for row in rows {
-                    results.push(row?);
+                    let entry = row?;
+                    if let Some(sid) = session_id {
+                        if entry.session_id.as_deref() != Some(sid) {
+                            continue;
+                        }
+                    }
+                    results.push(entry);
                 }
             }
         }
@@ -484,13 +519,10 @@ impl Memory for SqliteMemory {
     }
 
     async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock error: {e}"))?;
+        let conn = self.conn.lock();
 
         let mut stmt = conn.prepare(
-            "SELECT id, key, content, category, created_at FROM memories WHERE key = ?1",
+            "SELECT id, key, content, category, created_at, session_id FROM memories WHERE key = ?1",
         )?;
 
         let mut rows = stmt.query_map(params![key], |row| {
@@ -500,7 +532,7 @@ impl Memory for SqliteMemory {
                 content: row.get(2)?,
                 category: Self::str_to_category(&row.get::<_, String>(3)?),
                 timestamp: row.get(4)?,
-                session_id: None,
+                session_id: row.get(5)?,
                 score: None,
             })
         })?;
@@ -511,11 +543,12 @@ impl Memory for SqliteMemory {
         }
     }
 
-    async fn list(&self, category: Option<&MemoryCategory>) -> anyhow::Result<Vec<MemoryEntry>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock error: {e}"))?;
+    async fn list(
+        &self,
+        category: Option<&MemoryCategory>,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let conn = self.conn.lock();
 
         let mut results = Vec::new();
 
@@ -526,7 +559,7 @@ impl Memory for SqliteMemory {
                 content: row.get(2)?,
                 category: Self::str_to_category(&row.get::<_, String>(3)?),
                 timestamp: row.get(4)?,
-                session_id: None,
+                session_id: row.get(5)?,
                 score: None,
             })
         };
@@ -534,21 +567,33 @@ impl Memory for SqliteMemory {
         if let Some(cat) = category {
             let cat_str = Self::category_to_str(cat);
             let mut stmt = conn.prepare(
-                "SELECT id, key, content, category, created_at FROM memories
+                "SELECT id, key, content, category, created_at, session_id FROM memories
                  WHERE category = ?1 ORDER BY updated_at DESC",
             )?;
             let rows = stmt.query_map(params![cat_str], row_mapper)?;
             for row in rows {
-                results.push(row?);
+                let entry = row?;
+                if let Some(sid) = session_id {
+                    if entry.session_id.as_deref() != Some(sid) {
+                        continue;
+                    }
+                }
+                results.push(entry);
             }
         } else {
             let mut stmt = conn.prepare(
-                "SELECT id, key, content, category, created_at FROM memories
+                "SELECT id, key, content, category, created_at, session_id FROM memories
                  ORDER BY updated_at DESC",
             )?;
             let rows = stmt.query_map([], row_mapper)?;
             for row in rows {
-                results.push(row?);
+                let entry = row?;
+                if let Some(sid) = session_id {
+                    if entry.session_id.as_deref() != Some(sid) {
+                        continue;
+                    }
+                }
+                results.push(entry);
             }
         }
 
@@ -556,29 +601,20 @@ impl Memory for SqliteMemory {
     }
 
     async fn forget(&self, key: &str) -> anyhow::Result<bool> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock error: {e}"))?;
+        let conn = self.conn.lock();
         let affected = conn.execute("DELETE FROM memories WHERE key = ?1", params![key])?;
         Ok(affected > 0)
     }
 
     async fn count(&self) -> anyhow::Result<usize> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock error: {e}"))?;
+        let conn = self.conn.lock();
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))?;
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         Ok(count as usize)
     }
 
     async fn health_check(&self) -> bool {
-        self.conn
-            .lock()
-            .map(|c| c.execute_batch("SELECT 1").is_ok())
-            .unwrap_or(false)
+        self.conn.lock().execute_batch("SELECT 1").is_ok()
     }
 }
 
@@ -608,7 +644,7 @@ mod tests {
     #[tokio::test]
     async fn sqlite_store_and_get() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("user_lang", "Prefers Rust", MemoryCategory::Core)
+        mem.store("user_lang", "Prefers Rust", MemoryCategory::Core, None)
             .await
             .unwrap();
 
@@ -623,10 +659,10 @@ mod tests {
     #[tokio::test]
     async fn sqlite_store_upsert() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("pref", "likes Rust", MemoryCategory::Core)
+        mem.store("pref", "likes Rust", MemoryCategory::Core, None)
             .await
             .unwrap();
-        mem.store("pref", "loves Rust", MemoryCategory::Core)
+        mem.store("pref", "loves Rust", MemoryCategory::Core, None)
             .await
             .unwrap();
 
@@ -638,17 +674,22 @@ mod tests {
     #[tokio::test]
     async fn sqlite_recall_keyword() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("a", "Rust is fast and safe", MemoryCategory::Core)
+        mem.store("a", "Rust is fast and safe", MemoryCategory::Core, None)
             .await
             .unwrap();
-        mem.store("b", "Python is interpreted", MemoryCategory::Core)
+        mem.store("b", "Python is interpreted", MemoryCategory::Core, None)
             .await
             .unwrap();
-        mem.store("c", "Rust has zero-cost abstractions", MemoryCategory::Core)
-            .await
-            .unwrap();
+        mem.store(
+            "c",
+            "Rust has zero-cost abstractions",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
 
-        let results = mem.recall("Rust", 10).await.unwrap();
+        let results = mem.recall("Rust", 10, None).await.unwrap();
         assert_eq!(results.len(), 2);
         assert!(results
             .iter()
@@ -658,14 +699,14 @@ mod tests {
     #[tokio::test]
     async fn sqlite_recall_multi_keyword() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("a", "Rust is fast", MemoryCategory::Core)
+        mem.store("a", "Rust is fast", MemoryCategory::Core, None)
             .await
             .unwrap();
-        mem.store("b", "Rust is safe and fast", MemoryCategory::Core)
+        mem.store("b", "Rust is safe and fast", MemoryCategory::Core, None)
             .await
             .unwrap();
 
-        let results = mem.recall("fast safe", 10).await.unwrap();
+        let results = mem.recall("fast safe", 10, None).await.unwrap();
         assert!(!results.is_empty());
         // Entry with both keywords should score higher
         assert!(results[0].content.contains("safe") && results[0].content.contains("fast"));
@@ -674,17 +715,17 @@ mod tests {
     #[tokio::test]
     async fn sqlite_recall_no_match() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("a", "Rust rocks", MemoryCategory::Core)
+        mem.store("a", "Rust rocks", MemoryCategory::Core, None)
             .await
             .unwrap();
-        let results = mem.recall("javascript", 10).await.unwrap();
+        let results = mem.recall("javascript", 10, None).await.unwrap();
         assert!(results.is_empty());
     }
 
     #[tokio::test]
     async fn sqlite_forget() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("temp", "temporary data", MemoryCategory::Conversation)
+        mem.store("temp", "temporary data", MemoryCategory::Conversation, None)
             .await
             .unwrap();
         assert_eq!(mem.count().await.unwrap(), 1);
@@ -704,29 +745,37 @@ mod tests {
     #[tokio::test]
     async fn sqlite_list_all() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("a", "one", MemoryCategory::Core).await.unwrap();
-        mem.store("b", "two", MemoryCategory::Daily).await.unwrap();
-        mem.store("c", "three", MemoryCategory::Conversation)
+        mem.store("a", "one", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("b", "two", MemoryCategory::Daily, None)
+            .await
+            .unwrap();
+        mem.store("c", "three", MemoryCategory::Conversation, None)
             .await
             .unwrap();
 
-        let all = mem.list(None).await.unwrap();
+        let all = mem.list(None, None).await.unwrap();
         assert_eq!(all.len(), 3);
     }
 
     #[tokio::test]
     async fn sqlite_list_by_category() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("a", "core1", MemoryCategory::Core).await.unwrap();
-        mem.store("b", "core2", MemoryCategory::Core).await.unwrap();
-        mem.store("c", "daily1", MemoryCategory::Daily)
+        mem.store("a", "core1", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("b", "core2", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("c", "daily1", MemoryCategory::Daily, None)
             .await
             .unwrap();
 
-        let core = mem.list(Some(&MemoryCategory::Core)).await.unwrap();
+        let core = mem.list(Some(&MemoryCategory::Core), None).await.unwrap();
         assert_eq!(core.len(), 2);
 
-        let daily = mem.list(Some(&MemoryCategory::Daily)).await.unwrap();
+        let daily = mem.list(Some(&MemoryCategory::Daily), None).await.unwrap();
         assert_eq!(daily.len(), 1);
     }
 
@@ -748,7 +797,7 @@ mod tests {
 
         {
             let mem = SqliteMemory::new(tmp.path()).unwrap();
-            mem.store("persist", "I survive restarts", MemoryCategory::Core)
+            mem.store("persist", "I survive restarts", MemoryCategory::Core, None)
                 .await
                 .unwrap();
         }
@@ -771,7 +820,7 @@ mod tests {
         ];
 
         for (i, cat) in categories.iter().enumerate() {
-            mem.store(&format!("k{i}"), &format!("v{i}"), cat.clone())
+            mem.store(&format!("k{i}"), &format!("v{i}"), cat.clone(), None)
                 .await
                 .unwrap();
         }
@@ -791,21 +840,28 @@ mod tests {
             "a",
             "Rust is a systems programming language",
             MemoryCategory::Core,
+            None,
         )
         .await
         .unwrap();
-        mem.store("b", "Python is great for scripting", MemoryCategory::Core)
-            .await
-            .unwrap();
+        mem.store(
+            "b",
+            "Python is great for scripting",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
         mem.store(
             "c",
             "Rust and Rust and Rust everywhere",
             MemoryCategory::Core,
+            None,
         )
         .await
         .unwrap();
 
-        let results = mem.recall("Rust", 10).await.unwrap();
+        let results = mem.recall("Rust", 10, None).await.unwrap();
         assert!(results.len() >= 2);
         // All results should contain "Rust"
         for r in &results {
@@ -820,17 +876,17 @@ mod tests {
     #[tokio::test]
     async fn fts5_multi_word_query() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("a", "The quick brown fox jumps", MemoryCategory::Core)
+        mem.store("a", "The quick brown fox jumps", MemoryCategory::Core, None)
             .await
             .unwrap();
-        mem.store("b", "A lazy dog sleeps", MemoryCategory::Core)
+        mem.store("b", "A lazy dog sleeps", MemoryCategory::Core, None)
             .await
             .unwrap();
-        mem.store("c", "The quick dog runs fast", MemoryCategory::Core)
+        mem.store("c", "The quick dog runs fast", MemoryCategory::Core, None)
             .await
             .unwrap();
 
-        let results = mem.recall("quick dog", 10).await.unwrap();
+        let results = mem.recall("quick dog", 10, None).await.unwrap();
         assert!(!results.is_empty());
         // "The quick dog runs fast" matches both terms
         assert!(results[0].content.contains("quick"));
@@ -839,16 +895,20 @@ mod tests {
     #[tokio::test]
     async fn recall_empty_query_returns_empty() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("a", "data", MemoryCategory::Core).await.unwrap();
-        let results = mem.recall("", 10).await.unwrap();
+        mem.store("a", "data", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let results = mem.recall("", 10, None).await.unwrap();
         assert!(results.is_empty());
     }
 
     #[tokio::test]
     async fn recall_whitespace_query_returns_empty() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("a", "data", MemoryCategory::Core).await.unwrap();
-        let results = mem.recall("   ", 10).await.unwrap();
+        mem.store("a", "data", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let results = mem.recall("   ", 10, None).await.unwrap();
         assert!(results.is_empty());
     }
 
@@ -873,7 +933,7 @@ mod tests {
     #[tokio::test]
     async fn schema_has_fts5_table() {
         let (_tmp, mem) = temp_sqlite();
-        let conn = mem.conn.lock().unwrap();
+        let conn = mem.conn.lock();
         // FTS5 table should exist
         let count: i64 = conn
             .query_row(
@@ -888,7 +948,7 @@ mod tests {
     #[tokio::test]
     async fn schema_has_embedding_cache() {
         let (_tmp, mem) = temp_sqlite();
-        let conn = mem.conn.lock().unwrap();
+        let conn = mem.conn.lock();
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='embedding_cache'",
@@ -902,7 +962,7 @@ mod tests {
     #[tokio::test]
     async fn schema_memories_has_embedding_column() {
         let (_tmp, mem) = temp_sqlite();
-        let conn = mem.conn.lock().unwrap();
+        let conn = mem.conn.lock();
         // Check that embedding column exists by querying it
         let result = conn.execute_batch("SELECT embedding FROM memories LIMIT 0");
         assert!(result.is_ok());
@@ -913,11 +973,16 @@ mod tests {
     #[tokio::test]
     async fn fts5_syncs_on_insert() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("test_key", "unique_searchterm_xyz", MemoryCategory::Core)
-            .await
-            .unwrap();
+        mem.store(
+            "test_key",
+            "unique_searchterm_xyz",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
 
-        let conn = mem.conn.lock().unwrap();
+        let conn = mem.conn.lock();
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM memories_fts WHERE memories_fts MATCH '\"unique_searchterm_xyz\"'",
@@ -931,12 +996,17 @@ mod tests {
     #[tokio::test]
     async fn fts5_syncs_on_delete() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("del_key", "deletable_content_abc", MemoryCategory::Core)
-            .await
-            .unwrap();
+        mem.store(
+            "del_key",
+            "deletable_content_abc",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
         mem.forget("del_key").await.unwrap();
 
-        let conn = mem.conn.lock().unwrap();
+        let conn = mem.conn.lock();
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM memories_fts WHERE memories_fts MATCH '\"deletable_content_abc\"'",
@@ -950,14 +1020,19 @@ mod tests {
     #[tokio::test]
     async fn fts5_syncs_on_update() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("upd_key", "original_content_111", MemoryCategory::Core)
-            .await
-            .unwrap();
-        mem.store("upd_key", "updated_content_222", MemoryCategory::Core)
+        mem.store(
+            "upd_key",
+            "original_content_111",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store("upd_key", "updated_content_222", MemoryCategory::Core, None)
             .await
             .unwrap();
 
-        let conn = mem.conn.lock().unwrap();
+        let conn = mem.conn.lock();
         // Old content should not be findable
         let old: i64 = conn
             .query_row(
@@ -995,10 +1070,10 @@ mod tests {
     #[tokio::test]
     async fn reindex_rebuilds_fts() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("r1", "reindex test alpha", MemoryCategory::Core)
+        mem.store("r1", "reindex test alpha", MemoryCategory::Core, None)
             .await
             .unwrap();
-        mem.store("r2", "reindex test beta", MemoryCategory::Core)
+        mem.store("r2", "reindex test beta", MemoryCategory::Core, None)
             .await
             .unwrap();
 
@@ -1007,7 +1082,7 @@ mod tests {
         assert_eq!(count, 0);
 
         // FTS should still work after rebuild
-        let results = mem.recall("reindex", 10).await.unwrap();
+        let results = mem.recall("reindex", 10, None).await.unwrap();
         assert_eq!(results.len(), 2);
     }
 
@@ -1021,12 +1096,13 @@ mod tests {
                 &format!("k{i}"),
                 &format!("common keyword item {i}"),
                 MemoryCategory::Core,
+                None,
             )
             .await
             .unwrap();
         }
 
-        let results = mem.recall("common keyword", 5).await.unwrap();
+        let results = mem.recall("common keyword", 5, None).await.unwrap();
         assert!(results.len() <= 5);
     }
 
@@ -1035,11 +1111,11 @@ mod tests {
     #[tokio::test]
     async fn recall_results_have_scores() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("s1", "scored result test", MemoryCategory::Core)
+        mem.store("s1", "scored result test", MemoryCategory::Core, None)
             .await
             .unwrap();
 
-        let results = mem.recall("scored", 10).await.unwrap();
+        let results = mem.recall("scored", 10, None).await.unwrap();
         assert!(!results.is_empty());
         for r in &results {
             assert!(r.score.is_some(), "Expected score on result: {:?}", r.key);
@@ -1051,11 +1127,11 @@ mod tests {
     #[tokio::test]
     async fn recall_with_quotes_in_query() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("q1", "He said hello world", MemoryCategory::Core)
+        mem.store("q1", "He said hello world", MemoryCategory::Core, None)
             .await
             .unwrap();
         // Quotes in query should not crash FTS5
-        let results = mem.recall("\"hello\"", 10).await.unwrap();
+        let results = mem.recall("\"hello\"", 10, None).await.unwrap();
         // May or may not match depending on FTS5 escaping, but must not error
         assert!(results.len() <= 10);
     }
@@ -1063,31 +1139,34 @@ mod tests {
     #[tokio::test]
     async fn recall_with_asterisk_in_query() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("a1", "wildcard test content", MemoryCategory::Core)
+        mem.store("a1", "wildcard test content", MemoryCategory::Core, None)
             .await
             .unwrap();
-        let results = mem.recall("wild*", 10).await.unwrap();
+        let results = mem.recall("wild*", 10, None).await.unwrap();
         assert!(results.len() <= 10);
     }
 
     #[tokio::test]
     async fn recall_with_parentheses_in_query() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("p1", "function call test", MemoryCategory::Core)
+        mem.store("p1", "function call test", MemoryCategory::Core, None)
             .await
             .unwrap();
-        let results = mem.recall("function()", 10).await.unwrap();
+        let results = mem.recall("function()", 10, None).await.unwrap();
         assert!(results.len() <= 10);
     }
 
     #[tokio::test]
     async fn recall_with_sql_injection_attempt() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("safe", "normal content", MemoryCategory::Core)
+        mem.store("safe", "normal content", MemoryCategory::Core, None)
             .await
             .unwrap();
         // Should not crash or leak data
-        let results = mem.recall("'; DROP TABLE memories; --", 10).await.unwrap();
+        let results = mem
+            .recall("'; DROP TABLE memories; --", 10, None)
+            .await
+            .unwrap();
         assert!(results.len() <= 10);
         // Table should still exist
         assert_eq!(mem.count().await.unwrap(), 1);
@@ -1098,7 +1177,9 @@ mod tests {
     #[tokio::test]
     async fn store_empty_content() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("empty", "", MemoryCategory::Core).await.unwrap();
+        mem.store("empty", "", MemoryCategory::Core, None)
+            .await
+            .unwrap();
         let entry = mem.get("empty").await.unwrap().unwrap();
         assert_eq!(entry.content, "");
     }
@@ -1106,7 +1187,7 @@ mod tests {
     #[tokio::test]
     async fn store_empty_key() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("", "content for empty key", MemoryCategory::Core)
+        mem.store("", "content for empty key", MemoryCategory::Core, None)
             .await
             .unwrap();
         let entry = mem.get("").await.unwrap().unwrap();
@@ -1117,7 +1198,7 @@ mod tests {
     async fn store_very_long_content() {
         let (_tmp, mem) = temp_sqlite();
         let long_content = "x".repeat(100_000);
-        mem.store("long", &long_content, MemoryCategory::Core)
+        mem.store("long", &long_content, MemoryCategory::Core, None)
             .await
             .unwrap();
         let entry = mem.get("long").await.unwrap().unwrap();
@@ -1127,9 +1208,14 @@ mod tests {
     #[tokio::test]
     async fn store_unicode_and_emoji() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("emoji_key_🦀", "こんにちは 🚀 Ñoño", MemoryCategory::Core)
-            .await
-            .unwrap();
+        mem.store(
+            "emoji_key_🦀",
+            "こんにちは 🚀 Ñoño",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
         let entry = mem.get("emoji_key_🦀").await.unwrap().unwrap();
         assert_eq!(entry.content, "こんにちは 🚀 Ñoño");
     }
@@ -1138,7 +1224,7 @@ mod tests {
     async fn store_content_with_newlines_and_tabs() {
         let (_tmp, mem) = temp_sqlite();
         let content = "line1\nline2\ttab\rcarriage\n\nnewparagraph";
-        mem.store("whitespace", content, MemoryCategory::Core)
+        mem.store("whitespace", content, MemoryCategory::Core, None)
             .await
             .unwrap();
         let entry = mem.get("whitespace").await.unwrap().unwrap();
@@ -1150,11 +1236,11 @@ mod tests {
     #[tokio::test]
     async fn recall_single_character_query() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("a", "x marks the spot", MemoryCategory::Core)
+        mem.store("a", "x marks the spot", MemoryCategory::Core, None)
             .await
             .unwrap();
         // Single char may not match FTS5 but LIKE fallback should work
-        let results = mem.recall("x", 10).await.unwrap();
+        let results = mem.recall("x", 10, None).await.unwrap();
         // Should not crash; may or may not find results
         assert!(results.len() <= 10);
     }
@@ -1162,23 +1248,23 @@ mod tests {
     #[tokio::test]
     async fn recall_limit_zero() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("a", "some content", MemoryCategory::Core)
+        mem.store("a", "some content", MemoryCategory::Core, None)
             .await
             .unwrap();
-        let results = mem.recall("some", 0).await.unwrap();
+        let results = mem.recall("some", 0, None).await.unwrap();
         assert!(results.is_empty());
     }
 
     #[tokio::test]
     async fn recall_limit_one() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("a", "matching content alpha", MemoryCategory::Core)
+        mem.store("a", "matching content alpha", MemoryCategory::Core, None)
             .await
             .unwrap();
-        mem.store("b", "matching content beta", MemoryCategory::Core)
+        mem.store("b", "matching content beta", MemoryCategory::Core, None)
             .await
             .unwrap();
-        let results = mem.recall("matching content", 1).await.unwrap();
+        let results = mem.recall("matching content", 1, None).await.unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -1189,21 +1275,22 @@ mod tests {
             "rust_preferences",
             "User likes systems programming",
             MemoryCategory::Core,
+            None,
         )
         .await
         .unwrap();
         // "rust" appears in key but not content — LIKE fallback checks key too
-        let results = mem.recall("rust", 10).await.unwrap();
+        let results = mem.recall("rust", 10, None).await.unwrap();
         assert!(!results.is_empty(), "Should match by key");
     }
 
     #[tokio::test]
     async fn recall_unicode_query() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("jp", "日本語のテスト", MemoryCategory::Core)
+        mem.store("jp", "日本語のテスト", MemoryCategory::Core, None)
             .await
             .unwrap();
-        let results = mem.recall("日本語", 10).await.unwrap();
+        let results = mem.recall("日本語", 10, None).await.unwrap();
         assert!(!results.is_empty());
     }
 
@@ -1214,7 +1301,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         {
             let mem = SqliteMemory::new(tmp.path()).unwrap();
-            mem.store("k1", "v1", MemoryCategory::Core).await.unwrap();
+            mem.store("k1", "v1", MemoryCategory::Core, None)
+                .await
+                .unwrap();
         }
         // Open again — init_schema runs again on existing DB
         let mem2 = SqliteMemory::new(tmp.path()).unwrap();
@@ -1222,7 +1311,9 @@ mod tests {
         assert!(entry.is_some());
         assert_eq!(entry.unwrap().content, "v1");
         // Store more data — should work fine
-        mem2.store("k2", "v2", MemoryCategory::Daily).await.unwrap();
+        mem2.store("k2", "v2", MemoryCategory::Daily, None)
+            .await
+            .unwrap();
         assert_eq!(mem2.count().await.unwrap(), 2);
     }
 
@@ -1240,11 +1331,16 @@ mod tests {
     #[tokio::test]
     async fn forget_then_recall_no_ghost_results() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("ghost", "phantom memory content", MemoryCategory::Core)
-            .await
-            .unwrap();
+        mem.store(
+            "ghost",
+            "phantom memory content",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
         mem.forget("ghost").await.unwrap();
-        let results = mem.recall("phantom memory", 10).await.unwrap();
+        let results = mem.recall("phantom memory", 10, None).await.unwrap();
         assert!(
             results.is_empty(),
             "Deleted memory should not appear in recall"
@@ -1254,11 +1350,11 @@ mod tests {
     #[tokio::test]
     async fn forget_and_re_store_same_key() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("cycle", "version 1", MemoryCategory::Core)
+        mem.store("cycle", "version 1", MemoryCategory::Core, None)
             .await
             .unwrap();
         mem.forget("cycle").await.unwrap();
-        mem.store("cycle", "version 2", MemoryCategory::Core)
+        mem.store("cycle", "version 2", MemoryCategory::Core, None)
             .await
             .unwrap();
         let entry = mem.get("cycle").await.unwrap().unwrap();
@@ -1278,14 +1374,14 @@ mod tests {
     #[tokio::test]
     async fn reindex_twice_is_safe() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("r1", "reindex data", MemoryCategory::Core)
+        mem.store("r1", "reindex data", MemoryCategory::Core, None)
             .await
             .unwrap();
         mem.reindex().await.unwrap();
         let count = mem.reindex().await.unwrap();
         assert_eq!(count, 0); // Noop embedder → nothing to re-embed
                               // Data should still be intact
-        let results = mem.recall("reindex", 10).await.unwrap();
+        let results = mem.recall("reindex", 10, None).await.unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -1339,18 +1435,28 @@ mod tests {
     #[tokio::test]
     async fn list_custom_category() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("c1", "custom1", MemoryCategory::Custom("project".into()))
-            .await
-            .unwrap();
-        mem.store("c2", "custom2", MemoryCategory::Custom("project".into()))
-            .await
-            .unwrap();
-        mem.store("c3", "other", MemoryCategory::Core)
+        mem.store(
+            "c1",
+            "custom1",
+            MemoryCategory::Custom("project".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "c2",
+            "custom2",
+            MemoryCategory::Custom("project".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store("c3", "other", MemoryCategory::Core, None)
             .await
             .unwrap();
 
         let project = mem
-            .list(Some(&MemoryCategory::Custom("project".into())))
+            .list(Some(&MemoryCategory::Custom("project".into())), None)
             .await
             .unwrap();
         assert_eq!(project.len(), 2);
@@ -1359,7 +1465,122 @@ mod tests {
     #[tokio::test]
     async fn list_empty_db() {
         let (_tmp, mem) = temp_sqlite();
-        let all = mem.list(None).await.unwrap();
+        let all = mem.list(None, None).await.unwrap();
         assert!(all.is_empty());
+    }
+
+    // ── Session isolation ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn store_and_recall_with_session_id() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("k1", "session A fact", MemoryCategory::Core, Some("sess-a"))
+            .await
+            .unwrap();
+        mem.store("k2", "session B fact", MemoryCategory::Core, Some("sess-b"))
+            .await
+            .unwrap();
+        mem.store("k3", "no session fact", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        // Recall with session-a filter returns only session-a entry
+        let results = mem.recall("fact", 10, Some("sess-a")).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key, "k1");
+        assert_eq!(results[0].session_id.as_deref(), Some("sess-a"));
+    }
+
+    #[tokio::test]
+    async fn recall_no_session_filter_returns_all() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("k1", "alpha fact", MemoryCategory::Core, Some("sess-a"))
+            .await
+            .unwrap();
+        mem.store("k2", "beta fact", MemoryCategory::Core, Some("sess-b"))
+            .await
+            .unwrap();
+        mem.store("k3", "gamma fact", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        // Recall without session filter returns all matching entries
+        let results = mem.recall("fact", 10, None).await.unwrap();
+        assert_eq!(results.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn cross_session_recall_isolation() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store(
+            "secret",
+            "session A secret data",
+            MemoryCategory::Core,
+            Some("sess-a"),
+        )
+        .await
+        .unwrap();
+
+        // Session B cannot see session A data
+        let results = mem.recall("secret", 10, Some("sess-b")).await.unwrap();
+        assert!(results.is_empty());
+
+        // Session A can see its own data
+        let results = mem.recall("secret", 10, Some("sess-a")).await.unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_with_session_filter() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("k1", "a1", MemoryCategory::Core, Some("sess-a"))
+            .await
+            .unwrap();
+        mem.store("k2", "a2", MemoryCategory::Conversation, Some("sess-a"))
+            .await
+            .unwrap();
+        mem.store("k3", "b1", MemoryCategory::Core, Some("sess-b"))
+            .await
+            .unwrap();
+        mem.store("k4", "none1", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        // List with session-a filter
+        let results = mem.list(None, Some("sess-a")).await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results
+            .iter()
+            .all(|e| e.session_id.as_deref() == Some("sess-a")));
+
+        // List with session-a + category filter
+        let results = mem
+            .list(Some(&MemoryCategory::Core), Some("sess-a"))
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key, "k1");
+    }
+
+    #[tokio::test]
+    async fn schema_migration_idempotent_on_reopen() {
+        let tmp = TempDir::new().unwrap();
+
+        // First open: creates schema + migration
+        {
+            let mem = SqliteMemory::new(tmp.path()).unwrap();
+            mem.store("k1", "before reopen", MemoryCategory::Core, Some("sess-x"))
+                .await
+                .unwrap();
+        }
+
+        // Second open: migration runs again but is idempotent
+        {
+            let mem = SqliteMemory::new(tmp.path()).unwrap();
+            let results = mem.recall("reopen", 10, Some("sess-x")).await.unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].key, "k1");
+            assert_eq!(results[0].session_id.as_deref(), Some("sess-x"));
+        }
     }
 }

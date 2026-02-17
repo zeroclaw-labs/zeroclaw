@@ -1,0 +1,28 @@
+# Default owner for all files
+* @theonlyhennygod
+
+# High-risk surfaces
+/src/security/** @willsarg
+/src/runtime/** @theonlyhennygod
+/src/memory/** @theonlyhennygod @chumyin
+/.github/** @theonlyhennygod
+/Cargo.toml @theonlyhennygod
+/Cargo.lock @theonlyhennygod
+
+# CI
+/.github/workflows/**  @theonlyhennygod @willsarg
+/.github/codeql/**     @willsarg
+/.github/dependabot.yml @willsarg
+
+# Docs & governance
+/docs/**                @chumyin
+/AGENTS.md              @chumyin
+/CLAUDE.md              @chumyin
+/CONTRIBUTING.md        @chumyin
+/docs/pr-workflow.md    @chumyin
+/docs/reviewer-playbook.md @chumyin
+
+# Security / CI-CD governance overrides (last-match wins)
+/SECURITY.md              @willsarg
+/docs/actions-source-policy.md @willsarg
+/docs/ci-map.md           @willsarg

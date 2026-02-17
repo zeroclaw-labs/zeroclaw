@@ -23,7 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `enc:` prefix for encrypted secrets — Use `enc2:` (ChaCha20-Poly1305) instead.
   Legacy values are still decrypted for backward compatibility but should be migrated.
 
-## [0.1.0] - 2025-02-13
+## [0.1.0] - 2026-02-13
 
 ### Added
 - **Core Architecture**: Trait-based pluggable system for Provider, Channel, Observer, RuntimeAdapter, Tool

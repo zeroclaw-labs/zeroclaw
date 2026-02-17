@@ -71,7 +71,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         ));
     }
 
-    {
+    if config.cron.enabled {
         let scheduler_cfg = config.clone();
         handles.push(spawn_component_supervisor(
             "scheduler",
@@ -82,6 +82,9 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                 async move { crate::cron::scheduler::run(cfg).await }
             },
         ));
+    } else {
+        crate::health::mark_component_ok("scheduler");
+        tracing::info!("Cron disabled; scheduler supervisor not started");
     }
 
     println!("🧠 ZeroClaw daemon started");
@@ -153,6 +156,8 @@ where
                 Ok(()) => {
                     crate::health::mark_component_error(name, "component exited unexpectedly");
                     tracing::warn!("Daemon component '{name}' exited unexpectedly");
+                    // Clean exit — reset backoff since the component ran successfully
+                    backoff = initial_backoff_secs.max(1);
                 }
                 Err(e) => {
                     crate::health::mark_component_error(name, e.to_string());
@@ -162,6 +167,7 @@ where
 
             crate::health::bump_component_restart(name);
             tokio::time::sleep(Duration::from_secs(backoff)).await;
+            // Double backoff AFTER sleeping so first error uses initial_backoff
             backoff = backoff.saturating_mul(2).min(max_backoff);
         }
     })
@@ -190,7 +196,8 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         for task in tasks {
             let prompt = format!("[Heartbeat Task] {task}");
             let temp = config.default_temperature;
-            if let Err(e) = crate::agent::run(config.clone(), Some(prompt), None, None, temp).await
+            if let Err(e) =
+                crate::agent::run(config.clone(), Some(prompt), None, None, temp, vec![]).await
             {
                 crate::health::mark_component_error("heartbeat", e.to_string());
                 tracing::warn!("Heartbeat task failed: {e}");
@@ -207,6 +214,12 @@ fn has_supervised_channels(config: &Config) -> bool {
         || config.channels_config.slack.is_some()
         || config.channels_config.imessage.is_some()
         || config.channels_config.matrix.is_some()
+        || config.channels_config.signal.is_some()
+        || config.channels_config.whatsapp.is_some()
+        || config.channels_config.email.is_some()
+        || config.channels_config.irc.is_some()
+        || config.channels_config.lark.is_some()
+        || config.channels_config.dingtalk.is_some()
 }
 
 #[cfg(test)]
@@ -283,6 +296,17 @@ mod tests {
         config.channels_config.telegram = Some(crate::config::TelegramConfig {
             bot_token: "token".into(),
             allowed_users: vec![],
+        });
+        assert!(has_supervised_channels(&config));
+    }
+
+    #[test]
+    fn detects_dingtalk_as_supervised_channel() {
+        let mut config = Config::default();
+        config.channels_config.dingtalk = Some(crate::config::schema::DingTalkConfig {
+            client_id: "client_id".into(),
+            client_secret: "client_secret".into(),
+            allowed_users: vec!["*".into()],
         });
         assert!(has_supervised_channels(&config));
     }

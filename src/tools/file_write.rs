@@ -53,6 +53,22 @@ impl Tool for FileWriteTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'content' parameter"))?;
 
+        if !self.security.can_act() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Action blocked: autonomy is read-only".into()),
+            });
+        }
+
+        if self.security.is_rate_limited() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
+            });
+        }
+
         // Security check: validate path is within workspace
         if !self.security.is_path_allowed(path) {
             return Ok(ToolResult {
@@ -64,11 +80,6 @@ impl Tool for FileWriteTool {
 
         let full_path = self.security.workspace_dir.join(path);
 
-        // Ensure parent directory exists
-        if let Some(parent) = full_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-
         let Some(parent) = full_path.parent() else {
             return Ok(ToolResult {
                 success: false,
@@ -77,7 +88,10 @@ impl Tool for FileWriteTool {
             });
         };
 
-        // Resolve parent before writing to block symlink escapes.
+        // Ensure parent directory exists
+        tokio::fs::create_dir_all(parent).await?;
+
+        // Resolve parent AFTER creation to block symlink escapes.
         let resolved_parent = match tokio::fs::canonicalize(parent).await {
             Ok(p) => p,
             Err(e) => {
@@ -110,6 +124,28 @@ impl Tool for FileWriteTool {
 
         let resolved_target = resolved_parent.join(file_name);
 
+        // If the target already exists and is a symlink, refuse to follow it
+        if let Ok(meta) = tokio::fs::symlink_metadata(&resolved_target).await {
+            if meta.file_type().is_symlink() {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Refusing to write through symlink: {}",
+                        resolved_target.display()
+                    )),
+                });
+            }
+        }
+
+        if !self.security.record_action() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Rate limit exceeded: action budget exhausted".into()),
+            });
+        }
+
         match tokio::fs::write(&resolved_target, content).await {
             Ok(()) => Ok(ToolResult {
                 success: true,
@@ -134,6 +170,19 @@ mod tests {
         Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: workspace,
+            ..SecurityPolicy::default()
+        })
+    }
+
+    fn test_security_with(
+        workspace: std::path::PathBuf,
+        autonomy: AutonomyLevel,
+        max_actions_per_hour: u32,
+    ) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy,
+            workspace_dir: workspace,
+            max_actions_per_hour,
             ..SecurityPolicy::default()
         })
     }
@@ -311,5 +360,51 @@ mod tests {
         assert!(!outside.join("hijack.txt").exists());
 
         let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn file_write_blocks_readonly_mode() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_readonly");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let tool = FileWriteTool::new(test_security_with(dir.clone(), AutonomyLevel::ReadOnly, 20));
+        let result = tool
+            .execute(json!({"path": "out.txt", "content": "should-block"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("read-only"));
+        assert!(!dir.join("out.txt").exists());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_write_blocks_when_rate_limited() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_rate_limited");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let tool = FileWriteTool::new(test_security_with(
+            dir.clone(),
+            AutonomyLevel::Supervised,
+            0,
+        ));
+        let result = tool
+            .execute(json!({"path": "out.txt", "content": "should-block"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Rate limit exceeded"));
+        assert!(!dir.join("out.txt").exists());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

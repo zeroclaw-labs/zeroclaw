@@ -1,0 +1,148 @@
+name: Bug Report
+description: Report a reproducible defect in ZeroClaw
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug.
+        Please provide a minimal reproducible case so maintainers can triage quickly.
+        Do not include personal/sensitive data; redact and anonymize all logs/payloads.
+
+  - type: input
+    id: summary
+    attributes:
+      label: Summary
+      description: One-line description of the problem.
+      placeholder: zeroclaw daemon exits immediately when ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected component
+      options:
+        - runtime/daemon
+        - provider
+        - channel
+        - memory
+        - security/sandbox
+        - tooling/ci
+        - docs
+        - unknown
+    validations:
+      required: true
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      options:
+        - S0 - data loss / security risk
+        - S1 - workflow blocked
+        - S2 - degraded behavior
+        - S3 - minor issue
+    validations:
+      required: true
+
+  - type: textarea
+    id: current
+    attributes:
+      label: Current behavior
+      description: What is happening now?
+      placeholder: The process exits with ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should happen instead?
+      placeholder: The daemon should stay alive and ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Please provide exact commands/config.
+      placeholder: |
+        1. zeroclaw onboard --interactive
+        2. zeroclaw daemon
+        3. Observe crash in logs
+      render: bash
+    validations:
+      required: true
+
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact
+      description: Who is affected, how often, and practical consequences.
+      placeholder: |
+        Affected users: ...
+        Frequency: always/intermittent
+        Consequence: ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / stack traces
+      description: Paste relevant logs (redact secrets, personal identifiers, and sensitive data).
+      render: text
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: ZeroClaw version
+      placeholder: v0.1.0 / commit SHA
+    validations:
+      required: true
+
+  - type: input
+    id: rust
+    attributes:
+      label: Rust version
+      placeholder: rustc 1.xx.x
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: Ubuntu 24.04 / macOS 15 / Windows 11
+    validations:
+      required: true
+
+  - type: dropdown
+    id: regression
+    attributes:
+      label: Regression?
+      options:
+        - Unknown
+        - Yes, it worked before
+        - No, first-time setup
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-flight checks
+      options:
+        - label: I reproduced this on the latest main branch or latest release.
+          required: true
+        - label: I redacted secrets/tokens from logs.
+          required: true
+        - label: I removed personal identifiers and replaced identity-specific data with neutral placeholders.
+          required: true

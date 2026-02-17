@@ -1,6 +1,5 @@
-use super::traits::{Channel, ChannelMessage};
+use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
-use uuid::Uuid;
 
 /// Slack channel — polls conversations.history via Web API
 pub struct SlackChannel {
@@ -52,18 +51,39 @@ impl Channel for SlackChannel {
         "slack"
     }
 
-    async fn send(&self, message: &str, channel: &str) -> anyhow::Result<()> {
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let body = serde_json::json!({
-            "channel": channel,
-            "text": message
+            "channel": message.recipient,
+            "text": message.content
         });
 
-        self.client
+        let resp = self
+            .client
             .post("https://slack.com/api/chat.postMessage")
             .bearer_auth(&self.bot_token)
             .json(&body)
             .send()
             .await?;
+
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+
+        if !status.is_success() {
+            anyhow::bail!("Slack chat.postMessage failed ({status}): {body}");
+        }
+
+        // Slack returns 200 for most app-level errors; check JSON "ok" field
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+        if parsed.get("ok") == Some(&serde_json::Value::Bool(false)) {
+            let err = parsed
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("unknown");
+            anyhow::bail!("Slack chat.postMessage failed: {err}");
+        }
 
         Ok(())
     }
@@ -139,8 +159,9 @@ impl Channel for SlackChannel {
                     last_ts = ts.to_string();
 
                     let channel_msg = ChannelMessage {
-                        id: Uuid::new_v4().to_string(),
-                        sender: channel_id.clone(),
+                        id: format!("slack_{channel_id}_{ts}"),
+                        sender: user.to_string(),
+                        reply_target: channel_id.clone(),
                         content: text.to_string(),
                         channel: "slack".to_string(),
                         timestamp: std::time::SystemTime::now()
@@ -230,5 +251,54 @@ mod tests {
         let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["U111".into(), "*".into()]);
         assert!(ch.is_user_allowed("U111"));
         assert!(ch.is_user_allowed("anyone"));
+    }
+
+    // ── Message ID edge cases ─────────────────────────────────────
+
+    #[test]
+    fn slack_message_id_format_includes_channel_and_ts() {
+        // Verify that message IDs follow the format: slack_{channel_id}_{ts}
+        let ts = "1234567890.123456";
+        let channel_id = "C12345";
+        let expected_id = format!("slack_{channel_id}_{ts}");
+        assert_eq!(expected_id, "slack_C12345_1234567890.123456");
+    }
+
+    #[test]
+    fn slack_message_id_is_deterministic() {
+        // Same channel_id + same ts = same ID (prevents duplicates after restart)
+        let ts = "1234567890.123456";
+        let channel_id = "C12345";
+        let id1 = format!("slack_{channel_id}_{ts}");
+        let id2 = format!("slack_{channel_id}_{ts}");
+        assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn slack_message_id_different_ts_different_id() {
+        // Different timestamps produce different IDs
+        let channel_id = "C12345";
+        let id1 = format!("slack_{channel_id}_1234567890.123456");
+        let id2 = format!("slack_{channel_id}_1234567890.123457");
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn slack_message_id_different_channel_different_id() {
+        // Different channels produce different IDs even with same ts
+        let ts = "1234567890.123456";
+        let id1 = format!("slack_C12345_{ts}");
+        let id2 = format!("slack_C67890_{ts}");
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn slack_message_id_no_uuid_randomness() {
+        // Verify format doesn't contain random UUID components
+        let ts = "1234567890.123456";
+        let channel_id = "C12345";
+        let id = format!("slack_{channel_id}_{ts}");
+        assert!(!id.contains('-')); // No UUID dashes
+        assert!(id.starts_with("slack_"));
     }
 }

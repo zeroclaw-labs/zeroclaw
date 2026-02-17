@@ -11,13 +11,13 @@ fn windows_task_name() -> &'static str {
     WINDOWS_TASK_NAME
 }
 
-pub fn handle_command(command: &super::ServiceCommands, config: &Config) -> Result<()> {
+pub fn handle_command(command: &crate::ServiceCommands, config: &Config) -> Result<()> {
     match command {
-        super::ServiceCommands::Install => install(config),
-        super::ServiceCommands::Start => start(config),
-        super::ServiceCommands::Stop => stop(config),
-        super::ServiceCommands::Status => status(config),
-        super::ServiceCommands::Uninstall => uninstall(config),
+        crate::ServiceCommands::Install => install(config),
+        crate::ServiceCommands::Start => start(config),
+        crate::ServiceCommands::Stop => stop(config),
+        crate::ServiceCommands::Status => status(config),
+        crate::ServiceCommands::Uninstall => uninstall(config),
     }
 }
 

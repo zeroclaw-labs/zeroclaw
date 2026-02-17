@@ -1,0 +1,4 @@
+self-hosted-runner:
+    labels:
+        - lxc-ci
+        - blacksmith-2vcpu-ubuntu-2404

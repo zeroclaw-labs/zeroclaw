@@ -1,0 +1,179 @@
+name: PR Intake Sanity
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, edited, ready_for_review]
+
+concurrency:
+  group: pr-intake-sanity-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  intake:
+    name: Intake Sanity
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 10
+    steps:
+      - name: Run safe PR intake checks
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pr = context.payload.pull_request;
+            if (!pr) return;
+
+            const marker = "<!-- pr-intake-sanity -->";
+            const requiredSections = [
+              "## Summary",
+              "## Validation Evidence (required)",
+              "## Security Impact (required)",
+              "## Privacy and Data Hygiene (required)",
+              "## Rollback Plan (required)",
+            ];
+            const body = pr.body || "";
+
+            const missingSections = requiredSections.filter((section) => !body.includes(section));
+            const missingFields = [];
+            const requiredFieldChecks = [
+              ["summary problem", /- Problem:\s*\S+/m],
+              ["summary why it matters", /- Why it matters:\s*\S+/m],
+              ["summary what changed", /- What changed:\s*\S+/m],
+              ["validation commands", /Commands and result summary:\s*[\s\S]*```/m],
+              ["security risk/mitigation", /- New permissions\/capabilities\?\s*\(`Yes\/No`\):\s*\S+/m],
+              ["privacy status", /- Data-hygiene status\s*\(`pass\|needs-follow-up`\):\s*\S+/m],
+              ["rollback plan", /- Fast rollback command\/path:\s*\S+/m],
+            ];
+            for (const [name, pattern] of requiredFieldChecks) {
+              if (!pattern.test(body)) {
+                missingFields.push(name);
+              }
+            }
+
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner,
+              repo,
+              pull_number: pr.number,
+              per_page: 100,
+            });
+
+            const formatProblems = [];
+            for (const file of files) {
+              const patch = file.patch || "";
+              if (!patch) continue;
+              const lines = patch.split("\n");
+              for (let idx = 0; idx < lines.length; idx += 1) {
+                const line = lines[idx];
+                if (!line.startsWith("+") || line.startsWith("+++")) continue;
+                const added = line.slice(1);
+                const lineNo = idx + 1;
+                if (/\t/.test(added)) {
+                  formatProblems.push(`${file.filename}:patch#${lineNo} contains tab characters`);
+                }
+                if (/[ \t]+$/.test(added)) {
+                  formatProblems.push(`${file.filename}:patch#${lineNo} contains trailing whitespace`);
+                }
+                if (/^(<<<<<<<|=======|>>>>>>>)/.test(added)) {
+                  formatProblems.push(`${file.filename}:patch#${lineNo} contains merge conflict markers`);
+                }
+              }
+            }
+
+            const workflowFilesChanged = files
+              .map((file) => file.filename)
+              .filter((name) => name.startsWith(".github/workflows/"));
+
+            const failures = [];
+            if (missingSections.length > 0) {
+              failures.push(`Missing required PR template sections: ${missingSections.join(", ")}`);
+            }
+            if (missingFields.length > 0) {
+              failures.push(`Incomplete required PR template fields: ${missingFields.join(", ")}`);
+            }
+            if (formatProblems.length > 0) {
+              failures.push(`Formatting/safety issues in added lines (${formatProblems.length})`);
+            }
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number: pr.number,
+              per_page: 100,
+            });
+            const existing = comments.find((comment) => (comment.body || "").includes(marker));
+
+            if (failures.length === 0) {
+              if (existing) {
+                await github.rest.issues.deleteComment({
+                  owner,
+                  repo,
+                  comment_id: existing.id,
+                });
+              }
+              core.info("PR intake sanity checks passed.");
+              return;
+            }
+
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const details = [];
+            if (formatProblems.length > 0) {
+              details.push(...formatProblems.slice(0, 20).map((entry) => `- ${entry}`));
+              if (formatProblems.length > 20) {
+                details.push(`- ...and ${formatProblems.length - 20} more issue(s)`);
+              }
+            }
+
+            const ownerApprovalNote = workflowFilesChanged.length > 0
+              ? [
+                  "",
+                  "Workflow files changed in this PR:",
+                  ...workflowFilesChanged.map((name) => `- \`${name}\``),
+                  "",
+                  "Reminder: workflow changes require owner approval via `CI Required Gate`.",
+                ].join("\n")
+              : "";
+
+            const commentBody = [
+              marker,
+              "### PR intake checks failed",
+              "",
+              "Fast safe checks ran before full CI and found issues:",
+              ...failures.map((entry) => `- ${entry}`),
+              "",
+              "Action items:",
+              "1. Complete the required PR template sections/fields.",
+              "2. Remove tabs, trailing whitespace, and conflict markers from added lines.",
+              "3. Re-run local checks before pushing:",
+              "   - `./scripts/ci/rust_quality_gate.sh`",
+              "   - `./scripts/ci/rust_strict_delta_gate.sh`",
+              "   - `./scripts/ci/docs_quality_gate.sh`",
+              "",
+              `Run logs: ${runUrl}`,
+              "",
+              "Detected line issues (sample):",
+              ...(details.length > 0 ? details : ["- none"]),
+              ownerApprovalNote,
+            ].join("\n");
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body: commentBody,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: pr.number,
+                body: commentBody,
+              });
+            }
+
+            core.setFailed("PR intake sanity checks failed. See sticky comment for details.");

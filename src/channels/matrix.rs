@@ -1,4 +1,4 @@
-use crate::channels::traits::{Channel, ChannelMessage};
+use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
@@ -117,7 +117,7 @@ impl Channel for MatrixChannel {
         "matrix"
     }
 
-    async fn send(&self, message: &str, _target: &str) -> anyhow::Result<()> {
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let txn_id = format!("zc_{}", chrono::Utc::now().timestamp_millis());
         let url = format!(
             "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
@@ -126,7 +126,7 @@ impl Channel for MatrixChannel {
 
         let body = serde_json::json!({
             "msgtype": "m.text",
-            "body": message
+            "body": message.content
         });
 
         let resp = self
@@ -230,6 +230,7 @@ impl Channel for MatrixChannel {
                     let msg = ChannelMessage {
                         id: format!("mx_{}", chrono::Utc::now().timestamp_millis()),
                         sender: event.sender.clone(),
+                        reply_target: event.sender.clone(),
                         content: body.clone(),
                         channel: "matrix".to_string(),
                         timestamp: std::time::SystemTime::now()

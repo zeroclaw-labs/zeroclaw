@@ -1,5 +1,5 @@
 use super::traits::RuntimeAdapter;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Native runtime — full access, runs on Mac/Linux/Docker/Raspberry Pi
 pub struct NativeRuntime;
@@ -32,6 +32,16 @@ impl RuntimeAdapter for NativeRuntime {
 
     fn supports_long_running(&self) -> bool {
         true
+    }
+
+    fn build_shell_command(
+        &self,
+        command: &str,
+        workspace_dir: &Path,
+    ) -> anyhow::Result<tokio::process::Command> {
+        let mut process = tokio::process::Command::new("sh");
+        process.arg("-c").arg(command).current_dir(workspace_dir);
+        Ok(process)
     }
 }
 
@@ -68,5 +78,15 @@ mod tests {
     fn native_storage_path_contains_zeroclaw() {
         let path = NativeRuntime::new().storage_path();
         assert!(path.to_string_lossy().contains("zeroclaw"));
+    }
+
+    #[test]
+    fn native_builds_shell_command() {
+        let cwd = std::env::temp_dir();
+        let command = NativeRuntime::new()
+            .build_shell_command("echo hello", &cwd)
+            .unwrap();
+        let debug = format!("{command:?}");
+        assert!(debug.contains("echo hello"));
     }
 }

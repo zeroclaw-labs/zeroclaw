@@ -1,4 +1,4 @@
-use crate::channels::traits::{Channel, ChannelMessage};
+use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use directories::UserDirs;
 use rusqlite::{Connection, OpenFlags};
@@ -36,8 +36,12 @@ impl IMessageChannel {
 /// This prevents injection attacks by escaping:
 /// - Backslashes (`\` → `\\`)
 /// - Double quotes (`"` → `\"`)
+/// - Newlines (`\n` → `\\n`, `\r` → `\\r`) to prevent code injection via line breaks
 fn escape_applescript(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 /// Validate that a target looks like a valid phone number or email address.
@@ -91,9 +95,9 @@ impl Channel for IMessageChannel {
         "imessage"
     }
 
-    async fn send(&self, message: &str, target: &str) -> anyhow::Result<()> {
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         // Defense-in-depth: validate target format before any interpolation
-        if !is_valid_imessage_target(target) {
+        if !is_valid_imessage_target(&message.recipient) {
             anyhow::bail!(
                 "Invalid iMessage target: must be a phone number (+1234567890) or email (user@example.com)"
             );
@@ -101,8 +105,8 @@ impl Channel for IMessageChannel {
 
         // SECURITY: Escape both message AND target to prevent AppleScript injection
         // See: CWE-78 (OS Command Injection)
-        let escaped_msg = escape_applescript(message);
-        let escaped_target = escape_applescript(target);
+        let escaped_msg = escape_applescript(&message.content);
+        let escaped_target = escape_applescript(&message.recipient);
 
         let script = format!(
             r#"tell application "Messages"
@@ -168,6 +172,7 @@ end tell"#
                         let msg = ChannelMessage {
                             id: rowid.to_string(),
                             sender: sender.clone(),
+                            reply_target: sender.clone(),
                             content: text,
                             channel: "imessage".to_string(),
                             timestamp: std::time::SystemTime::now()
@@ -386,8 +391,10 @@ mod tests {
     }
 
     #[test]
-    fn escape_applescript_newlines_preserved() {
-        assert_eq!(escape_applescript("line1\nline2"), "line1\nline2");
+    fn escape_applescript_newlines_escaped() {
+        assert_eq!(escape_applescript("line1\nline2"), "line1\\nline2");
+        assert_eq!(escape_applescript("line1\rline2"), "line1\\rline2");
+        assert_eq!(escape_applescript("line1\r\nline2"), "line1\\r\\nline2");
     }
 
     // ══════════════════════════════════════════════════════════
