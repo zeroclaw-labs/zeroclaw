@@ -245,6 +245,7 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 dc.guild_id.clone(),
                 dc.allowed_users.clone(),
                 dc.listen_to_bots,
+                dc.mention_only,
             );
             channel.send(output, target).await?;
         }

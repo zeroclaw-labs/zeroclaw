@@ -1319,6 +1319,10 @@ pub struct DiscordConfig {
     /// The bot still ignores its own messages to prevent feedback loops.
     #[serde(default)]
     pub listen_to_bots: bool,
+    /// When true, only respond to messages that @-mention the bot.
+    /// Other messages in the guild are silently ignored.
+    #[serde(default)]
+    pub mention_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2392,6 +2396,7 @@ tool_dispatcher = "xml"
             guild_id: Some("12345".into()),
             allowed_users: vec![],
             listen_to_bots: false,
+            mention_only: false,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -2406,6 +2411,7 @@ tool_dispatcher = "xml"
             guild_id: None,
             allowed_users: vec![],
             listen_to_bots: false,
+            mention_only: false,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
