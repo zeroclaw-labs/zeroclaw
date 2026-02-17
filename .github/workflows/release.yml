@@ -4,6 +4,10 @@ on:
     push:
         tags: ["v*"]
 
+concurrency:
+    group: release
+    cancel-in-progress: false
+
 permissions:
     contents: write
     id-token: write # Required for cosign keyless signing via OIDC
