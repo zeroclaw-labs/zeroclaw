@@ -349,10 +349,10 @@ pub fn create_resilient_provider(
 
         match create_provider(fallback, credential_override) {
             Ok(provider) => providers.push((fallback.clone(), provider)),
-            Err(e) => {
+            Err(_error) => {
                 tracing::warn!(
                     fallback_provider = fallback,
-                    "Ignoring invalid fallback provider: {e}"
+                    "Ignoring invalid fallback provider during initialization"
                 );
             }
         }
@@ -407,7 +407,7 @@ pub fn create_routed_provider(
                 }
                 tracing::warn!(
                     provider = name.as_str(),
-                    "Ignoring routed provider that failed to create: {e}"
+                    "Ignoring routed provider that failed to initialize"
                 );
             }
         }
