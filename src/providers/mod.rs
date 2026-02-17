@@ -965,7 +965,7 @@ mod tests {
 
     #[test]
     fn sanitize_preserves_unicode_boundaries() {
-        let input = format!("{} sk-abcdef123", "こんにちは".repeat(80));
+        let input = format!("{} sk-abcdef123", "hello🙂".repeat(80));
         let result = sanitize_api_error(&input);
         assert!(std::str::from_utf8(result.as_bytes()).is_ok());
         assert!(!result.contains("sk-abcdef123"));
