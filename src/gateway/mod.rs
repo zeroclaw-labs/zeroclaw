@@ -16,7 +16,7 @@ use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::security::SecurityPolicy;
 use crate::tools;
 use crate::util::truncate_with_ellipsis;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::{
     body::Bytes,
     extract::{Query, State},
@@ -176,6 +176,7 @@ fn client_key_from_headers(headers: &HeaderMap) -> String {
 /// Shared state for all axum handlers
 #[derive(Clone)]
 pub struct AppState {
+    pub config: Arc<Mutex<Config>>,
     pub provider: Arc<dyn Provider>,
     pub model: String,
     pub temperature: f64,
@@ -203,6 +204,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
              [gateway] allow_public_bind = true in config.toml (NOT recommended)."
         );
     }
+    let config_state = Arc::new(Mutex::new(config.clone()));
 
     let addr: SocketAddr = format!("{host}:{port}").parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -355,6 +357,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     // Build shared state
     let state = AppState {
+        config: config_state,
         provider,
         model,
         temperature,
@@ -422,8 +425,20 @@ async fn handle_pair(State(state): State<AppState>, headers: HeaderMap) -> impl 
     match state.pairing.try_pair(code) {
         Ok(Some(token)) => {
             tracing::info!("🔐 New client paired successfully");
+            if let Err(err) = persist_pairing_tokens(&state.config, &state.pairing) {
+                tracing::error!("🔐 Pairing succeeded but token persistence failed: {err:#}");
+                let body = serde_json::json!({
+                    "paired": true,
+                    "persisted": false,
+                    "token": token,
+                    "message": "Paired for this process, but failed to persist token to config.toml. Check config path and write permissions.",
+                });
+                return (StatusCode::OK, Json(body));
+            }
+
             let body = serde_json::json!({
                 "paired": true,
+                "persisted": true,
                 "token": token,
                 "message": "Save this token — use it as Authorization: Bearer <token>"
             });
@@ -445,6 +460,14 @@ async fn handle_pair(State(state): State<AppState>, headers: HeaderMap) -> impl 
             (StatusCode::TOO_MANY_REQUESTS, Json(err))
         }
     }
+}
+
+fn persist_pairing_tokens(config: &Arc<Mutex<Config>>, pairing: &PairingGuard) -> Result<()> {
+    let paired_tokens = pairing.tokens();
+    let mut cfg = config.lock();
+    cfg.gateway.paired_tokens = paired_tokens;
+    cfg.save()
+        .context("Failed to persist paired tokens to config.toml")
 }
 
 /// Webhook request body
@@ -837,6 +860,33 @@ mod tests {
     }
 
     #[test]
+    fn persist_pairing_tokens_writes_config_tokens() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        let workspace_path = temp.path().join("workspace");
+
+        let mut config = Config::default();
+        config.config_path = config_path.clone();
+        config.workspace_dir = workspace_path;
+        config.save().unwrap();
+
+        let guard = PairingGuard::new(true, &[]);
+        let code = guard.pairing_code().unwrap();
+        let token = guard.try_pair(&code).unwrap().unwrap();
+        assert!(guard.is_authenticated(&token));
+
+        let shared_config = Arc::new(Mutex::new(config));
+        persist_pairing_tokens(&shared_config, &guard).unwrap();
+
+        let saved = std::fs::read_to_string(config_path).unwrap();
+        let parsed: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(parsed.gateway.paired_tokens.len(), 1);
+        let persisted = &parsed.gateway.paired_tokens[0];
+        assert_eq!(persisted.len(), 64);
+        assert!(persisted.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
     fn webhook_memory_key_is_unique() {
         let key1 = webhook_memory_key();
         let key2 = webhook_memory_key();
@@ -997,6 +1047,7 @@ mod tests {
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
         let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -1045,6 +1096,7 @@ mod tests {
         let memory: Arc<dyn Memory> = tracking_impl.clone();
 
         let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -1102,6 +1154,7 @@ mod tests {
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
         let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -1136,6 +1189,7 @@ mod tests {
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
         let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -1173,6 +1227,7 @@ mod tests {
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
         let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,

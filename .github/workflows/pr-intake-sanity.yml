@@ -62,7 +62,8 @@ jobs:
               per_page: 100,
             });
 
-            const formatProblems = [];
+            const formatWarnings = [];
+            const dangerousProblems = [];
             for (const file of files) {
               const patch = file.patch || "";
               if (!patch) continue;
@@ -73,13 +74,13 @@ jobs:
                 const added = line.slice(1);
                 const lineNo = idx + 1;
                 if (/\t/.test(added)) {
-                  formatProblems.push(`${file.filename}:patch#${lineNo} contains tab characters`);
+                  formatWarnings.push(`${file.filename}:patch#${lineNo} contains tab characters`);
                 }
                 if (/[ \t]+$/.test(added)) {
-                  formatProblems.push(`${file.filename}:patch#${lineNo} contains trailing whitespace`);
+                  formatWarnings.push(`${file.filename}:patch#${lineNo} contains trailing whitespace`);
                 }
                 if (/^(<<<<<<<|=======|>>>>>>>)/.test(added)) {
-                  formatProblems.push(`${file.filename}:patch#${lineNo} contains merge conflict markers`);
+                  dangerousProblems.push(`${file.filename}:patch#${lineNo} contains merge conflict markers`);
                 }
               }
             }
@@ -88,15 +89,19 @@ jobs:
               .map((file) => file.filename)
               .filter((name) => name.startsWith(".github/workflows/"));
 
-            const failures = [];
+            const advisoryFindings = [];
+            const blockingFindings = [];
             if (missingSections.length > 0) {
-              failures.push(`Missing required PR template sections: ${missingSections.join(", ")}`);
+              advisoryFindings.push(`Missing required PR template sections: ${missingSections.join(", ")}`);
             }
             if (missingFields.length > 0) {
-              failures.push(`Incomplete required PR template fields: ${missingFields.join(", ")}`);
+              advisoryFindings.push(`Incomplete required PR template fields: ${missingFields.join(", ")}`);
             }
-            if (formatProblems.length > 0) {
-              failures.push(`Formatting/safety issues in added lines (${formatProblems.length})`);
+            if (formatWarnings.length > 0) {
+              advisoryFindings.push(`Formatting issues in added lines (${formatWarnings.length})`);
+            }
+            if (dangerousProblems.length > 0) {
+              blockingFindings.push(`Dangerous patch markers found (${dangerousProblems.length})`);
             }
 
             const comments = await github.paginate(github.rest.issues.listComments, {
@@ -107,7 +112,7 @@ jobs:
             });
             const existing = comments.find((comment) => (comment.body || "").includes(marker));
 
-            if (failures.length === 0) {
+            if (advisoryFindings.length === 0 && blockingFindings.length === 0) {
               if (existing) {
                 await github.rest.issues.deleteComment({
                   owner,
@@ -120,13 +125,22 @@ jobs:
             }
 
             const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
-            const details = [];
-            if (formatProblems.length > 0) {
-              details.push(...formatProblems.slice(0, 20).map((entry) => `- ${entry}`));
-              if (formatProblems.length > 20) {
-                details.push(`- ...and ${formatProblems.length - 20} more issue(s)`);
+            const advisoryDetails = [];
+            if (formatWarnings.length > 0) {
+              advisoryDetails.push(...formatWarnings.slice(0, 20).map((entry) => `- ${entry}`));
+              if (formatWarnings.length > 20) {
+                advisoryDetails.push(`- ...and ${formatWarnings.length - 20} more issue(s)`);
               }
             }
+            const blockingDetails = [];
+            if (dangerousProblems.length > 0) {
+              blockingDetails.push(...dangerousProblems.slice(0, 20).map((entry) => `- ${entry}`));
+              if (dangerousProblems.length > 20) {
+                blockingDetails.push(`- ...and ${dangerousProblems.length - 20} more issue(s)`);
+              }
+            }
+
+            const isBlocking = blockingFindings.length > 0;
 
             const ownerApprovalNote = workflowFilesChanged.length > 0
               ? [
@@ -140,14 +154,19 @@ jobs:
 
             const commentBody = [
               marker,
-              "### PR intake checks failed",
+              isBlocking
+                ? "### PR intake checks failed (blocking)"
+                : "### PR intake checks found warnings (non-blocking)",
               "",
-              "Fast safe checks ran before full CI and found issues:",
-              ...failures.map((entry) => `- ${entry}`),
+              isBlocking
+                ? "Fast safe checks found blocking safety issues:"
+                : "Fast safe checks found advisory issues. CI lint/test/build gates still enforce merge quality.",
+              ...(blockingFindings.length > 0 ? blockingFindings.map((entry) => `- ${entry}`) : []),
+              ...(advisoryFindings.length > 0 ? advisoryFindings.map((entry) => `- ${entry}`) : []),
               "",
               "Action items:",
-              "1. Complete the required PR template sections/fields.",
-              "2. Remove tabs, trailing whitespace, and conflict markers from added lines.",
+              "1. Complete required PR template sections/fields.",
+              "2. Remove tabs, trailing whitespace, and merge conflict markers from added lines.",
               "3. Re-run local checks before pushing:",
               "   - `./scripts/ci/rust_quality_gate.sh`",
               "   - `./scripts/ci/rust_strict_delta_gate.sh`",
@@ -155,8 +174,11 @@ jobs:
               "",
               `Run logs: ${runUrl}`,
               "",
-              "Detected line issues (sample):",
-              ...(details.length > 0 ? details : ["- none"]),
+              "Detected blocking line issues (sample):",
+              ...(blockingDetails.length > 0 ? blockingDetails : ["- none"]),
+              "",
+              "Detected advisory line issues (sample):",
+              ...(advisoryDetails.length > 0 ? advisoryDetails : ["- none"]),
               ownerApprovalNote,
             ].join("\n");
 
@@ -176,4 +198,9 @@ jobs:
               });
             }
 
-            core.setFailed("PR intake sanity checks failed. See sticky comment for details.");
+            if (isBlocking) {
+              core.setFailed("PR intake sanity checks found blocking issues. See sticky comment for details.");
+              return;
+            }
+
+            core.info("PR intake sanity checks found advisory issues only.");

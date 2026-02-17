@@ -159,7 +159,7 @@ jobs:
       pull-requests: write
     steps:
       - name: Greet first-time contributors
-        uses: actions/first-interaction@2ec0f0fd78838633cd1c1342e4536d49ef72be54 # v1
+        uses: actions/first-interaction@a1db7729b356323c7988c20ed6f0d33fe31297be # v1
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
           issue-message: |

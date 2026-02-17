@@ -30,7 +30,7 @@ jobs:
         steps:
             - name: Apply path labels
               if: github.event_name == 'pull_request_target'
-              uses: actions/labeler@8558fd74291d67161a8a78ce36a881fa63b766a9 # v5
+              uses: actions/labeler@634933edcd8ababfe52f92936142cc22ac488b1b # v6.0.1
               continue-on-error: true
               with:
                   repo-token: ${{ secrets.GITHUB_TOKEN }}

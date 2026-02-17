@@ -90,7 +90,7 @@ WORKDIR /zeroclaw-data
 USER 65534:65534
 EXPOSE 3000
 ENTRYPOINT ["zeroclaw"]
-CMD ["gateway", "--port", "3000", "--host", "[::]"]
+CMD ["gateway"]
 
 # ── Stage 4: Production Runtime (Distroless) ─────────────────
 FROM gcr.io/distroless/cc-debian13:nonroot@sha256:84fcd3c223b144b0cb6edc5ecc75641819842a9679a3a58fd6294bec47532bf7 AS release
@@ -112,4 +112,4 @@ WORKDIR /zeroclaw-data
 USER 65534:65534
 EXPOSE 3000
 ENTRYPOINT ["zeroclaw"]
-CMD ["gateway", "--port", "3000", "--host", "[::]"]
+CMD ["gateway"]

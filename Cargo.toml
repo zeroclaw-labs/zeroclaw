@@ -29,7 +29,7 @@ serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 
 # Config
-directories = "5.0"
+directories = "6.0"
 toml = "1.0"
 shellexpand = "3.1"
 
@@ -62,13 +62,16 @@ sha2 = "0.10"
 hex = "0.4"
 
 # CSPRNG for secure token generation
-rand = "0.8"
+rand = "0.9"
 
 # Fast mutexes that don't poison on panic
 parking_lot = "0.12"
 
 # Async traits
 async-trait = "0.1"
+
+# HMAC-SHA256 (Zhipu/GLM JWT auth)
+ring = "0.17"
 
 # Protobuf encode/decode (Feishu WS long-connection frame codec)
 prost = { version = "0.14", default-features = false }
@@ -77,11 +80,11 @@ prost = { version = "0.14", default-features = false }
 rusqlite = { version = "0.38", features = ["bundled"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 chrono-tz = "0.10"
-cron = "0.12"
+cron = "0.15"
 
 # Interactive CLI prompts
 dialoguer = { version = "0.12", features = ["fuzzy-select"] }
-console = "0.15"
+console = "0.16"
 
 # Hardware discovery (device path globbing)
 glob = "0.3"
@@ -124,7 +127,7 @@ pdf-extract = { version = "0.10", optional = true }
 
 # Raspberry Pi GPIO / Landlock (Linux only) — target-specific to avoid compile failure on macOS
 [target.'cfg(target_os = "linux")'.dependencies]
-rppal = { version = "0.14", optional = true }
+rppal = { version = "0.22", optional = true }
 landlock = { version = "0.4", optional = true }
 
 [features]
@@ -168,3 +171,8 @@ panic = "abort"
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3.14"
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "agent_benchmarks"
+harness = false
