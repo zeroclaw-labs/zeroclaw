@@ -9,7 +9,7 @@ pub use schema::{
     ModelRouteConfig, ObservabilityConfig, PeripheralBoardConfig, PeripheralsConfig,
     ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig,
     SchedulerConfig, SecretsConfig, SecurityConfig, SlackConfig, TelegramConfig, TunnelConfig,
-    WebhookConfig,
+    WebhookConfig, CronConfig,
 };
 
 #[cfg(test)]
