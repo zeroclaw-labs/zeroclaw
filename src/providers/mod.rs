@@ -560,6 +560,57 @@ pub fn create_routed_provider(
     )))
 }
 
+/// Information about a supported provider for display purposes.
+pub struct ProviderInfo {
+    /// Canonical name used in config (e.g. `"openrouter"`)
+    pub name: &'static str,
+    /// Human-readable display name
+    pub display_name: &'static str,
+    /// Alternative names accepted in config
+    pub aliases: &'static [&'static str],
+    /// Whether the provider runs locally (no API key required)
+    pub local: bool,
+}
+
+/// Return the list of all known providers for display in `zeroclaw providers list`.
+///
+/// This is intentionally separate from the factory match in `create_provider`
+/// (display concern vs. construction concern).
+pub fn list_providers() -> Vec<ProviderInfo> {
+    vec![
+        // ── Primary providers ────────────────────────────────
+        ProviderInfo { name: "openrouter",  display_name: "OpenRouter",          aliases: &[],                                                  local: false },
+        ProviderInfo { name: "anthropic",   display_name: "Anthropic",           aliases: &[],                                                  local: false },
+        ProviderInfo { name: "openai",      display_name: "OpenAI",              aliases: &[],                                                  local: false },
+        ProviderInfo { name: "ollama",      display_name: "Ollama",              aliases: &[],                                                  local: true  },
+        ProviderInfo { name: "gemini",      display_name: "Google Gemini",       aliases: &["google", "google-gemini"],                          local: false },
+        // ── OpenAI-compatible providers ──────────────────────
+        ProviderInfo { name: "venice",      display_name: "Venice",              aliases: &[],                                                  local: false },
+        ProviderInfo { name: "vercel",      display_name: "Vercel AI Gateway",   aliases: &["vercel-ai"],                                       local: false },
+        ProviderInfo { name: "cloudflare",  display_name: "Cloudflare AI",       aliases: &["cloudflare-ai"],                                   local: false },
+        ProviderInfo { name: "moonshot",    display_name: "Moonshot",            aliases: &["kimi"],                                            local: false },
+        ProviderInfo { name: "synthetic",   display_name: "Synthetic",           aliases: &[],                                                  local: false },
+        ProviderInfo { name: "opencode",    display_name: "OpenCode Zen",        aliases: &["opencode-zen"],                                    local: false },
+        ProviderInfo { name: "zai",         display_name: "Z.AI",                aliases: &["z.ai"],                                            local: false },
+        ProviderInfo { name: "glm",         display_name: "GLM (Zhipu)",         aliases: &["zhipu"],                                           local: false },
+        ProviderInfo { name: "minimax",     display_name: "MiniMax",             aliases: &[],                                                  local: false },
+        ProviderInfo { name: "bedrock",     display_name: "Amazon Bedrock",      aliases: &["aws-bedrock"],                                     local: false },
+        ProviderInfo { name: "qianfan",     display_name: "Qianfan (Baidu)",     aliases: &["baidu"],                                           local: false },
+        ProviderInfo { name: "qwen",        display_name: "Qwen (DashScope)",    aliases: &["dashscope", "qwen-intl", "dashscope-intl", "qwen-us", "dashscope-us"], local: false },
+        ProviderInfo { name: "groq",        display_name: "Groq",                aliases: &[],                                                  local: false },
+        ProviderInfo { name: "mistral",     display_name: "Mistral",             aliases: &[],                                                  local: false },
+        ProviderInfo { name: "xai",         display_name: "xAI (Grok)",          aliases: &["grok"],                                            local: false },
+        ProviderInfo { name: "deepseek",    display_name: "DeepSeek",            aliases: &[],                                                  local: false },
+        ProviderInfo { name: "together",    display_name: "Together AI",         aliases: &["together-ai"],                                     local: false },
+        ProviderInfo { name: "fireworks",   display_name: "Fireworks AI",        aliases: &["fireworks-ai"],                                    local: false },
+        ProviderInfo { name: "perplexity",  display_name: "Perplexity",          aliases: &[],                                                  local: false },
+        ProviderInfo { name: "cohere",      display_name: "Cohere",              aliases: &[],                                                  local: false },
+        ProviderInfo { name: "copilot",     display_name: "GitHub Copilot",      aliases: &["github-copilot"],                                  local: false },
+        ProviderInfo { name: "lmstudio",    display_name: "LM Studio",           aliases: &["lm-studio"],                                       local: true  },
+        ProviderInfo { name: "nvidia",      display_name: "NVIDIA NIM",          aliases: &["nvidia-nim", "build.nvidia.com"],                   local: false },
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -192,6 +192,9 @@ enum Commands {
         model_command: ModelCommands,
     },
 
+    /// List supported AI providers
+    Providers,
+
     /// Manage channels (telegram, discord, slack)
     Channel {
         #[command(subcommand)]
@@ -551,6 +554,27 @@ async fn main() -> Result<()> {
             }
         },
 
+        Commands::Providers => {
+            let providers = providers::list_providers();
+            let current = config.default_provider.as_deref().unwrap_or("openrouter");
+            println!("Supported providers ({} total):\n", providers.len());
+            println!("  {:<19} {}", "ID (use in config)", "DESCRIPTION");
+            println!("  {:<19} {}", "───────────────────", "───────────");
+            for p in &providers {
+                let marker = if p.name == current { " (active)" } else { "" };
+                let local_tag = if p.local { " [local]" } else { "" };
+                let aliases = if p.aliases.is_empty() {
+                    String::new()
+                } else {
+                    format!("  (aliases: {})", p.aliases.join(", "))
+                };
+                println!("  {:<19} {}{}{}{}", p.name, p.display_name, local_tag, marker, aliases);
+            }
+            println!("\n  custom:<URL>   Any OpenAI-compatible endpoint");
+            println!("  anthropic-custom:<URL>  Any Anthropic-compatible endpoint");
+            Ok(())
+        }
+    
         Commands::Service { service_command } => service::handle_command(&service_command, &config),
 
         Commands::Doctor => doctor::run(&config),
