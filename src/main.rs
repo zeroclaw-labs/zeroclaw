@@ -563,8 +563,8 @@ async fn main() -> Result<()> {
                 .trim()
                 .to_ascii_lowercase();
             println!("Supported providers ({} total):\n", providers.len());
-            println!("  {:<19} {}", "ID (use in config)", "DESCRIPTION");
-            println!("  {:<19} {}", "───────────────────", "───────────");
+            println!("  ID (use in config)  DESCRIPTION");
+            println!("  ─────────────────── ───────────");
             for p in &providers {
                 let is_active = p.name.eq_ignore_ascii_case(&current)
                     || p.aliases
