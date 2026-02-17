@@ -1,4 +1,4 @@
-use super::traits::{Channel, ChannelMessage};
+use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use uuid::Uuid;
 
@@ -139,7 +139,7 @@ impl Channel for WhatsAppChannel {
         "whatsapp"
     }
 
-    async fn send(&self, message: &str, recipient: &str) -> anyhow::Result<()> {
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         // WhatsApp Cloud API: POST to /v18.0/{phone_number_id}/messages
         let url = format!(
             "https://graph.facebook.com/v18.0/{}/messages",
@@ -147,7 +147,10 @@ impl Channel for WhatsAppChannel {
         );
 
         // Normalize recipient (remove leading + if present for API)
-        let to = recipient.strip_prefix('+').unwrap_or(recipient);
+        let to = message
+            .recipient
+            .strip_prefix('+')
+            .unwrap_or(&message.recipient);
 
         let body = serde_json::json!({
             "messaging_product": "whatsapp",
@@ -156,7 +159,7 @@ impl Channel for WhatsAppChannel {
             "type": "text",
             "text": {
                 "preview_url": false,
-                "body": message
+                "body": message.content
             }
         });
 

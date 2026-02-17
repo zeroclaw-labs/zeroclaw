@@ -1,4 +1,4 @@
-use crate::channels::traits::{Channel, ChannelMessage};
+use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use directories::UserDirs;
 use rusqlite::{Connection, OpenFlags};
@@ -95,9 +95,9 @@ impl Channel for IMessageChannel {
         "imessage"
     }
 
-    async fn send(&self, message: &str, target: &str) -> anyhow::Result<()> {
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         // Defense-in-depth: validate target format before any interpolation
-        if !is_valid_imessage_target(target) {
+        if !is_valid_imessage_target(&message.recipient) {
             anyhow::bail!(
                 "Invalid iMessage target: must be a phone number (+1234567890) or email (user@example.com)"
             );
@@ -105,8 +105,8 @@ impl Channel for IMessageChannel {
 
         // SECURITY: Escape both message AND target to prevent AppleScript injection
         // See: CWE-78 (OS Command Injection)
-        let escaped_msg = escape_applescript(message);
-        let escaped_target = escape_applescript(target);
+        let escaped_msg = escape_applescript(&message.content);
+        let escaped_target = escape_applescript(&message.recipient);
 
         let script = format!(
             r#"tell application "Messages"

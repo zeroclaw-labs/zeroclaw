@@ -25,7 +25,7 @@ pub use qq::QQChannel;
 pub use signal::SignalChannel;
 pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
-pub use traits::Channel;
+pub use traits::{Channel, SendMessage};
 pub use whatsapp::WhatsAppChannel;
 
 use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
@@ -235,7 +235,10 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                 truncate_with_ellipsis(&response, 80)
             );
             if let Some(channel) = target_channel.as_ref() {
-                if let Err(e) = channel.send(&response, &msg.reply_target).await {
+                if let Err(e) = channel
+                    .send(&SendMessage::new(response, &msg.reply_target))
+                    .await
+                {
                     eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
                 }
             }
@@ -247,7 +250,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             );
             if let Some(channel) = target_channel.as_ref() {
                 let _ = channel
-                    .send(&format!("⚠️ Error: {e}"), &msg.reply_target)
+                    .send(&SendMessage::new(format!("⚠️ Error: {e}"), &msg.reply_target))
                     .await;
             }
         }
@@ -263,10 +266,10 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             );
             if let Some(channel) = target_channel.as_ref() {
                 let _ = channel
-                    .send(
+                    .send(&SendMessage::new(
                         "⚠️ Request timed out while waiting for the model. Please try again.",
                         &msg.reply_target,
-                    )
+                    ))
                     .await;
             }
         }
@@ -1310,11 +1313,11 @@ mod tests {
             "test-channel"
         }
 
-        async fn send(&self, message: &str, recipient: &str) -> anyhow::Result<()> {
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
             self.sent_messages
                 .lock()
                 .await
-                .push(format!("{recipient}:{message}"));
+                .push(format!("{}:{}", message.recipient, message.content));
             Ok(())
         }
 
@@ -2089,7 +2092,7 @@ mod tests {
             self.name
         }
 
-        async fn send(&self, _message: &str, _recipient: &str) -> anyhow::Result<()> {
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
             Ok(())
         }
 

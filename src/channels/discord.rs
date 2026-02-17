@@ -1,4 +1,4 @@
-use super::traits::{Channel, ChannelMessage};
+use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
@@ -185,11 +185,15 @@ impl Channel for DiscordChannel {
         "discord"
     }
 
-    async fn send(&self, message: &str, channel_id: &str) -> anyhow::Result<()> {
-        let chunks = split_message_for_discord(message);
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        let chunks = split_message_for_discord(&message.content);
 
         for (i, chunk) in chunks.iter().enumerate() {
-            let url = format!("https://discord.com/api/v10/channels/{channel_id}/messages");
+            let url = format!(
+                "https://discord.com/api/v10/channels/{}/messages",
+                message.recipient
+            );
+
             let body = json!({ "content": chunk });
 
             let resp = self

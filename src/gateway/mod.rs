@@ -7,7 +7,7 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
-use crate::channels::{Channel, WhatsAppChannel};
+use crate::channels::{Channel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::providers::{self, Provider};
@@ -704,17 +704,17 @@ async fn handle_whatsapp_message(
         {
             Ok(response) => {
                 // Send reply via WhatsApp
-                if let Err(e) = wa.send(&response, &msg.reply_target).await {
+                if let Err(e) = wa.send(&SendMessage::new(response, &msg.reply_target)).await {
                     tracing::error!("Failed to send WhatsApp reply: {e}");
                 }
             }
             Err(e) => {
                 tracing::error!("LLM error for WhatsApp message: {e:#}");
                 let _ = wa
-                    .send(
+                    .send(&SendMessage::new(
                         "Sorry, I couldn't process your message right now.",
                         &msg.reply_target,
-                    )
+                    ))
                     .await;
             }
         }

@@ -11,6 +11,58 @@ pub struct ChannelMessage {
     pub timestamp: u64,
 }
 
+/// Message to send through a channel
+#[derive(Debug, Clone, Default)]
+pub struct SendMessage {
+    pub content: String,
+    pub recipient: String,
+    pub subject: Option<String>,
+}
+
+impl SendMessage {
+    /// Create a new message with content and recipient
+    pub fn new(content: impl Into<String>, recipient: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            recipient: recipient.into(),
+            subject: None,
+        }
+    }
+
+    /// Create a new message with content, recipient, and subject
+    pub fn with_subject(
+        content: impl Into<String>,
+        recipient: impl Into<String>,
+        subject: impl Into<String>,
+    ) -> Self {
+        Self {
+            content: content.into(),
+            recipient: recipient.into(),
+            subject: Some(subject.into()),
+        }
+    }
+}
+
+impl From<&str> for SendMessage {
+    fn from(content: &str) -> Self {
+        Self {
+            content: content.to_string(),
+            recipient: String::new(),
+            subject: None,
+        }
+    }
+}
+
+impl From<(String, String)> for SendMessage {
+    fn from(value: (String, String)) -> Self {
+        Self {
+            content: value.0,
+            recipient: value.1,
+            subject: None,
+        }
+    }
+}
+
 /// Core channel trait — implement for any messaging platform
 #[async_trait]
 pub trait Channel: Send + Sync {
@@ -18,7 +70,7 @@ pub trait Channel: Send + Sync {
     fn name(&self) -> &str;
 
     /// Send a message through this channel
-    async fn send(&self, message: &str, recipient: &str) -> anyhow::Result<()>;
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()>;
 
     /// Start listening for incoming messages (long-running)
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()>;
@@ -52,7 +104,7 @@ mod tests {
             "dummy"
         }
 
-        async fn send(&self, _message: &str, _recipient: &str) -> anyhow::Result<()> {
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
             Ok(())
         }
 
@@ -100,7 +152,7 @@ mod tests {
         assert!(channel.health_check().await);
         assert!(channel.start_typing("bob").await.is_ok());
         assert!(channel.stop_typing("bob").await.is_ok());
-        assert!(channel.send("hello", "bob").await.is_ok());
+        assert!(channel.send(&SendMessage::new("hello", "bob")).await.is_ok());
     }
 
     #[tokio::test]
