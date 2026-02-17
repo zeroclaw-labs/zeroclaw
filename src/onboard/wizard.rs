@@ -887,9 +887,7 @@ fn fetch_anthropic_models(api_key: Option<&str>) -> Result<Vec<String>> {
     let status = response.status();
     if !status.is_success() {
         let body = response.text().unwrap_or_default();
-        bail!(
-            "Anthropic model list request failed (HTTP {status}): {body}"
-        );
+        bail!("Anthropic model list request failed (HTTP {status}): {body}");
     }
 
     let payload: Value = response
@@ -1475,7 +1473,9 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
         } else {
             print_bullet(&format!(
                 "Get your API key at: {}",
-                style("https://console.anthropic.com/settings/keys").cyan().underlined()
+                style("https://console.anthropic.com/settings/keys")
+                    .cyan()
+                    .underlined()
             ));
             print_bullet("Or run `claude setup-token` to get an OAuth setup-token.");
             println!();
