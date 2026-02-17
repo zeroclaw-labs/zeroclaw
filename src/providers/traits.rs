@@ -1,6 +1,7 @@
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::fmt::Write;
 
 /// A single message in a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,21 +196,27 @@ pub trait Provider: Send + Sync {
         // inject tool instructions into system prompt as fallback
         if let Some(tools) = request.tools {
             if !tools.is_empty() && !self.supports_native_tools() {
-                let tool_instructions = build_tool_instructions_text(tools);
+                let tool_instructions = match self.convert_tools(tools) {
+                    ToolsPayload::PromptGuided { instructions } => instructions,
+                    payload => {
+                        anyhow::bail!(
+                            "Provider returned non-prompt-guided tools payload ({payload:?}) while supports_native_tools() is false"
+                        )
+                    }
+                };
                 let mut modified_messages = request.messages.to_vec();
 
-                // Inject tool instructions into system message
-                if let Some(first) = modified_messages.first_mut() {
-                    if first.role == "system" {
-                        first.content.push_str("\n\n");
-                        first.content.push_str(&tool_instructions);
-                    } else {
-                        // No system message exists, prepend one
-                        modified_messages.insert(0, ChatMessage::system(tool_instructions));
+                // Inject tool instructions into an existing system message.
+                // If none exists, prepend one to the conversation.
+                if let Some(system_message) =
+                    modified_messages.iter_mut().find(|m| m.role == "system")
+                {
+                    if !system_message.content.is_empty() {
+                        system_message.content.push_str("\n\n");
                     }
+                    system_message.content.push_str(&tool_instructions);
                 } else {
-                    // Empty message list, add system message
-                    modified_messages.push(ChatMessage::system(tool_instructions));
+                    modified_messages.insert(0, ChatMessage::system(tool_instructions));
                 }
 
                 let text = self
@@ -281,11 +288,14 @@ pub fn build_tool_instructions_text(tools: &[ToolSpec]) -> String {
     instructions.push_str("### Available Tools\n\n");
 
     for tool in tools {
-        instructions.push_str(&format!("**{}**: {}\n", tool.name, tool.description));
-        instructions.push_str(&format!(
-            "Parameters: `{}`\n\n",
-            serde_json::to_string(&tool.parameters).unwrap_or_else(|_| "{}".to_string())
-        ));
+        writeln!(&mut instructions, "**{}**: {}", tool.name, tool.description)
+            .expect("writing to String cannot fail");
+
+        let parameters =
+            serde_json::to_string(&tool.parameters).unwrap_or_else(|_| "{}".to_string());
+        writeln!(&mut instructions, "Parameters: `{parameters}`")
+            .expect("writing to String cannot fail");
+        instructions.push('\n');
     }
 
     instructions
@@ -522,5 +532,149 @@ mod tests {
 
         // Should work normally without tools
         assert!(response.text.is_some());
+    }
+
+    // Provider that echoes the system prompt for assertions.
+    struct EchoSystemProvider {
+        supports_native: bool,
+    }
+
+    #[async_trait]
+    impl Provider for EchoSystemProvider {
+        fn supports_native_tools(&self) -> bool {
+            self.supports_native
+        }
+
+        async fn chat_with_system(
+            &self,
+            system: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(system.unwrap_or_default().to_string())
+        }
+    }
+
+    // Provider with custom prompt-guided conversion.
+    struct CustomConvertProvider;
+
+    #[async_trait]
+    impl Provider for CustomConvertProvider {
+        fn supports_native_tools(&self) -> bool {
+            false
+        }
+
+        fn convert_tools(&self, _tools: &[ToolSpec]) -> ToolsPayload {
+            ToolsPayload::PromptGuided {
+                instructions: "CUSTOM_TOOL_INSTRUCTIONS".to_string(),
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            system: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(system.unwrap_or_default().to_string())
+        }
+    }
+
+    // Provider returning an invalid payload for non-native mode.
+    struct InvalidConvertProvider;
+
+    #[async_trait]
+    impl Provider for InvalidConvertProvider {
+        fn supports_native_tools(&self) -> bool {
+            false
+        }
+
+        fn convert_tools(&self, _tools: &[ToolSpec]) -> ToolsPayload {
+            ToolsPayload::OpenAI {
+                tools: vec![serde_json::json!({"type": "function"})],
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("should_not_reach".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_chat_prompt_guided_preserves_existing_system_not_first() {
+        let provider = EchoSystemProvider {
+            supports_native: false,
+        };
+
+        let tools = vec![ToolSpec {
+            name: "shell".to_string(),
+            description: "Run commands".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+
+        let request = ChatRequest {
+            messages: &[
+                ChatMessage::user("Hello"),
+                ChatMessage::system("BASE_SYSTEM_PROMPT"),
+            ],
+            tools: Some(&tools),
+        };
+
+        let response = provider.chat(request, "model", 0.7).await.unwrap();
+        let text = response.text.unwrap_or_default();
+
+        assert!(text.contains("BASE_SYSTEM_PROMPT"));
+        assert!(text.contains("Tool Use Protocol"));
+    }
+
+    #[tokio::test]
+    async fn provider_chat_prompt_guided_uses_convert_tools_override() {
+        let provider = CustomConvertProvider;
+
+        let tools = vec![ToolSpec {
+            name: "shell".to_string(),
+            description: "Run commands".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+
+        let request = ChatRequest {
+            messages: &[ChatMessage::system("BASE"), ChatMessage::user("Hello")],
+            tools: Some(&tools),
+        };
+
+        let response = provider.chat(request, "model", 0.7).await.unwrap();
+        let text = response.text.unwrap_or_default();
+
+        assert!(text.contains("BASE"));
+        assert!(text.contains("CUSTOM_TOOL_INSTRUCTIONS"));
+    }
+
+    #[tokio::test]
+    async fn provider_chat_prompt_guided_rejects_non_prompt_payload() {
+        let provider = InvalidConvertProvider;
+
+        let tools = vec![ToolSpec {
+            name: "shell".to_string(),
+            description: "Run commands".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+
+        let request = ChatRequest {
+            messages: &[ChatMessage::user("Hello")],
+            tools: Some(&tools),
+        };
+
+        let err = provider.chat(request, "model", 0.7).await.unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("non-prompt-guided"));
     }
 }
