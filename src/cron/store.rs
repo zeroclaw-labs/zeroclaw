@@ -8,6 +8,9 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use uuid::Uuid;
 
+const MAX_CRON_OUTPUT_BYTES: usize = 16 * 1024;
+const TRUNCATED_OUTPUT_MARKER: &str = "\n...[truncated]";
+
 pub fn add_job(config: &Config, expression: &str, command: &str) -> Result<CronJob> {
     let schedule = Schedule::Cron {
         expr: expression.to_string(),
@@ -149,14 +152,19 @@ pub fn remove_job(config: &Config, id: &str) -> Result<()> {
 }
 
 pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
+    let lim = i64::try_from(config.scheduler.max_tasks.max(1))
+        .context("Scheduler max_tasks overflows i64")?;
     with_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output
-             FROM cron_jobs WHERE enabled = 1 AND next_run <= ?1 ORDER BY next_run ASC",
+             FROM cron_jobs
+             WHERE enabled = 1 AND next_run <= ?1
+             ORDER BY next_run ASC
+             LIMIT ?2",
         )?;
 
-        let rows = stmt.query_map(params![now.to_rfc3339()], map_cron_job_row)?;
+        let rows = stmt.query_map(params![now.to_rfc3339(), lim], map_cron_job_row)?;
 
         let mut jobs = Vec::new();
         for row in rows {
@@ -243,12 +251,13 @@ pub fn record_last_run(
     output: &str,
 ) -> Result<()> {
     let status = if success { "ok" } else { "error" };
+    let bounded_output = truncate_cron_output(output);
     with_connection(config, |conn| {
         conn.execute(
             "UPDATE cron_jobs
              SET last_run = ?1, last_status = ?2, last_output = ?3
              WHERE id = ?4",
-            params![finished_at.to_rfc3339(), status, output, job_id],
+            params![finished_at.to_rfc3339(), status, bounded_output, job_id],
         )
         .context("Failed to update cron last run fields")?;
         Ok(())
@@ -264,6 +273,7 @@ pub fn reschedule_after_run(
     let now = Utc::now();
     let next_run = next_run_for_schedule(&job.schedule, now)?;
     let status = if success { "ok" } else { "error" };
+    let bounded_output = truncate_cron_output(output);
 
     with_connection(config, |conn| {
         conn.execute(
@@ -274,7 +284,7 @@ pub fn reschedule_after_run(
                 next_run.to_rfc3339(),
                 now.to_rfc3339(),
                 status,
-                output,
+                bounded_output,
                 job.id
             ],
         )
@@ -292,6 +302,7 @@ pub fn record_run(
     output: Option<&str>,
     duration_ms: i64,
 ) -> Result<()> {
+    let bounded_output = output.map(truncate_cron_output);
     with_connection(config, |conn| {
         conn.execute(
             "INSERT INTO cron_runs (job_id, started_at, finished_at, status, output, duration_ms)
@@ -301,7 +312,7 @@ pub fn record_run(
                 started_at.to_rfc3339(),
                 finished_at.to_rfc3339(),
                 status,
-                output,
+                bounded_output.as_deref(),
                 duration_ms,
             ],
         )
@@ -322,6 +333,25 @@ pub fn record_run(
         .context("Failed to prune cron run history")?;
         Ok(())
     })
+}
+
+fn truncate_cron_output(output: &str) -> String {
+    if output.len() <= MAX_CRON_OUTPUT_BYTES {
+        return output.to_string();
+    }
+
+    if MAX_CRON_OUTPUT_BYTES <= TRUNCATED_OUTPUT_MARKER.len() {
+        return TRUNCATED_OUTPUT_MARKER.to_string();
+    }
+
+    let mut cutoff = MAX_CRON_OUTPUT_BYTES - TRUNCATED_OUTPUT_MARKER.len();
+    while cutoff > 0 && !output.is_char_boundary(cutoff) {
+        cutoff -= 1;
+    }
+
+    let mut truncated = output[..cutoff].to_string();
+    truncated.push_str(TRUNCATED_OUTPUT_MARKER);
+    truncated
 }
 
 pub fn list_runs(config: &Config, job_id: &str, limit: usize) -> Result<Vec<CronRun>> {
@@ -595,6 +625,21 @@ mod tests {
     }
 
     #[test]
+    fn due_jobs_respects_scheduler_max_tasks_limit() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.scheduler.max_tasks = 2;
+
+        let _ = add_job(&config, "* * * * *", "echo due-1").unwrap();
+        let _ = add_job(&config, "* * * * *", "echo due-2").unwrap();
+        let _ = add_job(&config, "* * * * *", "echo due-3").unwrap();
+
+        let far_future = Utc::now() + ChronoDuration::days(365);
+        let due = due_jobs(&config, far_future).unwrap();
+        assert_eq!(due.len(), 2);
+    }
+
+    #[test]
     fn reschedule_after_run_persists_last_status_and_last_run() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
@@ -676,5 +721,44 @@ mod tests {
         remove_job(&config, &job.id).unwrap();
         let runs = list_runs(&config, &job.id, 10).unwrap();
         assert!(runs.is_empty());
+    }
+
+    #[test]
+    fn record_run_truncates_large_output() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "*/5 * * * *", "echo trunc").unwrap();
+        let output = "x".repeat(MAX_CRON_OUTPUT_BYTES + 512);
+
+        record_run(
+            &config,
+            &job.id,
+            Utc::now(),
+            Utc::now(),
+            "ok",
+            Some(&output),
+            1,
+        )
+        .unwrap();
+
+        let runs = list_runs(&config, &job.id, 1).unwrap();
+        let stored = runs[0].output.as_deref().unwrap_or_default();
+        assert!(stored.ends_with(TRUNCATED_OUTPUT_MARKER));
+        assert!(stored.len() <= MAX_CRON_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn reschedule_after_run_truncates_last_output() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "*/5 * * * *", "echo trunc").unwrap();
+        let output = "y".repeat(MAX_CRON_OUTPUT_BYTES + 1024);
+
+        reschedule_after_run(&config, &job, false, &output).unwrap();
+
+        let stored = get_job(&config, &job.id).unwrap();
+        let last_output = stored.last_output.as_deref().unwrap_or_default();
+        assert!(last_output.ends_with(TRUNCATED_OUTPUT_MARKER));
+        assert!(last_output.len() <= MAX_CRON_OUTPUT_BYTES);
     }
 }
