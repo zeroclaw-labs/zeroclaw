@@ -28,6 +28,7 @@ Commands:
   shell         Open an interactive shell inside the CI container
   lint          Run rustfmt + clippy correctness gate (container only)
   lint-strict   Run rustfmt + full clippy warnings gate (container only)
+  lint-delta    Run strict lint delta gate on changed Rust lines (container only)
   test          Run cargo test (container only)
   build         Run release build smoke check (container only)
   audit         Run cargo audit (container only)
@@ -59,6 +60,10 @@ case "$1" in
 
   lint-strict)
     run_in_ci "./scripts/ci/rust_quality_gate.sh --strict"
+    ;;
+
+  lint-delta)
+    run_in_ci "./scripts/ci/rust_strict_delta_gate.sh"
     ;;
 
   test)

@@ -21,8 +21,11 @@ cargo test --locked
 # Format & lint (required before PR)
 ./scripts/ci/rust_quality_gate.sh
 
-# Optional strict lint audit (recommended periodically)
+# Optional strict lint audit (full repo, recommended periodically)
 ./scripts/ci/rust_quality_gate.sh --strict
+
+# Optional strict lint delta gate (blocks only changed Rust lines)
+./scripts/ci/rust_strict_delta_gate.sh
 
 # Optional docs lint gate (blocks only markdown issues on changed lines)
 ./scripts/ci/docs_quality_gate.sh
@@ -42,6 +45,12 @@ For an opt-in strict lint pass during pre-push, set:
 
 ```bash
 ZEROCLAW_STRICT_LINT=1 git push
+```
+
+For an opt-in strict lint delta pass during pre-push (changed Rust lines only), set:
+
+```bash
+ZEROCLAW_STRICT_DELTA_LINT=1 git push
 ```
 
 For an opt-in docs quality pass during pre-push (changed-line markdown gate), set:
@@ -359,7 +368,8 @@ impl Tool for YourTool {
 - [ ] PR template sections are completed (including security + rollback)
 - [ ] `./scripts/ci/rust_quality_gate.sh` — merge gate formatter/lint baseline passes
 - [ ] `cargo test --locked` — all tests pass locally or skipped tests are explained
-- [ ] Optional strict audit: `./scripts/ci/rust_quality_gate.sh --strict` (run when doing lint cleanup or before release-hardening work)
+- [ ] Optional strict audit: `./scripts/ci/rust_quality_gate.sh --strict` (full repo, run when doing lint cleanup or release-hardening work)
+- [ ] Optional strict delta audit: `./scripts/ci/rust_strict_delta_gate.sh` (changed Rust lines only, useful for incremental debt control)
 - [ ] New code has inline `#[cfg(test)]` tests
 - [ ] No new dependencies unless absolutely necessary (we optimize for binary size)
 - [ ] README updated if adding user-facing features

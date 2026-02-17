@@ -115,10 +115,17 @@ To run an opt-in strict lint audit locally:
 ./dev/ci.sh lint-strict
 ```
 
+To run the incremental strict gate (changed Rust lines only):
+
+```bash
+./dev/ci.sh lint-delta
+```
+
 ### 3. Run targeted stages
 
 ```bash
 ./dev/ci.sh lint
+./dev/ci.sh lint-delta
 ./dev/ci.sh test
 ./dev/ci.sh build
 ./dev/ci.sh deny
