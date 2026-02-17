@@ -171,3 +171,8 @@ panic = "abort"
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3.14"
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "agent_benchmarks"
+harness = false
