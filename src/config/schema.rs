@@ -2003,8 +2003,8 @@ impl Config {
             }
         }
 
-        // Model: ZEROCLAW_MODEL
-        if let Ok(model) = std::env::var("ZEROCLAW_MODEL") {
+        // Model: ZEROCLAW_MODEL or MODEL
+        if let Ok(model) = std::env::var("ZEROCLAW_MODEL").or_else(|_| std::env::var("MODEL")) {
             if !model.is_empty() {
                 self.default_model = Some(model);
             }
@@ -3290,6 +3290,22 @@ default_temperature = 0.7
         assert_eq!(config.default_model.as_deref(), Some("gpt-4o"));
 
         std::env::remove_var("ZEROCLAW_MODEL");
+    }
+
+    #[test]
+    fn env_override_model_fallback() {
+        let _env_guard = env_override_test_guard();
+        let mut config = Config::default();
+
+        std::env::remove_var("ZEROCLAW_MODEL");
+        std::env::set_var("MODEL", "anthropic/claude-3.5-sonnet");
+        config.apply_env_overrides();
+        assert_eq!(
+            config.default_model.as_deref(),
+            Some("anthropic/claude-3.5-sonnet")
+        );
+
+        std::env::remove_var("MODEL");
     }
 
     #[test]
