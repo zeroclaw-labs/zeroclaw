@@ -563,6 +563,46 @@ fn inject_workspace_file(
     }
 }
 
+fn normalize_telegram_identity(value: &str) -> String {
+    value.trim().trim_start_matches('@').to_string()
+}
+
+fn bind_telegram_identity(config: &Config, identity: &str) -> Result<()> {
+    let normalized = normalize_telegram_identity(identity);
+    if normalized.is_empty() {
+        anyhow::bail!("Telegram identity cannot be empty");
+    }
+
+    let mut updated = config.clone();
+    let Some(telegram) = updated.channels_config.telegram.as_mut() else {
+        anyhow::bail!(
+            "Telegram channel is not configured. Run `zeroclaw onboard --channels-only` first"
+        );
+    };
+
+    if telegram.allowed_users.iter().any(|u| u == "*") {
+        println!(
+            "⚠️ Telegram allowlist is currently wildcard (`*`) — binding is unnecessary until you remove '*'."
+        );
+    }
+
+    if telegram
+        .allowed_users
+        .iter()
+        .map(|entry| normalize_telegram_identity(entry))
+        .any(|entry| entry == normalized)
+    {
+        println!("✅ Telegram identity already bound: {normalized}");
+        return Ok(());
+    }
+
+    telegram.allowed_users.push(normalized.clone());
+    updated.save()?;
+    println!("✅ Bound Telegram identity: {normalized}");
+    println!("   Saved to {}", updated.config_path.display());
+    Ok(())
+}
+
 pub fn handle_command(command: crate::ChannelCommands, config: &Config) -> Result<()> {
     match command {
         crate::ChannelCommands::Start => {
@@ -605,6 +645,9 @@ pub fn handle_command(command: crate::ChannelCommands, config: &Config) -> Resul
         }
         crate::ChannelCommands::Remove { name } => {
             anyhow::bail!("Remove channel '{name}' — edit ~/.zeroclaw/config.toml directly");
+        }
+        crate::ChannelCommands::BindTelegram { identity } => {
+            bind_telegram_identity(config, &identity)
         }
     }
 }
