@@ -1347,6 +1347,7 @@ mod tests {
             "cohere",
             "copilot",
             "nvidia",
+            "astrai",
         ];
         for name in providers {
             assert!(

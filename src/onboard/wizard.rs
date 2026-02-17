@@ -1402,6 +1402,10 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
         2 => vec![
             ("vercel", "Vercel AI Gateway"),
             ("cloudflare", "Cloudflare AI Gateway"),
+            (
+                "astrai",
+                "Astrai — compliant AI routing (PII stripping, cost optimization)",
+            ),
             ("bedrock", "Amazon Bedrock — AWS managed models"),
         ],
         3 => vec![
@@ -2002,6 +2006,7 @@ fn provider_env_var(name: &str) -> &'static str {
         "bedrock" | "aws-bedrock" => "AWS_ACCESS_KEY_ID",
         "gemini" => "GEMINI_API_KEY",
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => "NVIDIA_API_KEY",
+        "astrai" => "ASTRAI_API_KEY",
         _ => "API_KEY",
     }
 }
@@ -4793,6 +4798,7 @@ mod tests {
         assert_eq!(provider_env_var("nvidia"), "NVIDIA_API_KEY");
         assert_eq!(provider_env_var("nvidia-nim"), "NVIDIA_API_KEY"); // alias
         assert_eq!(provider_env_var("build.nvidia.com"), "NVIDIA_API_KEY"); // alias
+        assert_eq!(provider_env_var("astrai"), "ASTRAI_API_KEY");
     }
 
     #[test]
