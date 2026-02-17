@@ -611,19 +611,6 @@ dependencies = [
 
 [[package]]
 name = "console"
-version = "0.15.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "054ccb5b10f9f2cbf51eb355ca1d05c2d279ce1804688d0db74b4733a5aeafd8"
-dependencies = [
- "encode_unicode",
- "libc",
- "once_cell",
- "unicode-width 0.2.2",
- "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "console"
 version = "0.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03e45a4a8926227e4197636ba97a9fc9b00477e9f4bd711395687c5f0734bec4"
@@ -902,7 +889,7 @@ version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "25f104b501bf2364e78d0d3974cbc774f738f5865306ed128e1e0d7499c0ad96"
 dependencies = [
- "console 0.16.2",
+ "console",
  "fuzzy-matcher",
  "shell-words",
  "tempfile",
@@ -3259,7 +3246,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3659,6 +3646,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
+ "windows-sys 0.52.0",
  "windows-sys 0.59.0",
 ]
 
@@ -5127,7 +5115,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "clap",
- "console 0.15.11",
+ "console",
  "criterion",
  "cron",
  "dialoguer",
