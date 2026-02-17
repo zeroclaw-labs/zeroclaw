@@ -62,7 +62,7 @@ sha2 = "0.10"
 hex = "0.4"
 
 # CSPRNG for secure token generation
-rand = "0.8"
+rand = "0.9"
 
 # Fast mutexes that don't poison on panic
 parking_lot = "0.12"
