@@ -1,4 +1,4 @@
-use crate::config::schema::{DingTalkConfig, IrcConfig, WhatsAppConfig};
+use crate::config::schema::{DingTalkConfig, IrcConfig, QQConfig, WhatsAppConfig};
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
     HeartbeatConfig, IMessageConfig, MatrixConfig, MemoryConfig, ObservabilityConfig,
@@ -158,7 +158,8 @@ pub fn run_wizard() -> Result<Config> {
         || config.channels_config.imessage.is_some()
         || config.channels_config.matrix.is_some()
         || config.channels_config.email.is_some()
-        || config.channels_config.dingtalk.is_some();
+        || config.channels_config.dingtalk.is_some()
+        || config.channels_config.qq.is_some();
 
     if has_channels && config.api_key.is_some() {
         let launch: bool = Confirm::new()
@@ -215,7 +216,8 @@ pub fn run_channels_repair_wizard() -> Result<Config> {
         || config.channels_config.imessage.is_some()
         || config.channels_config.matrix.is_some()
         || config.channels_config.email.is_some()
-        || config.channels_config.dingtalk.is_some();
+        || config.channels_config.dingtalk.is_some()
+        || config.channels_config.qq.is_some();
 
     if has_channels && config.api_key.is_some() {
         let launch: bool = Confirm::new()
@@ -2427,6 +2429,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
         irc: None,
         lark: None,
         dingtalk: None,
+        qq: None,
     };
 
     loop {
@@ -2503,13 +2506,21 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     "— DingTalk Stream Mode"
                 }
             ),
+            format!(
+                "QQ Official {}",
+                if config.qq.is_some() {
+                    "✅ connected"
+                } else {
+                    "— Tencent QQ Bot"
+                }
+            ),
             "Done — finish setup".to_string(),
         ];
 
         let choice = Select::new()
             .with_prompt("  Connect a channel (or Done to continue)")
             .items(&options)
-            .default(9)
+            .default(10)
             .interact()?;
 
         match choice {
@@ -3291,6 +3302,82 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     allowed_users,
                 });
             }
+            9 => {
+                // ── QQ Official ──
+                println!();
+                println!(
+                    "  {} {}",
+                    style("QQ Official Setup").white().bold(),
+                    style("— Tencent QQ Bot SDK").dim()
+                );
+                print_bullet("1. Go to QQ Bot developer console (q.qq.com)");
+                print_bullet("2. Create a bot application");
+                print_bullet("3. Copy the App ID and App Secret");
+                println!();
+
+                let app_id: String = Input::new().with_prompt("  App ID").interact_text()?;
+
+                if app_id.trim().is_empty() {
+                    println!("  {} Skipped", style("→").dim());
+                    continue;
+                }
+
+                let app_secret: String =
+                    Input::new().with_prompt("  App Secret").interact_text()?;
+
+                // Test connection
+                print!("  {} Testing connection... ", style("⏳").dim());
+                let client = reqwest::blocking::Client::new();
+                let body = serde_json::json!({
+                    "appId": app_id,
+                    "clientSecret": app_secret,
+                });
+                match client
+                    .post("https://bots.qq.com/app/getAppAccessToken")
+                    .json(&body)
+                    .send()
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        let data: serde_json::Value = resp.json().unwrap_or_default();
+                        if data.get("access_token").is_some() {
+                            println!(
+                                "\r  {} QQ Bot credentials verified        ",
+                                style("✅").green().bold()
+                            );
+                        } else {
+                            println!(
+                                "\r  {} Auth error — check your credentials",
+                                style("❌").red().bold()
+                            );
+                            continue;
+                        }
+                    }
+                    _ => {
+                        println!(
+                            "\r  {} Connection failed — check your credentials",
+                            style("❌").red().bold()
+                        );
+                        continue;
+                    }
+                }
+
+                let users_str: String = Input::new()
+                    .with_prompt("  Allowed user IDs (comma-separated, '*' for all)")
+                    .allow_empty(true)
+                    .interact_text()?;
+
+                let allowed_users: Vec<String> = users_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+
+                config.qq = Some(QQConfig {
+                    app_id,
+                    app_secret,
+                    allowed_users,
+                });
+            }
             _ => break, // Done
         }
         println!();
@@ -3327,6 +3414,9 @@ fn setup_channels() -> Result<ChannelsConfig> {
     }
     if config.dingtalk.is_some() {
         active.push("DingTalk");
+    }
+    if config.qq.is_some() {
+        active.push("QQ");
     }
 
     println!(
@@ -3779,7 +3869,8 @@ fn print_summary(config: &Config) {
         || config.channels_config.imessage.is_some()
         || config.channels_config.matrix.is_some()
         || config.channels_config.email.is_some()
-        || config.channels_config.dingtalk.is_some();
+        || config.channels_config.dingtalk.is_some()
+        || config.channels_config.qq.is_some();
 
     println!();
     println!(

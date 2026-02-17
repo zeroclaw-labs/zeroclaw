@@ -143,6 +143,18 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
                 }
             },
         },
+        IntegrationEntry {
+            name: "QQ Official",
+            description: "Tencent QQ Bot SDK",
+            category: IntegrationCategory::Chat,
+            status_fn: |c| {
+                if c.channels_config.qq.is_some() {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
+        },
         // ── AI Models ───────────────────────────────────────────
         IntegrationEntry {
             name: "OpenRouter",
