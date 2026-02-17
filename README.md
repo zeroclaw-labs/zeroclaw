@@ -686,5 +686,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Implement a trait, submit a PR:
 <p align="center">
   <a href="https://www.star-history.com/#zeroclaw-labs/zeroclaw&Date">
     <img src="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=Date" alt="Star History Chart" />
-  </a>
-</p>
+  </a>  
+
+
+  </p>
+-shamanth says that this community id amazing
+
