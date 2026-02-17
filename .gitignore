@@ -5,3 +5,5 @@ firmware/*/target
 .DS_Store
 .wt-pr37/
 .env
+__pycache__/
+*.pyc
