@@ -688,16 +688,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     }
 
     if let Some(ref lk) = config.channels_config.lark {
-        channels.push((
-            "Lark",
-            Arc::new(LarkChannel::new(
-                lk.app_id.clone(),
-                lk.app_secret.clone(),
-                lk.verification_token.clone().unwrap_or_default(),
-                lk.port,
-                lk.allowed_users.clone(),
-            )),
-        ));
+        channels.push(("Lark", Arc::new(LarkChannel::from_config(lk))));
     }
 
     if let Some(ref dt) = config.channels_config.dingtalk {

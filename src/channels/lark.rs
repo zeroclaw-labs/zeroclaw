@@ -201,6 +201,14 @@ impl LarkChannel {
         }
     }
 
+    fn tenant_access_token_url(&self) -> String {
+        format!("{}/auth/v3/tenant_access_token/internal", self.api_base())
+    }
+
+    fn send_message_url(&self) -> String {
+        format!("{}/im/v1/messages?receive_id_type=chat_id", self.api_base())
+    }
+
     /// POST /callback/ws/endpoint → (wss_url, client_config)
     async fn get_ws_endpoint(&self) -> anyhow::Result<(String, WsClientConfig)> {
         let resp = self
@@ -473,7 +481,7 @@ impl LarkChannel {
             }
         }
 
-        let url = format!("{FEISHU_BASE_URL}/auth/v3/tenant_access_token/internal");
+        let url = self.tenant_access_token_url();
         let body = serde_json::json!({
             "app_id": self.app_id,
             "app_secret": self.app_secret,
@@ -622,7 +630,7 @@ impl Channel for LarkChannel {
 
     async fn send(&self, message: &str, recipient: &str) -> anyhow::Result<()> {
         let token = self.get_tenant_access_token().await?;
-        let url = format!("{FEISHU_BASE_URL}/im/v1/messages?receive_id_type=chat_id");
+        let url = self.send_message_url();
 
         let content = serde_json::json!({ "text": message }).to_string();
         let body = serde_json::json!({
@@ -1166,11 +1174,36 @@ mod tests {
 
     #[test]
     fn lark_config_defaults_optional_fields() {
-        use crate::config::schema::LarkConfig;
+        use crate::config::schema::{LarkConfig, LarkReceiveMode};
         let json = r#"{"app_id":"a","app_secret":"s"}"#;
         let parsed: LarkConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.verification_token.is_none());
         assert!(parsed.allowed_users.is_empty());
+        assert_eq!(parsed.receive_mode, LarkReceiveMode::Websocket);
+        assert!(parsed.port.is_none());
+    }
+
+    #[test]
+    fn lark_from_config_preserves_mode_and_region() {
+        use crate::config::schema::{LarkConfig, LarkReceiveMode};
+
+        let cfg = LarkConfig {
+            app_id: "cli_app123".into(),
+            app_secret: "secret456".into(),
+            encrypt_key: None,
+            verification_token: Some("vtoken789".into()),
+            allowed_users: vec!["*".into()],
+            use_feishu: false,
+            receive_mode: LarkReceiveMode::Webhook,
+            port: Some(9898),
+        };
+
+        let ch = LarkChannel::from_config(&cfg);
+
+        assert_eq!(ch.api_base(), LARK_BASE_URL);
+        assert_eq!(ch.ws_base(), LARK_WS_BASE_URL);
+        assert_eq!(ch.receive_mode, LarkReceiveMode::Webhook);
+        assert_eq!(ch.port, Some(9898));
     }
 
     #[test]
