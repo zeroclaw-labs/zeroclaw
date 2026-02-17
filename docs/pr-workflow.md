@@ -52,6 +52,7 @@ Maintain these branch protection rules on `main`:
 - `PR Labeler` applies scope/path labels + size labels + risk labels + module labels (for example `channel:telegram`, `provider:kimi`, `tool:shell`) and contributor tiers by merged PR count (`trusted` >=5, `experienced` >=10, `principal` >=20, `distinguished` >=50), while de-duplicating less-specific scope labels when a more specific module label is present.
 - For all module prefixes, module labels are compacted to reduce noise: one specific module keeps `prefix:component`, but multiple specifics collapse to the base scope label `prefix`.
 - Label ordering is priority-first: `risk:*` -> `size:*` -> contributor tier -> module/path labels.
+- Maintainers can run `PR Labeler` manually (`workflow_dispatch`) in `audit` mode for drift visibility or `repair` mode to normalize managed label metadata repository-wide.
 - Hovering a label in GitHub shows its auto-managed description (rule/threshold summary).
 - Managed label colors are arranged by display order to create a smooth gradient across long label rows.
 - `Auto Response` posts first-time guidance, handles label-driven routing for low-signal items, and auto-applies issue contributor tiers using the same thresholds as `PR Labeler` (`trusted` >=5, `experienced` >=10, `principal` >=20, `distinguished` >=50).

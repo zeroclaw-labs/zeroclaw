@@ -35,6 +35,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
     - Additional behavior: applies contributor tiers on PRs by merged PR count (`trusted` >=5, `experienced` >=10, `principal` >=20, `distinguished` >=50)
     - Additional behavior: final label set is priority-sorted (`risk:*` first, then `size:*`, then contributor tier, then module/path labels)
     - Additional behavior: managed label colors follow display order to produce a smooth left-to-right gradient when many labels are present
+    - Manual governance: supports `workflow_dispatch` with `mode=audit|repair` to inspect/fix managed label metadata drift across the whole repository
     - Additional behavior: risk + size labels are auto-corrected on manual PR label edits (`labeled`/`unlabeled` events); apply `risk: manual` when maintainers intentionally override automated risk selection
     - High-risk heuristic paths: `src/security/**`, `src/runtime/**`, `src/gateway/**`, `src/tools/**`, `.github/workflows/**`
     - Guardrail: maintainers can apply `risk: manual` to freeze automated risk recalculation
