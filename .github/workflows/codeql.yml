@@ -21,19 +21,21 @@ jobs:
         timeout-minutes: 30
         steps:
             - name: Checkout repository
-              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+              uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # tag v6.0.2
 
             - name: Initialize CodeQL
-              uses: github/codeql-action/init@v4
+              uses: github/codeql-action/init@9e907b5e64f6b83e7804b09294d44122997950d6 # tag v4.32.3
               with:
                   languages: rust
                   config-file: ./.github/codeql/codeql-config.yml
 
             - name: Set up Rust
-              uses: dtolnay/rust-toolchain@stable
+              uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # tag v1
+              with:
+                  toolchain: stable
 
             - name: Build
               run: cargo build --workspace --all-targets
 
             - name: Perform CodeQL Analysis
-              uses: github/codeql-action/analyze@v4
+              uses: github/codeql-action/analyze@9e907b5e64f6b83e7804b09294d44122997950d6 # tag v4.32.3
