@@ -229,6 +229,7 @@ impl Channel for DingTalkChannel {
                     let channel_msg = ChannelMessage {
                         id: Uuid::new_v4().to_string(),
                         sender: sender_id.to_string(),
+                        reply_to: sender_id.to_string(),
                         content: content.to_string(),
                         channel: "dingtalk".to_string(),
                         timestamp: std::time::SystemTime::now()

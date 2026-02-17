@@ -353,6 +353,7 @@ impl Channel for DiscordChannel {
                             format!("discord_{message_id}")
                         },
                         sender: author_id.to_string(),
+                        reply_to: channel_id.clone(),
                         content: content.to_string(),
                         channel: "discord".to_string(),
                         timestamp: std::time::SystemTime::now()

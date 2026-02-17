@@ -40,6 +40,7 @@ impl Channel for CliChannel {
             let msg = ChannelMessage {
                 id: Uuid::new_v4().to_string(),
                 sender: "user".to_string(),
+                reply_to: "user".to_string(),
                 content: line,
                 channel: "cli".to_string(),
                 timestamp: std::time::SystemTime::now()
@@ -90,6 +91,7 @@ mod tests {
         let msg = ChannelMessage {
             id: "test-id".into(),
             sender: "user".into(),
+            reply_to: "user".into(),
             content: "hello".into(),
             channel: "cli".into(),
             timestamp: 1_234_567_890,
@@ -106,6 +108,7 @@ mod tests {
         let msg = ChannelMessage {
             id: "id".into(),
             sender: "s".into(),
+            reply_to: "s".into(),
             content: "c".into(),
             channel: "ch".into(),
             timestamp: 0,
