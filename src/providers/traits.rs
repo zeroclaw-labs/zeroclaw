@@ -76,6 +76,13 @@ pub struct ChatRequest<'a> {
     pub tools: Option<&'a [ToolSpec]>,
 }
 
+/// Declares optional provider features.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProviderCapabilities {
+    /// Provider can perform native tool calling without prompt-level emulation.
+    pub native_tool_calling: bool,
+}
+
 /// A tool result to feed back to the LLM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResultMessage {
@@ -189,21 +196,6 @@ pub enum StreamError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-}
-
-/// Provider capabilities declaration.
-///
-/// Describes what features a provider supports, enabling intelligent
-/// adaptation of tool calling modes and request formatting.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ProviderCapabilities {
-    /// Whether the provider supports native tool calling via API primitives.
-    ///
-    /// When `true`, the provider can convert tool definitions to API-native
-    /// formats (e.g., Gemini's functionDeclarations, Anthropic's input_schema).
-    ///
-    /// When `false`, tools must be injected via system prompt as text.
-    pub native_tool_calling: bool,
 }
 
 #[async_trait]
@@ -329,11 +321,21 @@ pub trait Provider: Send + Sync {
     /// Default implementation falls back to stream_chat_with_system with last user message.
     fn stream_chat_with_history(
         &self,
-        _messages: &[ChatMessage],
+        messages: &[ChatMessage],
         _model: &str,
         _temperature: f64,
         _options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let _system = messages
+            .iter()
+            .find(|m| m.role == "system")
+            .map(|m| m.content.clone());
+        let _last_user = messages
+            .iter()
+            .rfind(|m| m.role == "user")
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+
         // For default implementation, we need to convert to owned strings
         // This is a limitation of the default implementation
         let provider_name = "unknown".to_string();

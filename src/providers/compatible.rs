@@ -683,7 +683,7 @@ impl Provider for OpenAiCompatibleProvider {
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
         let credential = match self.credential.as_ref() {
-            Some(key) => key.clone(),
+            Some(value) => value.clone(),
             None => {
                 let provider_name = self.name.clone();
                 return stream::once(async move {

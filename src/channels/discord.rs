@@ -363,11 +363,7 @@ impl Channel for DiscordChannel {
                     };
 
                     let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
-                    let channel_id = d
-                        .get("channel_id")
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("")
-                        .to_string();
+                    let channel_id = d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("").to_string();
 
                     let channel_msg = ChannelMessage {
                         id: if message_id.is_empty() {
@@ -379,10 +375,10 @@ impl Channel for DiscordChannel {
                         reply_target: if channel_id.is_empty() {
                             author_id.to_string()
                         } else {
-                            channel_id
+                            channel_id.clone()
                         },
-                        content: content.to_string(),
-                        channel: "discord".to_string(),
+                        content: clean_content,
+                        channel: channel_id,
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
