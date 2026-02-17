@@ -50,19 +50,22 @@ mod tests {
         }
 
         // Test case 3: Non-Unix platforms should handle symlink errors gracefully
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
             let source_dir = tmp.path().join("source_skill");
             std::fs::create_dir_all(&source_dir).unwrap();
 
             let dest_link = skills_path.join("linked_skill");
 
-            // Symlink should fail on non-Unix
-            let result = std::os::unix::fs::symlink(&source_dir, &dest_link);
-            assert!(result.is_err());
-
-            // Directory should not exist
-            assert!(!dest_link.exists());
+            // On Windows, creating directory symlinks may require elevated privileges
+            let result = std::os::windows::fs::symlink_dir(&source_dir, &dest_link);
+            // If symlink creation fails (no privileges), the directory should not exist
+            if result.is_err() {
+                assert!(!dest_link.exists());
+            } else {
+                // Clean up if it succeeded
+                let _ = std::fs::remove_dir(&dest_link);
+            }
         }
 
         // Test case 4: skills_dir function edge cases
