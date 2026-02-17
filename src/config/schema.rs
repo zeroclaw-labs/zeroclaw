@@ -1595,7 +1595,7 @@ impl Default for AuditConfig {
     }
 }
 
-/// DingTalk (钉钉) configuration for Stream Mode messaging
+/// DingTalk configuration for Stream Mode messaging
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DingTalkConfig {
     /// Client ID (AppKey) from DingTalk developer console

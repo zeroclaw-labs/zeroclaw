@@ -127,7 +127,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
         },
         IntegrationEntry {
             name: "DingTalk",
-            description: "DingTalk Stream Mode (钉钉)",
+            description: "DingTalk Stream Mode",
             category: IntegrationCategory::Chat,
             status_fn: |c| {
                 if c.channels_config.dingtalk.is_some() {

@@ -2451,7 +2451,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 if config.dingtalk.is_some() {
                     "✅ connected"
                 } else {
-                    "— 钉钉 Stream Mode"
+                    "— DingTalk Stream Mode"
                 }
             ),
             "Done — finish setup".to_string(),
@@ -3178,7 +3178,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 println!(
                     "  {} {}",
                     style("DingTalk Setup").white().bold(),
-                    style("— 钉钉 Stream Mode").dim()
+                    style("— DingTalk Stream Mode").dim()
                 );
                 print_bullet("1. Go to DingTalk developer console (open.dingtalk.com)");
                 print_bullet("2. Create an app and enable the Stream Mode bot");
