@@ -28,7 +28,7 @@ jobs:
             timeout_minutes: 20
             toolchain: stable
             run_command: |
-                cargo install --locked cargo-audit --version 0.22.1
+                cargo install --locked cargo-audit
                 cargo audit
 
     deny:
