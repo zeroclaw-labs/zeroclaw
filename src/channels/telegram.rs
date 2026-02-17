@@ -1115,8 +1115,7 @@ impl Channel for TelegramChannel {
             return Ok(());
         }
 
-        self.send_text_chunks(&content, &message.recipient)
-            .await
+        self.send_text_chunks(&content, &message.recipient).await
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
@@ -1838,7 +1837,8 @@ mod tests {
 
     #[test]
     fn strip_tool_call_tags_removes_standard_tags() {
-        let input = "Hello <tool>{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}</tool> world";
+        let input =
+            "Hello <tool>{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}</tool> world";
         let result = strip_tool_call_tags(input);
         assert_eq!(result, "Hello  world");
     }
@@ -1866,8 +1866,7 @@ mod tests {
 
     #[test]
     fn strip_tool_call_tags_handles_mixed_tags() {
-        let input =
-            "A <tool>a</tool> B <toolcall>b</toolcall> C <tool-call>c</tool-call> D";
+        let input = "A <tool>a</tool> B <toolcall>b</toolcall> C <tool-call>c</tool-call> D";
         let result = strip_tool_call_tags(input);
         assert_eq!(result, "A  B  C  D");
     }
