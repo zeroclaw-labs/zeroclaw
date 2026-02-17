@@ -3192,5 +3192,4 @@ default_model = "legacy-model"
         let parsed: LarkConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.allowed_users, vec!["*"]);
     }
-
 }
