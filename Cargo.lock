@@ -4918,7 +4918,6 @@ dependencies = [
  "lettre",
  "mail-parser",
  "nusb 0.2.1",
- "once_cell",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

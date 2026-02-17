@@ -485,7 +485,9 @@ pub fn build_system_prompt(
 
     // ── 8. Channel Capabilities ─────────────────────────────────────
     prompt.push_str("## Channel Capabilities\n\n");
-    prompt.push_str("- You are running as a Discord bot. You CAN and do send messages to Discord channels.\n");
+    prompt.push_str(
+        "- You are running as a Discord bot. You CAN and do send messages to Discord channels.\n",
+    );
     prompt.push_str("- When someone messages you on Discord, your response is automatically sent back to Discord.\n");
     prompt.push_str("- You do NOT need to ask permission to respond — just respond directly.\n");
     prompt.push_str("- NEVER repeat, describe, or echo credentials, tokens, API keys, or secrets in your responses.\n");

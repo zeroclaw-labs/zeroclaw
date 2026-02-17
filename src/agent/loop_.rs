@@ -7,19 +7,18 @@ use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
+use regex::{Regex, RegexSet};
 use std::fmt::Write;
 use std::io::Write as _;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 use uuid::Uuid;
-use regex::{Regex, RegexSet};
-use once_cell::sync::Lazy;
 
 /// Maximum agentic tool-use iterations per user message to prevent runaway loops.
 const MAX_TOOL_ITERATIONS: usize = 10;
 
-static SENSITIVE_KEY_PATTERNS: Lazy<RegexSet> = Lazy::new(|| {
-    RegexSet::new(&[
+static SENSITIVE_KEY_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
+    RegexSet::new([
         r"(?i)token",
         r"(?i)api[_-]?key",
         r"(?i)password",
@@ -27,10 +26,11 @@ static SENSITIVE_KEY_PATTERNS: Lazy<RegexSet> = Lazy::new(|| {
         r"(?i)user[_-]?key",
         r"(?i)bearer",
         r"(?i)credential",
-    ]).unwrap()
+    ])
+    .unwrap()
 });
 
-static SENSITIVE_KV_REGEX: Lazy<Regex> = Lazy::new(|| {
+static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)(token|api[_-]?key|password|secret|user[_-]?key|bearer|credential)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\.]{8,}))"#).unwrap()
 });
 
@@ -38,34 +38,37 @@ static SENSITIVE_KV_REGEX: Lazy<Regex> = Lazy::new(|| {
 /// Replaces known credential patterns with a redacted placeholder while preserving
 /// a small prefix for context.
 fn scrub_credentials(input: &str) -> String {
-    SENSITIVE_KV_REGEX.replace_all(input, |caps: &regex::Captures| {
-        let full_match = &caps[0];
-        let key = &caps[1];
-        let val = caps.get(2).or(caps.get(3)).or(caps.get(4)).map(|m| m.as_str()).unwrap_or("");
-        
-        // Preserve first 4 chars for context, then redact
-        let prefix = if val.len() > 4 {
-            &val[..4]
-        } else {
-            ""
-        };
-        
-        if full_match.contains(':') {
-            if full_match.contains('"') {
-                format!("\"{}\": \"{}*[REDACTED]\"", key, prefix)
+    SENSITIVE_KV_REGEX
+        .replace_all(input, |caps: &regex::Captures| {
+            let full_match = &caps[0];
+            let key = &caps[1];
+            let val = caps
+                .get(2)
+                .or(caps.get(3))
+                .or(caps.get(4))
+                .map(|m| m.as_str())
+                .unwrap_or("");
+
+            // Preserve first 4 chars for context, then redact
+            let prefix = if val.len() > 4 { &val[..4] } else { "" };
+
+            if full_match.contains(':') {
+                if full_match.contains('"') {
+                    format!("\"{}\": \"{}*[REDACTED]\"", key, prefix)
+                } else {
+                    format!("{}: {}*[REDACTED]", key, prefix)
+                }
+            } else if full_match.contains('=') {
+                if full_match.contains('"') {
+                    format!("{}=\"{}*[REDACTED]\"", key, prefix)
+                } else {
+                    format!("{}={}*[REDACTED]", key, prefix)
+                }
             } else {
                 format!("{}: {}*[REDACTED]", key, prefix)
             }
-        } else if full_match.contains('=') {
-            if full_match.contains('"') {
-                format!("{}=\"{}*[REDACTED]\"", key, prefix)
-            } else {
-                format!("{}={}*[REDACTED]", key, prefix)
-            }
-        } else {
-            format!("{}: {}*[REDACTED]", key, prefix)
-        }
-    }).to_string()
+        })
+        .to_string()
 }
 
 /// Trigger auto-compaction when non-system message count exceeds this threshold.
@@ -489,6 +492,7 @@ struct ParsedToolCall {
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
 /// When `silent` is true, suppresses stdout (for channel use).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn agent_turn(
     provider: &dyn Provider,
     history: &mut Vec<ChatMessage>,
@@ -514,6 +518,7 @@ pub(crate) async fn agent_turn(
 
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_tool_call_loop(
     provider: &dyn Provider,
     history: &mut Vec<ChatMessage>,
