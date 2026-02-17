@@ -79,6 +79,94 @@ git push --no-verify
 
 > **Note:** CI runs the same checks, so skipped hooks will be caught on the PR.
 
+## Local Secret Management (Required)
+
+ZeroClaw supports layered secret management for local development and CI hygiene.
+
+### Secret Storage Options
+
+1. **Environment variables** (recommended for local development)
+    - Copy `.env.example` to `.env` and fill in values
+    - `.env` files are Git-ignored and should stay local
+    - Best for temporary/local API keys
+
+2. **Config file** (`~/.zeroclaw/config.toml`)
+    - Persistent setup for long-term use
+    - When `secrets.encrypt = true` (default), secret values are encrypted before save
+    - Secret key is stored at `~/.zeroclaw/.secret_key` with restricted permissions
+    - Use `zeroclaw onboard` for guided setup
+
+### Runtime Resolution Rules
+
+API key resolution follows this order:
+
+1. Explicit key passed from config/CLI
+2. Provider-specific env vars (`OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, ...)
+3. Generic env vars (`ZEROCLAW_API_KEY`, `API_KEY`)
+
+Provider/model config overrides:
+
+- `ZEROCLAW_PROVIDER` / `PROVIDER`
+- `ZEROCLAW_MODEL`
+
+See `.env.example` for practical examples and currently supported provider key env vars.
+
+### Pre-Commit Secret Hygiene (Mandatory)
+
+Before every commit, verify:
+
+- [ ] No `.env` files are staged (`.env.example` only)
+- [ ] No raw API keys/tokens in code, tests, fixtures, examples, logs, or commit messages
+- [ ] No credentials in debug output or error payloads
+- [ ] `git diff --cached` has no accidental secret-like strings
+
+Quick local audit:
+
+```bash
+# Search staged diff for common secret markers
+git diff --cached | grep -iE '(api[_-]?key|secret|token|password|bearer|sk-)'
+
+# Confirm no .env file is staged
+git status --short | grep -E '\.env$'
+```
+
+### Optional Local Secret Scanning
+
+For extra guardrails, install one of:
+
+- **gitleaks**: [GitHub - gitleaks/gitleaks](https://github.com/gitleaks/gitleaks)
+- **truffleHog**: [GitHub - trufflesecurity/trufflehog](https://github.com/trufflesecurity/trufflehog)
+- **git-secrets**: [GitHub - awslabs/git-secrets](https://github.com/awslabs/git-secrets)
+
+This repo includes `.githooks/pre-commit` to run `gitleaks protect --staged --redact` when gitleaks is installed.
+
+Enable hooks with:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+If gitleaks is not installed, the pre-commit hook prints a warning and continues.
+
+### What Must Never Be Committed
+
+- `.env` files (use `.env.example` only)
+- API keys, tokens, passwords, or credentials (plain or encrypted)
+- OAuth tokens or session identifiers
+- Webhook signing secrets
+- `~/.zeroclaw/.secret_key` or similar key files
+- Personal identifiers or real user data in tests/fixtures
+
+### If a Secret Is Committed Accidentally
+
+1. Revoke/rotate the credential immediately
+2. Do not rely only on `git revert` (history still contains the secret)
+3. Purge history with `git filter-repo` or BFG
+4. Force-push cleaned history (coordinate with maintainers)
+5. Ensure the leaked value is removed from PR/issue/discussion/comment history
+
+Reference: [GitHub guide: removing sensitive data from a repository](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/removing-sensitive-data-from-a-repository)
+
 ## Collaboration Tracks (Risk-Based)
 
 To keep review throughput high without lowering quality, every PR should map to one track:
