@@ -1002,7 +1002,25 @@ fn fetch_live_models_for_provider(provider_name: &str, api_key: &str) -> Result<
         )?,
         "anthropic" => fetch_anthropic_models(api_key.as_deref())?,
         "gemini" => fetch_gemini_models(api_key.as_deref())?,
-        "ollama" => fetch_ollama_models()?,
+        "ollama" => {
+            if api_key.as_deref().map_or(true, |k| k.trim().is_empty()) {
+                // Key is None or empty, assume local Ollama
+                fetch_ollama_models()?
+            } else {
+                // Key is present, assume Ollama Cloud and return hardcoded list
+                vec![
+                    "glm-5:cloud".to_string(),
+                    "glm-4.7:cloud".to_string(),
+                    "gpt-oss:cloud".to_string(),
+                    "gemini-3-flash-preview:cloud".to_string(),
+                    "qwen2.5-coder:1.5b".to_string(),
+                    "qwen2.5-coder:3b".to_string(),
+                    "qwen2.5:cloud".to_string(),
+                    "minimax-m2.5:cloud".to_string(),
+                    "deepseek-v3.1:cloud".to_string(),
+                ]
+            }
+        }
         _ => Vec::new(),
     };
 
@@ -1796,11 +1814,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
         .collect();
     let mut live_options: Option<Vec<(String, String)>> = None;
 
-    if provider_name == "ollama" && provider_api_url.is_some() {
-        print_bullet(
-            "Skipping local Ollama model discovery because a remote endpoint is configured.",
-        );
-    } else if supports_live_model_fetch(provider_name) {
+    if supports_live_model_fetch(provider_name) {
         let can_fetch_without_key = matches!(provider_name, "openrouter" | "ollama");
         let has_api_key = !api_key.trim().is_empty()
             || std::env::var(provider_env_var(provider_name))
