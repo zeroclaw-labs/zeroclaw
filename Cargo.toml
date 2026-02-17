@@ -139,12 +139,6 @@ landlock = ["sandbox-landlock"]
 probe = ["dep:probe-rs"]
 # rag-pdf = PDF ingestion for datasheet RAG
 rag-pdf = ["dep:pdf-extract"]
-# sandbox backends (optional, platform-specific)
-sandbox-landlock = []
-sandbox-bubblewrap = []
-# native browser backend (optional, adds WebDriver dependency)
-browser-native = []
-
 [profile.release]
 opt-level = "z"      # Optimize for size
 lto = "thin"         # Lower memory use during release builds
