@@ -244,6 +244,9 @@ keyword_weight = 0.3
 
 # backend = "none" uses an explicit no-op memory backend (no persistence)
 
+# Optional for backend = "sqlite": max seconds to wait when opening the DB (e.g. file locked). Omit or leave unset for no timeout.
+# sqlite_open_timeout_secs = 30
+
 # Optional for backend = "lucid"
 # ZEROCLAW_LUCID_CMD=/usr/local/bin/lucid   # default: lucid
 # ZEROCLAW_LUCID_BUDGET=200                 # default: 200
