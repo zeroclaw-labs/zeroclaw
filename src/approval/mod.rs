@@ -6,10 +6,10 @@
 use crate::config::AutonomyConfig;
 use crate::security::AutonomyLevel;
 use chrono::Utc;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
-use std::sync::Mutex;
 
 // ── Types ────────────────────────────────────────────────────────
 
@@ -99,10 +99,7 @@ impl ApprovalManager {
         }
 
         // Session allowlist (from prior "Always" responses).
-        let allowlist = self
-            .session_allowlist
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let allowlist = self.session_allowlist.lock();
         if allowlist.contains(tool_name) {
             return false;
         }
@@ -121,10 +118,7 @@ impl ApprovalManager {
     ) {
         // If "Always", add to session allowlist.
         if decision == ApprovalResponse::Always {
-            let mut allowlist = self
-                .session_allowlist
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut allowlist = self.session_allowlist.lock();
             allowlist.insert(tool_name.to_string());
         }
 
@@ -137,27 +131,18 @@ impl ApprovalManager {
             decision,
             channel: channel.to_string(),
         };
-        let mut log = self
-            .audit_log
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut log = self.audit_log.lock();
         log.push(entry);
     }
 
     /// Get a snapshot of the audit log.
     pub fn audit_log(&self) -> Vec<ApprovalLogEntry> {
-        self.audit_log
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        self.audit_log.lock().clone()
     }
 
     /// Get the current session allowlist.
     pub fn session_allowlist(&self) -> HashSet<String> {
-        self.session_allowlist
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        self.session_allowlist.lock().clone()
     }
 
     /// Prompt the user on the CLI and return their decision.
