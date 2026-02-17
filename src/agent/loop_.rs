@@ -35,6 +35,9 @@ static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)(token|api[_-]?key|password|secret|user[_-]?key|bearer|credential)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\.]{8,}))"#).unwrap()
 });
 
+static MALFORMED_TOOL_CALL_PREFIX_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?is)^<tool_call>\s*[a-zA-Z_][a-zA-Z0-9_:-]*\s*\{"#).unwrap());
+
 /// Scrub credentials from tool output to prevent accidental exfiltration.
 /// Replaces known credential patterns with a redacted placeholder while preserving
 /// a small prefix for context.
@@ -488,6 +491,19 @@ fn parse_structured_tool_calls(tool_calls: &[ToolCall]) -> Vec<ParsedToolCall> {
         .collect()
 }
 
+fn looks_like_malformed_tool_call_markup(response: &str) -> bool {
+    let trimmed = response.trim_start();
+    if !trimmed.starts_with("<tool_call>") {
+        return false;
+    }
+
+    if !trimmed.contains("</tool_call>") {
+        return true;
+    }
+
+    MALFORMED_TOOL_CALL_PREFIX_REGEX.is_match(trimmed)
+}
+
 fn build_assistant_history_with_tool_calls(text: &str, tool_calls: &[ToolCall]) -> String {
     let mut parts = Vec::new();
 
@@ -668,11 +684,12 @@ pub(crate) async fn run_tool_call_loop(
         };
         let has_tool_call_markup =
             response_text.contains("<tool_call>") && response_text.contains("</tool_call>");
+        let malformed_tool_call_markup = looks_like_malformed_tool_call_markup(&response_text);
 
         if tool_calls.is_empty() {
             // Recovery path: the model attempted tool use but emitted malformed JSON.
             // Ask it to re-send valid tool-call payload instead of leaking raw markup to users.
-            if has_tool_call_markup && parsed_text_is_empty {
+            if (has_tool_call_markup && parsed_text_is_empty) || malformed_tool_call_markup {
                 history.push(ChatMessage::assistant(response_text.clone()));
                 history.push(ChatMessage::user(
                     "[Tool parser error]\nYour previous <tool_call> payload was invalid JSON and was NOT executed. Re-send the same tool call using strict valid JSON only. Escape inner double quotes inside string values.",
@@ -1602,6 +1619,17 @@ I will now call the tool with this payload:
     }
 
     #[test]
+    fn looks_like_malformed_tool_call_markup_detects_prefixed_json() {
+        let malformed = r#"<tool_call>schedule{"action":"create","id":"nova-self-update"}"#;
+        assert!(looks_like_malformed_tool_call_markup(malformed));
+
+        let valid = r#"<tool_call>
+{"name":"shell","arguments":{"command":"date"}}
+</tool_call>"#;
+        assert!(!looks_like_malformed_tool_call_markup(valid));
+    }
+
+    #[test]
     fn build_tool_instructions_includes_all_tools() {
         use crate::security::SecurityPolicy;
         let security = Arc::new(SecurityPolicy::from_config(
@@ -2051,6 +2079,80 @@ Done."#;
         .unwrap();
 
         assert_eq!(response, "Top memory users parsed successfully.");
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert!(!response.contains("<tool_call>"));
+        assert!(history
+            .iter()
+            .any(|m| m.role == "user" && m.content.contains("[Tool parser error]")));
+    }
+
+    struct PrefixMalformedThenValidToolProvider;
+
+    #[async_trait]
+    impl Provider for PrefixMalformedThenValidToolProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system should not be called in this test");
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            if messages
+                .iter()
+                .any(|m| m.role == "user" && m.content.contains("[Tool results]"))
+            {
+                return Ok("Scheduled successfully.".to_string());
+            }
+
+            if messages
+                .iter()
+                .any(|m| m.role == "user" && m.content.contains("[Tool parser error]"))
+            {
+                return Ok(r#"<tool_call>
+{"name":"shell","arguments":{"command":"echo fixed"}}
+</tool_call>"#
+                    .to_string());
+            }
+
+            Ok(r#"<tool_call>schedule{"action":"create","command":"date","expression":"0 3 * * *","id":"nova-self-update"}"#.to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_retries_prefixed_tool_call_markup() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingShellTool {
+            runs: Arc::clone(&runs),
+        })];
+
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("set schedule"),
+        ];
+
+        let response = run_tool_call_loop(
+            &PrefixMalformedThenValidToolProvider,
+            &mut history,
+            &tools_registry,
+            &NoopObserver,
+            "test-provider",
+            "test-model",
+            0.0,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response, "Scheduled successfully.");
         assert_eq!(runs.load(Ordering::SeqCst), 1);
         assert!(!response.contains("<tool_call>"));
         assert!(history
