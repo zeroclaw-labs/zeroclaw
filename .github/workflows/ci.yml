@@ -128,7 +128,7 @@ jobs:
                   } >> "$GITHUB_OUTPUT"
 
     lint:
-        name: Format & Lint
+        name: Lint Gate (Format + Clippy)
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
         runs-on: blacksmith-2vcpu-ubuntu-2404
@@ -146,7 +146,7 @@ jobs:
               run: ./scripts/ci/rust_quality_gate.sh
 
     lint-strict-delta:
-        name: Lint Strict Delta
+        name: Lint Gate (Strict Delta)
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
         runs-on: blacksmith-2vcpu-ubuntu-2404
@@ -167,8 +167,8 @@ jobs:
 
     test:
         name: Test
-        needs: [changes]
-        if: needs.changes.outputs.rust_changed == 'true'
+        needs: [changes, lint, lint-strict-delta]
+        if: needs.changes.outputs.rust_changed == 'true' && needs.lint.result == 'success' && needs.lint-strict-delta.result == 'success'
         runs-on: blacksmith-2vcpu-ubuntu-2404
         timeout-minutes: 30
         steps:
@@ -182,8 +182,8 @@ jobs:
 
     build:
         name: Build (Smoke)
-        needs: [changes]
-        if: needs.changes.outputs.rust_changed == 'true'
+        needs: [changes, lint, lint-strict-delta]
+        if: needs.changes.outputs.rust_changed == 'true' && needs.lint.result == 'success' && needs.lint-strict-delta.result == 'success'
         runs-on: blacksmith-2vcpu-ubuntu-2404
         timeout-minutes: 20
 
@@ -268,6 +268,106 @@ jobs:
             - name: Skip link check (no added links)
               if: steps.collect_links.outputs.count == '0'
               run: echo "No added links in changed docs lines. Link check skipped."
+
+    lint-feedback:
+        name: Lint Feedback
+        if: github.event_name == 'pull_request'
+        needs: [changes, lint, lint-strict-delta, docs-quality]
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        permissions:
+            contents: read
+            pull-requests: write
+            issues: write
+        steps:
+            - name: Post actionable lint failure summary
+              if: always()
+              uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+              env:
+                  RUST_CHANGED: ${{ needs.changes.outputs.rust_changed }}
+                  DOCS_CHANGED: ${{ needs.changes.outputs.docs_changed }}
+                  LINT_RESULT: ${{ needs.lint.result }}
+                  LINT_DELTA_RESULT: ${{ needs.lint-strict-delta.result }}
+                  DOCS_RESULT: ${{ needs.docs-quality.result }}
+              with:
+                  script: |
+                      const owner = context.repo.owner;
+                      const repo = context.repo.repo;
+                      const issueNumber = context.payload.pull_request?.number;
+                      if (!issueNumber) return;
+
+                      const marker = "<!-- ci-lint-feedback -->";
+                      const rustChanged = process.env.RUST_CHANGED === "true";
+                      const docsChanged = process.env.DOCS_CHANGED === "true";
+                      const lintResult = process.env.LINT_RESULT || "skipped";
+                      const lintDeltaResult = process.env.LINT_DELTA_RESULT || "skipped";
+                      const docsResult = process.env.DOCS_RESULT || "skipped";
+
+                      const failures = [];
+                      if (rustChanged && !["success", "skipped"].includes(lintResult)) {
+                        failures.push("`Lint Gate (Format + Clippy)` failed.");
+                      }
+                      if (rustChanged && !["success", "skipped"].includes(lintDeltaResult)) {
+                        failures.push("`Lint Gate (Strict Delta)` failed.");
+                      }
+                      if (docsChanged && !["success", "skipped"].includes(docsResult)) {
+                        failures.push("`Docs Quality` failed.");
+                      }
+
+                      const comments = await github.paginate(github.rest.issues.listComments, {
+                        owner,
+                        repo,
+                        issue_number: issueNumber,
+                        per_page: 100,
+                      });
+                      const existing = comments.find((comment) => (comment.body || "").includes(marker));
+
+                      if (failures.length === 0) {
+                        if (existing) {
+                          await github.rest.issues.deleteComment({
+                            owner,
+                            repo,
+                            comment_id: existing.id,
+                          });
+                        }
+                        core.info("No lint/docs gate failures. No feedback comment required.");
+                        return;
+                      }
+
+                      const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+                      const body = [
+                        marker,
+                        "### CI lint feedback",
+                        "",
+                        "This PR failed one or more fast lint/documentation gates:",
+                        "",
+                        ...failures.map((item) => `- ${item}`),
+                        "",
+                        "Open the failing logs in this run:",
+                        `- ${runUrl}`,
+                        "",
+                        "Local fix commands:",
+                        "- `./scripts/ci/rust_quality_gate.sh`",
+                        "- `./scripts/ci/rust_strict_delta_gate.sh`",
+                        "- `./scripts/ci/docs_quality_gate.sh`",
+                        "",
+                        "After fixes, push a new commit and CI will re-run automatically.",
+                      ].join("\n");
+
+                      if (existing) {
+                        await github.rest.issues.updateComment({
+                          owner,
+                          repo,
+                          comment_id: existing.id,
+                          body,
+                        });
+                      } else {
+                        await github.rest.issues.createComment({
+                          owner,
+                          repo,
+                          issue_number: issueNumber,
+                          body,
+                        });
+                      }
 
     workflow-owner-approval:
         name: Workflow Owner Approval
@@ -356,7 +456,7 @@ jobs:
     ci-required:
         name: CI Required Gate
         if: always()
-        needs: [changes, lint, lint-strict-delta, test, build, docs-only, non-rust, docs-quality, workflow-owner-approval]
+        needs: [changes, lint, lint-strict-delta, test, build, docs-only, non-rust, docs-quality, lint-feedback, workflow-owner-approval]
         runs-on: blacksmith-2vcpu-ubuntu-2404
         steps:
             - name: Enforce required status
