@@ -357,29 +357,35 @@ async fn main() -> Result<()> {
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
-    // Onboard runs quick setup by default, or the interactive wizard with --interactive
+    // Onboard runs quick setup by default, or the interactive wizard with --interactive.
+    // The onboard wizard uses reqwest::blocking internally, which creates its own
+    // Tokio runtime. To avoid "Cannot drop a runtime in a context where blocking is
+    // not allowed", we run the wizard on a blocking thread via spawn_blocking.
     if let Commands::Onboard {
         interactive,
         channels_only,
         api_key,
         provider,
         memory,
-    } = &cli.command
+    } = cli.command
     {
-        if *interactive && *channels_only {
+        if interactive && channels_only {
             bail!("Use either --interactive or --channels-only, not both");
         }
-        if *channels_only && (api_key.is_some() || provider.is_some() || memory.is_some()) {
+        if channels_only && (api_key.is_some() || provider.is_some() || memory.is_some()) {
             bail!("--channels-only does not accept --api-key, --provider, or --memory");
         }
 
-        let config = if *channels_only {
-            onboard::run_channels_repair_wizard()?
-        } else if *interactive {
-            onboard::run_wizard()?
-        } else {
-            onboard::run_quick_setup(api_key.as_deref(), provider.as_deref(), memory.as_deref())?
-        };
+        let config = tokio::task::spawn_blocking(move || {
+            if channels_only {
+                onboard::run_channels_repair_wizard()
+            } else if interactive {
+                onboard::run_wizard()
+            } else {
+                onboard::run_quick_setup(api_key.as_deref(), provider.as_deref(), memory.as_deref())
+            }
+        })
+        .await??;
         // Auto-start channels if user said yes during wizard
         if std::env::var("ZEROCLAW_AUTOSTART_CHANNELS").as_deref() == Ok("1") {
             channels::start_channels(config).await?;

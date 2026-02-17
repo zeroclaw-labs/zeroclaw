@@ -8,7 +8,7 @@ use crate::hardware::{self, HardwareConfig};
 use crate::memory::{
     default_memory_backend_key, memory_backend_profile, selectable_memory_backends,
 };
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use console::style;
 use dialoguer::{Confirm, Input, Select};
 use serde::{Deserialize, Serialize};
@@ -459,7 +459,7 @@ const MINIMAX_ONBOARD_MODELS: [(&str, &str); 5] = [
 
 fn default_model_for_provider(provider: &str) -> String {
     match canonical_provider_name(provider) {
-        "anthropic" => "claude-sonnet-4-20250514".into(),
+        "anthropic" => "claude-sonnet-4-5-20250929".into(),
         "openai" => "gpt-5.2".into(),
         "glm" | "zhipu" | "zai" | "z.ai" => "glm-5".into(),
         "minimax" => "MiniMax-M2.5".into(),
@@ -467,7 +467,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "groq" => "llama-3.3-70b-versatile".into(),
         "deepseek" => "deepseek-chat".into(),
         "gemini" => "gemini-2.5-pro".into(),
-        _ => "anthropic/claude-sonnet-4.5".into(),
+        _ => "anthropic/claude-sonnet-4-5".into(),
     }
 }
 
@@ -475,7 +475,7 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
     match canonical_provider_name(provider_name) {
         "openrouter" => vec![
             (
-                "anthropic/claude-sonnet-4.5".to_string(),
+                "anthropic/claude-sonnet-4-5".to_string(),
                 "Claude Sonnet 4.5 (balanced, recommended)".to_string(),
             ),
             (
@@ -505,16 +505,16 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
         ],
         "anthropic" => vec![
             (
-                "claude-sonnet-4-20250514".to_string(),
-                "Claude Sonnet 4 (balanced, recommended)".to_string(),
+                "claude-sonnet-4-5-20250929".to_string(),
+                "Claude Sonnet 4.5 (balanced, recommended)".to_string(),
             ),
             (
-                "claude-opus-4-1-20250805".to_string(),
-                "Claude Opus 4.1 (best quality)".to_string(),
+                "claude-opus-4-6".to_string(),
+                "Claude Opus 4.6 (best quality)".to_string(),
             ),
             (
-                "claude-3-5-haiku-20241022".to_string(),
-                "Claude 3.5 Haiku (fastest, cheapest)".to_string(),
+                "claude-haiku-4-5-20251001".to_string(),
+                "Claude Haiku 4.5 (fastest, cheapest)".to_string(),
             ),
         ],
         "openai" => vec![
@@ -868,13 +868,31 @@ fn fetch_anthropic_models(api_key: Option<&str>) -> Result<Vec<String>> {
     };
 
     let client = build_model_fetch_client()?;
-    let payload: Value = client
+    let mut request = client
         .get("https://api.anthropic.com/v1/models")
-        .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
+        .header("anthropic-version", "2023-06-01");
+
+    if api_key.starts_with("sk-ant-oat01-") {
+        request = request
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("anthropic-beta", "oauth-2025-04-20");
+    } else {
+        request = request.header("x-api-key", api_key);
+    }
+
+    let response = request
         .send()
-        .and_then(reqwest::blocking::Response::error_for_status)
-        .context("model fetch failed: GET https://api.anthropic.com/v1/models")?
+        .context("model fetch failed: GET https://api.anthropic.com/v1/models")?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().unwrap_or_default();
+        bail!(
+            "Anthropic model list request failed (HTTP {status}): {body}"
+        );
+    }
+
+    let payload: Value = response
         .json()
         .context("failed to parse Anthropic model list response")?;
 
@@ -917,6 +935,14 @@ fn fetch_live_models_for_provider(provider_name: &str, api_key: &str) -> Result<
     let api_key = if api_key.trim().is_empty() {
         std::env::var(provider_env_var(provider_name))
             .ok()
+            .or_else(|| {
+                // Anthropic also accepts OAuth setup-tokens via ANTHROPIC_OAUTH_TOKEN
+                if provider_name == "anthropic" {
+                    std::env::var("ANTHROPIC_OAUTH_TOKEN").ok()
+                } else {
+                    None
+                }
+            })
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
     } else {
@@ -1433,10 +1459,45 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
                 .allow_empty(true)
                 .interact_text()?
         }
+    } else if canonical_provider_name(provider_name) == "anthropic" {
+        if std::env::var("ANTHROPIC_OAUTH_TOKEN").is_ok() {
+            print_bullet(&format!(
+                "{} ANTHROPIC_OAUTH_TOKEN environment variable detected!",
+                style("✓").green().bold()
+            ));
+            String::new()
+        } else if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+            print_bullet(&format!(
+                "{} ANTHROPIC_API_KEY environment variable detected!",
+                style("✓").green().bold()
+            ));
+            String::new()
+        } else {
+            print_bullet(&format!(
+                "Get your API key at: {}",
+                style("https://console.anthropic.com/settings/keys").cyan().underlined()
+            ));
+            print_bullet("Or run `claude setup-token` to get an OAuth setup-token.");
+            println!();
+
+            let key: String = Input::new()
+                .with_prompt("  Paste your API key or setup-token (or press Enter to skip)")
+                .allow_empty(true)
+                .interact_text()?;
+
+            if key.is_empty() {
+                print_bullet(&format!(
+                    "Skipped. Set {} or {} or edit config.toml later.",
+                    style("ANTHROPIC_API_KEY").yellow(),
+                    style("ANTHROPIC_OAUTH_TOKEN").yellow()
+                ));
+            }
+
+            key
+        }
     } else {
         let key_url = match provider_name {
             "openrouter" => "https://openrouter.ai/keys",
-            "anthropic" => "https://console.anthropic.com/settings/keys",
             "openai" => "https://platform.openai.com/api-keys",
             "venice" => "https://venice.ai/settings/api",
             "groq" => "https://console.groq.com/keys",
@@ -4263,7 +4324,7 @@ mod tests {
         assert_eq!(default_model_for_provider("openai"), "gpt-5.2");
         assert_eq!(
             default_model_for_provider("anthropic"),
-            "claude-sonnet-4-20250514"
+            "claude-sonnet-4-5-20250929"
         );
         assert_eq!(default_model_for_provider("gemini"), "gemini-2.5-pro");
         assert_eq!(default_model_for_provider("google"), "gemini-2.5-pro");
