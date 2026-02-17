@@ -136,9 +136,9 @@ enum Commands {
         #[arg(long)]
         model: Option<String>,
 
-        /// Temperature (0.0 - 2.0); defaults to config default_temperature
-        #[arg(short, long)]
-        temperature: Option<f64>,
+        /// Temperature (0.0 - 2.0)
+        #[arg(short, long, default_value = "0.7")]
+        temperature: f64,
 
         /// Attach a peripheral (board:path, e.g. nucleo-f401re:/dev/ttyACM0)
         #[arg(long)]
@@ -250,6 +250,23 @@ enum CronCommands {
     Add {
         /// Cron expression
         expression: String,
+        /// Optional IANA timezone (e.g. America/Los_Angeles)
+        #[arg(long)]
+        tz: Option<String>,
+        /// Command to run
+        command: String,
+    },
+    /// Add a one-shot scheduled task at an RFC3339 timestamp
+    AddAt {
+        /// One-shot timestamp in RFC3339 format
+        at: String,
+        /// Command to run
+        command: String,
+    },
+    /// Add a fixed-interval scheduled task
+    AddEvery {
+        /// Interval in milliseconds
+        every_ms: u64,
         /// Command to run
         command: String,
     },
@@ -412,10 +429,9 @@ async fn main() -> Result<()> {
             model,
             temperature,
             peripheral,
-        } => {
-            let temp = temperature.unwrap_or(config.default_temperature);
-            agent::run(config, message, provider, model, temp, peripheral).await
-        }
+        } => agent::run(config, message, provider, model, temperature, peripheral)
+            .await
+            .map(|_| ()),
 
         Commands::Gateway { port, host } => {
             if port == 0 {

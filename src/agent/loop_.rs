@@ -595,7 +595,7 @@ pub async fn run(
     model_override: Option<String>,
     temperature: f64,
     peripheral_overrides: Vec<String>,
-) -> Result<()> {
+) -> Result<String> {
     // ── Wire up agnostic subsystems ──────────────────────────────
     let base_observer = observability::create_observer(&config.observability);
     let observer: Arc<dyn Observer> = Arc::from(base_observer);
@@ -632,6 +632,7 @@ pub async fn run(
         (None, None)
     };
     let mut tools_registry = tools::all_tools_with_runtime(
+        Arc::new(config.clone()),
         &security,
         runtime,
         mem.clone(),
@@ -725,6 +726,24 @@ pub async fn run(
         ),
     ];
     tool_descs.push((
+        "cron_add",
+        "Create a cron job. Supports schedule kinds: cron, at, every; and job types: shell or agent.",
+    ));
+    tool_descs.push((
+        "cron_list",
+        "List all cron jobs with schedule, status, and metadata.",
+    ));
+    tool_descs.push(("cron_remove", "Remove a cron job by job_id."));
+    tool_descs.push((
+        "cron_update",
+        "Patch a cron job (schedule, enabled, command/prompt, model, delivery, session_target).",
+    ));
+    tool_descs.push((
+        "cron_run",
+        "Force-run a cron job immediately and record a run history entry.",
+    ));
+    tool_descs.push(("cron_runs", "Show recent run history for a cron job."));
+    tool_descs.push((
         "screenshot",
         "Capture a screenshot of the current screen. Returns file path and base64-encoded PNG. Use when: visual verification, UI inspection, debugging displays.",
     ));
@@ -804,6 +823,8 @@ pub async fn run(
     // ── Execute ──────────────────────────────────────────────────
     let start = Instant::now();
 
+    let mut final_output = String::new();
+
     if let Some(msg) = message {
         // Auto-save user message to memory
         if config.memory.auto_save {
@@ -843,6 +864,7 @@ pub async fn run(
             false,
         )
         .await?;
+        final_output = response.clone();
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
 
@@ -912,6 +934,7 @@ pub async fn run(
                     continue;
                 }
             };
+            final_output = response.clone();
             println!("\n{response}\n");
             observer.record_event(&ObserverEvent::TurnComplete);
 
@@ -945,7 +968,7 @@ pub async fn run(
         tokens_used: None,
     });
 
-    Ok(())
+    Ok(final_output)
 }
 
 /// Process a single message through the full agent (with tools, peripherals, memory).
@@ -974,6 +997,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         (None, None)
     };
     let mut tools_registry = tools::all_tools_with_runtime(
+        Arc::new(config.clone()),
         &security,
         runtime,
         mem.clone(),

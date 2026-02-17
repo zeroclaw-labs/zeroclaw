@@ -71,7 +71,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         ));
     }
 
-    {
+    if config.cron.enabled {
         let scheduler_cfg = config.clone();
         handles.push(spawn_component_supervisor(
             "scheduler",
@@ -82,6 +82,9 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                 async move { crate::cron::scheduler::run(cfg).await }
             },
         ));
+    } else {
+        crate::health::mark_component_ok("scheduler");
+        tracing::info!("Cron disabled; scheduler supervisor not started");
     }
 
     println!("🧠 ZeroClaw daemon started");

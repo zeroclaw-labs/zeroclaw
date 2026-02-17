@@ -161,9 +161,11 @@ impl ScheduleTool {
 
         let mut lines = Vec::with_capacity(jobs.len());
         for job in jobs {
-            let flags = match (job.paused, job.one_shot) {
-                (true, true) => " [paused, one-shot]",
-                (true, false) => " [paused]",
+            let paused = !job.enabled;
+            let one_shot = matches!(job.schedule, cron::Schedule::At { .. });
+            let flags = match (paused, one_shot) {
+                (true, true) => " [disabled, one-shot]",
+                (true, false) => " [disabled]",
                 (false, true) => " [one-shot]",
                 (false, false) => "",
             };
@@ -191,8 +193,8 @@ impl ScheduleTool {
     }
 
     fn handle_get(&self, id: &str) -> Result<ToolResult> {
-        match cron::get_job(&self.config, id)? {
-            Some(job) => {
+        match cron::get_job(&self.config, id) {
+            Ok(job) => {
                 let detail = json!({
                     "id": job.id,
                     "expression": job.expression,
@@ -200,8 +202,8 @@ impl ScheduleTool {
                     "next_run": job.next_run.to_rfc3339(),
                     "last_run": job.last_run.map(|value| value.to_rfc3339()),
                     "last_status": job.last_status,
-                    "paused": job.paused,
-                    "one_shot": job.one_shot,
+                    "enabled": job.enabled,
+                    "one_shot": matches!(job.schedule, cron::Schedule::At { .. }),
                 });
                 Ok(ToolResult {
                     success: true,
@@ -209,7 +211,7 @@ impl ScheduleTool {
                     error: None,
                 })
             }
-            None => Ok(ToolResult {
+            Err(_) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Job '{id}' not found")),
@@ -342,7 +344,7 @@ impl ScheduleTool {
         };
 
         match operation {
-            Ok(()) => ToolResult {
+            Ok(_) => ToolResult {
                 success: true,
                 output: if pause {
                     format!("Paused job {id}")

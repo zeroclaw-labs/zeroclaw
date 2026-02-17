@@ -48,6 +48,9 @@ pub struct Config {
     pub heartbeat: HeartbeatConfig,
 
     #[serde(default)]
+    pub cron: CronConfig,
+
+    #[serde(default)]
     pub channels_config: ChannelsConfig,
 
     #[serde(default)]
@@ -1172,6 +1175,29 @@ impl Default for HeartbeatConfig {
     }
 }
 
+// ── Cron ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CronConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_max_run_history")]
+    pub max_run_history: u32,
+}
+
+fn default_max_run_history() -> u32 {
+    50
+}
+
+impl Default for CronConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_run_history: default_max_run_history(),
+        }
+    }
+}
+
 // ── Tunnel ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1579,6 +1605,7 @@ impl Default for Config {
             agent: AgentConfig::default(),
             model_routes: Vec::new(),
             heartbeat: HeartbeatConfig::default(),
+            cron: CronConfig::default(),
             channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
             tunnel: TunnelConfig::default(),
@@ -1864,6 +1891,38 @@ mod tests {
     }
 
     #[test]
+    fn cron_config_default() {
+        let c = CronConfig::default();
+        assert!(c.enabled);
+        assert_eq!(c.max_run_history, 50);
+    }
+
+    #[test]
+    fn cron_config_serde_roundtrip() {
+        let c = CronConfig {
+            enabled: false,
+            max_run_history: 100,
+        };
+        let json = serde_json::to_string(&c).unwrap();
+        let parsed: CronConfig = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.enabled);
+        assert_eq!(parsed.max_run_history, 100);
+    }
+
+    #[test]
+    fn config_defaults_cron_when_section_missing() {
+        let toml_str = r#"
+workspace_dir = "/tmp/workspace"
+config_path = "/tmp/config.toml"
+default_temperature = 0.7
+"#;
+
+        let parsed: Config = toml::from_str(toml_str).unwrap();
+        assert!(parsed.cron.enabled);
+        assert_eq!(parsed.cron.max_run_history, 50);
+    }
+
+    #[test]
     fn memory_config_default_hygiene_settings() {
         let m = MemoryConfig::default();
         assert_eq!(m.backend, "sqlite");
@@ -1918,6 +1977,7 @@ mod tests {
                 enabled: true,
                 interval_minutes: 15,
             },
+            cron: CronConfig::default(),
             channels_config: ChannelsConfig {
                 cli: true,
                 telegram: Some(TelegramConfig {
@@ -2041,6 +2101,7 @@ tool_dispatcher = "xml"
             scheduler: SchedulerConfig::default(),
             model_routes: Vec::new(),
             heartbeat: HeartbeatConfig::default(),
+            cron: CronConfig::default(),
             channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
             tunnel: TunnelConfig::default(),

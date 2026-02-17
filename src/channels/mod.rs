@@ -800,6 +800,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     // Build system prompt from workspace identity files + skills
     let workspace = config.workspace_dir.clone();
     let tools_registry = Arc::new(tools::all_tools_with_runtime(
+        Arc::new(config.clone()),
         &security,
         runtime,
         Arc::clone(&mem),

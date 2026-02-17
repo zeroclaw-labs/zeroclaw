@@ -117,6 +117,7 @@ pub fn run_wizard() -> Result<Config> {
         agent: crate::config::schema::AgentConfig::default(),
         model_routes: Vec::new(),
         heartbeat: HeartbeatConfig::default(),
+        cron: crate::config::CronConfig::default(),
         channels_config,
         memory: memory_config, // User-selected memory backend
         tunnel: tunnel_config,
@@ -329,6 +330,7 @@ pub fn run_quick_setup(
         agent: crate::config::schema::AgentConfig::default(),
         model_routes: Vec::new(),
         heartbeat: HeartbeatConfig::default(),
+        cron: crate::config::CronConfig::default(),
         channels_config: ChannelsConfig::default(),
         memory: memory_config,
         tunnel: crate::config::TunnelConfig::default(),
