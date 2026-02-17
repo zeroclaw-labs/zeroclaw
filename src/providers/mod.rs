@@ -28,6 +28,8 @@ const MOONSHOT_CN_BASE_URL: &str = "https://api.moonshot.cn/v1";
 const QWEN_CN_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 const QWEN_INTL_BASE_URL: &str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1";
 const QWEN_US_BASE_URL: &str = "https://dashscope-us.aliyuncs.com/compatible-mode/v1";
+const ZAI_GLOBAL_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
+const ZAI_CN_BASE_URL: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
 
 fn minimax_base_url(name: &str) -> Option<&'static str> {
     match name {
@@ -62,6 +64,14 @@ fn qwen_base_url(name: &str) -> Option<&'static str> {
             Some(QWEN_INTL_BASE_URL)
         }
         "qwen-us" | "dashscope-us" => Some(QWEN_US_BASE_URL),
+        _ => None,
+    }
+}
+
+fn zai_base_url(name: &str) -> Option<&'static str> {
+    match name {
+        "zai" | "z.ai" | "zai-global" | "z.ai-global" => Some(ZAI_GLOBAL_BASE_URL),
+        "zai-cn" | "z.ai-cn" => Some(ZAI_CN_BASE_URL),
         _ => None,
     }
 }
@@ -200,7 +210,9 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         | "dashscope-international"
         | "qwen-us"
         | "dashscope-us" => vec!["DASHSCOPE_API_KEY"],
-        "zai" | "z.ai" => vec!["ZAI_API_KEY"],
+        "zai" | "z.ai" | "zai-global" | "z.ai-global" | "zai-cn" | "z.ai-cn" => {
+            vec!["ZAI_API_KEY"]
+        }
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => vec!["NVIDIA_API_KEY"],
         "synthetic" => vec!["SYNTHETIC_API_KEY"],
         "opencode" | "opencode-zen" => vec!["OPENCODE_API_KEY"],
@@ -305,8 +317,11 @@ pub fn create_provider_with_url(
         "opencode" | "opencode-zen" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "OpenCode Zen", "https://opencode.ai/zen/v1", key, AuthStyle::Bearer,
         ))),
-        "zai" | "z.ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Z.AI", "https://api.z.ai/api/coding/paas/v4", key, AuthStyle::Bearer,
+        name if zai_base_url(name).is_some() => Ok(Box::new(OpenAiCompatibleProvider::new(
+            "Z.AI",
+            zai_base_url(name).expect("checked in guard"),
+            key,
+            AuthStyle::Bearer,
         ))),
         name if glm_base_url(name).is_some() => {
             Ok(Box::new(OpenAiCompatibleProvider::new_no_responses_fallback(
@@ -578,6 +593,13 @@ mod tests {
         assert_eq!(qwen_base_url("qwen-cn"), Some(QWEN_CN_BASE_URL));
         assert_eq!(qwen_base_url("qwen-intl"), Some(QWEN_INTL_BASE_URL));
         assert_eq!(qwen_base_url("qwen-us"), Some(QWEN_US_BASE_URL));
+
+        assert_eq!(zai_base_url("zai"), Some(ZAI_GLOBAL_BASE_URL));
+        assert_eq!(zai_base_url("z.ai"), Some(ZAI_GLOBAL_BASE_URL));
+        assert_eq!(zai_base_url("zai-global"), Some(ZAI_GLOBAL_BASE_URL));
+        assert_eq!(zai_base_url("z.ai-global"), Some(ZAI_GLOBAL_BASE_URL));
+        assert_eq!(zai_base_url("zai-cn"), Some(ZAI_CN_BASE_URL));
+        assert_eq!(zai_base_url("z.ai-cn"), Some(ZAI_CN_BASE_URL));
     }
 
     // ── Primary providers ────────────────────────────────────
@@ -659,6 +681,10 @@ mod tests {
     fn factory_zai() {
         assert!(create_provider("zai", Some("key")).is_ok());
         assert!(create_provider("z.ai", Some("key")).is_ok());
+        assert!(create_provider("zai-global", Some("key")).is_ok());
+        assert!(create_provider("z.ai-global", Some("key")).is_ok());
+        assert!(create_provider("zai-cn", Some("key")).is_ok());
+        assert!(create_provider("z.ai-cn", Some("key")).is_ok());
     }
 
     #[test]
@@ -976,6 +1002,7 @@ mod tests {
             "synthetic",
             "opencode",
             "zai",
+            "zai-cn",
             "glm",
             "glm-cn",
             "minimax",

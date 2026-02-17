@@ -412,10 +412,7 @@ impl Provider for ReliableProvider {
 
             // Convert channel receiver to stream
             return stream::unfold(rx, |mut rx| async move {
-                match rx.recv().await {
-                    Some(chunk) => Some((chunk, rx)),
-                    None => None,
-                }
+                rx.recv().await.map(|chunk| (chunk, rx))
             })
             .boxed();
         }

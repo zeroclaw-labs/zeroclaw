@@ -25,7 +25,7 @@ use tokio::time::{interval, sleep};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use super::traits::{Channel, ChannelMessage};
+use super::traits::{Channel, ChannelMessage, SendMessage};
 
 /// Email channel configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -375,26 +375,29 @@ impl Channel for EmailChannel {
         "email"
     }
 
-    async fn send(&self, message: &str, recipient: &str) -> Result<()> {
-        let (subject, body) = if message.starts_with("Subject: ") {
-            if let Some(pos) = message.find('\n') {
-                (&message[9..pos], message[pos + 1..].trim())
+    async fn send(&self, message: &SendMessage) -> Result<()> {
+        // Use explicit subject if provided, otherwise fall back to legacy parsing or default
+        let (subject, body) = if let Some(ref subj) = message.subject {
+            (subj.as_str(), message.content.as_str())
+        } else if message.content.starts_with("Subject: ") {
+            if let Some(pos) = message.content.find('\n') {
+                (&message.content[9..pos], message.content[pos + 1..].trim())
             } else {
-                ("ZeroClaw Message", message)
+                ("ZeroClaw Message", message.content.as_str())
             }
         } else {
-            ("ZeroClaw Message", message)
+            ("ZeroClaw Message", message.content.as_str())
         };
 
         let email = Message::builder()
             .from(self.config.from_address.parse()?)
-            .to(recipient.parse()?)
+            .to(message.recipient.parse()?)
             .subject(subject)
             .singlepart(SinglePart::plain(body.to_string()))?;
 
         let transport = self.create_smtp_transport()?;
         transport.send(&email)?;
-        info!("Email sent to {}", recipient);
+        info!("Email sent to {}", message.recipient);
         Ok(())
     }
 
