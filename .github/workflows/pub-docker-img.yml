@@ -59,6 +59,11 @@ jobs:
             - name: Verify image
               run: docker run --rm zeroclaw-pr-smoke:latest --version
 
+            - name: Scan image with Trivy
+              run: |
+                  curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+                  trivy image --exit-code 1 --severity CRITICAL,HIGH --no-progress zeroclaw-pr-smoke:latest
+
     publish:
         name: Build and Push Docker Image
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
@@ -109,3 +114,11 @@ jobs:
                   push: true
                   tags: ${{ steps.meta.outputs.tags }}
                   platforms: ${{ startsWith(github.ref, 'refs/tags/') && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
+
+            - name: Scan published image with Trivy
+              run: |
+                  curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+                  IMAGE_TAG=$(echo "${{ steps.meta.outputs.tags }}" | cut -d',' -f1)
+                  trivy image --exit-code 0 --severity CRITICAL,HIGH --no-progress "${IMAGE_TAG}"
+                  echo "### Container Scan Results" >> "$GITHUB_STEP_SUMMARY"
+                  trivy image --severity CRITICAL,HIGH --no-progress --format table "${IMAGE_TAG}" >> "$GITHUB_STEP_SUMMARY" 2>&1 || true
