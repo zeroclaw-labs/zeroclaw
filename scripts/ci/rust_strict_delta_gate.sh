@@ -176,11 +176,6 @@ with open(messages_file, "r", encoding="utf-8", errors="ignore") as f:
             if ranges is None:
                 continue
 
-            if not ranges:
-                is_changed_line = True
-                best_path, best_line = path, line_start
-                break
-
             for start, end in ranges:
                 if line_end >= start and line_start <= end:
                     is_changed_line = True
