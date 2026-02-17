@@ -36,9 +36,11 @@ use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fmt::Write;
+use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -600,7 +602,97 @@ fn bind_telegram_identity(config: &Config, identity: &str) -> Result<()> {
     updated.save()?;
     println!("✅ Bound Telegram identity: {normalized}");
     println!("   Saved to {}", updated.config_path.display());
+    match maybe_restart_managed_daemon_service() {
+        Ok(true) => {
+            println!("🔄 Detected running managed daemon service; reloaded automatically.");
+        }
+        Ok(false) => {
+            println!(
+                "ℹ️ No managed daemon service detected. If `zeroclaw daemon`/`channel start` is already running, restart it to load the updated allowlist."
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "⚠️ Allowlist saved, but failed to reload daemon service automatically: {e}\n\
+                 Restart service manually with `zeroclaw service stop && zeroclaw service start`."
+            );
+        }
+    }
     Ok(())
+}
+
+fn maybe_restart_managed_daemon_service() -> Result<bool> {
+    if cfg!(target_os = "macos") {
+        let home = directories::UserDirs::new()
+            .map(|u| u.home_dir().to_path_buf())
+            .context("Could not find home directory")?;
+        let plist = home
+            .join("Library")
+            .join("LaunchAgents")
+            .join("com.zeroclaw.daemon.plist");
+        if !plist.exists() {
+            return Ok(false);
+        }
+
+        let list_output = Command::new("launchctl")
+            .arg("list")
+            .output()
+            .context("Failed to query launchctl list")?;
+        let listed = String::from_utf8_lossy(&list_output.stdout);
+        if !listed.contains("com.zeroclaw.daemon") {
+            return Ok(false);
+        }
+
+        let _ = Command::new("launchctl")
+            .args(["stop", "com.zeroclaw.daemon"])
+            .output();
+        let start_output = Command::new("launchctl")
+            .args(["start", "com.zeroclaw.daemon"])
+            .output()
+            .context("Failed to start launchd daemon service")?;
+        if !start_output.status.success() {
+            let stderr = String::from_utf8_lossy(&start_output.stderr);
+            anyhow::bail!("launchctl start failed: {}", stderr.trim());
+        }
+
+        return Ok(true);
+    }
+
+    if cfg!(target_os = "linux") {
+        let home = directories::UserDirs::new()
+            .map(|u| u.home_dir().to_path_buf())
+            .context("Could not find home directory")?;
+        let unit_path: PathBuf = home
+            .join(".config")
+            .join("systemd")
+            .join("user")
+            .join("zeroclaw.service");
+        if !unit_path.exists() {
+            return Ok(false);
+        }
+
+        let active_output = Command::new("systemctl")
+            .args(["--user", "is-active", "zeroclaw.service"])
+            .output()
+            .context("Failed to query systemd service state")?;
+        let state = String::from_utf8_lossy(&active_output.stdout);
+        if !state.trim().eq_ignore_ascii_case("active") {
+            return Ok(false);
+        }
+
+        let restart_output = Command::new("systemctl")
+            .args(["--user", "restart", "zeroclaw.service"])
+            .output()
+            .context("Failed to restart systemd daemon service")?;
+        if !restart_output.status.success() {
+            let stderr = String::from_utf8_lossy(&restart_output.stderr);
+            anyhow::bail!("systemctl restart failed: {}", stderr.trim());
+        }
+
+        return Ok(true);
+    }
+
+    Ok(false)
 }
 
 pub fn handle_command(command: crate::ChannelCommands, config: &Config) -> Result<()> {
