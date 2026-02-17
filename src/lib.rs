@@ -39,6 +39,7 @@ use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 
 pub mod agent;
+pub mod approval;
 pub mod channels;
 pub mod config;
 pub mod cost;
@@ -103,6 +104,11 @@ pub enum ChannelCommands {
     Remove {
         /// Channel name to remove
         name: String,
+    },
+    /// Bind a Telegram identity (username or numeric user ID) into allowlist
+    BindTelegram {
+        /// Telegram identity to allow (username without '@' or numeric user ID)
+        identity: String,
     },
 }
 

@@ -565,11 +565,12 @@ exit 1
                 "local_note",
                 "Local sqlite auth fallback note",
                 MemoryCategory::Core,
+                None,
             )
             .await
             .unwrap();
 
-        let entries = memory.recall("auth", 5).await.unwrap();
+        let entries = memory.recall("auth", 5, None).await.unwrap();
 
         assert!(entries
             .iter()

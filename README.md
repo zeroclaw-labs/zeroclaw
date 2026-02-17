@@ -12,13 +12,12 @@
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" /></a>
   <a href="NOTICE"><img src="https://img.shields.io/badge/contributors-27+-green.svg" alt="Contributors" /></a>
-  <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=flat&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
 </p>
 
 Fast, small, and fully autonomous AI assistant infrastructure — deploy anywhere, swap anything.
 
 ```
-~3.4MB binary · <10ms startup · 1,017 tests · 22+ providers · 8 traits · Pluggable everything
+~3.4MB binary · <10ms startup · 1,017 tests · 23+ providers · 8 traits · Pluggable everything
 ```
 
 ### ✨ Features
@@ -167,6 +166,9 @@ zeroclaw doctor
 # Check channel health
 zeroclaw channel doctor
 
+# Bind a Telegram identity into allowlist
+zeroclaw channel bind-telegram 123456789
+
 # Get integration setup details
 zeroclaw integrations info Telegram
 
@@ -191,7 +193,7 @@ Every subsystem is a **trait** — swap implementations with a config change, ze
 
 | Subsystem | Trait | Ships with | Extend |
 |-----------|-------|------------|--------|
-| **AI Models** | `Provider` | 22+ providers (OpenRouter, Anthropic, OpenAI, Ollama, Venice, Groq, Mistral, xAI, DeepSeek, Together, Fireworks, Perplexity, Cohere, Bedrock, etc.) | `custom:https://your-api.com` — any OpenAI-compatible API |
+| **AI Models** | `Provider` | 23+ providers (OpenRouter, Anthropic, OpenAI, Ollama, Venice, Groq, Mistral, xAI, DeepSeek, Together, Fireworks, Perplexity, Cohere, Bedrock, Astrai, etc.) | `custom:https://your-api.com` — any OpenAI-compatible API |
 | **Channels** | `Channel` | CLI, Telegram, Discord, Slack, iMessage, Matrix, WhatsApp, Webhook | Any messaging API |
 | **Memory** | `Memory` | SQLite with hybrid search (FTS5 + vector cosine similarity), Lucid bridge (CLI sync + SQLite fallback), Markdown | Any persistence backend |
 | **Tools** | `Tool` | shell, file_read, file_write, memory_store, memory_recall, memory_forget, browser_open (Brave + allowlist), browser (agent-browser / rust-native), composio (optional) | Any capability |
@@ -277,6 +279,19 @@ Recommended low-friction setup (secure + fast):
 - **Discord:** allowlist your own Discord user ID.
 - **Slack:** allowlist your own Slack member ID (usually starts with `U`).
 - Use `"*"` only for temporary open testing.
+
+Telegram operator-approval flow:
+
+1. Keep `[channels_config.telegram].allowed_users = []` for deny-by-default startup.
+2. Unauthorized users receive a hint with a copyable operator command:
+   `zeroclaw channel bind-telegram <IDENTITY>`.
+3. Operator runs that command locally, then user retries sending a message.
+
+If you need a one-shot manual approval, run:
+
+```bash
+zeroclaw channel bind-telegram 123456789
+```
 
 If you're not sure which identity to use:
 
@@ -436,6 +451,23 @@ format = "openclaw"             # "openclaw" (default, markdown files) or "aieos
 # aieos_inline = '{"identity":{"names":{"first":"Nova"}}}'  # inline AIEOS JSON
 ```
 
+### Ollama Local and Remote Endpoints
+
+ZeroClaw uses one provider key (`ollama`) for both local and remote Ollama deployments:
+
+- Local Ollama: keep `api_url` unset, run `ollama serve`, and use models like `llama3.2`.
+- Remote Ollama endpoint (including Ollama Cloud): set `api_url` to the remote endpoint and set `api_key` (or `OLLAMA_API_KEY`) when required.
+- Optional `:cloud` suffix: model IDs like `qwen3:cloud` are normalized to `qwen3` before the request.
+
+Example remote configuration:
+
+```toml
+default_provider = "ollama"
+default_model = "qwen3:cloud"
+api_url = "https://ollama.com"
+api_key = "ollama_api_key_here"
+```
+
 ## Python Companion Package (`zeroclaw-tools`)
 
 For LLM providers with inconsistent native tool calling (e.g., GLM-5/Zhipu), ZeroClaw ships a Python companion package with **LangGraph-based tool calling** for guaranteed consistency:
@@ -564,6 +596,7 @@ See [aieos.org](https://aieos.org) for the full schema and live examples.
 | `doctor` | Diagnose daemon/scheduler/channel freshness |
 | `status` | Show full system status |
 | `channel doctor` | Run health checks for configured channels |
+| `channel bind-telegram <IDENTITY>` | Add one Telegram username/user ID to allowlist |
 | `integrations info <name>` | Show setup/status details for one integration |
 
 ## Development
@@ -615,12 +648,6 @@ For high-throughput collaboration and consistent reviews:
 - Reviewer playbook (triage + deep review): [docs/reviewer-playbook.md](docs/reviewer-playbook.md)
 - CI ownership and triage map: [docs/ci-map.md](docs/ci-map.md)
 - Security disclosure policy: [SECURITY.md](SECURITY.md)
-
-## Support
-
-ZeroClaw is an open-source project maintained with passion. If you find it useful and would like to support its continued development, hardware for testing, and coffee for the maintainer, you can support me here:
-
-<a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=for-the-badge&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
 
 ### 🙏 Special Thanks
 

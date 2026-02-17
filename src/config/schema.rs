@@ -882,6 +882,22 @@ pub struct AutonomyConfig {
     /// Block high-risk shell commands even if allowlisted.
     #[serde(default = "default_true")]
     pub block_high_risk_commands: bool,
+
+    /// Tools that never require approval (e.g. read-only tools).
+    #[serde(default = "default_auto_approve")]
+    pub auto_approve: Vec<String>,
+
+    /// Tools that always require interactive approval, even after "Always".
+    #[serde(default = "default_always_ask")]
+    pub always_ask: Vec<String>,
+}
+
+fn default_auto_approve() -> Vec<String> {
+    vec!["file_read".into(), "memory_recall".into()]
+}
+
+fn default_always_ask() -> Vec<String> {
+    vec![]
 }
 
 impl Default for AutonomyConfig {
@@ -927,6 +943,8 @@ impl Default for AutonomyConfig {
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
+            auto_approve: default_auto_approve(),
+            always_ask: default_always_ask(),
         }
     }
 }
@@ -1277,11 +1295,13 @@ pub struct ChannelsConfig {
     pub webhook: Option<WebhookConfig>,
     pub imessage: Option<IMessageConfig>,
     pub matrix: Option<MatrixConfig>,
+    pub signal: Option<SignalConfig>,
     pub whatsapp: Option<WhatsAppConfig>,
     pub email: Option<crate::channels::email_channel::EmailConfig>,
     pub irc: Option<IrcConfig>,
     pub lark: Option<LarkConfig>,
     pub dingtalk: Option<DingTalkConfig>,
+    pub qq: Option<QQConfig>,
 }
 
 impl Default for ChannelsConfig {
@@ -1294,11 +1314,13 @@ impl Default for ChannelsConfig {
             webhook: None,
             imessage: None,
             matrix: None,
+            signal: None,
             whatsapp: None,
             email: None,
             irc: None,
             lark: None,
             dingtalk: None,
+            qq: None,
         }
     }
 }
@@ -1351,6 +1373,29 @@ pub struct MatrixConfig {
     pub access_token: String,
     pub room_id: String,
     pub allowed_users: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignalConfig {
+    /// Base URL for the signal-cli HTTP daemon (e.g. "http://127.0.0.1:8686").
+    pub http_url: String,
+    /// E.164 phone number of the signal-cli account (e.g. "+1234567890").
+    pub account: String,
+    /// Optional group ID to filter messages.
+    /// - `None` or omitted: accept all messages (DMs and groups)
+    /// - `"dm"`: only accept direct messages
+    /// - Specific group ID: only accept messages from that group
+    #[serde(default)]
+    pub group_id: Option<String>,
+    /// Allowed sender phone numbers (E.164) or "*" for all.
+    #[serde(default)]
+    pub allowed_from: Vec<String>,
+    /// Skip messages that are attachment-only (no text body).
+    #[serde(default)]
+    pub ignore_attachments: bool,
+    /// Skip incoming story messages.
+    #[serde(default)]
+    pub ignore_stories: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1595,7 +1640,7 @@ impl Default for AuditConfig {
     }
 }
 
-/// DingTalk (钉钉) configuration for Stream Mode messaging
+/// DingTalk configuration for Stream Mode messaging
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DingTalkConfig {
     /// Client ID (AppKey) from DingTalk developer console
@@ -1603,6 +1648,18 @@ pub struct DingTalkConfig {
     /// Client Secret (AppSecret) from DingTalk developer console
     pub client_secret: String,
     /// Allowed user IDs (staff IDs). Empty = deny all, "*" = allow all
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+}
+
+/// QQ Official Bot configuration (Tencent QQ Bot SDK)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QQConfig {
+    /// App ID from QQ Bot developer console
+    pub app_id: String,
+    /// App Secret from QQ Bot developer console
+    pub app_secret: String,
+    /// Allowed user IDs. Empty = deny all, "*" = allow all
     #[serde(default)]
     pub allowed_users: Vec<String>,
 }
@@ -1802,10 +1859,19 @@ impl Config {
                 self.api_key = Some(key);
             }
         }
-        // API Key: GLM_API_KEY overrides when provider is glm (provider-specific)
-        if self.default_provider.as_deref() == Some("glm")
-            || self.default_provider.as_deref() == Some("zhipu")
-        {
+        // API Key: GLM_API_KEY overrides when provider is a GLM/Zhipu variant.
+        if matches!(
+            self.default_provider.as_deref(),
+            Some(
+                "glm"
+                    | "zhipu"
+                    | "glm-global"
+                    | "zhipu-global"
+                    | "glm-cn"
+                    | "zhipu-cn"
+                    | "bigmodel"
+            )
+        ) {
             if let Ok(key) = std::env::var("GLM_API_KEY") {
                 if !key.is_empty() {
                     self.api_key = Some(key);
@@ -2109,6 +2175,8 @@ default_temperature = 0.7
                 max_cost_per_day_cents: 1000,
                 require_approval_for_medium_risk: false,
                 block_high_risk_commands: true,
+                auto_approve: vec!["file_read".into()],
+                always_ask: vec![],
             },
             runtime: RuntimeConfig {
                 kind: "docker".into(),
@@ -2133,11 +2201,13 @@ default_temperature = 0.7
                 webhook: None,
                 imessage: None,
                 matrix: None,
+                signal: None,
                 whatsapp: None,
                 email: None,
                 irc: None,
                 lark: None,
                 dingtalk: None,
+                qq: None,
             },
             memory: MemoryConfig::default(),
             tunnel: TunnelConfig::default(),
@@ -2482,6 +2552,54 @@ tool_dispatcher = "xml"
     }
 
     #[test]
+    fn signal_config_serde() {
+        let sc = SignalConfig {
+            http_url: "http://127.0.0.1:8686".into(),
+            account: "+1234567890".into(),
+            group_id: Some("group123".into()),
+            allowed_from: vec!["+1111111111".into()],
+            ignore_attachments: true,
+            ignore_stories: false,
+        };
+        let json = serde_json::to_string(&sc).unwrap();
+        let parsed: SignalConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.http_url, "http://127.0.0.1:8686");
+        assert_eq!(parsed.account, "+1234567890");
+        assert_eq!(parsed.group_id.as_deref(), Some("group123"));
+        assert_eq!(parsed.allowed_from.len(), 1);
+        assert!(parsed.ignore_attachments);
+        assert!(!parsed.ignore_stories);
+    }
+
+    #[test]
+    fn signal_config_toml_roundtrip() {
+        let sc = SignalConfig {
+            http_url: "http://localhost:8080".into(),
+            account: "+9876543210".into(),
+            group_id: None,
+            allowed_from: vec!["*".into()],
+            ignore_attachments: false,
+            ignore_stories: true,
+        };
+        let toml_str = toml::to_string(&sc).unwrap();
+        let parsed: SignalConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.http_url, "http://localhost:8080");
+        assert_eq!(parsed.account, "+9876543210");
+        assert!(parsed.group_id.is_none());
+        assert!(parsed.ignore_stories);
+    }
+
+    #[test]
+    fn signal_config_defaults() {
+        let json = r#"{"http_url":"http://127.0.0.1:8686","account":"+1234567890"}"#;
+        let parsed: SignalConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.group_id.is_none());
+        assert!(parsed.allowed_from.is_empty());
+        assert!(!parsed.ignore_attachments);
+        assert!(!parsed.ignore_stories);
+    }
+
+    #[test]
     fn channels_config_with_imessage_and_matrix() {
         let c = ChannelsConfig {
             cli: true,
@@ -2498,11 +2616,13 @@ tool_dispatcher = "xml"
                 room_id: "!r:m".into(),
                 allowed_users: vec!["@u:m".into()],
             }),
+            signal: None,
             whatsapp: None,
             email: None,
             irc: None,
             lark: None,
             dingtalk: None,
+            qq: None,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -2652,6 +2772,7 @@ channel_id = "C123"
             webhook: None,
             imessage: None,
             matrix: None,
+            signal: None,
             whatsapp: Some(WhatsAppConfig {
                 access_token: "tok".into(),
                 phone_number_id: "123".into(),
@@ -2663,6 +2784,7 @@ channel_id = "C123"
             irc: None,
             lark: None,
             dingtalk: None,
+            qq: None,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -3008,6 +3130,21 @@ default_temperature = 0.7
         assert_eq!(config.default_provider.as_deref(), Some("openai"));
 
         std::env::remove_var("PROVIDER");
+    }
+
+    #[test]
+    fn env_override_glm_api_key_for_regional_aliases() {
+        let _env_guard = env_override_test_guard();
+        let mut config = Config {
+            default_provider: Some("glm-cn".to_string()),
+            ..Config::default()
+        };
+
+        std::env::set_var("GLM_API_KEY", "glm-regional-key");
+        config.apply_env_overrides();
+        assert_eq!(config.api_key.as_deref(), Some("glm-regional-key"));
+
+        std::env::remove_var("GLM_API_KEY");
     }
 
     #[test]

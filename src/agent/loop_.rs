@@ -1,3 +1,4 @@
+use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{self, Observer, ObserverEvent};
@@ -7,13 +8,69 @@ use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
+use regex::{Regex, RegexSet};
 use std::fmt::Write;
 use std::io::Write as _;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 use uuid::Uuid;
+
 /// Maximum agentic tool-use iterations per user message to prevent runaway loops.
 const MAX_TOOL_ITERATIONS: usize = 10;
+
+static SENSITIVE_KEY_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
+    RegexSet::new([
+        r"(?i)token",
+        r"(?i)api[_-]?key",
+        r"(?i)password",
+        r"(?i)secret",
+        r"(?i)user[_-]?key",
+        r"(?i)bearer",
+        r"(?i)credential",
+    ])
+    .unwrap()
+});
+
+static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)(token|api[_-]?key|password|secret|user[_-]?key|bearer|credential)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\.]{8,}))"#).unwrap()
+});
+
+/// Scrub credentials from tool output to prevent accidental exfiltration.
+/// Replaces known credential patterns with a redacted placeholder while preserving
+/// a small prefix for context.
+fn scrub_credentials(input: &str) -> String {
+    SENSITIVE_KV_REGEX
+        .replace_all(input, |caps: &regex::Captures| {
+            let full_match = &caps[0];
+            let key = &caps[1];
+            let val = caps
+                .get(2)
+                .or(caps.get(3))
+                .or(caps.get(4))
+                .map(|m| m.as_str())
+                .unwrap_or("");
+
+            // Preserve first 4 chars for context, then redact
+            let prefix = if val.len() > 4 { &val[..4] } else { "" };
+
+            if full_match.contains(':') {
+                if full_match.contains('"') {
+                    format!("\"{}\": \"{}*[REDACTED]\"", key, prefix)
+                } else {
+                    format!("{}: {}*[REDACTED]", key, prefix)
+                }
+            } else if full_match.contains('=') {
+                if full_match.contains('"') {
+                    format!("{}=\"{}*[REDACTED]\"", key, prefix)
+                } else {
+                    format!("{}={}*[REDACTED]", key, prefix)
+                }
+            } else {
+                format!("{}: {}*[REDACTED]", key, prefix)
+            }
+        })
+        .to_string()
+}
 
 /// Trigger auto-compaction when non-system message count exceeds this threshold.
 const MAX_HISTORY_MESSAGES: usize = 50;
@@ -456,6 +513,8 @@ pub(crate) async fn agent_turn(
         model,
         temperature,
         silent,
+        None,
+        "channel",
     )
     .await
 }
@@ -472,6 +531,8 @@ pub(crate) async fn run_tool_call_loop(
     model: &str,
     temperature: f64,
     silent: bool,
+    approval: Option<&ApprovalManager>,
+    channel_name: &str,
 ) -> Result<String> {
     // Build native tool definitions once if the provider supports them.
     let use_native_tools = provider.supports_native_tools() && !tools_registry.is_empty();
@@ -595,6 +656,34 @@ pub(crate) async fn run_tool_call_loop(
         // Execute each tool call and build results
         let mut tool_results = String::new();
         for call in &tool_calls {
+            // ── Approval hook ────────────────────────────────
+            if let Some(mgr) = approval {
+                if mgr.needs_approval(&call.name) {
+                    let request = ApprovalRequest {
+                        tool_name: call.name.clone(),
+                        arguments: call.arguments.clone(),
+                    };
+
+                    // Only prompt interactively on CLI; auto-approve on other channels.
+                    let decision = if channel_name == "cli" {
+                        mgr.prompt_cli(&request)
+                    } else {
+                        ApprovalResponse::Yes
+                    };
+
+                    mgr.record_decision(&call.name, &call.arguments, decision, channel_name);
+
+                    if decision == ApprovalResponse::No {
+                        let _ = writeln!(
+                            tool_results,
+                            "<tool_result name=\"{}\">\nDenied by user.\n</tool_result>",
+                            call.name
+                        );
+                        continue;
+                    }
+                }
+            }
+
             observer.record_event(&ObserverEvent::ToolCallStart {
                 tool: call.name.clone(),
             });
@@ -608,7 +697,7 @@ pub(crate) async fn run_tool_call_loop(
                             success: r.success,
                         });
                         if r.success {
-                            r.output
+                            scrub_credentials(&r.output)
                         } else {
                             format!("Error: {}", r.error.unwrap_or_else(|| r.output))
                         }
@@ -905,6 +994,9 @@ pub async fn run(
     // Append structured tool-use instructions with schemas
     system_prompt.push_str(&build_tool_instructions(&tools_registry));
 
+    // ── Approval manager (supervised mode) ───────────────────────
+    let approval_manager = ApprovalManager::from_config(&config.autonomy);
+
     // ── Execute ──────────────────────────────────────────────────
     let start = Instant::now();
 
@@ -947,6 +1039,8 @@ pub async fn run(
             model_name,
             temperature,
             false,
+            Some(&approval_manager),
+            "cli",
         )
         .await?;
         final_output = response.clone();
@@ -964,39 +1058,53 @@ pub async fn run(
     } else {
         println!("🦀 ZeroClaw Interactive Mode");
         println!("Type /quit to exit.\n");
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         let cli = crate::channels::CliChannel::new();
-
-        // Spawn listener
-        let listen_handle = tokio::spawn(async move {
-            let _ = crate::channels::Channel::listen(&cli, tx).await;
-        });
 
         // Persistent conversation history across turns
         let mut history = vec![ChatMessage::system(&system_prompt)];
 
-        while let Some(msg) = rx.recv().await {
+        loop {
+            print!("> ");
+            let _ = std::io::stdout().flush();
+
+            let mut input = String::new();
+            match std::io::stdin().read_line(&mut input) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("\nError reading input: {e}\n");
+                    break;
+                }
+            }
+
+            let user_input = input.trim().to_string();
+            if user_input.is_empty() {
+                continue;
+            }
+            if user_input == "/quit" || user_input == "/exit" {
+                break;
+            }
+
             // Auto-save conversation turns
             if config.memory.auto_save {
                 let user_key = autosave_memory_key("user_msg");
                 let _ = mem
-                    .store(&user_key, &msg.content, MemoryCategory::Conversation, None)
+                    .store(&user_key, &user_input, MemoryCategory::Conversation, None)
                     .await;
             }
 
             // Inject memory + hardware RAG context into user message
-            let mem_context = build_context(mem.as_ref(), &msg.content).await;
+            let mem_context = build_context(mem.as_ref(), &user_input).await;
             let rag_limit = if config.agent.compact_context { 2 } else { 5 };
             let hw_context = hardware_rag
                 .as_ref()
-                .map(|r| build_hardware_context(r, &msg.content, &board_names, rag_limit))
+                .map(|r| build_hardware_context(r, &user_input, &board_names, rag_limit))
                 .unwrap_or_default();
             let context = format!("{mem_context}{hw_context}");
             let enriched = if context.is_empty() {
-                msg.content.clone()
+                user_input.clone()
             } else {
-                format!("{context}{}", msg.content)
+                format!("{context}{user_input}")
             };
 
             history.push(ChatMessage::user(&enriched));
@@ -1010,6 +1118,8 @@ pub async fn run(
                 model_name,
                 temperature,
                 false,
+                Some(&approval_manager),
+                "cli",
             )
             .await
             {
@@ -1020,7 +1130,11 @@ pub async fn run(
                 }
             };
             final_output = response.clone();
-            println!("\n{response}\n");
+            if let Err(e) =
+                crate::channels::Channel::send(&cli, &format!("\n{response}\n"), "user").await
+            {
+                eprintln!("\nError sending CLI response: {e}\n");
+            }
             observer.record_event(&ObserverEvent::TurnComplete);
 
             // Auto-compaction before hard trimming to preserve long-context signal.
@@ -1043,8 +1157,6 @@ pub async fn run(
                     .await;
             }
         }
-
-        listen_handle.abort();
     }
 
     let duration = start.elapsed();
@@ -1222,6 +1334,25 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_scrub_credentials() {
+        let input = "API_KEY=sk-1234567890abcdef; token: 1234567890; password=\"secret123456\"";
+        let scrubbed = scrub_credentials(input);
+        assert!(scrubbed.contains("API_KEY=sk-1*[REDACTED]"));
+        assert!(scrubbed.contains("token: 1234*[REDACTED]"));
+        assert!(scrubbed.contains("password=\"secr*[REDACTED]\""));
+        assert!(!scrubbed.contains("abcdef"));
+        assert!(!scrubbed.contains("secret123456"));
+    }
+
+    #[test]
+    fn test_scrub_credentials_json() {
+        let input = r#"{"api_key": "sk-1234567890", "other": "public"}"#;
+        let scrubbed = scrub_credentials(input);
+        assert!(scrubbed.contains("\"api_key\": \"sk-1*[REDACTED]\""));
+        assert!(scrubbed.contains("public"));
+    }
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use tempfile::TempDir;
 

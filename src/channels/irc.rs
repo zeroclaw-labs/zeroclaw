@@ -1,4 +1,4 @@
-use crate::channels::traits::{Channel, ChannelMessage};
+use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -345,7 +345,7 @@ impl Channel for IrcChannel {
         "irc"
     }
 
-    async fn send(&self, message: &str, recipient: &str) -> anyhow::Result<()> {
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let mut guard = self.writer.lock().await;
         let writer = guard
             .as_mut()
@@ -353,12 +353,12 @@ impl Channel for IrcChannel {
 
         // Calculate safe payload size:
         // 512 - sender prefix (~64 bytes for :nick!user@host) - "PRIVMSG " - target - " :" - "\r\n"
-        let overhead = SENDER_PREFIX_RESERVE + 10 + recipient.len() + 2;
+        let overhead = SENDER_PREFIX_RESERVE + 10 + message.recipient.len() + 2;
         let max_payload = 512_usize.saturating_sub(overhead);
-        let chunks = split_message(message, max_payload);
+        let chunks = split_message(&message.content, max_payload);
 
         for chunk in chunks {
-            Self::send_raw(writer, &format!("PRIVMSG {recipient} :{chunk}")).await?;
+            Self::send_raw(writer, &format!("PRIVMSG {} :{chunk}", message.recipient)).await?;
         }
 
         Ok(())

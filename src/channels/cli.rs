@@ -1,4 +1,4 @@
-use super::traits::{Channel, ChannelMessage};
+use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use tokio::io::{self, AsyncBufReadExt, BufReader};
 use uuid::Uuid;
@@ -18,8 +18,8 @@ impl Channel for CliChannel {
         "cli"
     }
 
-    async fn send(&self, message: &str, _recipient: &str) -> anyhow::Result<()> {
-        println!("{message}");
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        println!("{}", message.content);
         Ok(())
     }
 
@@ -69,14 +69,26 @@ mod tests {
     #[tokio::test]
     async fn cli_channel_send_does_not_panic() {
         let ch = CliChannel::new();
-        let result = ch.send("hello", "user").await;
+        let result = ch
+            .send(&SendMessage {
+                content: "hello".into(),
+                recipient: "user".into(),
+                subject: None,
+            })
+            .await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn cli_channel_send_empty_message() {
         let ch = CliChannel::new();
-        let result = ch.send("", "").await;
+        let result = ch
+            .send(&SendMessage {
+                content: String::new(),
+                recipient: String::new(),
+                subject: None,
+            })
+            .await;
         assert!(result.is_ok());
     }
 

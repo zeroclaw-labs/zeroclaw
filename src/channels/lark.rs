@@ -1,4 +1,4 @@
-use super::traits::{Channel, ChannelMessage};
+use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
@@ -630,13 +630,13 @@ impl Channel for LarkChannel {
         "lark"
     }
 
-    async fn send(&self, message: &str, recipient: &str) -> anyhow::Result<()> {
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let token = self.get_tenant_access_token().await?;
         let url = self.send_message_url();
 
-        let content = serde_json::json!({ "text": message }).to_string();
+        let content = serde_json::json!({ "text": message.content }).to_string();
         let body = serde_json::json!({
-            "receive_id": recipient,
+            "receive_id": message.recipient,
             "msg_type": "text",
             "content": content,
         });
@@ -1085,7 +1085,7 @@ mod tests {
                 "sender": { "sender_id": { "open_id": "ou_user" } },
                 "message": {
                     "message_type": "text",
-                    "content": "{\"text\":\"你好世界 🌍\"}",
+                    "content": "{\"text\":\"Hello world 🌍\"}",
                     "chat_id": "oc_chat",
                     "create_time": "1000"
                 }
@@ -1094,7 +1094,7 @@ mod tests {
 
         let msgs = ch.parse_event_payload(&payload);
         assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].content, "你好世界 🌍");
+        assert_eq!(msgs[0].content, "Hello world 🌍");
     }
 
     #[test]

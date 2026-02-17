@@ -1,4 +1,4 @@
-use crate::channels::{Channel, DiscordChannel, SlackChannel, TelegramChannel};
+use crate::channels::{Channel, DiscordChannel, SendMessage, SlackChannel, TelegramChannel};
 use crate::config::Config;
 use crate::cron::{
     due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job, reschedule_after_run,
@@ -232,7 +232,7 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("telegram channel not configured"))?;
             let channel = TelegramChannel::new(tg.bot_token.clone(), tg.allowed_users.clone());
-            channel.send(output, target).await?;
+            channel.send(&SendMessage::new(output, target)).await?;
         }
         "discord" => {
             let dc = config
@@ -247,7 +247,7 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 dc.listen_to_bots,
                 dc.mention_only,
             );
-            channel.send(output, target).await?;
+            channel.send(&SendMessage::new(output, target)).await?;
         }
         "slack" => {
             let sl = config
@@ -260,7 +260,7 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 sl.channel_id.clone(),
                 sl.allowed_users.clone(),
             );
-            channel.send(output, target).await?;
+            channel.send(&SendMessage::new(output, target)).await?;
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
