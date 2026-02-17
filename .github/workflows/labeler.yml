@@ -44,8 +44,6 @@ jobs:
                         manualRiskOverrideLabel,
                         ...computedRiskLabels,
                       ]);
-                      const legacyTrustedContributorLabel = "trusted contributor";
-
                       if ((action === "labeled" || action === "unlabeled") && !managedEnforcedLabels.has(changedLabel)) {
                         core.info(`skip non-size/risk label event: ${changedLabel || "unknown"}`);
                         return;
@@ -442,13 +440,13 @@ jobs:
                         return "Auto-managed label.";
                       }
 
-                      async function ensureLabel(name) {
+                      async function ensureLabel(name, existing = null) {
                         const expectedColor = colorForLabel(name);
                         const expectedDescription = descriptionForLabel(name);
                         try {
-                          const { data: existing } = await github.rest.issues.getLabel({ owner, repo, name });
-                          const currentColor = (existing.color || "").toUpperCase();
-                          const currentDescription = (existing.description || "").trim();
+                          const current = existing || (await github.rest.issues.getLabel({ owner, repo, name })).data;
+                          const currentColor = (current.color || "").toUpperCase();
+                          const currentDescription = (current.description || "").trim();
                           if (currentColor !== expectedColor || currentDescription !== expectedDescription) {
                             await github.rest.issues.updateLabel({
                               owner,
@@ -468,6 +466,29 @@ jobs:
                             color: expectedColor,
                             description: expectedDescription,
                           });
+                        }
+                      }
+
+                      function isManagedLabel(label) {
+                        if (label === manualRiskOverrideLabel) return true;
+                        if (sizeLabels.includes(label) || computedRiskLabels.includes(label)) return true;
+                        if (managedPathLabelSet.has(label)) return true;
+                        if (contributorTierLabels.includes(label)) return true;
+                        if (managedModulePrefixes.some((prefix) => label.startsWith(prefix))) return true;
+                        return false;
+                      }
+
+                      async function ensureManagedRepoLabelsMetadata() {
+                        const repoLabels = await github.paginate(github.rest.issues.listLabelsForRepo, {
+                          owner,
+                          repo,
+                          per_page: 100,
+                        });
+
+                        for (const existingLabel of repoLabels) {
+                          const labelName = existingLabel.name || "";
+                          if (!isManagedLabel(labelName)) continue;
+                          await ensureLabel(labelName, existingLabel);
                         }
                       }
 
@@ -629,6 +650,8 @@ jobs:
                         riskLabel = "risk: medium";
                       }
 
+                      await ensureManagedRepoLabelsMetadata();
+
                       const labelsToEnsure = new Set([
                         ...sizeLabels,
                         ...computedRiskLabels,
@@ -660,7 +683,6 @@ jobs:
                       const hasManualRiskOverride = currentLabelNames.includes(manualRiskOverrideLabel);
                       const keepNonManagedLabels = currentLabelNames.filter((label) => {
                         if (label === manualRiskOverrideLabel) return true;
-                        if (label === legacyTrustedContributorLabel) return false;
                         if (contributorTierLabels.includes(label)) return false;
                         if (sizeLabels.includes(label) || computedRiskLabels.includes(label)) return false;
                         if (managedPathLabelSet.has(label)) return false;

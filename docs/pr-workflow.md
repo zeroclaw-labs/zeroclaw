@@ -54,7 +54,7 @@ Maintain these branch protection rules on `main`:
 - Label ordering is priority-first: `risk:*` -> `size:*` -> contributor tier -> module/path labels.
 - Hovering a label in GitHub shows its auto-managed description (rule/threshold summary).
 - Managed label colors are arranged by display order to create a smooth gradient across long label rows.
-- `Auto Response` posts first-time guidance and handles label-driven routing for low-signal items.
+- `Auto Response` posts first-time guidance, handles label-driven routing for low-signal items, and auto-applies issue contributor tiers using the same thresholds as `PR Labeler` (`trusted` >=5, `experienced` >=10, `principal` >=20, `distinguished` >=50).
 
 ### Step B: Validation
 
