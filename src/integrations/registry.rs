@@ -133,7 +133,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
         },
         IntegrationEntry {
             name: "DingTalk",
-            description: "DingTalk Stream Mode (钉钉)",
+            description: "DingTalk Stream Mode",
             category: IntegrationCategory::Chat,
             status_fn: |c| {
                 if c.channels_config.dingtalk.is_some() {
@@ -317,7 +317,19 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Kimi & Kimi Coding",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.default_provider.as_deref() == Some("moonshot") {
+                if matches!(
+                    c.default_provider.as_deref(),
+                    Some(
+                        "moonshot"
+                            | "kimi"
+                            | "moonshot-intl"
+                            | "moonshot-global"
+                            | "moonshot-cn"
+                            | "kimi-intl"
+                            | "kimi-global"
+                            | "kimi-cn"
+                    )
+                ) {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -365,7 +377,18 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "ChatGLM / Zhipu models",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.default_provider.as_deref() == Some("glm") {
+                if matches!(
+                    c.default_provider.as_deref(),
+                    Some(
+                        "glm"
+                            | "zhipu"
+                            | "glm-global"
+                            | "zhipu-global"
+                            | "glm-cn"
+                            | "zhipu-cn"
+                            | "bigmodel"
+                    )
+                ) {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -377,7 +400,43 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "MiniMax AI models",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.default_provider.as_deref() == Some("minimax") {
+                if matches!(
+                    c.default_provider.as_deref(),
+                    Some(
+                        "minimax"
+                            | "minimax-intl"
+                            | "minimax-io"
+                            | "minimax-global"
+                            | "minimax-cn"
+                            | "minimaxi"
+                    )
+                ) {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
+        },
+        IntegrationEntry {
+            name: "Qwen",
+            description: "Alibaba DashScope Qwen models",
+            category: IntegrationCategory::AiModel,
+            status_fn: |c| {
+                if matches!(
+                    c.default_provider.as_deref(),
+                    Some(
+                        "qwen"
+                            | "dashscope"
+                            | "qwen-cn"
+                            | "dashscope-cn"
+                            | "qwen-intl"
+                            | "dashscope-intl"
+                            | "qwen-international"
+                            | "dashscope-international"
+                            | "qwen-us"
+                            | "dashscope-us"
+                    )
+                ) {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -904,5 +963,41 @@ mod tests {
             ai_count >= 5,
             "Expected 5+ AI model integrations, got {ai_count}"
         );
+    }
+
+    #[test]
+    fn regional_provider_aliases_activate_expected_ai_integrations() {
+        let entries = all_integrations();
+        let mut config = Config {
+            default_provider: Some("minimax-cn".to_string()),
+            ..Config::default()
+        };
+
+        let minimax = entries.iter().find(|e| e.name == "MiniMax").unwrap();
+        assert!(matches!(
+            (minimax.status_fn)(&config),
+            IntegrationStatus::Active
+        ));
+
+        config.default_provider = Some("glm-cn".to_string());
+        let glm = entries.iter().find(|e| e.name == "GLM").unwrap();
+        assert!(matches!(
+            (glm.status_fn)(&config),
+            IntegrationStatus::Active
+        ));
+
+        config.default_provider = Some("moonshot-intl".to_string());
+        let moonshot = entries.iter().find(|e| e.name == "Moonshot").unwrap();
+        assert!(matches!(
+            (moonshot.status_fn)(&config),
+            IntegrationStatus::Active
+        ));
+
+        config.default_provider = Some("qwen-intl".to_string());
+        let qwen = entries.iter().find(|e| e.name == "Qwen").unwrap();
+        assert!(matches!(
+            (qwen.status_fn)(&config),
+            IntegrationStatus::Active
+        ));
     }
 }

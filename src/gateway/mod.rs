@@ -1318,7 +1318,7 @@ mod tests {
     #[test]
     fn whatsapp_signature_unicode_body() {
         let app_secret = "test_secret_key_12345";
-        let body = "Hello 🦀 世界".as_bytes();
+        let body = "Hello 🦀 World".as_bytes();
 
         let signature_header = compute_whatsapp_signature_header(app_secret, body);
 

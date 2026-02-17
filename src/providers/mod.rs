@@ -19,6 +19,52 @@ use compatible::{AuthStyle, OpenAiCompatibleProvider};
 use reliable::ReliableProvider;
 
 const MAX_API_ERROR_CHARS: usize = 200;
+const MINIMAX_INTL_BASE_URL: &str = "https://api.minimax.io/v1";
+const MINIMAX_CN_BASE_URL: &str = "https://api.minimaxi.com/v1";
+const GLM_GLOBAL_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
+const GLM_CN_BASE_URL: &str = "https://open.bigmodel.cn/api/paas/v4";
+const MOONSHOT_INTL_BASE_URL: &str = "https://api.moonshot.ai/v1";
+const MOONSHOT_CN_BASE_URL: &str = "https://api.moonshot.cn/v1";
+const QWEN_CN_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
+const QWEN_INTL_BASE_URL: &str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1";
+const QWEN_US_BASE_URL: &str = "https://dashscope-us.aliyuncs.com/compatible-mode/v1";
+
+fn minimax_base_url(name: &str) -> Option<&'static str> {
+    match name {
+        "minimax" | "minimax-intl" | "minimax-io" | "minimax-global" => Some(MINIMAX_INTL_BASE_URL),
+        "minimax-cn" | "minimaxi" => Some(MINIMAX_CN_BASE_URL),
+        _ => None,
+    }
+}
+
+fn glm_base_url(name: &str) -> Option<&'static str> {
+    match name {
+        "glm" | "zhipu" | "glm-global" | "zhipu-global" => Some(GLM_GLOBAL_BASE_URL),
+        "glm-cn" | "zhipu-cn" | "bigmodel" => Some(GLM_CN_BASE_URL),
+        _ => None,
+    }
+}
+
+fn moonshot_base_url(name: &str) -> Option<&'static str> {
+    match name {
+        "moonshot-intl" | "moonshot-global" | "kimi-intl" | "kimi-global" => {
+            Some(MOONSHOT_INTL_BASE_URL)
+        }
+        "moonshot" | "kimi" | "moonshot-cn" | "kimi-cn" => Some(MOONSHOT_CN_BASE_URL),
+        _ => None,
+    }
+}
+
+fn qwen_base_url(name: &str) -> Option<&'static str> {
+    match name {
+        "qwen" | "dashscope" | "qwen-cn" | "dashscope-cn" => Some(QWEN_CN_BASE_URL),
+        "qwen-intl" | "dashscope-intl" | "qwen-international" | "dashscope-international" => {
+            Some(QWEN_INTL_BASE_URL)
+        }
+        "qwen-us" | "dashscope-us" => Some(QWEN_US_BASE_URL),
+        _ => None,
+    }
+}
 
 fn is_secret_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':')
@@ -135,13 +181,24 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "fireworks" | "fireworks-ai" => vec!["FIREWORKS_API_KEY"],
         "perplexity" => vec!["PERPLEXITY_API_KEY"],
         "cohere" => vec!["COHERE_API_KEY"],
-        "moonshot" | "kimi" => vec!["MOONSHOT_API_KEY"],
-        "glm" | "zhipu" => vec!["GLM_API_KEY"],
-        "minimax" => vec!["MINIMAX_API_KEY"],
-        "qianfan" | "baidu" => vec!["QIANFAN_API_KEY"],
-        "qwen" | "dashscope" | "qwen-intl" | "dashscope-intl" | "qwen-us" | "dashscope-us" => {
-            vec!["DASHSCOPE_API_KEY"]
+        "moonshot" | "kimi" | "moonshot-intl" | "moonshot-global" | "moonshot-cn" | "kimi-intl"
+        | "kimi-global" | "kimi-cn" => vec!["MOONSHOT_API_KEY"],
+        "glm" | "zhipu" | "glm-global" | "zhipu-global" | "glm-cn" | "zhipu-cn" | "bigmodel" => {
+            vec!["GLM_API_KEY"]
         }
+        "minimax" | "minimax-intl" | "minimax-io" | "minimax-global" | "minimax-cn"
+        | "minimaxi" => vec!["MINIMAX_API_KEY"],
+        "qianfan" | "baidu" => vec!["QIANFAN_API_KEY"],
+        "qwen"
+        | "dashscope"
+        | "qwen-cn"
+        | "dashscope-cn"
+        | "qwen-intl"
+        | "dashscope-intl"
+        | "qwen-international"
+        | "dashscope-international"
+        | "qwen-us"
+        | "dashscope-us" => vec!["DASHSCOPE_API_KEY"],
         "zai" | "z.ai" => vec!["ZAI_API_KEY"],
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => vec!["NVIDIA_API_KEY"],
         "synthetic" => vec!["SYNTHETIC_API_KEY"],
@@ -235,8 +292,11 @@ pub fn create_provider_with_url(
             key,
             AuthStyle::Bearer,
         ))),
-        "moonshot" | "kimi" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Moonshot", "https://api.moonshot.cn", key, AuthStyle::Bearer,
+        name if moonshot_base_url(name).is_some() => Ok(Box::new(OpenAiCompatibleProvider::new(
+            "Moonshot",
+            moonshot_base_url(name).expect("checked in guard"),
+            key,
+            AuthStyle::Bearer,
         ))),
         "synthetic" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Synthetic", "https://api.synthetic.com", key, AuthStyle::Bearer,
@@ -247,12 +307,17 @@ pub fn create_provider_with_url(
         "zai" | "z.ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Z.AI", "https://api.z.ai/api/coding/paas/v4", key, AuthStyle::Bearer,
         ))),
-        "glm" | "zhipu" => Ok(Box::new(OpenAiCompatibleProvider::new_no_responses_fallback(
-            "GLM", "https://api.z.ai/api/paas/v4", key, AuthStyle::Bearer,
-        ))),
-        "minimax" => Ok(Box::new(OpenAiCompatibleProvider::new(
+        name if glm_base_url(name).is_some() => {
+            Ok(Box::new(OpenAiCompatibleProvider::new_no_responses_fallback(
+                "GLM",
+                glm_base_url(name).expect("checked in guard"),
+                key,
+                AuthStyle::Bearer,
+            )))
+        }
+        name if minimax_base_url(name).is_some() => Ok(Box::new(OpenAiCompatibleProvider::new(
             "MiniMax",
-            "https://api.minimaxi.com/v1",
+            minimax_base_url(name).expect("checked in guard"),
             key,
             AuthStyle::Bearer,
         ))),
@@ -265,14 +330,11 @@ pub fn create_provider_with_url(
         "qianfan" | "baidu" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Qianfan", "https://aip.baidubce.com", key, AuthStyle::Bearer,
         ))),
-        "qwen" | "dashscope" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Qwen", "https://dashscope.aliyuncs.com/compatible-mode/v1", key, AuthStyle::Bearer,
-        ))),
-        "qwen-intl" | "dashscope-intl" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Qwen", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", key, AuthStyle::Bearer,
-        ))),
-        "qwen-us" | "dashscope-us" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Qwen", "https://dashscope-us.aliyuncs.com/compatible-mode/v1", key, AuthStyle::Bearer,
+        name if qwen_base_url(name).is_some() => Ok(Box::new(OpenAiCompatibleProvider::new(
+            "Qwen",
+            qwen_base_url(name).expect("checked in guard"),
+            key,
+            AuthStyle::Bearer,
         ))),
 
         // ── Extended ecosystem (community favorites) ─────────
@@ -492,6 +554,31 @@ mod tests {
         assert_eq!(resolved, Some("explicit-key".to_string()));
     }
 
+    #[test]
+    fn regional_endpoint_aliases_map_to_expected_urls() {
+        assert_eq!(minimax_base_url("minimax"), Some(MINIMAX_INTL_BASE_URL));
+        assert_eq!(
+            minimax_base_url("minimax-intl"),
+            Some(MINIMAX_INTL_BASE_URL)
+        );
+        assert_eq!(minimax_base_url("minimax-cn"), Some(MINIMAX_CN_BASE_URL));
+
+        assert_eq!(glm_base_url("glm"), Some(GLM_GLOBAL_BASE_URL));
+        assert_eq!(glm_base_url("glm-cn"), Some(GLM_CN_BASE_URL));
+        assert_eq!(glm_base_url("bigmodel"), Some(GLM_CN_BASE_URL));
+
+        assert_eq!(moonshot_base_url("moonshot"), Some(MOONSHOT_CN_BASE_URL));
+        assert_eq!(
+            moonshot_base_url("moonshot-intl"),
+            Some(MOONSHOT_INTL_BASE_URL)
+        );
+
+        assert_eq!(qwen_base_url("qwen"), Some(QWEN_CN_BASE_URL));
+        assert_eq!(qwen_base_url("qwen-cn"), Some(QWEN_CN_BASE_URL));
+        assert_eq!(qwen_base_url("qwen-intl"), Some(QWEN_INTL_BASE_URL));
+        assert_eq!(qwen_base_url("qwen-us"), Some(QWEN_US_BASE_URL));
+    }
+
     // ── Primary providers ────────────────────────────────────
 
     #[test]
@@ -550,6 +637,10 @@ mod tests {
     fn factory_moonshot() {
         assert!(create_provider("moonshot", Some("key")).is_ok());
         assert!(create_provider("kimi", Some("key")).is_ok());
+        assert!(create_provider("moonshot-intl", Some("key")).is_ok());
+        assert!(create_provider("moonshot-cn", Some("key")).is_ok());
+        assert!(create_provider("kimi-intl", Some("key")).is_ok());
+        assert!(create_provider("kimi-cn", Some("key")).is_ok());
     }
 
     #[test]
@@ -573,11 +664,19 @@ mod tests {
     fn factory_glm() {
         assert!(create_provider("glm", Some("key")).is_ok());
         assert!(create_provider("zhipu", Some("key")).is_ok());
+        assert!(create_provider("glm-cn", Some("key")).is_ok());
+        assert!(create_provider("zhipu-cn", Some("key")).is_ok());
+        assert!(create_provider("glm-global", Some("key")).is_ok());
+        assert!(create_provider("bigmodel", Some("key")).is_ok());
     }
 
     #[test]
     fn factory_minimax() {
         assert!(create_provider("minimax", Some("key")).is_ok());
+        assert!(create_provider("minimax-intl", Some("key")).is_ok());
+        assert!(create_provider("minimax-io", Some("key")).is_ok());
+        assert!(create_provider("minimax-cn", Some("key")).is_ok());
+        assert!(create_provider("minimaxi", Some("key")).is_ok());
     }
 
     #[test]
@@ -596,8 +695,12 @@ mod tests {
     fn factory_qwen() {
         assert!(create_provider("qwen", Some("key")).is_ok());
         assert!(create_provider("dashscope", Some("key")).is_ok());
+        assert!(create_provider("qwen-cn", Some("key")).is_ok());
+        assert!(create_provider("dashscope-cn", Some("key")).is_ok());
         assert!(create_provider("qwen-intl", Some("key")).is_ok());
         assert!(create_provider("dashscope-intl", Some("key")).is_ok());
+        assert!(create_provider("qwen-international", Some("key")).is_ok());
+        assert!(create_provider("dashscope-international", Some("key")).is_ok());
         assert!(create_provider("qwen-us", Some("key")).is_ok());
         assert!(create_provider("dashscope-us", Some("key")).is_ok());
     }
@@ -860,15 +963,20 @@ mod tests {
             "vercel",
             "cloudflare",
             "moonshot",
+            "moonshot-intl",
+            "moonshot-cn",
             "synthetic",
             "opencode",
             "zai",
             "glm",
+            "glm-cn",
             "minimax",
+            "minimax-cn",
             "bedrock",
             "qianfan",
             "qwen",
             "qwen-intl",
+            "qwen-cn",
             "qwen-us",
             "lmstudio",
             "groq",

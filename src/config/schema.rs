@@ -1620,7 +1620,7 @@ impl Default for AuditConfig {
     }
 }
 
-/// DingTalk (钉钉) configuration for Stream Mode messaging
+/// DingTalk configuration for Stream Mode messaging
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DingTalkConfig {
     /// Client ID (AppKey) from DingTalk developer console
@@ -1827,10 +1827,19 @@ impl Config {
                 self.api_key = Some(key);
             }
         }
-        // API Key: GLM_API_KEY overrides when provider is glm (provider-specific)
-        if self.default_provider.as_deref() == Some("glm")
-            || self.default_provider.as_deref() == Some("zhipu")
-        {
+        // API Key: GLM_API_KEY overrides when provider is a GLM/Zhipu variant.
+        if matches!(
+            self.default_provider.as_deref(),
+            Some(
+                "glm"
+                    | "zhipu"
+                    | "glm-global"
+                    | "zhipu-global"
+                    | "glm-cn"
+                    | "zhipu-cn"
+                    | "bigmodel"
+            )
+        ) {
             if let Ok(key) = std::env::var("GLM_API_KEY") {
                 if !key.is_empty() {
                     self.api_key = Some(key);
@@ -3084,6 +3093,21 @@ default_temperature = 0.7
         assert_eq!(config.default_provider.as_deref(), Some("openai"));
 
         std::env::remove_var("PROVIDER");
+    }
+
+    #[test]
+    fn env_override_glm_api_key_for_regional_aliases() {
+        let _env_guard = env_override_test_guard();
+        let mut config = Config {
+            default_provider: Some("glm-cn".to_string()),
+            ..Config::default()
+        };
+
+        std::env::set_var("GLM_API_KEY", "glm-regional-key");
+        config.apply_env_overrides();
+        assert_eq!(config.api_key.as_deref(), Some("glm-regional-key"));
+
+        std::env::remove_var("GLM_API_KEY");
     }
 
     #[test]

@@ -448,6 +448,20 @@ fn canonical_provider_name(provider_name: &str) -> &str {
         "grok" => "xai",
         "together" => "together-ai",
         "google" | "google-gemini" => "gemini",
+        "dashscope"
+        | "qwen-cn"
+        | "dashscope-cn"
+        | "qwen-intl"
+        | "dashscope-intl"
+        | "qwen-international"
+        | "dashscope-international"
+        | "qwen-us"
+        | "dashscope-us" => "qwen",
+        "zhipu" | "glm-global" | "zhipu-global" | "glm-cn" | "zhipu-cn" | "bigmodel" => "glm",
+        "kimi" | "moonshot-intl" | "moonshot-global" | "moonshot-cn" | "kimi-intl"
+        | "kimi-global" | "kimi-cn" => "moonshot",
+        "minimax-intl" | "minimax-io" | "minimax-global" | "minimax-cn" | "minimaxi" => "minimax",
+        "baidu" => "qianfan",
         _ => provider_name,
     }
 }
@@ -467,6 +481,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "openai" => "gpt-5.2".into(),
         "glm" | "zhipu" | "zai" | "z.ai" => "glm-5".into(),
         "minimax" => "MiniMax-M2.5".into(),
+        "qwen" => "qwen-plus".into(),
         "ollama" => "llama3.2".into(),
         "groq" => "llama-3.3-70b-versatile".into(),
         "deepseek" => "deepseek-chat".into(),
@@ -700,6 +715,20 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
             (
                 "MiniMax-M2.1-lightning".to_string(),
                 "MiniMax M2.1 Lightning (fast)".to_string(),
+            ),
+        ],
+        "qwen" => vec![
+            (
+                "qwen-max".to_string(),
+                "Qwen Max (highest quality)".to_string(),
+            ),
+            (
+                "qwen-plus".to_string(),
+                "Qwen Plus (balanced default)".to_string(),
+            ),
+            (
+                "qwen-turbo".to_string(),
+                "Qwen Turbo (fast and cost-efficient)".to_string(),
             ),
         ],
         "ollama" => vec![
@@ -1306,7 +1335,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
         "⭐ Recommended (OpenRouter, Venice, Anthropic, OpenAI, Gemini)",
         "⚡ Fast inference (Groq, Fireworks, Together AI, NVIDIA NIM)",
         "🌐 Gateway / proxy (Vercel AI, Cloudflare AI, Amazon Bedrock)",
-        "🔬 Specialized (Moonshot/Kimi, GLM/Zhipu, MiniMax, Qianfan, Z.AI, Synthetic, OpenCode Zen, Cohere)",
+        "🔬 Specialized (Moonshot/Kimi, GLM/Zhipu, MiniMax, Qwen/DashScope, Qianfan, Z.AI, Synthetic, OpenCode Zen, Cohere)",
         "🏠 Local / private (Ollama — no API key needed)",
         "🔧 Custom — bring your own OpenAI-compatible API",
     ];
@@ -1347,9 +1376,21 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
             ("bedrock", "Amazon Bedrock — AWS managed models"),
         ],
         3 => vec![
-            ("moonshot", "Moonshot — Kimi & Kimi Coding"),
-            ("glm", "GLM — ChatGLM / Zhipu models"),
-            ("minimax", "MiniMax — MiniMax AI models"),
+            ("moonshot", "Moonshot — Kimi API (China endpoint)"),
+            (
+                "moonshot-intl",
+                "Moonshot — Kimi API (international endpoint)",
+            ),
+            ("glm", "GLM — ChatGLM / Zhipu (international endpoint)"),
+            ("glm-cn", "GLM — ChatGLM / Zhipu (China endpoint)"),
+            (
+                "minimax",
+                "MiniMax — international endpoint (api.minimax.io)",
+            ),
+            ("minimax-cn", "MiniMax — China endpoint (api.minimaxi.com)"),
+            ("qwen", "Qwen — DashScope China endpoint"),
+            ("qwen-intl", "Qwen — DashScope international endpoint"),
+            ("qwen-us", "Qwen — DashScope US endpoint"),
             ("qianfan", "Qianfan — Baidu AI models"),
             ("zai", "Z.AI — Z.AI inference"),
             ("synthetic", "Synthetic — Synthetic AI models"),
@@ -1512,10 +1553,30 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
             "perplexity" => "https://www.perplexity.ai/settings/api",
             "xai" => "https://console.x.ai",
             "cohere" => "https://dashboard.cohere.com/api-keys",
-            "moonshot" => "https://platform.moonshot.cn/console/api-keys",
-            "glm" | "zhipu" => "https://open.bigmodel.cn/usercenter/proj-mgmt/apikeys",
-            "zai" | "z.ai" => "https://platform.z.ai/",
-            "minimax" => "https://www.minimaxi.com/user-center/basic-information",
+            "moonshot" | "moonshot-intl" | "moonshot-global" | "moonshot-cn" | "kimi"
+            | "kimi-intl" | "kimi-global" | "kimi-cn" => {
+                "https://platform.moonshot.cn/console/api-keys"
+            }
+            "glm" | "zhipu" | "glm-global" | "zhipu-global" | "zai" | "z.ai" => {
+                "https://platform.z.ai/"
+            }
+            "glm-cn" | "zhipu-cn" | "bigmodel" => {
+                "https://open.bigmodel.cn/usercenter/proj-mgmt/apikeys"
+            }
+            "minimax" | "minimax-intl" | "minimax-io" | "minimax-global" | "minimax-cn"
+            | "minimaxi" => "https://www.minimaxi.com/user-center/basic-information",
+            "qwen"
+            | "dashscope"
+            | "qwen-cn"
+            | "dashscope-cn"
+            | "qwen-intl"
+            | "dashscope-intl"
+            | "qwen-international"
+            | "dashscope-international"
+            | "qwen-us"
+            | "dashscope-us" => {
+                "https://help.aliyun.com/zh/model-studio/developer-reference/get-api-key"
+            }
             "vercel" => "https://vercel.com/account/tokens",
             "cloudflare" => "https://dash.cloudflare.com/profile/api-tokens",
             "nvidia" | "nvidia-nim" | "build.nvidia.com" => "https://build.nvidia.com/",
@@ -1551,7 +1612,8 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
     };
 
     // ── Model selection ──
-    let models: Vec<(&str, &str)> = match provider_name {
+    let canonical_provider = canonical_provider_name(provider_name);
+    let models: Vec<(&str, &str)> = match canonical_provider {
         "openrouter" => vec![
             (
                 "anthropic/claude-sonnet-4",
@@ -1629,7 +1691,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
                 "Mixtral 8x22B",
             ),
         ],
-        "together" => vec![
+        "together-ai" => vec![
             (
                 "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
                 "Llama 3.1 70B Turbo",
@@ -1660,6 +1722,11 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
             ("glm-4-flash", "GLM-4 Flash (fast)"),
         ],
         "minimax" => MINIMAX_ONBOARD_MODELS.to_vec(),
+        "qwen" => vec![
+            ("qwen-plus", "Qwen Plus (balanced default)"),
+            ("qwen-max", "Qwen Max (highest quality)"),
+            ("qwen-turbo", "Qwen Turbo (fast and cost-efficient)"),
+        ],
         "ollama" => vec![
             ("llama3.2", "Llama 3.2 (recommended local)"),
             ("mistral", "Mistral 7B"),
@@ -1861,6 +1928,7 @@ fn provider_env_var(name: &str) -> &'static str {
         "moonshot" | "kimi" => "MOONSHOT_API_KEY",
         "glm" | "zhipu" => "GLM_API_KEY",
         "minimax" => "MINIMAX_API_KEY",
+        "qwen" | "dashscope" => "DASHSCOPE_API_KEY",
         "qianfan" | "baidu" => "QIANFAN_API_KEY",
         "zai" | "z.ai" => "ZAI_API_KEY",
         "synthetic" => "SYNTHETIC_API_KEY",
@@ -2384,7 +2452,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 if config.dingtalk.is_some() {
                     "✅ connected"
                 } else {
-                    "— 钉钉 Stream Mode"
+                    "— DingTalk Stream Mode"
                 }
             ),
             "Done — finish setup".to_string(),
@@ -3111,7 +3179,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 println!(
                     "  {} {}",
                     style("DingTalk Setup").white().bold(),
-                    style("— 钉钉 Stream Mode").dim()
+                    style("— DingTalk Stream Mode").dim()
                 );
                 print_bullet("1. Go to DingTalk developer console (open.dingtalk.com)");
                 print_bullet("2. Create an app and enable the Stream Mode bot");
@@ -4313,12 +4381,27 @@ mod tests {
             default_model_for_provider("anthropic"),
             "claude-sonnet-4-5-20250929"
         );
+        assert_eq!(default_model_for_provider("qwen"), "qwen-plus");
+        assert_eq!(default_model_for_provider("qwen-intl"), "qwen-plus");
+        assert_eq!(default_model_for_provider("glm-cn"), "glm-5");
+        assert_eq!(default_model_for_provider("minimax-cn"), "MiniMax-M2.5");
         assert_eq!(default_model_for_provider("gemini"), "gemini-2.5-pro");
         assert_eq!(default_model_for_provider("google"), "gemini-2.5-pro");
         assert_eq!(
             default_model_for_provider("google-gemini"),
             "gemini-2.5-pro"
         );
+    }
+
+    #[test]
+    fn canonical_provider_name_normalizes_regional_aliases() {
+        assert_eq!(canonical_provider_name("qwen-intl"), "qwen");
+        assert_eq!(canonical_provider_name("dashscope-us"), "qwen");
+        assert_eq!(canonical_provider_name("moonshot-intl"), "moonshot");
+        assert_eq!(canonical_provider_name("kimi-cn"), "moonshot");
+        assert_eq!(canonical_provider_name("glm-cn"), "glm");
+        assert_eq!(canonical_provider_name("bigmodel"), "glm");
+        assert_eq!(canonical_provider_name("minimax-cn"), "minimax");
     }
 
     #[test]
@@ -4371,6 +4454,18 @@ mod tests {
         assert_eq!(
             curated_models_for_provider("gemini"),
             curated_models_for_provider("google-gemini")
+        );
+        assert_eq!(
+            curated_models_for_provider("qwen"),
+            curated_models_for_provider("qwen-intl")
+        );
+        assert_eq!(
+            curated_models_for_provider("qwen"),
+            curated_models_for_provider("dashscope-us")
+        );
+        assert_eq!(
+            curated_models_for_provider("minimax"),
+            curated_models_for_provider("minimax-cn")
         );
     }
 
@@ -4527,6 +4622,12 @@ mod tests {
         assert_eq!(provider_env_var("google"), "GEMINI_API_KEY"); // alias
         assert_eq!(provider_env_var("google-gemini"), "GEMINI_API_KEY"); // alias
         assert_eq!(provider_env_var("gemini"), "GEMINI_API_KEY");
+        assert_eq!(provider_env_var("qwen"), "DASHSCOPE_API_KEY");
+        assert_eq!(provider_env_var("qwen-intl"), "DASHSCOPE_API_KEY");
+        assert_eq!(provider_env_var("dashscope-us"), "DASHSCOPE_API_KEY");
+        assert_eq!(provider_env_var("glm-cn"), "GLM_API_KEY");
+        assert_eq!(provider_env_var("minimax-cn"), "MINIMAX_API_KEY");
+        assert_eq!(provider_env_var("moonshot-intl"), "MOONSHOT_API_KEY");
         assert_eq!(provider_env_var("nvidia"), "NVIDIA_API_KEY");
         assert_eq!(provider_env_var("nvidia-nim"), "NVIDIA_API_KEY"); // alias
         assert_eq!(provider_env_var("build.nvidia.com"), "NVIDIA_API_KEY"); // alias
