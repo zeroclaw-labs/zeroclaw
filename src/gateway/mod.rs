@@ -25,9 +25,9 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tower_http::limit::RequestBodyLimitLayer;
@@ -83,9 +83,7 @@ impl SlidingWindowRateLimiter {
         let now = Instant::now();
         let cutoff = now.checked_sub(self.window).unwrap_or_else(Instant::now);
 
-        let mut guard = self
-            .requests
-            .lock();
+        let mut guard = self.requests.lock();
         let (requests, last_sweep) = &mut *guard;
 
         // Periodic sweep: remove IPs with no recent requests
@@ -150,9 +148,7 @@ impl IdempotencyStore {
     /// Returns true if this key is new and is now recorded.
     fn record_if_new(&self, key: &str) -> bool {
         let now = Instant::now();
-        let mut keys = self
-            .keys
-            .lock();
+        let mut keys = self.keys.lock();
 
         keys.retain(|_, seen_at| now.duration_since(*seen_at) < self.ttl);
 
@@ -738,8 +734,8 @@ mod tests {
     use axum::http::HeaderValue;
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use parking_lot::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn security_body_limit_is_64kb() {
@@ -796,19 +792,13 @@ mod tests {
         assert!(limiter.allow("ip-3"));
 
         {
-            let guard = limiter
-                .requests
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let guard = limiter.requests.lock();
             assert_eq!(guard.0.len(), 3);
         }
 
         // Force a sweep by backdating last_sweep
         {
-            let mut guard = limiter
-                .requests
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut guard = limiter.requests.lock();
             guard.1 = Instant::now()
                 .checked_sub(Duration::from_secs(RATE_LIMITER_SWEEP_INTERVAL_SECS + 1))
                 .unwrap();
@@ -821,10 +811,7 @@ mod tests {
         assert!(limiter.allow("ip-1"));
 
         {
-            let guard = limiter
-                .requests
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let guard = limiter.requests.lock();
             assert_eq!(guard.0.len(), 1, "Stale entries should have been swept");
             assert!(guard.0.contains_key("ip-1"));
         }
@@ -961,10 +948,7 @@ mod tests {
             _category: MemoryCategory,
             _session_id: Option<&str>,
         ) -> anyhow::Result<()> {
-            self.keys
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(key.to_string());
+            self.keys.lock().push(key.to_string());
             Ok(())
         }
 
@@ -994,11 +978,7 @@ mod tests {
         }
 
         async fn count(&self) -> anyhow::Result<usize> {
-            let size = self
-                .keys
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .len();
+            let size = self.keys.lock().len();
             Ok(size)
         }
 
@@ -1093,11 +1073,7 @@ mod tests {
             .into_response();
         assert_eq!(second.status(), StatusCode::OK);
 
-        let keys = tracking_impl
-            .keys
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        let keys = tracking_impl.keys.lock().clone();
         assert_eq!(keys.len(), 2);
         assert_ne!(keys[0], keys[1]);
         assert!(keys[0].starts_with("webhook_msg_"));

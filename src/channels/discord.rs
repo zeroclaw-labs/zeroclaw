@@ -375,9 +375,9 @@ impl Channel for DiscordChannel {
                         reply_target: if channel_id.is_empty() {
                             author_id.to_string()
                         } else {
-                            channel_id
+                            channel_id.clone()
                         },
-                        content: content.to_string(),
+                        content: clean_content,
                         channel: channel_id,
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)

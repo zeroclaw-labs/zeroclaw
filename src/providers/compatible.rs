@@ -688,8 +688,8 @@ impl Provider for OpenAiCompatibleProvider {
         temperature: f64,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
-        let api_key = match self.api_key.as_ref() {
-            Some(key) => key.clone(),
+        let credential = match self.credential.as_ref() {
+            Some(value) => value.clone(),
             None => {
                 let provider_name = self.name.clone();
                 return stream::once(async move {
@@ -735,10 +735,10 @@ impl Provider for OpenAiCompatibleProvider {
             // Apply auth header
             req_builder = match &auth_header {
                 AuthStyle::Bearer => {
-                    req_builder.header("Authorization", format!("Bearer {}", api_key))
+                    req_builder.header("Authorization", format!("Bearer {}", credential))
                 }
-                AuthStyle::XApiKey => req_builder.header("x-api-key", &api_key),
-                AuthStyle::Custom(header) => req_builder.header(header, &api_key),
+                AuthStyle::XApiKey => req_builder.header("x-api-key", &credential),
+                AuthStyle::Custom(header) => req_builder.header(header, &credential),
             };
 
             // Set accept header for streaming

@@ -7,10 +7,10 @@
 
 use anyhow::Result;
 use chrono::{Duration, Local};
+use parking_lot::Mutex;
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use parking_lot::Mutex;
 
 /// Response cache backed by a dedicated SQLite database.
 ///

@@ -767,7 +767,7 @@ mod tests {
             .unwrap();
         assert_eq!(result, "ok from sonnet");
 
-        let seen = mock.models_seen.lock().unwrap();
+        let seen = mock.models_seen.lock();
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0], "claude-opus");
         assert_eq!(seen[1], "claude-sonnet");
@@ -802,7 +802,7 @@ mod tests {
             .expect_err("all models should fail");
         assert!(err.to_string().contains("All providers/models failed"));
 
-        let seen = mock.models_seen.lock().unwrap();
+        let seen = mock.models_seen.lock();
         assert_eq!(seen.len(), 3);
     }
 

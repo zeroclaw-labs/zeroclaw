@@ -2,9 +2,9 @@ use super::sqlite::SqliteMemory;
 use super::traits::{Memory, MemoryCategory, MemoryEntry};
 use async_trait::async_trait;
 use chrono::Local;
+use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -559,11 +559,12 @@ exit 1
                 "local_note",
                 "Local sqlite auth fallback note",
                 MemoryCategory::Core,
+                None,
             )
             .await
             .unwrap();
 
-        let entries = memory.recall("auth", 5).await.unwrap();
+        let entries = memory.recall("auth", 5, None).await.unwrap();
 
         assert!(entries
             .iter()

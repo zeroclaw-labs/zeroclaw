@@ -76,6 +76,13 @@ pub struct ChatRequest<'a> {
     pub tools: Option<&'a [ToolSpec]>,
 }
 
+/// Declares optional provider features.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProviderCapabilities {
+    /// Provider can perform native tool calling without prompt-level emulation.
+    pub native_tool_calling: bool,
+}
+
 /// A tool result to feed back to the LLM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResultMessage {
@@ -319,11 +326,11 @@ pub trait Provider: Send + Sync {
         _temperature: f64,
         _options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
-        let system = messages
+        let _system = messages
             .iter()
             .find(|m| m.role == "system")
             .map(|m| m.content.clone());
-        let last_user = messages
+        let _last_user = messages
             .iter()
             .rfind(|m| m.role == "user")
             .map(|m| m.content.clone())
