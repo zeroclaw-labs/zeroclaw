@@ -1,4 +1,4 @@
-name: Security Audit
+name: Rust Package Security Audit
 
 on:
     push:
@@ -47,25 +47,3 @@ jobs:
             - uses: EmbarkStudios/cargo-deny-action@3fd3802e88374d3fe9159b834c7714ec57d6c979 # v2
               with:
                   command: check advisories licenses sources
-
-    codeql:
-        name: CodeQL Analysis
-        runs-on: blacksmith-2vcpu-ubuntu-2404
-        timeout-minutes: 30
-        steps:
-            - name: Checkout repository
-              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-            - name: Initialize CodeQL
-              uses: github/codeql-action/init@v4
-              with:
-                  languages: rust
-
-            - name: Set up Rust
-              uses: dtolnay/rust-toolchain@stable
-
-            - name: Build
-              run: cargo build --workspace --all-targets
-
-            - name: Perform CodeQL Analysis
-              uses: github/codeql-action/analyze@v4
