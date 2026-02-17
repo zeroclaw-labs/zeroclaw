@@ -147,24 +147,24 @@ enum Commands {
 
     /// Start the gateway server (webhooks, websockets)
     Gateway {
-        /// Port to listen on (use 0 for random available port)
-        #[arg(short, long, default_value = "8080")]
-        port: u16,
+        /// Port to listen on (use 0 for random available port); defaults to config gateway.port
+        #[arg(short, long)]
+        port: Option<u16>,
 
-        /// Host to bind to
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
+        /// Host to bind to; defaults to config gateway.host
+        #[arg(long)]
+        host: Option<String>,
     },
 
     /// Start long-running autonomous runtime (gateway + channels + heartbeat + scheduler)
     Daemon {
-        /// Port to listen on (use 0 for random available port)
-        #[arg(short, long, default_value = "8080")]
-        port: u16,
+        /// Port to listen on (use 0 for random available port); defaults to config gateway.port
+        #[arg(short, long)]
+        port: Option<u16>,
 
-        /// Host to bind to
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
+        /// Host to bind to; defaults to config gateway.host
+        #[arg(long)]
+        host: Option<String>,
     },
 
     /// Manage OS service lifecycle (launchd/systemd user service)
@@ -436,6 +436,8 @@ async fn main() -> Result<()> {
             .map(|_| ()),
 
         Commands::Gateway { port, host } => {
+            let port = port.unwrap_or(config.gateway.port);
+            let host = host.unwrap_or_else(|| config.gateway.host.clone());
             if port == 0 {
                 info!("🚀 Starting ZeroClaw Gateway on {host} (random port)");
             } else {
@@ -445,6 +447,8 @@ async fn main() -> Result<()> {
         }
 
         Commands::Daemon { port, host } => {
+            let port = port.unwrap_or(config.gateway.port);
+            let host = host.unwrap_or_else(|| config.gateway.host.clone());
             if port == 0 {
                 info!("🧠 Starting ZeroClaw Daemon on {host} (random port)");
             } else {
