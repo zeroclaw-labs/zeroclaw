@@ -250,7 +250,10 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             );
             if let Some(channel) = target_channel.as_ref() {
                 let _ = channel
-                    .send(&SendMessage::new(format!("⚠️ Error: {e}"), &msg.reply_target))
+                    .send(&SendMessage::new(
+                        format!("⚠️ Error: {e}"),
+                        &msg.reply_target,
+                    ))
                     .await;
             }
         }

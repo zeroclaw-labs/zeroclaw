@@ -1,4 +1,4 @@
-use crate::channels::traits::{Channel, ChannelMessage};
+use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::Client;
@@ -269,17 +269,17 @@ impl Channel for SignalChannel {
         "signal"
     }
 
-    async fn send(&self, message: &str, recipient: &str) -> anyhow::Result<()> {
-        let params = match Self::parse_recipient_target(recipient) {
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        let params = match Self::parse_recipient_target(&message.recipient) {
             RecipientTarget::Direct(number) => serde_json::json!({
                 "recipient": [number],
-                "message": message,
-                "account": self.account,
+                "message": &message.content,
+                "account": &self.account,
             }),
             RecipientTarget::Group(group_id) => serde_json::json!({
                 "groupId": group_id,
-                "message": message,
-                "account": self.account,
+                "message": &message.content,
+                "account": &self.account,
             }),
         };
 
@@ -423,11 +423,11 @@ impl Channel for SignalChannel {
         let params = match Self::parse_recipient_target(recipient) {
             RecipientTarget::Direct(number) => serde_json::json!({
                 "recipient": [number],
-                "account": self.account,
+                "account": &self.account,
             }),
             RecipientTarget::Group(group_id) => serde_json::json!({
                 "groupId": group_id,
-                "account": self.account,
+                "account": &self.account,
             }),
         };
         self.rpc_request("sendTyping", params).await?;

@@ -12,7 +12,7 @@ pub struct ChannelMessage {
 }
 
 /// Message to send through a channel
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SendMessage {
     pub content: String,
     pub recipient: String,
@@ -39,26 +39,6 @@ impl SendMessage {
             content: content.into(),
             recipient: recipient.into(),
             subject: Some(subject.into()),
-        }
-    }
-}
-
-impl From<&str> for SendMessage {
-    fn from(content: &str) -> Self {
-        Self {
-            content: content.to_string(),
-            recipient: String::new(),
-            subject: None,
-        }
-    }
-}
-
-impl From<(String, String)> for SendMessage {
-    fn from(value: (String, String)) -> Self {
-        Self {
-            content: value.0,
-            recipient: value.1,
-            subject: None,
         }
     }
 }
@@ -152,7 +132,10 @@ mod tests {
         assert!(channel.health_check().await);
         assert!(channel.start_typing("bob").await.is_ok());
         assert!(channel.stop_typing("bob").await.is_ok());
-        assert!(channel.send(&SendMessage::new("hello", "bob")).await.is_ok());
+        assert!(channel
+            .send(&SendMessage::new("hello", "bob"))
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
