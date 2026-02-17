@@ -1,4 +1,8 @@
 use super::{IntegrationCategory, IntegrationEntry, IntegrationStatus};
+use crate::providers::{
+    is_glm_alias, is_minimax_alias, is_moonshot_alias, is_qianfan_alias, is_qwen_alias,
+    is_zai_alias,
+};
 
 /// Returns the full catalog of integrations
 #[allow(clippy::too_many_lines)]
@@ -329,19 +333,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Kimi & Kimi Coding",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if matches!(
-                    c.default_provider.as_deref(),
-                    Some(
-                        "moonshot"
-                            | "kimi"
-                            | "moonshot-intl"
-                            | "moonshot-global"
-                            | "moonshot-cn"
-                            | "kimi-intl"
-                            | "kimi-global"
-                            | "kimi-cn"
-                    )
-                ) {
+                if c.default_provider.as_deref().is_some_and(is_moonshot_alias) {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -377,10 +369,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Z.AI inference",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if matches!(
-                    c.default_provider.as_deref(),
-                    Some("zai" | "z.ai" | "zai-global" | "z.ai-global" | "zai-cn" | "z.ai-cn")
-                ) {
+                if c.default_provider.as_deref().is_some_and(is_zai_alias) {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -392,18 +381,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "ChatGLM / Zhipu models",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if matches!(
-                    c.default_provider.as_deref(),
-                    Some(
-                        "glm"
-                            | "zhipu"
-                            | "glm-global"
-                            | "zhipu-global"
-                            | "glm-cn"
-                            | "zhipu-cn"
-                            | "bigmodel"
-                    )
-                ) {
+                if c.default_provider.as_deref().is_some_and(is_glm_alias) {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -415,17 +393,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "MiniMax AI models",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if matches!(
-                    c.default_provider.as_deref(),
-                    Some(
-                        "minimax"
-                            | "minimax-intl"
-                            | "minimax-io"
-                            | "minimax-global"
-                            | "minimax-cn"
-                            | "minimaxi"
-                    )
-                ) {
+                if c.default_provider.as_deref().is_some_and(is_minimax_alias) {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -437,21 +405,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Alibaba DashScope Qwen models",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if matches!(
-                    c.default_provider.as_deref(),
-                    Some(
-                        "qwen"
-                            | "dashscope"
-                            | "qwen-cn"
-                            | "dashscope-cn"
-                            | "qwen-intl"
-                            | "dashscope-intl"
-                            | "qwen-international"
-                            | "dashscope-international"
-                            | "qwen-us"
-                            | "dashscope-us"
-                    )
-                ) {
+                if c.default_provider.as_deref().is_some_and(is_qwen_alias) {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -475,7 +429,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Baidu AI models",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if matches!(c.default_provider.as_deref(), Some("qianfan" | "baidu")) {
+                if c.default_provider.as_deref().is_some_and(is_qianfan_alias) {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available

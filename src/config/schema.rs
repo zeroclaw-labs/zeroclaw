@@ -1,3 +1,4 @@
+use crate::providers::{is_glm_alias, is_zai_alias};
 use crate::security::AutonomyLevel;
 use anyhow::{Context, Result};
 use directories::UserDirs;
@@ -1976,18 +1977,7 @@ impl Config {
             }
         }
         // API Key: GLM_API_KEY overrides when provider is a GLM/Zhipu variant.
-        if matches!(
-            self.default_provider.as_deref(),
-            Some(
-                "glm"
-                    | "zhipu"
-                    | "glm-global"
-                    | "zhipu-global"
-                    | "glm-cn"
-                    | "zhipu-cn"
-                    | "bigmodel"
-            )
-        ) {
+        if self.default_provider.as_deref().is_some_and(is_glm_alias) {
             if let Ok(key) = std::env::var("GLM_API_KEY") {
                 if !key.is_empty() {
                     self.api_key = Some(key);
@@ -1996,10 +1986,7 @@ impl Config {
         }
 
         // API Key: ZAI_API_KEY overrides when provider is a Z.AI variant.
-        if matches!(
-            self.default_provider.as_deref(),
-            Some("zai" | "z.ai" | "zai-global" | "z.ai-global" | "zai-cn" | "z.ai-cn")
-        ) {
+        if self.default_provider.as_deref().is_some_and(is_zai_alias) {
             if let Ok(key) = std::env::var("ZAI_API_KEY") {
                 if !key.is_empty() {
                     self.api_key = Some(key);

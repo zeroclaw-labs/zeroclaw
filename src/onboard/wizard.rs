@@ -8,6 +8,10 @@ use crate::hardware::{self, HardwareConfig};
 use crate::memory::{
     default_memory_backend_key, memory_backend_profile, selectable_memory_backends,
 };
+use crate::providers::{
+    canonical_china_provider_name, is_glm_alias, is_glm_cn_alias, is_minimax_alias,
+    is_moonshot_alias, is_qianfan_alias, is_qwen_alias, is_zai_alias, is_zai_cn_alias,
+};
 use anyhow::{bail, Context, Result};
 use console::style;
 use dialoguer::{Confirm, Input, Select};
@@ -449,25 +453,14 @@ pub fn run_quick_setup(
 }
 
 fn canonical_provider_name(provider_name: &str) -> &str {
+    if let Some(canonical) = canonical_china_provider_name(provider_name) {
+        return canonical;
+    }
+
     match provider_name {
         "grok" => "xai",
         "together" => "together-ai",
         "google" | "google-gemini" => "gemini",
-        "dashscope"
-        | "qwen-cn"
-        | "dashscope-cn"
-        | "qwen-intl"
-        | "dashscope-intl"
-        | "qwen-international"
-        | "dashscope-international"
-        | "qwen-us"
-        | "dashscope-us" => "qwen",
-        "zhipu" | "glm-global" | "zhipu-global" | "glm-cn" | "zhipu-cn" | "bigmodel" => "glm",
-        "kimi" | "moonshot-intl" | "moonshot-global" | "moonshot-cn" | "kimi-intl"
-        | "kimi-global" | "kimi-cn" => "moonshot",
-        "minimax-intl" | "minimax-io" | "minimax-global" | "minimax-cn" | "minimaxi" => "minimax",
-        "z.ai" | "zai-global" | "z.ai-global" | "zai-cn" | "z.ai-cn" => "zai",
-        "baidu" => "qianfan",
         _ => provider_name,
     }
 }
@@ -485,7 +478,7 @@ fn default_model_for_provider(provider: &str) -> String {
     match canonical_provider_name(provider) {
         "anthropic" => "claude-sonnet-4-5-20250929".into(),
         "openai" => "gpt-5.2".into(),
-        "glm" | "zhipu" | "zai" | "z.ai" => "glm-5".into(),
+        "glm" | "zai" => "glm-5".into(),
         "minimax" => "MiniMax-M2.5".into(),
         "qwen" => "qwen-plus".into(),
         "ollama" => "llama3.2".into(),
@@ -698,7 +691,7 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "Kimi Thinking Preview (deep reasoning)".to_string(),
             ),
         ],
-        "glm" | "zhipu" | "zai" | "z.ai" => vec![
+        "glm" | "zai" => vec![
             (
                 "glm-4.7".to_string(),
                 "GLM-4.7 (latest flagship)".to_string(),
@@ -1603,48 +1596,38 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
             key
         }
     } else {
-        let key_url = match provider_name {
-            "openrouter" => "https://openrouter.ai/keys",
-            "openai" => "https://platform.openai.com/api-keys",
-            "venice" => "https://venice.ai/settings/api",
-            "groq" => "https://console.groq.com/keys",
-            "mistral" => "https://console.mistral.ai/api-keys",
-            "deepseek" => "https://platform.deepseek.com/api_keys",
-            "together-ai" => "https://api.together.xyz/settings/api-keys",
-            "fireworks" => "https://fireworks.ai/account/api-keys",
-            "perplexity" => "https://www.perplexity.ai/settings/api",
-            "xai" => "https://console.x.ai",
-            "cohere" => "https://dashboard.cohere.com/api-keys",
-            "moonshot" | "moonshot-intl" | "moonshot-global" | "moonshot-cn" | "kimi"
-            | "kimi-intl" | "kimi-global" | "kimi-cn" => {
-                "https://platform.moonshot.cn/console/api-keys"
+        let key_url = if is_moonshot_alias(provider_name) {
+            "https://platform.moonshot.cn/console/api-keys"
+        } else if is_glm_cn_alias(provider_name) || is_zai_cn_alias(provider_name) {
+            "https://open.bigmodel.cn/usercenter/proj-mgmt/apikeys"
+        } else if is_glm_alias(provider_name) || is_zai_alias(provider_name) {
+            "https://platform.z.ai/"
+        } else if is_minimax_alias(provider_name) {
+            "https://www.minimaxi.com/user-center/basic-information"
+        } else if is_qwen_alias(provider_name) {
+            "https://help.aliyun.com/zh/model-studio/developer-reference/get-api-key"
+        } else if is_qianfan_alias(provider_name) {
+            "https://cloud.baidu.com/doc/WENXINWORKSHOP/s/7lm0vxo78"
+        } else {
+            match provider_name {
+                "openrouter" => "https://openrouter.ai/keys",
+                "openai" => "https://platform.openai.com/api-keys",
+                "venice" => "https://venice.ai/settings/api",
+                "groq" => "https://console.groq.com/keys",
+                "mistral" => "https://console.mistral.ai/api-keys",
+                "deepseek" => "https://platform.deepseek.com/api_keys",
+                "together-ai" => "https://api.together.xyz/settings/api-keys",
+                "fireworks" => "https://fireworks.ai/account/api-keys",
+                "perplexity" => "https://www.perplexity.ai/settings/api",
+                "xai" => "https://console.x.ai",
+                "cohere" => "https://dashboard.cohere.com/api-keys",
+                "vercel" => "https://vercel.com/account/tokens",
+                "cloudflare" => "https://dash.cloudflare.com/profile/api-tokens",
+                "nvidia" | "nvidia-nim" | "build.nvidia.com" => "https://build.nvidia.com/",
+                "bedrock" => "https://console.aws.amazon.com/iam",
+                "gemini" => "https://aistudio.google.com/app/apikey",
+                _ => "",
             }
-            "glm" | "zhipu" | "glm-global" | "zhipu-global" | "zai" | "z.ai" | "zai-global"
-            | "z.ai-global" => "https://platform.z.ai/",
-            "glm-cn" | "zhipu-cn" | "bigmodel" | "zai-cn" | "z.ai-cn" => {
-                "https://open.bigmodel.cn/usercenter/proj-mgmt/apikeys"
-            }
-            "minimax" | "minimax-intl" | "minimax-io" | "minimax-global" | "minimax-cn"
-            | "minimaxi" => "https://www.minimaxi.com/user-center/basic-information",
-            "qwen"
-            | "dashscope"
-            | "qwen-cn"
-            | "dashscope-cn"
-            | "qwen-intl"
-            | "dashscope-intl"
-            | "qwen-international"
-            | "dashscope-international"
-            | "qwen-us"
-            | "dashscope-us" => {
-                "https://help.aliyun.com/zh/model-studio/developer-reference/get-api-key"
-            }
-            "qianfan" | "baidu" => "https://cloud.baidu.com/doc/WENXINWORKSHOP/s/7lm0vxo78",
-            "vercel" => "https://vercel.com/account/tokens",
-            "cloudflare" => "https://dash.cloudflare.com/profile/api-tokens",
-            "nvidia" | "nvidia-nim" | "build.nvidia.com" => "https://build.nvidia.com/",
-            "bedrock" => "https://console.aws.amazon.com/iam",
-            "gemini" => "https://aistudio.google.com/app/apikey",
-            _ => "",
         };
 
         println!();
@@ -1778,7 +1761,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
             ("moonshot-v1-128k", "Moonshot V1 128K"),
             ("moonshot-v1-32k", "Moonshot V1 32K"),
         ],
-        "glm" | "zhipu" | "zai" | "z.ai" => vec![
+        "glm" | "zai" => vec![
             ("glm-5", "GLM-5 (latest)"),
             ("glm-4-plus", "GLM-4 Plus (flagship)"),
             ("glm-4-flash", "GLM-4 Flash (fast)"),
@@ -1992,12 +1975,12 @@ fn provider_env_var(name: &str) -> &'static str {
         "fireworks" | "fireworks-ai" => "FIREWORKS_API_KEY",
         "perplexity" => "PERPLEXITY_API_KEY",
         "cohere" => "COHERE_API_KEY",
-        "moonshot" | "kimi" => "MOONSHOT_API_KEY",
-        "glm" | "zhipu" => "GLM_API_KEY",
+        "moonshot" => "MOONSHOT_API_KEY",
+        "glm" => "GLM_API_KEY",
         "minimax" => "MINIMAX_API_KEY",
-        "qwen" | "dashscope" => "DASHSCOPE_API_KEY",
-        "qianfan" | "baidu" => "QIANFAN_API_KEY",
-        "zai" | "z.ai" => "ZAI_API_KEY",
+        "qwen" => "DASHSCOPE_API_KEY",
+        "qianfan" => "QIANFAN_API_KEY",
+        "zai" => "ZAI_API_KEY",
         "synthetic" => "SYNTHETIC_API_KEY",
         "opencode" | "opencode-zen" => "OPENCODE_API_KEY",
         "vercel" | "vercel-ai" => "VERCEL_API_KEY",
