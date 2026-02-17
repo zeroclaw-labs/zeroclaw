@@ -25,6 +25,8 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
     - Purpose: dependency advisories (`cargo audit`) and policy/license checks (`cargo deny`)
 - `.github/workflows/release.yml` (`Release`)
     - Purpose: build tagged release artifacts and publish GitHub releases
+- `.github/workflows/label-policy-sanity.yml` (`Label Policy Sanity`)
+    - Purpose: enforce contributor-tier rule/color parity between `labeler.yml` and `auto-response.yml`
 
 ### Optional Repository Automation
 
@@ -60,6 +62,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 - `Release`: tag push (`v*`)
 - `Security Audit`: push to `main`, PRs to `main`, weekly schedule
 - `Workflow Sanity`: PR/push when `.github/workflows/**`, `.github/*.yml`, or `.github/*.yaml` change
+- `Label Policy Sanity`: PR/push when `.github/workflows/labeler.yml` or `.github/workflows/auto-response.yml` changes
 - `PR Labeler`: `pull_request_target` lifecycle events
 - `PR Auto Responder`: issue opened/labeled, `pull_request_target` opened/labeled
 - `Stale`: daily schedule, manual dispatch
@@ -73,8 +76,9 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 3. Release failures on tags: inspect `.github/workflows/release.yml`.
 4. Security failures: inspect `.github/workflows/security.yml` and `deny.toml`.
 5. Workflow syntax/lint failures: inspect `.github/workflows/workflow-sanity.yml`.
-6. Docs failures in CI: inspect `docs-quality` job logs in `.github/workflows/ci.yml`.
-7. Strict delta lint failures in CI: inspect `lint-strict-delta` job logs and compare with `BASE_SHA` diff scope.
+6. Label policy parity failures: inspect `.github/workflows/label-policy-sanity.yml`.
+7. Docs failures in CI: inspect `docs-quality` job logs in `.github/workflows/ci.yml`.
+8. Strict delta lint failures in CI: inspect `lint-strict-delta` job logs and compare with `BASE_SHA` diff scope.
 
 ## Maintenance Rules
 
