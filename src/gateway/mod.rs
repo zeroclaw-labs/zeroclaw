@@ -261,15 +261,14 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         &config,
     ));
     // Extract webhook secret for authentication
-    let webhook_secret_hash: Option<Arc<str>> = config
-        .channels_config
-        .webhook
-        .as_ref()
-        .and_then(|w| w.secret.as_deref())
-        .map(str::trim)
-        .filter(|secret| !secret.is_empty())
-        .map(hash_webhook_secret)
-        .map(Arc::from);
+    let webhook_secret_hash: Option<Arc<str>> =
+        config.channels_config.webhook.as_ref().and_then(|webhook| {
+            webhook.secret.as_ref().and_then(|raw_secret| {
+                let trimmed_secret = raw_secret.trim();
+                (!trimmed_secret.is_empty())
+                    .then(|| Arc::<str>::from(hash_webhook_secret(trimmed_secret)))
+            })
+        });
 
     // WhatsApp channel (if configured)
     let whatsapp_channel: Option<Arc<WhatsAppChannel>> =
@@ -354,9 +353,6 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         println!("  🔒 Pairing: ACTIVE (bearer token required)");
     } else {
         println!("  ⚠️  Pairing: DISABLED (all requests accepted)");
-    }
-    if webhook_secret_hash.is_some() {
-        println!("  🔒 Webhook secret: ENABLED");
     }
     println!("  Press Ctrl+C to stop.\n");
 

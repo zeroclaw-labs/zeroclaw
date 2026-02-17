@@ -165,10 +165,11 @@ impl Tool for DelegateTool {
         }
 
         // Create provider for this agent
-        let provider_credential = agent_config
+        let provider_credential_owned = agent_config
             .api_key
-            .as_deref()
-            .or(self.fallback_credential.as_deref());
+            .clone()
+            .or_else(|| self.fallback_credential.clone());
+        let provider_credential = provider_credential_owned.as_ref().map(String::as_str);
 
         let provider: Box<dyn Provider> =
             match providers::create_provider(&agent_config.provider, provider_credential) {

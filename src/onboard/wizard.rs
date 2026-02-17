@@ -3773,15 +3773,7 @@ fn print_summary(config: &Config) {
     );
 
     // Secrets
-    println!(
-        "    {} Secrets:       {}",
-        style("🔒").cyan(),
-        if config.secrets.encrypt {
-            style("encrypted").green().to_string()
-        } else {
-            style("plaintext").yellow().to_string()
-        }
-    );
+    println!("    {} Secrets:       {}", style("🔒").cyan(), "configured");
 
     // Gateway
     println!(
