@@ -1,0 +1,75 @@
+[package]
+name = "zeroclaw-esp32-ui"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "ZeroClaw ESP32 UI firmware with Slint - Graphical interface for AI assistant"
+authors = ["ZeroClaw Team"]
+
+[dependencies]
+# ESP-IDF framework
+esp-idf-svc = "0.48"
+log = { version = "0.4", default-features = false }
+anyhow = "1.0"
+
+# Slint UI - MCU optimized
+slint = { version = "1.10", default-features = false, features = [
+    "compat-1-2",
+    "libm",
+    "renderer-software",
+] }
+
+# Display drivers
+mipidsi = { version = "0.9", features = ["batch"] }
+display-interface-spi = "0.5"
+embedded-graphics = "0.8"
+
+
+# Serialization for communication
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+
+# Async support
+embassy-sync = { version = "0.6", features = ["defmt"] }
+embassy-futures = "0.1"
+embassy-time = { version = "0.1", features = ["tick-hz-100", "defmt"] }
+
+# WiFi networking
+embedded-svc = "0.28"
+
+# Capacitive touch driver (FT6X36)
+ft6x36 = "0.2"
+
+# I2C for touch controller
+esp-idf-hal = "0.43"
+
+# Utilities
+heapless = "0.8"
+nb = "1.1"
+
+[build-dependencies]
+embuild = { version = "0.31", features = ["elf"] }
+slint-build = "1.10"
+
+[features]
+default = ["std", "display-st7789"]
+std = ["esp-idf-svc/std", "serde/std", "serde_json/std"]
+
+# Display selection (choose one)
+display-st7789 = []  # 320x240 or 135x240
+display-ili9341 = [] # 320x240
+display-ssd1306 = [] # 128x64 OLED
+
+# Input
+touch-xpt2046 = []   # Resistive touch
+touch-ft6x36 = []    # Capacitive touch
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.dev]
+opt-level = "s"
