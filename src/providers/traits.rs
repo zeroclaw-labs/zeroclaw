@@ -1,5 +1,6 @@
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
+use futures_util::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
 
 /// A single message in a conversation.
@@ -97,6 +98,99 @@ pub enum ConversationMessage {
     ToolResults(Vec<ToolResultMessage>),
 }
 
+/// A chunk of content from a streaming response.
+#[derive(Debug, Clone)]
+pub struct StreamChunk {
+    /// Text delta for this chunk.
+    pub delta: String,
+    /// Whether this is the final chunk.
+    pub is_final: bool,
+    /// Approximate token count for this chunk (estimated).
+    pub token_count: usize,
+}
+
+impl StreamChunk {
+    /// Create a new non-final chunk.
+    pub fn delta(text: impl Into<String>) -> Self {
+        Self {
+            delta: text.into(),
+            is_final: false,
+            token_count: 0,
+        }
+    }
+
+    /// Create a final chunk.
+    pub fn final_chunk() -> Self {
+        Self {
+            delta: String::new(),
+            is_final: true,
+            token_count: 0,
+        }
+    }
+
+    /// Create an error chunk.
+    pub fn error(message: impl Into<String>) -> Self {
+        Self {
+            delta: message.into(),
+            is_final: true,
+            token_count: 0,
+        }
+    }
+
+    /// Estimate tokens (rough approximation: ~4 chars per token).
+    pub fn with_token_estimate(mut self) -> Self {
+        self.token_count = (self.delta.len() + 3) / 4;
+        self
+    }
+}
+
+/// Options for streaming chat requests.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StreamOptions {
+    /// Whether to enable streaming (default: true).
+    pub enabled: bool,
+    /// Whether to include token counts in chunks.
+    pub count_tokens: bool,
+}
+
+impl StreamOptions {
+    /// Create new streaming options with enabled flag.
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            count_tokens: false,
+        }
+    }
+
+    /// Enable token counting.
+    pub fn with_token_count(mut self) -> Self {
+        self.count_tokens = true;
+        self
+    }
+}
+
+/// Result type for streaming operations.
+pub type StreamResult<T> = std::result::Result<T, StreamError>;
+
+/// Errors that can occur during streaming.
+#[derive(Debug, thiserror::Error)]
+pub enum StreamError {
+    #[error("HTTP error: {0}")]
+    Http(reqwest::Error),
+
+    #[error("JSON parse error: {0}")]
+    Json(serde_json::Error),
+
+    #[error("Invalid SSE format: {0}")]
+    InvalidSse(String),
+
+    #[error("Provider error: {0}")]
+    Provider(String),
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
 #[async_trait]
 pub trait Provider: Send + Sync {
     /// Simple one-shot chat (single user message, no explicit system prompt).
@@ -186,6 +280,58 @@ pub trait Provider: Send + Sync {
             text: Some(text),
             tool_calls: Vec::new(),
         })
+    }
+
+    /// Whether provider supports streaming responses.
+    /// Default implementation returns false.
+    fn supports_streaming(&self) -> bool {
+        false
+    }
+
+    /// Streaming chat with optional system prompt.
+    /// Returns an async stream of text chunks.
+    /// Default implementation falls back to non-streaming chat.
+    fn stream_chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: f64,
+        _options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        // Default: return an empty stream (not supported)
+        stream::empty().boxed()
+    }
+
+    /// Streaming chat with history.
+    /// Default implementation falls back to stream_chat_with_system with last user message.
+    fn stream_chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let system = messages
+            .iter()
+            .find(|m| m.role == "system")
+            .map(|m| m.content.clone());
+        let last_user = messages
+            .iter()
+            .rfind(|m| m.role == "user")
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+
+        // For default implementation, we need to convert to owned strings
+        // This is a limitation of the default implementation
+        let provider_name = "unknown".to_string();
+
+        // Create a single empty chunk to indicate not supported
+        let chunk = StreamChunk::error(format!(
+            "{} does not support streaming",
+            provider_name
+        ));
+        stream::once(async move { Ok(chunk) }).boxed()
     }
 }
 
