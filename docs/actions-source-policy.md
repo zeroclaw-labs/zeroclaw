@@ -15,7 +15,6 @@ Selected allowlist patterns:
 - `actions/*` (covers `actions/cache`, `actions/checkout`, `actions/upload-artifact`, `actions/download-artifact`, and other first-party actions)
 - `docker/*`
 - `dtolnay/rust-toolchain@*`
-- `Swatinem/rust-cache@*`
 - `DavidAnson/markdownlint-cli2-action@*`
 - `lycheeverse/lychee-action@*`
 - `EmbarkStudios/cargo-deny-action@*`
@@ -75,6 +74,8 @@ If encountered, add only the specific trusted missing action, rerun, and documen
 
 Latest sweep notes:
 
+- 2026-02-17: Rust dependency cache migrated from `Swatinem/rust-cache` to `useblacksmith/rust-cache`
+    - No new allowlist pattern required (`useblacksmith/*` already allowlisted)
 - 2026-02-16: Hidden dependency discovered in `release.yml`: `sigstore/cosign-installer@...`
     - Added allowlist pattern: `sigstore/cosign-installer@*`
 - 2026-02-16: Blacksmith migration blocked workflow execution
