@@ -104,6 +104,43 @@ fn split_message_for_discord(message: &str) -> Vec<String> {
     chunks
 }
 
+fn mention_tags(bot_user_id: &str) -> [String; 2] {
+    [format!("<@{bot_user_id}>"), format!("<@!{bot_user_id}>")]
+}
+
+fn contains_bot_mention(content: &str, bot_user_id: &str) -> bool {
+    let tags = mention_tags(bot_user_id);
+    content.contains(&tags[0]) || content.contains(&tags[1])
+}
+
+fn normalize_incoming_content(
+    content: &str,
+    mention_only: bool,
+    bot_user_id: &str,
+) -> Option<String> {
+    if content.is_empty() {
+        return None;
+    }
+
+    if mention_only && !contains_bot_mention(content, bot_user_id) {
+        return None;
+    }
+
+    let mut normalized = content.to_string();
+    if mention_only {
+        for tag in mention_tags(bot_user_id) {
+            normalized = normalized.replace(&tag, " ");
+        }
+    }
+
+    let normalized = normalized.trim().to_string();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    Some(normalized)
+}
+
 /// Minimal base64 decode (no extra dep) — only needs to decode the user ID portion
 #[allow(clippy::cast_possible_truncation)]
 fn base64_decode(input: &str) -> Option<String> {
@@ -342,24 +379,10 @@ impl Channel for DiscordChannel {
                     }
 
                     let content = d.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                    if content.is_empty() {
+                    let Some(clean_content) =
+                        normalize_incoming_content(content, self.mention_only, &bot_user_id)
+                    else {
                         continue;
-                    }
-
-                    // Skip messages that don't @-mention the bot (when mention_only is enabled)
-                    if self.mention_only {
-                        let mention_tag = format!("<@{bot_user_id}>");
-                        if !content.contains(&mention_tag) {
-                            continue;
-                        }
-                    }
-
-                    // Strip the bot mention from content so the agent sees clean text
-                    let clean_content = if self.mention_only {
-                        let mention_tag = format!("<@{bot_user_id}>");
-                        content.replace(&mention_tag, "").trim().to_string()
-                    } else {
-                        content.to_string()
                     };
 
                     let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
@@ -546,6 +569,31 @@ mod tests {
     fn bot_user_id_from_empty_token() {
         let id = DiscordChannel::bot_user_id_from_token("");
         assert_eq!(id, Some(String::new()));
+    }
+
+    #[test]
+    fn contains_bot_mention_supports_plain_and_nick_forms() {
+        assert!(contains_bot_mention("hi <@12345>", "12345"));
+        assert!(contains_bot_mention("hi <@!12345>", "12345"));
+        assert!(!contains_bot_mention("hi <@99999>", "12345"));
+    }
+
+    #[test]
+    fn normalize_incoming_content_requires_mention_when_enabled() {
+        let cleaned = normalize_incoming_content("hello there", true, "12345");
+        assert!(cleaned.is_none());
+    }
+
+    #[test]
+    fn normalize_incoming_content_strips_mentions_and_trims() {
+        let cleaned = normalize_incoming_content("  <@!12345> run status  ", true, "12345");
+        assert_eq!(cleaned.as_deref(), Some("run status"));
+    }
+
+    #[test]
+    fn normalize_incoming_content_rejects_empty_after_strip() {
+        let cleaned = normalize_incoming_content("<@12345>", true, "12345");
+        assert!(cleaned.is_none());
     }
 
     // Message splitting tests
