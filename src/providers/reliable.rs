@@ -461,7 +461,7 @@ mod tests {
     /// Mock that records which model was used for each call.
     struct ModelAwareMock {
         calls: Arc<AtomicUsize>,
-        models_seen: std::sync::Mutex<Vec<String>>,
+        models_seen: parking_lot::Mutex<Vec<String>>,
         fail_models: Vec<&'static str>,
         response: &'static str,
     }
@@ -476,7 +476,7 @@ mod tests {
             _temperature: f64,
         ) -> anyhow::Result<String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            self.models_seen.lock().unwrap().push(model.to_string());
+            self.models_seen.lock().push(model.to_string());
             if self.fail_models.contains(&model) {
                 anyhow::bail!("500 model {} unavailable", model);
             }
@@ -729,7 +729,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let mock = Arc::new(ModelAwareMock {
             calls: Arc::clone(&calls),
-            models_seen: std::sync::Mutex::new(Vec::new()),
+            models_seen: parking_lot::Mutex::new(Vec::new()),
             fail_models: vec!["claude-opus"],
             response: "ok from sonnet",
         });
@@ -764,7 +764,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let mock = Arc::new(ModelAwareMock {
             calls: Arc::clone(&calls),
-            models_seen: std::sync::Mutex::new(Vec::new()),
+            models_seen: parking_lot::Mutex::new(Vec::new()),
             fail_models: vec!["model-a", "model-b", "model-c"],
             response: "never",
         });

@@ -27,7 +27,8 @@ use axum::{
 };
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
@@ -77,8 +78,7 @@ impl SlidingWindowRateLimiter {
 
         let mut guard = self
             .requests
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock();
         let (requests, last_sweep) = &mut *guard;
 
         // Periodic sweep: remove IPs with no recent requests
@@ -145,8 +145,7 @@ impl IdempotencyStore {
         let now = Instant::now();
         let mut keys = self
             .keys
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock();
 
         keys.retain(|_, seen_at| now.duration_since(*seen_at) < self.ttl);
 
@@ -729,7 +728,7 @@ mod tests {
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
 
     #[test]
     fn security_body_limit_is_64kb() {

@@ -566,7 +566,7 @@ pub async fn run(
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
 
     struct MockProvider {
         responses: Mutex<Vec<crate::providers::ChatResponse>>,
@@ -590,7 +590,7 @@ mod tests {
             _model: &str,
             _temperature: f64,
         ) -> Result<crate::providers::ChatResponse> {
-            let mut guard = self.responses.lock().unwrap();
+            let mut guard = self.responses.lock();
             if guard.is_empty() {
                 return Ok(crate::providers::ChatResponse {
                     text: Some("done".into()),

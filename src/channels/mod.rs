@@ -213,7 +213,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                 truncate_with_ellipsis(&response, 80)
             );
             if let Some(channel) = target_channel.as_ref() {
-                if let Err(e) = channel.send(&response, &msg.sender).await {
+                if let Err(e) = channel.send(&response, &msg.channel).await {
                     eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
                 }
             }

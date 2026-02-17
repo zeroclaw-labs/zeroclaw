@@ -5,7 +5,8 @@ use async_trait::async_trait;
 use chrono::Local;
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// SQLite-backed persistent memory — the brain
@@ -896,7 +897,7 @@ mod tests {
     #[tokio::test]
     async fn schema_has_fts5_table() {
         let (_tmp, mem) = temp_sqlite();
-        let conn = mem.conn.lock().unwrap();
+        let conn = mem.conn.lock();
         // FTS5 table should exist
         let count: i64 = conn
             .query_row(
@@ -911,7 +912,7 @@ mod tests {
     #[tokio::test]
     async fn schema_has_embedding_cache() {
         let (_tmp, mem) = temp_sqlite();
-        let conn = mem.conn.lock().unwrap();
+        let conn = mem.conn.lock();
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='embedding_cache'",
@@ -925,7 +926,7 @@ mod tests {
     #[tokio::test]
     async fn schema_memories_has_embedding_column() {
         let (_tmp, mem) = temp_sqlite();
-        let conn = mem.conn.lock().unwrap();
+        let conn = mem.conn.lock();
         // Check that embedding column exists by querying it
         let result = conn.execute_batch("SELECT embedding FROM memories LIMIT 0");
         assert!(result.is_ok());
@@ -940,7 +941,7 @@ mod tests {
             .await
             .unwrap();
 
-        let conn = mem.conn.lock().unwrap();
+        let conn = mem.conn.lock();
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM memories_fts WHERE memories_fts MATCH '\"unique_searchterm_xyz\"'",
@@ -959,7 +960,7 @@ mod tests {
             .unwrap();
         mem.forget("del_key").await.unwrap();
 
-        let conn = mem.conn.lock().unwrap();
+        let conn = mem.conn.lock();
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM memories_fts WHERE memories_fts MATCH '\"deletable_content_abc\"'",
@@ -980,7 +981,7 @@ mod tests {
             .await
             .unwrap();
 
-        let conn = mem.conn.lock().unwrap();
+        let conn = mem.conn.lock();
         // Old content should not be findable
         let old: i64 = conn
             .query_row(

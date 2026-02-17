@@ -164,7 +164,7 @@ mod tests {
     struct MockProvider {
         calls: Arc<AtomicUsize>,
         response: &'static str,
-        last_model: std::sync::Mutex<String>,
+        last_model: parking_lot::Mutex<String>,
     }
 
     impl MockProvider {
@@ -172,7 +172,7 @@ mod tests {
             Self {
                 calls: Arc::new(AtomicUsize::new(0)),
                 response,
-                last_model: std::sync::Mutex::new(String::new()),
+                last_model: parking_lot::Mutex::new(String::new()),
             }
         }
 
@@ -181,7 +181,7 @@ mod tests {
         }
 
         fn last_model(&self) -> String {
-            self.last_model.lock().unwrap().clone()
+            self.last_model.lock().clone()
         }
     }
 
@@ -195,7 +195,7 @@ mod tests {
             _temperature: f64,
         ) -> anyhow::Result<String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            *self.last_model.lock().unwrap() = model.to_string();
+            *self.last_model.lock() = model.to_string();
             Ok(self.response.to_string())
         }
     }

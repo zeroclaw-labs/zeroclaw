@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io::Write as IoWrite;
 use std::net::TcpStream;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep};
@@ -415,7 +415,7 @@ impl Channel for EmailChannel {
                             let mut seen = self
                                 .seen_messages
                                 .lock()
-                                .expect("seen_messages mutex should not be poisoned");
+                ;
                             if seen.contains(&id) {
                                 continue;
                             }

@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use chrono::Local;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -113,9 +113,7 @@ impl LucidMemory {
     }
 
     fn in_failure_cooldown(&self) -> bool {
-        let Ok(guard) = self.last_failure_at.lock() else {
-            return false;
-        };
+        let guard = self.last_failure_at.lock();
 
         guard
             .as_ref()
@@ -123,15 +121,11 @@ impl LucidMemory {
     }
 
     fn mark_failure_now(&self) {
-        if let Ok(mut guard) = self.last_failure_at.lock() {
-            *guard = Some(Instant::now());
-        }
+        *self.last_failure_at.lock() = Some(Instant::now());
     }
 
     fn clear_failure(&self) {
-        if let Ok(mut guard) = self.last_failure_at.lock() {
-            *guard = None;
-        }
+        *self.last_failure_at.lock() = None;
     }
 
     fn to_lucid_type(category: &MemoryCategory) -> &'static str {
