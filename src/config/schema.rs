@@ -1678,6 +1678,40 @@ fn resolve_config_dir_for_workspace(workspace_dir: &Path) -> PathBuf {
     workspace_config_dir
 }
 
+fn decrypt_optional_secret(
+    store: &crate::security::SecretStore,
+    value: &mut Option<String>,
+    field_name: &str,
+) -> Result<()> {
+    if let Some(raw) = value.clone() {
+        if crate::security::SecretStore::is_encrypted(&raw) {
+            *value = Some(
+                store
+                    .decrypt(&raw)
+                    .with_context(|| format!("Failed to decrypt {field_name}"))?,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn encrypt_optional_secret(
+    store: &crate::security::SecretStore,
+    value: &mut Option<String>,
+    field_name: &str,
+) -> Result<()> {
+    if let Some(raw) = value.clone() {
+        if !crate::security::SecretStore::is_encrypted(&raw) {
+            *value = Some(
+                store
+                    .encrypt(&raw)
+                    .with_context(|| format!("Failed to encrypt {field_name}"))?,
+            );
+        }
+    }
+    Ok(())
+}
+
 impl Config {
     pub fn load_or_init() -> Result<Self> {
         // Resolve workspace first so config loading can follow ZEROCLAW_WORKSPACE.
@@ -1702,6 +1736,23 @@ impl Config {
             // Set computed paths that are skipped during serialization
             config.config_path = config_path.clone();
             config.workspace_dir = workspace_dir;
+            let store = crate::security::SecretStore::new(&zeroclaw_dir, config.secrets.encrypt);
+            decrypt_optional_secret(&store, &mut config.api_key, "config.api_key")?;
+            decrypt_optional_secret(
+                &store,
+                &mut config.composio.api_key,
+                "config.composio.api_key",
+            )?;
+
+            decrypt_optional_secret(
+                &store,
+                &mut config.browser.computer_use.api_key,
+                "config.browser.computer_use.api_key",
+            )?;
+
+            for agent in config.agents.values_mut() {
+                decrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
+            }
             config.apply_env_overrides();
             Ok(config)
         } else {
@@ -1789,23 +1840,29 @@ impl Config {
     }
 
     pub fn save(&self) -> Result<()> {
-        // Encrypt agent API keys before serialization
+        // Encrypt secrets before serialization
         let mut config_to_save = self.clone();
         let zeroclaw_dir = self
             .config_path
             .parent()
             .context("Config path must have a parent directory")?;
         let store = crate::security::SecretStore::new(zeroclaw_dir, self.secrets.encrypt);
+
+        encrypt_optional_secret(&store, &mut config_to_save.api_key, "config.api_key")?;
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.composio.api_key,
+            "config.composio.api_key",
+        )?;
+
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.browser.computer_use.api_key,
+            "config.browser.computer_use.api_key",
+        )?;
+
         for agent in config_to_save.agents.values_mut() {
-            if let Some(ref plaintext_key) = agent.api_key {
-                if !crate::security::SecretStore::is_encrypted(plaintext_key) {
-                    agent.api_key = Some(
-                        store
-                            .encrypt(plaintext_key)
-                            .context("Failed to encrypt agent API key")?,
-                    );
-                }
-            }
+            encrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
         }
 
         let toml_str =
@@ -2182,9 +2239,78 @@ tool_dispatcher = "xml"
 
         let contents = fs::read_to_string(&config_path).unwrap();
         let loaded: Config = toml::from_str(&contents).unwrap();
-        assert_eq!(loaded.api_key.as_deref(), Some("sk-roundtrip"));
+        assert!(loaded
+            .api_key
+            .as_deref()
+            .is_some_and(crate::security::SecretStore::is_encrypted));
+        let store = crate::security::SecretStore::new(&dir, true);
+        let decrypted = store.decrypt(loaded.api_key.as_deref().unwrap()).unwrap();
+        assert_eq!(decrypted, "sk-roundtrip");
         assert_eq!(loaded.default_model.as_deref(), Some("test-model"));
         assert!((loaded.default_temperature - 0.9).abs() < f64::EPSILON);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_save_encrypts_nested_credentials() {
+        let dir = std::env::temp_dir().join(format!(
+            "zeroclaw_test_nested_credentials_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut config = Config::default();
+        config.workspace_dir = dir.join("workspace");
+        config.config_path = dir.join("config.toml");
+        config.api_key = Some("root-credential".into());
+        config.composio.api_key = Some("composio-credential".into());
+        config.browser.computer_use.api_key = Some("browser-credential".into());
+
+        config.agents.insert(
+            "worker".into(),
+            DelegateAgentConfig {
+                provider: "openrouter".into(),
+                model: "model-test".into(),
+                system_prompt: None,
+                api_key: Some("agent-credential".into()),
+                temperature: None,
+                max_depth: 3,
+            },
+        );
+
+        config.save().unwrap();
+
+        let contents = fs::read_to_string(config.config_path.clone()).unwrap();
+        let stored: Config = toml::from_str(&contents).unwrap();
+        let store = crate::security::SecretStore::new(&dir, true);
+
+        let root_encrypted = stored.api_key.as_deref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(root_encrypted));
+        assert_eq!(store.decrypt(root_encrypted).unwrap(), "root-credential");
+
+        let composio_encrypted = stored.composio.api_key.as_deref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(
+            composio_encrypted
+        ));
+        assert_eq!(
+            store.decrypt(composio_encrypted).unwrap(),
+            "composio-credential"
+        );
+
+        let browser_encrypted = stored.browser.computer_use.api_key.as_deref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(
+            browser_encrypted
+        ));
+        assert_eq!(
+            store.decrypt(browser_encrypted).unwrap(),
+            "browser-credential"
+        );
+
+        let worker = stored.agents.get("worker").unwrap();
+        let worker_encrypted = worker.api_key.as_deref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(worker_encrypted));
+        assert_eq!(store.decrypt(worker_encrypted).unwrap(), "agent-credential");
 
         let _ = fs::remove_dir_all(&dir);
     }

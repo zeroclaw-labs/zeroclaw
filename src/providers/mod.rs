@@ -104,8 +104,8 @@ pub async fn api_error(provider: &str, response: reqwest::Response) -> anyhow::E
 ///
 /// For Anthropic, the provider-specific env var is `ANTHROPIC_OAUTH_TOKEN` (for setup-tokens)
 /// followed by `ANTHROPIC_API_KEY` (for regular API keys).
-fn resolve_api_key(name: &str, api_key: Option<&str>) -> Option<String> {
-    if let Some(key) = api_key.map(str::trim).filter(|k| !k.is_empty()) {
+fn resolve_provider_credential(name: &str, credential_override: Option<&str>) -> Option<String> {
+    if let Some(key) = credential_override.map(str::trim).filter(|k| !k.is_empty()) {
         return Some(key.to_string());
     }
 
@@ -194,7 +194,7 @@ pub fn create_provider_with_url(
     api_key: Option<&str>,
     api_url: Option<&str>,
 ) -> anyhow::Result<Box<dyn Provider>> {
-    let resolved_key = resolve_api_key(name, api_key);
+    let resolved_key = resolve_provider_credential(name, api_key);
     let key = resolved_key.as_deref();
     match name {
         // ── Primary providers (custom implementations) ───────
@@ -454,8 +454,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_api_key_prefers_explicit_argument() {
-        let resolved = resolve_api_key("openrouter", Some("  explicit-key  "));
+    fn resolve_provider_credential_prefers_explicit_argument() {
+        let resolved = resolve_provider_credential("openrouter", Some("  explicit-key  "));
         assert_eq!(resolved.as_deref(), Some("explicit-key"));
     }
 
@@ -463,18 +463,18 @@ mod tests {
 
     #[test]
     fn factory_openrouter() {
-        assert!(create_provider("openrouter", Some("sk-test")).is_ok());
+        assert!(create_provider("openrouter", Some("provider-test-credential")).is_ok());
         assert!(create_provider("openrouter", None).is_ok());
     }
 
     #[test]
     fn factory_anthropic() {
-        assert!(create_provider("anthropic", Some("sk-test")).is_ok());
+        assert!(create_provider("anthropic", Some("provider-test-credential")).is_ok());
     }
 
     #[test]
     fn factory_openai() {
-        assert!(create_provider("openai", Some("sk-test")).is_ok());
+        assert!(create_provider("openai", Some("provider-test-credential")).is_ok());
     }
 
     #[test]
@@ -774,15 +774,24 @@ mod tests {
             scheduler_retries: 2,
         };
 
-        let provider = create_resilient_provider("openrouter", Some("sk-test"), None, &reliability);
+        let provider = create_resilient_provider(
+            "openrouter",
+            Some("provider-test-credential"),
+            None,
+            &reliability,
+        );
         assert!(provider.is_ok());
     }
 
     #[test]
     fn resilient_provider_errors_for_invalid_primary() {
         let reliability = crate::config::ReliabilityConfig::default();
-        let provider =
-            create_resilient_provider("totally-invalid", Some("sk-test"), None, &reliability);
+        let provider = create_resilient_provider(
+            "totally-invalid",
+            Some("provider-test-credential"),
+            None,
+            &reliability,
+        );
         assert!(provider.is_err());
     }
 
