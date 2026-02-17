@@ -356,10 +356,10 @@ pub fn create_resilient_provider(
         // Fallback providers don't use the custom api_url (it's specific to primary)
         match create_provider(fallback, api_key) {
             Ok(provider) => providers.push((fallback.clone(), provider)),
-            Err(e) => {
+            Err(_error) => {
                 tracing::warn!(
                     fallback_provider = fallback,
-                    "Ignoring invalid fallback provider: {e}"
+                    "Ignoring invalid fallback provider during initialization"
                 );
             }
         }
@@ -417,7 +417,7 @@ pub fn create_routed_provider(
                 }
                 tracing::warn!(
                     provider = name.as_str(),
-                    "Ignoring routed provider that failed to create: {e}"
+                    "Ignoring routed provider that failed to initialize"
                 );
             }
         }
