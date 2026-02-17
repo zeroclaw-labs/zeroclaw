@@ -7,13 +7,69 @@ use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
+use regex::{Regex, RegexSet};
 use std::fmt::Write;
 use std::io::Write as _;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 use uuid::Uuid;
+
 /// Maximum agentic tool-use iterations per user message to prevent runaway loops.
 const MAX_TOOL_ITERATIONS: usize = 10;
+
+static SENSITIVE_KEY_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
+    RegexSet::new([
+        r"(?i)token",
+        r"(?i)api[_-]?key",
+        r"(?i)password",
+        r"(?i)secret",
+        r"(?i)user[_-]?key",
+        r"(?i)bearer",
+        r"(?i)credential",
+    ])
+    .unwrap()
+});
+
+static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)(token|api[_-]?key|password|secret|user[_-]?key|bearer|credential)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\.]{8,}))"#).unwrap()
+});
+
+/// Scrub credentials from tool output to prevent accidental exfiltration.
+/// Replaces known credential patterns with a redacted placeholder while preserving
+/// a small prefix for context.
+fn scrub_credentials(input: &str) -> String {
+    SENSITIVE_KV_REGEX
+        .replace_all(input, |caps: &regex::Captures| {
+            let full_match = &caps[0];
+            let key = &caps[1];
+            let val = caps
+                .get(2)
+                .or(caps.get(3))
+                .or(caps.get(4))
+                .map(|m| m.as_str())
+                .unwrap_or("");
+
+            // Preserve first 4 chars for context, then redact
+            let prefix = if val.len() > 4 { &val[..4] } else { "" };
+
+            if full_match.contains(':') {
+                if full_match.contains('"') {
+                    format!("\"{}\": \"{}*[REDACTED]\"", key, prefix)
+                } else {
+                    format!("{}: {}*[REDACTED]", key, prefix)
+                }
+            } else if full_match.contains('=') {
+                if full_match.contains('"') {
+                    format!("{}=\"{}*[REDACTED]\"", key, prefix)
+                } else {
+                    format!("{}={}*[REDACTED]", key, prefix)
+                }
+            } else {
+                format!("{}: {}*[REDACTED]", key, prefix)
+            }
+        })
+        .to_string()
+}
 
 /// Trigger auto-compaction when non-system message count exceeds this threshold.
 const MAX_HISTORY_MESSAGES: usize = 50;
@@ -608,7 +664,7 @@ pub(crate) async fn run_tool_call_loop(
                             success: r.success,
                         });
                         if r.success {
-                            r.output
+                            scrub_credentials(&r.output)
                         } else {
                             format!("Error: {}", r.error.unwrap_or_else(|| r.output))
                         }
@@ -1222,6 +1278,25 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_scrub_credentials() {
+        let input = "API_KEY=sk-1234567890abcdef; token: 1234567890; password=\"secret123456\"";
+        let scrubbed = scrub_credentials(input);
+        assert!(scrubbed.contains("API_KEY=sk-1*[REDACTED]"));
+        assert!(scrubbed.contains("token: 1234*[REDACTED]"));
+        assert!(scrubbed.contains("password=\"secr*[REDACTED]\""));
+        assert!(!scrubbed.contains("abcdef"));
+        assert!(!scrubbed.contains("secret123456"));
+    }
+
+    #[test]
+    fn test_scrub_credentials_json() {
+        let input = r#"{"api_key": "sk-1234567890", "other": "public"}"#;
+        let scrubbed = scrub_credentials(input);
+        assert!(scrubbed.contains("\"api_key\": \"sk-1*[REDACTED]\""));
+        assert!(scrubbed.contains("public"));
+    }
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use tempfile::TempDir;
 
