@@ -13,7 +13,9 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" /></a>
   <a href="NOTICE"><img src="https://img.shields.io/badge/contributors-27+-green.svg" alt="Contributors" /></a>
 </p>
+<p align="center">
 Built By Students and Members of the Harvard - MIT - Sundai.Club Communities.
+</p>
 Fast, small, and fully autonomous AI assistant infrastructure — deploy anywhere, swap anything.
 
 ```
