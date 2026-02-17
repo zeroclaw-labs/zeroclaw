@@ -27,7 +27,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 ### Optional Repository Automation
 
 - `.github/workflows/labeler.yml` (`PR Labeler`)
-    - Purpose: scope/path labels + size/risk labels + fine-grained module labels (`<module>:<component>`)
+    - Purpose: scope/path labels + size/risk labels + fine-grained module labels (`<module>: <component>`)
     - Additional behavior: label descriptions are auto-managed as hover tooltips to explain each auto-judgment rule
     - Additional behavior: provider-related keywords in provider/config/onboard/integration changes are promoted to `provider:*` labels (for example `provider:kimi`, `provider:deepseek`)
     - Additional behavior: hierarchical de-duplication keeps only the most specific scope labels (for example `tool:composio` suppresses `tool:core` and `tool`)

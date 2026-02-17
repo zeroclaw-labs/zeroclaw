@@ -36,7 +36,11 @@ jobs:
               { label: "trusted contributor", minMergedPRs: 5 },
             ];
             const contributorTierLabels = contributorTierRules.map((rule) => rule.label);
+<<<<<<< chore/labeler-spacing-trusted-tier
+            const contributorTierColor = "39FF14";
+=======
             const contributorTierColor = "2ED9FF"; // Keep in sync with .github/workflows/labeler.yml
+>>>>>>> main
             const managedContributorLabels = new Set(contributorTierLabels);
             const action = context.payload.action;
             const changedLabel = context.payload.label?.name;
