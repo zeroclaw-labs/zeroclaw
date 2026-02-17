@@ -85,6 +85,30 @@ impl Tool for ShellTool {
             }
         }
 
+        // Block unresolved $VAR references that could bypass workspace confinement
+        if self.security.has_unresolved_var_reference(command) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(
+                    "Command blocked: unresolved variable references are not allowed \
+                     in workspace-only mode (potential path escape)"
+                        .into(),
+                ),
+            });
+        }
+
+        // Block path arguments that resolve outside the workspace
+        if let Some(path) = self.security.forbidden_path_argument(command) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Command blocked: path argument not allowed: {path}"
+                )),
+            });
+        }
+
         if !self.security.record_action() {
             return Ok(ToolResult {
                 success: false,
@@ -364,5 +388,45 @@ mod tests {
         assert!(allowed.success);
 
         let _ = std::fs::remove_file(std::env::temp_dir().join("zeroclaw_shell_approval_test"));
+    }
+
+    #[tokio::test]
+    async fn shell_blocks_absolute_path_outside_workspace() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: std::env::temp_dir(),
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        });
+        let tool = ShellTool::new(security, test_runtime());
+        let result = tool
+            .execute(json!({"command": "cat /etc/passwd"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("path"));
+    }
+
+    #[tokio::test]
+    async fn shell_blocks_var_expansion_in_workspace_only() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: std::env::temp_dir(),
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        });
+        let tool = ShellTool::new(security, test_runtime());
+        let result = tool
+            .execute(json!({"command": "cat $HOME/.ssh/id_rsa"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("variable references")
+        );
     }
 }

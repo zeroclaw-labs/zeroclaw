@@ -454,6 +454,86 @@ impl SecurityPolicy {
         }
     }
 
+    /// Check if a shell command contains plain `$VAR` variable references
+    /// that could bypass workspace confinement via path expansion.
+    /// Already-blocked patterns: `$(`, `${`; this catches `$NAME`.
+    pub fn has_unresolved_var_reference(&self, command: &str) -> bool {
+        if !self.workspace_only {
+            return false;
+        }
+        let bytes = command.as_bytes();
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == b'$' {
+                let next = bytes.get(i + 1).copied().unwrap_or(0);
+                // $( and ${ are already blocked by is_command_allowed
+                if next.is_ascii_alphabetic() || next == b'_' {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Scan shell command arguments for path-like tokens that violate policy.
+    /// Returns the first forbidden path found, or `None` if all are allowed.
+    pub fn forbidden_path_argument(&self, command: &str) -> Option<String> {
+        let mut normalized = command.to_string();
+        for sep in ["&&", "||"] {
+            normalized = normalized.replace(sep, "\x00");
+        }
+        for sep in ['\n', ';', '|'] {
+            normalized = normalized.replace(sep, "\x00");
+        }
+
+        for segment in normalized.split('\x00') {
+            let tokens: Vec<&str> = segment.split_whitespace().collect();
+            if tokens.is_empty() {
+                continue;
+            }
+
+            // Skip leading env assignments and executable token.
+            let mut idx = 0;
+            while idx < tokens.len() {
+                let w = tokens[idx];
+                if w.contains('=')
+                    && w.chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                {
+                    idx += 1;
+                } else {
+                    break;
+                }
+            }
+            if idx >= tokens.len() {
+                continue;
+            }
+            idx += 1; // skip the command itself
+
+            for token in &tokens[idx..] {
+                let candidate = token.trim_matches(|c: char| c == '"' || c == '\'');
+                if candidate.is_empty()
+                    || candidate.starts_with('-')
+                    || candidate.contains("://")
+                {
+                    continue;
+                }
+
+                let looks_like_path = candidate.starts_with('/')
+                    || candidate.starts_with("./")
+                    || candidate.starts_with("../")
+                    || candidate.starts_with("~/")
+                    || candidate.contains('/');
+
+                if looks_like_path && !self.is_path_allowed(candidate) {
+                    return Some(candidate.to_string());
+                }
+            }
+        }
+
+        None
+    }
+
     /// Check if a file path is allowed (no path traversal, within workspace)
     pub fn is_path_allowed(&self, path: &str) -> bool {
         // Block null bytes (can truncate paths in C-backed syscalls)
@@ -1324,5 +1404,60 @@ mod tests {
                 "Default forbidden_paths must include {dot}"
             );
         }
+    }
+
+    // ── Workspace confinement for shell arguments ────────────
+
+    #[test]
+    fn has_unresolved_var_blocks_dollar_name() {
+        let p = SecurityPolicy {
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+        assert!(p.has_unresolved_var_reference("cat $HOME/.ssh/id_rsa"));
+        assert!(p.has_unresolved_var_reference("echo $PATH"));
+        assert!(p.has_unresolved_var_reference("ls $USER"));
+    }
+
+    #[test]
+    fn has_unresolved_var_ignores_when_not_workspace_only() {
+        let p = SecurityPolicy {
+            workspace_only: false,
+            ..SecurityPolicy::default()
+        };
+        assert!(!p.has_unresolved_var_reference("cat $HOME/file"));
+    }
+
+    #[test]
+    fn has_unresolved_var_allows_safe_dollar() {
+        let p = SecurityPolicy {
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+        // $? and $$ and $! are shell specials, not var names
+        assert!(!p.has_unresolved_var_reference("echo $?"));
+        assert!(!p.has_unresolved_var_reference("echo $$"));
+        // No dollar sign at all
+        assert!(!p.has_unresolved_var_reference("echo hello"));
+    }
+
+    #[test]
+    fn forbidden_path_argument_detects_absolute_read() {
+        let p = SecurityPolicy {
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+        assert!(p.forbidden_path_argument("cat /etc/passwd").is_some());
+        assert!(p.forbidden_path_argument("grep secret /etc/shadow").is_some());
+    }
+
+    #[test]
+    fn forbidden_path_argument_allows_relative() {
+        let p = SecurityPolicy {
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+        assert!(p.forbidden_path_argument("cat README.md").is_none());
+        assert!(p.forbidden_path_argument("echo hello").is_none());
     }
 }
