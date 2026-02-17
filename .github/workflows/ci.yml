@@ -315,13 +315,19 @@ jobs:
 
                   event_name="${{ github.event_name }}"
                   rust_changed="${{ needs.changes.outputs.rust_changed }}"
+                  docs_changed="${{ needs.changes.outputs.docs_changed }}"
                   workflow_changed="${{ needs.changes.outputs.workflow_changed }}"
+                  docs_result="${{ needs.docs-quality.result }}"
                   workflow_owner_result="${{ needs.workflow-owner-approval.result }}"
 
                   if [ "${{ needs.changes.outputs.docs_only }}" = "true" ]; then
                     echo "workflow_owner_approval=${workflow_owner_result}"
                     if [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
                       echo "Workflow files changed but workflow owner approval gate did not pass."
+                      exit 1
+                    fi
+                    if [ "$event_name" != "pull_request" ] && [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
+                      echo "Docs-only push changed docs, but docs-quality did not pass."
                       exit 1
                     fi
                     echo "Docs-only fast path passed."
@@ -333,6 +339,10 @@ jobs:
                     echo "workflow_owner_approval=${workflow_owner_result}"
                     if [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
                       echo "Workflow files changed but workflow owner approval gate did not pass."
+                      exit 1
+                    fi
+                    if [ "$event_name" != "pull_request" ] && [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
+                      echo "Non-rust push changed docs, but docs-quality did not pass."
                       exit 1
                     fi
                     echo "Non-rust fast path passed."
@@ -348,6 +358,7 @@ jobs:
                   echo "lint_strict_delta=${lint_strict_delta_result}"
                   echo "test=${test_result}"
                   echo "build=${build_result}"
+                  echo "docs=${docs_result}"
                   echo "workflow_owner_approval=${workflow_owner_result}"
 
                   if [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
@@ -366,6 +377,11 @@ jobs:
 
                   if [ "$lint_result" != "success" ] || [ "$lint_strict_delta_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ]; then
                     echo "Required push CI jobs did not pass."
+                    exit 1
+                  fi
+
+                  if [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
+                    echo "Push changed docs, but docs-quality did not pass."
                     exit 1
                   fi
 
