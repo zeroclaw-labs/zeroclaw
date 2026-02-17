@@ -1,4 +1,6 @@
-use crate::channels::{Channel, DiscordChannel, SendMessage, SlackChannel, TelegramChannel};
+use crate::channels::{
+    Channel, DiscordChannel, MattermostChannel, SendMessage, SlackChannel, TelegramChannel,
+};
 use crate::config::Config;
 use crate::cron::{
     due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job, reschedule_after_run,
@@ -259,6 +261,20 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 sl.bot_token.clone(),
                 sl.channel_id.clone(),
                 sl.allowed_users.clone(),
+            );
+            channel.send(&SendMessage::new(output, target)).await?;
+        }
+        "mattermost" => {
+            let mm = config
+                .channels_config
+                .mattermost
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("mattermost channel not configured"))?;
+            let channel = MattermostChannel::new(
+                mm.url.clone(),
+                mm.bot_token.clone(),
+                mm.channel_id.clone(),
+                mm.allowed_users.clone(),
             );
             channel.send(&SendMessage::new(output, target)).await?;
         }

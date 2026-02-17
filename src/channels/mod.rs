@@ -6,6 +6,7 @@ pub mod imessage;
 pub mod irc;
 pub mod lark;
 pub mod matrix;
+pub mod mattermost;
 pub mod qq;
 pub mod signal;
 pub mod slack;
@@ -21,6 +22,7 @@ pub use imessage::IMessageChannel;
 pub use irc::IrcChannel;
 pub use lark::LarkChannel;
 pub use matrix::MatrixChannel;
+pub use mattermost::MattermostChannel;
 pub use qq::QQChannel;
 pub use signal::SignalChannel;
 pub use slack::SlackChannel;
@@ -1115,6 +1117,15 @@ pub async fn start_channels(config: Config) -> Result<()> {
             sl.bot_token.clone(),
             sl.channel_id.clone(),
             sl.allowed_users.clone(),
+        )));
+    }
+
+    if let Some(ref mm) = config.channels_config.mattermost {
+        channels.push(Arc::new(MattermostChannel::new(
+            mm.url.clone(),
+            mm.bot_token.clone(),
+            mm.channel_id.clone(),
+            mm.allowed_users.clone(),
         )));
     }
 

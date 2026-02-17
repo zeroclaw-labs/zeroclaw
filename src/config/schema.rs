@@ -1278,6 +1278,7 @@ pub struct ChannelsConfig {
     pub telegram: Option<TelegramConfig>,
     pub discord: Option<DiscordConfig>,
     pub slack: Option<SlackConfig>,
+    pub mattermost: Option<MattermostConfig>,
     pub webhook: Option<WebhookConfig>,
     pub imessage: Option<IMessageConfig>,
     pub matrix: Option<MatrixConfig>,
@@ -1297,6 +1298,7 @@ impl Default for ChannelsConfig {
             telegram: None,
             discord: None,
             slack: None,
+            mattermost: None,
             webhook: None,
             imessage: None,
             matrix: None,
@@ -1337,6 +1339,15 @@ pub struct DiscordConfig {
 pub struct SlackConfig {
     pub bot_token: String,
     pub app_token: Option<String>,
+    pub channel_id: Option<String>,
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MattermostConfig {
+    pub url: String,
+    pub bot_token: String,
     pub channel_id: Option<String>,
     #[serde(default)]
     pub allowed_users: Vec<String>,
@@ -2196,6 +2207,7 @@ default_temperature = 0.7
                 }),
                 discord: None,
                 slack: None,
+                mattermost: None,
                 webhook: None,
                 imessage: None,
                 matrix: None,
@@ -2604,6 +2616,7 @@ tool_dispatcher = "xml"
             telegram: None,
             discord: None,
             slack: None,
+            mattermost: None,
             webhook: None,
             imessage: Some(IMessageConfig {
                 allowed_contacts: vec!["+1".into()],
@@ -2767,6 +2780,7 @@ channel_id = "C123"
             telegram: None,
             discord: None,
             slack: None,
+            mattermost: None,
             webhook: None,
             imessage: None,
             matrix: None,
