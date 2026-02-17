@@ -1130,8 +1130,11 @@ pub async fn run(
                 }
             };
             final_output = response.clone();
-            if let Err(e) =
-                crate::channels::Channel::send(&cli, &format!("\n{response}\n"), "user").await
+            if let Err(e) = crate::channels::Channel::send(
+                &cli,
+                &crate::channels::traits::SendMessage::new(format!("\n{response}\n"), "user"),
+            )
+            .await
             {
                 eprintln!("\nError sending CLI response: {e}\n");
             }
