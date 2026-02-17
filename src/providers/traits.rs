@@ -191,8 +191,30 @@ pub enum StreamError {
     Io(#[from] std::io::Error),
 }
 
+/// Provider capabilities declaration.
+///
+/// Describes what features a provider supports, enabling intelligent
+/// adaptation of tool calling modes and request formatting.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderCapabilities {
+    /// Whether the provider supports native tool calling via API primitives.
+    ///
+    /// When `true`, the provider can convert tool definitions to API-native
+    /// formats (e.g., Gemini's functionDeclarations, Anthropic's input_schema).
+    ///
+    /// When `false`, tools must be injected via system prompt as text.
+    pub native_tool_calling: bool,
+}
+
 #[async_trait]
 pub trait Provider: Send + Sync {
+    /// Query provider capabilities.
+    ///
+    /// Default implementation returns minimal capabilities (no native tool calling).
+    /// Providers should override this to declare their actual capabilities.
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities::default()
+    }
     /// Simple one-shot chat (single user message, no explicit system prompt).
     ///
     /// This is the preferred API for non-agentic direct interactions.
@@ -256,7 +278,7 @@ pub trait Provider: Send + Sync {
 
     /// Whether provider supports native tool calls over API.
     fn supports_native_tools(&self) -> bool {
-        false
+        self.capabilities().native_tool_calling
     }
 
     /// Warm up the HTTP connection pool (TLS handshake, DNS, HTTP/2 setup).
@@ -307,21 +329,11 @@ pub trait Provider: Send + Sync {
     /// Default implementation falls back to stream_chat_with_system with last user message.
     fn stream_chat_with_history(
         &self,
-        messages: &[ChatMessage],
-        model: &str,
-        temperature: f64,
-        options: StreamOptions,
+        _messages: &[ChatMessage],
+        _model: &str,
+        _temperature: f64,
+        _options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
-        let system = messages
-            .iter()
-            .find(|m| m.role == "system")
-            .map(|m| m.content.clone());
-        let last_user = messages
-            .iter()
-            .rfind(|m| m.role == "user")
-            .map(|m| m.content.clone())
-            .unwrap_or_default();
-
         // For default implementation, we need to convert to owned strings
         // This is a limitation of the default implementation
         let provider_name = "unknown".to_string();
@@ -335,6 +347,27 @@ pub trait Provider: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct CapabilityMockProvider;
+
+    #[async_trait]
+    impl Provider for CapabilityMockProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: true,
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("ok".into())
+        }
+    }
 
     #[test]
     fn chat_message_constructors() {
@@ -397,5 +430,33 @@ mod tests {
         }]);
         let json = serde_json::to_string(&tool_result).unwrap();
         assert!(json.contains("\"type\":\"ToolResults\""));
+    }
+
+    #[test]
+    fn provider_capabilities_default() {
+        let caps = ProviderCapabilities::default();
+        assert!(!caps.native_tool_calling);
+    }
+
+    #[test]
+    fn provider_capabilities_equality() {
+        let caps1 = ProviderCapabilities {
+            native_tool_calling: true,
+        };
+        let caps2 = ProviderCapabilities {
+            native_tool_calling: true,
+        };
+        let caps3 = ProviderCapabilities {
+            native_tool_calling: false,
+        };
+
+        assert_eq!(caps1, caps2);
+        assert_ne!(caps1, caps3);
+    }
+
+    #[test]
+    fn supports_native_tools_reflects_capabilities_default_mapping() {
+        let provider = CapabilityMockProvider;
+        assert!(provider.supports_native_tools());
     }
 }

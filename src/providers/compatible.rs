@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 pub struct OpenAiCompatibleProvider {
     pub(crate) name: String,
     pub(crate) base_url: String,
-    pub(crate) api_key: Option<String>,
+    pub(crate) credential: Option<String>,
     pub(crate) auth_header: AuthStyle,
     /// When false, do not fall back to /v1/responses on chat completions 404.
     /// GLM/Zhipu does not support the responses API.
@@ -37,11 +37,16 @@ pub enum AuthStyle {
 }
 
 impl OpenAiCompatibleProvider {
-    pub fn new(name: &str, base_url: &str, api_key: Option<&str>, auth_style: AuthStyle) -> Self {
+    pub fn new(
+        name: &str,
+        base_url: &str,
+        credential: Option<&str>,
+        auth_style: AuthStyle,
+    ) -> Self {
         Self {
             name: name.to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
-            api_key: api_key.map(ToString::to_string),
+            credential: credential.map(ToString::to_string),
             auth_header: auth_style,
             supports_responses_fallback: true,
             client: Client::builder()
@@ -57,13 +62,13 @@ impl OpenAiCompatibleProvider {
     pub fn new_no_responses_fallback(
         name: &str,
         base_url: &str,
-        api_key: Option<&str>,
+        credential: Option<&str>,
         auth_style: AuthStyle,
     ) -> Self {
         Self {
             name: name.to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
-            api_key: api_key.map(ToString::to_string),
+            credential: credential.map(ToString::to_string),
             auth_header: auth_style,
             supports_responses_fallback: false,
             client: Client::builder()
@@ -276,16 +281,12 @@ fn parse_sse_line(line: &str) -> StreamResult<Option<String>> {
 }
 
 /// Convert SSE byte stream to text chunks.
-async fn sse_bytes_to_chunks(
-    mut response: reqwest::Response,
+fn sse_bytes_to_chunks(
+    response: reqwest::Response,
     count_tokens: bool,
 ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
-    use tokio::io::AsyncBufReadExt;
-
-    let name = "stream".to_string();
-
     // Create a channel to send chunks
-    let (mut tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
+    let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
     tokio::spawn(async move {
         // Buffer for incomplete lines
@@ -336,10 +337,7 @@ async fn sse_bytes_to_chunks(
                                     return; // Receiver dropped
                                 }
                             }
-                            Ok(None) => {
-                                // Empty line or [DONE] sentinel - continue
-                                continue;
-                            }
+                            Ok(None) => {}
                             Err(e) => {
                                 let _ = tx.send(Err(e)).await;
                                 return;
@@ -360,10 +358,7 @@ async fn sse_bytes_to_chunks(
 
     // Convert channel receiver to stream
     stream::unfold(rx, |mut rx| async {
-        match rx.recv().await {
-            Some(chunk) => Some((chunk, rx)),
-            None => None,
-        }
+        rx.recv().await.map(|chunk| (chunk, rx))
     })
     .boxed()
 }
@@ -409,18 +404,18 @@ impl OpenAiCompatibleProvider {
     fn apply_auth_header(
         &self,
         req: reqwest::RequestBuilder,
-        api_key: &str,
+        credential: &str,
     ) -> reqwest::RequestBuilder {
         match &self.auth_header {
-            AuthStyle::Bearer => req.header("Authorization", format!("Bearer {api_key}")),
-            AuthStyle::XApiKey => req.header("x-api-key", api_key),
-            AuthStyle::Custom(header) => req.header(header, api_key),
+            AuthStyle::Bearer => req.header("Authorization", format!("Bearer {credential}")),
+            AuthStyle::XApiKey => req.header("x-api-key", credential),
+            AuthStyle::Custom(header) => req.header(header, credential),
         }
     }
 
     async fn chat_via_responses(
         &self,
-        api_key: &str,
+        credential: &str,
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
@@ -438,7 +433,7 @@ impl OpenAiCompatibleProvider {
         let url = self.responses_url();
 
         let response = self
-            .apply_auth_header(self.client.post(&url).json(&request), api_key)
+            .apply_auth_header(self.client.post(&url).json(&request), credential)
             .send()
             .await?;
 
@@ -463,7 +458,7 @@ impl Provider for OpenAiCompatibleProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let api_key = self.api_key.as_ref().ok_or_else(|| {
+        let credential = self.credential.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "{} API key not set. Run `zeroclaw onboard` or set the appropriate env var.",
                 self.name
@@ -494,7 +489,7 @@ impl Provider for OpenAiCompatibleProvider {
         let url = self.chat_completions_url();
 
         let response = self
-            .apply_auth_header(self.client.post(&url).json(&request), api_key)
+            .apply_auth_header(self.client.post(&url).json(&request), credential)
             .send()
             .await?;
 
@@ -505,7 +500,7 @@ impl Provider for OpenAiCompatibleProvider {
 
             if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
                 return self
-                    .chat_via_responses(api_key, system_prompt, message, model)
+                    .chat_via_responses(credential, system_prompt, message, model)
                     .await
                     .map_err(|responses_err| {
                         anyhow::anyhow!(
@@ -549,7 +544,7 @@ impl Provider for OpenAiCompatibleProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let api_key = self.api_key.as_ref().ok_or_else(|| {
+        let credential = self.credential.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "{} API key not set. Run `zeroclaw onboard` or set the appropriate env var.",
                 self.name
@@ -573,7 +568,7 @@ impl Provider for OpenAiCompatibleProvider {
 
         let url = self.chat_completions_url();
         let response = self
-            .apply_auth_header(self.client.post(&url).json(&request), api_key)
+            .apply_auth_header(self.client.post(&url).json(&request), credential)
             .send()
             .await?;
 
@@ -588,7 +583,7 @@ impl Provider for OpenAiCompatibleProvider {
                 if let Some(user_msg) = last_user {
                     return self
                         .chat_via_responses(
-                            api_key,
+                            credential,
                             system.map(|m| m.content.as_str()),
                             &user_msg.content,
                             model,
@@ -687,7 +682,7 @@ impl Provider for OpenAiCompatibleProvider {
         temperature: f64,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
-        let api_key = match self.api_key.as_ref() {
+        let credential = match self.credential.as_ref() {
             Some(key) => key.clone(),
             None => {
                 let provider_name = self.name.clone();
@@ -734,10 +729,10 @@ impl Provider for OpenAiCompatibleProvider {
             // Apply auth header
             req_builder = match &auth_header {
                 AuthStyle::Bearer => {
-                    req_builder.header("Authorization", format!("Bearer {}", api_key))
+                    req_builder.header("Authorization", format!("Bearer {}", credential))
                 }
-                AuthStyle::XApiKey => req_builder.header("x-api-key", &api_key),
-                AuthStyle::Custom(header) => req_builder.header(header, &api_key),
+                AuthStyle::XApiKey => req_builder.header("x-api-key", &credential),
+                AuthStyle::Custom(header) => req_builder.header(header, &credential),
             };
 
             // Set accept header for streaming
@@ -766,7 +761,7 @@ impl Provider for OpenAiCompatibleProvider {
             }
 
             // Convert to chunk stream and forward to channel
-            let mut chunk_stream = sse_bytes_to_chunks(response, options.count_tokens).await;
+            let mut chunk_stream = sse_bytes_to_chunks(response, options.count_tokens);
             while let Some(chunk) = chunk_stream.next().await {
                 if tx.send(chunk).await.is_err() {
                     break; // Receiver dropped
@@ -776,10 +771,7 @@ impl Provider for OpenAiCompatibleProvider {
 
         // Convert channel receiver to stream
         stream::unfold(rx, |mut rx| async move {
-            match rx.recv().await {
-                Some(chunk) => Some((chunk, rx)),
-                None => None,
-            }
+            rx.recv().await.map(|chunk| (chunk, rx))
         })
         .boxed()
     }
@@ -795,16 +787,20 @@ mod tests {
 
     #[test]
     fn creates_with_key() {
-        let p = make_provider("venice", "https://api.venice.ai", Some("vn-key"));
+        let p = make_provider(
+            "venice",
+            "https://api.venice.ai",
+            Some("venice-test-credential"),
+        );
         assert_eq!(p.name, "venice");
         assert_eq!(p.base_url, "https://api.venice.ai");
-        assert_eq!(p.api_key.as_deref(), Some("vn-key"));
+        assert_eq!(p.credential.as_deref(), Some("venice-test-credential"));
     }
 
     #[test]
     fn creates_without_key() {
         let p = make_provider("test", "https://example.com", None);
-        assert!(p.api_key.is_none());
+        assert!(p.credential.is_none());
     }
 
     #[test]

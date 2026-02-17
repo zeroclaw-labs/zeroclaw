@@ -122,14 +122,16 @@ impl Tool for HardwareMemoryMapTool {
 
         if !probe_ok {
             if let Some(map) = self.static_map_for_board(board) {
-                output.push_str(&format!("**{}** (from datasheet):\n{}", board, map));
+                use std::fmt::Write;
+                let _ = write!(output, "**{board}** (from datasheet):\n{map}");
             } else {
+                use std::fmt::Write;
                 let known: Vec<&str> = MEMORY_MAPS.iter().map(|(b, _)| *b).collect();
-                output.push_str(&format!(
-                    "No memory map for board '{}'. Known boards: {}",
-                    board,
+                let _ = write!(
+                    output,
+                    "No memory map for board '{board}'. Known boards: {}",
                     known.join(", ")
-                ));
+                );
             }
         }
 

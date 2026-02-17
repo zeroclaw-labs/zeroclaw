@@ -81,14 +81,17 @@ mod tests {
 
     #[test]
     fn bubblewrap_sandbox_name() {
-        assert_eq!(BubblewrapSandbox.name(), "bubblewrap");
+        let sandbox = BubblewrapSandbox;
+        assert_eq!(sandbox.name(), "bubblewrap");
     }
 
     #[test]
     fn bubblewrap_is_available_only_if_installed() {
         // Result depends on whether bwrap is installed
-        let available = BubblewrapSandbox::is_available();
+        let sandbox = BubblewrapSandbox;
+        let _available = sandbox.is_available();
+
         // Either way, the name should still work
-        assert_eq!(BubblewrapSandbox.name(), "bubblewrap");
+        assert_eq!(sandbox.name(), "bubblewrap");
     }
 }

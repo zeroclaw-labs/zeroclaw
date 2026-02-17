@@ -112,6 +112,7 @@ pub struct SerialPeripheral {
 
 impl SerialPeripheral {
     /// Create and connect to a serial peripheral.
+    #[allow(clippy::unused_async)]
     pub async fn connect(config: &PeripheralBoardConfig) -> anyhow::Result<Self> {
         let path = config
             .path

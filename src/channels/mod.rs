@@ -81,7 +81,7 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
 async fn build_memory_context(mem: &dyn Memory, user_msg: &str) -> String {
     let mut context = String::new();
 
-    if let Ok(entries) = mem.recall(user_msg, 5).await {
+    if let Ok(entries) = mem.recall(user_msg, 5, None).await {
         if !entries.is_empty() {
             context.push_str("[Memory context]\n");
             for entry in &entries {
@@ -167,6 +167,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                 &autosave_key,
                 &msg.content,
                 crate::memory::MemoryCategory::Conversation,
+                None,
             )
             .await;
     }
@@ -498,6 +499,16 @@ pub fn build_system_prompt(
         std::env::consts::OS,
     );
 
+    // ── 8. Channel Capabilities ─────────────────────────────────────
+    prompt.push_str("## Channel Capabilities\n\n");
+    prompt.push_str(
+        "- You are running as a Discord bot. You CAN and do send messages to Discord channels.\n",
+    );
+    prompt.push_str("- When someone messages you on Discord, your response is automatically sent back to Discord.\n");
+    prompt.push_str("- You do NOT need to ask permission to respond — just respond directly.\n");
+    prompt.push_str("- NEVER repeat, describe, or echo credentials, tokens, API keys, or secrets in your responses.\n");
+    prompt.push_str("- If a tool output contains credentials, they have already been redacted — do not mention them.\n\n");
+
     if prompt.is_empty() {
         "You are ZeroClaw, a fast and efficient AI assistant built in Rust. Be helpful, concise, and direct.".to_string()
     } else {
@@ -634,6 +645,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 dc.guild_id.clone(),
                 dc.allowed_users.clone(),
                 dc.listen_to_bots,
+                dc.mention_only,
             )),
         ));
     }
@@ -703,16 +715,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     }
 
     if let Some(ref lk) = config.channels_config.lark {
-        channels.push((
-            "Lark",
-            Arc::new(LarkChannel::new(
-                lk.app_id.clone(),
-                lk.app_secret.clone(),
-                lk.verification_token.clone().unwrap_or_default(),
-                9898,
-                lk.allowed_users.clone(),
-            )),
-        ));
+        channels.push(("Lark", Arc::new(LarkChannel::from_config(lk))));
     }
 
     if let Some(ref dt) = config.channels_config.dingtalk {
@@ -777,6 +780,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider(
         &provider_name,
         config.api_key.as_deref(),
+        config.api_url.as_deref(),
         &config.reliability,
     )?);
 
@@ -875,6 +879,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
         "schedule",
         "Manage scheduled tasks (create/list/get/cancel/pause/resume). Supports recurring cron and one-shot delays.",
     ));
+    tool_descs.push((
+        "pushover",
+        "Send a Pushover notification to your device. Requires PUSHOVER_TOKEN and PUSHOVER_USER_KEY in .env file.",
+    ));
     if !config.agents.is_empty() {
         tool_descs.push((
             "delegate",
@@ -924,6 +932,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             dc.guild_id.clone(),
             dc.allowed_users.clone(),
             dc.listen_to_bots,
+            dc.mention_only,
         )));
     }
 
@@ -977,13 +986,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
 
     if let Some(ref lk) = config.channels_config.lark {
-        channels.push(Arc::new(LarkChannel::new(
-            lk.app_id.clone(),
-            lk.app_secret.clone(),
-            lk.verification_token.clone().unwrap_or_default(),
-            9898,
-            lk.allowed_users.clone(),
-        )));
+        channels.push(Arc::new(LarkChannel::from_config(lk)));
     }
 
     if let Some(ref dt) = config.channels_config.dingtalk {
@@ -1286,6 +1289,7 @@ mod tests {
             _key: &str,
             _content: &str,
             _category: crate::memory::MemoryCategory,
+            _session_id: Option<&str>,
         ) -> anyhow::Result<()> {
             Ok(())
         }
@@ -1294,6 +1298,7 @@ mod tests {
             &self,
             _query: &str,
             _limit: usize,
+            _session_id: Option<&str>,
         ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
             Ok(Vec::new())
         }
@@ -1305,6 +1310,7 @@ mod tests {
         async fn list(
             &self,
             _category: Option<&crate::memory::MemoryCategory>,
+            _session_id: Option<&str>,
         ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
             Ok(Vec::new())
         }
@@ -1590,6 +1596,25 @@ mod tests {
     }
 
     #[test]
+    fn prompt_contains_channel_capabilities() {
+        let ws = make_workspace();
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
+
+        assert!(
+            prompt.contains("## Channel Capabilities"),
+            "missing Channel Capabilities section"
+        );
+        assert!(
+            prompt.contains("running as a Discord bot"),
+            "missing Discord context"
+        );
+        assert!(
+            prompt.contains("NEVER repeat, describe, or echo credentials"),
+            "missing security instruction"
+        );
+    }
+
+    #[test]
     fn prompt_workspace_path() {
         let ws = make_workspace();
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
@@ -1662,6 +1687,7 @@ mod tests {
             &conversation_memory_key(&msg1),
             &msg1.content,
             MemoryCategory::Conversation,
+            None,
         )
         .await
         .unwrap();
@@ -1669,13 +1695,14 @@ mod tests {
             &conversation_memory_key(&msg2),
             &msg2.content,
             MemoryCategory::Conversation,
+            None,
         )
         .await
         .unwrap();
 
         assert_eq!(mem.count().await.unwrap(), 2);
 
-        let recalled = mem.recall("45", 5).await.unwrap();
+        let recalled = mem.recall("45", 5, None).await.unwrap();
         assert!(recalled.iter().any(|entry| entry.content.contains("45")));
     }
 
@@ -1683,7 +1710,7 @@ mod tests {
     async fn build_memory_context_includes_recalled_entries() {
         let tmp = TempDir::new().unwrap();
         let mem = SqliteMemory::new(tmp.path()).unwrap();
-        mem.store("age_fact", "Age is 45", MemoryCategory::Conversation)
+        mem.store("age_fact", "Age is 45", MemoryCategory::Conversation, None)
             .await
             .unwrap();
 

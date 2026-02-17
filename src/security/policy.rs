@@ -350,12 +350,26 @@ impl SecurityPolicy {
 
         // Block subshell/expansion operators — these allow hiding arbitrary
         // commands inside an allowed command (e.g. `echo $(rm -rf /)`)
-        if command.contains('`') || command.contains("$(") || command.contains("${") {
+        if command.contains('`')
+            || command.contains("$(")
+            || command.contains("${")
+            || command.contains("<(")
+            || command.contains(">(")
+        {
             return false;
         }
 
         // Block output redirections — they can write to arbitrary paths
         if command.contains('>') {
+            return false;
+        }
+
+        // Block `tee` — it can write to arbitrary files, bypassing the
+        // redirect check above (e.g. `echo secret | tee /etc/crontab`)
+        if command
+            .split_whitespace()
+            .any(|w| w == "tee" || w.ends_with("/tee"))
+        {
             return false;
         }
 
@@ -986,6 +1000,21 @@ mod tests {
     fn command_injection_dollar_brace_blocked() {
         let p = default_policy();
         assert!(!p.is_command_allowed("echo ${IFS}cat${IFS}/etc/passwd"));
+    }
+
+    #[test]
+    fn command_injection_tee_blocked() {
+        let p = default_policy();
+        assert!(!p.is_command_allowed("echo secret | tee /etc/crontab"));
+        assert!(!p.is_command_allowed("ls | /usr/bin/tee outfile"));
+        assert!(!p.is_command_allowed("tee file.txt"));
+    }
+
+    #[test]
+    fn command_injection_process_substitution_blocked() {
+        let p = default_policy();
+        assert!(!p.is_command_allowed("cat <(echo pwned)"));
+        assert!(!p.is_command_allowed("ls >(cat /etc/passwd)"));
     }
 
     #[test]

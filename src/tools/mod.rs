@@ -19,7 +19,9 @@ pub mod image_info;
 pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
+pub mod pushover;
 pub mod schedule;
+pub mod schema;
 pub mod screenshot;
 pub mod shell;
 pub mod traits;
@@ -45,7 +47,9 @@ pub use image_info::ImageInfoTool;
 pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
+pub use pushover::PushoverTool;
 pub use schedule::ScheduleTool;
+pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
 pub use shell::ShellTool;
 pub use traits::Tool;
@@ -141,6 +145,10 @@ pub fn all_tools_with_runtime(
             security.clone(),
             workspace_dir.to_path_buf(),
         )),
+        Box::new(PushoverTool::new(
+            security.clone(),
+            workspace_dir.to_path_buf(),
+        )),
     ];
 
     if browser_config.enabled {
@@ -195,9 +203,13 @@ pub fn all_tools_with_runtime(
             .iter()
             .map(|(name, cfg)| (name.clone(), cfg.clone()))
             .collect();
+        let delegate_fallback_credential = fallback_api_key.and_then(|value| {
+            let trimmed_value = value.trim();
+            (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
+        });
         tools.push(Box::new(DelegateTool::new(
             delegate_agents,
-            fallback_api_key.map(String::from),
+            delegate_fallback_credential,
         )));
     }
 
@@ -261,6 +273,7 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"browser_open"));
         assert!(names.contains(&"schedule"));
+        assert!(names.contains(&"pushover"));
     }
 
     #[test]
@@ -298,6 +311,7 @@ mod tests {
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"browser_open"));
+        assert!(names.contains(&"pushover"));
     }
 
     #[test]
@@ -432,7 +446,7 @@ mod tests {
             &http,
             tmp.path(),
             &agents,
-            Some("sk-test"),
+            Some("delegate-test-credential"),
             &cfg,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();

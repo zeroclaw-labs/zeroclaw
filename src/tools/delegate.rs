@@ -16,8 +16,8 @@ const DELEGATE_TIMEOUT_SECS: u64 = 120;
 /// summarization) to purpose-built sub-agents.
 pub struct DelegateTool {
     agents: Arc<HashMap<String, DelegateAgentConfig>>,
-    /// Global API key fallback (from config.api_key)
-    fallback_api_key: Option<String>,
+    /// Global credential fallback (from config.api_key)
+    fallback_credential: Option<String>,
     /// Depth at which this tool instance lives in the delegation chain.
     depth: u32,
 }
@@ -25,11 +25,11 @@ pub struct DelegateTool {
 impl DelegateTool {
     pub fn new(
         agents: HashMap<String, DelegateAgentConfig>,
-        fallback_api_key: Option<String>,
+        fallback_credential: Option<String>,
     ) -> Self {
         Self {
             agents: Arc::new(agents),
-            fallback_api_key,
+            fallback_credential,
             depth: 0,
         }
     }
@@ -39,12 +39,12 @@ impl DelegateTool {
     /// their DelegateTool via this method with `depth: parent.depth + 1`.
     pub fn with_depth(
         agents: HashMap<String, DelegateAgentConfig>,
-        fallback_api_key: Option<String>,
+        fallback_credential: Option<String>,
         depth: u32,
     ) -> Self {
         Self {
             agents: Arc::new(agents),
-            fallback_api_key,
+            fallback_credential,
             depth,
         }
     }
@@ -165,13 +165,15 @@ impl Tool for DelegateTool {
         }
 
         // Create provider for this agent
-        let api_key = agent_config
+        let provider_credential_owned = agent_config
             .api_key
-            .as_deref()
-            .or(self.fallback_api_key.as_deref());
+            .clone()
+            .or_else(|| self.fallback_credential.clone());
+        #[allow(clippy::option_as_ref_deref)]
+        let provider_credential = provider_credential_owned.as_ref().map(String::as_str);
 
         let provider: Box<dyn Provider> =
-            match providers::create_provider(&agent_config.provider, api_key) {
+            match providers::create_provider(&agent_config.provider, provider_credential) {
                 Ok(p) => p,
                 Err(e) => {
                     return Ok(ToolResult {
@@ -268,7 +270,7 @@ mod tests {
                 provider: "openrouter".to_string(),
                 model: "anthropic/claude-sonnet-4-20250514".to_string(),
                 system_prompt: None,
-                api_key: Some("sk-test".to_string()),
+                api_key: Some("delegate-test-credential".to_string()),
                 temperature: None,
                 max_depth: 2,
             },

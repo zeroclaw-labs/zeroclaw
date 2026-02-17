@@ -37,9 +37,22 @@ mod tests {
             guild_id: Some("123".into()),
             allowed_users: vec![],
             listen_to_bots: false,
+            mention_only: false,
+        };
+
+        let lark = LarkConfig {
+            app_id: "app-id".into(),
+            app_secret: "app-secret".into(),
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec![],
+            use_feishu: false,
+            receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
+            port: None,
         };
 
         assert_eq!(telegram.allowed_users.len(), 1);
         assert_eq!(discord.guild_id.as_deref(), Some("123"));
+        assert_eq!(lark.app_id, "app-id");
     }
 }

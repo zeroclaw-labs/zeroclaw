@@ -34,8 +34,8 @@
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use tracing::{info, Level};
-use tracing_subscriber::FmtSubscriber;
+use tracing::info;
+use tracing_subscriber::{fmt, EnvFilter};
 
 mod agent;
 mod channels;
@@ -367,9 +367,11 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Initialize logging
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
+    // Initialize logging - respects RUST_LOG env var, defaults to INFO
+    let subscriber = fmt::Subscriber::builder()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .finish();
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");

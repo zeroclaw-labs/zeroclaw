@@ -12,6 +12,8 @@ use tokio::sync::mpsc;
 pub struct ChannelMessage {
     pub id: String,
     pub sender: String,
+    /// Channel-specific reply address (e.g. Telegram chat_id, Discord channel_id).
+    pub reply_to: String,
     pub content: String,
     pub channel: String,
     pub timestamp: u64,
@@ -90,9 +92,12 @@ impl Channel for TelegramChannel {
                             continue;
                         }
 
+                        let chat_id = msg["chat"]["id"].to_string();
+
                         let channel_msg = ChannelMessage {
                             id: msg["message_id"].to_string(),
                             sender,
+                            reply_to: chat_id,
                             content: msg["text"].as_str().unwrap_or("").to_string(),
                             channel: "telegram".into(),
                             timestamp: msg["date"].as_u64().unwrap_or(0),
