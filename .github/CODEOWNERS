@@ -4,7 +4,7 @@
 # High-risk surfaces
 /src/security/** @willsarg
 /src/runtime/** @theonlyhennygod
-/src/memory/** @theonlyhennygod
+/src/memory/** @theonlyhennygod @chumyin
 /.github/** @theonlyhennygod
 /Cargo.toml @theonlyhennygod
 /Cargo.lock @theonlyhennygod
@@ -17,12 +17,12 @@
 # Docs & governance
 /docs/**                @chumyin
 /AGENTS.md              @chumyin
+/CLAUDE.md              @chumyin
 /CONTRIBUTING.md        @chumyin
 /docs/pr-workflow.md    @chumyin
 /docs/reviewer-playbook.md @chumyin
-/docs/ci-map.md         @chumyin
 
 # Security / CI-CD governance overrides (last-match wins)
 /SECURITY.md              @willsarg
-/docs/actions-source-policy.md @willsarg @chumyin
-/docs/ci-map.md           @willsarg @chumyin
+/docs/actions-source-policy.md @willsarg
+/docs/ci-map.md           @willsarg
