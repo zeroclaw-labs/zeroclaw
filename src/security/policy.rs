@@ -24,6 +24,13 @@ pub enum CommandRiskLevel {
     High,
 }
 
+/// Classifies whether a tool operation is read-only or side-effecting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolOperation {
+    Read,
+    Act,
+}
+
 /// Sliding-window action tracker for rate limiting.
 #[derive(Debug)]
 pub struct ActionTracker {
@@ -530,6 +537,33 @@ impl SecurityPolicy {
         self.autonomy != AutonomyLevel::ReadOnly
     }
 
+    /// Enforce policy for a tool operation.
+    ///
+    /// Read operations are always allowed by autonomy/rate gates.
+    /// Act operations require non-readonly autonomy and available action budget.
+    pub fn enforce_tool_operation(
+        &self,
+        operation: ToolOperation,
+        operation_name: &str,
+    ) -> Result<(), String> {
+        match operation {
+            ToolOperation::Read => Ok(()),
+            ToolOperation::Act => {
+                if !self.can_act() {
+                    return Err(format!(
+                        "Security policy: read-only mode, cannot perform '{operation_name}'"
+                    ));
+                }
+
+                if !self.record_action() {
+                    return Err("Rate limit exceeded: action budget exhausted".to_string());
+                }
+
+                Ok(())
+            }
+        }
+    }
+
     /// Record an action and check if the rate limit has been exceeded.
     /// Returns `true` if the action is allowed, `false` if rate-limited.
     pub fn record_action(&self) -> bool {
@@ -614,6 +648,35 @@ mod tests {
     #[test]
     fn can_act_full_true() {
         assert!(full_policy().can_act());
+    }
+
+    #[test]
+    fn enforce_tool_operation_read_allowed_in_readonly_mode() {
+        let p = readonly_policy();
+        assert!(p
+            .enforce_tool_operation(ToolOperation::Read, "memory_recall")
+            .is_ok());
+    }
+
+    #[test]
+    fn enforce_tool_operation_act_blocked_in_readonly_mode() {
+        let p = readonly_policy();
+        let err = p
+            .enforce_tool_operation(ToolOperation::Act, "memory_store")
+            .unwrap_err();
+        assert!(err.contains("read-only mode"));
+    }
+
+    #[test]
+    fn enforce_tool_operation_act_uses_rate_budget() {
+        let p = SecurityPolicy {
+            max_actions_per_hour: 0,
+            ..default_policy()
+        };
+        let err = p
+            .enforce_tool_operation(ToolOperation::Act, "memory_store")
+            .unwrap_err();
+        assert!(err.contains("Rate limit exceeded"));
     }
 
     // ── is_command_allowed ───────────────────────────────────
