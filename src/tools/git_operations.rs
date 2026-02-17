@@ -706,4 +706,3 @@ mod tests {
         assert_eq!(truncated.chars().count(), 2000);
     }
 }
-
