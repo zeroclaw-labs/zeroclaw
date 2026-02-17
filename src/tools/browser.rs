@@ -1030,6 +1030,14 @@ impl Tool for BrowserTool {
             return self.execute_computer_use_action(action_str, &args).await;
         }
 
+        if is_computer_use_only_action(action_str) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(unavailable_action_for_backend_error(action_str, backend)),
+            });
+        }
+
         let action = match parse_browser_action(action_str, &args) {
             Ok(a) => a,
             Err(e) => {
@@ -1903,6 +1911,28 @@ fn is_supported_browser_action(action: &str) -> bool {
     )
 }
 
+fn is_computer_use_only_action(action: &str) -> bool {
+    matches!(
+        action,
+        "mouse_move" | "mouse_click" | "mouse_drag" | "key_type" | "key_press" | "screen_capture"
+    )
+}
+
+fn backend_name(backend: ResolvedBackend) -> &'static str {
+    match backend {
+        ResolvedBackend::AgentBrowser => "agent_browser",
+        ResolvedBackend::RustNative => "rust_native",
+        ResolvedBackend::ComputerUse => "computer_use",
+    }
+}
+
+fn unavailable_action_for_backend_error(action: &str, backend: ResolvedBackend) -> String {
+    format!(
+        "Action '{action}' is unavailable for backend '{}'",
+        backend_name(backend)
+    )
+}
+
 fn normalize_domains(domains: Vec<String>) -> Vec<String> {
     domains
         .into_iter()
@@ -2343,5 +2373,29 @@ mod tests {
         let security = Arc::new(SecurityPolicy::default());
         let tool = BrowserTool::new(security, vec![], None);
         assert!(tool.validate_url("https://example.com").is_err());
+    }
+
+    #[test]
+    fn computer_use_only_action_detection_is_correct() {
+        assert!(is_computer_use_only_action("mouse_move"));
+        assert!(is_computer_use_only_action("mouse_click"));
+        assert!(is_computer_use_only_action("mouse_drag"));
+        assert!(is_computer_use_only_action("key_type"));
+        assert!(is_computer_use_only_action("key_press"));
+        assert!(is_computer_use_only_action("screen_capture"));
+        assert!(!is_computer_use_only_action("open"));
+        assert!(!is_computer_use_only_action("snapshot"));
+    }
+
+    #[test]
+    fn unavailable_action_error_preserves_backend_context() {
+        assert_eq!(
+            unavailable_action_for_backend_error("mouse_move", ResolvedBackend::AgentBrowser),
+            "Action 'mouse_move' is unavailable for backend 'agent_browser'"
+        );
+        assert_eq!(
+            unavailable_action_for_backend_error("mouse_move", ResolvedBackend::RustNative),
+            "Action 'mouse_move' is unavailable for backend 'rust_native'"
+        );
     }
 }
