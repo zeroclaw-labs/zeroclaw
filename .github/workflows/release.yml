@@ -53,9 +53,17 @@ jobs:
               if: runner.os != 'Windows'
               run: |
                   SIZE=$(stat -f%z target/${{ matrix.target }}/release/${{ matrix.artifact }} 2>/dev/null || stat -c%s target/${{ matrix.target }}/release/${{ matrix.artifact }})
-                  echo "Binary size: $((SIZE / 1024 / 1024))MB ($SIZE bytes)"
-                  if [ "$SIZE" -gt 5242880 ]; then
-                    echo "::warning::Binary exceeds 5MB target"
+                  SIZE_MB=$((SIZE / 1024 / 1024))
+                  echo "Binary size: ${SIZE_MB}MB ($SIZE bytes)"
+                  echo "### Binary Size: ${{ matrix.target }}" >> "$GITHUB_STEP_SUMMARY"
+                  echo "- Size: ${SIZE_MB}MB ($SIZE bytes)" >> "$GITHUB_STEP_SUMMARY"
+                  if [ "$SIZE" -gt 15728640 ]; then
+                    echo "::error::Binary exceeds 15MB hard limit (${SIZE_MB}MB)"
+                    exit 1
+                  elif [ "$SIZE" -gt 5242880 ]; then
+                    echo "::warning::Binary exceeds 5MB target (${SIZE_MB}MB)"
+                  else
+                    echo "Binary size within target."
                   fi
 
             - name: Package (Unix)
