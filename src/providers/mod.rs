@@ -579,35 +579,181 @@ pub struct ProviderInfo {
 pub fn list_providers() -> Vec<ProviderInfo> {
     vec![
         // ── Primary providers ────────────────────────────────
-        ProviderInfo { name: "openrouter",  display_name: "OpenRouter",          aliases: &[],                                                  local: false },
-        ProviderInfo { name: "anthropic",   display_name: "Anthropic",           aliases: &[],                                                  local: false },
-        ProviderInfo { name: "openai",      display_name: "OpenAI",              aliases: &[],                                                  local: false },
-        ProviderInfo { name: "ollama",      display_name: "Ollama",              aliases: &[],                                                  local: true  },
-        ProviderInfo { name: "gemini",      display_name: "Google Gemini",       aliases: &["google", "google-gemini"],                          local: false },
+        ProviderInfo {
+            name: "openrouter",
+            display_name: "OpenRouter",
+            aliases: &[],
+            local: false,
+        },
+        ProviderInfo {
+            name: "anthropic",
+            display_name: "Anthropic",
+            aliases: &[],
+            local: false,
+        },
+        ProviderInfo {
+            name: "openai",
+            display_name: "OpenAI",
+            aliases: &[],
+            local: false,
+        },
+        ProviderInfo {
+            name: "ollama",
+            display_name: "Ollama",
+            aliases: &[],
+            local: true,
+        },
+        ProviderInfo {
+            name: "gemini",
+            display_name: "Google Gemini",
+            aliases: &["google", "google-gemini"],
+            local: false,
+        },
         // ── OpenAI-compatible providers ──────────────────────
-        ProviderInfo { name: "venice",      display_name: "Venice",              aliases: &[],                                                  local: false },
-        ProviderInfo { name: "vercel",      display_name: "Vercel AI Gateway",   aliases: &["vercel-ai"],                                       local: false },
-        ProviderInfo { name: "cloudflare",  display_name: "Cloudflare AI",       aliases: &["cloudflare-ai"],                                   local: false },
-        ProviderInfo { name: "moonshot",    display_name: "Moonshot",            aliases: &["kimi"],                                            local: false },
-        ProviderInfo { name: "synthetic",   display_name: "Synthetic",           aliases: &[],                                                  local: false },
-        ProviderInfo { name: "opencode",    display_name: "OpenCode Zen",        aliases: &["opencode-zen"],                                    local: false },
-        ProviderInfo { name: "zai",         display_name: "Z.AI",                aliases: &["z.ai"],                                            local: false },
-        ProviderInfo { name: "glm",         display_name: "GLM (Zhipu)",         aliases: &["zhipu"],                                           local: false },
-        ProviderInfo { name: "minimax",     display_name: "MiniMax",             aliases: &[],                                                  local: false },
-        ProviderInfo { name: "bedrock",     display_name: "Amazon Bedrock",      aliases: &["aws-bedrock"],                                     local: false },
-        ProviderInfo { name: "qianfan",     display_name: "Qianfan (Baidu)",     aliases: &["baidu"],                                           local: false },
-        ProviderInfo { name: "qwen",        display_name: "Qwen (DashScope)",    aliases: &["dashscope", "qwen-intl", "dashscope-intl", "qwen-us", "dashscope-us"], local: false },
-        ProviderInfo { name: "groq",        display_name: "Groq",                aliases: &[],                                                  local: false },
-        ProviderInfo { name: "mistral",     display_name: "Mistral",             aliases: &[],                                                  local: false },
-        ProviderInfo { name: "xai",         display_name: "xAI (Grok)",          aliases: &["grok"],                                            local: false },
-        ProviderInfo { name: "deepseek",    display_name: "DeepSeek",            aliases: &[],                                                  local: false },
-        ProviderInfo { name: "together",    display_name: "Together AI",         aliases: &["together-ai"],                                     local: false },
-        ProviderInfo { name: "fireworks",   display_name: "Fireworks AI",        aliases: &["fireworks-ai"],                                    local: false },
-        ProviderInfo { name: "perplexity",  display_name: "Perplexity",          aliases: &[],                                                  local: false },
-        ProviderInfo { name: "cohere",      display_name: "Cohere",              aliases: &[],                                                  local: false },
-        ProviderInfo { name: "copilot",     display_name: "GitHub Copilot",      aliases: &["github-copilot"],                                  local: false },
-        ProviderInfo { name: "lmstudio",    display_name: "LM Studio",           aliases: &["lm-studio"],                                       local: true  },
-        ProviderInfo { name: "nvidia",      display_name: "NVIDIA NIM",          aliases: &["nvidia-nim", "build.nvidia.com"],                   local: false },
+        ProviderInfo {
+            name: "venice",
+            display_name: "Venice",
+            aliases: &[],
+            local: false,
+        },
+        ProviderInfo {
+            name: "vercel",
+            display_name: "Vercel AI Gateway",
+            aliases: &["vercel-ai"],
+            local: false,
+        },
+        ProviderInfo {
+            name: "cloudflare",
+            display_name: "Cloudflare AI",
+            aliases: &["cloudflare-ai"],
+            local: false,
+        },
+        ProviderInfo {
+            name: "moonshot",
+            display_name: "Moonshot",
+            aliases: &["kimi"],
+            local: false,
+        },
+        ProviderInfo {
+            name: "synthetic",
+            display_name: "Synthetic",
+            aliases: &[],
+            local: false,
+        },
+        ProviderInfo {
+            name: "opencode",
+            display_name: "OpenCode Zen",
+            aliases: &["opencode-zen"],
+            local: false,
+        },
+        ProviderInfo {
+            name: "zai",
+            display_name: "Z.AI",
+            aliases: &["z.ai"],
+            local: false,
+        },
+        ProviderInfo {
+            name: "glm",
+            display_name: "GLM (Zhipu)",
+            aliases: &["zhipu"],
+            local: false,
+        },
+        ProviderInfo {
+            name: "minimax",
+            display_name: "MiniMax",
+            aliases: &[],
+            local: false,
+        },
+        ProviderInfo {
+            name: "bedrock",
+            display_name: "Amazon Bedrock",
+            aliases: &["aws-bedrock"],
+            local: false,
+        },
+        ProviderInfo {
+            name: "qianfan",
+            display_name: "Qianfan (Baidu)",
+            aliases: &["baidu"],
+            local: false,
+        },
+        ProviderInfo {
+            name: "qwen",
+            display_name: "Qwen (DashScope)",
+            aliases: &[
+                "dashscope",
+                "qwen-intl",
+                "dashscope-intl",
+                "qwen-us",
+                "dashscope-us",
+            ],
+            local: false,
+        },
+        ProviderInfo {
+            name: "groq",
+            display_name: "Groq",
+            aliases: &[],
+            local: false,
+        },
+        ProviderInfo {
+            name: "mistral",
+            display_name: "Mistral",
+            aliases: &[],
+            local: false,
+        },
+        ProviderInfo {
+            name: "xai",
+            display_name: "xAI (Grok)",
+            aliases: &["grok"],
+            local: false,
+        },
+        ProviderInfo {
+            name: "deepseek",
+            display_name: "DeepSeek",
+            aliases: &[],
+            local: false,
+        },
+        ProviderInfo {
+            name: "together",
+            display_name: "Together AI",
+            aliases: &["together-ai"],
+            local: false,
+        },
+        ProviderInfo {
+            name: "fireworks",
+            display_name: "Fireworks AI",
+            aliases: &["fireworks-ai"],
+            local: false,
+        },
+        ProviderInfo {
+            name: "perplexity",
+            display_name: "Perplexity",
+            aliases: &[],
+            local: false,
+        },
+        ProviderInfo {
+            name: "cohere",
+            display_name: "Cohere",
+            aliases: &[],
+            local: false,
+        },
+        ProviderInfo {
+            name: "copilot",
+            display_name: "GitHub Copilot",
+            aliases: &["github-copilot"],
+            local: false,
+        },
+        ProviderInfo {
+            name: "lmstudio",
+            display_name: "LM Studio",
+            aliases: &["lm-studio"],
+            local: true,
+        },
+        ProviderInfo {
+            name: "nvidia",
+            display_name: "NVIDIA NIM",
+            aliases: &["nvidia-nim", "build.nvidia.com"],
+            local: false,
+        },
     ]
 }
 
@@ -1081,6 +1227,55 @@ mod tests {
                 create_provider(name, Some("test-key")).is_ok(),
                 "Provider '{name}' should create successfully"
             );
+        }
+    }
+
+    #[test]
+    fn listed_providers_have_unique_ids_and_aliases() {
+        let providers = list_providers();
+        let mut canonical_ids = std::collections::HashSet::new();
+        let mut aliases = std::collections::HashSet::new();
+
+        for provider in providers {
+            assert!(
+                canonical_ids.insert(provider.name),
+                "Duplicate canonical provider id: {}",
+                provider.name
+            );
+
+            for alias in provider.aliases {
+                assert_ne!(
+                    *alias, provider.name,
+                    "Alias must differ from canonical id: {}",
+                    provider.name
+                );
+                assert!(
+                    !canonical_ids.contains(alias),
+                    "Alias conflicts with canonical provider id: {}",
+                    alias
+                );
+                assert!(aliases.insert(alias), "Duplicate provider alias: {}", alias);
+            }
+        }
+    }
+
+    #[test]
+    fn listed_providers_and_aliases_are_constructible() {
+        for provider in list_providers() {
+            assert!(
+                create_provider(provider.name, Some("provider-test-credential")).is_ok(),
+                "Canonical provider id should be constructible: {}",
+                provider.name
+            );
+
+            for alias in provider.aliases {
+                assert!(
+                    create_provider(alias, Some("provider-test-credential")).is_ok(),
+                    "Provider alias should be constructible: {} (for {})",
+                    alias,
+                    provider.name
+                );
+            }
         }
     }
 
