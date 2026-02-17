@@ -4,6 +4,7 @@ use crate::security::pairing::PairingGuard;
 use anyhow::Context;
 use async_trait::async_trait;
 use directories::UserDirs;
+use parking_lot::Mutex;
 use reqwest::multipart::{Form, Part};
 use std::fs;
 use std::path::Path;
@@ -235,6 +236,7 @@ pub struct TelegramChannel {
     allowed_users: Arc<RwLock<Vec<String>>>,
     pairing: Option<PairingGuard>,
     client: reqwest::Client,
+    typing_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl TelegramChannel {
@@ -256,6 +258,7 @@ impl TelegramChannel {
             allowed_users: Arc::new(RwLock::new(normalized_allowed)),
             pairing,
             client: reqwest::Client::new(),
+            typing_handle: Mutex::new(None),
         }
     }
 
@@ -1325,6 +1328,39 @@ Ensure only one `zeroclaw` process is using this bot token."
             }
         }
     }
+
+    async fn start_typing(&self, recipient: &str) -> anyhow::Result<()> {
+        self.stop_typing(recipient).await?;
+
+        let client = self.client.clone();
+        let url = self.api_url("sendChatAction");
+        let chat_id = recipient.to_string();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let body = serde_json::json!({
+                    "chat_id": &chat_id,
+                    "action": "typing"
+                });
+                let _ = client.post(&url).json(&body).send().await;
+                // Telegram typing indicator expires after 5s; refresh at 4s
+                tokio::time::sleep(Duration::from_secs(4)).await;
+            }
+        });
+
+        let mut guard = self.typing_handle.lock();
+        *guard = Some(handle);
+
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        let mut guard = self.typing_handle.lock();
+        if let Some(handle) = guard.take() {
+            handle.abort();
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1335,6 +1371,51 @@ mod tests {
     fn telegram_channel_name() {
         let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()]);
         assert_eq!(ch.name(), "telegram");
+    }
+
+    #[test]
+    fn typing_handle_starts_as_none() {
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()]);
+        let guard = ch.typing_handle.lock();
+        assert!(guard.is_none());
+    }
+
+    #[tokio::test]
+    async fn stop_typing_clears_handle() {
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()]);
+
+        // Manually insert a dummy handle
+        {
+            let mut guard = ch.typing_handle.lock();
+            *guard = Some(tokio::spawn(async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }));
+        }
+
+        // stop_typing should abort and clear
+        ch.stop_typing("123").await.unwrap();
+
+        let guard = ch.typing_handle.lock();
+        assert!(guard.is_none());
+    }
+
+    #[tokio::test]
+    async fn start_typing_replaces_previous_handle() {
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()]);
+
+        // Insert a dummy handle first
+        {
+            let mut guard = ch.typing_handle.lock();
+            *guard = Some(tokio::spawn(async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }));
+        }
+
+        // start_typing should abort the old handle and set a new one
+        let _ = ch.start_typing("123").await;
+
+        let guard = ch.typing_handle.lock();
+        assert!(guard.is_some());
     }
 
     #[test]
