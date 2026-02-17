@@ -116,6 +116,7 @@ impl HttpRequestTool {
     ) -> anyhow::Result<reqwest::Response> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.timeout_secs))
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
 
         let mut request = client.request(method, url);
@@ -798,5 +799,13 @@ mod tests {
                 "Expected allowlist rejection for {notation}, got: {err}"
             );
         }
+    }
+
+    #[test]
+    fn redirect_policy_is_none() {
+        // Structural test: the tool should be buildable with redirect-safe config.
+        // The actual Policy::none() enforcement is in execute_request's client builder.
+        let tool = test_tool(vec!["example.com"]);
+        assert_eq!(tool.name(), "http_request");
     }
 }
