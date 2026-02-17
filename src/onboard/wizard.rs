@@ -463,6 +463,7 @@ fn canonical_provider_name(provider_name: &str) -> &str {
         "kimi" | "moonshot-intl" | "moonshot-global" | "moonshot-cn" | "kimi-intl"
         | "kimi-global" | "kimi-cn" => "moonshot",
         "minimax-intl" | "minimax-io" | "minimax-global" | "minimax-cn" | "minimaxi" => "minimax",
+        "z.ai" | "zai-global" | "z.ai-global" | "zai-cn" | "z.ai-cn" => "zai",
         "baidu" => "qianfan",
         _ => provider_name,
     }
@@ -1393,8 +1394,9 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
             ("qwen", "Qwen — DashScope China endpoint"),
             ("qwen-intl", "Qwen — DashScope international endpoint"),
             ("qwen-us", "Qwen — DashScope US endpoint"),
-            ("qianfan", "Qianfan — Baidu AI models"),
-            ("zai", "Z.AI — Z.AI inference"),
+            ("qianfan", "Qianfan — Baidu AI models (China endpoint)"),
+            ("zai", "Z.AI — global coding endpoint"),
+            ("zai-cn", "Z.AI — China coding endpoint (open.bigmodel.cn)"),
             ("synthetic", "Synthetic — Synthetic AI models"),
             ("opencode", "OpenCode Zen — code-focused AI"),
             ("cohere", "Cohere — Command R+ & embeddings"),
@@ -1602,10 +1604,9 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
             | "kimi-intl" | "kimi-global" | "kimi-cn" => {
                 "https://platform.moonshot.cn/console/api-keys"
             }
-            "glm" | "zhipu" | "glm-global" | "zhipu-global" | "zai" | "z.ai" => {
-                "https://platform.z.ai/"
-            }
-            "glm-cn" | "zhipu-cn" | "bigmodel" => {
+            "glm" | "zhipu" | "glm-global" | "zhipu-global" | "zai" | "z.ai" | "zai-global"
+            | "z.ai-global" => "https://platform.z.ai/",
+            "glm-cn" | "zhipu-cn" | "bigmodel" | "zai-cn" | "z.ai-cn" => {
                 "https://open.bigmodel.cn/usercenter/proj-mgmt/apikeys"
             }
             "minimax" | "minimax-intl" | "minimax-io" | "minimax-global" | "minimax-cn"
@@ -1622,6 +1623,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
             | "dashscope-us" => {
                 "https://help.aliyun.com/zh/model-studio/developer-reference/get-api-key"
             }
+            "qianfan" | "baidu" => "https://cloud.baidu.com/doc/WENXINWORKSHOP/s/7lm0vxo78",
             "vercel" => "https://vercel.com/account/tokens",
             "cloudflare" => "https://dash.cloudflare.com/profile/api-tokens",
             "nvidia" | "nvidia-nim" | "build.nvidia.com" => "https://build.nvidia.com/",
@@ -4524,6 +4526,7 @@ mod tests {
         assert_eq!(default_model_for_provider("qwen-intl"), "qwen-plus");
         assert_eq!(default_model_for_provider("glm-cn"), "glm-5");
         assert_eq!(default_model_for_provider("minimax-cn"), "MiniMax-M2.5");
+        assert_eq!(default_model_for_provider("zai-cn"), "glm-5");
         assert_eq!(default_model_for_provider("gemini"), "gemini-2.5-pro");
         assert_eq!(default_model_for_provider("google"), "gemini-2.5-pro");
         assert_eq!(
@@ -4541,6 +4544,8 @@ mod tests {
         assert_eq!(canonical_provider_name("glm-cn"), "glm");
         assert_eq!(canonical_provider_name("bigmodel"), "glm");
         assert_eq!(canonical_provider_name("minimax-cn"), "minimax");
+        assert_eq!(canonical_provider_name("zai-cn"), "zai");
+        assert_eq!(canonical_provider_name("z.ai-global"), "zai");
     }
 
     #[test]
@@ -4605,6 +4610,10 @@ mod tests {
         assert_eq!(
             curated_models_for_provider("minimax"),
             curated_models_for_provider("minimax-cn")
+        );
+        assert_eq!(
+            curated_models_for_provider("zai"),
+            curated_models_for_provider("zai-cn")
         );
     }
 
@@ -4767,6 +4776,7 @@ mod tests {
         assert_eq!(provider_env_var("glm-cn"), "GLM_API_KEY");
         assert_eq!(provider_env_var("minimax-cn"), "MINIMAX_API_KEY");
         assert_eq!(provider_env_var("moonshot-intl"), "MOONSHOT_API_KEY");
+        assert_eq!(provider_env_var("zai-cn"), "ZAI_API_KEY");
         assert_eq!(provider_env_var("nvidia"), "NVIDIA_API_KEY");
         assert_eq!(provider_env_var("nvidia-nim"), "NVIDIA_API_KEY"); // alias
         assert_eq!(provider_env_var("build.nvidia.com"), "NVIDIA_API_KEY"); // alias
