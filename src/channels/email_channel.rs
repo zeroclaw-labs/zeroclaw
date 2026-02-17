@@ -13,11 +13,11 @@ use async_trait::async_trait;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
 use mail_parser::{MessageParser, MimeHeaders};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io::Write as IoWrite;
 use std::net::TcpStream;
-use parking_lot::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep};
@@ -471,18 +471,14 @@ mod tests {
     #[test]
     fn seen_messages_starts_empty() {
         let channel = EmailChannel::new(EmailConfig::default());
-        let seen = channel
-            .seen_messages
-            .lock();
+        let seen = channel.seen_messages.lock();
         assert!(seen.is_empty());
     }
 
     #[test]
     fn seen_messages_tracks_unique_ids() {
         let channel = EmailChannel::new(EmailConfig::default());
-        let mut seen = channel
-            .seen_messages
-            .lock();
+        let mut seen = channel.seen_messages.lock();
 
         assert!(seen.insert("first-id".to_string()));
         assert!(!seen.insert("first-id".to_string()));
@@ -557,9 +553,7 @@ mod tests {
         let channel = EmailChannel::new(config.clone());
         assert_eq!(channel.config.imap_host, config.imap_host);
 
-        let seen_guard = channel
-            .seen_messages
-            .lock();
+        let seen_guard = channel.seen_messages.lock();
         assert_eq!(seen_guard.len(), 0);
     }
 

@@ -25,9 +25,9 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tower_http::limit::RequestBodyLimitLayer;
@@ -76,9 +76,7 @@ impl SlidingWindowRateLimiter {
         let now = Instant::now();
         let cutoff = now.checked_sub(self.window).unwrap_or_else(Instant::now);
 
-        let mut guard = self
-            .requests
-            .lock();
+        let mut guard = self.requests.lock();
         let (requests, last_sweep) = &mut *guard;
 
         // Periodic sweep: remove IPs with no recent requests
@@ -143,9 +141,7 @@ impl IdempotencyStore {
     /// Returns true if this key is new and is now recorded.
     fn record_if_new(&self, key: &str) -> bool {
         let now = Instant::now();
-        let mut keys = self
-            .keys
-            .lock();
+        let mut keys = self.keys.lock();
 
         keys.retain(|_, seen_at| now.duration_since(*seen_at) < self.ttl);
 
@@ -784,17 +780,13 @@ mod tests {
         assert!(limiter.allow("ip-3"));
 
         {
-            let guard = limiter
-                .requests
-                .lock();
+            let guard = limiter.requests.lock();
             assert_eq!(guard.0.len(), 3);
         }
 
         // Force a sweep by backdating last_sweep
         {
-            let mut guard = limiter
-                .requests
-                .lock();
+            let mut guard = limiter.requests.lock();
             guard.1 = Instant::now() - Duration::from_secs(RATE_LIMITER_SWEEP_INTERVAL_SECS + 1);
             // Clear timestamps for ip-2 and ip-3 to simulate stale entries
             guard.0.get_mut("ip-2").unwrap().clear();
@@ -805,9 +797,7 @@ mod tests {
         assert!(limiter.allow("ip-1"));
 
         {
-            let guard = limiter
-                .requests
-                .lock();
+            let guard = limiter.requests.lock();
             assert_eq!(guard.0.len(), 1, "Stale entries should have been swept");
             assert!(guard.0.contains_key("ip-1"));
         }
@@ -935,9 +925,7 @@ mod tests {
             _content: &str,
             _category: MemoryCategory,
         ) -> anyhow::Result<()> {
-            self.keys
-                .lock()
-                .push(key.to_string());
+            self.keys.lock().push(key.to_string());
             Ok(())
         }
 
@@ -961,10 +949,7 @@ mod tests {
         }
 
         async fn count(&self) -> anyhow::Result<usize> {
-            let size = self
-                .keys
-                .lock()
-                .len();
+            let size = self.keys.lock().len();
             Ok(size)
         }
 
@@ -1059,10 +1044,7 @@ mod tests {
             .into_response();
         assert_eq!(second.status(), StatusCode::OK);
 
-        let keys = tracking_impl
-            .keys
-            .lock()
-            .clone();
+        let keys = tracking_impl.keys.lock().clone();
         assert_eq!(keys.len(), 2);
         assert_ne!(keys[0], keys[1]);
         assert!(keys[0].starts_with("webhook_msg_"));
