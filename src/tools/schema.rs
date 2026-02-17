@@ -1,24 +1,17 @@
-//! JSON Schema cleaning and validation for LLM tool calling compatibility.
+//! JSON Schema cleaning and validation for LLM tool-calling compatibility.
 //!
-//! Different LLM providers support different subsets of JSON Schema. This module
-//! normalizes tool schemas to maximize compatibility across providers (Gemini,
-//! Anthropic, OpenAI) while preserving semantic meaning.
+//! Different providers support different subsets of JSON Schema. This module
+//! normalizes tool schemas to improve cross-provider compatibility while
+//! preserving semantic intent.
 //!
-//! # Why Schema Cleaning?
+//! ## What this module does
 //!
-//! LLM providers reject schemas with unsupported keywords, causing tool calls to fail:
-//! - **Gemini**: Rejects `$ref`, `additionalProperties`, `minLength`, `pattern`, etc.
-//! - **Anthropic**: Generally permissive but doesn't support `$ref` resolution
-//! - **OpenAI**: Supports most keywords but has quirks with `anyOf`/`oneOf`
-//!
-//! # What This Module Does
-//!
-//! 1. **Removes unsupported keywords** - Strips provider-specific incompatible fields
-//! 2. **Resolves `$ref`** - Inlines referenced schemas from `$defs`/`definitions`
-//! 3. **Flattens unions** - Converts `anyOf`/`oneOf` with literals to `enum`
-//! 4. **Strips null variants** - Removes `type: null` from unions (most providers don't need it)
-//! 5. **Normalizes types** - Converts `const` to `enum`, handles type arrays
-//! 6. **Prevents cycles** - Detects and breaks circular `$ref` chains
+//! 1. Removes unsupported keywords per provider strategy
+//! 2. Resolves local `$ref` entries from `$defs` and `definitions`
+//! 3. Flattens literal `anyOf` / `oneOf` unions into `enum`
+//! 4. Strips nullable variants from unions and `type` arrays
+//! 5. Converts `const` to single-value `enum`
+//! 6. Detects circular references and stops recursion safely
 //!
 //! # Example
 //!
@@ -31,17 +24,17 @@
 //!     "properties": {
 //!         "name": {
 //!             "type": "string",
-//!             "minLength": 1,  // ← Gemini rejects this
-//!             "pattern": "^[a-z]+$"  // ← Gemini rejects this
+//!             "minLength": 1,  // Gemini rejects this
+//!             "pattern": "^[a-z]+$"  // Gemini rejects this
 //!         },
 //!         "age": {
-//!             "$ref": "#/$defs/Age"  // ← Needs resolution
+//!             "$ref": "#/$defs/Age"  // Needs resolution
 //!         }
 //!     },
 //!     "$defs": {
 //!         "Age": {
 //!             "type": "integer",
-//!             "minimum": 0  // ← Gemini rejects this
+//!             "minimum": 0  // Gemini rejects this
 //!         }
 //!     }
 //! });
@@ -58,29 +51,10 @@
 //! // }
 //! ```
 //!
-//! # Design Philosophy (vs OpenClaw)
-//!
-//! **OpenClaw** (TypeScript):
-//! - Focuses primarily on Gemini compatibility
-//! - Uses recursive object traversal with mutation
-//! - ~350 lines of complex nested logic
-//!
-//! **Zeroclaw** (this module):
-//! - ✅ **Multi-provider support** - Configurable for different LLMs
-//! - ✅ **Immutable by default** - Creates new schemas, preserves originals
-//! - ✅ **Performance** - Uses efficient Rust patterns (Cow, match)
-//! - ✅ **Safety** - No runtime panics, comprehensive error handling
-//! - ✅ **Extensible** - Easy to add new cleaning strategies
-
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 
-/// Keywords that Gemini's Cloud Code Assist API rejects.
-///
-/// Based on real-world testing, Gemini rejects schemas with these keywords,
-/// even though they're valid in JSON Schema draft 2020-12.
-///
-/// Reference: OpenClaw `clean-for-gemini.ts`
+/// Keywords that Gemini rejects for tool schemas.
 pub const GEMINI_UNSUPPORTED_KEYWORDS: &[&str] = &[
     // Schema composition
     "$ref",
@@ -88,33 +62,27 @@ pub const GEMINI_UNSUPPORTED_KEYWORDS: &[&str] = &[
     "$id",
     "$defs",
     "definitions",
-
     // Property constraints
     "additionalProperties",
     "patternProperties",
-
     // String constraints
     "minLength",
     "maxLength",
     "pattern",
     "format",
-
     // Number constraints
     "minimum",
     "maximum",
     "multipleOf",
-
     // Array constraints
     "minItems",
     "maxItems",
     "uniqueItems",
-
     // Object constraints
     "minProperties",
     "maxProperties",
-
     // Non-standard
-    "examples",  // OpenAPI keyword, not JSON Schema
+    "examples", // OpenAPI keyword, not JSON Schema
 ];
 
 /// Keywords that should be preserved during cleaning (metadata).
@@ -139,7 +107,7 @@ impl CleaningStrategy {
         match self {
             Self::Gemini => GEMINI_UNSUPPORTED_KEYWORDS,
             Self::Anthropic => &["$ref", "$defs", "definitions"], // Anthropic doesn't resolve refs
-            Self::OpenAI => &[], // OpenAI is most permissive
+            Self::OpenAI => &[],                                  // OpenAI is most permissive
             Self::Conservative => &["$ref", "$defs", "definitions", "additionalProperties"],
         }
     }
@@ -202,9 +170,9 @@ impl SchemaCleanr {
         Ok(())
     }
 
-    // ────────────────────────────────────────────────────────────────────
+    // --------------------------------------------------------------------
     // Internal implementation
-    // ────────────────────────────────────────────────────────────────────
+    // --------------------------------------------------------------------
 
     /// Extract $defs and definitions into a flat map for reference resolution.
     fn extract_defs(obj: &Map<String, Value>) -> HashMap<String, Value> {
@@ -236,9 +204,11 @@ impl SchemaCleanr {
     ) -> Value {
         match schema {
             Value::Object(obj) => Self::clean_object(obj, defs, strategy, ref_stack),
-            Value::Array(arr) => {
-                Value::Array(arr.into_iter().map(|v| Self::clean_with_defs(v, defs, strategy, ref_stack)).collect())
-            }
+            Value::Array(arr) => Value::Array(
+                arr.into_iter()
+                    .map(|v| Self::clean_with_defs(v, defs, strategy, ref_stack))
+                    .collect(),
+            ),
             other => other,
         }
     }
@@ -265,6 +235,7 @@ impl SchemaCleanr {
         // Build cleaned object
         let mut cleaned = Map::new();
         let unsupported: HashSet<&str> = strategy.unsupported_keywords().iter().copied().collect();
+        let has_union = obj.contains_key("anyOf") || obj.contains_key("oneOf");
 
         for (key, value) in obj {
             // Skip unsupported keywords
@@ -279,7 +250,7 @@ impl SchemaCleanr {
                     cleaned.insert("enum".to_string(), json!([value]));
                 }
                 // Skip type if we have anyOf/oneOf (they define the type)
-                "type" if cleaned.contains_key("anyOf") || cleaned.contains_key("oneOf") => {
+                "type" if has_union => {
                     // Skip
                 }
                 // Handle type arrays (remove null)
@@ -300,9 +271,15 @@ impl SchemaCleanr {
                     let cleaned_value = Self::clean_union(value, defs, strategy, ref_stack);
                     cleaned.insert(key, cleaned_value);
                 }
-                // Keep all other keys as-is
+                // Keep all other keys, cleaning nested objects/arrays recursively.
                 _ => {
-                    cleaned.insert(key, value);
+                    let cleaned_value = match value {
+                        Value::Object(_) | Value::Array(_) => {
+                            Self::clean_with_defs(value, defs, strategy, ref_stack)
+                        }
+                        other => other,
+                    };
+                    cleaned.insert(key, cleaned_value);
                 }
             }
         }
@@ -326,7 +303,7 @@ impl SchemaCleanr {
 
         // Try to resolve local ref (#/$defs/Name or #/definitions/Name)
         if let Some(def_name) = Self::parse_local_ref(ref_value) {
-            if let Some(definition) = defs.get(def_name) {
+            if let Some(definition) = defs.get(def_name.as_str()) {
                 ref_stack.insert(ref_value.to_string());
                 let cleaned = Self::clean_with_defs(definition.clone(), defs, strategy, ref_stack);
                 ref_stack.remove(ref_value);
@@ -340,18 +317,41 @@ impl SchemaCleanr {
     }
 
     /// Parse a local JSON Pointer ref (#/$defs/Name).
-    fn parse_local_ref(ref_value: &str) -> Option<&str> {
+    fn parse_local_ref(ref_value: &str) -> Option<String> {
         ref_value
             .strip_prefix("#/$defs/")
             .or_else(|| ref_value.strip_prefix("#/definitions/"))
             .map(Self::decode_json_pointer)
     }
 
-    /// Decode JSON Pointer escaping (~0 = ~, ~1 = /).
-    fn decode_json_pointer(segment: &str) -> &str {
-        // Simplified: in practice, most definition names don't need decoding
-        // Full implementation would use a Cow<str> to handle ~0/~1 escaping
-        segment
+    /// Decode JSON Pointer escaping (`~0` = `~`, `~1` = `/`).
+    fn decode_json_pointer(segment: &str) -> String {
+        if !segment.contains('~') {
+            return segment.to_string();
+        }
+
+        let mut decoded = String::with_capacity(segment.len());
+        let mut chars = segment.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            if ch == '~' {
+                match chars.peek().copied() {
+                    Some('0') => {
+                        chars.next();
+                        decoded.push('~');
+                    }
+                    Some('1') => {
+                        chars.next();
+                        decoded.push('/');
+                    }
+                    _ => decoded.push('~'),
+                }
+            } else {
+                decoded.push(ch);
+            }
+        }
+
+        decoded
     }
 
     /// Try to simplify anyOf/oneOf to a simpler form.
@@ -421,7 +421,7 @@ impl SchemaCleanr {
 
     /// Try to flatten anyOf/oneOf with only literal values to enum.
     ///
-    /// Example: `anyOf: [{const: "a"}, {const: "b"}]` → `{type: "string", enum: ["a", "b"]}`
+    /// Example: `anyOf: [{const: "a"}, {const: "b"}]` -> `{type: "string", enum: ["a", "b"]}`
     fn try_flatten_literal_union(variants: &[Value]) -> Option<Value> {
         if variants.is_empty() {
             return None;
@@ -473,10 +473,13 @@ impl SchemaCleanr {
                 .filter(|v| v.as_str() != Some("null"))
                 .collect();
 
-            if non_null.len() == 1 {
-                non_null[0].clone()
-            } else {
-                Value::Array(non_null)
+            match non_null.len() {
+                0 => Value::String("null".to_string()),
+                1 => non_null
+                    .into_iter()
+                    .next()
+                    .unwrap_or(Value::String("null".to_string())),
+                _ => Value::Array(non_null),
             }
         } else {
             value
@@ -740,8 +743,12 @@ mod tests {
 
         let cleaned = SchemaCleanr::clean_for_gemini(schema);
 
-        assert!(cleaned["properties"]["user"]["properties"]["name"].get("minLength").is_none());
-        assert!(cleaned["properties"]["user"].get("additionalProperties").is_none());
+        assert!(cleaned["properties"]["user"]["properties"]["name"]
+            .get("minLength")
+            .is_none());
+        assert!(cleaned["properties"]["user"]
+            .get("additionalProperties")
+            .is_none());
     }
 
     #[test]
@@ -754,5 +761,78 @@ mod tests {
 
         // Should simplify to just "string"
         assert_eq!(cleaned["type"], "string");
+    }
+
+    #[test]
+    fn test_type_array_only_null_preserved() {
+        let schema = json!({
+            "type": ["null"]
+        });
+
+        let cleaned = SchemaCleanr::clean_for_gemini(schema);
+
+        assert_eq!(cleaned["type"], "null");
+    }
+
+    #[test]
+    fn test_ref_with_json_pointer_escape() {
+        let schema = json!({
+            "$ref": "#/$defs/Foo~1Bar",
+            "$defs": {
+                "Foo/Bar": {
+                    "type": "string"
+                }
+            }
+        });
+
+        let cleaned = SchemaCleanr::clean_for_gemini(schema);
+
+        assert_eq!(cleaned["type"], "string");
+    }
+
+    #[test]
+    fn test_skip_type_when_non_simplifiable_union_exists() {
+        let schema = json!({
+            "type": "object",
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "a": { "type": "string" }
+                    }
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "b": { "type": "number" }
+                    }
+                }
+            ]
+        });
+
+        let cleaned = SchemaCleanr::clean_for_gemini(schema);
+
+        assert!(cleaned.get("type").is_none());
+        assert!(cleaned.get("oneOf").is_some());
+    }
+
+    #[test]
+    fn test_clean_nested_unknown_schema_keyword() {
+        let schema = json!({
+            "not": {
+                "$ref": "#/$defs/Age"
+            },
+            "$defs": {
+                "Age": {
+                    "type": "integer",
+                    "minimum": 0
+                }
+            }
+        });
+
+        let cleaned = SchemaCleanr::clean_for_gemini(schema);
+
+        assert_eq!(cleaned["not"]["type"], "integer");
+        assert!(cleaned["not"].get("minimum").is_none());
     }
 }
