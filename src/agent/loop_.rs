@@ -1399,8 +1399,8 @@ mod tests {
     use crate::providers::Provider;
     use crate::tools::{Tool, ToolResult};
     use async_trait::async_trait;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     #[test]
@@ -1974,20 +1974,16 @@ Done."#;
                 .iter()
                 .any(|m| m.role == "user" && m.content.contains("[Tool parser error]"))
             {
-                return Ok(
-                    r#"<tool_call>
+                return Ok(r#"<tool_call>
 {"name":"shell","arguments":{"command":"echo fixed"}}
 </tool_call>"#
-                        .to_string(),
-                );
+                    .to_string());
             }
 
-            Ok(
-                r#"<tool_call>
+            Ok(r#"<tool_call>
 {"name":"shell","arguments":{"command":"echo "$rss $name ($pid)""}}
 </tool_call>"#
-                    .to_string(),
-            )
+                .to_string())
         }
     }
 
@@ -2036,7 +2032,10 @@ Done."#;
             runs: Arc::clone(&runs),
         })];
 
-        let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("check memory")];
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("check memory"),
+        ];
 
         let response = run_tool_call_loop(
             &MalformedThenValidToolProvider,
