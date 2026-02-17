@@ -170,6 +170,11 @@ if baseline:
 
 for line in other_lines:
     print(line)
+
+if any(line.strip() for line in other_lines):
+    print("markdownlint exited non-zero with unclassified output; failing safe.")
+    sys.exit(2)
+
 print("No blocking markdown issues on changed lines.")
 PY
 SCRIPT_EXIT=$?
