@@ -3,9 +3,19 @@ name: PR Labeler
 on:
     pull_request_target:
         types: [opened, reopened, synchronize, edited, labeled, unlabeled]
+    workflow_dispatch:
+        inputs:
+            mode:
+                description: "Run mode for managed-label governance"
+                required: true
+                default: "audit"
+                type: choice
+                options:
+                    - audit
+                    - repair
 
 concurrency:
-    group: pr-labeler-${{ github.event.pull_request.number }}
+    group: pr-labeler-${{ github.event.pull_request.number || github.run_id }}
     cancel-in-progress: true
 
 permissions:
@@ -19,6 +29,7 @@ jobs:
         timeout-minutes: 10
         steps:
             - name: Apply path labels
+              if: github.event_name == 'pull_request_target'
               uses: actions/labeler@8558fd74291d67161a8a78ce36a881fa63b766a9 # v5
               continue-on-error: true
               with:
@@ -495,6 +506,80 @@ jobs:
                       function selectContributorTier(mergedCount) {
                         const matchedTier = contributorTierRules.find((rule) => mergedCount >= rule.minMergedPRs);
                         return matchedTier ? matchedTier.label : null;
+                      }
+
+                      if (context.eventName === "workflow_dispatch") {
+                        const mode = (context.payload.inputs?.mode || "audit").toLowerCase();
+                        const shouldRepair = mode === "repair";
+                        const repoLabels = await github.paginate(github.rest.issues.listLabelsForRepo, {
+                          owner,
+                          repo,
+                          per_page: 100,
+                        });
+
+                        let managedScanned = 0;
+                        const drifts = [];
+
+                        for (const existingLabel of repoLabels) {
+                          const labelName = existingLabel.name || "";
+                          if (!isManagedLabel(labelName)) continue;
+                          managedScanned += 1;
+
+                          const expectedColor = colorForLabel(labelName);
+                          const expectedDescription = descriptionForLabel(labelName);
+                          const currentColor = (existingLabel.color || "").toUpperCase();
+                          const currentDescription = (existingLabel.description || "").trim();
+                          if (currentColor !== expectedColor || currentDescription !== expectedDescription) {
+                            drifts.push({
+                              name: labelName,
+                              currentColor,
+                              expectedColor,
+                              currentDescription,
+                              expectedDescription,
+                            });
+                            if (shouldRepair) {
+                              await ensureLabel(labelName, existingLabel);
+                            }
+                          }
+                        }
+
+                        core.summary
+                          .addHeading("Managed Label Governance", 2)
+                          .addRaw(`Mode: ${shouldRepair ? "repair" : "audit"}`)
+                          .addEOL()
+                          .addRaw(`Managed labels scanned: ${managedScanned}`)
+                          .addEOL()
+                          .addRaw(`Drifts found: ${drifts.length}`)
+                          .addEOL();
+
+                        if (drifts.length > 0) {
+                          const sample = drifts.slice(0, 30).map((entry) => [
+                            entry.name,
+                            `${entry.currentColor} -> ${entry.expectedColor}`,
+                            `${entry.currentDescription || "(blank)"} -> ${entry.expectedDescription}`,
+                          ]);
+                          core.summary.addTable([
+                            [{ data: "Label", header: true }, { data: "Color", header: true }, { data: "Description", header: true }],
+                            ...sample,
+                          ]);
+                          if (drifts.length > sample.length) {
+                            core.summary
+                              .addRaw(`Additional drifts not shown: ${drifts.length - sample.length}`)
+                              .addEOL();
+                          }
+                        }
+
+                        await core.summary.write();
+
+                        if (!shouldRepair && drifts.length > 0) {
+                          core.info(`Managed-label metadata drifts detected: ${drifts.length}. Re-run with mode=repair to auto-fix.`);
+                        } else if (shouldRepair) {
+                          core.info(`Managed-label metadata repair applied to ${drifts.length} labels.`);
+                        } else {
+                          core.info("No managed-label metadata drift detected.");
+                        }
+
+                        return;
                       }
 
                       const files = await github.paginate(github.rest.pulls.listFiles, {

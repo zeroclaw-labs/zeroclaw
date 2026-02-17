@@ -26,7 +26,7 @@ jobs:
           # Fetch all contributors (excluding bots)
           gh api \
             --paginate \
-            repos/${{ github.repository }}/contributors \
+            "repos/${{ github.repository }}/contributors" \
             --jq '.[] | select(.type != "Bot") | .login' > /tmp/contributors_raw.txt
 
           # Sort alphabetically and filter
@@ -34,7 +34,7 @@ jobs:
 
           # Count contributors
           count=$(wc -l < contributors.txt | tr -d ' ')
-          echo "count=$count" >> $GITHUB_OUTPUT
+          echo "count=$count" >> "$GITHUB_OUTPUT"
 
       - name: Generate new NOTICE file
         run: |
@@ -71,9 +71,9 @@ jobs:
         id: check_diff
         run: |
           if git diff --quiet NOTICE; then
-            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "changed=false" >> "$GITHUB_OUTPUT"
           else
-            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Create Pull Request
@@ -101,12 +101,12 @@ jobs:
 
       - name: Summary
         run: |
-          echo "## NOTICE Update Results" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## NOTICE Update Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
           if [ "${{ steps.check_diff.outputs.changed }}" = "true" ]; then
-            echo "✅ PR created to update NOTICE" >> $GITHUB_STEP_SUMMARY
+            echo "✅ PR created to update NOTICE" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "✓ NOTICE file is up to date" >> $GITHUB_STEP_SUMMARY
+            echo "✓ NOTICE file is up to date" >> "$GITHUB_STEP_SUMMARY"
           fi
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Contributors:** ${{ steps.contributors.outputs.count }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Contributors:** ${{ steps.contributors.outputs.count }}" >> "$GITHUB_STEP_SUMMARY"
