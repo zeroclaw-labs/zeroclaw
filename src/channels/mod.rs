@@ -484,6 +484,16 @@ pub fn build_system_prompt(
         std::env::consts::OS,
     );
 
+    // ── 8. Channel Capabilities ─────────────────────────────────────
+    prompt.push_str("## Channel Capabilities\n\n");
+    prompt.push_str(
+        "- You are running as a Discord bot. You CAN and do send messages to Discord channels.\n",
+    );
+    prompt.push_str("- When someone messages you on Discord, your response is automatically sent back to Discord.\n");
+    prompt.push_str("- You do NOT need to ask permission to respond — just respond directly.\n");
+    prompt.push_str("- NEVER repeat, describe, or echo credentials, tokens, API keys, or secrets in your responses.\n");
+    prompt.push_str("- If a tool output contains credentials, they have already been redacted — do not mention them.\n\n");
+
     if prompt.is_empty() {
         "You are ZeroClaw, a fast and efficient AI assistant built in Rust. Be helpful, concise, and direct.".to_string()
     } else {
@@ -1567,6 +1577,25 @@ mod tests {
         let truncated = result.unwrap();
         assert!(!truncated.is_empty());
         assert!(truncated.is_char_boundary(truncated.len()));
+    }
+
+    #[test]
+    fn prompt_contains_channel_capabilities() {
+        let ws = make_workspace();
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
+
+        assert!(
+            prompt.contains("## Channel Capabilities"),
+            "missing Channel Capabilities section"
+        );
+        assert!(
+            prompt.contains("running as a Discord bot"),
+            "missing Discord context"
+        );
+        assert!(
+            prompt.contains("NEVER repeat, describe, or echo credentials"),
+            "missing security instruction"
+        );
     }
 
     #[test]
