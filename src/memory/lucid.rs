@@ -2,9 +2,9 @@ use super::sqlite::SqliteMemory;
 use super::traits::{Memory, MemoryCategory, MemoryEntry};
 use async_trait::async_trait;
 use chrono::Local;
-use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -116,7 +116,9 @@ impl LucidMemory {
     }
 
     fn in_failure_cooldown(&self) -> bool {
-        let guard = self.last_failure_at.lock();
+        let Ok(guard) = self.last_failure_at.lock() else {
+            return false;
+        };
 
         guard
             .as_ref()
@@ -124,11 +126,15 @@ impl LucidMemory {
     }
 
     fn mark_failure_now(&self) {
-        *self.last_failure_at.lock() = Some(Instant::now());
+        if let Ok(mut guard) = self.last_failure_at.lock() {
+            *guard = Some(Instant::now());
+        }
     }
 
     fn clear_failure(&self) {
-        *self.last_failure_at.lock() = None;
+        if let Ok(mut guard) = self.last_failure_at.lock() {
+            *guard = None;
+        }
     }
 
     fn to_lucid_type(category: &MemoryCategory) -> &'static str {
