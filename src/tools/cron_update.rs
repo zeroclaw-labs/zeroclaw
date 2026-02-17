@@ -47,6 +47,30 @@ impl Tool for CronUpdateTool {
             });
         }
 
+        if !self.security.can_act() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Blocked by security policy: autonomy is read-only".to_string()),
+            });
+        }
+
+        if self.security.is_rate_limited() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Blocked by security policy: rate limit exceeded".to_string()),
+            });
+        }
+
+        if !self.security.record_action() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Blocked by security policy: action budget exhausted".to_string()),
+            });
+        }
+
         let job_id = match args.get("job_id").and_then(serde_json::Value::as_str) {
             Some(v) if !v.trim().is_empty() => v,
             _ => {

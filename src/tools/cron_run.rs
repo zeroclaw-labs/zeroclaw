@@ -1,6 +1,7 @@
 use super::traits::{Tool, ToolResult};
 use crate::config::Config;
 use crate::cron;
+use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::json;
@@ -8,11 +9,12 @@ use std::sync::Arc;
 
 pub struct CronRunTool {
     config: Arc<Config>,
+    security: Arc<SecurityPolicy>,
 }
 
 impl CronRunTool {
-    pub fn new(config: Arc<Config>) -> Self {
-        Self { config }
+    pub fn new(config: Arc<Config>, security: Arc<SecurityPolicy>) -> Self {
+        Self { config, security }
     }
 }
 
@@ -42,6 +44,30 @@ impl Tool for CronRunTool {
                 success: false,
                 output: String::new(),
                 error: Some("cron is disabled by config (cron.enabled=false)".to_string()),
+            });
+        }
+
+        if !self.security.can_act() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Blocked by security policy: autonomy is read-only".to_string()),
+            });
+        }
+
+        if self.security.is_rate_limited() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Blocked by security policy: rate limit exceeded".to_string()),
+            });
+        }
+
+        if !self.security.record_action() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Blocked by security policy: action budget exhausted".to_string()),
             });
         }
 
@@ -105,6 +131,7 @@ impl Tool for CronRunTool {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::security::SecurityPolicy;
     use tempfile::TempDir;
 
     fn test_config(tmp: &TempDir) -> Arc<Config> {
@@ -117,12 +144,19 @@ mod tests {
         Arc::new(config)
     }
 
+    fn test_security(cfg: &Config) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy::from_config(
+            &cfg.autonomy,
+            &cfg.workspace_dir,
+        ))
+    }
+
     #[tokio::test]
     async fn force_runs_job_and_records_history() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
         let job = cron::add_job(&cfg, "*/5 * * * *", "echo run-now").unwrap();
-        let tool = CronRunTool::new(cfg.clone());
+        let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
 
         let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
         assert!(result.success, "{:?}", result.error);
@@ -135,7 +169,7 @@ mod tests {
     async fn errors_for_missing_job() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
-        let tool = CronRunTool::new(cfg);
+        let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
 
         let result = tool
             .execute(json!({ "job_id": "missing-job-id" }))
@@ -143,5 +177,29 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn blocks_readonly_mode() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let cfg = Arc::new(config);
+        let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool
+            .execute(json!({ "job_id": "any" }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("read-only"));
     }
 }

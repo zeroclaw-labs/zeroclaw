@@ -57,6 +57,30 @@ impl Tool for CronAddTool {
             });
         }
 
+        if !self.security.can_act() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Blocked by security policy: autonomy is read-only".to_string()),
+            });
+        }
+
+        if self.security.is_rate_limited() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Blocked by security policy: rate limit exceeded".to_string()),
+            });
+        }
+
+        if !self.security.record_action() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Blocked by security policy: action budget exhausted".to_string()),
+            });
+        }
+
         let schedule = match args.get("schedule") {
             Some(v) => match serde_json::from_value::<Schedule>(v.clone()) {
                 Ok(schedule) => schedule,
@@ -322,5 +346,33 @@ mod tests {
             .error
             .unwrap_or_default()
             .contains("Missing 'prompt'"));
+    }
+
+    #[tokio::test]
+    async fn blocks_readonly_mode() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.autonomy.level = AutonomyLevel::ReadOnly;
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let cfg = Arc::new(config);
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
+                "job_type": "shell",
+                "command": "echo ok"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("read-only"));
     }
 }
