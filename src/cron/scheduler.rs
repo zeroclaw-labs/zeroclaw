@@ -60,7 +60,7 @@ async fn execute_job_with_retry(
     for attempt in 0..=retries {
         let (success, output) = match job.job_type {
             JobType::Shell => run_job_command(config, security, job).await,
-            JobType::Agent => run_agent_job(config, job).await,
+            JobType::Agent => run_agent_job(config, security, job).await,
         };
         last_output = output;
 
@@ -115,7 +115,31 @@ async fn execute_and_persist_job(
     (job.id.clone(), success)
 }
 
-async fn run_agent_job(config: &Config, job: &CronJob) -> (bool, String) {
+async fn run_agent_job(
+    config: &Config,
+    security: &SecurityPolicy,
+    job: &CronJob,
+) -> (bool, String) {
+    if !security.can_act() {
+        return (
+            false,
+            "blocked by security policy: autonomy is read-only".to_string(),
+        );
+    }
+
+    if security.is_rate_limited() {
+        return (
+            false,
+            "blocked by security policy: rate limit exceeded".to_string(),
+        );
+    }
+
+    if !security.record_action() {
+        return (
+            false,
+            "blocked by security policy: action budget exhausted".to_string(),
+        );
+    }
     let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
     let prompt = job.prompt.clone().unwrap_or_default();
     let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
@@ -640,13 +664,43 @@ mod tests {
         let mut job = test_job("");
         job.job_type = JobType::Agent;
         job.prompt = Some("Say hello".into());
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) = run_agent_job(&config, &job).await;
-        assert!(!success, "Agent job without provider key should fail");
-        assert!(
-            !output.is_empty(),
-            "Expected non-empty error output from failed agent job"
-        );
+        let (success, output) = run_agent_job(&config, &security, &job).await;
+        assert!(!success);
+        assert!(output.contains("agent job failed:"));
+    }
+
+    #[tokio::test]
+    async fn run_agent_job_blocks_readonly_mode() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("Say hello".into());
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_agent_job(&config, &security, &job).await;
+        assert!(!success);
+        assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("read-only"));
+    }
+
+    #[tokio::test]
+    async fn run_agent_job_blocks_rate_limited() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.autonomy.max_actions_per_hour = 0;
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("Say hello".into());
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_agent_job(&config, &security, &job).await;
+        assert!(!success);
+        assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("rate limit exceeded"));
     }
 
     #[tokio::test]
