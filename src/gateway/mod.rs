@@ -27,7 +27,8 @@ use axum::{
 };
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
@@ -77,8 +78,7 @@ impl SlidingWindowRateLimiter {
 
         let mut guard = self
             .requests
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock();
         let (requests, last_sweep) = &mut *guard;
 
         // Periodic sweep: remove IPs with no recent requests
@@ -145,8 +145,7 @@ impl IdempotencyStore {
         let now = Instant::now();
         let mut keys = self
             .keys
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock();
 
         keys.retain(|_, seen_at| now.duration_since(*seen_at) < self.ttl);
 
@@ -729,7 +728,6 @@ mod tests {
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
 
     #[test]
     fn security_body_limit_is_64kb() {
@@ -788,8 +786,7 @@ mod tests {
         {
             let guard = limiter
                 .requests
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .lock();
             assert_eq!(guard.0.len(), 3);
         }
 
@@ -797,8 +794,7 @@ mod tests {
         {
             let mut guard = limiter
                 .requests
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .lock();
             guard.1 = Instant::now() - Duration::from_secs(RATE_LIMITER_SWEEP_INTERVAL_SECS + 1);
             // Clear timestamps for ip-2 and ip-3 to simulate stale entries
             guard.0.get_mut("ip-2").unwrap().clear();
@@ -811,8 +807,7 @@ mod tests {
         {
             let guard = limiter
                 .requests
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .lock();
             assert_eq!(guard.0.len(), 1, "Stale entries should have been swept");
             assert!(guard.0.contains_key("ip-1"));
         }
@@ -942,7 +937,6 @@ mod tests {
         ) -> anyhow::Result<()> {
             self.keys
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(key.to_string());
             Ok(())
         }
@@ -970,7 +964,6 @@ mod tests {
             let size = self
                 .keys
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .len();
             Ok(size)
         }
@@ -1069,7 +1062,6 @@ mod tests {
         let keys = tracking_impl
             .keys
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         assert_eq!(keys.len(), 2);
         assert_ne!(keys[0], keys[1]);

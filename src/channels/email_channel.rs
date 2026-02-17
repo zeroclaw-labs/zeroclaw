@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io::Write as IoWrite;
 use std::net::TcpStream;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep};
@@ -412,10 +412,7 @@ impl Channel for EmailChannel {
                 Ok(Ok(messages)) => {
                     for (id, sender, content, ts) in messages {
                         {
-                            let mut seen = self
-                                .seen_messages
-                                .lock()
-                                .expect("seen_messages mutex should not be poisoned");
+                            let mut seen = self.seen_messages.lock();
                             if seen.contains(&id) {
                                 continue;
                             }
@@ -476,8 +473,7 @@ mod tests {
         let channel = EmailChannel::new(EmailConfig::default());
         let seen = channel
             .seen_messages
-            .lock()
-            .expect("seen_messages mutex should not be poisoned");
+            .lock();
         assert!(seen.is_empty());
     }
 
@@ -486,8 +482,7 @@ mod tests {
         let channel = EmailChannel::new(EmailConfig::default());
         let mut seen = channel
             .seen_messages
-            .lock()
-            .expect("seen_messages mutex should not be poisoned");
+            .lock();
 
         assert!(seen.insert("first-id".to_string()));
         assert!(!seen.insert("first-id".to_string()));
@@ -564,8 +559,7 @@ mod tests {
 
         let seen_guard = channel
             .seen_messages
-            .lock()
-            .expect("seen_messages mutex should not be poisoned");
+            .lock();
         assert_eq!(seen_guard.len(), 0);
     }
 

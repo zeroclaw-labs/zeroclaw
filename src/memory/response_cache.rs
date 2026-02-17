@@ -10,7 +10,7 @@ use chrono::{Duration, Local};
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 /// Response cache backed by a dedicated SQLite database.
 ///
@@ -79,8 +79,7 @@ impl ResponseCache {
     pub fn get(&self, key: &str) -> Result<Option<String>> {
         let conn = self
             .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock error: {e}"))?;
+            .lock();
 
         let now = Local::now();
         let cutoff = (now - Duration::minutes(self.ttl_minutes)).to_rfc3339();
@@ -110,8 +109,7 @@ impl ResponseCache {
     pub fn put(&self, key: &str, model: &str, response: &str, token_count: u32) -> Result<()> {
         let conn = self
             .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock error: {e}"))?;
+            .lock();
 
         let now = Local::now().to_rfc3339();
 
@@ -148,8 +146,7 @@ impl ResponseCache {
     pub fn stats(&self) -> Result<(usize, u64, u64)> {
         let conn = self
             .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock error: {e}"))?;
+            .lock();
 
         let count: i64 =
             conn.query_row("SELECT COUNT(*) FROM response_cache", [], |row| row.get(0))?;
@@ -174,8 +171,7 @@ impl ResponseCache {
     pub fn clear(&self) -> Result<usize> {
         let conn = self
             .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock error: {e}"))?;
+            .lock();
 
         let affected = conn.execute("DELETE FROM response_cache", [])?;
         Ok(affected)
