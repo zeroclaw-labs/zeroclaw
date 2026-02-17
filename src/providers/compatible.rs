@@ -281,16 +281,12 @@ fn parse_sse_line(line: &str) -> StreamResult<Option<String>> {
 }
 
 /// Convert SSE byte stream to text chunks.
-async fn sse_bytes_to_chunks(
-    mut response: reqwest::Response,
+fn sse_bytes_to_chunks(
+    response: reqwest::Response,
     count_tokens: bool,
 ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
-    use tokio::io::AsyncBufReadExt;
-
-    let name = "stream".to_string();
-
     // Create a channel to send chunks
-    let (mut tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
+    let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
     tokio::spawn(async move {
         // Buffer for incomplete lines
@@ -341,10 +337,7 @@ async fn sse_bytes_to_chunks(
                                     return; // Receiver dropped
                                 }
                             }
-                            Ok(None) => {
-                                // Empty line or [DONE] sentinel - continue
-                                continue;
-                            }
+                            Ok(None) => {}
                             Err(e) => {
                                 let _ = tx.send(Err(e)).await;
                                 return;
@@ -365,10 +358,7 @@ async fn sse_bytes_to_chunks(
 
     // Convert channel receiver to stream
     stream::unfold(rx, |mut rx| async {
-        match rx.recv().await {
-            Some(chunk) => Some((chunk, rx)),
-            None => None,
-        }
+        rx.recv().await.map(|chunk| (chunk, rx))
     })
     .boxed()
 }
@@ -692,7 +682,7 @@ impl Provider for OpenAiCompatibleProvider {
         temperature: f64,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
-        let api_key = match self.api_key.as_ref() {
+        let credential = match self.credential.as_ref() {
             Some(key) => key.clone(),
             None => {
                 let provider_name = self.name.clone();
@@ -739,10 +729,10 @@ impl Provider for OpenAiCompatibleProvider {
             // Apply auth header
             req_builder = match &auth_header {
                 AuthStyle::Bearer => {
-                    req_builder.header("Authorization", format!("Bearer {}", api_key))
+                    req_builder.header("Authorization", format!("Bearer {}", credential))
                 }
-                AuthStyle::XApiKey => req_builder.header("x-api-key", &api_key),
-                AuthStyle::Custom(header) => req_builder.header(header, &api_key),
+                AuthStyle::XApiKey => req_builder.header("x-api-key", &credential),
+                AuthStyle::Custom(header) => req_builder.header(header, &credential),
             };
 
             // Set accept header for streaming
@@ -771,7 +761,7 @@ impl Provider for OpenAiCompatibleProvider {
             }
 
             // Convert to chunk stream and forward to channel
-            let mut chunk_stream = sse_bytes_to_chunks(response, options.count_tokens).await;
+            let mut chunk_stream = sse_bytes_to_chunks(response, options.count_tokens);
             while let Some(chunk) = chunk_stream.next().await {
                 if tx.send(chunk).await.is_err() {
                     break; // Receiver dropped
@@ -781,10 +771,7 @@ impl Provider for OpenAiCompatibleProvider {
 
         // Convert channel receiver to stream
         stream::unfold(rx, |mut rx| async move {
-            match rx.recv().await {
-                Some(chunk) => Some((chunk, rx)),
-                None => None,
-            }
+            rx.recv().await.map(|chunk| (chunk, rx))
         })
         .boxed()
     }
