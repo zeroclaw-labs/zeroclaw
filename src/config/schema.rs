@@ -1729,6 +1729,23 @@ impl Config {
         fs::create_dir_all(&workspace_dir).context("Failed to create workspace directory")?;
 
         if config_path.exists() {
+            // Warn if config file is world-readable (may contain API keys)
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = fs::metadata(&config_path) {
+                    if meta.permissions().mode() & 0o004 != 0 {
+                        tracing::warn!(
+                            "Config file {:?} is world-readable (mode {:o}). \
+                             Consider restricting with: chmod 600 {:?}",
+                            config_path,
+                            meta.permissions().mode() & 0o777,
+                            config_path,
+                        );
+                    }
+                }
+            }
+
             let contents =
                 fs::read_to_string(&config_path).context("Failed to read config file")?;
             let mut config: Config =
@@ -1760,6 +1777,14 @@ impl Config {
             config.config_path = config_path.clone();
             config.workspace_dir = workspace_dir;
             config.save()?;
+
+            // Restrict permissions on newly created config file (may contain API keys)
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600));
+            }
+
             config.apply_env_overrides();
             Ok(config)
         }
@@ -3317,5 +3342,51 @@ default_model = "legacy-model"
         let json = r#"{"app_id":"cli_123","app_secret":"secret","allowed_users":["*"]}"#;
         let parsed: LarkConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.allowed_users, vec!["*"]);
+    }
+
+    // ── Config file permission hardening (Unix only) ───────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn new_config_file_has_restricted_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        // Create a config and save it
+        let mut config = Config::default();
+        config.config_path = config_path.clone();
+        config.save().unwrap();
+
+        // Apply the same permission logic as load_or_init
+        let _ = std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600));
+
+        let meta = std::fs::metadata(&config_path).unwrap();
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "New config file should be owner-only (0600), got {mode:o}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn world_readable_config_is_detectable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        // Create a config file with intentionally loose permissions
+        std::fs::write(&config_path, "# test config").unwrap();
+        std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let meta = std::fs::metadata(&config_path).unwrap();
+        let mode = meta.permissions().mode();
+        assert!(
+            mode & 0o004 != 0,
+            "Test setup: file should be world-readable (mode {mode:o})"
+        );
     }
 }
