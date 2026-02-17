@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.7
 
 # ── Stage 1: Build ────────────────────────────────────────────
 FROM rust:1.93-slim-trixie@sha256:9663b80a1621253d30b146454f903de48f0af925c967be48c84745537cd35d8b AS builder
@@ -6,27 +6,30 @@ FROM rust:1.93-slim-trixie@sha256:9663b80a1621253d30b146454f903de48f0af925c967be
 WORKDIR /app
 
 # Install build dependencies
-RUN apt-get update && apt-get install -y \
-    pkg-config \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y \
+        pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 # 1. Copy manifests to cache dependencies
 COPY Cargo.toml Cargo.lock ./
 # Create dummy main.rs to build dependencies
 RUN mkdir src && echo "fn main() {}" > src/main.rs
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
+RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
     cargo build --release --locked
 RUN rm -rf src
 
 # 2. Copy source code
 COPY . .
-# Touch main.rs to force rebuild
-RUN touch src/main.rs
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
+RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
     cargo build --release --locked && \
-    strip target/release/zeroclaw
+    cp target/release/zeroclaw /app/zeroclaw && \
+    strip /app/zeroclaw
 
 # ── Stage 2: Permissions & Config Prep ───────────────────────
 FROM busybox:1.37@sha256:b3255e7dfbcd10cb367af0d409747d511aeb66dfac98cf30e97e87e4207dd76f AS permissions
@@ -35,7 +38,7 @@ RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace
 
 # Create minimal config for PRODUCTION (allows binding to public interfaces)
 # NOTE: Provider configuration must be done via environment variables at runtime
-RUN cat > /zeroclaw-data/.zeroclaw/config.toml << 'EOF'
+RUN cat > /zeroclaw-data/.zeroclaw/config.toml <<EOF
 workspace_dir = "/zeroclaw-data/workspace"
 config_path = "/zeroclaw-data/.zeroclaw/config.toml"
 api_key = ""
@@ -65,7 +68,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=permissions /zeroclaw-data /zeroclaw-data
-COPY --from=builder /app/target/release/zeroclaw /usr/local/bin/zeroclaw
+COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
 
 # Overwrite minimal config with DEV template (Ollama defaults)
 COPY dev/config.template.toml /zeroclaw-data/.zeroclaw/config.toml
@@ -92,7 +95,7 @@ CMD ["gateway", "--port", "3000", "--host", "[::]"]
 # ── Stage 4: Production Runtime (Distroless) ─────────────────
 FROM gcr.io/distroless/cc-debian13:nonroot@sha256:84fcd3c223b144b0cb6edc5ecc75641819842a9679a3a58fd6294bec47532bf7 AS release
 
-COPY --from=builder /app/target/release/zeroclaw /usr/local/bin/zeroclaw
+COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
 COPY --from=permissions /zeroclaw-data /zeroclaw-data
 
 # Environment setup
