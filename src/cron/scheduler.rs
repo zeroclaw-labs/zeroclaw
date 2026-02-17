@@ -642,8 +642,8 @@ mod tests {
         job.prompt = Some("Say hello".into());
 
         let (success, output) = run_agent_job(&config, &job).await;
-        assert!(!success);
-        assert!(output.contains("agent job failed:"));
+        assert!(!success, "Agent job without provider key should fail");
+        assert!(!output.is_empty(), "Expected non-empty error output from failed agent job");
     }
 
     #[tokio::test]

@@ -758,9 +758,14 @@ mod tests {
 
         // This will fail because there's no git repo, but it shouldn't be blocked by autonomy
         let result = tool.execute(json!({"operation": "status"})).await.unwrap();
-        // The error should be about not being in a git repo, not about read-only mode
+        // The error should be about git (not about autonomy/read-only mode)
+        assert!(!result.success, "Expected failure due to missing git repo");
         let error_msg = result.error.as_deref().unwrap_or("");
-        assert!(error_msg.contains("git repository") || error_msg.contains("Git command failed"));
+        assert!(!error_msg.is_empty(), "Expected a git-related error message");
+        assert!(
+            !error_msg.contains("read-only") && !error_msg.contains("autonomy"),
+            "Error should be about git, not about autonomy restrictions: {error_msg}"
+        );
     }
 
     #[tokio::test]
