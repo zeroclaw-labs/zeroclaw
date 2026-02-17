@@ -239,6 +239,10 @@ Examples:
 
     /// Manage OS service lifecycle (launchd/systemd user service)
     Service {
+        /// Init system to use: auto (detect), systemd, or openrc
+        #[arg(long, default_value = "auto", value_parser = ["auto", "systemd", "openrc"])]
+        service_init: String,
+
         #[command(subcommand)]
         service_command: ServiceCommands,
     },
@@ -897,7 +901,13 @@ async fn main() -> Result<()> {
             Ok(())
         }
 
-        Commands::Service { service_command } => service::handle_command(&service_command, &config),
+        Commands::Service {
+            service_command,
+            service_init,
+        } => {
+            let init_system = service_init.parse()?;
+            service::handle_command(&service_command, &config, init_system)
+        }
 
         Commands::Doctor { doctor_command } => match doctor_command {
             Some(DoctorCommands::Models {

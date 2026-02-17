@@ -104,6 +104,9 @@ console = "0.16"
 # Hardware discovery (device path globbing)
 glob = "0.3"
 
+# Binary discovery (init system detection)
+which = "7.0"
+
 # WebSocket client channels (Discord/Lark/DingTalk)
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
@@ -162,6 +165,10 @@ wa-rs-tokio-transport = { version = "0.2", optional = true, default-features = f
 [target.'cfg(target_os = "linux")'.dependencies]
 rppal = { version = "0.22", optional = true }
 landlock = { version = "0.4", optional = true }
+
+# Unix-specific dependencies (for root check, etc.)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [features]
 default = ["hardware", "channel-matrix"]

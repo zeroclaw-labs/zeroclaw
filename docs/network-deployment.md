@@ -13,6 +13,7 @@ This document covers deploying ZeroClaw on a Raspberry Pi or other host on your 
 | **Discord/Slack** | No | Same — outbound only |
 | **Gateway webhook** | Yes | POST /webhook, WhatsApp, etc. need a public URL |
 | **Gateway pairing** | Yes | If you pair clients via the gateway |
+| **Alpine/OpenRC service** | No | System-wide background service on Alpine Linux |
 
 **Key:** Telegram, Discord, and Slack use **long-polling** — ZeroClaw makes outbound requests. No port forwarding or public IP required.
 
@@ -198,7 +199,111 @@ Configure Cloudflare Tunnel to forward to `127.0.0.1:3000`, then set your webhoo
 
 ---
 
-## 7. References
+## 7. OpenRC (Alpine Linux Service)
+
+ZeroClaw supports OpenRC for Alpine Linux and other distributions using the OpenRC init system. OpenRC services run **system-wide** and require root/sudo.
+
+### 7.1 Prerequisites
+
+- Alpine Linux (or another OpenRC-based distro)
+- Root or sudo access
+- A dedicated `zeroclaw` system user (created during install)
+
+### 7.2 Install Service
+
+```bash
+# Install the OpenRC init script (requires sudo)
+sudo zeroclaw service install --service-init=openrc
+```
+
+This creates:
+- Init script: `/etc/init.d/zeroclaw`
+- Config directory: `/etc/zeroclaw/`
+- Log directory: `/var/log/zeroclaw/`
+
+### 7.3 Configuration
+
+Place your ZeroClaw config at `/etc/zeroclaw/config.toml`:
+
+```bash
+# Copy or create system-wide config
+sudo mkdir -p /etc/zeroclaw
+sudo cp ~/.zeroclaw/config.toml /etc/zeroclaw/config.toml
+
+# Set recommended permissions (root-owned, mode 600 for secrets)
+sudo chown root:root /etc/zeroclaw/config.toml
+sudo chmod 600 /etc/zeroclaw/config.toml
+```
+
+### 7.4 Enable and Start
+
+```bash
+# Add to default runlevel
+sudo rc-update add zeroclaw default
+
+# Start the service
+sudo rc-service zeroclaw start
+
+# Check status
+sudo rc-service zeroclaw status
+```
+
+### 7.5 Manage Service
+
+| Command | Description |
+|---------|-------------|
+| `sudo rc-service zeroclaw start` | Start the daemon |
+| `sudo rc-service zeroclaw stop` | Stop the daemon |
+| `sudo rc-service zeroclaw status` | Check service status |
+| `sudo rc-service zeroclaw restart` | Restart the daemon |
+| `sudo zeroclaw service status --service-init=openrc` | ZeroClaw status wrapper |
+
+### 7.6 Logs
+
+OpenRC routes logs to:
+
+| Log | Path |
+|-----|------|
+| Access/stdout | `/var/log/zeroclaw/access.log` |
+| Errors/stderr | `/var/log/zeroclaw/error.log` |
+
+View logs:
+
+```bash
+sudo tail -f /var/log/zeroclaw/error.log
+```
+
+### 7.7 Uninstall
+
+```bash
+# Stop and remove from runlevel
+sudo rc-service zeroclaw stop
+sudo rc-update del zeroclaw default
+
+# Remove init script
+sudo zeroclaw service uninstall --service-init=openrc
+```
+
+### 7.8 Notes
+
+- OpenRC is **system-wide only** (no user-level services)
+- Requires `sudo` or root for all service operations
+- The service runs as the `zeroclaw:zeroclaw` user (least privilege)
+- Config must be at `/etc/zeroclaw/config.toml` (explicit path in init script)
+- If the `zeroclaw` user does not exist, install will fail with instructions to create it
+
+### 7.9 Checklist: Alpine/OpenRC Deployment
+
+- [ ] Install: `sudo zeroclaw service install --service-init=openrc`
+- [ ] Create config: `/etc/zeroclaw/config.toml` with permissions `600`
+- [ ] Enable: `sudo rc-update add zeroclaw default`
+- [ ] Start: `sudo rc-service zeroclaw start`
+- [ ] Verify: `sudo rc-service zeroclaw status`
+- [ ] Check logs: `/var/log/zeroclaw/error.log`
+
+---
+
+## 8. References
 
 - [channels-reference.md](./channels-reference.md) — Channel configuration overview
 - [matrix-e2ee-guide.md](./matrix-e2ee-guide.md) — Matrix setup and encrypted-room troubleshooting

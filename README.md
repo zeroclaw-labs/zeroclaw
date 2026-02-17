@@ -321,6 +321,8 @@ zeroclaw service install
 zeroclaw service status
 zeroclaw service restart
 
+# On Alpine (OpenRC): sudo zeroclaw service install --service-init=openrc
+
 # Migrate memory from OpenClaw (safe preview first)
 zeroclaw migrate openclaw --dry-run
 zeroclaw migrate openclaw
@@ -896,7 +898,7 @@ See [aieos.org](https://aieos.org) for the full schema and live examples.
 | `agent` | Interactive or single-message chat mode |
 | `gateway` | Start webhook server (default: `127.0.0.1:3000`) |
 | `daemon` | Start long-running autonomous runtime |
-| `service` | Manage user-level background service |
+| `service install/start/stop/status/uninstall` | Manage background service (systemd user-level or OpenRC system-wide) |
 | `doctor` | Diagnose daemon/scheduler/channel freshness |
 | `status` | Show full system status |
 | `cron` | Manage scheduled tasks (`list/add/add-at/add-every/once/remove/update/pause/resume`) |
@@ -911,6 +913,30 @@ See [aieos.org](https://aieos.org) for the full schema and live examples.
 | `peripheral` | Manage and flash hardware peripherals |
 
 For a task-oriented command guide, see [`docs/commands-reference.md`](docs/commands-reference.md).
+
+### Service Management
+
+ZeroClaw supports two init systems for background services:
+
+| Init System | Scope | Config Path | Requires |
+|------------|-------|-------------|----------|
+| **systemd** (default on Linux) | User-level | `~/.zeroclaw/config.toml` | No sudo |
+| **OpenRC** (Alpine) | System-wide | `/etc/zeroclaw/config.toml` | sudo/root |
+
+Use `--service-init` to select the init system:
+
+```bash
+# Linux with systemd (default, user-level)
+zeroclaw service install
+zeroclaw service start
+
+# Alpine with OpenRC (system-wide, requires sudo)
+sudo zeroclaw service install --service-init=openrc
+sudo rc-update add zeroclaw default
+sudo rc-service zeroclaw start
+```
+
+For full OpenRC setup instructions, see [docs/network-deployment.md](docs/network-deployment.md#7-openrc-alpine-linux-service).
 
 ### Open-Skills Opt-In
 

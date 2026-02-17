@@ -178,6 +178,11 @@ fn runtime_config_store() -> &'static Mutex<HashMap<PathBuf, RuntimeConfigState>
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+const SYSTEMD_STATUS_ARGS: [&str; 3] = ["--user", "is-active", "zeroclaw.service"];
+const SYSTEMD_RESTART_ARGS: [&str; 3] = ["--user", "restart", "zeroclaw.service"];
+const OPENRC_STATUS_ARGS: [&str; 2] = ["zeroclaw", "status"];
+const OPENRC_RESTART_ARGS: [&str; 2] = ["zeroclaw", "restart"];
+
 #[derive(Clone)]
 struct ChannelRuntimeContext {
     channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
@@ -1911,6 +1916,30 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
     }
 
     if cfg!(target_os = "linux") {
+        // OpenRC (system-wide) takes precedence over systemd (user-level)
+        let openrc_init_script = PathBuf::from("/etc/init.d/zeroclaw");
+        if openrc_init_script.exists() {
+            let status_output = Command::new("rc-service")
+                .args(OPENRC_STATUS_ARGS)
+                .output()
+                .context("Failed to query OpenRC service state")?;
+
+            // rc-service exits 0 if running, non-zero otherwise
+            if status_output.status.success() {
+                let restart_output = Command::new("rc-service")
+                    .args(OPENRC_RESTART_ARGS)
+                    .output()
+                    .context("Failed to restart OpenRC daemon service")?;
+                if !restart_output.status.success() {
+                    let stderr = String::from_utf8_lossy(&restart_output.stderr);
+                    anyhow::bail!("rc-service restart failed: {}", stderr.trim());
+                }
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+
+        // Systemd (user-level)
         let home = directories::UserDirs::new()
             .map(|u| u.home_dir().to_path_buf())
             .context("Could not find home directory")?;
@@ -1924,7 +1953,7 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
         }
 
         let active_output = Command::new("systemctl")
-            .args(["--user", "is-active", "zeroclaw.service"])
+            .args(SYSTEMD_STATUS_ARGS)
             .output()
             .context("Failed to query systemd service state")?;
         let state = String::from_utf8_lossy(&active_output.stdout);
@@ -1933,7 +1962,7 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
         }
 
         let restart_output = Command::new("systemctl")
-            .args(["--user", "restart", "zeroclaw.service"])
+            .args(SYSTEMD_RESTART_ARGS)
             .output()
             .context("Failed to restart systemd daemon service")?;
         if !restart_output.status.success() {
@@ -5200,5 +5229,23 @@ Mon Feb 20
         let join = tokio::time::timeout(Duration::from_secs(1), handle).await;
         assert!(join.is_ok(), "listener should stop after channel shutdown");
         assert!(calls.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn maybe_restart_daemon_systemd_args_regression() {
+        assert_eq!(
+            SYSTEMD_STATUS_ARGS,
+            ["--user", "is-active", "zeroclaw.service"]
+        );
+        assert_eq!(
+            SYSTEMD_RESTART_ARGS,
+            ["--user", "restart", "zeroclaw.service"]
+        );
+    }
+
+    #[test]
+    fn maybe_restart_daemon_openrc_args_regression() {
+        assert_eq!(OPENRC_STATUS_ARGS, ["zeroclaw", "status"]);
+        assert_eq!(OPENRC_RESTART_ARGS, ["zeroclaw", "restart"]);
     }
 }
