@@ -466,7 +466,8 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     // ```tool_call ... </tool_call> instead of structured API calls or XML tags.
     if calls.is_empty() {
         static MD_TOOL_CALL_RE: LazyLock<Regex> = LazyLock::new(|| {
-            Regex::new(r"(?s)```tool[_-]?call\s*\n(.*?)(?:```|</tool[_-]?call>|</toolcall>)").unwrap()
+            Regex::new(r"(?s)```tool[_-]?call\s*\n(.*?)(?:```|</tool[_-]?call>|</toolcall>)")
+                .unwrap()
         });
         let mut md_remaining = response;
         let mut md_text_parts: Vec<String> = Vec::new();
@@ -676,14 +677,17 @@ pub(crate) async fn run_tool_call_loop(
                         let assistant_history_content = if resp.tool_calls.is_empty() {
                             response_text.clone()
                         } else {
-                            build_native_assistant_history(
-                                &response_text,
-                                &resp.tool_calls,
-                            )
+                            build_native_assistant_history(&response_text, &resp.tool_calls)
                         };
 
                         let native_calls = resp.tool_calls;
-                        (response_text, parsed_text, calls, assistant_history_content, native_calls)
+                        (
+                            response_text,
+                            parsed_text,
+                            calls,
+                            assistant_history_content,
+                            native_calls,
+                        )
                     }
                     Err(e) => {
                         observer.record_event(&ObserverEvent::LlmResponse {
@@ -714,7 +718,13 @@ pub(crate) async fn run_tool_call_loop(
                         let response_text = resp;
                         let assistant_history_content = response_text.clone();
                         let (parsed_text, calls) = parse_tool_calls(&response_text);
-                        (response_text, parsed_text, calls, assistant_history_content, Vec::new())
+                        (
+                            response_text,
+                            parsed_text,
+                            calls,
+                            assistant_history_content,
+                            Vec::new(),
+                        )
                     }
                     Err(e) => {
                         observer.record_event(&ObserverEvent::LlmResponse {
