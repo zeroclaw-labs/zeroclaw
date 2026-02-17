@@ -101,12 +101,6 @@ impl OllamaProvider {
             temperature
         );
 
-        if tracing::enabled!(tracing::Level::TRACE) {
-            if let Ok(req_json) = serde_json::to_string(&request) {
-                tracing::trace!("Ollama request body: {}", req_json);
-            }
-        }
-
         let response = self.client.post(&url).json(&request).send().await?;
         let status = response.status();
         tracing::debug!("Ollama response status: {}", status);
@@ -114,21 +108,18 @@ impl OllamaProvider {
         let body = response.bytes().await?;
         tracing::debug!("Ollama response body length: {} bytes", body.len());
 
-        if tracing::enabled!(tracing::Level::TRACE) {
-            let raw = String::from_utf8_lossy(&body);
-            tracing::trace!(
-                "Ollama raw response: {}",
-                if raw.len() > 2000 { &raw[..2000] } else { &raw }
-            );
-        }
-
         if !status.is_success() {
             let raw = String::from_utf8_lossy(&body);
-            tracing::error!("Ollama error response: status={} body={}", status, raw);
+            let sanitized = super::sanitize_api_error(&raw);
+            tracing::error!(
+                "Ollama error response: status={} body_excerpt={}",
+                status,
+                sanitized
+            );
             anyhow::bail!(
                 "Ollama API error ({}): {}. Is Ollama running? (brew install ollama && ollama serve)",
                 status,
-                if raw.len() > 200 { &raw[..200] } else { &raw }
+                sanitized
             );
         }
 
@@ -136,9 +127,10 @@ impl OllamaProvider {
             Ok(r) => r,
             Err(e) => {
                 let raw = String::from_utf8_lossy(&body);
+                let sanitized = super::sanitize_api_error(&raw);
                 tracing::error!(
-                    "Ollama response deserialization failed: {e}. Raw body: {}",
-                    if raw.len() > 500 { &raw[..500] } else { &raw }
+                    "Ollama response deserialization failed: {e}. body_excerpt={}",
+                    sanitized
                 );
                 anyhow::bail!("Failed to parse Ollama response: {e}");
             }
@@ -148,7 +140,7 @@ impl OllamaProvider {
     }
 
     /// Convert Ollama tool calls to the JSON format expected by parse_tool_calls in loop_.rs
-    /// 
+    ///
     /// Handles quirky model behavior where tool calls are wrapped:
     /// - `{"name": "tool_call", "arguments": {"name": "shell", "arguments": {...}}}`
     /// - `{"name": "tool.shell", "arguments": {...}}`
@@ -157,11 +149,11 @@ impl OllamaProvider {
             .iter()
             .map(|tc| {
                 let (tool_name, tool_args) = self.extract_tool_name_and_args(tc);
-                
+
                 // Arguments must be a JSON string for parse_tool_calls compatibility
-                let args_str = serde_json::to_string(&tool_args)
-                    .unwrap_or_else(|_| "{}".to_string());
-                
+                let args_str =
+                    serde_json::to_string(&tool_args).unwrap_or_else(|_| "{}".to_string());
+
                 serde_json::json!({
                     "id": tc.id,
                     "type": "function",
@@ -189,13 +181,16 @@ impl OllamaProvider {
         // {"name": "tool_call", "arguments": {"name": "shell", "arguments": {"command": "date"}}}
         // {"name": "tool_call><json", "arguments": {"name": "shell", ...}}
         // {"name": "tool.call", "arguments": {"name": "shell", ...}}
-        if name == "tool_call" 
-            || name == "tool.call" 
+        if name == "tool_call"
+            || name == "tool.call"
             || name.starts_with("tool_call>")
             || name.starts_with("tool_call<")
         {
             if let Some(nested_name) = args.get("name").and_then(|v| v.as_str()) {
-                let nested_args = args.get("arguments").cloned().unwrap_or(serde_json::json!({}));
+                let nested_args = args
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or(serde_json::json!({}));
                 tracing::debug!(
                     "Unwrapped nested tool call: {} -> {} with args {:?}",
                     name,
@@ -252,7 +247,7 @@ impl Provider for OllamaProvider {
 
         // Plain text response
         let content = response.message.content;
-        
+
         // Handle edge case: model returned only "thinking" with no content or tool calls
         if content.is_empty() {
             if let Some(thinking) = &response.message.thinking {
@@ -298,7 +293,7 @@ impl Provider for OllamaProvider {
 
         // Plain text response
         let content = response.message.content;
-        
+
         // Handle edge case: model returned only "thinking" with no content or tool calls
         // This is a model quirk - it stopped after reasoning without producing output
         if content.is_empty() {
@@ -380,7 +375,8 @@ mod tests {
 
     #[test]
     fn response_with_thinking_field_extracts_content() {
-        let json = r#"{"message":{"role":"assistant","content":"hello","thinking":"internal reasoning"}}"#;
+        let json =
+            r#"{"message":{"role":"assistant","content":"hello","thinking":"internal reasoning"}}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.message.content, "hello");
     }

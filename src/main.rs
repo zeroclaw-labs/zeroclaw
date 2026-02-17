@@ -34,7 +34,7 @@
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use tracing::{info, Level};
+use tracing::info;
 use tracing_subscriber::{fmt, EnvFilter};
 
 mod agent;
