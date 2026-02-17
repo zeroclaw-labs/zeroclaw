@@ -1276,7 +1276,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
     // ── Tier selection ──
     let tiers = vec![
         "⭐ Recommended (OpenRouter, Venice, Anthropic, OpenAI, Gemini)",
-        "⚡ Fast inference (Groq, Fireworks, Together AI)",
+        "⚡ Fast inference (Groq, Fireworks, Together AI, NVIDIA NIM)",
         "🌐 Gateway / proxy (Vercel AI, Cloudflare AI, Amazon Bedrock)",
         "🔬 Specialized (Moonshot/Kimi, GLM/Zhipu, MiniMax, Qianfan, Z.AI, Synthetic, OpenCode Zen, Cohere)",
         "🏠 Local / private (Ollama — no API key needed)",
@@ -1311,6 +1311,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
             ("groq", "Groq — ultra-fast LPU inference"),
             ("fireworks", "Fireworks AI — fast open-source inference"),
             ("together-ai", "Together AI — open-source model hosting"),
+            ("nvidia", "NVIDIA NIM — DeepSeek, Llama, & more"),
         ],
         2 => vec![
             ("vercel", "Vercel AI Gateway"),
@@ -1452,6 +1453,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
             "minimax" => "https://www.minimaxi.com/user-center/basic-information",
             "vercel" => "https://vercel.com/account/tokens",
             "cloudflare" => "https://dash.cloudflare.com/profile/api-tokens",
+            "nvidia" | "nvidia-nim" | "build.nvidia.com" => "https://build.nvidia.com/",
             "bedrock" => "https://console.aws.amazon.com/iam",
             "gemini" => "https://aistudio.google.com/app/apikey",
             _ => "",
@@ -1572,6 +1574,12 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String)> {
                 "Llama 3.1 8B Turbo",
             ),
             ("mistralai/Mixtral-8x22B-Instruct-v0.1", "Mixtral 8x22B"),
+        ],
+        "nvidia" | "nvidia-nim" | "build.nvidia.com" => vec![
+            ("deepseek-ai/DeepSeek-R1", "DeepSeek R1 (reasoning)"),
+            ("meta/llama-3.1-70b-instruct", "Llama 3.1 70B Instruct"),
+            ("mistralai/Mistral-7B-Instruct-v0.3", "Mistral 7B Instruct"),
+            ("meta/llama-3.1-405b-instruct", "Llama 3.1 405B Instruct"),
         ],
         "cohere" => vec![
             ("command-r-plus", "Command R+ (flagship)"),
@@ -1796,6 +1804,7 @@ fn provider_env_var(name: &str) -> &'static str {
         "cloudflare" | "cloudflare-ai" => "CLOUDFLARE_API_KEY",
         "bedrock" | "aws-bedrock" => "AWS_ACCESS_KEY_ID",
         "gemini" => "GEMINI_API_KEY",
+        "nvidia" | "nvidia-nim" | "build.nvidia.com" => "NVIDIA_API_KEY",
         _ => "API_KEY",
     }
 }
@@ -4460,6 +4469,9 @@ mod tests {
         assert_eq!(provider_env_var("google"), "GEMINI_API_KEY"); // alias
         assert_eq!(provider_env_var("google-gemini"), "GEMINI_API_KEY"); // alias
         assert_eq!(provider_env_var("gemini"), "GEMINI_API_KEY");
+        assert_eq!(provider_env_var("nvidia"), "NVIDIA_API_KEY");
+        assert_eq!(provider_env_var("nvidia-nim"), "NVIDIA_API_KEY"); // alias
+        assert_eq!(provider_env_var("build.nvidia.com"), "NVIDIA_API_KEY"); // alias
     }
 
     #[test]
