@@ -1733,14 +1733,14 @@ fn default_config_and_workspace_dirs() -> Result<(PathBuf, PathBuf)> {
     Ok((config_dir.clone(), config_dir.join("workspace")))
 }
 
-const ACTIVE_WORKSPACE_STATE_FILE: &str = "active_workspace.toml";
+pub(crate) const ACTIVE_WORKSPACE_STATE_FILE: &str = "active_workspace.toml";
 
 #[derive(Debug, Serialize, Deserialize)]
-struct ActiveWorkspaceState {
-    config_dir: String,
+pub(crate) struct ActiveWorkspaceState {
+    pub(crate) config_dir: String,
 }
 
-fn default_config_dir() -> Result<PathBuf> {
+pub(crate) fn default_config_dir() -> Result<PathBuf> {
     let home = UserDirs::new()
         .map(|u| u.home_dir().to_path_buf())
         .context("Could not find home directory")?;
@@ -1751,50 +1751,41 @@ fn active_workspace_state_path(default_dir: &Path) -> PathBuf {
     default_dir.join(ACTIVE_WORKSPACE_STATE_FILE)
 }
 
+/// Resolve the active config directory by reading the workspace marker file.
+///
+/// Returns `Some(config_dir)` if marker is present and valid, `None` otherwise.
+pub(crate) fn resolve_active_config_dir(default_dir: &Path) -> Option<PathBuf> {
+    let marker_path = default_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
+    let contents = fs::read_to_string(&marker_path).ok()?;
+    let state: ActiveWorkspaceState = toml::from_str(&contents).ok()?;
+    let raw = state.config_dir.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let parsed = PathBuf::from(raw);
+    if parsed.is_absolute() {
+        Some(parsed)
+    } else {
+        Some(default_dir.join(parsed))
+    }
+}
+
 fn load_persisted_workspace_dirs(default_config_dir: &Path) -> Result<Option<(PathBuf, PathBuf)>> {
     let state_path = active_workspace_state_path(default_config_dir);
     if !state_path.exists() {
         return Ok(None);
     }
 
-    let contents = match fs::read_to_string(&state_path) {
-        Ok(contents) => contents,
-        Err(error) => {
+    match resolve_active_config_dir(default_config_dir) {
+        Some(config_dir) => Ok(Some((config_dir.clone(), config_dir.join("workspace")))),
+        None => {
             tracing::warn!(
-                "Failed to read active workspace marker {}: {error}",
+                "Active workspace marker {} exists but could not be parsed",
                 state_path.display()
             );
-            return Ok(None);
+            Ok(None)
         }
-    };
-
-    let state: ActiveWorkspaceState = match toml::from_str(&contents) {
-        Ok(state) => state,
-        Err(error) => {
-            tracing::warn!(
-                "Failed to parse active workspace marker {}: {error}",
-                state_path.display()
-            );
-            return Ok(None);
-        }
-    };
-
-    let raw_config_dir = state.config_dir.trim();
-    if raw_config_dir.is_empty() {
-        tracing::warn!(
-            "Ignoring active workspace marker {} because config_dir is empty",
-            state_path.display()
-        );
-        return Ok(None);
     }
-
-    let parsed_dir = PathBuf::from(raw_config_dir);
-    let config_dir = if parsed_dir.is_absolute() {
-        parsed_dir
-    } else {
-        default_config_dir.join(parsed_dir)
-    };
-    Ok(Some((config_dir.clone(), config_dir.join("workspace"))))
 }
 
 pub(crate) fn persist_active_workspace_config_dir(config_dir: &Path) -> Result<()> {
