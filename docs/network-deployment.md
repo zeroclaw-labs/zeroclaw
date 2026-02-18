@@ -230,10 +230,12 @@ Place your ZeroClaw config at `/etc/zeroclaw/config.toml`:
 sudo mkdir -p /etc/zeroclaw
 sudo cp ~/.zeroclaw/config.toml /etc/zeroclaw/config.toml
 
-# Set recommended permissions (root-owned, mode 600 for secrets)
-sudo chown root:root /etc/zeroclaw/config.toml
+# Set ownership to zeroclaw user (service runs as zeroclaw:zeroclaw)
+sudo chown zeroclaw:zeroclaw /etc/zeroclaw/config.toml
 sudo chmod 600 /etc/zeroclaw/config.toml
 ```
+
+> **Note**: The service runs as `zeroclaw:zeroclaw`, so the config file must be readable by that user. The `zeroclaw service install` command creates `/var/log/zeroclaw/` with correct ownership automatically.
 
 ### 7.4 Enable and Start
 
