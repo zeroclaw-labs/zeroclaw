@@ -293,7 +293,12 @@ pub fn record_run(
     duration_ms: i64,
 ) -> Result<()> {
     with_connection(config, |conn| {
-        conn.execute(
+        // Wrap INSERT + pruning DELETE in an explicit transaction so that
+        // if the DELETE fails, the INSERT is rolled back and the run table
+        // cannot grow unboundedly.
+        let tx = conn.unchecked_transaction()?;
+
+        tx.execute(
             "INSERT INTO cron_runs (job_id, started_at, finished_at, status, output, duration_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
@@ -308,7 +313,7 @@ pub fn record_run(
         .context("Failed to insert cron run")?;
 
         let keep = i64::from(config.cron.max_run_history.max(1));
-        conn.execute(
+        tx.execute(
             "DELETE FROM cron_runs
              WHERE job_id = ?1
                AND id NOT IN (
@@ -320,6 +325,8 @@ pub fn record_run(
             params![job_id, keep],
         )
         .context("Failed to prune cron run history")?;
+
+        tx.commit().context("Failed to commit cron run transaction")?;
         Ok(())
     })
 }
