@@ -476,7 +476,7 @@ Config: `~/.zeroclaw/config.toml` (created by `onboard`)
 ```toml
 api_key = "sk-..."
 default_provider = "openrouter"
-default_model = "anthropic/claude-sonnet-4"
+default_model = "anthropic/claude-sonnet-4-6"
 default_temperature = 0.7
 
 # Custom OpenAI-compatible endpoint

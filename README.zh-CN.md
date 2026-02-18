@@ -5,7 +5,7 @@
 <h1 align="center">ZeroClaw 🦀（简体中文）</h1>
 
 <p align="center">
-  <strong>Zero overhead. Zero compromise. 100% Rust. 100% Agnostic.</strong>
+  <strong>零开销、零妥协；随处部署、万物可换。</strong>
 </p>
 
 <p align="center">
@@ -125,7 +125,7 @@ zeroclaw daemon
 ```toml
 api_key = "sk-..."
 default_provider = "openrouter"
-default_model = "anthropic/claude-sonnet-4"
+default_model = "anthropic/claude-sonnet-4-6"
 default_temperature = 0.7
 
 [memory]
