@@ -18,7 +18,13 @@ use tokio::sync::Mutex;
 /// Drive backend abstraction
 #[async_trait]
 trait DriveBackend: Send + Sync {
-    async fn move_robot(&self, linear_x: f64, linear_y: f64, angular_z: f64, duration_ms: u64) -> Result<()>;
+    async fn move_robot(
+        &self,
+        linear_x: f64,
+        linear_y: f64,
+        angular_z: f64,
+        duration_ms: u64,
+    ) -> Result<()>;
     async fn stop(&self) -> Result<()>;
     #[allow(dead_code)]
     async fn get_odometry(&self) -> Result<(f64, f64, f64)>; // x, y, theta - reserved for future odometry integration
@@ -29,10 +35,19 @@ struct MockDrive;
 
 #[async_trait]
 impl DriveBackend for MockDrive {
-    async fn move_robot(&self, linear_x: f64, linear_y: f64, angular_z: f64, duration_ms: u64) -> Result<()> {
+    async fn move_robot(
+        &self,
+        linear_x: f64,
+        linear_y: f64,
+        angular_z: f64,
+        duration_ms: u64,
+    ) -> Result<()> {
         tracing::info!(
             "MOCK DRIVE: linear=({:.2}, {:.2}), angular={:.2}, duration={}ms",
-            linear_x, linear_y, angular_z, duration_ms
+            linear_x,
+            linear_y,
+            angular_z,
+            duration_ms
         );
         tokio::time::sleep(Duration::from_millis(duration_ms.min(100))).await;
         Ok(())
@@ -55,7 +70,13 @@ struct Ros2Drive {
 
 #[async_trait]
 impl DriveBackend for Ros2Drive {
-    async fn move_robot(&self, linear_x: f64, linear_y: f64, angular_z: f64, duration_ms: u64) -> Result<()> {
+    async fn move_robot(
+        &self,
+        linear_x: f64,
+        linear_y: f64,
+        angular_z: f64,
+        duration_ms: u64,
+    ) -> Result<()> {
         // Publish Twist message via ros2 CLI
         // In production, use rclrs (Rust ROS2 bindings) instead
         let msg = format!(
@@ -64,12 +85,22 @@ impl DriveBackend for Ros2Drive {
         );
 
         let output = tokio::process::Command::new("ros2")
-            .args(["topic", "pub", "--once", &self.topic, "geometry_msgs/msg/Twist", &msg])
+            .args([
+                "topic",
+                "pub",
+                "--once",
+                &self.topic,
+                "geometry_msgs/msg/Twist",
+                &msg,
+            ])
             .output()
             .await?;
 
         if !output.status.success() {
-            anyhow::bail!("ROS2 publish failed: {}", String::from_utf8_lossy(&output.stderr));
+            anyhow::bail!(
+                "ROS2 publish failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
 
         // Hold for duration then stop
@@ -82,7 +113,14 @@ impl DriveBackend for Ros2Drive {
     async fn stop(&self) -> Result<()> {
         let msg = "{linear: {x: 0.0, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}";
         tokio::process::Command::new("ros2")
-            .args(["topic", "pub", "--once", &self.topic, "geometry_msgs/msg/Twist", msg])
+            .args([
+                "topic",
+                "pub",
+                "--once",
+                &self.topic,
+                "geometry_msgs/msg/Twist",
+                msg,
+            ])
             .output()
             .await?;
         Ok(())
@@ -101,22 +139,30 @@ struct SerialDrive {
 
 #[async_trait]
 impl DriveBackend for SerialDrive {
-    async fn move_robot(&self, linear_x: f64, linear_y: f64, angular_z: f64, duration_ms: u64) -> Result<()> {
+    async fn move_robot(
+        &self,
+        linear_x: f64,
+        linear_y: f64,
+        angular_z: f64,
+        duration_ms: u64,
+    ) -> Result<()> {
         // Protocol: "M <lx> <ly> <az> <ms>\n"
         // The motor controller interprets this and drives motors
-        let cmd = format!("M {:.2} {:.2} {:.2} {}\n", linear_x, linear_y, angular_z, duration_ms);
+        let cmd = format!(
+            "M {:.2} {:.2} {:.2} {}\n",
+            linear_x, linear_y, angular_z, duration_ms
+        );
 
         // Use blocking serial in spawn_blocking
         let port = self.port.clone();
         tokio::task::spawn_blocking(move || {
             use std::io::Write;
-            let mut serial = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&port)?;
+            let mut serial = std::fs::OpenOptions::new().write(true).open(&port)?;
             serial.write_all(cmd.as_bytes())?;
             serial.flush()?;
             Ok::<_, anyhow::Error>(())
-        }).await??;
+        })
+        .await??;
 
         tokio::time::sleep(Duration::from_millis(duration_ms)).await;
         Ok(())
@@ -141,8 +187,12 @@ pub struct DriveTool {
 impl DriveTool {
     pub fn new(config: RobotConfig) -> Self {
         let backend: Arc<dyn DriveBackend> = match config.drive.backend.as_str() {
-            "ros2" => Arc::new(Ros2Drive { topic: config.drive.ros2_topic.clone() }),
-            "serial" => Arc::new(SerialDrive { port: config.drive.serial_port.clone() }),
+            "ros2" => Arc::new(Ros2Drive {
+                topic: config.drive.ros2_topic.clone(),
+            }),
+            "serial" => Arc::new(SerialDrive {
+                port: config.drive.serial_port.clone(),
+            }),
             // "gpio" => Arc::new(GpioDrive::new(&config)), // Would use rppal
             _ => Arc::new(MockDrive),
         };
@@ -213,7 +263,9 @@ impl Tool for DriveTool {
                     return Ok(ToolResult {
                         success: false,
                         output: String::new(),
-                        error: Some("Rate limited: wait 1 second between drive commands".to_string()),
+                        error: Some(
+                            "Rate limited: wait 1 second between drive commands".to_string(),
+                        ),
                     });
                 }
             }
@@ -236,41 +288,76 @@ impl Tool for DriveTool {
             "forward" => {
                 let dist = args["distance"].as_f64().unwrap_or(0.5);
                 let duration = (dist / max_speed * 1000.0) as u64;
-                (max_speed, 0.0, 0.0, duration.min(self.config.safety.max_drive_duration * 1000))
+                (
+                    max_speed,
+                    0.0,
+                    0.0,
+                    duration.min(self.config.safety.max_drive_duration * 1000),
+                )
             }
             "backward" => {
                 let dist = args["distance"].as_f64().unwrap_or(0.5);
                 let duration = (dist / max_speed * 1000.0) as u64;
-                (-max_speed, 0.0, 0.0, duration.min(self.config.safety.max_drive_duration * 1000))
+                (
+                    -max_speed,
+                    0.0,
+                    0.0,
+                    duration.min(self.config.safety.max_drive_duration * 1000),
+                )
             }
             "left" => {
                 let dist = args["distance"].as_f64().unwrap_or(0.5);
                 let duration = (dist / max_speed * 1000.0) as u64;
-                (0.0, max_speed, 0.0, duration.min(self.config.safety.max_drive_duration * 1000))
+                (
+                    0.0,
+                    max_speed,
+                    0.0,
+                    duration.min(self.config.safety.max_drive_duration * 1000),
+                )
             }
             "right" => {
                 let dist = args["distance"].as_f64().unwrap_or(0.5);
                 let duration = (dist / max_speed * 1000.0) as u64;
-                (0.0, -max_speed, 0.0, duration.min(self.config.safety.max_drive_duration * 1000))
+                (
+                    0.0,
+                    -max_speed,
+                    0.0,
+                    duration.min(self.config.safety.max_drive_duration * 1000),
+                )
             }
             "rotate_left" => {
                 let degrees = args["distance"].as_f64().unwrap_or(90.0);
                 let radians = degrees.to_radians();
                 let duration = (radians / max_rotation * 1000.0) as u64;
-                (0.0, 0.0, max_rotation, duration.min(self.config.safety.max_drive_duration * 1000))
+                (
+                    0.0,
+                    0.0,
+                    max_rotation,
+                    duration.min(self.config.safety.max_drive_duration * 1000),
+                )
             }
             "rotate_right" => {
                 let degrees = args["distance"].as_f64().unwrap_or(90.0);
                 let radians = degrees.to_radians();
                 let duration = (radians / max_rotation * 1000.0) as u64;
-                (0.0, 0.0, -max_rotation, duration.min(self.config.safety.max_drive_duration * 1000))
+                (
+                    0.0,
+                    0.0,
+                    -max_rotation,
+                    duration.min(self.config.safety.max_drive_duration * 1000),
+                )
             }
             "custom" => {
                 let lx = args["linear_x"].as_f64().unwrap_or(0.0).clamp(-1.0, 1.0) * max_speed;
                 let ly = args["linear_y"].as_f64().unwrap_or(0.0).clamp(-1.0, 1.0) * max_speed;
                 let az = args["angular_z"].as_f64().unwrap_or(0.0).clamp(-1.0, 1.0) * max_rotation;
                 let duration = args["duration_ms"].as_u64().unwrap_or(1000);
-                (lx, ly, az, duration.min(self.config.safety.max_drive_duration * 1000))
+                (
+                    lx,
+                    ly,
+                    az,
+                    duration.min(self.config.safety.max_drive_duration * 1000),
+                )
             }
             _ => {
                 return Ok(ToolResult {
@@ -281,7 +368,9 @@ impl Tool for DriveTool {
             }
         };
 
-        self.backend.move_robot(linear_x, linear_y, angular_z, duration_ms).await?;
+        self.backend
+            .move_robot(linear_x, linear_y, angular_z, duration_ms)
+            .await?;
 
         Ok(ToolResult {
             success: true,
@@ -314,7 +403,10 @@ mod tests {
     #[tokio::test]
     async fn drive_forward_mock() {
         let tool = DriveTool::new(RobotConfig::default());
-        let result = tool.execute(json!({"action": "forward", "distance": 1.0})).await.unwrap();
+        let result = tool
+            .execute(json!({"action": "forward", "distance": 1.0}))
+            .await
+            .unwrap();
         assert!(result.success);
         assert!(result.output.contains("forward"));
     }

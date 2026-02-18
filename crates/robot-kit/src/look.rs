@@ -24,7 +24,10 @@ impl LookTool {
         // Ensure capture directory exists
         let _ = std::fs::create_dir_all(&capture_dir);
 
-        Self { config, capture_dir }
+        Self {
+            config,
+            capture_dir,
+        }
     }
 
     /// Capture image using ffmpeg (works with most cameras)
@@ -39,10 +42,14 @@ impl LookTool {
         // Use ffmpeg for broad camera compatibility
         let output = tokio::process::Command::new("ffmpeg")
             .args([
-                "-f", "v4l2",
-                "-video_size", &format!("{}x{}", width, height),
-                "-i", device,
-                "-frames:v", "1",
+                "-f",
+                "v4l2",
+                "-video_size",
+                &format!("{}x{}", width, height),
+                "-i",
+                device,
+                "-frames:v",
+                "1",
                 "-y", // Overwrite
                 filename.to_str().unwrap(),
             ])
@@ -53,9 +60,11 @@ impl LookTool {
             // Fallback: try fswebcam (simpler, often works on Pi)
             let fallback = tokio::process::Command::new("fswebcam")
                 .args([
-                    "-r", &format!("{}x{}", width, height),
+                    "-r",
+                    &format!("{}x{}", width, height),
                     "--no-banner",
-                    "-d", device,
+                    "-d",
+                    device,
                     filename.to_str().unwrap(),
                 ])
                 .output()
@@ -84,10 +93,8 @@ impl LookTool {
 
         // Read image as base64
         let image_bytes = tokio::fs::read(image_path).await?;
-        let base64_image = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            &image_bytes,
-        );
+        let base64_image =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &image_bytes);
 
         // Call Ollama with image
         let client = reqwest::Client::new();
@@ -182,15 +189,18 @@ impl Tool for LookTool {
                     }),
                     Err(e) => Ok(ToolResult {
                         success: false,
-                        output: format!("Image captured at {} but description failed", image_path.display()),
+                        output: format!(
+                            "Image captured at {} but description failed",
+                            image_path.display()
+                        ),
                         error: Some(e.to_string()),
                     }),
                 }
             }
             "find" => {
-                let target = args["prompt"]
-                    .as_str()
-                    .ok_or_else(|| anyhow::anyhow!("'find' action requires 'prompt' specifying what to find"))?;
+                let target = args["prompt"].as_str().ok_or_else(|| {
+                    anyhow::anyhow!("'find' action requires 'prompt' specifying what to find")
+                })?;
 
                 let prompt = format!(
                     "Look at this image and determine: Is there a {} visible? \

@@ -13,16 +13,16 @@ use std::path::PathBuf;
 /// Predefined LED expressions
 #[derive(Debug, Clone, Copy)]
 pub enum Expression {
-    Happy,      // :)
-    Sad,        // :(
-    Surprised,  // :O
-    Thinking,   // :?
-    Sleepy,     // -_-
-    Excited,    // ^_^
-    Love,       // <3 <3
-    Angry,      // >:(
-    Confused,   // @_@
-    Wink,       // ;)
+    Happy,     // :)
+    Sad,       // :(
+    Surprised, // :O
+    Thinking,  // :?
+    Sleepy,    // -_-
+    Excited,   // ^_^
+    Love,      // <3 <3
+    Angry,     // >:(
+    Confused,  // @_@
+    Wink,      // ;)
 }
 
 impl Expression {
@@ -57,62 +57,53 @@ impl Expression {
             Self::Happy => {
                 // Simple smiley
                 vec![
-                    black, black, yellow, yellow, yellow, yellow, black, black,
-                    black, yellow, black, black, black, black, yellow, black,
-                    yellow, black, white, black, black, white, black, yellow,
-                    yellow, black, black, black, black, black, black, yellow,
-                    yellow, black, white, black, black, white, black, yellow,
-                    yellow, black, black, white, white, black, black, yellow,
-                    black, yellow, black, black, black, black, yellow, black,
-                    black, black, yellow, yellow, yellow, yellow, black, black,
+                    black, black, yellow, yellow, yellow, yellow, black, black, black, yellow,
+                    black, black, black, black, yellow, black, yellow, black, white, black, black,
+                    white, black, yellow, yellow, black, black, black, black, black, black, yellow,
+                    yellow, black, white, black, black, white, black, yellow, yellow, black, black,
+                    white, white, black, black, yellow, black, yellow, black, black, black, black,
+                    yellow, black, black, black, yellow, yellow, yellow, yellow, black, black,
                 ]
             }
             Self::Sad => {
                 vec![
-                    black, black, blue, blue, blue, blue, black, black,
-                    black, blue, black, black, black, black, blue, black,
-                    blue, black, white, black, black, white, black, blue,
-                    blue, black, black, black, black, black, black, blue,
-                    blue, black, black, white, white, black, black, blue,
-                    blue, black, white, black, black, white, black, blue,
-                    black, blue, black, black, black, black, blue, black,
-                    black, black, blue, blue, blue, blue, black, black,
+                    black, black, blue, blue, blue, blue, black, black, black, blue, black, black,
+                    black, black, blue, black, blue, black, white, black, black, white, black,
+                    blue, blue, black, black, black, black, black, black, blue, blue, black, black,
+                    white, white, black, black, blue, blue, black, white, black, black, white,
+                    black, blue, black, blue, black, black, black, black, blue, black, black,
+                    black, blue, blue, blue, blue, black, black,
                 ]
             }
             Self::Excited => {
                 vec![
-                    yellow, yellow, yellow, yellow, yellow, yellow, yellow, yellow,
-                    yellow, black, black, yellow, yellow, black, black, yellow,
-                    yellow, black, white, yellow, yellow, white, black, yellow,
-                    yellow, yellow, yellow, yellow, yellow, yellow, yellow, yellow,
-                    yellow, black, black, black, black, black, black, yellow,
-                    yellow, black, white, white, white, white, black, yellow,
-                    yellow, black, black, black, black, black, black, yellow,
-                    yellow, yellow, yellow, yellow, yellow, yellow, yellow, yellow,
+                    yellow, yellow, yellow, yellow, yellow, yellow, yellow, yellow, yellow, black,
+                    black, yellow, yellow, black, black, yellow, yellow, black, white, yellow,
+                    yellow, white, black, yellow, yellow, yellow, yellow, yellow, yellow, yellow,
+                    yellow, yellow, yellow, black, black, black, black, black, black, yellow,
+                    yellow, black, white, white, white, white, black, yellow, yellow, black, black,
+                    black, black, black, black, yellow, yellow, yellow, yellow, yellow, yellow,
+                    yellow, yellow, yellow,
                 ]
             }
             Self::Love => {
                 vec![
-                    black, pink, pink, black, black, pink, pink, black,
-                    pink, pink, pink, pink, pink, pink, pink, pink,
-                    pink, pink, pink, pink, pink, pink, pink, pink,
-                    pink, pink, pink, pink, pink, pink, pink, pink,
-                    black, pink, pink, pink, pink, pink, pink, black,
-                    black, black, pink, pink, pink, pink, black, black,
-                    black, black, black, pink, pink, black, black, black,
-                    black, black, black, black, black, black, black, black,
+                    black, pink, pink, black, black, pink, pink, black, pink, pink, pink, pink,
+                    pink, pink, pink, pink, pink, pink, pink, pink, pink, pink, pink, pink, pink,
+                    pink, pink, pink, pink, pink, pink, pink, black, pink, pink, pink, pink, pink,
+                    pink, black, black, black, pink, pink, pink, pink, black, black, black, black,
+                    black, pink, pink, black, black, black, black, black, black, black, black,
+                    black, black, black,
                 ]
             }
             Self::Angry => {
                 vec![
-                    red, red, black, black, black, black, red, red,
-                    black, red, red, black, black, red, red, black,
-                    black, black, red, black, black, red, black, black,
-                    black, black, white, black, black, white, black, black,
-                    black, black, black, black, black, black, black, black,
-                    black, black, white, white, white, white, black, black,
-                    black, white, black, black, black, black, white, black,
-                    black, black, black, black, black, black, black, black,
+                    red, red, black, black, black, black, red, red, black, red, red, black, black,
+                    red, red, black, black, black, red, black, black, red, black, black, black,
+                    black, white, black, black, white, black, black, black, black, black, black,
+                    black, black, black, black, black, black, white, white, white, white, black,
+                    black, black, white, black, black, black, black, white, black, black, black,
+                    black, black, black, black, black, black,
                 ]
             }
             _ => {
@@ -205,7 +196,12 @@ impl EmoteTool {
             }
             "dance" => {
                 // Cycle through expressions
-                for expr in [Expression::Happy, Expression::Excited, Expression::Love, Expression::Happy] {
+                for expr in [
+                    Expression::Happy,
+                    Expression::Excited,
+                    Expression::Love,
+                    Expression::Happy,
+                ] {
                     self.set_expression(expr).await?;
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
@@ -318,10 +314,13 @@ mod tests {
     #[tokio::test]
     async fn emote_happy() {
         let tool = EmoteTool::new(RobotConfig::default());
-        let result = tool.execute(json!({
-            "expression": "happy",
-            "duration": 0
-        })).await.unwrap();
+        let result = tool
+            .execute(json!({
+                "expression": "happy",
+                "duration": 0
+            }))
+            .await
+            .unwrap();
         assert!(result.success);
     }
 }
