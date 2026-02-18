@@ -13,7 +13,7 @@ import { useToast } from "../../state/toast";
 import { appendChat, loadChat, type ChatMessage } from "../../state/chat";
 import { addActivity } from "../../state/activity";
 import { loadAgentConfig } from "../../state/mobileclaw";
-import { sendAgentPrompt } from "../../api/mobileclaw";
+import { runAgentTurn } from "../../runtime/session";
 
 const BUBBLE_USER = SlideInRight.duration(280).springify().damping(18).stiffness(180);
 const BUBBLE_ASSISTANT = SlideInLeft.duration(280).springify().damping(18).stiffness(180);
@@ -148,17 +148,25 @@ export function ChatScreen() {
 
       setBusy(true);
       try {
-        const runtime = await loadAgentConfig();
-        const reply = await sendAgentPrompt(userMsg.text, runtime);
+        const result = await runAgentTurn(userMsg.text);
         const assistantMsg: ChatMessage = {
           id: `a_${Date.now()}_${Math.random()}`,
           role: "assistant",
-          text: reply || "(empty response)",
+          text: result.assistantText || "(empty response)",
           ts: Date.now(),
         };
         setMessages((prev) => [...prev, assistantMsg]);
         await appendChat(assistantMsg);
         await addActivity({ kind: "action", source: "chat", title: "Agent response", detail: assistantMsg.text.slice(0, 120) });
+
+        for (const event of result.toolEvents) {
+          await addActivity({
+            kind: "action",
+            source: "chat",
+            title: `Tool ${event.status}`,
+            detail: `${event.tool}: ${event.detail}`,
+          });
+        }
       } catch (error) {
         const detail = error instanceof Error ? error.message : "Unknown error";
         toast.show(detail);

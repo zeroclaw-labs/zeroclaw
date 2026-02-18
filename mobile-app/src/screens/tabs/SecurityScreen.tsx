@@ -12,6 +12,8 @@ export function SecurityScreen() {
   const navigation = useNavigation<any>();
   const [requireApproval, setRequireApproval] = useState(DEFAULT_SECURITY.requireApproval);
   const [highRiskActions, setHighRiskActions] = useState(DEFAULT_SECURITY.highRiskActions);
+  const [incomingCallHooks, setIncomingCallHooks] = useState(DEFAULT_SECURITY.incomingCallHooks);
+  const [includeCallerNumber, setIncludeCallerNumber] = useState(DEFAULT_SECURITY.includeCallerNumber);
   const [saveStatus, setSaveStatus] = useState("Loading...");
   const hydratedRef = useRef(false);
 
@@ -22,6 +24,8 @@ export function SecurityScreen() {
       if (cancelled) return;
       setRequireApproval(loaded.requireApproval);
       setHighRiskActions(loaded.highRiskActions);
+      setIncomingCallHooks(loaded.incomingCallHooks);
+      setIncludeCallerNumber(loaded.includeCallerNumber);
       hydratedRef.current = true;
       setSaveStatus("Autosave enabled");
     })();
@@ -33,12 +37,17 @@ export function SecurityScreen() {
   useEffect(() => {
     if (!hydratedRef.current) return;
     const timer = setTimeout(() => {
-      void saveSecurityConfig({ requireApproval, highRiskActions });
-      void addActivity({ kind: "action", source: "security", title: "Security policy updated", detail: `approval=${requireApproval}, high_risk=${highRiskActions}` });
+      void saveSecurityConfig({ requireApproval, highRiskActions, incomingCallHooks, includeCallerNumber });
+      void addActivity({
+        kind: "action",
+        source: "security",
+        title: "Security policy updated",
+        detail: `approval=${requireApproval}, high_risk=${highRiskActions}, call_hooks=${incomingCallHooks}, caller_number=${includeCallerNumber}`,
+      });
       setSaveStatus("Saved locally");
     }, 300);
     return () => clearTimeout(timer);
-  }, [requireApproval, highRiskActions]);
+  }, [requireApproval, highRiskActions, incomingCallHooks, includeCallerNumber]);
 
   return (
     <Screen>
@@ -68,6 +77,14 @@ export function SecurityScreen() {
           <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
             <Text variant="bodyMedium">Enable high-risk actions</Text>
             <Switch value={highRiskActions} onValueChange={setHighRiskActions} />
+          </View>
+          <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
+            <Text variant="bodyMedium">Enable incoming call hooks</Text>
+            <Switch value={incomingCallHooks} onValueChange={setIncomingCallHooks} />
+          </View>
+          <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
+            <Text variant="bodyMedium">Share caller number with agent</Text>
+            <Switch value={includeCallerNumber} onValueChange={setIncludeCallerNumber} />
           </View>
         </View>
 

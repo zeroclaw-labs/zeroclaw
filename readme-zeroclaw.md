@@ -214,7 +214,6 @@ Every subsystem is a **trait** — swap implementations with a config change, ze
 
 When an unsupported `runtime.kind` is configured, ZeroClaw now exits with a clear error instead of silently falling back to native.
 
-Android deployment guide: `docs/android-deployment.md`
 React Native mobile app guide: `docs/mobile-app-react-native.md`
 
 ### Memory System (Full-Stack Search Engine)

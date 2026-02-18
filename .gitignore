@@ -16,14 +16,6 @@ docker-compose.override.yml
 *.log
 *.tmp
 
-# Android/Gradle local build artifacts
-android-app/.gradle/
-android-app/.kotlin/
-android-app/build/
-android-app/**/build/
-android-app/local.properties
-android-app/**/*.iml
-
 # React Native mobile app artifacts
 mobile-app/node_modules/
 mobile-app/.expo/

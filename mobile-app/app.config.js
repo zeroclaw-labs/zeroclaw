@@ -36,7 +36,29 @@ module.exports = {
     },
     android: {
       package: "com.mobileclaw.app",
-      permissions: ["RECORD_AUDIO"]
+      permissions: [
+        "RECORD_AUDIO",
+        "POST_NOTIFICATIONS",
+        "READ_PHONE_STATE",
+        "CALL_PHONE",
+        "READ_CALL_LOG",
+        "SEND_SMS",
+        "READ_SMS",
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION",
+        "READ_CONTACTS",
+        "READ_CALENDAR",
+        "WRITE_CALENDAR",
+        "BLUETOOTH_SCAN",
+        "BLUETOOTH_CONNECT",
+        "NFC",
+        "READ_EXTERNAL_STORAGE",
+        "WRITE_EXTERNAL_STORAGE",
+        "READ_MEDIA_IMAGES",
+        "READ_MEDIA_VIDEO",
+        "READ_MEDIA_AUDIO",
+        "MANAGE_EXTERNAL_STORAGE"
+      ]
     },
     extra: {
       eas: {

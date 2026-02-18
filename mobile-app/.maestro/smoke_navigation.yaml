@@ -14,6 +14,8 @@ appId: com.mobileclaw.app
     timeout: 10000
 - tapOn:
     id: "dock-tab-integrations"
+- tapOn:
+    id: "dock-tab-integrations"
 - extendedWaitUntil:
     visible:
       id: "screen-integrations"

@@ -18,6 +18,9 @@ import { ActivityProvider } from "./src/state/activity";
 import { RootNavigator } from "./src/navigation/RootNavigator";
 import { log } from "./src/logger";
 import { ErrorBoundary } from "./src/state/ErrorBoundary";
+import { addActivity } from "./src/state/activity";
+import { loadSecurityConfig } from "./src/state/mobileclaw";
+import { subscribeIncomingCalls } from "./src/native/incomingCalls";
 
 export default function App() {
   const [fontsLoaded] = Font.useFonts({
@@ -30,6 +33,26 @@ export default function App() {
   useEffect(() => {
     if (!fontsLoaded) return;
     log("info", "app started", { platform: Platform.OS });
+  }, [fontsLoaded]);
+
+  useEffect(() => {
+    if (!fontsLoaded) return;
+
+    const unsubscribe = subscribeIncomingCalls((event) => {
+      void (async () => {
+        const security = await loadSecurityConfig();
+        if (!security.incomingCallHooks) return;
+        const suffix = security.includeCallerNumber && event.phone.trim() ? event.phone.trim() : "redacted";
+        await addActivity({
+          kind: "action",
+          source: "device",
+          title: "Incoming call hook",
+          detail: `${event.state} from ${suffix}`,
+        });
+      })();
+    });
+
+    return () => unsubscribe();
   }, [fontsLoaded]);
 
   if (!fontsLoaded) return null;

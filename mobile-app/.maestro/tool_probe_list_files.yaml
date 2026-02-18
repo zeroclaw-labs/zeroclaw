@@ -1,0 +1,19 @@
+appId: com.mobileclaw.app
+---
+- launchApp
+- extendedWaitUntil:
+    visible:
+      id: "dock-tab-device"
+    timeout: 30000
+- tapOn:
+    id: "dock-tab-device"
+- extendedWaitUntil:
+    visible:
+      id: "screen-device"
+    timeout: 10000
+- tapOn:
+    id: "device-run-file-probe"
+- extendedWaitUntil:
+    visible:
+      id: "device-probe-status"
+    timeout: 20000

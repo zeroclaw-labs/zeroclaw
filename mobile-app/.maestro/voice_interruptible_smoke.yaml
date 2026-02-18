@@ -1,0 +1,33 @@
+appId: com.mobileclaw.app
+---
+- launchApp:
+    clearState: true
+- extendedWaitUntil:
+    visible:
+      id: "screen-chat"
+    timeout: 30000
+- tapOn:
+    id: "dock-tab-settings"
+- tapOn:
+    id: "dock-tab-settings"
+- scrollUntilVisible:
+    element:
+      id: "deepgram-key-input"
+    direction: DOWN
+- tapOn:
+    id: "deepgram-key-input"
+- eraseText
+- inputText: "${DEEPGRAM_KEY}"
+- waitForAnimationToEnd
+- tapOn:
+    id: "dock-tab-chat"
+- tapOn:
+    id: "chat-send-or-voice"
+- extendedWaitUntil:
+    visible: "Listening…"
+    timeout: 15000
+- tapOn:
+    id: "chat-send-or-voice"
+- extendedWaitUntil:
+    visible: "Didn't catch that. Try again."
+    timeout: 30000

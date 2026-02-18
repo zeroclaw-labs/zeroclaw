@@ -35,11 +35,21 @@ export type IntegrationsConfig = {
 export type SecurityConfig = {
   requireApproval: boolean;
   highRiskActions: boolean;
+  incomingCallHooks: boolean;
+  includeCallerNumber: boolean;
+};
+
+export type MobileToolCapability = {
+  id: string;
+  title: string;
+  detail: string;
+  enabled: boolean;
 };
 
 const AGENT_KEY = "mobileclaw:agent-config:v1";
 const INTEGRATIONS_KEY = "mobileclaw:integrations-config:v1";
 const SECURITY_KEY = "mobileclaw:security-config:v1";
+const DEVICE_TOOLS_KEY = "mobileclaw:device-tools:v1";
 
 export const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig = {
   provider: "openrouter",
@@ -57,23 +67,65 @@ export const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig = {
 };
 
 export const DEFAULT_INTEGRATIONS: IntegrationsConfig = {
-  telegramEnabled: false,
+  telegramEnabled: true,
   telegramBotToken: "",
   telegramChatId: "",
-  discordEnabled: false,
+  discordEnabled: true,
   discordBotToken: "",
-  slackEnabled: false,
+  slackEnabled: true,
   slackBotToken: "",
-  whatsappEnabled: false,
+  whatsappEnabled: true,
   whatsappAccessToken: "",
-  composioEnabled: false,
+  composioEnabled: true,
   composioApiKey: "",
 };
 
 export const DEFAULT_SECURITY: SecurityConfig = {
-  requireApproval: true,
-  highRiskActions: false,
+  requireApproval: false,
+  highRiskActions: true,
+  incomingCallHooks: true,
+  includeCallerNumber: true,
 };
+
+export const DEFAULT_DEVICE_TOOLS: MobileToolCapability[] = [
+  { id: "android_device.storage.files", title: "File Storage", detail: "Read/write local files", enabled: false },
+  { id: "android_device.storage.files_full_access", title: "All Files Access", detail: "Request/manage full storage access", enabled: false },
+  { id: "android_device.storage.documents", title: "Document Picker", detail: "Pick files with scoped access", enabled: false },
+  { id: "android_device.open_app", title: "Launch App", detail: "Open installed package by id", enabled: false },
+  { id: "android_device.list_apps", title: "List Installed Apps", detail: "Enumerate launchable package ids", enabled: false },
+  { id: "android_device.open_url", title: "Open URL", detail: "Open https links via Android intent", enabled: false },
+  { id: "android_device.open_settings", title: "Open Settings", detail: "Open Android system settings", enabled: false },
+  { id: "android_device.notifications.read", title: "Read Notifications", detail: "Inspect notification feed", enabled: false },
+  { id: "android_device.notifications.post", title: "Post Notification", detail: "Create local system notifications", enabled: false },
+  { id: "android_device.notifications.hook", title: "Notification Hook", detail: "Receive notification listener events", enabled: false },
+  { id: "android_device.location.read", title: "GPS Location", detail: "Read current location", enabled: false },
+  { id: "android_device.location.geofence", title: "Geofencing", detail: "Background region enter/exit hooks", enabled: false },
+  { id: "android_device.sensor.accelerometer", title: "Accelerometer", detail: "Read movement/tilt", enabled: false },
+  { id: "android_device.sensor.gyroscope", title: "Gyroscope", detail: "Read rotation deltas", enabled: false },
+  { id: "android_device.sensor.magnetometer", title: "Magnetometer", detail: "Read magnetic field/compass", enabled: false },
+  { id: "android_device.sensor.battery", title: "Battery State", detail: "Read battery level and charging", enabled: false },
+  { id: "android_device.sensor.network", title: "Network State", detail: "Read connectivity and transport", enabled: false },
+  { id: "android_device.camera.capture", title: "Camera Capture", detail: "Capture photos/video", enabled: false },
+  { id: "android_device.camera.scan_qr", title: "QR/Barcode Scan", detail: "Scan machine-readable codes", enabled: false },
+  { id: "android_device.microphone.record", title: "Microphone", detail: "Capture audio input", enabled: false },
+  { id: "android_device.contacts.read", title: "Contacts", detail: "Read contact cards", enabled: false },
+  { id: "android_device.calendar.read_write", title: "Calendar", detail: "Read/create events", enabled: false },
+  { id: "android_device.calls.start", title: "Calls", detail: "Start phone calls", enabled: false },
+  { id: "android_device.calls.incoming_hook", title: "Incoming Call Hook", detail: "Notify agent on incoming calls", enabled: false },
+  { id: "android_device.sms.send", title: "SMS", detail: "Send text messages", enabled: false },
+  { id: "android_device.sms.incoming_hook", title: "Incoming SMS Hook", detail: "Notify agent on received SMS", enabled: false },
+  { id: "android_device.userdata.clipboard", title: "Clipboard", detail: "Read/write clipboard", enabled: false },
+  { id: "android_device.userdata.photos", title: "Photo Library", detail: "Read media files", enabled: false },
+  { id: "android_device.userdata.call_log", title: "Call Log", detail: "Read recent calls", enabled: false },
+  { id: "android_device.userdata.sms_inbox", title: "SMS Inbox", detail: "Read incoming SMS", enabled: false },
+  { id: "android_device.bluetooth.scan", title: "Bluetooth LE Scan", detail: "Scan nearby BLE devices", enabled: false },
+  { id: "android_device.bluetooth.connect", title: "Bluetooth Connect", detail: "Connect to known BLE device", enabled: false },
+  { id: "android_device.nfc.read", title: "NFC Read", detail: "Read NFC tags with tap", enabled: false },
+  { id: "android_device.nfc.write", title: "NFC Write", detail: "Write NFC tags", enabled: false },
+  { id: "hardware_board_info", title: "Hardware Board Info", detail: "Read connected board/chip info", enabled: false },
+  { id: "hardware_memory_map", title: "Hardware Memory Map", detail: "Read flash/RAM ranges", enabled: false },
+  { id: "hardware_memory_read", title: "Hardware Memory Read", detail: "Read memory addresses from board", enabled: false },
+];
 
 async function readJson<T>(key: string, fallback: T): Promise<T> {
   const raw = await AsyncStorage.getItem(key);
@@ -107,4 +159,27 @@ export async function loadSecurityConfig(): Promise<SecurityConfig> {
 
 export async function saveSecurityConfig(config: SecurityConfig): Promise<void> {
   await AsyncStorage.setItem(SECURITY_KEY, JSON.stringify(config));
+}
+
+export async function loadDeviceToolsConfig(): Promise<MobileToolCapability[]> {
+  const raw = await AsyncStorage.getItem(DEVICE_TOOLS_KEY);
+  if (!raw) return DEFAULT_DEVICE_TOOLS;
+
+  try {
+    const parsed = JSON.parse(raw) as Array<Partial<MobileToolCapability>>;
+    const map = new Map((Array.isArray(parsed) ? parsed : []).map((item) => [item.id, item]));
+    return DEFAULT_DEVICE_TOOLS.map((item) => {
+      const saved = map.get(item.id);
+      return {
+        ...item,
+        enabled: typeof saved?.enabled === "boolean" ? saved.enabled : item.enabled,
+      };
+    });
+  } catch {
+    return DEFAULT_DEVICE_TOOLS;
+  }
+}
+
+export async function saveDeviceToolsConfig(tools: MobileToolCapability[]): Promise<void> {
+  await AsyncStorage.setItem(DEVICE_TOOLS_KEY, JSON.stringify(tools));
 }
