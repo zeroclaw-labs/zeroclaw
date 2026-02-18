@@ -5,6 +5,7 @@ use opentelemetry::{global, KeyValue};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::SdkTracerProvider;
+use std::any::Any;
 use std::time::SystemTime;
 
 /// OpenTelemetry-backed observer — exports traces and metrics via OTLP.
@@ -225,6 +226,8 @@ impl Observer for OtelObserver {
                 span.end();
             }
             ObserverEvent::AgentEnd {
+                provider,
+                model,
                 duration,
                 tokens_used,
                 cost_usd,
@@ -239,7 +242,11 @@ impl Observer for OtelObserver {
                     opentelemetry::trace::SpanBuilder::from_name("agent.invocation")
                         .with_kind(SpanKind::Internal)
                         .with_start_time(start_time)
-                        .with_attributes(vec![KeyValue::new("duration_s", secs)]),
+                        .with_attributes(vec![
+                            KeyValue::new("provider", provider.clone()),
+                            KeyValue::new("model", model.clone()),
+                            KeyValue::new("duration_s", secs),
+                        ]),
                 );
                 if let Some(t) = tokens_used {
                     span.set_attribute(KeyValue::new("tokens_used", *t as i64));
@@ -249,7 +256,13 @@ impl Observer for OtelObserver {
                 }
                 span.end();
 
-                self.agent_duration.record(secs, &[]);
+                self.agent_duration.record(
+                    secs,
+                    &[
+                        KeyValue::new("provider", provider.clone()),
+                        KeyValue::new("model", model.clone()),
+                    ],
+                );
                 // Note: tokens are recorded via record_metric(TokensUsed) to avoid
                 // double-counting. AgentEnd only records duration.
             }
@@ -350,6 +363,10 @@ impl Observer for OtelObserver {
     fn name(&self) -> &str {
         "otel"
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 #[cfg(test)]
@@ -396,11 +413,15 @@ mod tests {
             error_message: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
+            provider: "openrouter".into(),
+            model: "claude-sonnet".into(),
             duration: Duration::from_millis(500),
             tokens_used: Some(100),
             cost_usd: Some(0.0015),
         });
         obs.record_event(&ObserverEvent::AgentEnd {
+            provider: "openrouter".into(),
+            model: "claude-sonnet".into(),
             duration: Duration::ZERO,
             tokens_used: None,
             cost_usd: None,

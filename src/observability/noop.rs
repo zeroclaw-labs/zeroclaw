@@ -43,12 +43,14 @@ mod tests {
             model: "test".into(),
             duration: Duration::from_millis(100),
             tokens_used: Some(42),
+            cost_usd: Some(0.001),
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             provider: "test".into(),
             model: "test".into(),
             duration: Duration::ZERO,
             tokens_used: None,
+            cost_usd: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),

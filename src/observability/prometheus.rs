@@ -47,11 +47,9 @@ impl PrometheusObserver {
         )
         .expect("valid metric");
 
-        let heartbeat_ticks = prometheus::IntCounter::new(
-            "zeroclaw_heartbeat_ticks_total",
-            "Total heartbeat ticks",
-        )
-        .expect("valid metric");
+        let heartbeat_ticks =
+            prometheus::IntCounter::new("zeroclaw_heartbeat_ticks_total", "Total heartbeat ticks")
+                .expect("valid metric");
 
         let errors = IntCounterVec::new(
             prometheus::Opts::new("zeroclaw_errors_total", "Total errors by component"),
@@ -158,6 +156,7 @@ impl Observer for PrometheusObserver {
                 model,
                 duration,
                 tokens_used,
+                cost_usd: _,
             } => {
                 // Agent duration is recorded via the histogram with provider/model labels
                 self.agent_duration
@@ -167,11 +166,7 @@ impl Observer for PrometheusObserver {
                     self.tokens_used.set(i64::try_from(*t).unwrap_or(i64::MAX));
                 }
             }
-            ObserverEvent::ToolCallStart { tool } => {
-                self.tool_calls
-                    .with_label_values(&[&tool.to_string(), &"start".to_string()])
-                    .inc();
-            }
+            ObserverEvent::ToolCallStart { tool: _ } => {}
             ObserverEvent::ToolCall {
                 tool,
                 duration,
@@ -179,10 +174,10 @@ impl Observer for PrometheusObserver {
             } => {
                 let success_str = if *success { "true" } else { "false" };
                 self.tool_calls
-                    .with_label_values(&[&tool.to_string(), &success_str.to_string()])
+                    .with_label_values(&[tool.as_str(), success_str])
                     .inc();
                 self.tool_duration
-                    .with_label_values(&[&tool.to_string()])
+                    .with_label_values(&[tool.as_str()])
                     .observe(duration.as_secs_f64());
             }
             ObserverEvent::TurnComplete => {
@@ -221,7 +216,9 @@ impl Observer for PrometheusObserver {
                     .set(*s as f64);
             }
             ObserverMetric::QueueDepth(d) => {
-                self.queue_depth.with_label_values(&[] as &[&str]).set(*d as f64);
+                self.queue_depth
+                    .with_label_values(&[] as &[&str])
+                    .set(*d as f64);
             }
         }
     }
@@ -257,12 +254,14 @@ mod tests {
             model: "claude-sonnet".into(),
             duration: Duration::from_millis(500),
             tokens_used: Some(100),
+            cost_usd: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             duration: Duration::ZERO,
             tokens_used: None,
+            cost_usd: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
