@@ -448,21 +448,29 @@ fn find_json_end(input: &str) -> Option<usize> {
 /// - `browser_open/url>https://example.com`
 /// - `shell/command>ls -la`
 /// - `http_request/url>https://api.example.com`
+fn map_glm_tool_alias(tool_name: &str) -> &str {
+    match tool_name {
+        "browser_open" | "browser" | "web_search" | "shell" | "bash" => "shell",
+        "http_request" | "http" => "http_request",
+        _ => tool_name,
+    }
+}
+
+fn build_curl_command(url: &str) -> Option<String> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return None;
+    }
+
+    if url.chars().any(char::is_whitespace) {
+        return None;
+    }
+
+    let escaped = url.replace('\'', r#"'\\''"#);
+    Some(format!("curl -s '{}'", escaped))
+}
+
 fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value, Option<String>)> {
     let mut calls = Vec::new();
-
-    let tool_aliases: std::collections::HashMap<&str, &str> = [
-        ("browser_open", "shell"),
-        ("browser", "shell"),
-        ("web_search", "shell"),
-        ("http_request", "http_request"),
-        ("http", "http_request"),
-        ("shell", "shell"),
-        ("bash", "shell"),
-    ]
-    .iter()
-    .cloned()
-    .collect();
 
     for line in text.lines() {
         let line = line.trim();
@@ -476,16 +484,26 @@ fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value, Opt
             let rest = &line[pos + 1..];
 
             if tool_part.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                let tool_name = tool_aliases.get(tool_part).unwrap_or(&tool_part);
+                let tool_name = map_glm_tool_alias(tool_part);
 
                 if let Some(gt_pos) = rest.find('>') {
                     let param_name = rest[..gt_pos].trim();
                     let value = rest[gt_pos + 1..].trim();
 
-                    let arguments = match *tool_name {
+                    let arguments = match tool_name {
                         "shell" => {
-                            if param_name == "url" || value.starts_with("http") {
-                                serde_json::json!({"command": format!("curl -s '{}'", value)})
+                            if param_name == "url" {
+                                let Some(command) = build_curl_command(value) else {
+                                    continue;
+                                };
+                                serde_json::json!({"command": command})
+                            } else if value.starts_with("http://") || value.starts_with("https://")
+                            {
+                                if let Some(command) = build_curl_command(value) {
+                                    serde_json::json!({"command": command})
+                                } else {
+                                    serde_json::json!({"command": value})
+                                }
                             } else {
                                 serde_json::json!({"command": value})
                             }
@@ -509,10 +527,10 @@ fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value, Opt
         }
 
         // Plain URL
-        if line.starts_with("http://") || line.starts_with("https://") {
+        if let Some(command) = build_curl_command(line) {
             calls.push((
                 "shell".to_string(),
-                serde_json::json!({"command": format!("curl -s '{}'", line)}),
+                serde_json::json!({"command": command}),
                 Some(line.to_string()),
             ));
         }
@@ -585,6 +603,21 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
 
             remaining = &after_open[close_idx + close_tag.len()..];
         } else {
+            if let Some(json_end) = find_json_end(after_open) {
+                if let Ok(value) =
+                    serde_json::from_str::<serde_json::Value>(&after_open[..json_end])
+                {
+                    let parsed_calls = parse_tool_calls_from_json_value(&value);
+                    if !parsed_calls.is_empty() {
+                        calls.extend(parsed_calls);
+                        let after_json = &after_open[json_end..];
+                        if !after_json.trim().is_empty() {
+                            text_parts.push(after_json.trim().to_string());
+                        }
+                        remaining = "";
+                    }
+                }
+            }
             break;
         }
     }
@@ -653,6 +686,7 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     // 1. OpenAI-style JSON with a "tool_calls" array
     // 2. ZeroClaw tool-call tags (<tool_call>, <toolcall>, <tool-call>)
     // 3. Markdown code blocks with tool_call/toolcall/tool-call language
+    // 4. Explicit GLM line-based call formats (e.g. `shell/command>...`)
     // This ensures only the LLM's intentional tool calls are executed.
 
     // Remaining text after last tool call
@@ -2350,5 +2384,22 @@ browser_open/url>https://example.com"#;
         assert_eq!(calls[0].name, "shell");
         assert!(text.contains("Checking"));
         assert!(text.contains("Done"));
+    }
+
+    #[test]
+    fn parse_glm_style_rejects_non_http_url_param() {
+        let response = "browser_open/url>javascript:alert(1)";
+        let calls = parse_glm_style_tool_calls(response);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_unclosed_tool_call_tag() {
+        let response = "<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}}\nDone";
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "pwd");
+        assert_eq!(text, "Done");
     }
 }
