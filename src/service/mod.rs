@@ -509,6 +509,31 @@ fn check_zeroclaw_user() -> Result<()> {
     }
 }
 
+/// Change ownership of a path to zeroclaw:zeroclaw
+#[cfg(unix)]
+fn chown_to_zeroclaw(path: &Path) -> Result<()> {
+    let output = Command::new("chown")
+        .args(["zeroclaw:zeroclaw", &path.to_string_lossy()])
+        .output()
+        .context("Failed to run chown")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Non-fatal: warn but continue
+        eprintln!(
+            "⚠️  Warning: Could not change ownership of {} to zeroclaw:zeroclaw: {}",
+            path.display(),
+            stderr.trim()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn chown_to_zeroclaw(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 /// Warn if the binary path is in a user home directory
 fn warn_if_binary_in_home(exe_path: &Path) {
     let path_str = exe_path.to_string_lossy();
@@ -588,7 +613,11 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
             fs::set_permissions(log_dir, fs::Permissions::from_mode(0o750))
                 .with_context(|| format!("Failed to set permissions on {}", log_dir.display()))?;
         }
-        println!("✅ Created directory: {}", log_dir.display());
+        chown_to_zeroclaw(log_dir)?;
+        println!(
+            "✅ Created directory: {} (owned by zeroclaw:zeroclaw)",
+            log_dir.display()
+        );
     }
 
     let init_script = generate_openrc_script(&exe, "/etc/zeroclaw/config.toml");
