@@ -20,7 +20,6 @@ pub struct QQChannel {
     app_id: String,
     app_secret: String,
     allowed_users: Vec<String>,
-    client: reqwest::Client,
     /// Cached access token + expiry timestamp.
     token_cache: Arc<RwLock<Option<(String, u64)>>>,
     /// Message deduplication set.
@@ -33,10 +32,13 @@ impl QQChannel {
             app_id,
             app_secret,
             allowed_users,
-            client: reqwest::Client::new(),
             token_cache: Arc::new(RwLock::new(None)),
             dedup: Arc::new(RwLock::new(HashSet::new())),
         }
+    }
+
+    fn http_client(&self) -> reqwest::Client {
+        crate::config::build_runtime_proxy_client("channel.qq")
     }
 
     fn is_user_allowed(&self, user_id: &str) -> bool {
@@ -50,7 +52,12 @@ impl QQChannel {
             "clientSecret": self.app_secret,
         });
 
-        let resp = self.client.post(QQ_AUTH_URL).json(&body).send().await?;
+        let resp = self
+            .http_client()
+            .post(QQ_AUTH_URL)
+            .json(&body)
+            .send()
+            .await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -109,7 +116,7 @@ impl QQChannel {
     /// Get the WebSocket gateway URL.
     async fn get_gateway_url(&self, token: &str) -> anyhow::Result<String> {
         let resp = self
-            .client
+            .http_client()
             .get(format!("{QQ_API_BASE}/gateway"))
             .header("Authorization", format!("QQBot {token}"))
             .send()
@@ -190,7 +197,7 @@ impl Channel for QQChannel {
         };
 
         let resp = self
-            .client
+            .http_client()
             .post(&url)
             .header("Authorization", format!("QQBot {token}"))
             .json(&body)

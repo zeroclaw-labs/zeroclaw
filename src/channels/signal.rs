@@ -28,7 +28,6 @@ pub struct SignalChannel {
     allowed_from: Vec<String>,
     ignore_attachments: bool,
     ignore_stories: bool,
-    client: Client,
 }
 
 // ── signal-cli SSE event JSON shapes ────────────────────────────
@@ -81,10 +80,6 @@ impl SignalChannel {
         ignore_stories: bool,
     ) -> Self {
         let http_url = http_url.trim_end_matches('/').to_string();
-        let client = Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .build()
-            .expect("Signal HTTP client should build");
         Self {
             http_url,
             account,
@@ -92,8 +87,13 @@ impl SignalChannel {
             allowed_from,
             ignore_attachments,
             ignore_stories,
-            client,
         }
+    }
+
+    fn http_client(&self) -> Client {
+        let builder = Client::builder().connect_timeout(Duration::from_secs(10));
+        let builder = crate::config::apply_runtime_proxy_to_builder(builder, "channel.signal");
+        builder.build().expect("Signal HTTP client should build")
     }
 
     /// Effective sender: prefer `sourceNumber` (E.164), fall back to `source`.
@@ -178,7 +178,7 @@ impl SignalChannel {
         });
 
         let resp = self
-            .client
+            .http_client()
             .post(&url)
             .timeout(Duration::from_secs(30))
             .header("Content-Type", "application/json")
@@ -298,7 +298,7 @@ impl Channel for SignalChannel {
 
         loop {
             let resp = self
-                .client
+                .http_client()
                 .get(url.clone())
                 .header("Accept", "text/event-stream")
                 .send()
@@ -408,7 +408,7 @@ impl Channel for SignalChannel {
     async fn health_check(&self) -> bool {
         let url = format!("{}/api/v1/check", self.http_url);
         let Ok(resp) = self
-            .client
+            .http_client()
             .get(&url)
             .timeout(Duration::from_secs(10))
             .send()

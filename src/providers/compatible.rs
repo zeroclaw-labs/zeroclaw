@@ -22,7 +22,6 @@ pub struct OpenAiCompatibleProvider {
     /// When false, do not fall back to /v1/responses on chat completions 404.
     /// GLM/Zhipu does not support the responses API.
     supports_responses_fallback: bool,
-    client: Client,
 }
 
 /// How the provider expects the API key to be sent.
@@ -49,11 +48,6 @@ impl OpenAiCompatibleProvider {
             credential: credential.map(ToString::to_string),
             auth_header: auth_style,
             supports_responses_fallback: true,
-            client: Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
         }
     }
 
@@ -71,12 +65,11 @@ impl OpenAiCompatibleProvider {
             credential: credential.map(ToString::to_string),
             auth_header: auth_style,
             supports_responses_fallback: false,
-            client: Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
         }
+    }
+
+    fn http_client(&self) -> Client {
+        crate::config::build_runtime_proxy_client_with_timeouts("provider.compatible", 120, 10)
     }
 
     /// Build the full URL for chat completions, detecting if base_url already includes the path.
@@ -513,7 +506,7 @@ impl OpenAiCompatibleProvider {
         let url = self.responses_url();
 
         let response = self
-            .apply_auth_header(self.client.post(&url).json(&request), credential)
+            .apply_auth_header(self.http_client().post(&url).json(&request), credential)
             .send()
             .await?;
 
@@ -578,7 +571,7 @@ impl Provider for OpenAiCompatibleProvider {
         let url = self.chat_completions_url();
 
         let response = self
-            .apply_auth_header(self.client.post(&url).json(&request), credential)
+            .apply_auth_header(self.http_client().post(&url).json(&request), credential)
             .send()
             .await?;
 
@@ -660,7 +653,7 @@ impl Provider for OpenAiCompatibleProvider {
 
         let url = self.chat_completions_url();
         let response = self
-            .apply_auth_header(self.client.post(&url).json(&request), credential)
+            .apply_auth_header(self.http_client().post(&url).json(&request), credential)
             .send()
             .await?;
 
@@ -760,7 +753,7 @@ impl Provider for OpenAiCompatibleProvider {
 
         let url = self.chat_completions_url();
         let response = self
-            .apply_auth_header(self.client.post(&url).json(&request), credential)
+            .apply_auth_header(self.http_client().post(&url).json(&request), credential)
             .send()
             .await?;
 
@@ -900,7 +893,7 @@ impl Provider for OpenAiCompatibleProvider {
         };
 
         let url = self.chat_completions_url();
-        let client = self.client.clone();
+        let client = self.http_client();
         let auth_header = self.auth_header.clone();
 
         // Use a channel to bridge the async HTTP response to the stream
@@ -967,7 +960,7 @@ impl Provider for OpenAiCompatibleProvider {
             // the goal is TLS handshake and HTTP/2 negotiation.
             let url = self.chat_completions_url();
             let _ = self
-                .apply_auth_header(self.client.get(&url), credential)
+                .apply_auth_header(self.http_client().get(&url), credential)
                 .send()
                 .await?;
         }

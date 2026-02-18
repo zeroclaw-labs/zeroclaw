@@ -15,7 +15,6 @@ pub struct MattermostChannel {
     thread_replies: bool,
     /// When true, only respond to messages that @-mention the bot.
     mention_only: bool,
-    client: reqwest::Client,
     /// Handle for the background typing-indicator loop (aborted on stop_typing).
     typing_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -38,9 +37,12 @@ impl MattermostChannel {
             allowed_users,
             thread_replies,
             mention_only,
-            client: reqwest::Client::new(),
             typing_handle: Mutex::new(None),
         }
+    }
+
+    fn http_client(&self) -> reqwest::Client {
+        crate::config::build_runtime_proxy_client("channel.mattermost")
     }
 
     /// Check if a user ID is in the allowlist.
@@ -53,7 +55,7 @@ impl MattermostChannel {
     /// and detect @-mentions by username.
     async fn get_bot_identity(&self) -> (String, String) {
         let resp: Option<serde_json::Value> = async {
-            self.client
+            self.http_client()
                 .get(format!("{}/api/v4/users/me", self.base_url))
                 .bearer_auth(&self.bot_token)
                 .send()
@@ -109,7 +111,7 @@ impl Channel for MattermostChannel {
         }
 
         let resp = self
-            .client
+            .http_client()
             .post(format!("{}/api/v4/posts", self.base_url))
             .bearer_auth(&self.bot_token)
             .json(&body_map)
@@ -147,7 +149,7 @@ impl Channel for MattermostChannel {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
             let resp = match self
-                .client
+                .http_client()
                 .get(format!(
                     "{}/api/v4/channels/{}/posts",
                     self.base_url, channel_id
@@ -202,7 +204,7 @@ impl Channel for MattermostChannel {
     }
 
     async fn health_check(&self) -> bool {
-        self.client
+        self.http_client()
             .get(format!("{}/api/v4/users/me", self.base_url))
             .bearer_auth(&self.bot_token)
             .send()
@@ -215,7 +217,7 @@ impl Channel for MattermostChannel {
         // Cancel any existing typing loop before starting a new one.
         self.stop_typing(recipient).await?;
 
-        let client = self.client.clone();
+        let client = self.http_client();
         let token = self.bot_token.clone();
         let base_url = self.base_url.clone();
 

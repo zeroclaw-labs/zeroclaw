@@ -7,6 +7,41 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{OnceLock, RwLock};
+
+const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
+    "provider.anthropic",
+    "provider.compatible",
+    "provider.copilot",
+    "provider.gemini",
+    "provider.glm",
+    "provider.ollama",
+    "provider.openai",
+    "provider.openrouter",
+    "channel.dingtalk",
+    "channel.discord",
+    "channel.lark",
+    "channel.matrix",
+    "channel.mattermost",
+    "channel.qq",
+    "channel.signal",
+    "channel.slack",
+    "channel.telegram",
+    "channel.whatsapp",
+    "tool.browser",
+    "tool.composio",
+    "tool.http_request",
+    "tool.pushover",
+    "memory.embeddings",
+    "tunnel.custom",
+];
+
+const SUPPORTED_PROXY_SERVICE_SELECTORS: &[&str] =
+    &["provider.*", "channel.*", "tool.*", "memory.*", "tunnel.*"];
+
+static RUNTIME_PROXY_CONFIG: OnceLock<RwLock<ProxyConfig>> = OnceLock::new();
+static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Client>>> =
+    OnceLock::new();
 
 // ── Top-level config ──────────────────────────────────────────────
 
@@ -86,6 +121,9 @@ pub struct Config {
 
     #[serde(default)]
     pub web_search: WebSearchConfig,
+
+    #[serde(default)]
+    pub proxy: ProxyConfig,
 
     #[serde(default)]
     pub identity: IdentityConfig,
@@ -772,6 +810,465 @@ impl Default for WebSearchConfig {
     }
 }
 
+// ── Proxy ───────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyScope {
+    Environment,
+    #[default]
+    Zeroclaw,
+    Services,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyConfig {
+    /// Enable proxy support for selected scope.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Proxy URL for HTTP requests (supports http, https, socks5, socks5h).
+    #[serde(default)]
+    pub http_proxy: Option<String>,
+    /// Proxy URL for HTTPS requests (supports http, https, socks5, socks5h).
+    #[serde(default)]
+    pub https_proxy: Option<String>,
+    /// Fallback proxy URL for all schemes.
+    #[serde(default)]
+    pub all_proxy: Option<String>,
+    /// No-proxy bypass list. Same format as NO_PROXY.
+    #[serde(default)]
+    pub no_proxy: Vec<String>,
+    /// Proxy application scope.
+    #[serde(default)]
+    pub scope: ProxyScope,
+    /// Service selectors used when scope = "services".
+    #[serde(default)]
+    pub services: Vec<String>,
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            http_proxy: None,
+            https_proxy: None,
+            all_proxy: None,
+            no_proxy: Vec::new(),
+            scope: ProxyScope::Zeroclaw,
+            services: Vec::new(),
+        }
+    }
+}
+
+impl ProxyConfig {
+    pub fn supported_service_keys() -> &'static [&'static str] {
+        SUPPORTED_PROXY_SERVICE_KEYS
+    }
+
+    pub fn supported_service_selectors() -> &'static [&'static str] {
+        SUPPORTED_PROXY_SERVICE_SELECTORS
+    }
+
+    pub fn has_any_proxy_url(&self) -> bool {
+        normalize_proxy_url_option(self.http_proxy.as_deref()).is_some()
+            || normalize_proxy_url_option(self.https_proxy.as_deref()).is_some()
+            || normalize_proxy_url_option(self.all_proxy.as_deref()).is_some()
+    }
+
+    pub fn normalized_services(&self) -> Vec<String> {
+        normalize_service_list(self.services.clone())
+    }
+
+    pub fn normalized_no_proxy(&self) -> Vec<String> {
+        normalize_no_proxy_list(self.no_proxy.clone())
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        for (field, value) in [
+            ("http_proxy", self.http_proxy.as_deref()),
+            ("https_proxy", self.https_proxy.as_deref()),
+            ("all_proxy", self.all_proxy.as_deref()),
+        ] {
+            if let Some(url) = normalize_proxy_url_option(value) {
+                validate_proxy_url(field, &url)?;
+            }
+        }
+
+        for selector in self.normalized_services() {
+            if !is_supported_proxy_service_selector(&selector) {
+                anyhow::bail!(
+                    "Unsupported proxy service selector '{selector}'. Use tool `proxy_config` action `list_services` for valid values"
+                );
+            }
+        }
+
+        if self.enabled && !self.has_any_proxy_url() {
+            anyhow::bail!(
+                "Proxy is enabled but no proxy URL is configured. Set at least one of http_proxy, https_proxy, or all_proxy"
+            );
+        }
+
+        if self.enabled
+            && self.scope == ProxyScope::Services
+            && self.normalized_services().is_empty()
+        {
+            anyhow::bail!(
+                "proxy.scope='services' requires a non-empty proxy.services list when proxy is enabled"
+            );
+        }
+
+        Ok(())
+    }
+
+    pub fn should_apply_to_service(&self, service_key: &str) -> bool {
+        if !self.enabled {
+            return false;
+        }
+
+        match self.scope {
+            ProxyScope::Environment => false,
+            ProxyScope::Zeroclaw => true,
+            ProxyScope::Services => {
+                let service_key = service_key.trim().to_ascii_lowercase();
+                if service_key.is_empty() {
+                    return false;
+                }
+
+                self.normalized_services()
+                    .iter()
+                    .any(|selector| service_selector_matches(selector, &service_key))
+            }
+        }
+    }
+
+    pub fn apply_to_reqwest_builder(
+        &self,
+        mut builder: reqwest::ClientBuilder,
+        service_key: &str,
+    ) -> reqwest::ClientBuilder {
+        if !self.should_apply_to_service(service_key) {
+            return builder;
+        }
+
+        let no_proxy = self.no_proxy_value();
+
+        if let Some(url) = normalize_proxy_url_option(self.all_proxy.as_deref()) {
+            match reqwest::Proxy::all(&url) {
+                Ok(proxy) => {
+                    builder = builder.proxy(apply_no_proxy(proxy, no_proxy.clone()));
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        proxy_url = %url,
+                        service_key,
+                        "Ignoring invalid all_proxy URL: {error}"
+                    );
+                }
+            }
+        }
+
+        if let Some(url) = normalize_proxy_url_option(self.http_proxy.as_deref()) {
+            match reqwest::Proxy::http(&url) {
+                Ok(proxy) => {
+                    builder = builder.proxy(apply_no_proxy(proxy, no_proxy.clone()));
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        proxy_url = %url,
+                        service_key,
+                        "Ignoring invalid http_proxy URL: {error}"
+                    );
+                }
+            }
+        }
+
+        if let Some(url) = normalize_proxy_url_option(self.https_proxy.as_deref()) {
+            match reqwest::Proxy::https(&url) {
+                Ok(proxy) => {
+                    builder = builder.proxy(apply_no_proxy(proxy, no_proxy));
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        proxy_url = %url,
+                        service_key,
+                        "Ignoring invalid https_proxy URL: {error}"
+                    );
+                }
+            }
+        }
+
+        builder
+    }
+
+    pub fn apply_to_process_env(&self) {
+        set_proxy_env_pair("HTTP_PROXY", self.http_proxy.as_deref());
+        set_proxy_env_pair("HTTPS_PROXY", self.https_proxy.as_deref());
+        set_proxy_env_pair("ALL_PROXY", self.all_proxy.as_deref());
+
+        let no_proxy_joined = {
+            let list = self.normalized_no_proxy();
+            (!list.is_empty()).then(|| list.join(","))
+        };
+        set_proxy_env_pair("NO_PROXY", no_proxy_joined.as_deref());
+    }
+
+    pub fn clear_process_env() {
+        clear_proxy_env_pair("HTTP_PROXY");
+        clear_proxy_env_pair("HTTPS_PROXY");
+        clear_proxy_env_pair("ALL_PROXY");
+        clear_proxy_env_pair("NO_PROXY");
+    }
+
+    fn no_proxy_value(&self) -> Option<reqwest::NoProxy> {
+        let joined = {
+            let list = self.normalized_no_proxy();
+            (!list.is_empty()).then(|| list.join(","))
+        };
+        joined.as_deref().and_then(reqwest::NoProxy::from_string)
+    }
+}
+
+fn apply_no_proxy(proxy: reqwest::Proxy, no_proxy: Option<reqwest::NoProxy>) -> reqwest::Proxy {
+    proxy.no_proxy(no_proxy)
+}
+
+fn normalize_proxy_url_option(raw: Option<&str>) -> Option<String> {
+    let value = raw?.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn normalize_no_proxy_list(values: Vec<String>) -> Vec<String> {
+    normalize_comma_values(values)
+}
+
+fn normalize_service_list(values: Vec<String>) -> Vec<String> {
+    let mut normalized = normalize_comma_values(values)
+        .into_iter()
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    normalized.sort_unstable();
+    normalized.dedup();
+    normalized
+}
+
+fn normalize_comma_values(values: Vec<String>) -> Vec<String> {
+    let mut output = Vec::new();
+    for value in values {
+        for part in value.split(',') {
+            let normalized = part.trim();
+            if normalized.is_empty() {
+                continue;
+            }
+            output.push(normalized.to_string());
+        }
+    }
+    output.sort_unstable();
+    output.dedup();
+    output
+}
+
+fn is_supported_proxy_service_selector(selector: &str) -> bool {
+    if SUPPORTED_PROXY_SERVICE_KEYS
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(selector))
+    {
+        return true;
+    }
+
+    SUPPORTED_PROXY_SERVICE_SELECTORS
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(selector))
+}
+
+fn service_selector_matches(selector: &str, service_key: &str) -> bool {
+    if selector == service_key {
+        return true;
+    }
+
+    if let Some(prefix) = selector.strip_suffix(".*") {
+        return service_key.starts_with(prefix)
+            && service_key
+                .strip_prefix(prefix)
+                .is_some_and(|suffix| suffix.starts_with('.'));
+    }
+
+    false
+}
+
+fn validate_proxy_url(field: &str, url: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(url)
+        .with_context(|| format!("Invalid {field} URL: '{url}' is not a valid URL"))?;
+
+    match parsed.scheme() {
+        "http" | "https" | "socks5" | "socks5h" => {}
+        scheme => {
+            anyhow::bail!(
+                "Invalid {field} URL scheme '{scheme}'. Allowed: http, https, socks5, socks5h"
+            );
+        }
+    }
+
+    if parsed.host_str().is_none() {
+        anyhow::bail!("Invalid {field} URL: host is required");
+    }
+
+    Ok(())
+}
+
+fn set_proxy_env_pair(key: &str, value: Option<&str>) {
+    let lowercase_key = key.to_ascii_lowercase();
+    if let Some(value) = value.and_then(|candidate| normalize_proxy_url_option(Some(candidate))) {
+        std::env::set_var(key, &value);
+        std::env::set_var(lowercase_key, value);
+    } else {
+        std::env::remove_var(key);
+        std::env::remove_var(lowercase_key);
+    }
+}
+
+fn clear_proxy_env_pair(key: &str) {
+    std::env::remove_var(key);
+    std::env::remove_var(key.to_ascii_lowercase());
+}
+
+fn runtime_proxy_state() -> &'static RwLock<ProxyConfig> {
+    RUNTIME_PROXY_CONFIG.get_or_init(|| RwLock::new(ProxyConfig::default()))
+}
+
+fn runtime_proxy_client_cache() -> &'static RwLock<HashMap<String, reqwest::Client>> {
+    RUNTIME_PROXY_CLIENT_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn clear_runtime_proxy_client_cache() {
+    match runtime_proxy_client_cache().write() {
+        Ok(mut guard) => {
+            guard.clear();
+        }
+        Err(poisoned) => {
+            poisoned.into_inner().clear();
+        }
+    }
+}
+
+fn runtime_proxy_cache_key(
+    service_key: &str,
+    timeout_secs: Option<u64>,
+    connect_timeout_secs: Option<u64>,
+) -> String {
+    format!(
+        "{}|timeout={}|connect_timeout={}",
+        service_key.trim().to_ascii_lowercase(),
+        timeout_secs
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        connect_timeout_secs
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string())
+    )
+}
+
+fn runtime_proxy_cached_client(cache_key: &str) -> Option<reqwest::Client> {
+    match runtime_proxy_client_cache().read() {
+        Ok(guard) => guard.get(cache_key).cloned(),
+        Err(poisoned) => poisoned.into_inner().get(cache_key).cloned(),
+    }
+}
+
+fn set_runtime_proxy_cached_client(cache_key: String, client: reqwest::Client) {
+    match runtime_proxy_client_cache().write() {
+        Ok(mut guard) => {
+            guard.insert(cache_key, client);
+        }
+        Err(poisoned) => {
+            poisoned.into_inner().insert(cache_key, client);
+        }
+    }
+}
+
+pub fn set_runtime_proxy_config(config: ProxyConfig) {
+    match runtime_proxy_state().write() {
+        Ok(mut guard) => {
+            *guard = config;
+        }
+        Err(poisoned) => {
+            *poisoned.into_inner() = config;
+        }
+    }
+
+    clear_runtime_proxy_client_cache();
+}
+
+pub fn runtime_proxy_config() -> ProxyConfig {
+    match runtime_proxy_state().read() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+pub fn apply_runtime_proxy_to_builder(
+    builder: reqwest::ClientBuilder,
+    service_key: &str,
+) -> reqwest::ClientBuilder {
+    runtime_proxy_config().apply_to_reqwest_builder(builder, service_key)
+}
+
+pub fn build_runtime_proxy_client(service_key: &str) -> reqwest::Client {
+    let cache_key = runtime_proxy_cache_key(service_key, None, None);
+    if let Some(client) = runtime_proxy_cached_client(&cache_key) {
+        return client;
+    }
+
+    let builder = apply_runtime_proxy_to_builder(reqwest::Client::builder(), service_key);
+    let client = builder.build().unwrap_or_else(|error| {
+        tracing::warn!(service_key, "Failed to build proxied client: {error}");
+        reqwest::Client::new()
+    });
+    set_runtime_proxy_cached_client(cache_key, client.clone());
+    client
+}
+
+pub fn build_runtime_proxy_client_with_timeouts(
+    service_key: &str,
+    timeout_secs: u64,
+    connect_timeout_secs: u64,
+) -> reqwest::Client {
+    let cache_key =
+        runtime_proxy_cache_key(service_key, Some(timeout_secs), Some(connect_timeout_secs));
+    if let Some(client) = runtime_proxy_cached_client(&cache_key) {
+        return client;
+    }
+
+    let builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs));
+    let builder = apply_runtime_proxy_to_builder(builder, service_key);
+    let client = builder.build().unwrap_or_else(|error| {
+        tracing::warn!(
+            service_key,
+            "Failed to build proxied timeout client: {error}"
+        );
+        reqwest::Client::new()
+    });
+    set_runtime_proxy_cached_client(cache_key, client.clone());
+    client
+}
+
+fn parse_proxy_scope(raw: &str) -> Option<ProxyScope> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "environment" | "env" => Some(ProxyScope::Environment),
+        "zeroclaw" | "internal" | "core" => Some(ProxyScope::Zeroclaw),
+        "services" | "service" => Some(ProxyScope::Services),
+        _ => None,
+    }
+}
+
+fn parse_proxy_enabled(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
 // ── Memory ───────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1922,6 +2419,7 @@ impl Default for Config {
             browser: BrowserConfig::default(),
             http_request: HttpRequestConfig::default(),
             web_search: WebSearchConfig::default(),
+            proxy: ProxyConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
@@ -2368,6 +2866,74 @@ impl Config {
                 }
             }
         }
+        // Proxy enabled flag: ZEROCLAW_PROXY_ENABLED
+        let explicit_proxy_enabled = std::env::var("ZEROCLAW_PROXY_ENABLED")
+            .ok()
+            .as_deref()
+            .and_then(parse_proxy_enabled);
+        if let Some(enabled) = explicit_proxy_enabled {
+            self.proxy.enabled = enabled;
+        }
+
+        // Proxy URLs: ZEROCLAW_* wins, then generic *PROXY vars.
+        let mut proxy_url_overridden = false;
+        if let Ok(proxy_url) =
+            std::env::var("ZEROCLAW_HTTP_PROXY").or_else(|_| std::env::var("HTTP_PROXY"))
+        {
+            self.proxy.http_proxy = normalize_proxy_url_option(Some(&proxy_url));
+            proxy_url_overridden = true;
+        }
+        if let Ok(proxy_url) =
+            std::env::var("ZEROCLAW_HTTPS_PROXY").or_else(|_| std::env::var("HTTPS_PROXY"))
+        {
+            self.proxy.https_proxy = normalize_proxy_url_option(Some(&proxy_url));
+            proxy_url_overridden = true;
+        }
+        if let Ok(proxy_url) =
+            std::env::var("ZEROCLAW_ALL_PROXY").or_else(|_| std::env::var("ALL_PROXY"))
+        {
+            self.proxy.all_proxy = normalize_proxy_url_option(Some(&proxy_url));
+            proxy_url_overridden = true;
+        }
+        if let Ok(no_proxy) =
+            std::env::var("ZEROCLAW_NO_PROXY").or_else(|_| std::env::var("NO_PROXY"))
+        {
+            self.proxy.no_proxy = normalize_no_proxy_list(vec![no_proxy]);
+        }
+
+        if explicit_proxy_enabled.is_none()
+            && proxy_url_overridden
+            && self.proxy.has_any_proxy_url()
+        {
+            self.proxy.enabled = true;
+        }
+
+        // Proxy scope and service selectors.
+        if let Ok(scope_raw) = std::env::var("ZEROCLAW_PROXY_SCOPE") {
+            if let Some(scope) = parse_proxy_scope(&scope_raw) {
+                self.proxy.scope = scope;
+            } else {
+                tracing::warn!(
+                    scope = %scope_raw,
+                    "Ignoring invalid ZEROCLAW_PROXY_SCOPE (valid: environment|zeroclaw|services)"
+                );
+            }
+        }
+
+        if let Ok(services_raw) = std::env::var("ZEROCLAW_PROXY_SERVICES") {
+            self.proxy.services = normalize_service_list(vec![services_raw]);
+        }
+
+        if let Err(error) = self.proxy.validate() {
+            tracing::warn!("Invalid proxy configuration ignored: {error}");
+            self.proxy.enabled = false;
+        }
+
+        if self.proxy.enabled && self.proxy.scope == ProxyScope::Environment {
+            self.proxy.apply_to_process_env();
+        }
+
+        set_runtime_proxy_config(self.proxy.clone());
     }
 
     pub fn save(&self) -> Result<()> {
@@ -2682,6 +3248,7 @@ default_temperature = 0.7
             browser: BrowserConfig::default(),
             http_request: HttpRequestConfig::default(),
             web_search: WebSearchConfig::default(),
+            proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
@@ -2821,6 +3388,7 @@ tool_dispatcher = "xml"
             browser: BrowserConfig::default(),
             http_request: HttpRequestConfig::default(),
             web_search: WebSearchConfig::default(),
+            proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
@@ -3619,6 +4187,28 @@ default_temperature = 0.7
             .expect("env override test lock poisoned")
     }
 
+    fn clear_proxy_env_test_vars() {
+        for key in [
+            "ZEROCLAW_PROXY_ENABLED",
+            "ZEROCLAW_HTTP_PROXY",
+            "ZEROCLAW_HTTPS_PROXY",
+            "ZEROCLAW_ALL_PROXY",
+            "ZEROCLAW_NO_PROXY",
+            "ZEROCLAW_PROXY_SCOPE",
+            "ZEROCLAW_PROXY_SERVICES",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+
     #[test]
     fn env_override_api_key() {
         let _env_guard = env_override_test_guard();
@@ -4106,6 +4696,128 @@ default_model = "legacy-model"
         std::env::remove_var("ZEROCLAW_STORAGE_PROVIDER");
         std::env::remove_var("ZEROCLAW_STORAGE_DB_URL");
         std::env::remove_var("ZEROCLAW_STORAGE_CONNECT_TIMEOUT_SECS");
+    }
+
+    #[test]
+    fn proxy_config_scope_services_requires_entries_when_enabled() {
+        let proxy = ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://127.0.0.1:7890".into()),
+            https_proxy: None,
+            all_proxy: None,
+            no_proxy: Vec::new(),
+            scope: ProxyScope::Services,
+            services: Vec::new(),
+        };
+
+        let error = proxy.validate().unwrap_err().to_string();
+        assert!(error.contains("proxy.scope='services'"));
+    }
+
+    #[test]
+    fn env_override_proxy_scope_services() {
+        let _env_guard = env_override_test_guard();
+        clear_proxy_env_test_vars();
+
+        let mut config = Config::default();
+        std::env::set_var("ZEROCLAW_PROXY_ENABLED", "true");
+        std::env::set_var("ZEROCLAW_HTTP_PROXY", "http://127.0.0.1:7890");
+        std::env::set_var(
+            "ZEROCLAW_PROXY_SERVICES",
+            "provider.openai, tool.http_request",
+        );
+        std::env::set_var("ZEROCLAW_PROXY_SCOPE", "services");
+
+        config.apply_env_overrides();
+
+        assert!(config.proxy.enabled);
+        assert_eq!(config.proxy.scope, ProxyScope::Services);
+        assert_eq!(
+            config.proxy.http_proxy.as_deref(),
+            Some("http://127.0.0.1:7890")
+        );
+        assert!(config.proxy.should_apply_to_service("provider.openai"));
+        assert!(config.proxy.should_apply_to_service("tool.http_request"));
+        assert!(!config.proxy.should_apply_to_service("provider.anthropic"));
+
+        clear_proxy_env_test_vars();
+    }
+
+    #[test]
+    fn env_override_proxy_scope_environment_applies_process_env() {
+        let _env_guard = env_override_test_guard();
+        clear_proxy_env_test_vars();
+
+        let mut config = Config::default();
+        std::env::set_var("ZEROCLAW_PROXY_ENABLED", "true");
+        std::env::set_var("ZEROCLAW_PROXY_SCOPE", "environment");
+        std::env::set_var("ZEROCLAW_HTTP_PROXY", "http://127.0.0.1:7890");
+        std::env::set_var("ZEROCLAW_HTTPS_PROXY", "http://127.0.0.1:7891");
+        std::env::set_var("ZEROCLAW_NO_PROXY", "localhost,127.0.0.1");
+
+        config.apply_env_overrides();
+
+        assert_eq!(config.proxy.scope, ProxyScope::Environment);
+        assert_eq!(
+            std::env::var("HTTP_PROXY").ok().as_deref(),
+            Some("http://127.0.0.1:7890")
+        );
+        assert_eq!(
+            std::env::var("HTTPS_PROXY").ok().as_deref(),
+            Some("http://127.0.0.1:7891")
+        );
+        assert!(std::env::var("NO_PROXY")
+            .ok()
+            .is_some_and(|value| value.contains("localhost")));
+
+        clear_proxy_env_test_vars();
+    }
+
+    fn runtime_proxy_cache_contains(cache_key: &str) -> bool {
+        match runtime_proxy_client_cache().read() {
+            Ok(guard) => guard.contains_key(cache_key),
+            Err(poisoned) => poisoned.into_inner().contains_key(cache_key),
+        }
+    }
+
+    #[test]
+    fn runtime_proxy_client_cache_reuses_default_profile_key() {
+        let service_key = format!(
+            "provider.cache_test.{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let cache_key = runtime_proxy_cache_key(&service_key, None, None);
+
+        clear_runtime_proxy_client_cache();
+        assert!(!runtime_proxy_cache_contains(&cache_key));
+
+        let _ = build_runtime_proxy_client(&service_key);
+        assert!(runtime_proxy_cache_contains(&cache_key));
+
+        let _ = build_runtime_proxy_client(&service_key);
+        assert!(runtime_proxy_cache_contains(&cache_key));
+    }
+
+    #[test]
+    fn set_runtime_proxy_config_clears_runtime_proxy_client_cache() {
+        let service_key = format!(
+            "provider.cache_timeout_test.{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let cache_key = runtime_proxy_cache_key(&service_key, Some(30), Some(5));
+
+        clear_runtime_proxy_client_cache();
+        let _ = build_runtime_proxy_client_with_timeouts(&service_key, 30, 5);
+        assert!(runtime_proxy_cache_contains(&cache_key));
+
+        set_runtime_proxy_config(ProxyConfig::default());
+        assert!(!runtime_proxy_cache_contains(&cache_key));
     }
 
     #[test]

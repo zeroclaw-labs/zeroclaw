@@ -114,10 +114,12 @@ impl HttpRequestTool {
         headers: Vec<(String, String)>,
         body: Option<&str>,
     ) -> anyhow::Result<reqwest::Response> {
-        let client = reqwest::Client::builder()
+        let builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.timeout_secs))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
+            .connect_timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none());
+        let builder = crate::config::apply_runtime_proxy_to_builder(builder, "tool.http_request");
+        let client = builder.build()?;
 
         let mut request = client.request(method, url);
 

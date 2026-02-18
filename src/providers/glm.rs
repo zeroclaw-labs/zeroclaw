@@ -14,7 +14,6 @@ pub struct GlmProvider {
     api_key_id: String,
     api_key_secret: String,
     base_url: String,
-    client: Client,
     /// Cached JWT token + expiry timestamp (ms)
     token_cache: Mutex<Option<(String, u64)>>,
 }
@@ -90,11 +89,6 @@ impl GlmProvider {
             api_key_id: id,
             api_key_secret: secret,
             base_url: "https://api.z.ai/api/paas/v4".to_string(),
-            client: Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
             token_cache: Mutex::new(None),
         }
     }
@@ -149,6 +143,10 @@ impl GlmProvider {
 
         Ok(token)
     }
+
+    fn http_client(&self) -> Client {
+        crate::config::build_runtime_proxy_client_with_timeouts("provider.glm", 120, 10)
+    }
 }
 
 #[async_trait]
@@ -185,7 +183,7 @@ impl Provider for GlmProvider {
         let url = format!("{}/chat/completions", self.base_url);
 
         let response = self
-            .client
+            .http_client()
             .post(&url)
             .header("Authorization", format!("Bearer {token}"))
             .json(&request)
