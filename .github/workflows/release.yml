@@ -55,8 +55,12 @@ jobs:
                   printf '%s' "${{ secrets.ANDROID_RELEASE_KEYSTORE_B64 }}" | base64 --decode > android/app/release.keystore
 
             - name: Build release APK
+              env:
+                  JAVA_TOOL_OPTIONS: -XX:MaxMetaspaceSize=1024m
+                  GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m -Dfile.encoding=UTF-8"
               run: |
-                  ./gradlew :app:assembleRelease --no-daemon \
+                  ./gradlew :app:assembleRelease --no-daemon --max-workers=2 \
+                    -PreactNativeArchitectures=arm64-v8a \
                     -Pandroid.injected.signing.store.file=app/release.keystore \
                     -Pandroid.injected.signing.store.password="${{ secrets.ANDROID_RELEASE_STORE_PASSWORD }}" \
                     -Pandroid.injected.signing.key.alias="${{ secrets.ANDROID_RELEASE_KEY_ALIAS }}" \
