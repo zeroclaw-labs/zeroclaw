@@ -1264,19 +1264,18 @@ impl Channel for TelegramChannel {
         message_id: &str,
         text: &str,
     ) -> anyhow::Result<()> {
+        let (chat_id, _) = Self::parse_reply_target(recipient);
+
         // Rate-limit edits per chat
         {
-            let (chat_id_for_limit, _) = Self::parse_reply_target(recipient);
             let last_edits = self.last_draft_edit.lock();
-            if let Some(last_time) = last_edits.get(&chat_id_for_limit) {
+            if let Some(last_time) = last_edits.get(&chat_id) {
                 let elapsed = u64::try_from(last_time.elapsed().as_millis()).unwrap_or(u64::MAX);
                 if elapsed < self.draft_update_interval_ms {
                     return Ok(());
                 }
             }
         }
-
-        let (chat_id, _) = Self::parse_reply_target(recipient);
 
         // Truncate to Telegram limit for mid-stream edits (UTF-8 safe)
         let display_text = if text.len() > TELEGRAM_MAX_MESSAGE_LENGTH {
@@ -1333,7 +1332,11 @@ impl Channel for TelegramChannel {
         message_id: &str,
         text: &str,
     ) -> anyhow::Result<()> {
+        let text = &strip_tool_call_tags(text);
         let (chat_id, thread_id) = Self::parse_reply_target(recipient);
+
+        // Clean up rate-limit tracking for this chat
+        self.last_draft_edit.lock().remove(&chat_id);
 
         // If text exceeds limit, delete draft and send as chunked messages
         if text.len() > TELEGRAM_MAX_MESSAGE_LENGTH {
@@ -1375,7 +1378,7 @@ impl Channel for TelegramChannel {
         };
 
         // Try editing with Markdown formatting
-        let mut body = serde_json::json!({
+        let body = serde_json::json!({
             "chat_id": chat_id,
             "message_id": msg_id,
             "text": text,
@@ -1394,12 +1397,16 @@ impl Channel for TelegramChannel {
         }
 
         // Markdown failed — retry without parse_mode
-        body.as_object_mut().unwrap().remove("parse_mode");
+        let plain_body = serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": msg_id,
+            "text": text,
+        });
 
         let resp = self
             .client
             .post(self.api_url("editMessageText"))
-            .json(&body)
+            .json(&plain_body)
             .send()
             .await?;
 

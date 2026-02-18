@@ -15,6 +15,9 @@ use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 use uuid::Uuid;
 
+/// Minimum characters per chunk when relaying LLM text to a streaming draft.
+const STREAM_CHUNK_MIN_CHARS: usize = 80;
+
 /// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
@@ -944,11 +947,12 @@ pub(crate) async fn run_tool_call_loop(
             // If a streaming sender is provided, relay the text in small chunks
             // so the channel can progressively update the draft message.
             if let Some(ref tx) = on_delta {
-                // Split on whitespace boundaries, accumulating ~80-char chunks.
+                // Split on whitespace boundaries, accumulating chunks of at least
+                // STREAM_CHUNK_MIN_CHARS characters for progressive draft updates.
                 let mut chunk = String::new();
                 for word in display_text.split_inclusive(char::is_whitespace) {
                     chunk.push_str(word);
-                    if chunk.len() >= 80 {
+                    if chunk.len() >= STREAM_CHUNK_MIN_CHARS {
                         if tx.send(std::mem::take(&mut chunk)).await.is_err() {
                             break; // receiver dropped
                         }
