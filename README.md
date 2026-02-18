@@ -134,7 +134,7 @@ Example sample (macOS arm64, measured on February 18, 2026):
 
 1. **Build essentials:**
    - **Linux (Debian/Ubuntu):** `sudo apt install build-essential pkg-config`
-   - **Linux (Fedora/RHEL):** `sudo dnf groupinstall "Development Tools" && sudo dnf install pkg-config`
+   - **Linux (Fedora/RHEL):** `sudo dnf group install development-tools && sudo dnf install pkg-config`
    - **macOS:** Install Xcode Command Line Tools: `xcode-select --install`
 
 2. **Rust toolchain:**
