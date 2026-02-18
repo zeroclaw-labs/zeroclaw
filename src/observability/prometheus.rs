@@ -197,10 +197,6 @@ impl Observer for PrometheusObserver {
             } => {
                 self.errors.with_label_values(&[component]).inc();
             }
-            ObserverEvent::ToolCallStart { .. }
-            | ObserverEvent::TurnComplete
-            | ObserverEvent::LlmRequest { .. }
-            | ObserverEvent::LlmResponse { .. } => {}
         }
     }
 
