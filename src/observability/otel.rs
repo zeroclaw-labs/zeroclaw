@@ -467,4 +467,56 @@ mod tests {
         obs.record_event(&ObserverEvent::HeartbeatTick);
         obs.flush();
     }
+
+    // ── §8.2 OTel export failure resilience tests ────────────
+
+    #[test]
+    fn otel_records_error_event_without_panic() {
+        let obs = test_observer();
+        // Simulate an error event — should not panic even with unreachable endpoint
+        obs.record_event(&ObserverEvent::Error {
+            component: "provider".into(),
+            message: "connection refused to model endpoint".into(),
+        });
+    }
+
+    #[test]
+    fn otel_records_llm_failure_without_panic() {
+        let obs = test_observer();
+        obs.record_event(&ObserverEvent::LlmResponse {
+            provider: "openrouter".into(),
+            model: "missing-model".into(),
+            duration: Duration::from_millis(0),
+            success: false,
+            error_message: Some("404 Not Found".into()),
+        });
+    }
+
+    #[test]
+    fn otel_flush_idempotent_with_unreachable_endpoint() {
+        let obs = test_observer();
+        // Multiple flushes should not panic even when endpoint is unreachable
+        obs.flush();
+        obs.flush();
+        obs.flush();
+    }
+
+    #[test]
+    fn otel_records_zero_duration_metrics() {
+        let obs = test_observer();
+        obs.record_metric(&ObserverMetric::RequestLatency(Duration::ZERO));
+        obs.record_metric(&ObserverMetric::TokensUsed(0));
+        obs.record_metric(&ObserverMetric::ActiveSessions(0));
+        obs.record_metric(&ObserverMetric::QueueDepth(0));
+    }
+
+    #[test]
+    fn otel_observer_creation_with_valid_endpoint_succeeds() {
+        // Even though endpoint is unreachable, creation should succeed
+        let result = OtelObserver::new(Some("http://127.0.0.1:12345"), Some("zeroclaw-test"));
+        assert!(
+            result.is_ok(),
+            "observer creation must succeed even with unreachable endpoint"
+        );
+    }
 }

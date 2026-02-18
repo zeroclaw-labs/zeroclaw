@@ -1012,6 +1012,140 @@ mod tests {
         assert_eq!(provider.compute_backoff(500, &err), 500);
     }
 
+    // ── §2.1 API auth error (401/403) tests ──────────────────
+
+    #[test]
+    fn non_retryable_detects_401() {
+        let err = anyhow::anyhow!("API error (401 Unauthorized): invalid api key");
+        assert!(
+            is_non_retryable(&err),
+            "401 errors must be detected as non-retryable"
+        );
+    }
+
+    #[test]
+    fn non_retryable_detects_403() {
+        let err = anyhow::anyhow!("API error (403 Forbidden): access denied");
+        assert!(
+            is_non_retryable(&err),
+            "403 errors must be detected as non-retryable"
+        );
+    }
+
+    #[test]
+    fn non_retryable_detects_404() {
+        let err = anyhow::anyhow!("API error (404 Not Found): model not found");
+        assert!(
+            is_non_retryable(&err),
+            "404 errors must be detected as non-retryable"
+        );
+    }
+
+    #[test]
+    fn non_retryable_does_not_flag_429() {
+        let err = anyhow::anyhow!("429 Too Many Requests");
+        assert!(
+            !is_non_retryable(&err),
+            "429 must NOT be treated as non-retryable (it is retryable with backoff)"
+        );
+    }
+
+    #[test]
+    fn non_retryable_does_not_flag_408() {
+        let err = anyhow::anyhow!("408 Request Timeout");
+        assert!(
+            !is_non_retryable(&err),
+            "408 must NOT be treated as non-retryable (it is retryable)"
+        );
+    }
+
+    #[test]
+    fn non_retryable_does_not_flag_500() {
+        let err = anyhow::anyhow!("500 Internal Server Error");
+        assert!(
+            !is_non_retryable(&err),
+            "500 must NOT be treated as non-retryable (server errors are retryable)"
+        );
+    }
+
+    #[test]
+    fn non_retryable_does_not_flag_502() {
+        let err = anyhow::anyhow!("502 Bad Gateway");
+        assert!(
+            !is_non_retryable(&err),
+            "502 must NOT be treated as non-retryable"
+        );
+    }
+
+    // ── §2.2 Rate limit Retry-After edge cases ───────────────
+
+    #[test]
+    fn parse_retry_after_zero() {
+        let err = anyhow::anyhow!("429 Too Many Requests, Retry-After: 0");
+        assert_eq!(
+            parse_retry_after_ms(&err),
+            Some(0),
+            "Retry-After: 0 should parse as 0ms"
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_with_underscore_separator() {
+        let err = anyhow::anyhow!("rate limited, retry_after: 10");
+        assert_eq!(
+            parse_retry_after_ms(&err),
+            Some(10_000),
+            "retry_after with underscore must be parsed"
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_space_separator() {
+        let err = anyhow::anyhow!("Retry-After 7");
+        assert_eq!(
+            parse_retry_after_ms(&err),
+            Some(7000),
+            "Retry-After with space separator must be parsed"
+        );
+    }
+
+    #[test]
+    fn rate_limited_false_for_generic_error() {
+        let err = anyhow::anyhow!("Connection refused");
+        assert!(
+            !is_rate_limited(&err),
+            "generic errors must not be flagged as rate-limited"
+        );
+    }
+
+    // ── §2.3 Malformed API response error classification ─────
+
+    #[tokio::test]
+    async fn non_retryable_skips_retries_for_401() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![(
+                "primary".into(),
+                Box::new(MockProvider {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: usize::MAX,
+                    response: "never",
+                    error: "API error (401 Unauthorized): invalid key",
+                }),
+            )],
+            5,
+            1,
+        );
+
+        let result = provider.simple_chat("hello", "test", 0.0).await;
+        assert!(result.is_err(), "401 should fail without retries");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "must not retry on 401 — should be exactly 1 call"
+        );
+    }
+
     // ── Arc<ModelAwareMock> Provider impl for test ──
 
     #[async_trait]

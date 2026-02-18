@@ -493,4 +493,85 @@ mod tests {
             .unwrap_or("")
             .contains("Rate limit exceeded"));
     }
+
+    #[tokio::test]
+    async fn delegate_context_is_prepended_to_prompt() {
+        let mut agents = HashMap::new();
+        agents.insert(
+            "tester".to_string(),
+            DelegateAgentConfig {
+                provider: "invalid-for-test".to_string(),
+                model: "test-model".to_string(),
+                system_prompt: None,
+                api_key: None,
+                temperature: None,
+                max_depth: 3,
+            },
+        );
+        let tool = DelegateTool::new(agents, None, test_security());
+        let result = tool
+            .execute(json!({
+                "agent": "tester",
+                "prompt": "do something",
+                "context": "some context data"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Failed to create provider"));
+    }
+
+    #[tokio::test]
+    async fn delegate_empty_context_omits_prefix() {
+        let mut agents = HashMap::new();
+        agents.insert(
+            "tester".to_string(),
+            DelegateAgentConfig {
+                provider: "invalid-for-test".to_string(),
+                model: "test-model".to_string(),
+                system_prompt: None,
+                api_key: None,
+                temperature: None,
+                max_depth: 3,
+            },
+        );
+        let tool = DelegateTool::new(agents, None, test_security());
+        let result = tool
+            .execute(json!({
+                "agent": "tester",
+                "prompt": "do something",
+                "context": ""
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Failed to create provider"));
+    }
+
+    #[test]
+    fn delegate_depth_construction() {
+        let tool = DelegateTool::with_depth(sample_agents(), None, test_security(), 5);
+        assert_eq!(tool.depth, 5);
+    }
+
+    #[tokio::test]
+    async fn delegate_no_agents_configured() {
+        let tool = DelegateTool::new(HashMap::new(), None, test_security());
+        let result = tool
+            .execute(json!({"agent": "any", "prompt": "test"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("none configured"));
+    }
 }

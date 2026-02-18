@@ -348,4 +348,76 @@ mod tests {
         let result = cache.get(&key).unwrap();
         assert_eq!(result.as_deref(), Some("はい、Rustは素晴らしい"));
     }
+
+    // ── §4.4 Cache eviction under pressure tests ─────────────
+
+    #[test]
+    fn lru_eviction_keeps_most_recent() {
+        let tmp = TempDir::new().unwrap();
+        let cache = ResponseCache::new(tmp.path(), 60, 3).unwrap();
+
+        // Insert 3 entries
+        for i in 0..3 {
+            let key = ResponseCache::cache_key("gpt-4", None, &format!("prompt {i}"));
+            cache
+                .put(&key, "gpt-4", &format!("response {i}"), 10)
+                .unwrap();
+        }
+
+        // Access entry 0 to make it recently used
+        let key0 = ResponseCache::cache_key("gpt-4", None, "prompt 0");
+        let _ = cache.get(&key0).unwrap();
+
+        // Insert entry 3 (triggers eviction)
+        let key3 = ResponseCache::cache_key("gpt-4", None, "prompt 3");
+        cache.put(&key3, "gpt-4", "response 3", 10).unwrap();
+
+        let (count, _, _) = cache.stats().unwrap();
+        assert!(count <= 3, "cache must not exceed max_entries");
+
+        // Entry 0 was recently accessed and should survive
+        let entry0 = cache.get(&key0).unwrap();
+        assert!(
+            entry0.is_some(),
+            "recently accessed entry should survive LRU eviction"
+        );
+    }
+
+    #[test]
+    fn cache_handles_zero_max_entries() {
+        let tmp = TempDir::new().unwrap();
+        let cache = ResponseCache::new(tmp.path(), 60, 0).unwrap();
+
+        let key = ResponseCache::cache_key("gpt-4", None, "test");
+        // Should not panic even with max_entries=0
+        cache.put(&key, "gpt-4", "response", 10).unwrap();
+
+        let (count, _, _) = cache.stats().unwrap();
+        assert_eq!(count, 0, "cache with max_entries=0 should evict everything");
+    }
+
+    #[test]
+    fn cache_concurrent_reads_no_panic() {
+        let tmp = TempDir::new().unwrap();
+        let cache = std::sync::Arc::new(ResponseCache::new(tmp.path(), 60, 100).unwrap());
+
+        let key = ResponseCache::cache_key("gpt-4", None, "concurrent");
+        cache.put(&key, "gpt-4", "response", 10).unwrap();
+
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let cache = std::sync::Arc::clone(&cache);
+            let key = key.clone();
+            handles.push(std::thread::spawn(move || {
+                let _ = cache.get(&key).unwrap();
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let (_, hits, _) = cache.stats().unwrap();
+        assert_eq!(hits, 10, "all concurrent reads should register as hits");
+    }
 }

@@ -1666,4 +1666,117 @@ mod tests {
             assert_eq!(results[0].session_id.as_deref(), Some("sess-x"));
         }
     }
+
+    // ── §4.1 Concurrent write contention tests ──────────────
+
+    #[tokio::test]
+    async fn sqlite_concurrent_writes_no_data_loss() {
+        let (_tmp, mem) = temp_sqlite();
+        let mem = std::sync::Arc::new(mem);
+
+        let mut handles = Vec::new();
+        for i in 0..10 {
+            let mem = std::sync::Arc::clone(&mem);
+            handles.push(tokio::spawn(async move {
+                mem.store(
+                    &format!("concurrent_key_{i}"),
+                    &format!("value_{i}"),
+                    MemoryCategory::Core,
+                    None,
+                )
+                .await
+                .unwrap();
+            }));
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        let count = mem.count().await.unwrap();
+        assert_eq!(
+            count, 10,
+            "all 10 concurrent writes must succeed without data loss"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_concurrent_read_write_no_panic() {
+        let (_tmp, mem) = temp_sqlite();
+        let mem = std::sync::Arc::new(mem);
+
+        // Pre-populate
+        mem.store("shared_key", "initial", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let mut handles = Vec::new();
+
+        // Concurrent reads
+        for _ in 0..5 {
+            let mem = std::sync::Arc::clone(&mem);
+            handles.push(tokio::spawn(async move {
+                let _ = mem.get("shared_key").await.unwrap();
+            }));
+        }
+
+        // Concurrent writes
+        for i in 0..5 {
+            let mem = std::sync::Arc::clone(&mem);
+            handles.push(tokio::spawn(async move {
+                mem.store(
+                    &format!("key_{i}"),
+                    &format!("val_{i}"),
+                    MemoryCategory::Core,
+                    None,
+                )
+                .await
+                .unwrap();
+            }));
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        // Should have 6 total entries (1 pre-existing + 5 new)
+        assert_eq!(mem.count().await.unwrap(), 6);
+    }
+
+    // ── §4.2 Reindex / corruption recovery tests ────────────
+
+    #[tokio::test]
+    async fn sqlite_reindex_preserves_data() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("a", "Rust is fast", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("b", "Python is interpreted", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        mem.reindex().await.unwrap();
+
+        let count = mem.count().await.unwrap();
+        assert_eq!(count, 2, "reindex must preserve all entries");
+
+        let entry = mem.get("a").await.unwrap();
+        assert!(entry.is_some());
+        assert_eq!(entry.unwrap().content, "Rust is fast");
+    }
+
+    #[tokio::test]
+    async fn sqlite_reindex_idempotent() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("x", "test data", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        // Multiple reindex calls should be safe
+        mem.reindex().await.unwrap();
+        mem.reindex().await.unwrap();
+        mem.reindex().await.unwrap();
+
+        assert_eq!(mem.count().await.unwrap(), 1);
+    }
 }

@@ -808,4 +808,73 @@ mod tests {
         let tool = test_tool(vec!["example.com"]);
         assert_eq!(tool.name(), "http_request");
     }
+
+    // ── §1.4 DNS rebinding / SSRF defense-in-depth tests ─────
+
+    #[test]
+    fn ssrf_blocks_loopback_127_range() {
+        assert!(is_private_or_local_host("127.0.0.1"));
+        assert!(is_private_or_local_host("127.0.0.2"));
+        assert!(is_private_or_local_host("127.255.255.255"));
+    }
+
+    #[test]
+    fn ssrf_blocks_rfc1918_10_range() {
+        assert!(is_private_or_local_host("10.0.0.1"));
+        assert!(is_private_or_local_host("10.255.255.255"));
+    }
+
+    #[test]
+    fn ssrf_blocks_rfc1918_172_range() {
+        assert!(is_private_or_local_host("172.16.0.1"));
+        assert!(is_private_or_local_host("172.31.255.255"));
+    }
+
+    #[test]
+    fn ssrf_blocks_unspecified_address() {
+        assert!(is_private_or_local_host("0.0.0.0"));
+    }
+
+    #[test]
+    fn ssrf_blocks_dot_localhost_subdomain() {
+        assert!(is_private_or_local_host("evil.localhost"));
+        assert!(is_private_or_local_host("a.b.localhost"));
+    }
+
+    #[test]
+    fn ssrf_blocks_dot_local_tld() {
+        assert!(is_private_or_local_host("service.local"));
+    }
+
+    #[test]
+    fn ssrf_ipv6_unspecified() {
+        assert!(is_private_or_local_host("::"));
+    }
+
+    #[test]
+    fn validate_rejects_ftp_scheme() {
+        let tool = test_tool(vec!["example.com"]);
+        let err = tool
+            .validate_url("ftp://example.com")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("http://") || err.contains("https://"));
+    }
+
+    #[test]
+    fn validate_rejects_empty_url() {
+        let tool = test_tool(vec!["example.com"]);
+        let err = tool.validate_url("").unwrap_err().to_string();
+        assert!(err.contains("empty"));
+    }
+
+    #[test]
+    fn validate_rejects_ipv6_host() {
+        let tool = test_tool(vec!["example.com"]);
+        let err = tool
+            .validate_url("http://[::1]:8080/path")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("IPv6"));
+    }
 }
