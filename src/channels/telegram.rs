@@ -485,21 +485,75 @@ impl TelegramChannel {
         }
     }
 
+    fn is_telegram_username_char(ch: char) -> bool {
+        ch.is_ascii_alphanumeric() || ch == '_'
+    }
+
+    fn find_bot_mention_spans(text: &str, bot_username: &str) -> Vec<(usize, usize)> {
+        let bot_username = bot_username.trim_start_matches('@');
+        if bot_username.is_empty() {
+            return Vec::new();
+        }
+
+        let mut spans = Vec::new();
+
+        for (at_idx, ch) in text.char_indices() {
+            if ch != '@' {
+                continue;
+            }
+
+            if at_idx > 0 {
+                let prev = text[..at_idx].chars().next_back().unwrap_or(' ');
+                if Self::is_telegram_username_char(prev) {
+                    continue;
+                }
+            }
+
+            let username_start = at_idx + 1;
+            let mut username_end = username_start;
+
+            for (rel_idx, candidate_ch) in text[username_start..].char_indices() {
+                if Self::is_telegram_username_char(candidate_ch) {
+                    username_end = username_start + rel_idx + candidate_ch.len_utf8();
+                } else {
+                    break;
+                }
+            }
+
+            if username_end == username_start {
+                continue;
+            }
+
+            let mention_username = &text[username_start..username_end];
+            if mention_username.eq_ignore_ascii_case(bot_username) {
+                spans.push((at_idx, username_end));
+            }
+        }
+
+        spans
+    }
+
     fn contains_bot_mention(text: &str, bot_username: &str) -> bool {
-        let mention = format!("@{}", bot_username);
-        text.contains(&mention)
+        !Self::find_bot_mention_spans(text, bot_username).is_empty()
     }
 
     fn normalize_incoming_content(text: &str, bot_username: &str) -> Option<String> {
-        let mention = format!("@{}", bot_username);
-        let normalized = text.replace(&mention, " ");
-        let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
-
-        if normalized.is_empty() {
-            None
-        } else {
-            Some(normalized)
+        let spans = Self::find_bot_mention_spans(text, bot_username);
+        if spans.is_empty() {
+            let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            return (!normalized.is_empty()).then_some(normalized);
         }
+
+        let mut normalized = String::with_capacity(text.len());
+        let mut cursor = 0;
+        for (start, end) in spans {
+            normalized.push_str(&text[cursor..start]);
+            cursor = end;
+        }
+        normalized.push_str(&text[cursor..]);
+
+        let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+        (!normalized.is_empty()).then_some(normalized)
     }
 
     fn is_group_message(message: &serde_json::Value) -> bool {
@@ -751,12 +805,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
         let content = if self.mention_only && is_group {
             let bot_username = self.bot_username.lock();
-            if let Some(ref bot_username) = *bot_username {
-                Self::normalize_incoming_content(text, bot_username)
-                    .unwrap_or_else(|| text.to_string())
-            } else {
-                text.to_string()
-            }
+            let bot_username = bot_username.as_ref()?;
+            Self::normalize_incoming_content(text, bot_username)?
         } else {
             text.to_string()
         };
@@ -1621,6 +1671,13 @@ impl Channel for TelegramChannel {
         tracing::info!("Telegram channel listening for messages...");
 
         loop {
+            if self.mention_only {
+                let missing_username = self.bot_username.lock().is_none();
+                if missing_username {
+                    let _ = self.get_bot_username().await;
+                }
+            }
+
             let url = self.api_url("getUpdates");
             let body = serde_json::json!({
                 "offset": offset,
@@ -2627,6 +2684,10 @@ mod tests {
             "Hey @mybot how are you?",
             "mybot"
         ));
+        assert!(TelegramChannel::contains_bot_mention(
+            "Hello @MyBot, can you help?",
+            "mybot"
+        ));
     }
 
     #[test]
@@ -2637,6 +2698,10 @@ mod tests {
         ));
         assert!(!TelegramChannel::contains_bot_mention(
             "Hello mybot",
+            "mybot"
+        ));
+        assert!(!TelegramChannel::contains_bot_mention(
+            "Hello @mybot2",
             "mybot"
         ));
         assert!(!TelegramChannel::contains_bot_mention("", "mybot"));
@@ -2658,6 +2723,81 @@ mod tests {
     fn telegram_normalize_incoming_content_returns_none_for_empty() {
         let result = TelegramChannel::normalize_incoming_content("@mybot", "mybot");
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn parse_update_message_mention_only_group_requires_exact_mention() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], true);
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+
+        let update = serde_json::json!({
+            "update_id": 10,
+            "message": {
+                "message_id": 44,
+                "text": "hello @mybot2",
+                "from": {
+                    "id": 555,
+                    "username": "alice"
+                },
+                "chat": {
+                    "id": -100_200_300,
+                    "type": "group"
+                }
+            }
+        });
+
+        assert!(ch.parse_update_message(&update).is_none());
+    }
+
+    #[test]
+    fn parse_update_message_mention_only_group_strips_mention_and_drops_empty() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], true);
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+
+        let update = serde_json::json!({
+            "update_id": 11,
+            "message": {
+                "message_id": 45,
+                "text": "Hi @MyBot status please",
+                "from": {
+                    "id": 555,
+                    "username": "alice"
+                },
+                "chat": {
+                    "id": -100_200_300,
+                    "type": "group"
+                }
+            }
+        });
+
+        let parsed = ch
+            .parse_update_message(&update)
+            .expect("mention should parse");
+        assert_eq!(parsed.content, "Hi status please");
+
+        let empty_update = serde_json::json!({
+            "update_id": 12,
+            "message": {
+                "message_id": 46,
+                "text": "@mybot",
+                "from": {
+                    "id": 555,
+                    "username": "alice"
+                },
+                "chat": {
+                    "id": -100_200_300,
+                    "type": "group"
+                }
+            }
+        });
+
+        assert!(ch.parse_update_message(&empty_update).is_none());
     }
 
     #[test]
