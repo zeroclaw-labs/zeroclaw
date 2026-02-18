@@ -469,7 +469,6 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
             Regex::new(r"(?s)```tool[_-]?call\s*\n(.*?)(?:```|</tool[_-]?call>|</toolcall>)")
                 .unwrap()
         });
-        let mut md_remaining = response;
         let mut md_text_parts: Vec<String> = Vec::new();
         let mut last_end = 0;
 
@@ -494,9 +493,8 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                 md_text_parts.push(after.trim().to_string());
             }
             text_parts = md_text_parts;
-            md_remaining = "";
+            remaining = "";
         }
-        let _ = md_remaining; // suppress unused warning
     }
 
     // SECURITY: We do NOT fall back to extracting arbitrary JSON from the response
@@ -1664,6 +1662,46 @@ I will now call the tool with this payload:
             calls[0].arguments.get("command").unwrap().as_str().unwrap(),
             "pwd"
         );
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_markdown_tool_call_fence() {
+        let response = r#"I'll check that.
+```tool_call
+{"name": "shell", "arguments": {"command": "pwd"}}
+```
+Done."#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "pwd"
+        );
+        assert!(text.contains("I'll check that."));
+        assert!(text.contains("Done."));
+        assert!(!text.contains("```tool_call"));
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_markdown_tool_call_hybrid_close_tag() {
+        let response = r#"Preface
+```tool-call
+{"name": "shell", "arguments": {"command": "date"}}
+</tool_call>
+Tail"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "date"
+        );
+        assert!(text.contains("Preface"));
+        assert!(text.contains("Tail"));
+        assert!(!text.contains("```tool-call"));
     }
 
     #[test]
