@@ -103,7 +103,7 @@ fn remove_pid(instance_dir: &Path) -> Result<()> {
 ///
 /// Uses `kill(pid, 0)`. Returns true if the process exists, even if we lack
 /// permission to signal it (EPERM means "process exists, but you can't signal it").
-fn is_pid_alive(pid: u32) -> bool {
+pub fn is_pid_alive(pid: u32) -> bool {
     let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
     if ret == 0 {
         return true;

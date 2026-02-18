@@ -115,29 +115,47 @@ fn gate3_pid_ownership_rejects_wrong_process() -> Result<()> {
 fn gate4_stale_pid_cleared() -> Result<()> {
     let (_tmp, registry, _id, inst_dir) = setup_instance("stale", 18804);
 
-    // Write a PID that doesn't exist
+    // Write a PID that doesn't exist (definitely dead)
     let pid_path = inst_dir.join("daemon.pid");
-    fs::write(&pid_path, "4294967")?;
+    let stale_pid: u32 = 4_294_967;
+    fs::write(&pid_path, stale_pid.to_string())?;
     assert!(pid_path.exists(), "PID file should exist before start");
 
-    // Start should detect the stale PID and clear it before spawn attempt.
-    // It will fail because no zeroclaw binary, but the PID file should
-    // have been removed before that error.
+    // Start should detect the stale PID and clear it. Depending on whether
+    // a zeroclaw binary is discoverable, the spawn may succeed or fail.
+    // Either way, the stale PID must NOT be retained.
     let result = lifecycle::start_instance(&registry, "stale");
-    assert!(result.is_err());
-    let msg = result.unwrap_err().to_string();
 
-    // It should NOT say "already running" - the stale PID was cleared
-    assert!(
-        !msg.contains("already running"),
-        "Stale PID should have been cleared, but got: {msg}"
-    );
+    // If it errored, it must not be "already running" (that would mean the
+    // stale PID was treated as alive, which is wrong for a dead PID).
+    if let Err(ref e) = result {
+        assert!(
+            !e.to_string().contains("already running"),
+            "Dead PID {stale_pid} must not be treated as alive: {e}"
+        );
+        // Spawn failed after clearing stale PID -- pidfile should be gone
+        assert!(
+            !pid_path.exists(),
+            "Stale PID file should have been removed before spawn attempt"
+        );
+    }
 
-    // The stale PID file should have been removed
-    assert!(
-        !pid_path.exists(),
-        "Stale PID file should have been removed before spawn attempt"
-    );
+    // If spawn succeeded, the pidfile should contain a NEW pid (not the stale one)
+    if result.is_ok() {
+        assert!(pid_path.exists(), "PID file should exist after successful start");
+        let current_pid: u32 = fs::read_to_string(&pid_path)?.trim().parse()?;
+        assert_ne!(
+            current_pid, stale_pid,
+            "Stale PID must have been replaced, not retained"
+        );
+        // Clean up: stop the accidentally-started instance
+        let _ = lifecycle::stop_instance(&registry, "stale");
+        if pid_path.exists() {
+            // Fallback: direct kill if stop failed (e.g., ownership check on fake binary)
+            unsafe { libc::kill(current_pid as libc::pid_t, libc::SIGKILL); }
+            let _ = fs::remove_file(&pid_path);
+        }
+    }
 
     Ok(())
 }
@@ -307,47 +325,134 @@ fn gate10_fleet_status_multiple_instances() -> Result<()> {
     Ok(())
 }
 
-// ── Gate 11: EPERM liveness -- PID 1 detected as alive ─────────
+// ── Gate 11: EPERM liveness -- direct assertion on is_pid_alive ─
 
 #[test]
 fn gate11_eperm_pid_detected_as_alive() {
-    // As non-root, kill(1, 0) returns EPERM. We must treat that as "alive".
+    // As non-root, kill(1, 0) returns -1 with errno=EPERM.
+    // is_pid_alive must return true (process exists, just can't signal it).
     if unsafe { libc::getuid() } == 0 {
-        return; // skip if running as root (CI edge case)
+        return; // skip if root -- kill(1,0) returns 0 directly
     }
 
+    // Direct liveness assertion: PID 1 is alive via EPERM
+    assert!(
+        lifecycle::is_pid_alive(1),
+        "PID 1 must be detected as alive (EPERM means exists, not dead)"
+    );
+
+    // Counter-assertion: impossible PID is dead (ESRCH)
+    assert!(
+        !lifecycle::is_pid_alive(4_294_967),
+        "Impossible PID must be detected as dead (ESRCH)"
+    );
+
+    // Our own PID is alive (returns 0 directly)
+    assert!(
+        lifecycle::is_pid_alive(std::process::id()),
+        "Own PID must be detected as alive"
+    );
+}
+
+// ── Gate 13: Rollback kills child on post-spawn bookkeeping failure
+
+#[test]
+fn gate13_rollback_kills_child_on_write_pid_failure() {
+    use std::os::unix::fs::PermissionsExt;
+
     let tmp = TempDir::new().unwrap();
-    let cp_dir = tmp.path().join("cp");
-    let instances_dir = cp_dir.join("instances");
-    fs::create_dir_all(&instances_dir).unwrap();
-
-    let registry = Registry::open(&cp_dir.join("registry.db")).unwrap();
-
-    let id = uuid::Uuid::new_v4().to_string();
-    let inst_dir = instances_dir.join(&id);
+    let inst_dir = tmp.path().join("instance");
     fs::create_dir_all(&inst_dir).unwrap();
+
+    // Pre-create logs dir (writable) and lifecycle.lock (writable file)
+    // so they work even after inst_dir becomes read-only.
+    let logs_dir = inst_dir.join("logs");
+    fs::create_dir_all(&logs_dir).unwrap();
+    let lock_file = inst_dir.join("lifecycle.lock");
+    fs::write(&lock_file, "").unwrap();
+
+    // Create a fake zeroclaw binary that just sleeps
+    let fake_bin = tmp.path().join("fake-zeroclaw");
+    fs::write(&fake_bin, "#!/bin/sh\nexec sleep 3600\n").unwrap();
+    fs::set_permissions(&fake_bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // Register instance
+    let registry = Registry::open(&tmp.path().join("registry.db")).unwrap();
     let config_path = inst_dir.join("config.toml");
     fs::write(&config_path, "default_temperature = 0.7\n").unwrap();
     registry
-        .create_instance(&id, "eperm-test", 18813, config_path.to_str().unwrap(), None, None)
+        .create_instance(
+            "rollback-id",
+            "rollback-test",
+            18900,
+            config_path.to_str().unwrap(),
+            None,
+            None,
+        )
         .unwrap();
 
-    // Write PID 1 (init) as the daemon PID. It's alive but EPERM.
-    fs::write(inst_dir.join("daemon.pid"), "1").unwrap();
+    // Make instance dir read-only: lifecycle.lock can still be opened (existing file),
+    // logs/ subdir is still writable, but daemon.pid creation will fail (EACCES).
+    fs::set_permissions(&inst_dir, fs::Permissions::from_mode(0o555)).unwrap();
 
-    // start_instance should see PID 1 as alive (not clear it as stale)
-    let result = lifecycle::start_instance(&registry, "eperm-test");
+    std::env::set_var("ZEROCLAW_BIN", fake_bin.to_str().unwrap());
+    let result = lifecycle::start_instance(&registry, "rollback-test");
+    std::env::remove_var("ZEROCLAW_BIN");
+
+    // Restore permissions so TempDir cleanup works
+    fs::set_permissions(&inst_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // 1. Should have failed with PID write error + rollback message
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
-
-    // It should NOT be a "Cannot find zeroclaw binary" error -- that would mean
-    // it cleared the PID and tried to spawn. It should either report "already running"
-    // (if ownership matched, which it won't) or clear-as-stale (ownership fails).
-    // Since PID 1's environ is unreadable, ownership returns false, so it clears
-    // as "stale PID not owned by this instance". That's correct behavior.
     assert!(
-        !err.contains("already running"),
-        "PID 1 should not be considered 'ours': {err}"
+        err.contains("killed spawned daemon"),
+        "Error should mention rollback kill, got: {err}"
+    );
+
+    // 2. DB status should still be stopped (never updated)
+    let inst = registry.get_instance("rollback-id").unwrap().unwrap();
+    assert_eq!(
+        inst.status, "stopped",
+        "DB must not be updated to 'running' after rollback"
+    );
+
+    // 3. No PID file should exist
+    assert!(
+        !inst_dir.join("daemon.pid").exists(),
+        "PID file must not exist after rollback"
+    );
+
+    // 4. Verify child was killed: scan /proc for any process with our ZEROCLAW_HOME
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let needle = format!("ZEROCLAW_HOME={}", inst_dir.to_string_lossy());
+    let mut orphan_found = false;
+    if let Ok(entries) = fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            let environ_path = format!("/proc/{name}/environ");
+            if let Ok(data) = fs::read(&environ_path) {
+                for chunk in data.split(|&b| b == 0) {
+                    if let Ok(s) = std::str::from_utf8(chunk) {
+                        if s == needle {
+                            orphan_found = true;
+                            // Kill it so we don't leak even if assertion fails
+                            if let Ok(pid) = name.parse::<i32>() {
+                                unsafe { libc::kill(pid, libc::SIGKILL); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        !orphan_found,
+        "Orphaned child process must be killed during rollback"
     );
 }
 
