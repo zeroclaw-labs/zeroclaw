@@ -443,13 +443,25 @@ fn add_column_if_missing(conn: &Connection, name: &str, sql_type: &str) -> Resul
             return Ok(());
         }
     }
+    // Drop the statement/rows before executing ALTER to release any locks
+    drop(rows);
+    drop(stmt);
 
-    conn.execute(
+    // Tolerate "duplicate column name" errors to handle the race where
+    // another process adds the column between our PRAGMA check and ALTER.
+    match conn.execute(
         &format!("ALTER TABLE cron_jobs ADD COLUMN {name} {sql_type}"),
         [],
-    )
-    .with_context(|| format!("Failed to add cron_jobs.{name}"))?;
-    Ok(())
+    ) {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(err, Some(ref msg)))
+            if msg.contains("duplicate column name") =>
+        {
+            tracing::debug!("Column cron_jobs.{name} already exists (concurrent migration): {err}");
+            Ok(())
+        }
+        Err(e) => Err(e).with_context(|| format!("Failed to add cron_jobs.{name}")),
+    }
 }
 
 fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
