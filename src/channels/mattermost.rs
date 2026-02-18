@@ -335,22 +335,8 @@ fn contains_bot_mention_mm(
     post: &serde_json::Value,
 ) -> bool {
     // 1. Text-based: @username (case-insensitive, word-boundary aware)
-    if !bot_username.is_empty() {
-        let at_mention = format!("@{}", bot_username);
-        let text_lower = text.to_lowercase();
-        let mention_lower = at_mention.to_lowercase();
-        if let Some(pos) = text_lower.find(&mention_lower) {
-            // Verify it's a word boundary: the char after the mention (if any) must not be
-            // alphanumeric or underscore (Mattermost usernames are [a-z0-9._-]).
-            let end = pos + mention_lower.len();
-            let at_boundary = end >= text_lower.len()
-                || !text_lower[end..].chars().next().map_or(false, |c| {
-                    c.is_alphanumeric() || c == '_' || c == '-' || c == '.'
-                });
-            if at_boundary {
-                return true;
-            }
-        }
+    if !find_bot_mention_spans(text, bot_username).is_empty() {
+        return true;
     }
 
     // 2. Metadata-based: Mattermost may include a "metadata.mentions" array of user IDs.
@@ -369,6 +355,53 @@ fn contains_bot_mention_mm(
     false
 }
 
+fn is_mattermost_username_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'
+}
+
+fn find_bot_mention_spans(text: &str, bot_username: &str) -> Vec<(usize, usize)> {
+    if bot_username.is_empty() {
+        return Vec::new();
+    }
+
+    let mention = format!("@{}", bot_username.to_ascii_lowercase());
+    let mention_len = mention.len();
+    if mention_len == 0 {
+        return Vec::new();
+    }
+
+    let mention_bytes = mention.as_bytes();
+    let text_bytes = text.as_bytes();
+    let mut spans = Vec::new();
+    let mut index = 0;
+
+    while index + mention_len <= text_bytes.len() {
+        let is_match = text_bytes[index] == b'@'
+            && text_bytes[index..index + mention_len]
+                .iter()
+                .zip(mention_bytes.iter())
+                .all(|(left, right)| left.eq_ignore_ascii_case(right));
+
+        if is_match {
+            let end = index + mention_len;
+            let at_boundary = text[end..]
+                .chars()
+                .next()
+                .is_none_or(|next| !is_mattermost_username_char(next));
+            if at_boundary {
+                spans.push((index, end));
+                index = end;
+                continue;
+            }
+        }
+
+        let step = text[index..].chars().next().map_or(1, char::len_utf8);
+        index += step;
+    }
+
+    spans
+}
+
 /// Normalize incoming Mattermost content when `mention_only` is enabled.
 ///
 /// Returns `None` if the message doesn't mention the bot.
@@ -379,26 +412,28 @@ fn normalize_mattermost_content(
     bot_username: &str,
     post: &serde_json::Value,
 ) -> Option<String> {
-    if !contains_bot_mention_mm(text, bot_user_id, bot_username, post) {
+    let mention_spans = find_bot_mention_spans(text, bot_username);
+    let metadata_mentions_bot = !bot_user_id.is_empty()
+        && post
+            .get("metadata")
+            .and_then(|m| m.get("mentions"))
+            .and_then(|m| m.as_array())
+            .is_some_and(|mentions| mentions.iter().any(|m| m.as_str() == Some(bot_user_id)));
+
+    if mention_spans.is_empty() && !metadata_mentions_bot {
         return None;
     }
 
-    // Strip @bot_username from the text (case-insensitive).
     let mut cleaned = text.to_string();
-    if !bot_username.is_empty() {
-        let at_mention = format!("@{}", bot_username);
-        // Case-insensitive replacement: find each occurrence and replace with space.
-        let lower = cleaned.to_lowercase();
-        let mention_lower = at_mention.to_lowercase();
-        let mut result = String::with_capacity(cleaned.len());
-        let mut search_start = 0;
-        while let Some(pos) = lower[search_start..].find(&mention_lower) {
-            let abs_pos = search_start + pos;
-            result.push_str(&cleaned[search_start..abs_pos]);
+    if !mention_spans.is_empty() {
+        let mut result = String::with_capacity(text.len());
+        let mut cursor = 0;
+        for (start, end) in mention_spans {
+            result.push_str(&text[cursor..start]);
             result.push(' ');
-            search_start = abs_pos + at_mention.len();
+            cursor = end;
         }
-        result.push_str(&cleaned[search_start..]);
+        result.push_str(&text[cursor..]);
         cleaned = result;
     }
 
@@ -789,6 +824,17 @@ mod tests {
     }
 
     #[test]
+    fn mention_detects_later_valid_mention_after_partial_prefix() {
+        let post = json!({});
+        assert!(contains_bot_mention_mm(
+            "@mybotx ignore this, but @mybot handle this",
+            "bot123",
+            "mybot",
+            &post
+        ));
+    }
+
+    #[test]
     fn mention_followed_by_punctuation() {
         let post = json!({});
         // "@mybot," — comma is not alphanumeric/underscore/dash/dot, so it's a boundary
@@ -857,5 +903,13 @@ mod tests {
         let result =
             normalize_mattermost_content("@mybot hello @mybot world", "bot123", "mybot", &post);
         assert_eq!(result.as_deref(), Some("hello   world"));
+    }
+
+    #[test]
+    fn normalize_keeps_partial_username_mentions() {
+        let post = json!({});
+        let result =
+            normalize_mattermost_content("@mybot hello @mybotx world", "bot123", "mybot", &post);
+        assert_eq!(result.as_deref(), Some("hello @mybotx world"));
     }
 }
