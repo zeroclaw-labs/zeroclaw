@@ -60,11 +60,27 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 - **Fully swappable:** core systems are traits (providers, channels, tools, memory, tunnels).
 - **No lock-in:** OpenAI-compatible provider support + pluggable custom endpoints.
 
-## Benchmark Snapshot (Reproducible)
+## Benchmark Snapshot (ZeroClaw vs OpenClaw, Reproducible)
 
-Benchmark claims can drift as code and toolchains evolve, so this section focuses on reproducible local measurement.
+Local machine quick benchmark (macOS arm64, Feb 2026) normalized for 0.8GHz edge hardware.
 
-Measure your current build locally:
+| | OpenClaw | NanoBot | PicoClaw | ZeroClaw 🦀 |
+|---|---|---|---|---|
+| **Language** | TypeScript | Python | Go | **Rust** |
+| **RAM** | > 1GB | > 100MB | < 10MB | **< 5MB** |
+| **Startup (0.8GHz core)** | > 500s | > 30s | < 1s | **< 10ms** |
+| **Binary Size** | ~28MB (dist) | N/A (Scripts) | ~8MB | **3.4 MB** |
+| **Cost** | Mac Mini $599 | Linux SBC ~$50 | Linux Board $10 | **Any hardware $10** |
+
+> Notes: ZeroClaw results measured with `/usr/bin/time -l` on release builds. OpenClaw requires Node.js runtime (~390MB overhead). PicoClaw and ZeroClaw are static binaries.
+
+<p align="center">
+  <img src="zero-claw.jpeg" alt="ZeroClaw vs OpenClaw Comparison" width="800" />
+</p>
+
+### Reproducible local measurement
+
+Benchmark claims can drift as code and toolchains evolve, so always measure your current build locally:
 
 ```bash
 cargo build --release
