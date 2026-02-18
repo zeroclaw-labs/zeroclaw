@@ -1856,10 +1856,11 @@ pub(crate) fn persist_active_workspace_config_dir(config_dir: &Path) -> Result<(
     Ok(())
 }
 
-fn resolve_config_dir_for_workspace(workspace_dir: &Path) -> PathBuf {
+fn resolve_config_dir_for_workspace(workspace_dir: &Path) -> (PathBuf, PathBuf) {
     let workspace_config_dir = workspace_dir.to_path_buf();
+    let workspace_dir = workspace_dir.join("workspace").to_path_buf();
     if workspace_config_dir.join("config.toml").exists() {
-        return workspace_config_dir;
+        return (workspace_config_dir, workspace_dir);
     }
 
     let legacy_config_dir = workspace_dir
@@ -1867,18 +1868,18 @@ fn resolve_config_dir_for_workspace(workspace_dir: &Path) -> PathBuf {
         .map(|parent| parent.join(".zeroclaw"));
     if let Some(legacy_dir) = legacy_config_dir {
         if legacy_dir.join("config.toml").exists() {
-            return legacy_dir;
+            return (legacy_dir, workspace_config_dir);
         }
 
         if workspace_dir
             .file_name()
             .is_some_and(|name| name == std::ffi::OsStr::new("workspace"))
         {
-            return legacy_dir;
+            return (legacy_dir, workspace_config_dir);
         }
     }
 
-    workspace_config_dir
+    (workspace_config_dir, workspace_dir)
 }
 
 fn decrypt_optional_secret(
@@ -1925,8 +1926,7 @@ impl Config {
         // 3. Default ~/.zeroclaw layout
         let (zeroclaw_dir, workspace_dir) = match std::env::var("ZEROCLAW_WORKSPACE") {
             Ok(custom_workspace) if !custom_workspace.is_empty() => {
-                let workspace = PathBuf::from(custom_workspace);
-                (resolve_config_dir_for_workspace(&workspace), workspace)
+                resolve_config_dir_for_workspace(&PathBuf::from(custom_workspace))
             }
             _ => load_persisted_workspace_dirs(&default_zeroclaw_dir)?
                 .unwrap_or((default_zeroclaw_dir, default_workspace_dir)),
@@ -2044,7 +2044,9 @@ impl Config {
         // Workspace directory: ZEROCLAW_WORKSPACE
         if let Ok(workspace) = std::env::var("ZEROCLAW_WORKSPACE") {
             if !workspace.is_empty() {
-                self.workspace_dir = PathBuf::from(workspace);
+                let (_, workspace_dir) =
+                    resolve_config_dir_for_workspace(&PathBuf::from(workspace));
+                self.workspace_dir = workspace_dir;
             }
         }
 
