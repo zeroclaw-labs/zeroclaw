@@ -548,6 +548,10 @@ impl Memory for SqliteMemory {
         category: Option<&MemoryCategory>,
         session_id: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
+        /// Default row cap to prevent unbounded loading.
+        /// Callers needing more should use pagination (future trait extension).
+        const DEFAULT_LIST_LIMIT: i64 = 1000;
+
         let conn = self.conn.lock();
 
         let mut results = Vec::new();
@@ -568,9 +572,9 @@ impl Memory for SqliteMemory {
             let cat_str = Self::category_to_str(cat);
             let mut stmt = conn.prepare(
                 "SELECT id, key, content, category, created_at, session_id FROM memories
-                 WHERE category = ?1 ORDER BY updated_at DESC",
+                 WHERE category = ?1 ORDER BY updated_at DESC LIMIT ?2",
             )?;
-            let rows = stmt.query_map(params![cat_str], row_mapper)?;
+            let rows = stmt.query_map(params![cat_str, DEFAULT_LIST_LIMIT], row_mapper)?;
             for row in rows {
                 let entry = row?;
                 if let Some(sid) = session_id {
@@ -583,9 +587,9 @@ impl Memory for SqliteMemory {
         } else {
             let mut stmt = conn.prepare(
                 "SELECT id, key, content, category, created_at, session_id FROM memories
-                 ORDER BY updated_at DESC",
+                 ORDER BY updated_at DESC LIMIT ?1",
             )?;
-            let rows = stmt.query_map([], row_mapper)?;
+            let rows = stmt.query_map(params![DEFAULT_LIST_LIMIT], row_mapper)?;
             for row in rows {
                 let entry = row?;
                 if let Some(sid) = session_id {
