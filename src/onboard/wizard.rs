@@ -992,6 +992,8 @@ fn fetch_live_models_for_provider(provider_name: &str, api_key: &str) -> Result<
                 // Anthropic also accepts OAuth setup-tokens via ANTHROPIC_OAUTH_TOKEN
                 if provider_name == "anthropic" {
                     std::env::var("ANTHROPIC_OAUTH_TOKEN").ok()
+                } else if provider_name == "minimax" {
+                    std::env::var("MINIMAX_OAUTH_TOKEN").ok()
                 } else {
                     None
                 }
@@ -1881,7 +1883,11 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
         let has_api_key = !api_key.trim().is_empty()
             || std::env::var(provider_env_var(provider_name))
                 .ok()
-                .is_some_and(|value| !value.trim().is_empty());
+                .is_some_and(|value| !value.trim().is_empty())
+            || (provider_name == "minimax"
+                && std::env::var("MINIMAX_OAUTH_TOKEN")
+                    .ok()
+                    .is_some_and(|value| !value.trim().is_empty()));
 
         if can_fetch_without_key || has_api_key {
             if let Some(cached) =
@@ -4901,6 +4907,8 @@ mod tests {
         assert_eq!(provider_env_var("kimi-code"), "KIMI_CODE_API_KEY");
         assert_eq!(provider_env_var("kimi_coding"), "KIMI_CODE_API_KEY");
         assert_eq!(provider_env_var("kimi_for_coding"), "KIMI_CODE_API_KEY");
+        assert_eq!(provider_env_var("minimax-oauth"), "MINIMAX_API_KEY");
+        assert_eq!(provider_env_var("minimax-oauth-cn"), "MINIMAX_API_KEY");
         assert_eq!(provider_env_var("moonshot-intl"), "MOONSHOT_API_KEY");
         assert_eq!(provider_env_var("zai-cn"), "ZAI_API_KEY");
         assert_eq!(provider_env_var("nvidia"), "NVIDIA_API_KEY");
