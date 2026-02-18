@@ -259,7 +259,11 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 .telegram
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("telegram channel not configured"))?;
-            let channel = TelegramChannel::new(tg.bot_token.clone(), tg.allowed_users.clone());
+            let channel = TelegramChannel::new(
+                tg.bot_token.clone(),
+                tg.allowed_users.clone(),
+                tg.mention_only,
+            );
             channel.send(&SendMessage::new(output, target)).await?;
         }
         "discord" => {

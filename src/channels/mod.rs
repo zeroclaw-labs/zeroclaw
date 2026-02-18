@@ -942,8 +942,12 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         channels.push((
             "Telegram",
             Arc::new(
-                TelegramChannel::new(tg.bot_token.clone(), tg.allowed_users.clone())
-                    .with_streaming(tg.stream_mode, tg.draft_update_interval_ms),
+                TelegramChannel::new(
+                    tg.bot_token.clone(),
+                    tg.allowed_users.clone(),
+                    tg.mention_only,
+                )
+                .with_streaming(tg.stream_mode, tg.draft_update_interval_ms),
             ),
         ));
     }
@@ -1262,8 +1266,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     if let Some(ref tg) = config.channels_config.telegram {
         channels.push(Arc::new(
-            TelegramChannel::new(tg.bot_token.clone(), tg.allowed_users.clone())
-                .with_streaming(tg.stream_mode, tg.draft_update_interval_ms),
+            TelegramChannel::new(
+                tg.bot_token.clone(),
+                tg.allowed_users.clone(),
+                tg.mention_only,
+            )
+            .with_streaming(tg.stream_mode, tg.draft_update_interval_ms),
         ));
     }
 

@@ -298,6 +298,7 @@ mod tests {
             allowed_users: vec![],
             stream_mode: crate::config::StreamMode::default(),
             draft_update_interval_ms: 1000,
+            mention_only: false,
         });
         assert!(has_supervised_channels(&config));
     }

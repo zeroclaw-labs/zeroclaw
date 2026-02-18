@@ -1465,6 +1465,10 @@ pub struct TelegramConfig {
     /// Minimum interval (ms) between draft message edits to avoid rate limits.
     #[serde(default = "default_draft_update_interval_ms")]
     pub draft_update_interval_ms: u64,
+    /// When true, only respond to messages that @-mention the bot in groups.
+    /// Direct messages are always processed.
+    #[serde(default)]
+    pub mention_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2535,6 +2539,7 @@ default_temperature = 0.7
                     allowed_users: vec!["user1".into()],
                     stream_mode: StreamMode::default(),
                     draft_update_interval_ms: default_draft_update_interval_ms(),
+                    mention_only: false,
                 }),
                 discord: None,
                 slack: None,
@@ -2808,6 +2813,7 @@ tool_dispatcher = "xml"
             allowed_users: vec!["alice".into(), "bob".into()],
             stream_mode: StreamMode::Partial,
             draft_update_interval_ms: 500,
+            mention_only: false,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
