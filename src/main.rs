@@ -178,7 +178,10 @@ enum Commands {
     },
 
     /// Run diagnostics for daemon/scheduler/channel freshness
-    Doctor,
+    Doctor {
+        #[command(subcommand)]
+        doctor_command: Option<DoctorCommands>,
+    },
 
     /// Show system status (full details)
     Status,
@@ -401,6 +404,20 @@ enum ModelCommands {
         /// Force live refresh and ignore fresh cache
         #[arg(long)]
         force: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DoctorCommands {
+    /// Probe model catalogs across providers and report availability
+    Models {
+        /// Probe a specific provider only (default: all known providers)
+        #[arg(long)]
+        provider: Option<String>,
+
+        /// Prefer cached catalogs when available (skip forced live refresh)
+        #[arg(long)]
+        use_cache: bool,
     },
 }
 
@@ -646,7 +663,12 @@ async fn main() -> Result<()> {
 
         Commands::Models { model_command } => match model_command {
             ModelCommands::Refresh { provider, force } => {
-                onboard::run_models_refresh(&config, provider.as_deref(), force)
+                let config_for_refresh = config.clone();
+                tokio::task::spawn_blocking(move || {
+                    onboard::run_models_refresh(&config_for_refresh, provider.as_deref(), force)
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("models refresh task failed: {e}"))?
             }
         },
 
@@ -685,7 +707,20 @@ async fn main() -> Result<()> {
 
         Commands::Service { service_command } => service::handle_command(&service_command, &config),
 
-        Commands::Doctor => doctor::run(&config),
+        Commands::Doctor { doctor_command } => match doctor_command {
+            Some(DoctorCommands::Models {
+                provider,
+                use_cache,
+            }) => {
+                let config_for_models = config.clone();
+                tokio::task::spawn_blocking(move || {
+                    doctor::run_models(&config_for_models, provider.as_deref(), use_cache)
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("doctor models task failed: {e}"))?
+            }
+            None => doctor::run(&config),
+        },
 
         Commands::Channel { channel_command } => match channel_command {
             ChannelCommands::Start => channels::start_channels(config).await,

@@ -2402,7 +2402,7 @@ impl Default for Config {
             api_key: None,
             api_url: None,
             default_provider: Some("openrouter".to_string()),
-            default_model: Some("anthropic/claude-sonnet-4".to_string()),
+            default_model: Some("anthropic/claude-sonnet-4.6".to_string()),
             default_temperature: 0.7,
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),

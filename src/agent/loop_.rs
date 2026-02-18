@@ -2,7 +2,7 @@ use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{self, Observer, ObserverEvent};
-use crate::providers::{self, ChatMessage, Provider, ToolCall};
+use crate::providers::{self, ChatMessage, ChatRequest, Provider, ToolCall};
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
@@ -868,13 +868,9 @@ pub(crate) async fn run_tool_call_loop(
         max_tool_iterations
     };
 
-    // Build native tool definitions once if the provider supports them.
-    let use_native_tools = provider.supports_native_tools() && !tools_registry.is_empty();
-    let tool_definitions = if use_native_tools {
-        tools_to_openai_format(tools_registry)
-    } else {
-        Vec::new()
-    };
+    let tool_specs: Vec<crate::tools::ToolSpec> =
+        tools_registry.iter().map(|tool| tool.spec()).collect();
+    let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
 
     for _iteration in 0..max_iterations {
         observer.record_event(&ObserverEvent::LlmRequest {
@@ -885,101 +881,73 @@ pub(crate) async fn run_tool_call_loop(
 
         let llm_started_at = Instant::now();
 
-        // Choose between native tool-call API and prompt-based tool use.
-        // `native_tool_calls` preserves the structured ToolCall vec (with IDs) so
-        // that tool results can later be sent back as proper `role: tool` messages.
+        // Unified path via Provider::chat so provider-specific native tool logic
+        // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
+        let request_tools = if use_native_tools {
+            Some(tool_specs.as_slice())
+        } else {
+            None
+        };
+
         let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
-            if use_native_tools {
-                match provider
-                    .chat_with_tools(history, &tool_definitions, model, temperature)
-                    .await
-                {
-                    Ok(resp) => {
-                        observer.record_event(&ObserverEvent::LlmResponse {
-                            provider: provider_name.to_string(),
-                            model: model.to_string(),
-                            duration: llm_started_at.elapsed(),
-                            success: true,
-                            error_message: None,
-                        });
-                        let response_text = resp.text_or_empty().to_string();
-                        let mut calls = parse_structured_tool_calls(&resp.tool_calls);
-                        let mut parsed_text = String::new();
+            match provider
+                .chat(
+                    ChatRequest {
+                        messages: history,
+                        tools: request_tools,
+                    },
+                    model,
+                    temperature,
+                )
+                .await
+            {
+                Ok(resp) => {
+                    observer.record_event(&ObserverEvent::LlmResponse {
+                        provider: provider_name.to_string(),
+                        model: model.to_string(),
+                        duration: llm_started_at.elapsed(),
+                        success: true,
+                        error_message: None,
+                    });
 
-                        if calls.is_empty() {
-                            let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
-                            if !fallback_text.is_empty() {
-                                parsed_text = fallback_text;
-                            }
-                            calls = fallback_calls;
+                    let response_text = resp.text_or_empty().to_string();
+                    let mut calls = parse_structured_tool_calls(&resp.tool_calls);
+                    let mut parsed_text = String::new();
+
+                    if calls.is_empty() {
+                        let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
+                        if !fallback_text.is_empty() {
+                            parsed_text = fallback_text;
                         }
-
-                        // Use JSON format for native tools so convert_messages()
-                        // can reconstruct proper NativeMessage with tool_calls.
-                        let assistant_history_content = if resp.tool_calls.is_empty() {
-                            response_text.clone()
-                        } else {
-                            build_native_assistant_history(&response_text, &resp.tool_calls)
-                        };
-
-                        let native_calls = resp.tool_calls;
-                        (
-                            response_text,
-                            parsed_text,
-                            calls,
-                            assistant_history_content,
-                            native_calls,
-                        )
+                        calls = fallback_calls;
                     }
-                    Err(e) => {
-                        observer.record_event(&ObserverEvent::LlmResponse {
-                            provider: provider_name.to_string(),
-                            model: model.to_string(),
-                            duration: llm_started_at.elapsed(),
-                            success: false,
-                            error_message: Some(crate::providers::sanitize_api_error(
-                                &e.to_string(),
-                            )),
-                        });
-                        return Err(e);
-                    }
+
+                    // Preserve native tool call IDs in assistant history so role=tool
+                    // follow-up messages can reference the exact call id.
+                    let assistant_history_content = if resp.tool_calls.is_empty() {
+                        response_text.clone()
+                    } else {
+                        build_native_assistant_history(&response_text, &resp.tool_calls)
+                    };
+
+                    let native_calls = resp.tool_calls;
+                    (
+                        response_text,
+                        parsed_text,
+                        calls,
+                        assistant_history_content,
+                        native_calls,
+                    )
                 }
-            } else {
-                match provider
-                    .chat_with_history(history, model, temperature)
-                    .await
-                {
-                    Ok(resp) => {
-                        observer.record_event(&ObserverEvent::LlmResponse {
-                            provider: provider_name.to_string(),
-                            model: model.to_string(),
-                            duration: llm_started_at.elapsed(),
-                            success: true,
-                            error_message: None,
-                        });
-                        let response_text = resp;
-                        let assistant_history_content = response_text.clone();
-                        let (parsed_text, calls) = parse_tool_calls(&response_text);
-                        (
-                            response_text,
-                            parsed_text,
-                            calls,
-                            assistant_history_content,
-                            Vec::new(),
-                        )
-                    }
-                    Err(e) => {
-                        observer.record_event(&ObserverEvent::LlmResponse {
-                            provider: provider_name.to_string(),
-                            model: model.to_string(),
-                            duration: llm_started_at.elapsed(),
-                            success: false,
-                            error_message: Some(crate::providers::sanitize_api_error(
-                                &e.to_string(),
-                            )),
-                        });
-                        return Err(e);
-                    }
+                Err(e) => {
+                    observer.record_event(&ObserverEvent::LlmResponse {
+                        provider: provider_name.to_string(),
+                        model: model.to_string(),
+                        duration: llm_started_at.elapsed(),
+                        success: false,
+                        error_message: Some(crate::providers::sanitize_api_error(&e.to_string())),
+                    });
+                    return Err(e);
                 }
             };
 

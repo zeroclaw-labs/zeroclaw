@@ -99,6 +99,132 @@ pub fn run(config: &Config) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelProbeOutcome {
+    Ok,
+    Skipped,
+    AuthOrAccess,
+    Error,
+}
+
+fn classify_model_probe_error(err_message: &str) -> ModelProbeOutcome {
+    let lower = err_message.to_lowercase();
+
+    if lower.contains("does not support live model discovery") {
+        return ModelProbeOutcome::Skipped;
+    }
+
+    if [
+        "401",
+        "403",
+        "429",
+        "unauthorized",
+        "forbidden",
+        "api key",
+        "token",
+        "insufficient balance",
+        "insufficient quota",
+        "plan does not include",
+        "rate limit",
+    ]
+    .iter()
+    .any(|hint| lower.contains(hint))
+    {
+        return ModelProbeOutcome::AuthOrAccess;
+    }
+
+    ModelProbeOutcome::Error
+}
+
+fn doctor_model_targets(provider_override: Option<&str>) -> Vec<String> {
+    if let Some(provider) = provider_override.map(str::trim).filter(|p| !p.is_empty()) {
+        return vec![provider.to_string()];
+    }
+
+    crate::providers::list_providers()
+        .into_iter()
+        .map(|provider| provider.name.to_string())
+        .collect()
+}
+
+pub fn run_models(config: &Config, provider_override: Option<&str>, use_cache: bool) -> Result<()> {
+    let targets = doctor_model_targets(provider_override);
+
+    if targets.is_empty() {
+        anyhow::bail!("No providers available for model probing");
+    }
+
+    println!("🩺 ZeroClaw Doctor — Model Catalog Probe");
+    println!("  Providers to probe: {}", targets.len());
+    println!(
+        "  Mode: {}",
+        if use_cache {
+            "cache-first"
+        } else {
+            "force live refresh"
+        }
+    );
+    println!();
+
+    let mut ok_count = 0usize;
+    let mut skipped_count = 0usize;
+    let mut auth_count = 0usize;
+    let mut error_count = 0usize;
+
+    for provider_name in &targets {
+        println!("  [{}]", provider_name);
+
+        match crate::onboard::run_models_refresh(config, Some(provider_name), !use_cache) {
+            Ok(()) => {
+                ok_count += 1;
+                println!("    ✅ model catalog check passed");
+            }
+            Err(error) => {
+                let error_text = format_error_chain(&error);
+                match classify_model_probe_error(&error_text) {
+                    ModelProbeOutcome::Skipped => {
+                        skipped_count += 1;
+                        println!("    ⚪ skipped: {}", truncate_for_display(&error_text, 160));
+                    }
+                    ModelProbeOutcome::AuthOrAccess => {
+                        auth_count += 1;
+                        println!(
+                            "    ⚠️  auth/access: {}",
+                            truncate_for_display(&error_text, 160)
+                        );
+                    }
+                    ModelProbeOutcome::Error => {
+                        error_count += 1;
+                        println!("    ❌ error: {}", truncate_for_display(&error_text, 160));
+                    }
+                    ModelProbeOutcome::Ok => {
+                        ok_count += 1;
+                    }
+                }
+            }
+        }
+
+        println!();
+    }
+
+    println!(
+        "  Summary: {} ok, {} skipped, {} auth/access, {} errors",
+        ok_count, skipped_count, auth_count, error_count
+    );
+
+    if auth_count > 0 {
+        println!(
+            "  💡 Some providers need valid API keys/plan access before `/models` can be fetched."
+        );
+    }
+
+    if provider_override.is_some() && ok_count == 0 {
+        anyhow::bail!("Model probe failed for target provider")
+    }
+
+    Ok(())
+}
+
 // ── Config semantic validation ───────────────────────────────────
 
 fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
@@ -572,6 +698,22 @@ fn check_command_available(cmd: &str, args: &[&str], cat: &'static str, items: &
     }
 }
 
+fn format_error_chain(error: &anyhow::Error) -> String {
+    let mut parts = Vec::new();
+    for cause in error.chain() {
+        let message = cause.to_string();
+        if !message.is_empty() {
+            parts.push(message);
+        }
+    }
+
+    if parts.is_empty() {
+        return String::new();
+    }
+
+    parts.join(": ")
+}
+
 fn truncate_for_display(input: &str, max_chars: usize) -> String {
     let mut chars = input.chars();
     let preview: String = chars.by_ref().take(max_chars).collect();
@@ -613,6 +755,25 @@ mod tests {
         assert_eq!(DiagItem::ok("t", "m").icon(), "✅");
         assert_eq!(DiagItem::warn("t", "m").icon(), "⚠️ ");
         assert_eq!(DiagItem::error("t", "m").icon(), "❌");
+    }
+
+    #[test]
+    fn classify_model_probe_error_marks_unsupported_as_skipped() {
+        let outcome = classify_model_probe_error(
+            "Provider 'copilot' does not support live model discovery yet",
+        );
+        assert_eq!(outcome, ModelProbeOutcome::Skipped);
+    }
+
+    #[test]
+    fn classify_model_probe_error_marks_auth_and_plan_issues() {
+        let auth_outcome = classify_model_probe_error("OpenAI API error (401): unauthorized");
+        assert_eq!(auth_outcome, ModelProbeOutcome::AuthOrAccess);
+
+        let plan_outcome = classify_model_probe_error(
+            "Z.AI API error (429): plan does not include requested model",
+        );
+        assert_eq!(plan_outcome, ModelProbeOutcome::AuthOrAccess);
     }
 
     #[test]
