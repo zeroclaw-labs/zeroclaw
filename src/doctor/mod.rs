@@ -241,7 +241,10 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     }
 
     // Delegate agents: provider validity
-    for (name, agent) in &config.agents {
+    let mut agent_names: Vec<_> = config.agents.keys().collect();
+    agent_names.sort();
+    for name in agent_names {
+        let agent = config.agents.get(name).unwrap();
         if let Some(reason) = provider_validation_error(&agent.provider) {
             items.push(DiagItem::warn(
                 cat,

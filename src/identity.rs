@@ -783,7 +783,10 @@ pub fn aieos_to_system_prompt(identity: &AieosIdentity) -> String {
         if let Some(ref matrix) = psych.neural_matrix {
             if !matrix.is_empty() {
                 prompt.push_str("\n**Neural Matrix (Cognitive Weights):**\n");
-                for (trait_name, weight) in matrix {
+                let mut sorted_keys: Vec<_> = matrix.keys().collect();
+                sorted_keys.sort();
+                for trait_name in sorted_keys {
+                    let weight = matrix.get(trait_name).unwrap();
                     let _ = writeln!(prompt, "- {}: {:.2}", trait_name, weight);
                 }
             }
@@ -952,7 +955,10 @@ pub fn aieos_to_system_prompt(identity: &AieosIdentity) -> String {
         if let Some(ref favorites) = interests.favorites {
             if !favorites.is_empty() {
                 prompt.push_str("\n**Favorites:**\n");
-                for (category, value) in favorites {
+                let mut sorted_keys: Vec<_> = favorites.keys().collect();
+                sorted_keys.sort();
+                for category in sorted_keys {
+                    let value = favorites.get(category).unwrap();
                     let _ = writeln!(prompt, "- {}: {}", category, value);
                 }
             }
