@@ -80,7 +80,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
             initial_backoff,
             max_backoff,
             move || {
-                let cfg = nodes_cfg.clone();
+                let _cfg = nodes_cfg.clone();
                 let srv = server.clone();
                 async move {
                     // Use the pre-initialized server instance

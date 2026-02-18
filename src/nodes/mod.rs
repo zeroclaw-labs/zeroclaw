@@ -12,7 +12,8 @@ use std::sync::OnceLock;
 use parking_lot::RwLock;
 
 pub use server::NodeServer;
-pub use client::{connect_to_server, NodeClient};
+pub use client::connect_to_server;
+#[allow(unused_imports)]
 pub use types::{
     NodeInfo, NodeCommand, NodeResponse, PairingRequest, PairingResponse,
 };
