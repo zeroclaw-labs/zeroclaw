@@ -9,7 +9,8 @@ pub use schema::{
     LarkConfig, MatrixConfig, MemoryConfig, ModelRouteConfig, ObservabilityConfig,
     PeripheralBoardConfig, PeripheralsConfig, QueryClassificationConfig, ReliabilityConfig,
     ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig,
-    SecretsConfig, SecurityConfig, SlackConfig, TelegramConfig, TunnelConfig, WebSearchConfig,
+    SecretsConfig, SecurityConfig, SlackConfig, StreamMode, TelegramConfig, TunnelConfig,
+    WebSearchConfig,
     WebhookConfig,
 };
 
@@ -31,6 +32,8 @@ mod tests {
         let telegram = TelegramConfig {
             bot_token: "token".into(),
             allowed_users: vec!["alice".into()],
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1000,
         };
 
         let discord = DiscordConfig {

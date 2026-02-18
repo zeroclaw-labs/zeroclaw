@@ -337,7 +337,8 @@ pub fn record_run(
         )
         .context("Failed to prune cron run history")?;
 
-        tx.commit().context("Failed to commit cron run transaction")?;
+        tx.commit()
+            .context("Failed to commit cron run transaction")?;
         Ok(())
     })
 }

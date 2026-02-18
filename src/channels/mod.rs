@@ -221,6 +221,64 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
         history.push(ChatMessage::system(instructions));
     }
 
+    // Determine if this channel supports streaming draft updates
+    let use_streaming = target_channel
+        .as_ref()
+        .map_or(false, |ch| ch.supports_draft_updates());
+
+    // Set up streaming channel if supported
+    let (delta_tx, delta_rx) = if use_streaming {
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
+    // Send initial draft message if streaming
+    let draft_message_id = if use_streaming {
+        if let Some(channel) = target_channel.as_ref() {
+            match channel
+                .send_draft(&SendMessage::new("...", &msg.reply_target))
+                .await
+            {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::debug!("Failed to send draft on {}: {e}", channel.name());
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Spawn a task to forward streaming deltas to draft updates
+    let draft_updater = if let (Some(mut rx), Some(draft_id_ref), Some(channel_ref)) = (
+        delta_rx,
+        draft_message_id.as_deref(),
+        target_channel.as_ref(),
+    ) {
+        let channel = Arc::clone(channel_ref);
+        let reply_target = msg.reply_target.clone();
+        let draft_id = draft_id_ref.to_string();
+        Some(tokio::spawn(async move {
+            let mut accumulated = String::new();
+            while let Some(delta) = rx.recv().await {
+                accumulated.push_str(&delta);
+                if let Err(e) = channel
+                    .update_draft(&reply_target, &draft_id, &accumulated)
+                    .await
+                {
+                    tracing::debug!("Draft update failed: {e}");
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
     let llm_result = tokio::time::timeout(
         Duration::from_secs(CHANNEL_MESSAGE_TIMEOUT_SECS),
         run_tool_call_loop(
@@ -231,13 +289,19 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             "channel-runtime",
             ctx.model.as_str(),
             ctx.temperature,
-            true, // silent — channels don't write to stdout
+            true,
             None,
             msg.channel.as_str(),
             ctx.max_tool_iterations,
+            delta_tx,
         ),
     )
     .await;
+
+    // Wait for draft updater to finish
+    if let Some(handle) = draft_updater {
+        let _ = handle.await;
+    }
 
     if let Some(channel) = target_channel.as_ref() {
         if let Err(e) = channel.stop_typing(&msg.reply_target).await {
@@ -253,7 +317,17 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                 truncate_with_ellipsis(&response, 80)
             );
             if let Some(channel) = target_channel.as_ref() {
-                if let Err(e) = channel
+                if let Some(ref draft_id) = draft_message_id {
+                    if let Err(e) = channel
+                        .finalize_draft(&msg.reply_target, draft_id, &response)
+                        .await
+                    {
+                        tracing::warn!("Failed to finalize draft: {e}; sending as new message");
+                        let _ = channel
+                            .send(&SendMessage::new(&response, &msg.reply_target))
+                            .await;
+                    }
+                } else if let Err(e) = channel
                     .send(&SendMessage::new(response, &msg.reply_target))
                     .await
                 {
@@ -267,12 +341,18 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                 started_at.elapsed().as_millis()
             );
             if let Some(channel) = target_channel.as_ref() {
-                let _ = channel
-                    .send(&SendMessage::new(
-                        format!("⚠️ Error: {e}"),
-                        &msg.reply_target,
-                    ))
-                    .await;
+                if let Some(ref draft_id) = draft_message_id {
+                    let _ = channel
+                        .finalize_draft(&msg.reply_target, draft_id, &format!("⚠️ Error: {e}"))
+                        .await;
+                } else {
+                    let _ = channel
+                        .send(&SendMessage::new(
+                            format!("⚠️ Error: {e}"),
+                            &msg.reply_target,
+                        ))
+                        .await;
+                }
             }
         }
         Err(_) => {
@@ -286,12 +366,17 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                 started_at.elapsed().as_millis()
             );
             if let Some(channel) = target_channel.as_ref() {
-                let _ = channel
-                    .send(&SendMessage::new(
-                        "⚠️ Request timed out while waiting for the model. Please try again.",
-                        &msg.reply_target,
-                    ))
-                    .await;
+                let error_text =
+                    "⚠️ Request timed out while waiting for the model. Please try again.";
+                if let Some(ref draft_id) = draft_message_id {
+                    let _ = channel
+                        .finalize_draft(&msg.reply_target, draft_id, error_text)
+                        .await;
+                } else {
+                    let _ = channel
+                        .send(&SendMessage::new(error_text, &msg.reply_target))
+                        .await;
+                }
             }
         }
     }
@@ -797,10 +882,10 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     if let Some(ref tg) = config.channels_config.telegram {
         channels.push((
             "Telegram",
-            Arc::new(TelegramChannel::new(
-                tg.bot_token.clone(),
-                tg.allowed_users.clone(),
-            )),
+            Arc::new(
+                TelegramChannel::new(tg.bot_token.clone(), tg.allowed_users.clone())
+                    .with_streaming(tg.stream_mode, tg.draft_update_interval_ms),
+            ),
         ));
     }
 
@@ -1117,10 +1202,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
     let mut channels: Vec<Arc<dyn Channel>> = Vec::new();
 
     if let Some(ref tg) = config.channels_config.telegram {
-        channels.push(Arc::new(TelegramChannel::new(
-            tg.bot_token.clone(),
-            tg.allowed_users.clone(),
-        )));
+        channels.push(Arc::new(
+            TelegramChannel::new(tg.bot_token.clone(), tg.allowed_users.clone())
+                .with_streaming(tg.stream_mode, tg.draft_update_interval_ms),
+        ));
     }
 
     if let Some(ref dc) = config.channels_config.discord {

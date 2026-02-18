@@ -725,7 +725,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::schema::{IMessageConfig, MatrixConfig, TelegramConfig};
+    use crate::config::schema::{IMessageConfig, MatrixConfig, StreamMode, TelegramConfig};
     use crate::config::Config;
 
     #[test]
@@ -788,6 +788,8 @@ mod tests {
         config.channels_config.telegram = Some(TelegramConfig {
             bot_token: "123:ABC".into(),
             allowed_users: vec!["user".into()],
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1000,
         });
         let entries = all_integrations();
         let tg = entries.iter().find(|e| e.name == "Telegram").unwrap();

@@ -790,6 +790,7 @@ pub(crate) async fn agent_turn(
         None,
         "channel",
         max_tool_iterations,
+        None,
     )
     .await
 }
@@ -809,6 +810,7 @@ pub(crate) async fn run_tool_call_loop(
     approval: Option<&ApprovalManager>,
     channel_name: &str,
     max_tool_iterations: usize,
+    on_delta: Option<tokio::sync::mpsc::Sender<String>>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -938,7 +940,11 @@ pub(crate) async fn run_tool_call_loop(
         };
 
         if tool_calls.is_empty() {
-            // No tool calls — this is the final response
+            // No tool calls — this is the final response.
+            // If a streaming sender is provided, send the final text through it.
+            if let Some(ref tx) = on_delta {
+                let _ = tx.send(display_text.clone()).await;
+            }
             history.push(ChatMessage::assistant(response_text.clone()));
             return Ok(display_text);
         }
@@ -1358,6 +1364,7 @@ pub async fn run(
             Some(&approval_manager),
             "cli",
             config.agent.max_tool_iterations,
+            None,
         )
         .await?;
         final_output = response.clone();
@@ -1483,6 +1490,7 @@ pub async fn run(
                 Some(&approval_manager),
                 "cli",
                 config.agent.max_tool_iterations,
+                None,
             )
             .await
             {
