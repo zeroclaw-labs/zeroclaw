@@ -497,9 +497,6 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "perplexity" => vec!["PERPLEXITY_API_KEY"],
         "cohere" => vec!["COHERE_API_KEY"],
         name if is_moonshot_alias(name) => vec!["MOONSHOT_API_KEY"],
-        "kimi-code" | "kimi_coding" | "kimi_for_coding" => {
-            vec!["KIMI_CODE_API_KEY", "MOONSHOT_API_KEY"]
-        }
         name if is_glm_alias(name) => vec!["GLM_API_KEY"],
         name if is_minimax_alias(name) => vec![MINIMAX_OAUTH_TOKEN_ENV, MINIMAX_API_KEY_ENV],
         name if is_qianfan_alias(name) => vec!["QIANFAN_API_KEY"],
@@ -628,15 +625,6 @@ pub fn create_provider_with_url(
             key,
             AuthStyle::Bearer,
         ))),
-        "kimi-code" | "kimi_coding" | "kimi_for_coding" => Ok(Box::new(
-            OpenAiCompatibleProvider::new_with_user_agent(
-                "Kimi Code",
-                "https://api.kimi.com/coding/v1",
-                key,
-                AuthStyle::Bearer,
-                "KimiCLI/0.77",
-            ),
-        )),
         "synthetic" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Synthetic", "https://api.synthetic.com", key, AuthStyle::Bearer,
         ))),
@@ -993,12 +981,6 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             local: false,
         },
         ProviderInfo {
-            name: "kimi-code",
-            display_name: "Kimi Code",
-            aliases: &["kimi_coding", "kimi_for_coding"],
-            local: false,
-        },
-        ProviderInfo {
             name: "synthetic",
             display_name: "Synthetic",
             aliases: &[],
@@ -1352,13 +1334,6 @@ mod tests {
     }
 
     #[test]
-    fn factory_kimi_code() {
-        assert!(create_provider("kimi-code", Some("key")).is_ok());
-        assert!(create_provider("kimi_coding", Some("key")).is_ok());
-        assert!(create_provider("kimi_for_coding", Some("key")).is_ok());
-    }
-
-    #[test]
     fn factory_synthetic() {
         assert!(create_provider("synthetic", Some("key")).is_ok());
     }
@@ -1695,7 +1670,6 @@ mod tests {
             "cloudflare",
             "moonshot",
             "moonshot-intl",
-            "kimi-code",
             "moonshot-cn",
             "synthetic",
             "opencode",
