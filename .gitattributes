@@ -1,0 +1,33 @@
+# Normalize all text files
+* text=auto
+
+# Force LF for scripts and build-critical files
+*.sh text eol=lf
+Dockerfile* text eol=lf
+*.rs text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# CI
+.github/**/* text eol=lf
+
+# Images
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+
+# Archives
+*.zip binary
+*.tar binary
+*.tgz binary
+*.gz binary
+*.7z binary
+
+# Compiled artifacts
+*.so binary
+*.dll binary
+*.exe binary
+*.a binary
