@@ -505,16 +505,6 @@ fn check_zeroclaw_user() -> Result<()> {
                     );
                 }
 
-                if !shell.contains("nologin") && !shell.contains("false") {
-                    bail!(
-                        "User 'zeroclaw' exists but has unexpected shell '{}'.\n\
-                         Expected nologin/false for security. Fix with: sudo {} && sudo {}",
-                        shell,
-                        del_cmd,
-                        add_cmd
-                    );
-                }
-
                 if home != "/var/lib/zeroclaw" && home != "/nonexistent" {
                     eprintln!(
                         "⚠️  Warning: zeroclaw user has home directory '{}' (expected /var/lib/zeroclaw or /nonexistent)",
@@ -616,6 +606,115 @@ fn chown_to_zeroclaw(_path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn chown_recursive_to_zeroclaw(path: &Path) -> Result<()> {
+    let output = Command::new("chown")
+        .args(["-R", "zeroclaw:zeroclaw", &path.to_string_lossy()])
+        .output()
+        .context("Failed to run recursive chown")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!(
+            "⚠️  Warning: Could not recursively change ownership of {} to zeroclaw:zeroclaw: {}",
+            path.display(),
+            stderr.trim()
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn chown_recursive_to_zeroclaw(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
+    fs::create_dir_all(target)
+        .with_context(|| format!("Failed to create directory {}", target.display()))?;
+
+    for entry in fs::read_dir(source)
+        .with_context(|| format!("Failed to read directory {}", source.display()))?
+    {
+        let entry = entry?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("Failed to inspect {}", source_path.display()))?;
+
+        if file_type.is_dir() {
+            copy_dir_recursive(&source_path, &target_path)?;
+        } else if file_type.is_file() {
+            if target_path.exists() {
+                continue;
+            }
+            fs::copy(&source_path, &target_path).with_context(|| {
+                format!(
+                    "Failed to copy file {} -> {}",
+                    source_path.display(),
+                    target_path.display()
+                )
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
+fn resolve_invoking_user_config_dir() -> Option<PathBuf> {
+    let sudo_user = std::env::var("SUDO_USER")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty() && value != "root");
+
+    if let Some(user) = sudo_user {
+        if let Ok(output) = Command::new("getent").args(["passwd", &user]).output() {
+            if output.status.success() {
+                let entry = String::from_utf8_lossy(&output.stdout);
+                let fields: Vec<&str> = entry.trim().split(':').collect();
+                if fields.len() >= 6 {
+                    return Some(PathBuf::from(fields[5]).join(".zeroclaw"));
+                }
+            }
+        }
+    }
+
+    std::env::var("HOME")
+        .ok()
+        .map(PathBuf::from)
+        .map(|home| home.join(".zeroclaw"))
+}
+
+fn migrate_openrc_runtime_state_if_needed(config_dir: &Path) -> Result<()> {
+    let target_config = config_dir.join("config.toml");
+    if target_config.exists() {
+        println!(
+            "✅ Reusing existing OpenRC config at {}",
+            target_config.display()
+        );
+        return Ok(());
+    }
+
+    let Some(source_dir) = resolve_invoking_user_config_dir() else {
+        return Ok(());
+    };
+
+    let source_config = source_dir.join("config.toml");
+    if !source_config.exists() {
+        return Ok(());
+    }
+
+    copy_dir_recursive(&source_dir, config_dir)?;
+    println!(
+        "✅ Migrated runtime state from {} to {}",
+        source_dir.display(),
+        config_dir.display()
+    );
+    Ok(())
+}
+
 /// Warn if the binary path is in a user home directory
 fn warn_if_binary_in_home(exe_path: &Path) {
     let path_str = exe_path.to_string_lossy();
@@ -639,7 +738,7 @@ name="zeroclaw"
 description="ZeroClaw daemon"
 
 command="{}"
-command_args="--config-dir {} daemon"
+command_args="daemon"
 command_background="yes"
 command_user="zeroclaw:zeroclaw"
 pidfile="/run/${{RC_SVCNAME}}.pid"
@@ -655,7 +754,6 @@ depend() {{
 }}
 "#,
         exe_path.display(),
-        config_dir.display(),
         config_dir.display(),
         config_dir.join("workspace").display()
     )
@@ -675,7 +773,7 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
     if !is_root() {
         bail!(
             "OpenRC service installation requires root privileges.\n\
-             Please run with sudo: sudo zeroclaw service install --service-init=openrc"
+             Please run with sudo: sudo zeroclaw service install"
         );
     }
 
@@ -701,6 +799,8 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
         println!("✅ Created directory: {}", config_dir.display());
     }
 
+    migrate_openrc_runtime_state_if_needed(config_dir)?;
+
     if !workspace_dir.exists() {
         fs::create_dir_all(&workspace_dir)
             .with_context(|| format!("Failed to create {}", workspace_dir.display()))?;
@@ -717,6 +817,34 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
             workspace_dir.display()
         );
     }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&workspace_dir, fs::Permissions::from_mode(0o750))
+            .with_context(|| format!("Failed to set permissions on {}", workspace_dir.display()))?;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(config_dir, fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("Failed to set permissions on {}", config_dir.display()))?;
+        let config_path = config_dir.join("config.toml");
+        if config_path.exists() {
+            fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).with_context(
+                || format!("Failed to set permissions on {}", config_path.display()),
+            )?;
+        }
+        let secret_key_path = config_dir.join(".secret_key");
+        if secret_key_path.exists() {
+            fs::set_permissions(&secret_key_path, fs::Permissions::from_mode(0o600)).with_context(
+                || format!("Failed to set permissions on {}", secret_key_path.display()),
+            )?;
+        }
+    }
+
+    chown_recursive_to_zeroclaw(config_dir)?;
 
     let created_log_dir = !log_dir.exists();
     if created_log_dir {
@@ -965,7 +1093,7 @@ mod tests {
         assert!(script.contains("name=\"zeroclaw\""));
         assert!(script.contains("description=\"ZeroClaw daemon\""));
         assert!(script.contains("command=\"/usr/local/bin/zeroclaw\""));
-        assert!(script.contains("command_args=\"--config-dir /etc/zeroclaw daemon\""));
+        assert!(script.contains("command_args=\"daemon\""));
         assert!(script.contains("env ZEROCLAW_CONFIG_DIR=\"/etc/zeroclaw\""));
         assert!(script.contains("env ZEROCLAW_WORKSPACE=\"/etc/zeroclaw/workspace\""));
         assert!(script.contains("command_background=\"yes\""));

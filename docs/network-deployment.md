@@ -212,8 +212,8 @@ ZeroClaw supports OpenRC for Alpine Linux and other distributions using the Open
 ### 7.2 Install Service
 
 ```bash
-# Install the OpenRC init script (requires sudo)
-sudo zeroclaw service --service-init=openrc install
+# Install service (OpenRC is auto-detected on Alpine)
+sudo zeroclaw service install
 ```
 
 This creates:
@@ -223,20 +223,9 @@ This creates:
 
 ### 7.3 Configuration
 
-Place your ZeroClaw config at `/etc/zeroclaw/config.toml`:
+No manual config copy is required.
 
-```bash
-# Copy or create system-wide config
-sudo mkdir -p /etc/zeroclaw
-sudo cp ~/.zeroclaw/config.toml /etc/zeroclaw/config.toml
-
-# Set ownership to zeroclaw user (service runs as zeroclaw:zeroclaw)
-sudo chown zeroclaw:zeroclaw /etc/zeroclaw/config.toml
-sudo chmod 600 /etc/zeroclaw/config.toml
-```
-
-> **Note**: The service runs as `zeroclaw:zeroclaw`, so the config file must be readable by that user. The `zeroclaw service install` command creates `/var/log/zeroclaw/` with correct ownership automatically.
-> The OpenRC service also sets `ZEROCLAW_CONFIG_DIR=/etc/zeroclaw` so config and workspace resolve under `/etc/zeroclaw`.
+`sudo zeroclaw service install` automatically prepares `/etc/zeroclaw`, migrates existing runtime state from your user setup when available, and sets ownership/permissions for the `zeroclaw` service user.
 
 ### 7.4 Enable and Start
 
@@ -259,7 +248,7 @@ sudo rc-service zeroclaw status
 | `sudo rc-service zeroclaw stop` | Stop the daemon |
 | `sudo rc-service zeroclaw status` | Check service status |
 | `sudo rc-service zeroclaw restart` | Restart the daemon |
-| `sudo zeroclaw service --service-init=openrc status` | ZeroClaw status wrapper (uses `/etc/zeroclaw` config) |
+| `sudo zeroclaw service status` | ZeroClaw status wrapper (uses `/etc/zeroclaw` config) |
 
 ### 7.6 Logs
 
@@ -284,7 +273,7 @@ sudo rc-service zeroclaw stop
 sudo rc-update del zeroclaw default
 
 # Remove init script
-sudo zeroclaw service --service-init=openrc uninstall
+sudo zeroclaw service uninstall
 ```
 
 ### 7.8 Notes
@@ -297,8 +286,7 @@ sudo zeroclaw service --service-init=openrc uninstall
 
 ### 7.9 Checklist: Alpine/OpenRC Deployment
 
-- [ ] Install: `sudo zeroclaw service --service-init=openrc install`
-- [ ] Create config: `/etc/zeroclaw/config.toml` with permissions `600`
+- [ ] Install: `sudo zeroclaw service install`
 - [ ] Enable: `sudo rc-update add zeroclaw default`
 - [ ] Start: `sudo rc-service zeroclaw start`
 - [ ] Verify: `sudo rc-service zeroclaw status`
