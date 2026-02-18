@@ -59,9 +59,7 @@ const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 
 const DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS: u64 = 2;
 const DEFAULT_CHANNEL_MAX_BACKOFF_SECS: u64 = 60;
-/// Timeout for processing a single channel message (LLM + tools).
-/// 300s for on-device LLMs (Ollama) which are slower than cloud APIs.
-const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 300;
+const MIN_CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 30;
 const CHANNEL_PARALLELISM_PER_CHANNEL: usize = 4;
 const CHANNEL_MIN_IN_FLIGHT_MESSAGES: usize = 8;
 const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
@@ -77,6 +75,7 @@ struct ChannelRuntimeContext {
     system_prompt: Arc<String>,
     model: Arc<String>,
     temperature: f64,
+    message_timeout_secs: u64,
     auto_save_memory: bool,
     max_tool_iterations: usize,
     min_relevance_score: f64,
@@ -331,7 +330,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
     };
 
     let llm_result = tokio::time::timeout(
-        Duration::from_secs(CHANNEL_MESSAGE_TIMEOUT_SECS),
+        Duration::from_secs(ctx.message_timeout_secs),
         run_tool_call_loop(
             ctx.provider.as_ref(),
             &mut history,
@@ -424,7 +423,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
         Err(_) => {
             let timeout_msg = format!(
                 "LLM response timed out after {}s",
-                CHANNEL_MESSAGE_TIMEOUT_SECS
+                ctx.message_timeout_secs
             );
             eprintln!(
                 "  ❌ {} (elapsed: {}ms)",
@@ -1415,6 +1414,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .reliability
         .channel_max_backoff_secs
         .max(DEFAULT_CHANNEL_MAX_BACKOFF_SECS);
+    let message_timeout_secs = config
+        .reliability
+        .channel_message_timeout_secs
+        .max(MIN_CHANNEL_MESSAGE_TIMEOUT_SECS);
 
     // Single message bus — all channels send messages here
     let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(100);
@@ -1450,6 +1453,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         system_prompt: Arc::new(system_prompt),
         model: Arc::new(model.clone()),
         temperature,
+        message_timeout_secs,
         auto_save_memory: config.memory.auto_save,
         max_tool_iterations: config.agent.max_tool_iterations,
         min_relevance_score: config.memory.min_relevance_score,

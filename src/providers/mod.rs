@@ -1348,6 +1348,7 @@ mod tests {
             model_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: 2,
             channel_max_backoff_secs: 60,
+            channel_message_timeout_secs: 300,
             scheduler_poll_secs: 15,
             scheduler_retries: 2,
         };

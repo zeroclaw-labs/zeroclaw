@@ -1208,6 +1208,9 @@ pub struct ReliabilityConfig {
     /// Max backoff for channel/daemon restarts.
     #[serde(default = "default_channel_backoff_max_secs")]
     pub channel_max_backoff_secs: u64,
+    /// Max seconds to wait for one channel message response (LLM + tools).
+    #[serde(default = "default_channel_message_timeout_secs")]
+    pub channel_message_timeout_secs: u64,
     /// Scheduler polling cadence in seconds.
     #[serde(default = "default_scheduler_poll_secs")]
     pub scheduler_poll_secs: u64,
@@ -1232,6 +1235,10 @@ fn default_channel_backoff_max_secs() -> u64 {
     60
 }
 
+fn default_channel_message_timeout_secs() -> u64 {
+    300
+}
+
 fn default_scheduler_poll_secs() -> u64 {
     15
 }
@@ -1250,6 +1257,7 @@ impl Default for ReliabilityConfig {
             model_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: default_channel_backoff_secs(),
             channel_max_backoff_secs: default_channel_backoff_max_secs(),
+            channel_message_timeout_secs: default_channel_message_timeout_secs(),
             scheduler_poll_secs: default_scheduler_poll_secs(),
             scheduler_retries: default_scheduler_retries(),
         }
