@@ -81,6 +81,7 @@ console = "0.15"
 # Discord WebSocket gateway
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+tokio-util = { version = "0.7", features = ["io"] }
 hostname = "0.4.2"
 lettre = { version = "0.11.19", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }
 mail-parser = "0.11.2"

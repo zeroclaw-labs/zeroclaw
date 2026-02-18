@@ -2,6 +2,45 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
+/// Represents an agent lifecycle/task event.
+#[derive(Debug, Clone)]
+pub struct AgentEvent {
+    pub id: String,
+    pub instance_id: String,
+    pub event_type: String,
+    pub channel: Option<String>,
+    pub summary: Option<String>,
+    pub status: String,
+    pub duration_ms: Option<i64>,
+    pub correlation_id: Option<String>,
+    pub metadata: Option<String>,
+    pub created_at: String,
+}
+
+/// Represents a single model usage record.
+#[derive(Debug, Clone)]
+pub struct AgentUsageRecord {
+    pub id: String,
+    pub instance_id: String,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub total_tokens: Option<i64>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub request_id: Option<String>,
+    pub created_at: String,
+}
+
+/// Aggregated usage summary for an instance within a time window.
+#[derive(Debug, Clone)]
+pub struct AgentUsageSummary {
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub total_tokens: Option<i64>,
+    pub request_count: usize,
+    pub unknown_count: usize,
+}
+
 /// Represents a managed ZeroClaw instance in the CP registry.
 #[derive(Debug, Clone)]
 pub struct Instance {
@@ -85,6 +124,66 @@ impl Registry {
         if !has_pid_column {
             conn.execute_batch("ALTER TABLE instances ADD COLUMN pid INTEGER;")?;
         }
+
+        // Phase 7.5: unique active-name index (prevents duplicate active names)
+        let dupes: Vec<(String, i64)> = conn
+            .prepare("SELECT name, COUNT(*) as cnt FROM instances WHERE archived_at IS NULL GROUP BY name HAVING cnt > 1")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if !dupes.is_empty() {
+            let names: Vec<&str> = dupes.iter().map(|(n, _)| n.as_str()).collect();
+            anyhow::bail!(
+                "Cannot create unique active-name index: duplicate active instance names found: {:?}. \
+                 Resolve manually by archiving or renaming duplicates, then restart. \
+                 SQL to inspect: SELECT id, name, status FROM instances WHERE name IN ({}) AND archived_at IS NULL",
+                names,
+                names.iter().map(|n| format!("'{n}'")).collect::<Vec<_>>().join(", ")
+            );
+        }
+
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_instances_active_name
+             ON instances(name) WHERE archived_at IS NULL;"
+        )?;
+
+        // Phase 7.5: agent_events table
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS agent_events (
+                id TEXT PRIMARY KEY NOT NULL,
+                instance_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                channel TEXT,
+                summary TEXT,
+                status TEXT NOT NULL DEFAULT 'completed',
+                duration_ms INTEGER,
+                correlation_id TEXT,
+                metadata TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (instance_id) REFERENCES instances(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_events_instance_created
+                ON agent_events(instance_id, created_at DESC);"
+        )?;
+
+        // Phase 7.5: agent_usage table
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS agent_usage (
+                id TEXT PRIMARY KEY NOT NULL,
+                instance_id TEXT NOT NULL,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                total_tokens INTEGER,
+                provider TEXT,
+                model TEXT,
+                request_id TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (instance_id) REFERENCES instances(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_usage_instance_created
+                ON agent_usage(instance_id, created_at DESC);"
+        )?;
 
         Ok(())
     }
@@ -253,6 +352,171 @@ impl Registry {
     /// Borrow the underlying connection (for rollback operations).
     pub fn conn(&self) -> &Connection {
         &self.conn
+    }
+
+    // ── Agent events (Phase 7.5) ──────────────────────────────────
+
+    /// Insert an agent event record.
+    pub fn insert_agent_event(&self, event: &AgentEvent) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO agent_events (id, instance_id, event_type, channel, summary, status, duration_ms, correlation_id, metadata, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                event.id,
+                event.instance_id,
+                event.event_type,
+                event.channel,
+                event.summary,
+                event.status,
+                event.duration_ms,
+                event.correlation_id,
+                event.metadata,
+                event.created_at,
+            ],
+        ).context("Failed to insert agent event")?;
+        Ok(())
+    }
+
+    /// List agent events for an instance with pagination and filtering.
+    /// Returns (events, total_count).
+    pub fn list_agent_events(
+        &self,
+        instance_id: &str,
+        limit: usize,
+        offset: usize,
+        status_filter: Option<&str>,
+        after: Option<&str>,
+        before: Option<&str>,
+    ) -> Result<(Vec<AgentEvent>, usize)> {
+        let mut where_clauses = vec!["instance_id = ?1".to_string()];
+        let mut param_idx = 2u32;
+        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(instance_id.to_string())];
+
+        if let Some(status) = status_filter {
+            where_clauses.push(format!("status = ?{param_idx}"));
+            bind_values.push(Box::new(status.to_string()));
+            param_idx += 1;
+        }
+        if let Some(after_ts) = after {
+            where_clauses.push(format!("created_at > ?{param_idx}"));
+            bind_values.push(Box::new(after_ts.to_string()));
+            param_idx += 1;
+        }
+        if let Some(before_ts) = before {
+            where_clauses.push(format!("created_at < ?{param_idx}"));
+            bind_values.push(Box::new(before_ts.to_string()));
+            param_idx += 1;
+        }
+
+        let where_sql = where_clauses.join(" AND ");
+
+        // Count total
+        let count_sql = format!("SELECT COUNT(*) FROM agent_events WHERE {where_sql}");
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> = bind_values.iter().map(|b| b.as_ref()).collect();
+        let total: usize = self.conn.query_row(&count_sql, params_ref.as_slice(), |row| {
+            row.get::<_, i64>(0).map(|v| v as usize)
+        })?;
+
+        // Query with pagination
+        let query_sql = format!(
+            "SELECT id, instance_id, event_type, channel, summary, status, duration_ms, correlation_id, metadata, created_at \
+             FROM agent_events WHERE {where_sql} \
+             ORDER BY created_at DESC, id DESC \
+             LIMIT ?{param_idx} OFFSET ?{}",
+            param_idx + 1
+        );
+        let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = bind_values;
+        all_params.push(Box::new(limit as i64));
+        all_params.push(Box::new(offset as i64));
+
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> = all_params.iter().map(|b| b.as_ref()).collect();
+        let mut stmt = self.conn.prepare(&query_sql)?;
+        let rows = stmt.query_map(params_ref.as_slice(), |row| {
+            Ok(AgentEvent {
+                id: row.get(0)?,
+                instance_id: row.get(1)?,
+                event_type: row.get(2)?,
+                channel: row.get(3)?,
+                summary: row.get(4)?,
+                status: row.get(5)?,
+                duration_ms: row.get(6)?,
+                correlation_id: row.get(7)?,
+                metadata: row.get(8)?,
+                created_at: row.get(9)?,
+            })
+        })?;
+
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row?);
+        }
+        Ok((events, total))
+    }
+
+    // ── Agent usage (Phase 7.5) ─────────────────────────────────
+
+    /// Insert an agent usage record.
+    pub fn insert_agent_usage(&self, usage: &AgentUsageRecord) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO agent_usage (id, instance_id, input_tokens, output_tokens, total_tokens, provider, model, request_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                usage.id,
+                usage.instance_id,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.total_tokens,
+                usage.provider,
+                usage.model,
+                usage.request_id,
+                usage.created_at,
+            ],
+        ).context("Failed to insert agent usage")?;
+        Ok(())
+    }
+
+    /// Get aggregated usage for an instance within a time window.
+    pub fn get_agent_usage(
+        &self,
+        instance_id: &str,
+        window_start: Option<&str>,
+        window_end: Option<&str>,
+    ) -> Result<AgentUsageSummary> {
+        let mut where_clauses = vec!["instance_id = ?1".to_string()];
+        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(instance_id.to_string())];
+        let mut param_idx = 2u32;
+
+        if let Some(start) = window_start {
+            where_clauses.push(format!("created_at >= ?{param_idx}"));
+            bind_values.push(Box::new(start.to_string()));
+            param_idx += 1;
+        }
+        if let Some(end) = window_end {
+            where_clauses.push(format!("created_at <= ?{param_idx}"));
+            bind_values.push(Box::new(end.to_string()));
+        }
+
+        let where_sql = where_clauses.join(" AND ");
+        let sql = format!(
+            "SELECT \
+                SUM(input_tokens), \
+                SUM(output_tokens), \
+                SUM(total_tokens), \
+                COUNT(*), \
+                SUM(CASE WHEN total_tokens IS NULL THEN 1 ELSE 0 END) \
+             FROM agent_usage WHERE {where_sql}"
+        );
+
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> = bind_values.iter().map(|b| b.as_ref()).collect();
+        self.conn.query_row(&sql, params_ref.as_slice(), |row| {
+            Ok(AgentUsageSummary {
+                input_tokens: row.get(0)?,
+                output_tokens: row.get(1)?,
+                total_tokens: row.get(2)?,
+                request_count: row.get::<_, Option<i64>>(3)?.unwrap_or(0) as usize,
+                unknown_count: row.get::<_, Option<i64>>(4)?.unwrap_or(0) as usize,
+            })
+        }).context("Failed to query agent usage")
     }
 
     /// List all non-archived instances.

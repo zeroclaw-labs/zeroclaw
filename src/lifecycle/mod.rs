@@ -251,7 +251,7 @@ pub fn log_path(instance_dir: &Path) -> PathBuf {
 }
 
 /// Rotated log file path.
-fn rotated_log_path(instance_dir: &Path) -> PathBuf {
+pub fn rotated_log_path(instance_dir: &Path) -> PathBuf {
     instance_dir.join(LOG_DIR).join(LOG_FILE_ROTATED)
 }
 
