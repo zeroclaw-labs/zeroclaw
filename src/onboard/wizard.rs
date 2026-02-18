@@ -776,6 +776,7 @@ fn supports_live_model_fetch(provider_name: &str) -> bool {
             | "together-ai"
             | "gemini"
             | "ollama"
+            | "astrai"
     )
 }
 
@@ -1022,6 +1023,9 @@ fn fetch_live_models_for_provider(provider_name: &str, api_key: &str) -> Result<
                     "deepseek-v3.1:cloud".to_string(),
                 ]
             }
+        }
+        "astrai" => {
+            fetch_openai_compatible_models("https://as-trai.com/v1/models", api_key.as_deref())?
         }
         _ => Vec::new(),
     };
@@ -1654,6 +1658,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
                 "nvidia" | "nvidia-nim" | "build.nvidia.com" => "https://build.nvidia.com/",
                 "bedrock" => "https://console.aws.amazon.com/iam",
                 "gemini" => "https://aistudio.google.com/app/apikey",
+                "astrai" => "https://as-trai.com",
                 _ => "",
             }
         };
@@ -1818,6 +1823,16 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
             ),
             ("gemini-1.5-pro", "Gemini 1.5 Pro (best quality)"),
             ("gemini-1.5-flash", "Gemini 1.5 Flash (balanced)"),
+        ],
+        "astrai" => vec![
+            ("auto", "Auto — Astrai best execution routing (recommended)"),
+            ("gpt-4o", "GPT-4o (OpenAI via Astrai)"),
+            (
+                "claude-sonnet-4.5",
+                "Claude Sonnet 4.5 (Anthropic via Astrai)",
+            ),
+            ("deepseek-v3", "DeepSeek V3 (best value via Astrai)"),
+            ("llama-3.3-70b", "Llama 3.3 70B (open source via Astrai)"),
         ],
         _ => vec![("default", "Default model")],
     };
@@ -4634,6 +4649,7 @@ mod tests {
         assert!(supports_live_model_fetch("grok"));
         assert!(supports_live_model_fetch("together"));
         assert!(supports_live_model_fetch("ollama"));
+        assert!(supports_live_model_fetch("astrai"));
         assert!(!supports_live_model_fetch("venice"));
     }
 
