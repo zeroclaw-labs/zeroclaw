@@ -105,7 +105,7 @@ webpki-roots = "1.0.6"
 # HTTP server (gateway) — replaces raw TCP for proper HTTP/1.1 compliance
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "ws"] }
 tower = { version = "0.5", default-features = false }
-tower-http = { version = "0.6", default-features = false, features = ["limit", "timeout"] }
+tower-http = { version = "0.6", default-features = false, features = ["limit", "timeout", "cors"] }
 http-body-util = "0.1"
 
 # OpenTelemetry — OTLP trace + metrics export

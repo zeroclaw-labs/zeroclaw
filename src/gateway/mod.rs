@@ -372,7 +372,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     };
 
     // Build router with middleware
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/health", get(handle_health))
         .route("/pair", post(handle_pair))
         .route("/webhook", post(handle_webhook))
@@ -384,6 +384,38 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(REQUEST_TIMEOUT_SECS),
         ));
+
+    // Optional CORS - enabled via [gateway] cors_origins in config.toml
+    // - value `*` => allow any origin
+    // - comma-separated origins (e.g. "https://app.a.com,https://app.b.com")
+    let origins = &config.gateway.cors_origins;
+    if !origins.is_empty() {
+        use axum::http::Method;
+        use tower_http::cors::{Any, CorsLayer};
+
+        let mut cors_layer = if origins.trim() == "*" {
+            CorsLayer::new().allow_origin(Any)
+        } else {
+            let mut layer = CorsLayer::new();
+            for origin in origins.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                match header::HeaderValue::from_str(origin) {
+                    Ok(val) => layer = layer.allow_origin(val),
+                    Err(_) => tracing::warn!("Invalid CORS origin ignored: {}", origin),
+                }
+            }
+            layer
+        };
+
+        cors_layer = cors_layer
+            .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+            .allow_headers([
+                header::CONTENT_TYPE,
+                header::HeaderName::from_static("x-pairing-code"),
+            ]);
+
+        app = app.layer(cors_layer);
+        println!("🟦 CORS: enabled for origins: {origins}");
+    }
 
     // Run the server
     axum::serve(listener, app).await?;

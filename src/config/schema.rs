@@ -482,6 +482,10 @@ pub struct GatewayConfig {
     /// TTL for webhook idempotency keys.
     #[serde(default = "default_idempotency_ttl_secs")]
     pub idempotency_ttl_secs: u64,
+
+    /// Optional CORS origins (e.g. "*", "https://app.zeroclaw.local", or comma-separated).
+    #[serde(default)]
+    pub cors_origins: String,
 }
 
 fn default_gateway_port() -> u16 {
@@ -519,6 +523,7 @@ impl Default for GatewayConfig {
             pair_rate_limit_per_minute: default_pair_rate_limit(),
             webhook_rate_limit_per_minute: default_webhook_rate_limit(),
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
+            cors_origins: String::new(),
         }
     }
 }
@@ -2975,6 +2980,7 @@ channel_id = "C123"
             pair_rate_limit_per_minute: 12,
             webhook_rate_limit_per_minute: 80,
             idempotency_ttl_secs: 600,
+            cors_origins: "".into(),
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();
@@ -2984,6 +2990,7 @@ channel_id = "C123"
         assert_eq!(parsed.pair_rate_limit_per_minute, 12);
         assert_eq!(parsed.webhook_rate_limit_per_minute, 80);
         assert_eq!(parsed.idempotency_ttl_secs, 600);
+        assert_eq!(parsed.cors_origins, "");
     }
 
     #[test]
