@@ -1,15 +1,18 @@
-# Z.AI GLM Coding Plan Setup
+# Z.AI GLM Setup
 
-ZeroClaw supports Z.AI's GLM models through multiple endpoints. This guide covers the recommended configuration.
+ZeroClaw supports Z.AI's GLM models through OpenAI-compatible endpoints.
+This guide covers practical setup options that match current ZeroClaw provider behavior.
 
 ## Overview
 
-Z.AI provides GLM models through two API styles:
+ZeroClaw supports these Z.AI aliases and endpoints out of the box:
 
-| Endpoint | API Style | Provider String |
-|----------|-----------|-----------------|
-| `/api/coding/paas/v4` | OpenAI-compatible | `zai` |
-| `/api/anthropic` | Anthropic-compatible | `anthropic-custom:https://api.z.ai/api/anthropic` |
+| Alias | Endpoint | Notes |
+|-------|----------|-------|
+| `zai` | `https://api.z.ai/api/coding/paas/v4` | Global endpoint |
+| `zai-cn` | `https://open.bigmodel.cn/api/paas/v4` | China endpoint |
+
+If you need a custom base URL, see `docs/custom-providers.md`.
 
 ## Setup
 
@@ -28,7 +31,7 @@ Edit `~/.zeroclaw/config.toml`:
 ```toml
 api_key = "YOUR_ZAI_API_KEY"
 default_provider = "zai"
-default_model = "glm-4.7"
+default_model = "glm-5"
 default_temperature = 0.7
 ```
 
@@ -36,11 +39,12 @@ default_temperature = 0.7
 
 | Model | Description |
 |-------|-------------|
-| `glm-4.5` | Stable release |
-| `glm-4.5-air` | Lightweight version |
-| `glm-4.6` | Improved reasoning |
-| `glm-4.7` | Current recommended |
-| `glm-5` | Latest |
+| `glm-5` | Default in onboarding; strongest reasoning |
+| `glm-4.7` | Strong general-purpose quality |
+| `glm-4-plus` | Stable baseline |
+| `glm-4-flash` | Lower-latency option |
+
+Model availability can vary by account/region, so use the `/models` API when in doubt.
 
 ## Verify Setup
 
@@ -52,7 +56,7 @@ curl -X POST "https://api.z.ai/api/coding/paas/v4/chat/completions" \
   -H "Authorization: Bearer YOUR_ZAI_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "glm-4.7",
+    "model": "glm-5",
     "messages": [{"role": "user", "content": "Hello"}]
   }'
 ```
@@ -87,9 +91,11 @@ Add to your `.env` file:
 # Z.AI API Key
 ZAI_API_KEY=your-id.secret
 
-# Or use the provider-specific variable
-# The key format is: id.secret (e.g., abc123.xyz789)
+# Optional generic key (used by many providers)
+# API_KEY=your-id.secret
 ```
+
+The key format is `id.secret` (for example: `abc123.xyz789`).
 
 ## Troubleshooting
 
@@ -100,7 +106,7 @@ ZAI_API_KEY=your-id.secret
 **Solution:**
 - Wait and retry
 - Check your Z.AI plan limits
-- Try `glm-4.7` instead of `glm-5` (more stable availability)
+- Try `glm-4-flash` for lower latency and higher quota tolerance
 
 ### Authentication Errors
 
@@ -132,4 +138,5 @@ curl -s "https://api.z.ai/api/coding/paas/v4/models" \
 ## Related Documentation
 
 - [ZeroClaw README](../README.md)
+- [Custom Provider Endpoints](./custom-providers.md)
 - [Contributing Guide](../CONTRIBUTING.md)

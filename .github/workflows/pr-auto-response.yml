@@ -40,8 +40,8 @@ jobs:
       - name: Greet first-time contributors
         uses: actions/first-interaction@a1db7729b356323c7988c20ed6f0d33fe31297be # v1
         with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          issue_message: |
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          issue-message: |
             Thanks for opening this issue.
 
             Before maintainers triage it, please confirm:
@@ -50,7 +50,7 @@ jobs:
             - Sensitive values are redacted
 
             This helps us keep issue throughput high and response latency low.
-          pr_message: |
+          pr-message: |
             Thanks for contributing to ZeroClaw.
 
             For faster review, please ensure:
