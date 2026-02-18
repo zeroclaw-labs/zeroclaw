@@ -1054,7 +1054,10 @@ impl Provider for OpenAiCompatibleProvider {
 
         let url = self.chat_completions_url();
         let response = self
-            .apply_auth_header(self.http_client().post(&url).json(&native_request), credential)
+            .apply_auth_header(
+                self.http_client().post(&url).json(&native_request),
+                credential,
+            )
             .send()
             .await?;
 
