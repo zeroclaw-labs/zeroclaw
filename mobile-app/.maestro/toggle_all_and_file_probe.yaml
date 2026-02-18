@@ -1,0 +1,49 @@
+appId: com.mobileclaw.app
+---
+- launchApp
+- tapOn:
+    text: "Dismiss"
+    optional: true
+- tapOn:
+    text: "Close"
+    optional: true
+- tapOn:
+    text: "OK"
+    optional: true
+- extendedWaitUntil:
+    visible:
+      id: "dock-tab-device"
+    timeout: 30000
+- tapOn:
+    id: "dock-tab-device"
+- tapOn:
+    id: "dock-tab-device"
+- extendedWaitUntil:
+    visible: "Device"
+    timeout: 10000
+- tapOn:
+    id: "device-toggle-all"
+- tapOn:
+    text: "Allow"
+    optional: true
+- tapOn:
+    text: "Allow"
+    optional: true
+- tapOn:
+    text: "Allow"
+    optional: true
+- tapOn:
+    text: "Allow"
+    optional: true
+- tapOn:
+    text: "While using the app"
+    optional: true
+- tapOn:
+    text: "Only this time"
+    optional: true
+- tapOn:
+    id: "device-run-file-probe"
+- extendedWaitUntil:
+    visible:
+      id: "device-probe-status"
+    timeout: 20000

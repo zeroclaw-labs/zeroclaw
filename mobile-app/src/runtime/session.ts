@@ -16,6 +16,30 @@ function stripSystemReminder(text: string): string {
     .trim();
 }
 
+async function renderHumanToolReply(
+  runtime: Awaited<ReturnType<typeof loadAgentConfig>>,
+  system: string,
+  userPrompt: string,
+  tool: string,
+  output: unknown,
+): Promise<string> {
+  const messages: ChatCompletionMessage[] = [
+    { role: "system", content: system },
+    { role: "user", content: userPrompt },
+    {
+      role: "user",
+      content: `Tool ${tool} executed successfully. Result JSON: ${JSON.stringify(output ?? null)}. Reply for a human user only. Do not print raw JSON unless explicitly requested.`,
+    },
+  ];
+
+  try {
+    const reply = await runAgentChat(runtime, messages);
+    return stripSystemReminder(reply) || `Done. Executed ${tool}.`;
+  } catch {
+    return `Done. Executed ${tool}.`;
+  }
+}
+
 function makeSystemInstruction(enabledTools: string[], enabledIntegrations: string[]): string {
   const toolList = enabledTools.length ? enabledTools.join(", ") : "none";
   const integrationList = enabledIntegrations.length ? enabledIntegrations.join(", ") : "none";
@@ -177,9 +201,16 @@ export async function runAgentTurn(userPrompt: string): Promise<AgentTurnResult>
       };
     }
 
-    const out = JSON.stringify(toolEvent.output ?? null);
+    const humanReply = await renderHumanToolReply(
+      runtime,
+      system,
+      userPrompt,
+      toolEvent.tool,
+      toolEvent.output,
+    );
+
     return {
-      assistantText: `Executed ${toolEvent.tool}. Result: ${out}`,
+      assistantText: humanReply,
       toolEvents: [toolEvent],
     };
   }
@@ -228,7 +259,7 @@ export async function runAgentTurn(userPrompt: string): Promise<AgentTurnResult>
     { role: "assistant", content: firstReply },
     {
       role: "user",
-      content: `Tool ${toolEvent.tool} executed successfully. Tool result JSON: ${summarizeToolResult}. Reply to the user with what happened and next steps.`,
+      content: `Tool ${toolEvent.tool} executed successfully. Tool result JSON: ${summarizeToolResult}. Reply for a human user with what happened and next steps. Do not print raw JSON unless explicitly requested.`,
     },
   ];
 
