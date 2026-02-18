@@ -843,4 +843,110 @@ mod tests {
         // Should have UUID dashes
         assert!(id.contains('-'));
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // TG6: Channel platform limit edge cases for Discord (2000 char limit)
+    // Prevents: Pattern 6 — issues #574, #499
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn split_message_code_block_at_boundary() {
+        // Code block that spans the split boundary
+        let mut msg = String::new();
+        msg.push_str("```rust\n");
+        msg.push_str(&"x".repeat(1990));
+        msg.push_str("\n```\nMore text after code block");
+        let parts = split_message_for_discord(&msg);
+        assert!(parts.len() >= 2, "code block spanning boundary should split");
+        for part in &parts {
+            assert!(
+                part.len() <= DISCORD_MAX_MESSAGE_LENGTH,
+                "each part must be <= {DISCORD_MAX_MESSAGE_LENGTH}, got {}",
+                part.len()
+            );
+        }
+    }
+
+    #[test]
+    fn split_message_single_long_word_exceeds_limit() {
+        // A single word longer than 2000 chars must be hard-split
+        let long_word = "a".repeat(2500);
+        let parts = split_message_for_discord(&long_word);
+        assert!(parts.len() >= 2, "word exceeding limit must be split");
+        for part in &parts {
+            assert!(
+                part.len() <= DISCORD_MAX_MESSAGE_LENGTH,
+                "hard-split part must be <= {DISCORD_MAX_MESSAGE_LENGTH}, got {}",
+                part.len()
+            );
+        }
+        // Reassembled content should match original
+        let reassembled: String = parts.join("");
+        assert_eq!(reassembled, long_word);
+    }
+
+    #[test]
+    fn split_message_exactly_at_limit_no_split() {
+        let msg = "a".repeat(DISCORD_MAX_MESSAGE_LENGTH);
+        let parts = split_message_for_discord(&msg);
+        assert_eq!(parts.len(), 1, "message exactly at limit should not split");
+        assert_eq!(parts[0].len(), DISCORD_MAX_MESSAGE_LENGTH);
+    }
+
+    #[test]
+    fn split_message_one_over_limit_splits() {
+        let msg = "a".repeat(DISCORD_MAX_MESSAGE_LENGTH + 1);
+        let parts = split_message_for_discord(&msg);
+        assert!(parts.len() >= 2, "message 1 char over limit must split");
+    }
+
+    #[test]
+    fn split_message_many_short_lines() {
+        // Many short lines should be batched into chunks under the limit
+        let msg: String = (0..500).map(|i| format!("line {i}\n")).collect();
+        let parts = split_message_for_discord(&msg);
+        for part in &parts {
+            assert!(
+                part.len() <= DISCORD_MAX_MESSAGE_LENGTH,
+                "short-line batch must be <= limit"
+            );
+        }
+        // All content should be preserved
+        let reassembled: String = parts.join("");
+        assert_eq!(reassembled.trim(), msg.trim());
+    }
+
+    #[test]
+    fn split_message_only_whitespace() {
+        let msg = "   \n\n\t  ";
+        let parts = split_message_for_discord(msg);
+        // Should handle gracefully without panic
+        assert!(parts.len() <= 1);
+    }
+
+    #[test]
+    fn split_message_emoji_at_boundary() {
+        // Emoji are multi-byte; ensure we don't split mid-emoji
+        let mut msg = "a".repeat(1998);
+        msg.push_str("🎉🎊"); // 2 emoji at the boundary (2000 chars total)
+        let parts = split_message_for_discord(&msg);
+        for part in &parts {
+            // The function splits on character count, not byte count
+            assert!(
+                part.chars().count() <= DISCORD_MAX_MESSAGE_LENGTH,
+                "emoji boundary split must respect limit"
+            );
+        }
+    }
+
+    #[test]
+    fn split_message_consecutive_newlines_at_boundary() {
+        let mut msg = "a".repeat(1995);
+        msg.push_str("\n\n\n\n\n");
+        msg.push_str(&"b".repeat(100));
+        let parts = split_message_for_discord(&msg);
+        for part in &parts {
+            assert!(part.len() <= DISCORD_MAX_MESSAGE_LENGTH);
+        }
+    }
 }
