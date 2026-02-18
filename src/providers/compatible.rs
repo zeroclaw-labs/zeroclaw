@@ -8,7 +8,10 @@ use crate::providers::traits::{
 };
 use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
-use reqwest::Client;
+use reqwest::{
+    header::{HeaderMap, HeaderValue, USER_AGENT},
+    Client,
+};
 use serde::{Deserialize, Serialize};
 
 /// A provider that speaks the OpenAI-compatible chat completions API.
@@ -22,6 +25,7 @@ pub struct OpenAiCompatibleProvider {
     /// When false, do not fall back to /v1/responses on chat completions 404.
     /// GLM/Zhipu does not support the responses API.
     supports_responses_fallback: bool,
+    user_agent: Option<String>,
 }
 
 /// How the provider expects the API key to be sent.
@@ -42,13 +46,7 @@ impl OpenAiCompatibleProvider {
         credential: Option<&str>,
         auth_style: AuthStyle,
     ) -> Self {
-        Self {
-            name: name.to_string(),
-            base_url: base_url.trim_end_matches('/').to_string(),
-            credential: credential.map(ToString::to_string),
-            auth_header: auth_style,
-            supports_responses_fallback: true,
-        }
+        Self::new_with_options(name, base_url, credential, auth_style, true, None)
     }
 
     /// Same as `new` but skips the /v1/responses fallback on 404.
@@ -59,16 +57,68 @@ impl OpenAiCompatibleProvider {
         credential: Option<&str>,
         auth_style: AuthStyle,
     ) -> Self {
+        Self::new_with_options(name, base_url, credential, auth_style, false, None)
+    }
+
+    /// Create a provider with a custom User-Agent header.
+    ///
+    /// Some providers (for example Kimi Code) require a specific User-Agent
+    /// for request routing and policy enforcement.
+    pub fn new_with_user_agent(
+        name: &str,
+        base_url: &str,
+        credential: Option<&str>,
+        auth_style: AuthStyle,
+        user_agent: &str,
+    ) -> Self {
+        Self::new_with_options(
+            name,
+            base_url,
+            credential,
+            auth_style,
+            true,
+            Some(user_agent),
+        )
+    }
+
+    fn new_with_options(
+        name: &str,
+        base_url: &str,
+        credential: Option<&str>,
+        auth_style: AuthStyle,
+        supports_responses_fallback: bool,
+        user_agent: Option<&str>,
+    ) -> Self {
         Self {
             name: name.to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
             credential: credential.map(ToString::to_string),
             auth_header: auth_style,
-            supports_responses_fallback: false,
+            supports_responses_fallback,
+            user_agent: user_agent.map(ToString::to_string),
         }
     }
 
     fn http_client(&self) -> Client {
+        if let Some(ua) = self.user_agent.as_deref() {
+            let mut headers = HeaderMap::new();
+            if let Ok(value) = HeaderValue::from_str(ua) {
+                headers.insert(USER_AGENT, value);
+            }
+
+            let builder = Client::builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .default_headers(headers);
+            let builder =
+                crate::config::apply_runtime_proxy_to_builder(builder, "provider.compatible");
+
+            return builder.build().unwrap_or_else(|error| {
+                tracing::warn!("Failed to build proxied timeout client with user-agent: {error}");
+                Client::new()
+            });
+        }
+
         crate::config::build_runtime_proxy_client_with_timeouts("provider.compatible", 120, 10)
     }
 
