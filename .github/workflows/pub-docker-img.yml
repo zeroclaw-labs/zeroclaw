@@ -139,32 +139,32 @@ jobs:
                   owner="${GITHUB_REPOSITORY_OWNER,,}"
                   repo="${GITHUB_REPOSITORY#*/}"
 
-                  # Package path can be either "<repo>" or URL-encoded "<owner>/<repo>".
+                  # Package path can vary depending on repository/package linkage.
                   candidates=(
                     "$repo"
                     "${owner}%2F${repo}"
                   )
 
-                  for pkg in "${candidates[@]}"; do
-                    code="$(curl -sS -o /tmp/ghcr-visibility.json -w "%{http_code}" \
-                      -X PATCH \
-                      -H "Authorization: Bearer ${GH_TOKEN}" \
-                      -H "Accept: application/vnd.github+json" \
-                      -H "X-GitHub-Api-Version: 2022-11-28" \
-                      "https://api.github.com/orgs/${owner}/packages/container/${pkg}/visibility" \
-                      -d '{"visibility":"public"}' || true)"
+                  for scope in orgs users; do
+                    for pkg in "${candidates[@]}"; do
+                      code="$(curl -sS -o /tmp/ghcr-visibility.json -w "%{http_code}" \
+                        -X PATCH \
+                        -H "Authorization: Bearer ${GH_TOKEN}" \
+                        -H "Accept: application/vnd.github+json" \
+                        -H "X-GitHub-Api-Version: 2022-11-28" \
+                        "https://api.github.com/${scope}/${owner}/packages/container/${pkg}/visibility" \
+                        -d '{"visibility":"public"}' || true)"
 
-                    if [ "$code" = "200" ] || [ "$code" = "204" ]; then
-                      echo "GHCR package visibility is public for ${pkg}."
-                      exit 0
-                    fi
+                      if [ "$code" = "200" ] || [ "$code" = "204" ]; then
+                        echo "GHCR package visibility is public (${scope}/${owner}/${pkg})."
+                        exit 0
+                      fi
 
-                    echo "Attempt for ${pkg} returned HTTP ${code}."
-                    cat /tmp/ghcr-visibility.json || true
+                      echo "Visibility attempt ${scope}/${owner}/${pkg} returned HTTP ${code}."
+                    done
                   done
 
-                  echo "::error::Failed to set GHCR package visibility to public."
-                  exit 1
+                  echo "::warning::Unable to update GHCR visibility via API in this run; proceeding to direct anonymous pull verification."
 
             - name: Verify anonymous GHCR pull access
               shell: bash
