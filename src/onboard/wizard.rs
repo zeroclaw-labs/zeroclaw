@@ -1,5 +1,5 @@
 use crate::config::schema::{
-    DingTalkConfig, IrcConfig, LarkReceiveMode, QQConfig, StreamMode, WhatsAppConfig,
+    DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig, QQConfig, StreamMode, WhatsAppConfig,
 };
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
@@ -2505,6 +2505,14 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 }
             ),
             format!(
+                "Linq       {}",
+                if config.linq.is_some() {
+                    "✅ connected"
+                } else {
+                    "— iMessage/RCS/SMS via Linq API"
+                }
+            ),
+            format!(
                 "IRC        {}",
                 if config.irc.is_some() {
                     "✅ configured"
@@ -3126,6 +3134,98 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 });
             }
             6 => {
+                // ── Linq ──
+                println!();
+                println!(
+                    "  {} {}",
+                    style("Linq Setup").white().bold(),
+                    style("— iMessage/RCS/SMS via Linq API").dim()
+                );
+                print_bullet("1. Sign up at linqapp.com and get your Partner API token");
+                print_bullet("2. Note your Linq phone number (E.164 format)");
+                print_bullet("3. Configure webhook URL to: https://your-domain/linq");
+                println!();
+
+                let api_token: String = Input::new()
+                    .with_prompt("  API token (Linq Partner API token)")
+                    .interact_text()?;
+
+                if api_token.trim().is_empty() {
+                    println!("  {} Skipped", style("→").dim());
+                    continue;
+                }
+
+                let from_phone: String = Input::new()
+                    .with_prompt("  From phone number (E.164 format, e.g. +12223334444)")
+                    .interact_text()?;
+
+                if from_phone.trim().is_empty() {
+                    println!("  {} Skipped — phone number required", style("→").dim());
+                    continue;
+                }
+
+                // Test connection
+                print!("  {} Testing connection... ", style("⏳").dim());
+                let api_token_clone = api_token.clone();
+                let thread_result = std::thread::spawn(move || {
+                    let client = reqwest::blocking::Client::new();
+                    let url = "https://api.linqapp.com/api/partner/v3/phonenumbers";
+                    let resp = client
+                        .get(url)
+                        .header(
+                            "Authorization",
+                            format!("Bearer {}", api_token_clone.trim()),
+                        )
+                        .send()?;
+                    Ok::<_, reqwest::Error>(resp.status().is_success())
+                })
+                .join();
+                match thread_result {
+                    Ok(Ok(true)) => {
+                        println!(
+                            "\r  {} Connected to Linq API              ",
+                            style("✅").green().bold()
+                        );
+                    }
+                    _ => {
+                        println!(
+                            "\r  {} Connection failed — check API token",
+                            style("❌").red().bold()
+                        );
+                        continue;
+                    }
+                }
+
+                let users_str: String = Input::new()
+                    .with_prompt(
+                        "  Allowed sender numbers (comma-separated +1234567890, or * for all)",
+                    )
+                    .default("*".into())
+                    .interact_text()?;
+
+                let allowed_senders = if users_str.trim() == "*" {
+                    vec!["*".into()]
+                } else {
+                    users_str.split(',').map(|s| s.trim().to_string()).collect()
+                };
+
+                let signing_secret: String = Input::new()
+                    .with_prompt("  Webhook signing secret (optional, press Enter to skip)")
+                    .allow_empty(true)
+                    .interact_text()?;
+
+                config.linq = Some(LinqConfig {
+                    api_token: api_token.trim().to_string(),
+                    from_phone: from_phone.trim().to_string(),
+                    signing_secret: if signing_secret.trim().is_empty() {
+                        None
+                    } else {
+                        Some(signing_secret.trim().to_string())
+                    },
+                    allowed_senders,
+                });
+            }
+            7 => {
                 // ── IRC ──
                 println!();
                 println!(
@@ -3264,7 +3364,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     verify_tls: Some(verify_tls),
                 });
             }
-            7 => {
+            8 => {
                 // ── Webhook ──
                 println!();
                 println!(
@@ -3297,7 +3397,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     style(&port).cyan()
                 );
             }
-            8 => {
+            9 => {
                 // ── DingTalk ──
                 println!();
                 println!(
@@ -3367,7 +3467,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     allowed_users,
                 });
             }
-            9 => {
+            10 => {
                 // ── QQ Official ──
                 println!();
                 println!(
@@ -3654,6 +3754,9 @@ fn setup_channels() -> Result<ChannelsConfig> {
     }
     if config.whatsapp.is_some() {
         active.push("WhatsApp");
+    }
+    if config.linq.is_some() {
+        active.push("Linq");
     }
     if config.email.is_some() {
         active.push("Email");
