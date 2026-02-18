@@ -754,10 +754,10 @@ pub(crate) async fn run_tool_call_loop(
         history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
     }
 
-        anyhow::bail!(
-            "Agent exceeded maximum tool iterations ({})",
-            max_tool_iterations
-        )
+    anyhow::bail!(
+        "Agent exceeded maximum tool iterations ({})",
+        max_tool_iterations
+    )
 }
 
 /// Build the tool instruction block for the system prompt so the LLM knows
@@ -1872,8 +1872,8 @@ Done."#;
     // ═══════════════════════════════════════════════════════════════════════
 
     const _: () = {
-        assert!(MAX_TOOL_ITERATIONS > 0);
-        assert!(MAX_TOOL_ITERATIONS <= 100);
+        assert!(DEFAULT_MAX_TOOL_ITERATIONS > 0);
+        assert!(DEFAULT_MAX_TOOL_ITERATIONS <= 100);
         assert!(MAX_HISTORY_MESSAGES > 0);
         assert!(MAX_HISTORY_MESSAGES <= 1000);
     };
