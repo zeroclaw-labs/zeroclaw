@@ -2667,6 +2667,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     allowed_users,
                     stream_mode: StreamMode::default(),
                     draft_update_interval_ms: 1000,
+                    mention_only: false,
                 });
             }
             1 => {

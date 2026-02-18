@@ -790,6 +790,7 @@ mod tests {
             allowed_users: vec!["user".into()],
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
+            mention_only: false,
         });
         let entries = all_integrations();
         let tg = entries.iter().find(|e| e.name == "Telegram").unwrap();
