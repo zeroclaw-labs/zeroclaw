@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { View, ScrollView, TextInput } from "react-native";
+import { View, ScrollView, TextInput, Pressable } from "react-native";
 import Animated, { FadeIn, SlideInLeft, SlideInRight } from "react-native-reanimated";
 import { useFocusEffect } from "@react-navigation/native";
 
@@ -28,6 +28,7 @@ export function ChatScreen() {
   const [deepgramApiKey, setDeepgramApiKey] = useState("");
   const voice = useVoiceRecording(deepgramApiKey);
   const scrollRef = useRef<ScrollView | null>(null);
+  const runNonceRef = useRef(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -129,6 +130,31 @@ export function ChatScreen() {
     );
   }, []);
 
+  const runTurnWithTimeout = useCallback(async (prompt: string) => {
+    const timeoutMs = 90_000;
+    return await Promise.race([
+      runAgentTurn(prompt),
+      new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error("Agent request timed out. You can restart and retry.")), timeoutMs);
+      }),
+    ]);
+  }, []);
+
+  const restartAgent = useCallback(async () => {
+    runNonceRef.current += 1;
+    setBusy(false);
+    setThinkingDots(".");
+    const assistantMsg: ChatMessage = {
+      id: `a_restart_${Date.now()}`,
+      role: "assistant",
+      text: "Agent runtime restarted. Please retry your request.",
+      ts: Date.now(),
+    };
+    setMessages((prev) => [...prev, assistantMsg]);
+    await appendChat(assistantMsg);
+    await addActivity({ kind: "action", source: "chat", title: "Agent restarted", detail: "Runtime state was reset from chat screen" });
+  }, []);
+
   const send = useCallback(
     async (text: string, voiceText?: string | null) => {
       const trimmed = text.trim();
@@ -146,9 +172,13 @@ export function ChatScreen() {
       await appendChat(userMsg);
       await addActivity({ kind: "message", source: "chat", title: "User message", detail: userMsg.text.slice(0, 120) });
 
+      const runNonce = runNonceRef.current + 1;
+      runNonceRef.current = runNonce;
       setBusy(true);
       try {
-        const result = await runAgentTurn(userMsg.text);
+        const result = await runTurnWithTimeout(userMsg.text);
+        if (runNonceRef.current !== runNonce) return;
+
         const assistantMsg: ChatMessage = {
           id: `a_${Date.now()}_${Math.random()}`,
           role: "assistant",
@@ -168,14 +198,25 @@ export function ChatScreen() {
           });
         }
       } catch (error) {
+        if (runNonceRef.current !== runNonce) return;
         const detail = error instanceof Error ? error.message : "Unknown error";
         toast.show(detail);
+        const assistantMsg: ChatMessage = {
+          id: `a_err_${Date.now()}_${Math.random()}`,
+          role: "assistant",
+          text: `Agent error: ${detail}. You can tap Restart Agent and try again.`,
+          ts: Date.now(),
+        };
+        setMessages((prev) => [...prev, assistantMsg]);
+        await appendChat(assistantMsg);
         await addActivity({ kind: "log", source: "chat", title: "Agent error", detail });
       } finally {
-        setBusy(false);
+        if (runNonceRef.current === runNonce) {
+          setBusy(false);
+        }
       }
     },
-    [toast],
+    [runTurnWithTimeout, toast],
   );
 
   const canSend = useMemo(() => !!draft.trim() && !busy, [draft, busy]);
@@ -185,9 +226,26 @@ export function ChatScreen() {
     <Screen>
       <View style={{ flex: 1, paddingHorizontal: theme.spacing.lg, paddingTop: theme.spacing.xl, paddingBottom: 92 }}>
         <Text testID="screen-chat" variant="display">Chat</Text>
-        <Text variant="muted" style={{ marginTop: theme.spacing.xs, marginBottom: theme.spacing.md }}>
-          MobileClaw agent chat with voice mode.
-        </Text>
+        <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginTop: theme.spacing.xs }}>
+          <Text variant="muted">MobileClaw agent chat with voice mode.</Text>
+          <Pressable
+            testID="chat-restart-agent"
+            onPress={() => {
+              void restartAgent();
+            }}
+            style={{
+              paddingHorizontal: 10,
+              paddingVertical: 6,
+              borderRadius: theme.radii.md,
+              backgroundColor: theme.colors.surface.panel,
+              borderWidth: 1,
+              borderColor: theme.colors.stroke.subtle,
+            }}
+          >
+            <Text variant="label">Restart Agent</Text>
+          </Pressable>
+        </View>
+        <View style={{ marginBottom: theme.spacing.md }} />
 
         <ScrollView
           ref={scrollRef}

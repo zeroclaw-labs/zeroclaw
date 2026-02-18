@@ -1,6 +1,15 @@
 appId: com.mobileclaw.app
 ---
 - launchApp
+- tapOn:
+    text: "Dismiss"
+    optional: true
+- tapOn:
+    text: "Close"
+    optional: true
+- tapOn:
+    text: "OK"
+    optional: true
 - extendedWaitUntil:
     visible: "MobileClaw agent chat with voice mode."
     timeout: 30000
@@ -20,6 +29,8 @@ appId: com.mobileclaw.app
     visible:
       id: "screen-integrations"
     timeout: 10000
+- tapOn:
+    id: "dock-tab-device"
 - tapOn:
     id: "dock-tab-device"
 - extendedWaitUntil:

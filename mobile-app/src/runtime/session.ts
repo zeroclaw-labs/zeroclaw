@@ -9,6 +9,13 @@ import {
 import { executeToolDirective, parseToolDirective } from "./tooling";
 import type { AgentTurnResult } from "./types";
 
+function stripSystemReminder(text: string): string {
+  return String(text || "")
+    .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, "")
+    .replace(/<system-reminder>[\s\S]*$/gi, "")
+    .trim();
+}
+
 function makeSystemInstruction(enabledTools: string[], enabledIntegrations: string[]): string {
   const toolList = enabledTools.length ? enabledTools.join(", ") : "none";
   const integrationList = enabledIntegrations.length ? enabledIntegrations.join(", ") : "none";
@@ -18,10 +25,97 @@ function makeSystemInstruction(enabledTools: string[], enabledIntegrations: stri
     "Do not pretend to execute device actions.",
     `Enabled tool ids: ${toolList}.`,
     `Enabled integrations: ${integrationList}.`,
+    "Tool intent mapping rules:",
+    "- Place outgoing call -> android_device.calls.start with {\"to\":\"+15551234567\"}",
+    "- Read last calls/history -> android_device.userdata.call_log",
+    "- Read SMS inbox/messages -> android_device.userdata.sms_inbox",
+    "- List files/storage -> android_device.storage.files",
+    "Never use call_log tool when user asks to place a call.",
     "If a device/tool action is needed, output ONLY valid JSON with this exact shape:",
     '{"type":"tool_call","tool":"<tool_id>","arguments":{}}',
     "For normal conversation, return plain text.",
   ].join(" ");
+}
+
+function extractPhoneNumber(text: string): string | null {
+  const match = text.match(/(\+?\d[\d\s\-()]{5,}\d)/);
+  if (!match?.[1]) return null;
+  const normalized = match[1].replace(/[^\d+]/g, "");
+  return normalized.length >= 6 ? normalized : null;
+}
+
+function extractSmsTargetAndBody(text: string): { to: string; body: string } | null {
+  const match = text.match(/(?:send\s+sms\s+to|sms\s+to)\s*([+\d][\d\s\-()]{5,})\s*[:,-]\s*(.+)$/i);
+  if (!match?.[1] || !match?.[2]) return null;
+  const to = match[1].replace(/[^\d+]/g, "").trim();
+  const body = match[2].trim();
+  if (!to || !body) return null;
+  return { to, body };
+}
+
+function normalizeDirectiveForPrompt(
+  userPrompt: string,
+  directive: { tool: string; arguments: Record<string, unknown> },
+): { tool: string; arguments: Record<string, unknown> } {
+  const prompt = userPrompt.toLowerCase();
+  const asksToCall = /\b(call|dial|make\s+.*call|test\s+call)\b/.test(prompt);
+  if (!asksToCall) return directive;
+  if (directive.tool === "android_device.calls.start") return directive;
+
+  const guessedPhone =
+    (typeof directive.arguments.to === "string" && directive.arguments.to.trim()) ||
+    (typeof directive.arguments.phone === "string" && directive.arguments.phone.trim()) ||
+    (typeof directive.arguments.number === "string" && directive.arguments.number.trim()) ||
+    extractPhoneNumber(userPrompt) ||
+    "";
+
+  if (!guessedPhone) return directive;
+
+  return {
+    tool: "android_device.calls.start",
+    arguments: { to: guessedPhone },
+  };
+}
+
+function inferDirectiveFromPrompt(
+  userPrompt: string,
+  enabledToolIds: string[],
+): { tool: string; arguments: Record<string, unknown> } | null {
+  const text = userPrompt.toLowerCase();
+  const hasTool = (id: string) => enabledToolIds.includes(id);
+
+  const sms = extractSmsTargetAndBody(userPrompt);
+  if (sms && hasTool("android_device.sms.send")) {
+    return { tool: "android_device.sms.send", arguments: sms };
+  }
+
+  const callNumber = extractPhoneNumber(userPrompt);
+  if (/\b(call|dial|make\s+.*call|test\s+call)\b/.test(text) && callNumber && hasTool("android_device.calls.start")) {
+    return { tool: "android_device.calls.start", arguments: { to: callNumber } };
+  }
+
+  if (/\b(photo|picture|camera|selfie)\b/.test(text) && hasTool("android_device.camera.capture")) {
+    const front = /\b(front|selfie)\b/.test(text);
+    return { tool: "android_device.camera.capture", arguments: { lens: front ? "front" : "rear" } };
+  }
+
+  if (/\b(gps|coordinates|location|where am i|current location)\b/.test(text) && hasTool("android_device.location.read")) {
+    return { tool: "android_device.location.read", arguments: {} };
+  }
+
+  if (/\b(last calls|call history|recent calls|phone calls)\b/.test(text) && hasTool("android_device.userdata.call_log")) {
+    return { tool: "android_device.userdata.call_log", arguments: { limit: 20 } };
+  }
+
+  if (/\b(sms|text messages|inbox)\b/.test(text) && hasTool("android_device.userdata.sms_inbox")) {
+    return { tool: "android_device.userdata.sms_inbox", arguments: { limit: 20 } };
+  }
+
+  if (/\b(list files|show files|directory|storage)\b/.test(text) && hasTool("android_device.storage.files")) {
+    return { tool: "android_device.storage.files", arguments: { scope: "user", path: "", limit: 200 } };
+  }
+
+  return null;
 }
 
 function integrationList(config: Awaited<ReturnType<typeof loadIntegrationsConfig>>): string[] {
@@ -66,16 +160,53 @@ export async function runAgentTurn(userPrompt: string): Promise<AgentTurnResult>
     { role: "user", content: userPrompt },
   ];
 
-  const firstReply = await runAgentChat(runtime, firstMessages);
-  const directive = parseToolDirective(firstReply);
+  const deterministicDirective = inferDirectiveFromPrompt(userPrompt, enabledTools);
+  if (deterministicDirective) {
+    const toolEvent = await executeToolDirective(deterministicDirective, { tools, security });
+    await addActivity({
+      kind: "action",
+      source: "chat",
+      title: `Tool ${toolEvent.status}: ${toolEvent.tool}`,
+      detail: toolEvent.detail,
+    });
+
+    if (toolEvent.status !== "executed") {
+      return {
+        assistantText: `I could not run ${toolEvent.tool}: ${toolEvent.detail}`,
+        toolEvents: [toolEvent],
+      };
+    }
+
+    const out = JSON.stringify(toolEvent.output ?? null);
+    return {
+      assistantText: `Executed ${toolEvent.tool}. Result: ${out}`,
+      toolEvents: [toolEvent],
+    };
+  }
+
+  let firstReply: string;
+  try {
+    firstReply = await runAgentChat(runtime, firstMessages);
+  } catch (error) {
+    return {
+      assistantText:
+        error instanceof Error
+          ? `Agent provider error: ${error.message}. Try again or use Restart Agent.`
+          : "Agent provider error. Try again or use Restart Agent.",
+      toolEvents: [],
+    };
+  }
+  const parsedDirective = parseToolDirective(firstReply);
+  const directive = parsedDirective || inferDirectiveFromPrompt(userPrompt, enabledTools);
   if (!directive) {
     return {
-      assistantText: firstReply || "(empty response)",
+      assistantText: stripSystemReminder(firstReply) || "(empty response)",
       toolEvents: [],
     };
   }
 
-  const toolEvent = await executeToolDirective(directive, { tools, security });
+  const normalizedDirective = normalizeDirectiveForPrompt(userPrompt, directive);
+  const toolEvent = await executeToolDirective(normalizedDirective, { tools, security });
   await addActivity({
     kind: "action",
     source: "chat",
@@ -104,7 +235,7 @@ export async function runAgentTurn(userPrompt: string): Promise<AgentTurnResult>
   const finalReply = await runAgentChat(runtime, finalMessages);
 
   return {
-    assistantText: finalReply || "Tool executed.",
+    assistantText: stripSystemReminder(finalReply) || "Tool executed.",
     toolEvents: [toolEvent],
   };
 }

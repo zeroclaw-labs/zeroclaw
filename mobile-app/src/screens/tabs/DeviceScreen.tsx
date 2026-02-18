@@ -14,10 +14,28 @@ import {
 import { runToolExecutionProbe } from "../../runtime/session";
 import { executeAndroidToolAction } from "../../native/androidAgentBridge";
 
+const sdkInt = typeof Platform.Version === "number" ? Platform.Version : Number(Platform.Version || 0);
+const UI_AUTOMATION_TOOL_IDS = [
+  "android_device.ui.automation_enable",
+  "android_device.ui.automation_status",
+  "android_device.ui.tap",
+  "android_device.ui.swipe",
+  "android_device.ui.click_text",
+  "android_device.ui.back",
+  "android_device.ui.home",
+  "android_device.ui.recents",
+];
+
+function unique(values: Array<string | undefined>): string[] {
+  return Array.from(new Set(values.filter((value): value is string => Boolean(value))));
+}
+
 export function DeviceScreen() {
   const [tools, setTools] = useState<MobileToolCapability[]>(DEFAULT_DEVICE_TOOLS);
   const [saveStatus, setSaveStatus] = useState("Loading...");
   const [probeStatus, setProbeStatus] = useState("");
+  const [accessibilityServiceEnabled, setAccessibilityServiceEnabled] = useState(false);
+  const [accessibilityConnected, setAccessibilityConnected] = useState(false);
   const hydratedRef = useRef(false);
 
   const enabledCount = useMemo(() => tools.filter((t) => t.enabled).length, [tools]);
@@ -37,6 +55,24 @@ export function DeviceScreen() {
     };
   }, []);
 
+  const refreshUiAutomationStatus = async () => {
+    try {
+      const output = (await executeAndroidToolAction("ui_automation_status", {})) as {
+        enabled?: boolean;
+        connected?: boolean;
+      } | null;
+      setAccessibilityServiceEnabled(Boolean(output?.enabled));
+      setAccessibilityConnected(Boolean(output?.connected));
+    } catch {
+      setAccessibilityServiceEnabled(false);
+      setAccessibilityConnected(false);
+    }
+  };
+
+  useEffect(() => {
+    void refreshUiAutomationStatus();
+  }, []);
+
   useEffect(() => {
     if (!hydratedRef.current) return;
     const timer = setTimeout(() => {
@@ -47,26 +83,32 @@ export function DeviceScreen() {
   }, [tools]);
 
   const permissionsForTool = (id: string): string[] => {
+    const modernMedia = sdkInt >= 33;
+    const bluetoothRuntime = sdkInt >= 31;
+    const notificationsRuntime = sdkInt >= 33;
+
+    const storagePermissions = modernMedia
+      ? [
+          PermissionsAndroid.PERMISSIONS.READ_MEDIA_IMAGES,
+          PermissionsAndroid.PERMISSIONS.READ_MEDIA_VIDEO,
+          PermissionsAndroid.PERMISSIONS.READ_MEDIA_AUDIO,
+        ]
+      : [
+          PermissionsAndroid.PERMISSIONS.READ_EXTERNAL_STORAGE,
+          PermissionsAndroid.PERMISSIONS.WRITE_EXTERNAL_STORAGE,
+        ];
+
     const byTool: Record<string, string[]> = {
-      "android_device.storage.files": [
-        PermissionsAndroid.PERMISSIONS.READ_EXTERNAL_STORAGE,
-        PermissionsAndroid.PERMISSIONS.WRITE_EXTERNAL_STORAGE,
-        PermissionsAndroid.PERMISSIONS.READ_MEDIA_IMAGES,
-        PermissionsAndroid.PERMISSIONS.READ_MEDIA_VIDEO,
-        PermissionsAndroid.PERMISSIONS.READ_MEDIA_AUDIO,
-      ],
-      "android_device.storage.documents": [
-        PermissionsAndroid.PERMISSIONS.READ_EXTERNAL_STORAGE,
-        PermissionsAndroid.PERMISSIONS.WRITE_EXTERNAL_STORAGE,
-        PermissionsAndroid.PERMISSIONS.READ_MEDIA_IMAGES,
-        PermissionsAndroid.PERMISSIONS.READ_MEDIA_VIDEO,
-        PermissionsAndroid.PERMISSIONS.READ_MEDIA_AUDIO,
-      ],
+      "android_device.storage.files": storagePermissions,
+      "android_device.storage.documents": storagePermissions,
       "android_device.userdata.photos": [
-        PermissionsAndroid.PERMISSIONS.READ_MEDIA_IMAGES,
-        PermissionsAndroid.PERMISSIONS.READ_MEDIA_VIDEO,
+        ...(modernMedia
+          ? [PermissionsAndroid.PERMISSIONS.READ_MEDIA_IMAGES, PermissionsAndroid.PERMISSIONS.READ_MEDIA_VIDEO]
+          : [PermissionsAndroid.PERMISSIONS.READ_EXTERNAL_STORAGE]),
       ],
       "android_device.microphone.record": [PermissionsAndroid.PERMISSIONS.RECORD_AUDIO],
+      "android_device.camera.capture": [PermissionsAndroid.PERMISSIONS.CAMERA],
+      "android_device.camera.scan_qr": [PermissionsAndroid.PERMISSIONS.CAMERA],
       "android_device.location.read": [
         PermissionsAndroid.PERMISSIONS.ACCESS_COARSE_LOCATION,
         PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
@@ -75,33 +117,34 @@ export function DeviceScreen() {
         PermissionsAndroid.PERMISSIONS.ACCESS_COARSE_LOCATION,
         PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
       ],
-      "android_device.notifications.post": [PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS],
-      "android_device.notifications.read": [PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS],
-      "android_device.notifications.hook": [PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS],
+      "android_device.notifications.post": notificationsRuntime ? [PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS] : [],
+      "android_device.notifications.read": notificationsRuntime ? [PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS] : [],
+      "android_device.notifications.hook": notificationsRuntime ? [PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS] : [],
       "android_device.calls.start": [PermissionsAndroid.PERMISSIONS.CALL_PHONE],
       "android_device.calls.incoming_hook": [PermissionsAndroid.PERMISSIONS.READ_PHONE_STATE],
       "android_device.sms.send": [PermissionsAndroid.PERMISSIONS.SEND_SMS],
+      "android_device.sms.incoming_hook": [PermissionsAndroid.PERMISSIONS.RECEIVE_SMS],
       "android_device.contacts.read": [PermissionsAndroid.PERMISSIONS.READ_CONTACTS],
       "android_device.calendar.read_write": [
         PermissionsAndroid.PERMISSIONS.READ_CALENDAR,
         PermissionsAndroid.PERMISSIONS.WRITE_CALENDAR,
       ],
-      "android_device.bluetooth.scan": [PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN],
-      "android_device.bluetooth.connect": [PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT],
+      "android_device.bluetooth.scan": bluetoothRuntime ? [PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN] : [],
+      "android_device.bluetooth.connect": bluetoothRuntime ? [PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT] : [],
       "android_device.userdata.call_log": [PermissionsAndroid.PERMISSIONS.READ_CALL_LOG],
       "android_device.userdata.sms_inbox": [PermissionsAndroid.PERMISSIONS.READ_SMS],
     };
-    return byTool[id] || [];
+    return unique(byTool[id] || []);
   };
 
   const requestPermissionsForTools = async (ids: string[]): Promise<boolean> => {
     if (Platform.OS !== "android") return true;
 
-    const unique = Array.from(new Set(ids.flatMap((id) => permissionsForTool(id)).filter(Boolean)));
-    if (unique.length === 0) return true;
+    const requestedPermissions = unique(ids.flatMap((id) => permissionsForTool(id)));
+    if (requestedPermissions.length === 0) return true;
 
-    const result = await PermissionsAndroid.requestMultiple(unique as any);
-    return unique.every((permission) => result[permission] === PermissionsAndroid.RESULTS.GRANTED);
+    const result = await PermissionsAndroid.requestMultiple(requestedPermissions as any);
+    return requestedPermissions.every((permission) => result[permission] === PermissionsAndroid.RESULTS.GRANTED);
   };
 
   const setToggle = async (id: string, enabled: boolean) => {
@@ -116,14 +159,13 @@ export function DeviceScreen() {
 
       const granted = await requestPermissionsForTools([id]);
       if (!granted) {
-        setSaveStatus("Permission denied");
+        setSaveStatus("Enabled with limited permissions");
         await addActivity({
           kind: "action",
           source: "device",
           title: "Permission denied",
-          detail: `Could not enable ${id}`,
+          detail: `Enabled ${id}, but one or more Android permissions were denied`,
         });
-        return;
       }
     }
 
@@ -141,14 +183,13 @@ export function DeviceScreen() {
     if (enabled) {
       const granted = await requestPermissionsForTools(tools.map((tool) => tool.id));
       if (!granted) {
-        setSaveStatus("Permission denied");
+        setSaveStatus("Enabled with limited permissions");
         await addActivity({
           kind: "action",
           source: "device",
           title: "Permission denied",
-          detail: "Could not enable all capabilities",
+          detail: "Enabled all capabilities, but one or more Android permissions were denied",
         });
-        return;
       }
     }
 
@@ -199,6 +240,49 @@ export function DeviceScreen() {
     });
   };
 
+  const setUiAutomationBundle = async (enabled: boolean) => {
+    setTools((prev) =>
+      prev.map((tool) =>
+        UI_AUTOMATION_TOOL_IDS.includes(tool.id)
+          ? {
+              ...tool,
+              enabled,
+            }
+          : tool,
+      ),
+    );
+
+    if (enabled) {
+      try {
+        await executeAndroidToolAction("ui_automation_enable", {});
+      } catch {
+        setSaveStatus("Could not open accessibility settings");
+      }
+      await addActivity({
+        kind: "action",
+        source: "device",
+        title: "UI automation requested",
+        detail: "Open Android Accessibility settings and enable MobileClaw accessibility service",
+      });
+    } else {
+      await addActivity({
+        kind: "action",
+        source: "device",
+        title: "UI automation toggled off",
+        detail: "MobileClaw UI automation capabilities disabled in app policy",
+      });
+    }
+
+    setTimeout(() => {
+      void refreshUiAutomationStatus();
+    }, 500);
+  };
+
+  const uiAutomationToggleOn = useMemo(
+    () => tools.some((tool) => UI_AUTOMATION_TOOL_IDS.includes(tool.id) && tool.enabled),
+    [tools],
+  );
+
   return (
     <Screen>
       <ScrollView contentContainerStyle={{ paddingHorizontal: theme.spacing.lg, paddingTop: theme.spacing.xl, paddingBottom: 140, gap: theme.spacing.lg }}>
@@ -213,6 +297,51 @@ export function DeviceScreen() {
           <Text variant="mono" style={{ marginTop: theme.spacing.sm, color: theme.colors.base.textMuted }}>
             {`${enabledCount}/${tools.length} enabled`}
           </Text>
+        </View>
+
+        <View style={{ padding: theme.spacing.lg, borderRadius: theme.radii.xl, backgroundColor: theme.colors.surface.raised, borderWidth: 1, borderColor: theme.colors.stroke.subtle, gap: theme.spacing.md }}>
+          <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: theme.spacing.md }}>
+            <View style={{ flex: 1 }}>
+              <Text variant="title">Accessibility Automation</Text>
+              <Text variant="muted" style={{ marginTop: 4 }}>
+                Required for full OS UI automation (tap/swipe/click/back/home/recents).
+              </Text>
+            </View>
+            <Switch
+              testID="device-accessibility-toggle"
+              value={uiAutomationToggleOn}
+              onValueChange={(value) => {
+                void setUiAutomationBundle(value);
+              }}
+            />
+          </View>
+
+          <Text variant="mono" style={{ color: theme.colors.base.textMuted }}>
+            {`service_enabled=${accessibilityServiceEnabled}, connected=${accessibilityConnected}`}
+          </Text>
+
+          <Pressable
+            testID="device-open-accessibility-settings"
+            onPress={() => {
+              void executeAndroidToolAction("ui_automation_enable", {});
+            }}
+            style={{
+              paddingVertical: 12,
+              paddingHorizontal: 14,
+              borderRadius: theme.radii.lg,
+              borderWidth: 1,
+              borderColor: theme.colors.stroke.subtle,
+              backgroundColor: theme.colors.surface.panel,
+            }}
+          >
+            <Text variant="bodyMedium">Open Accessibility Settings</Text>
+          </Pressable>
+
+          <Text variant="muted">How to enable:</Text>
+          <Text variant="muted">1) Tap "Open Accessibility Settings".</Text>
+          <Text variant="muted">2) Select "MobileClaw" service.</Text>
+          <Text variant="muted">3) Turn on accessibility permission and confirm prompt.</Text>
+          <Text variant="muted">4) Return here and verify `service_enabled=true`.</Text>
         </View>
 
         <View style={{ padding: theme.spacing.lg, borderRadius: theme.radii.xl, backgroundColor: theme.colors.surface.raised, borderWidth: 1, borderColor: theme.colors.stroke.subtle, gap: theme.spacing.md }}>

@@ -47,9 +47,9 @@ export type MobileToolCapability = {
 };
 
 const AGENT_KEY = "mobileclaw:agent-config:v1";
-const INTEGRATIONS_KEY = "mobileclaw:integrations-config:v1";
+const INTEGRATIONS_KEY = "mobileclaw:integrations-config:v2";
 const SECURITY_KEY = "mobileclaw:security-config:v1";
-const DEVICE_TOOLS_KEY = "mobileclaw:device-tools:v1";
+const DEVICE_TOOLS_KEY = "mobileclaw:device-tools:v2";
 
 export const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig = {
   provider: "openrouter",
@@ -67,16 +67,16 @@ export const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig = {
 };
 
 export const DEFAULT_INTEGRATIONS: IntegrationsConfig = {
-  telegramEnabled: true,
+  telegramEnabled: false,
   telegramBotToken: "",
   telegramChatId: "",
-  discordEnabled: true,
+  discordEnabled: false,
   discordBotToken: "",
-  slackEnabled: true,
+  slackEnabled: false,
   slackBotToken: "",
-  whatsappEnabled: true,
+  whatsappEnabled: false,
   whatsappAccessToken: "",
-  composioEnabled: true,
+  composioEnabled: false,
   composioApiKey: "",
 };
 
@@ -122,6 +122,18 @@ export const DEFAULT_DEVICE_TOOLS: MobileToolCapability[] = [
   { id: "android_device.bluetooth.connect", title: "Bluetooth Connect", detail: "Connect to known BLE device", enabled: false },
   { id: "android_device.nfc.read", title: "NFC Read", detail: "Read NFC tags with tap", enabled: false },
   { id: "android_device.nfc.write", title: "NFC Write", detail: "Write NFC tags", enabled: false },
+  { id: "android_device.ui.automation_enable", title: "UI Automation Enable", detail: "Open accessibility settings for automation", enabled: false },
+  { id: "android_device.ui.automation_status", title: "UI Automation Status", detail: "Check accessibility automation status", enabled: false },
+  { id: "android_device.ui.tap", title: "UI Tap", detail: "Tap screen coordinates via accessibility", enabled: false },
+  { id: "android_device.ui.swipe", title: "UI Swipe", detail: "Swipe on screen via accessibility", enabled: false },
+  { id: "android_device.ui.click_text", title: "UI Click Text", detail: "Click visible text on screen", enabled: false },
+  { id: "android_device.ui.back", title: "UI Back", detail: "Perform Android back action", enabled: false },
+  { id: "android_device.ui.home", title: "UI Home", detail: "Go to Android home screen", enabled: false },
+  { id: "android_device.ui.recents", title: "UI Recents", detail: "Open recents screen", enabled: false },
+  { id: "android_device.browser.open_session", title: "Browser Open Session", detail: "Open in-app browser session", enabled: false },
+  { id: "android_device.browser.navigate", title: "Browser Navigate", detail: "Navigate active in-app browser session", enabled: false },
+  { id: "android_device.browser.state", title: "Browser State", detail: "Read current browser URL/title", enabled: false },
+  { id: "android_device.browser.fetch_page", title: "Browser Fetch Page", detail: "Fetch page source text for browsing", enabled: false },
   { id: "hardware_board_info", title: "Hardware Board Info", detail: "Read connected board/chip info", enabled: false },
   { id: "hardware_memory_map", title: "Hardware Memory Map", detail: "Read flash/RAM ranges", enabled: false },
   { id: "hardware_memory_read", title: "Hardware Memory Read", detail: "Read memory addresses from board", enabled: false },

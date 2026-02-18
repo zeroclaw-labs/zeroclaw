@@ -12,6 +12,14 @@ const HIGH_RISK_TOOLS = new Set<string>([
   "android_device.contacts.read",
   "android_device.calendar.read_write",
   "android_device.notifications.read",
+  "android_device.ui.tap",
+  "android_device.ui.swipe",
+  "android_device.ui.click_text",
+  "android_device.ui.back",
+  "android_device.ui.home",
+  "android_device.ui.recents",
+  "android_device.browser.open_session",
+  "android_device.browser.navigate",
 ]);
 
 const TOOL_ACTION_MAP: Record<string, string> = {
@@ -49,6 +57,18 @@ const TOOL_ACTION_MAP: Record<string, string> = {
   "android_device.bluetooth.connect": "connect_bluetooth",
   "android_device.nfc.read": "read_nfc",
   "android_device.nfc.write": "write_nfc",
+  "android_device.ui.automation_enable": "ui_automation_enable",
+  "android_device.ui.automation_status": "ui_automation_status",
+  "android_device.ui.tap": "ui_automation_tap",
+  "android_device.ui.swipe": "ui_automation_swipe",
+  "android_device.ui.click_text": "ui_automation_click_text",
+  "android_device.ui.back": "ui_automation_back",
+  "android_device.ui.home": "ui_automation_home",
+  "android_device.ui.recents": "ui_automation_recents",
+  "android_device.browser.open_session": "browser_open_session",
+  "android_device.browser.navigate": "browser_navigate",
+  "android_device.browser.state": "browser_state",
+  "android_device.browser.fetch_page": "browser_fetch_page",
   hardware_board_info: "hardware_board_info",
   hardware_memory_map: "hardware_memory_map",
   hardware_memory_read: "hardware_memory_read",
@@ -58,28 +78,111 @@ export function parseToolDirective(replyText: string): ToolCallDirective | null 
   const raw = String(replyText || "").trim();
   if (!raw) return null;
 
-  const fencedMatch = raw.match(/```json\s*([\s\S]*?)```/i);
-  const candidateJson = fencedMatch?.[1]?.trim() || raw;
+  const cleaned = raw
+    .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, "")
+    .replace(/<system-reminder>[\s\S]*$/gi, "")
+    .trim();
 
-  let parsed: any;
-  try {
-    parsed = JSON.parse(candidateJson);
-  } catch {
-    return null;
+  const invokeMatch = cleaned.match(/<invoke\s+name\s*=\s*"([^"]+)"\s*>/i);
+  if (invokeMatch?.[1]) {
+    return {
+      tool: invokeMatch[1].trim(),
+      arguments: {},
+    };
   }
 
-  const type = String(parsed?.type || "").trim().toLowerCase();
-  const tool = String(parsed?.tool || parsed?.tool_id || "").trim();
-  const args = parsed?.arguments;
-
-  if (type !== "tool_call" || !tool || typeof args !== "object" || args === null || Array.isArray(args)) {
-    return null;
+  const taggedToolCallMatch = cleaned.match(/\[TOOL_CALL\]\s*([\s\S]*?)\s*\[\/TOOL_CALL\]/i);
+  if (taggedToolCallMatch?.[1]) {
+    const taggedBody = taggedToolCallMatch[1].trim();
+    try {
+      const taggedParsed = JSON.parse(taggedBody) as { tool?: string; arguments?: Record<string, unknown> };
+      if (typeof taggedParsed.tool === "string" && taggedParsed.tool.trim()) {
+        return {
+          tool: taggedParsed.tool.trim(),
+          arguments:
+            taggedParsed.arguments && typeof taggedParsed.arguments === "object" && !Array.isArray(taggedParsed.arguments)
+              ? taggedParsed.arguments
+              : {},
+        };
+      }
+    } catch {
+      // fall through to other parsers
+    }
   }
 
-  return {
-    tool,
-    arguments: args as Record<string, unknown>,
+  const parseCandidate = (candidate: string): ToolCallDirective | null => {
+    let parsed: any;
+    try {
+      parsed = JSON.parse(candidate);
+    } catch {
+      return null;
+    }
+
+    const type = String(parsed?.type || "").trim().toLowerCase();
+    const tool = String(parsed?.tool || parsed?.tool_id || "").trim();
+    const args = parsed?.arguments;
+    const looksLikeToolCallWithoutType = !type && !!tool;
+    if ((!looksLikeToolCallWithoutType && type !== "tool_call") || !tool || typeof args !== "object" || args === null || Array.isArray(args)) {
+      return null;
+    }
+
+    return {
+      tool,
+      arguments: args as Record<string, unknown>,
+    };
   };
+
+  const direct = parseCandidate(cleaned);
+  if (direct) return direct;
+
+  const fencedBlocks = [...cleaned.matchAll(/```json\s*([\s\S]*?)```/gi)].map((match) => match[1]?.trim()).filter(Boolean) as string[];
+  for (const block of fencedBlocks) {
+    const parsed = parseCandidate(block);
+    if (parsed) return parsed;
+  }
+
+  const candidates: string[] = [];
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < cleaned.length; i += 1) {
+    const ch = cleaned[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === "{") {
+      if (depth === 0) start = i;
+      depth += 1;
+      continue;
+    }
+    if (ch === "}") {
+      if (depth > 0) depth -= 1;
+      if (depth === 0 && start >= 0) {
+        candidates.push(cleaned.slice(start, i + 1));
+        start = -1;
+      }
+    }
+  }
+
+  for (const candidate of candidates) {
+    const parsed = parseCandidate(candidate);
+    if (parsed) return parsed;
+  }
+
+  return null;
 }
 
 function defaultPayloadForTool(tool: string, args: Record<string, unknown>): Record<string, unknown> {
@@ -89,11 +192,49 @@ function defaultPayloadForTool(tool: string, args: Record<string, unknown>): Rec
   }
 
   if (tool === "android_device.storage.files") {
+    const rawPath = String(args.path || "").trim();
+    const normalizedPath = rawPath
+      .replace(/^\/sdcard\/?/i, "")
+      .replace(/^\/storage\/emulated\/0\/?/i, "");
+
     return {
       scope: args.scope || "user",
-      path: args.path || "",
+      path: normalizedPath,
       limit: args.limit || 200,
     };
+  }
+
+  if (tool === "android_device.calls.start") {
+    const to =
+      (typeof args.to === "string" && args.to.trim()) ||
+      (typeof args.phone === "string" && args.phone.trim()) ||
+      (typeof args.number === "string" && args.number.trim()) ||
+      "";
+    return { to };
+  }
+
+  if (tool === "android_device.sms.send") {
+    const to =
+      (typeof args.to === "string" && args.to.trim()) ||
+      (typeof args.phone === "string" && args.phone.trim()) ||
+      (typeof args.number === "string" && args.number.trim()) ||
+      "";
+    const body =
+      (typeof args.body === "string" && args.body.trim()) ||
+      (typeof args.text === "string" && args.text.trim()) ||
+      (typeof args.message === "string" && args.message.trim()) ||
+      (typeof args.content === "string" && args.content.trim()) ||
+      "";
+    return { to, body };
+  }
+
+  if (tool === "android_device.camera.capture") {
+    const lens =
+      (typeof args.lens === "string" && args.lens.trim()) ||
+      (typeof args.camera === "string" && args.camera.trim()) ||
+      (typeof args.facing === "string" && args.facing.trim()) ||
+      "rear";
+    return { lens };
   }
 
   return args;
