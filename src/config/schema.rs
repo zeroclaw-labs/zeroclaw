@@ -1449,7 +1449,8 @@ pub enum StreamMode {
     Off,
     /// Update a draft message with every flush interval.
     Partial,
-    /// Update a draft message in larger chunks.
+    /// Update a draft message in larger chunks (reserved for future use;
+    /// currently behaves the same as `Partial`).
     Block,
 }
 
