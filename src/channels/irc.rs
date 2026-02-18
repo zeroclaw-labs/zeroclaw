@@ -551,7 +551,7 @@ impl Channel for IrcChannel {
                     // Determine reply target: if sent to a channel, reply to channel;
                     // if DM (target == our nick), reply to sender
                     let is_channel = target.starts_with('#') || target.starts_with('&');
-                    let reply_to = if is_channel {
+                    let reply_target = if is_channel {
                         target.to_string()
                     } else {
                         sender_nick.to_string()
@@ -566,7 +566,7 @@ impl Channel for IrcChannel {
                     let channel_msg = ChannelMessage {
                         id: format!("irc_{}_{seq}", chrono::Utc::now().timestamp_millis()),
                         sender: sender_nick.to_string(),
-                        reply_target: reply_to,
+                        reply_target,
                         content,
                         channel: "irc".to_string(),
                         timestamp: std::time::SystemTime::now()
