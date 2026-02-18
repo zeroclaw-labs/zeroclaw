@@ -816,10 +816,10 @@ fn default_embedding_dims() -> usize {
     1536
 }
 fn default_vector_weight() -> f64 {
-    0.4
+    0.7
 }
 fn default_keyword_weight() -> f64 {
-    0.6
+    0.3
 }
 fn default_min_relevance_score() -> f64 {
     0.4
