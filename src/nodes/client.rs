@@ -4,7 +4,7 @@
 //! connection to the main gateway. It can receive and execute commands.
 
 use crate::nodes::types::{
-    NodeCommand, NodeInfo, NodeResponse, PairingRequest, PairingResponse,
+    NodeResponse, PairingRequest, PairingResponse,
 };
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -124,7 +124,7 @@ impl NodeClient {
         let (mut write, mut read) = ws_stream.split();
 
         // Start heartbeat task
-        let heartbeat_interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+        let mut heartbeat_interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
 
         loop {
             tokio::select! {
@@ -177,7 +177,7 @@ impl NodeClient {
                             .as_str()
                             .context("Command missing 'command' field")?;
 
-                        let timeout_secs = json["timeout_secs"].and_then(|v| v.as_u64());
+                        let timeout_secs = json["timeout_secs"].as_u64();
 
                         let result = self.execute_command(command, timeout_secs).await?;
 
@@ -226,19 +226,19 @@ impl NodeClient {
 
     /// Execute a shell command
     async fn execute_command(&self, command: &str, timeout_secs: Option<u64>) -> Result<ExecResult> {
-        use tokio::process::Command;
         use tokio::time::timeout;
 
         let duration = std::time::Duration::from_secs(timeout_secs.unwrap_or(60));
+        let command_owned = command.to_string();
 
         let output = tokio::task::spawn_blocking(move || {
             let mut cmd = if cfg!(target_os = "windows") {
                 let mut c = std::process::Command::new("cmd");
-                c.args(["/C", command]);
+                c.args(["/C", &command_owned]);
                 c
             } else {
                 let mut c = std::process::Command::new("sh");
-                c.args(["-c", command]);
+                c.args(["-c", &command_owned]);
                 c
             };
             cmd.output()
@@ -262,7 +262,7 @@ impl NodeClient {
     /// Get CPU usage percentage
     fn get_cpu_usage(&self) -> Result<f32> {
         let mut sys = sysinfo::System::new_all();
-        sys.refresh_cpu();
+        sys.refresh_cpu_all();
         let cpu_usage = sys.global_cpu_usage();
         Ok(cpu_usage)
     }
@@ -297,8 +297,7 @@ impl NodeClient {
             use std::time::SystemTime;
             // Windows uptime - simplified implementation
             // In production, use GetTickCount64 from winapi
-            let boot_time = sysinfo::System::new_all()
-                .boot_time();
+            let boot_time = sysinfo::System::boot_time();
             let now = SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs();
@@ -308,8 +307,7 @@ impl NodeClient {
         {
             use std::time::SystemTime;
             // macOS uptime - simplified implementation
-            let boot_time = sysinfo::System::new_all()
-                .boot_time();
+            let boot_time = sysinfo::System::boot_time();
             let now = SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs();

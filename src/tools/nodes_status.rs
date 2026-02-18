@@ -1,5 +1,6 @@
 //! Tool for getting node status information
 
+use async_trait::async_trait;
 use crate::nodes::NodeServer;
 use crate::tools::traits::{Tool, ToolResult};
 use std::sync::Arc;
@@ -16,6 +17,7 @@ impl NodesStatusTool {
     }
 }
 
+#[async_trait]
 impl Tool for NodesStatusTool {
     fn name(&self) -> &str {
         "nodes_status"

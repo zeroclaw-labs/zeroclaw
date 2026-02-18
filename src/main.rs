@@ -783,14 +783,14 @@ async fn handle_node_command(command: NodeCommands, config: &Config) -> Result<(
                 "linux".to_string()
             };
 
+            println!("🔗 Connecting to {}", server);
+
             let client = crate::nodes::connect_to_server(
                 server,
                 node_name,
                 Some(hostname),
                 platform,
             );
-
-            println!("🔗 Connecting to {}", server);
             let node_id = client.connect_with_code(code).await?;
 
             println!("✅ Connected as node: {}", node_id);

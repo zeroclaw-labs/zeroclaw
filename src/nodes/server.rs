@@ -3,7 +3,7 @@
 //! The node server accepts reverse WebSocket connections from remote nodes,
 //! handles pairing via 6-digit codes, and routes commands to connected nodes.
 
-use crate::config::NodesConfig;
+use crate::config::schema::NodesConfig;
 use crate::nodes::types::{
     NodeCommand, NodeInfo, NodeResponse, PairingRequest, PairingResponse,
 };
@@ -22,7 +22,6 @@ use tokio_tungstenite::{
         handshake::server::{Request, Response},
         Message,
     },
-    WebSocketStream,
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
@@ -70,7 +69,7 @@ impl NodeServer {
         tracing::info!("Node server listening on {}", addr);
 
         // Start heartbeat checker task
-        let server_for_heartbeat = self.clone_for_handler();
+        let server_for_heartbeat = Arc::new(self.clone_for_handler());
         tokio::spawn(async move {
             server_for_heartbeat.heartbeat_checker().await;
         });
@@ -93,10 +92,9 @@ impl NodeServer {
     pub fn generate_pairing_code(&self) -> String {
         use rand::Rng;
 
-        let code: String = rand::thread_rng()
-            .sample_iter(&rand::distributions::Uniform::new(0u8, 10))
-            .take(6)
-            .map(|d| char::from_digit(d as u32, 10).unwrap())
+        let code: String = (0..6)
+            .map(|_| rand::rng().random_range(0..10))
+            .map(|d| char::from_digit(d, 10).unwrap())
             .collect();
 
         let expiry = Instant::now() + Duration::from_secs(self.config.pairing_timeout_secs);
@@ -124,10 +122,14 @@ impl NodeServer {
         command: &str,
         timeout_secs: Option<u32>,
     ) -> Result<NodeResponse> {
-        let nodes = self.nodes.read();
-        let node = nodes
-            .get(node_id)
-            .context(format!("Node '{}' not found", node_id))?;
+        // Get sender from node - release lock before await
+        let sender = {
+            let nodes = self.nodes.read();
+            let node = nodes
+                .get(node_id)
+                .context(format!("Node '{}' not found", node_id))?;
+            node.sender.clone()
+        };
 
         // Generate unique request ID
         let request_id = self.next_request_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -147,7 +149,7 @@ impl NodeServer {
         let message = Message::Text(cmd_json);
 
         // Send command
-        node.sender
+        sender
             .send(message)
             .context("Failed to send command to node")?;
 
@@ -155,7 +157,7 @@ impl NodeServer {
         let timeout = Duration::from_secs(timeout_secs.unwrap_or(60) as u64);
         tokio::select! {
             result = rx => {
-                result.context("Failed to receive response from node")?
+                Ok(result.context("Failed to receive response from node")?)
             }
             _ = tokio::time::sleep(timeout) => {
                 // Clean up pending request on timeout
@@ -190,7 +192,7 @@ impl NodeServer {
             anyhow::bail!("Max connections reached");
         }
 
-        let callback = |req: &Request, mut response: Response| {
+        let callback = |req: &Request, response: Response| {
             tracing::info!("WebSocket handshake from {}", req.uri());
             Ok(response)
         };
@@ -288,7 +290,7 @@ impl NodeServer {
             "exec_result" => {
                 // Handle command execution result and route back to waiting command
                 let response: NodeResponse =
-                    serde_json::from_value(json).context("Failed to parse exec result")?;
+                    serde_json::from_value(json.clone()).context("Failed to parse exec result")?;
 
                 if let NodeResponse::ExecResult { .. } = &response {
                     // Extract request_id from the message if present

@@ -1,5 +1,6 @@
 //! Tool for listing all connected nodes
 
+use async_trait::async_trait;
 use crate::nodes::NodeServer;
 use crate::tools::traits::{Tool, ToolResult};
 use std::sync::Arc;
@@ -16,6 +17,7 @@ impl NodesListTool {
     }
 }
 
+#[async_trait]
 impl Tool for NodesListTool {
     fn name(&self) -> &str {
         "nodes_list"

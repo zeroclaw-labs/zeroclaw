@@ -138,6 +138,7 @@ pub fn run_wizard() -> Result<Config> {
         agents: std::collections::HashMap::new(),
         hardware: hardware_config,
         query_classification: crate::config::QueryClassificationConfig::default(),
+        nodes: crate::config::schema::NodesConfig::default(),
     };
 
     println!(
@@ -360,6 +361,7 @@ pub fn run_quick_setup(
         agents: std::collections::HashMap::new(),
         hardware: crate::config::HardwareConfig::default(),
         query_classification: crate::config::QueryClassificationConfig::default(),
+        nodes: crate::config::schema::NodesConfig::default(),
     };
 
     config.save()?;

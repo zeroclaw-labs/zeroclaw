@@ -1,5 +1,6 @@
 //! Tool for executing commands on remote nodes
 
+use async_trait::async_trait;
 use crate::nodes::NodeServer;
 use crate::tools::traits::{Tool, ToolResult};
 use std::sync::Arc;
@@ -16,6 +17,7 @@ impl NodesRunTool {
     }
 }
 
+#[async_trait]
 impl Tool for NodesRunTool {
     fn name(&self) -> &str {
         "nodes_run"
