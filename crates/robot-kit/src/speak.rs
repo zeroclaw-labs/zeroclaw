@@ -34,7 +34,10 @@ impl SpeakTool {
 
         // Model path
         let model_path = directories::UserDirs::new()
-            .map(|d| d.home_dir().join(format!(".zeroclaw/models/piper/{}.onnx", voice)))
+            .map(|d| {
+                d.home_dir()
+                    .join(format!(".zeroclaw/models/piper/{}.onnx", voice))
+            })
             .unwrap_or_else(|| PathBuf::from(format!("/usr/local/share/piper/{}.onnx", voice)));
 
         // Adjust text based on emotion (simple SSML-like modifications)
@@ -51,8 +54,10 @@ impl SpeakTool {
         // Pipe text to piper, output to WAV
         let mut piper = tokio::process::Command::new(piper_path)
             .args([
-                "--model", model_path.to_str().unwrap(),
-                "--output_file", output_path.to_str().unwrap(),
+                "--model",
+                model_path.to_str().unwrap(),
+                "--output_file",
+                output_path.to_str().unwrap(),
             ])
             .stdin(std::process::Stdio::piped())
             .spawn()?;
@@ -70,10 +75,7 @@ impl SpeakTool {
 
         // Play audio using aplay
         let play_result = tokio::process::Command::new("aplay")
-            .args([
-                "-D", speaker_device,
-                output_path.to_str().unwrap(),
-            ])
+            .args(["-D", speaker_device, output_path.to_str().unwrap()])
             .output()
             .await?;
 
@@ -171,9 +173,9 @@ impl Tool for SpeakTool {
         }
 
         // Speak text
-        let text = args["text"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Missing 'text' parameter (or use 'sound' for effects)"))?;
+        let text = args["text"].as_str().ok_or_else(|| {
+            anyhow::anyhow!("Missing 'text' parameter (or use 'sound' for effects)")
+        })?;
 
         if text.is_empty() {
             return Ok(ToolResult {

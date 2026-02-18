@@ -123,7 +123,9 @@ impl SafetyMonitor {
         // Check general movement permission
         if !self.state.can_move.load(Ordering::SeqCst) {
             let reason = self.state.block_reason.read().await;
-            return Err(reason.clone().unwrap_or_else(|| "Movement blocked".to_string()));
+            return Err(reason
+                .clone()
+                .unwrap_or_else(|| "Movement blocked".to_string()));
         }
 
         // Check obstacle distance in movement direction
@@ -133,7 +135,9 @@ impl SafetyMonitor {
                 "Obstacle too close: {:.2}m (min: {:.2}m)",
                 min_dist, self.config.min_obstacle_distance
             );
-            let _ = self.event_tx.send(SafetyEvent::MovementDenied { reason: msg.clone() });
+            let _ = self.event_tx.send(SafetyEvent::MovementDenied {
+                reason: msg.clone(),
+            });
             return Err(msg);
         }
 
@@ -141,12 +145,17 @@ impl SafetyMonitor {
         if distance > min_dist - self.config.min_obstacle_distance {
             let safe_distance = (min_dist - self.config.min_obstacle_distance).max(0.0);
             if safe_distance < 0.1 {
-                return Err(format!("Cannot move {}: obstacle at {:.2}m", direction, min_dist));
+                return Err(format!(
+                    "Cannot move {}: obstacle at {:.2}m",
+                    direction, min_dist
+                ));
             }
             // Allow reduced distance
             tracing::warn!(
                 "Reducing {} distance from {:.2}m to {:.2}m due to obstacle",
-                direction, distance, safe_distance
+                direction,
+                distance,
+                safe_distance
             );
         }
 
@@ -219,12 +228,12 @@ impl SafetyMonitor {
         // Check if too close
         if distance < self.config.min_obstacle_distance {
             self.state.can_move.store(false, Ordering::SeqCst);
-            *self.state.block_reason.write().await = Some(format!(
-                "Obstacle at {:.2}m ({}°)",
-                distance, angle
-            ));
+            *self.state.block_reason.write().await =
+                Some(format!("Obstacle at {:.2}m ({}°)", distance, angle));
 
-            let _ = self.event_tx.send(SafetyEvent::ObstacleDetected { distance, angle });
+            let _ = self
+                .event_tx
+                .send(SafetyEvent::ObstacleDetected { distance, angle });
         } else if !self.state.estop_active.load(Ordering::SeqCst) {
             // Clear block if obstacle moved away and no E-stop
             self.state.can_move.store(true, Ordering::SeqCst);
@@ -336,10 +345,7 @@ pub struct SafeDrive {
 }
 
 impl SafeDrive {
-    pub fn new(
-        drive: Arc<dyn crate::traits::Tool>,
-        safety: Arc<SafetyMonitor>,
-    ) -> Self {
+    pub fn new(drive: Arc<dyn crate::traits::Tool>, safety: Arc<SafetyMonitor>) -> Self {
         Self {
             inner_drive: drive,
             safety,
@@ -361,10 +367,7 @@ impl crate::traits::Tool for SafeDrive {
         self.inner_drive.parameters_schema()
     }
 
-    async fn execute(
-        &self,
-        args: serde_json::Value,
-    ) -> Result<ToolResult> {
+    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult> {
         // ToolResult imported at top of file
 
         let action = args["action"].as_str().unwrap_or("unknown");
@@ -392,13 +395,11 @@ impl crate::traits::Tool for SafeDrive {
 
                 self.inner_drive.execute(modified_args).await
             }
-            Err(reason) => {
-                Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Safety blocked movement: {}", reason)),
-                })
-            }
+            Err(reason) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Safety blocked movement: {}", reason)),
+            }),
         }
     }
 }
@@ -421,7 +422,10 @@ pub async fn preflight_check(config: &RobotConfig) -> Result<Vec<String>> {
     }
 
     if config.safety.estop_pin.is_none() {
-        warnings.push("WARNING: No E-stop pin configured. Recommend wiring a hardware stop button.".to_string());
+        warnings.push(
+            "WARNING: No E-stop pin configured. Recommend wiring a hardware stop button."
+                .to_string(),
+        );
     }
 
     // Check for sensor availability

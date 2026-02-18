@@ -23,24 +23,34 @@ impl ListenTool {
 
         let _ = std::fs::create_dir_all(&recordings_dir);
 
-        Self { config, recordings_dir }
+        Self {
+            config,
+            recordings_dir,
+        }
     }
 
     /// Record audio using arecord (ALSA)
     async fn record_audio(&self, duration_secs: u64) -> Result<PathBuf> {
         let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-        let filename = self.recordings_dir.join(format!("recording_{}.wav", timestamp));
+        let filename = self
+            .recordings_dir
+            .join(format!("recording_{}.wav", timestamp));
 
         let device = &self.config.audio.mic_device;
 
         // Record using arecord (standard on Linux/Pi)
         let output = tokio::process::Command::new("arecord")
             .args([
-                "-D", device,
-                "-f", "S16_LE",     // 16-bit signed little-endian
-                "-r", "16000",       // 16kHz (Whisper expects this)
-                "-c", "1",           // Mono
-                "-d", &duration_secs.to_string(),
+                "-D",
+                device,
+                "-f",
+                "S16_LE", // 16-bit signed little-endian
+                "-r",
+                "16000", // 16kHz (Whisper expects this)
+                "-c",
+                "1", // Mono
+                "-d",
+                &duration_secs.to_string(),
                 filename.to_str().unwrap(),
             ])
             .output()
@@ -63,16 +73,23 @@ impl ListenTool {
 
         // whisper.cpp model path (typically in ~/.zeroclaw/models/)
         let model_path = directories::UserDirs::new()
-            .map(|d| d.home_dir().join(format!(".zeroclaw/models/ggml-{}.bin", model)))
-            .unwrap_or_else(|| PathBuf::from(format!("/usr/local/share/whisper/ggml-{}.bin", model)));
+            .map(|d| {
+                d.home_dir()
+                    .join(format!(".zeroclaw/models/ggml-{}.bin", model))
+            })
+            .unwrap_or_else(|| {
+                PathBuf::from(format!("/usr/local/share/whisper/ggml-{}.bin", model))
+            });
 
         // Run whisper.cpp
         let output = tokio::process::Command::new(whisper_path)
             .args([
-                "-m", model_path.to_str().unwrap(),
-                "-f", audio_path.to_str().unwrap(),
+                "-m",
+                model_path.to_str().unwrap(),
+                "-f",
+                audio_path.to_str().unwrap(),
                 "--no-timestamps",
-                "-otxt",  // Output as text
+                "-otxt", // Output as text
             ])
             .output()
             .await?;
@@ -127,10 +144,7 @@ impl Tool for ListenTool {
     }
 
     async fn execute(&self, args: Value) -> Result<ToolResult> {
-        let duration = args["duration"]
-            .as_u64()
-            .unwrap_or(5)
-            .clamp(1, 30);
+        let duration = args["duration"].as_u64().unwrap_or(5).clamp(1, 30);
 
         // Record audio
         tracing::info!("Recording audio for {} seconds...", duration);

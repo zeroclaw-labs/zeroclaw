@@ -185,17 +185,17 @@ impl Default for RobotConfig {
                 ultrasonic_pins: Some((23, 24)),
             },
             safety: SafetyConfig {
-                min_obstacle_distance: 0.3,        // 30cm - absolute minimum
-                slow_zone_multiplier: 3.0,         // Start slowing at 90cm
-                approach_speed_limit: 0.3,         // 30% max speed near obstacles
-                max_drive_duration: 30,            // Auto-stop after 30s
-                estop_pin: Some(4),                // GPIO 4 for big red button
-                bump_sensor_pins: vec![5, 6],      // Front bump sensors
-                bump_reverse_distance: 0.15,       // Back up 15cm after bump
-                confirm_movement: false,           // Don't require verbal confirm
-                predict_collisions: true,          // Use LIDAR prediction
-                sensor_timeout_secs: 5,            // Block if sensors stale 5s
-                blind_mode_speed_limit: 0.2,       // 20% speed without sensors
+                min_obstacle_distance: 0.3,   // 30cm - absolute minimum
+                slow_zone_multiplier: 3.0,    // Start slowing at 90cm
+                approach_speed_limit: 0.3,    // 30% max speed near obstacles
+                max_drive_duration: 30,       // Auto-stop after 30s
+                estop_pin: Some(4),           // GPIO 4 for big red button
+                bump_sensor_pins: vec![5, 6], // Front bump sensors
+                bump_reverse_distance: 0.15,  // Back up 15cm after bump
+                confirm_movement: false,      // Don't require verbal confirm
+                predict_collisions: true,     // Use LIDAR prediction
+                sensor_timeout_secs: 5,       // Block if sensors stale 5s
+                blind_mode_speed_limit: 0.2,  // 20% speed without sensors
             },
         }
     }

@@ -88,13 +88,9 @@ pip install piper-tts
 
 ```bash
 # Clone and build
-git clone https://github.com/your/zeroclaw
+git clone https://github.com/zeroclaw-labs/zeroclaw
 cd zeroclaw
-cargo build --release
-
-# Copy robot kit to src/tools/
-cp -r examples/robot_kit src/tools/
-# Add to src/tools/mod.rs (see Integration section)
+cargo build -p zeroclaw-robot-kit --release
 ```
 
 ### 2. Configure
@@ -102,8 +98,8 @@ cp -r examples/robot_kit src/tools/
 ```bash
 # Copy config
 mkdir -p ~/.zeroclaw
-cp examples/robot_kit/robot.toml ~/.zeroclaw/
-cp examples/robot_kit/SOUL.md ~/.zeroclaw/workspace/
+cp crates/robot-kit/robot.toml ~/.zeroclaw/
+cp crates/robot-kit/SOUL.md ~/.zeroclaw/workspace/
 
 # Edit for your hardware
 nano ~/.zeroclaw/robot.toml
@@ -125,22 +121,23 @@ ollama serve &
 
 ## Integration
 
-Add to `src/tools/mod.rs`:
+This crate is currently added as a standalone workspace member.
+It is not auto-registered in the core runtime by default.
+
+Use it directly from Rust:
 
 ```rust
-mod robot_kit;
+use zeroclaw_robot_kit::{create_tools, RobotConfig};
 
-pub fn robot_tools(config: &RobotConfig) -> Vec<Arc<dyn Tool>> {
-    vec![
-        Arc::new(robot_kit::DriveTool::new(config.clone())),
-        Arc::new(robot_kit::LookTool::new(config.clone())),
-        Arc::new(robot_kit::ListenTool::new(config.clone())),
-        Arc::new(robot_kit::SpeakTool::new(config.clone())),
-        Arc::new(robot_kit::SenseTool::new(config.clone())),
-        Arc::new(robot_kit::EmoteTool::new(config.clone())),
-    ]
+fn build_robot_tools() {
+    let config = RobotConfig::default();
+    let tools = create_tools(&config);
+    assert_eq!(tools.len(), 6);
 }
 ```
+
+If you want runtime registration in `zeroclaw`, add a thin adapter that maps this
+crate's tools to the project's `src/tools::Tool` and register it in the factory.
 
 ## Usage Examples
 

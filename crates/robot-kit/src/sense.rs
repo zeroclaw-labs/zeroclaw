@@ -76,7 +76,9 @@ impl SenseTool {
             .map(|(i, &d)| (d, i as u16))
             .unwrap_or((999.0, 0));
 
-        let forward_clear = ranges[0..30].iter().chain(ranges[330..360].iter())
+        let forward_clear = ranges[0..30]
+            .iter()
+            .chain(ranges[330..360].iter())
             .all(|&d| d > self.config.safety.min_obstacle_distance);
 
         Ok(LidarScan {
@@ -118,10 +120,16 @@ impl SenseTool {
                     .map(|(i, &d)| (d, i as u16))
                     .unwrap_or((999.0, 0));
 
-                let forward_clear = ranges[0..30].iter().chain(ranges[330..360].iter())
+                let forward_clear = ranges[0..30]
+                    .iter()
+                    .chain(ranges[330..360].iter())
                     .all(|&d| d > self.config.safety.min_obstacle_distance);
 
-                Ok(LidarScan { ranges, nearest, forward_clear })
+                Ok(LidarScan {
+                    ranges,
+                    nearest,
+                    forward_clear,
+                })
             }
             _ => {
                 // Fallback to mock if hardware unavailable
@@ -159,10 +167,16 @@ impl SenseTool {
             .map(|(i, &d)| (d, i as u16))
             .unwrap_or((999.0, 0));
 
-        let forward_clear = ranges[0..30].iter().chain(ranges[330..360].iter())
+        let forward_clear = ranges[0..30]
+            .iter()
+            .chain(ranges[330..360].iter())
             .all(|&d| d > self.config.safety.min_obstacle_distance);
 
-        Ok(LidarScan { ranges, nearest, forward_clear })
+        Ok(LidarScan {
+            ranges,
+            nearest,
+            forward_clear,
+        })
     }
 
     /// Check PIR motion sensors
@@ -199,8 +213,10 @@ impl SenseTool {
         // Ultrasonic requires µs-level timing, so shell out to helper
         let output = tokio::process::Command::new("hc-sr04")
             .args([
-                "--trigger", &trigger.to_string(),
-                "--echo", &echo.to_string(),
+                "--trigger",
+                &trigger.to_string(),
+                "--echo",
+                &echo.to_string(),
             ])
             .output()
             .await;
@@ -265,7 +281,11 @@ impl Tool for SenseTool {
                         format!(
                             "Forward: {:.2}m {}. Nearest obstacle: {:.2}m at {}°",
                             fwd_dist,
-                            if scan.forward_clear { "(clear)" } else { "(BLOCKED)" },
+                            if scan.forward_clear {
+                                "(clear)"
+                            } else {
+                                "(BLOCKED)"
+                            },
                             scan.nearest.0,
                             scan.nearest.1
                         )
@@ -291,9 +311,17 @@ impl Tool for SenseTool {
                              - Right (270°): {:.2}m\n\
                              - Nearest: {:.2}m at {}°\n\
                              - Forward path: {}",
-                            scan.ranges[0], scan.ranges[90], scan.ranges[180], scan.ranges[270],
-                            scan.nearest.0, scan.nearest.1,
-                            if scan.forward_clear { "CLEAR" } else { "BLOCKED" }
+                            scan.ranges[0],
+                            scan.ranges[90],
+                            scan.ranges[180],
+                            scan.ranges[270],
+                            scan.nearest.0,
+                            scan.nearest.1,
+                            if scan.forward_clear {
+                                "CLEAR"
+                            } else {
+                                "BLOCKED"
+                            }
                         )
                     }
                     _ => "Unknown direction".to_string(),
@@ -344,7 +372,10 @@ impl Tool for SenseTool {
                 Ok(ToolResult {
                     success: true,
                     output: if scan.forward_clear {
-                        format!("Path ahead is CLEAR (nearest obstacle: {:.2}m)", scan.nearest.0)
+                        format!(
+                            "Path ahead is CLEAR (nearest obstacle: {:.2}m)",
+                            scan.nearest.0
+                        )
                     } else {
                         format!("Path ahead is BLOCKED (obstacle at {:.2}m)", scan.ranges[0])
                     },
@@ -362,9 +393,18 @@ impl Tool for SenseTool {
                      LIDAR: nearest {:.2}m at {}°, forward {}\n\
                      Motion: {}\n\
                      Ultrasonic: {:.2}m",
-                    scan.nearest.0, scan.nearest.1,
-                    if scan.forward_clear { "CLEAR" } else { "BLOCKED" },
-                    if motion.detected { format!("DETECTED ({:?})", motion.sensors_triggered) } else { "none".to_string() },
+                    scan.nearest.0,
+                    scan.nearest.1,
+                    if scan.forward_clear {
+                        "CLEAR"
+                    } else {
+                        "BLOCKED"
+                    },
+                    if motion.detected {
+                        format!("DETECTED ({:?})", motion.sensors_triggered)
+                    } else {
+                        "none".to_string()
+                    },
                     distance
                 );
 
@@ -397,7 +437,10 @@ mod tests {
     #[tokio::test]
     async fn sense_scan_mock() {
         let tool = SenseTool::new(RobotConfig::default());
-        let result = tool.execute(json!({"action": "scan", "direction": "all"})).await.unwrap();
+        let result = tool
+            .execute(json!({"action": "scan", "direction": "all"}))
+            .await
+            .unwrap();
         assert!(result.success);
         assert!(result.output.contains("Forward"));
     }
@@ -405,7 +448,10 @@ mod tests {
     #[tokio::test]
     async fn sense_clear_ahead() {
         let tool = SenseTool::new(RobotConfig::default());
-        let result = tool.execute(json!({"action": "clear_ahead"})).await.unwrap();
+        let result = tool
+            .execute(json!({"action": "clear_ahead"}))
+            .await
+            .unwrap();
         assert!(result.success);
     }
 }

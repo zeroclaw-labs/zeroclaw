@@ -8,7 +8,7 @@
 #[cfg(test)]
 mod unit_tests {
     use crate::config::RobotConfig;
-    use crate::traits::{Tool, ToolResult};
+    use crate::traits::Tool;
     use crate::{DriveTool, EmoteTool, ListenTool, LookTool, SenseTool, SpeakTool};
     use serde_json::json;
 
@@ -208,9 +208,7 @@ mod unit_tests {
 
         assert!(result.success);
         // Mock should report clear or blocked
-        assert!(
-            result.output.contains("CLEAR") || result.output.contains("BLOCKED")
-        );
+        assert!(result.output.contains("CLEAR") || result.output.contains("BLOCKED"));
     }
 
     #[tokio::test]
@@ -246,8 +244,16 @@ mod unit_tests {
         let tool = EmoteTool::new(config);
 
         let expressions = [
-            "happy", "sad", "surprised", "thinking", "sleepy", "excited", "love", "angry",
-            "confused", "wink",
+            "happy",
+            "sad",
+            "surprised",
+            "thinking",
+            "sleepy",
+            "excited",
+            "love",
+            "angry",
+            "confused",
+            "wink",
         ];
 
         for expr in expressions {
@@ -265,9 +271,7 @@ mod unit_tests {
         let config = RobotConfig::default();
         let tool = EmoteTool::new(config);
 
-        let result = tool
-            .execute(json!({"expression": "nonexistent"}))
-            .await;
+        let result = tool.execute(json!({"expression": "nonexistent"})).await;
 
         assert!(result.is_err());
     }
@@ -313,7 +317,7 @@ mod unit_tests {
 #[cfg(feature = "safety")]
 mod safety_tests {
     use crate::config::SafetyConfig;
-    use crate::safety::{SafetyEvent, SafetyMonitor, SensorReading};
+    use crate::safety::{SafetyEvent, SafetyMonitor};
     use std::sync::atomic::Ordering;
 
     fn test_safety_config() -> SafetyConfig {
