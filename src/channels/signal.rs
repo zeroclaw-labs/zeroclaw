@@ -119,16 +119,45 @@ impl SignalChannel {
         (2..=15).contains(&number.len()) && number.chars().all(|c| c.is_ascii_digit())
     }
 
+    /// Determine whether a recipient string should be treated as a direct
+    /// message target or a group target.
+    ///
+    /// The original implementation considered any non‑E.164 string (including
+    /// UUIDs used for private Signal numbers) as a group identifier. That caused
+    /// the daemon to send replies using the `groupId` RPC field, which the
+    /// Signal server rejects because a UUID is not a base‑64‑encoded group ID.
+    ///
+    /// The updated logic follows these rules:
+    ///   1. If the string is explicitly prefixed with `group:` → Group.
+    ///   2. If the string parses as a UUID (used for private numbers) → Direct.
+    ///   3. If the string is a valid E.164 phone number → Direct.
+    ///   4. If the string starts with `+` but is not a valid E.164 number →
+    ///      Group (preserves existing behaviour for malformed numbers).
+    ///   5. Anything else → Group (fallback for legacy behaviour).
     fn parse_recipient_target(recipient: &str) -> RecipientTarget {
+        // Explicit group prefix takes precedence.
         if let Some(group_id) = recipient.strip_prefix(GROUP_TARGET_PREFIX) {
             return RecipientTarget::Group(group_id.to_string());
         }
 
-        if Self::is_e164(recipient) {
-            RecipientTarget::Direct(recipient.to_string())
-        } else {
-            RecipientTarget::Group(recipient.to_string())
+        // Private Signal numbers appear as UUIDs. Treat them as direct targets.
+        if uuid::Uuid::parse_str(recipient).is_ok() {
+            return RecipientTarget::Direct(recipient.to_string());
         }
+
+        // Standard phone numbers.
+        if Self::is_e164(recipient) {
+            return RecipientTarget::Direct(recipient.to_string());
+        }
+
+        // Strings that start with '+' but are not valid E.164 numbers have been
+        // historically interpreted as group identifiers (see existing test).
+        if recipient.starts_with('+') {
+            return RecipientTarget::Group(recipient.to_string());
+        }
+
+        // Fallback – treat as a group identifier.
+        RecipientTarget::Group(recipient.to_string())
     }
 
     /// Check whether the message targets the configured group.
