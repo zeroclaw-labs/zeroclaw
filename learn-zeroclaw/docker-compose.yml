@@ -1,0 +1,67 @@
+name: zeroclaw-learn
+
+services:
+  # ZeroClaw Daemon (gateway + agent loop + heartbeat + scheduler)
+  zeroclaw:
+    build:
+      context: ..
+      dockerfile: learn-zeroclaw/Dockerfile
+    container_name: zeroclaw-learn
+    restart: unless-stopped
+    command: ["daemon", "--port", "3000", "--host", "[::]"]
+    environment:
+      - API_KEY=${API_KEY}
+      - PROVIDER=${PROVIDER:-openrouter}
+      - ZEROCLAW_MODEL=
+      - ZEROCLAW_GATEWAY_PORT=3000
+    depends_on:
+      chrome:
+        condition: service_healthy
+    volumes:
+      - ./config.toml:/zeroclaw-data/.zeroclaw/config.toml
+      - ./workspace:/zeroclaw-data/workspace
+    networks:
+      - learn-net
+    healthcheck:
+      test: ["CMD", "zeroclaw", "status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+
+  # Chromium browser (Selenium sidecar for browser tools)
+  chrome:
+    image: selenium/standalone-chromium:latest
+    container_name: zeroclaw-chrome
+    restart: unless-stopped
+    ports:
+      - "7900:7900"   # noVNC — visit http://localhost:7900 to watch
+    environment:
+      - SE_VNC_NO_PASSWORD=true
+    networks:
+      - learn-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4444/status"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Web UI (frontend)
+  web-ui:
+    build:
+      context: ./web-ui
+      args:
+        VITE_API_URL: "/api"
+    container_name: zeroclaw-web-ui
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    depends_on:
+      - zeroclaw
+    networks:
+      - learn-net
+
+networks:
+  learn-net:
+    driver: bridge

@@ -7,14 +7,16 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
+use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
 use crate::channels::{Channel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
-use crate::providers::{self, Provider};
+use crate::observability::{self, Observer};
+use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::security::SecurityPolicy;
-use crate::tools;
+use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use axum::{
@@ -27,6 +29,7 @@ use axum::{
 };
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::fmt::Write as FmtWrite;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -36,8 +39,9 @@ use uuid::Uuid;
 
 /// Maximum request body size (64KB) — prevents memory exhaustion
 pub const MAX_BODY_SIZE: usize = 65_536;
-/// Request timeout (30s) — prevents slow-loris attacks
-pub const REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Request timeout — prevents slow-loris attacks.
+/// Set to 120s to accommodate the full agent tool-call loop.
+pub const REQUEST_TIMEOUT_SECS: u64 = 120;
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 /// Fallback max distinct client keys tracked in gateway rate limiter.
@@ -51,6 +55,21 @@ fn webhook_memory_key() -> String {
 
 fn whatsapp_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
     format!("whatsapp_{}_{}", msg.sender, msg.id)
+}
+
+/// Build context by recalling relevant memory entries for the user message.
+async fn build_memory_context(mem: &dyn Memory, user_msg: &str) -> String {
+    let mut context = String::new();
+    if let Ok(entries) = mem.recall(user_msg, 5, None).await {
+        if !entries.is_empty() {
+            context.push_str("[Memory context]\n");
+            for entry in &entries {
+                let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
+            }
+            context.push('\n');
+        }
+    }
+    context
 }
 
 fn hash_webhook_secret(value: &str) -> String {
@@ -274,6 +293,12 @@ pub struct AppState {
     pub whatsapp: Option<Arc<WhatsAppChannel>>,
     /// `WhatsApp` app secret for webhook signature verification (`X-Hub-Signature-256`)
     pub whatsapp_app_secret: Option<Arc<str>>,
+    /// Tool registry for full agent loop in webhook
+    pub tools_registry: Arc<Vec<Box<dyn Tool>>>,
+    /// Observer for recording agent events
+    pub observer: Arc<dyn Observer>,
+    /// Pre-built system prompt (workspace identity + tool instructions)
+    pub system_prompt: Arc<String>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -327,7 +352,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         (None, None)
     };
 
-    let _tools_registry = Arc::new(tools::all_tools_with_runtime(
+    let tools_registry = Arc::new(tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -341,6 +366,45 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         config.api_key.as_deref(),
         &config,
     ));
+
+    // ── Observer for agent loop events ──
+    let observer: Arc<dyn Observer> =
+        Arc::from(observability::create_observer(&config.observability));
+
+    // ── System prompt from workspace identity files + tool instructions ──
+    let skills = crate::skills::load_skills(&config.workspace_dir);
+    let mut tool_descs: Vec<(&str, &str)> = vec![
+        ("shell", "Execute terminal commands."),
+        ("file_read", "Read file contents."),
+        ("file_write", "Write file contents."),
+        ("memory_store", "Save to memory."),
+        ("memory_recall", "Search memory."),
+        ("memory_forget", "Delete a memory entry."),
+    ];
+    if config.browser.enabled {
+        tool_descs.push(("browser_open", "Open approved URLs in browser."));
+    }
+    if config.composio.enabled {
+        tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio."));
+    }
+    if !config.agents.is_empty() {
+        tool_descs.push(("delegate", "Delegate a sub-task to a specialized agent."));
+    }
+    let bootstrap_max_chars = if config.agent.compact_context {
+        Some(6000)
+    } else {
+        None
+    };
+    let mut system_prompt = crate::channels::build_system_prompt(
+        &config.workspace_dir,
+        &model,
+        &tool_descs,
+        &skills,
+        Some(&config.identity),
+        bootstrap_max_chars,
+    );
+    system_prompt.push_str(&build_tool_instructions(tools_registry.as_ref()));
+
     // Extract webhook secret for authentication
     let webhook_secret_hash: Option<Arc<str>> =
         config.channels_config.webhook.as_ref().and_then(|webhook| {
@@ -464,6 +528,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         idempotency_store,
         whatsapp: whatsapp_channel,
         whatsapp_app_secret,
+        tools_registry,
+        observer,
+        system_prompt: Arc::new(system_prompt),
     };
 
     // Build router with middleware
@@ -664,6 +731,7 @@ async fn handle_webhook(
 
     let message = &webhook_body.message;
 
+    // Auto-save incoming message to memory
     if state.auto_save {
         let key = webhook_memory_key();
         let _ = state
@@ -672,22 +740,56 @@ async fn handle_webhook(
             .await;
     }
 
-    match state
-        .provider
-        .simple_chat(message, &state.model, state.temperature)
-        .await
-    {
-        Ok(response) => {
+    // Build memory context (recall relevant entries)
+    let memory_context = build_memory_context(state.mem.as_ref(), message).await;
+    let enriched_message = if memory_context.is_empty() {
+        message.clone()
+    } else {
+        format!("{memory_context}{message}")
+    };
+
+    // Construct conversation history with system prompt
+    let mut history = vec![
+        ChatMessage::system(state.system_prompt.as_str()),
+        ChatMessage::user(&enriched_message),
+    ];
+
+    // Run full agent loop with tool support (120s timeout)
+    const WEBHOOK_AGENT_TIMEOUT_SECS: u64 = 120;
+    let llm_result = tokio::time::timeout(
+        Duration::from_secs(WEBHOOK_AGENT_TIMEOUT_SECS),
+        run_tool_call_loop(
+            state.provider.as_ref(),
+            &mut history,
+            state.tools_registry.as_ref(),
+            state.observer.as_ref(),
+            "gateway",
+            &state.model,
+            state.temperature,
+            true, // silent — gateway doesn't write to stdout
+            None, // no approval manager for webhook
+            "webhook",
+        ),
+    )
+    .await;
+
+    match llm_result {
+        Ok(Ok(response)) => {
             let body = serde_json::json!({"response": response, "model": state.model});
             (StatusCode::OK, Json(body))
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::error!(
-                "Webhook provider error: {}",
+                "Webhook agent loop error: {}",
                 providers::sanitize_api_error(&e.to_string())
             );
             let err = serde_json::json!({"error": "LLM request failed"});
             (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+        }
+        Err(_) => {
+            tracing::error!("Webhook agent loop timed out after {WEBHOOK_AGENT_TIMEOUT_SECS}s");
+            let err = serde_json::json!({"error": "Request timed out"});
+            (StatusCode::GATEWAY_TIMEOUT, Json(err))
         }
     }
 }
@@ -875,8 +977,8 @@ mod tests {
     }
 
     #[test]
-    fn security_timeout_is_30_seconds() {
-        assert_eq!(REQUEST_TIMEOUT_SECS, 30);
+    fn security_timeout_accommodates_agent_loop() {
+        assert_eq!(REQUEST_TIMEOUT_SECS, 120);
     }
 
     #[test]
@@ -1247,6 +1349,9 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(crate::observability::NoopObserver),
+            system_prompt: Arc::new(String::new()),
         };
 
         let mut headers = HeaderMap::new();
@@ -1302,6 +1407,9 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(crate::observability::NoopObserver),
+            system_prompt: Arc::new(String::new()),
         };
 
         let headers = HeaderMap::new();
@@ -1366,6 +1474,9 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(crate::observability::NoopObserver),
+            system_prompt: Arc::new(String::new()),
         };
 
         let response = handle_webhook(
@@ -1403,6 +1514,9 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(crate::observability::NoopObserver),
+            system_prompt: Arc::new(String::new()),
         };
 
         let mut headers = HeaderMap::new();
@@ -1443,6 +1557,9 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(crate::observability::NoopObserver),
+            system_prompt: Arc::new(String::new()),
         };
 
         let mut headers = HeaderMap::new();
