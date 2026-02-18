@@ -378,6 +378,23 @@ enum CronCommands {
         /// Task ID
         id: String,
     },
+    /// Update a scheduled task
+    Update {
+        /// Task ID
+        id: String,
+        /// New cron expression
+        #[arg(long)]
+        expression: Option<String>,
+        /// New IANA timezone
+        #[arg(long)]
+        tz: Option<String>,
+        /// New command to run
+        #[arg(long)]
+        command: Option<String>,
+        /// New job name
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// Pause a scheduled task
     Pause {
         /// Task ID
