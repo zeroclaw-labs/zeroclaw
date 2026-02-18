@@ -150,7 +150,7 @@ mod tests {
     #[tokio::test]
     async fn store_with_custom_category() {
         let (_tmp, mem) = test_mem();
-        let tool = MemoryStoreTool::new(mem.clone());
+        let tool = MemoryStoreTool::new(mem.clone(), test_security());
         let result = tool
             .execute(
                 json!({"key": "proj_note", "content": "Uses async runtime", "category": "project"}),

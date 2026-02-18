@@ -144,37 +144,102 @@ fn parse_path_only_attachment(message: &str) -> Option<TelegramAttachment> {
 /// These tags are used internally but must not be sent to Telegram as raw markup,
 /// since Telegram's Markdown parser will reject them (causing status 400 errors).
 fn strip_tool_call_tags(message: &str) -> String {
-    let mut result = message.to_string();
+    const TOOL_CALL_OPEN_TAGS: [&str; 5] = [
+        "<tool_call>",
+        "<toolcall>",
+        "<tool-call>",
+        "<tool>",
+        "<invoke>",
+    ];
 
-    // Strip <tool>...</tool>
-    while let Some(start) = result.find("<tool>") {
-        if let Some(end) = result[start..].find("</tool>") {
-            let end = start + end + "</tool>".len();
-            result = format!("{}{}", &result[..start], &result[end..]);
-        } else {
-            break;
+    fn find_first_tag<'a>(haystack: &str, tags: &'a [&'a str]) -> Option<(usize, &'a str)> {
+        tags.iter()
+            .filter_map(|tag| haystack.find(tag).map(|idx| (idx, *tag)))
+            .min_by_key(|(idx, _)| *idx)
+    }
+
+    fn matching_close_tag(open_tag: &str) -> Option<&'static str> {
+        match open_tag {
+            "<tool_call>" => Some("</tool_call>"),
+            "<toolcall>" => Some("</toolcall>"),
+            "<tool-call>" => Some("</tool-call>"),
+            "<tool>" => Some("</tool>"),
+            "<invoke>" => Some("</invoke>"),
+            _ => None,
         }
     }
 
-    // Strip <toolcall>...</toolcall>
-    while let Some(start) = result.find("<toolcall>") {
-        if let Some(end) = result[start..].find("</toolcall>") {
-            let end = start + end + "</toolcall>".len();
-            result = format!("{}{}", &result[..start], &result[end..]);
-        } else {
-            break;
+    fn extract_first_json_end(input: &str) -> Option<usize> {
+        let trimmed = input.trim_start();
+        let trim_offset = input.len().saturating_sub(trimmed.len());
+
+        for (byte_idx, ch) in trimmed.char_indices() {
+            if ch != '{' && ch != '[' {
+                continue;
+            }
+
+            let slice = &trimmed[byte_idx..];
+            let mut stream =
+                serde_json::Deserializer::from_str(slice).into_iter::<serde_json::Value>();
+            if let Some(Ok(_value)) = stream.next() {
+                let consumed = stream.byte_offset();
+                if consumed > 0 {
+                    return Some(trim_offset + byte_idx + consumed);
+                }
+            }
+        }
+
+        None
+    }
+
+    fn strip_leading_close_tags(mut input: &str) -> &str {
+        loop {
+            let trimmed = input.trim_start();
+            if !trimmed.starts_with("</") {
+                return trimmed;
+            }
+
+            let Some(close_end) = trimmed.find('>') else {
+                return "";
+            };
+            input = &trimmed[close_end + 1..];
         }
     }
 
-    // Strip <tool-call>...</tool-call>
-    while let Some(start) = result.find("<tool-call>") {
-        if let Some(end) = result[start..].find("</tool-call>") {
-            let end = start + end + "</tool-call>".len();
-            result = format!("{}{}", &result[..start], &result[end..]);
-        } else {
-            break;
+    let mut kept_segments = Vec::new();
+    let mut remaining = message;
+
+    while let Some((start, open_tag)) = find_first_tag(remaining, &TOOL_CALL_OPEN_TAGS) {
+        let before = &remaining[..start];
+        if !before.is_empty() {
+            kept_segments.push(before.to_string());
         }
+
+        let Some(close_tag) = matching_close_tag(open_tag) else {
+            break;
+        };
+        let after_open = &remaining[start + open_tag.len()..];
+
+        if let Some(close_idx) = after_open.find(close_tag) {
+            remaining = &after_open[close_idx + close_tag.len()..];
+            continue;
+        }
+
+        if let Some(consumed_end) = extract_first_json_end(after_open) {
+            remaining = strip_leading_close_tags(&after_open[consumed_end..]);
+            continue;
+        }
+
+        kept_segments.push(remaining[start..].to_string());
+        remaining = "";
+        break;
     }
+
+    if !remaining.is_empty() {
+        kept_segments.push(remaining.to_string());
+    }
+
+    let mut result = kept_segments.concat();
 
     // Clean up any resulting blank lines (but preserve paragraphs)
     while result.contains("\n\n\n") {
@@ -2374,6 +2439,20 @@ mod tests {
     }
 
     #[test]
+    fn strip_tool_call_tags_removes_tool_call_tags() {
+        let input = "Hello <tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}</tool_call> world";
+        let result = strip_tool_call_tags(input);
+        assert_eq!(result, "Hello  world");
+    }
+
+    #[test]
+    fn strip_tool_call_tags_removes_invoke_tags() {
+        let input = "Hello <invoke>{\"name\":\"shell\",\"arguments\":{\"command\":\"date\"}}</invoke> world";
+        let result = strip_tool_call_tags(input);
+        assert_eq!(result, "Hello  world");
+    }
+
+    #[test]
     fn strip_tool_call_tags_handles_multiple_tags() {
         let input = "Start <tool>a</tool> middle <tool>b</tool> end";
         let result = strip_tool_call_tags(input);
@@ -2399,6 +2478,22 @@ mod tests {
         let input = "Hello <tool>world";
         let result = strip_tool_call_tags(input);
         assert_eq!(result, "Hello <tool>world");
+    }
+
+    #[test]
+    fn strip_tool_call_tags_handles_unclosed_tool_call_with_json() {
+        let input =
+            "Status:\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"uptime\"}}";
+        let result = strip_tool_call_tags(input);
+        assert_eq!(result, "Status:");
+    }
+
+    #[test]
+    fn strip_tool_call_tags_handles_mismatched_close_tag() {
+        let input =
+            "<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"uptime\"}}</arg_value>";
+        let result = strip_tool_call_tags(input);
+        assert_eq!(result, "");
     }
 
     #[test]

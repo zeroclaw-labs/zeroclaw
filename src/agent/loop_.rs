@@ -346,7 +346,7 @@ fn parse_tool_calls_from_json_value(value: &serde_json::Value) -> Vec<ParsedTool
     calls
 }
 
-const TOOL_CALL_OPEN_TAGS: [&str; 3] = ["<tool_call>", "<toolcall>", "<tool-call>"];
+const TOOL_CALL_OPEN_TAGS: [&str; 4] = ["<tool_call>", "<toolcall>", "<tool-call>", "<invoke>"];
 
 fn find_first_tag<'a>(haystack: &str, tags: &'a [&'a str]) -> Option<(usize, &'a str)> {
     tags.iter()
@@ -359,7 +359,44 @@ fn matching_tool_call_close_tag(open_tag: &str) -> Option<&'static str> {
         "<tool_call>" => Some("</tool_call>"),
         "<toolcall>" => Some("</toolcall>"),
         "<tool-call>" => Some("</tool-call>"),
+        "<invoke>" => Some("</invoke>"),
         _ => None,
+    }
+}
+
+fn extract_first_json_value_with_end(input: &str) -> Option<(serde_json::Value, usize)> {
+    let trimmed = input.trim_start();
+    let trim_offset = input.len().saturating_sub(trimmed.len());
+
+    for (byte_idx, ch) in trimmed.char_indices() {
+        if ch != '{' && ch != '[' {
+            continue;
+        }
+
+        let slice = &trimmed[byte_idx..];
+        let mut stream = serde_json::Deserializer::from_str(slice).into_iter::<serde_json::Value>();
+        if let Some(Ok(value)) = stream.next() {
+            let consumed = stream.byte_offset();
+            if consumed > 0 {
+                return Some((value, trim_offset + byte_idx + consumed));
+            }
+        }
+    }
+
+    None
+}
+
+fn strip_leading_close_tags(mut input: &str) -> &str {
+    loop {
+        let trimmed = input.trim_start();
+        if !trimmed.starts_with("</") {
+            return trimmed;
+        }
+
+        let Some(close_end) = trimmed.find('>') else {
+            return "";
+        };
+        input = &trimmed[close_end + 1..];
     }
 }
 
@@ -607,20 +644,27 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
             remaining = &after_open[close_idx + close_tag.len()..];
         } else {
             if let Some(json_end) = find_json_end(after_open) {
-                if let Ok(value) =
-                    serde_json::from_str::<serde_json::Value>(&after_open[..json_end])
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&after_open[..json_end])
                 {
                     let parsed_calls = parse_tool_calls_from_json_value(&value);
                     if !parsed_calls.is_empty() {
                         calls.extend(parsed_calls);
-                        let after_json = &after_open[json_end..];
-                        if !after_json.trim().is_empty() {
-                            text_parts.push(after_json.trim().to_string());
-                        }
-                        remaining = "";
+                        remaining = strip_leading_close_tags(&after_open[json_end..]);
+                        continue;
                     }
                 }
             }
+
+            if let Some((value, consumed_end)) = extract_first_json_value_with_end(after_open) {
+                let parsed_calls = parse_tool_calls_from_json_value(&value);
+                if !parsed_calls.is_empty() {
+                    calls.extend(parsed_calls);
+                    remaining = strip_leading_close_tags(&after_open[consumed_end..]);
+                    continue;
+                }
+            }
+
+            remaining = &remaining[start..];
             break;
         }
     }
@@ -630,8 +674,10 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     // ```tool_call ... </tool_call> instead of structured API calls or XML tags.
     if calls.is_empty() {
         static MD_TOOL_CALL_RE: LazyLock<Regex> = LazyLock::new(|| {
-            Regex::new(r"(?s)```tool[_-]?call\s*\n(.*?)(?:```|</tool[_-]?call>|</toolcall>)")
-                .unwrap()
+            Regex::new(
+                r"(?s)```(?:tool[_-]?call|invoke)\s*\n(.*?)(?:```|</tool[_-]?call>|</toolcall>|</invoke>)",
+            )
+            .unwrap()
         });
         let mut md_text_parts: Vec<String> = Vec::new();
         let mut last_end = 0;
@@ -1933,6 +1979,25 @@ Tail"#;
     }
 
     #[test]
+    fn parse_tool_calls_handles_markdown_invoke_fence() {
+        let response = r#"Checking.
+```invoke
+{"name": "shell", "arguments": {"command": "date"}}
+```
+Done."#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "date"
+        );
+        assert!(text.contains("Checking."));
+        assert!(text.contains("Done."));
+    }
+
+    #[test]
     fn parse_tool_calls_handles_toolcall_tag_alias() {
         let response = r#"<toolcall>
 {"name": "shell", "arguments": {"command": "date"}}
@@ -1965,15 +2030,63 @@ Tail"#;
     }
 
     #[test]
-    fn parse_tool_calls_does_not_cross_match_alias_tags() {
+    fn parse_tool_calls_handles_invoke_tag_alias() {
+        let response = r#"<invoke>
+{"name": "shell", "arguments": {"command": "uptime"}}
+</invoke>"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "uptime"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_recovers_unclosed_tool_call_with_json() {
+        let response = r#"I will call the tool now.
+<tool_call>
+{"name": "shell", "arguments": {"command": "uptime -p"}}"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.contains("I will call the tool now."));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "uptime -p"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_recovers_mismatched_close_tag() {
+        let response = r#"<tool_call>
+{"name": "shell", "arguments": {"command": "uptime"}}
+</arg_value>"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "uptime"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_recovers_cross_alias_closing_tags() {
         let response = r#"<toolcall>
 {"name": "shell", "arguments": {"command": "date"}}
 </tool_call>"#;
 
         let (text, calls) = parse_tool_calls(response);
-        assert!(calls.is_empty());
-        assert!(text.contains("<toolcall>"));
-        assert!(text.contains("</tool_call>"));
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
     }
 
     #[test]
