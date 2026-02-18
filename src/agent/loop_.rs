@@ -346,6 +346,43 @@ fn matching_tool_call_close_tag(open_tag: &str) -> Option<&'static str> {
     }
 }
 
+/// Find the end position of a JSON object by tracking balanced braces.
+/// Returns the byte position after the closing brace, or None if not found.
+fn find_json_end(input: &str) -> Option<usize> {
+    let trimmed = input.trim_start();
+    let offset = input.len() - trimmed.len();
+    
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    
+    let mut depth = 0;
+    let mut in_string = false;
+    let mut escape_next = false;
+    
+    for (i, ch) in trimmed.char_indices() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        
+        match ch {
+            '\\' if in_string => escape_next = true,
+            '"' => in_string = !in_string,
+            '{' if !in_string => depth += 1,
+            '}' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(offset + i + ch.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    None
+}
+
 /// Extract JSON values from a string.
 ///
 /// # Security Warning
@@ -393,6 +430,127 @@ fn extract_json_values(input: &str) -> Vec<serde_json::Value> {
     values
 }
 
+/// Parsed GLM-style tool call with raw text for removal
+struct GlmToolCall {
+    name: String,
+    arguments: serde_json::Value,
+    raw_text: Option<String>,
+}
+
+/// Parse GLM-style tool calls from response text.
+/// GLM uses proprietary formats like:
+/// - `browser_open/url>https://example.com`
+/// - `shell/command>ls -la`
+/// - `http_request/url>https://api.example.com`
+/// - `shell/{"command": "ls -la"}`
+fn parse_glm_style_tool_calls(text: &str) -> Vec<GlmToolCall> {
+    let mut calls = Vec::new();
+    
+    // GLM tool name aliases (what GLM calls them -> what ZeroClaw calls them)
+    let tool_aliases: std::collections::HashMap<&str, &str> = [
+        ("browser_open", "shell"),
+        ("browser", "shell"),
+        ("web_search", "shell"),
+        ("search", "shell"),
+        ("http_request", "http_request"),
+        ("http", "http_request"),
+        ("shell", "shell"),
+        ("bash", "shell"),
+        ("cmd", "shell"),
+        ("run", "shell"),
+        ("execute", "shell"),
+    ].iter().cloned().collect();
+    
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        
+        // Format 1: tool_name/param>value (e.g., browser_open/url>https://...)
+        if let Some(pos) = line.find('/') {
+            let tool_part = &line[..pos];
+            let rest = &line[pos + 1..];
+            
+            // Check if this looks like a tool call (tool name should be alphanumeric + underscore)
+            if tool_part.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                // Get the canonical tool name
+                let tool_name = tool_aliases.get(tool_part).unwrap_or(&tool_part);
+                
+                // Check if rest contains > (param>value format) or is JSON
+                if let Some(gt_pos) = rest.find('>') {
+                    let param_name = rest[..gt_pos].trim();
+                    let value = rest[gt_pos + 1..].trim();
+                    
+                    // Build arguments based on tool and parameter
+                    let arguments = match *tool_name {
+                        "shell" => {
+                            // For shell, wrap in curl command for URLs
+                            if param_name == "url" || value.starts_with("http") {
+                                serde_json::json!({
+                                    "command": format!("curl -s '{}'", value)
+                                })
+                            } else if param_name == "command" {
+                                serde_json::json!({
+                                    "command": value
+                                })
+                            } else {
+                                serde_json::json!({
+                                    "command": value
+                                })
+                            }
+                        }
+                        "http_request" => {
+                            serde_json::json!({
+                                "url": value,
+                                "method": "GET"
+                            })
+                        }
+                        _ => {
+                            // Generic: use param_name as the key
+                            serde_json::json!({
+                                param_name: value
+                            })
+                        }
+                    };
+                    
+                    calls.push(GlmToolCall {
+                        name: tool_name.to_string(),
+                        arguments,
+                        raw_text: Some(line.to_string()),
+                    });
+                    continue;
+                }
+                
+                // Format 2: tool_name/{json} (e.g., shell/{"command": "ls"})
+                if rest.starts_with('{') {
+                    if let Ok(json_args) = serde_json::from_str::<serde_json::Value>(rest) {
+                        calls.push(GlmToolCall {
+                            name: tool_name.to_string(),
+                            arguments: json_args,
+                            raw_text: Some(line.to_string()),
+                        });
+                        continue;
+                    }
+                }
+            }
+        }
+        
+        // Format 3: Just a URL on its own line (convert to curl)
+        if line.starts_with("http://") || line.starts_with("https://") {
+            calls.push(GlmToolCall {
+                name: "shell".to_string(),
+                arguments: serde_json::json!({
+                    "command": format!("curl -s '{}'", line)
+                }),
+                raw_text: Some(line.to_string()),
+            });
+        }
+    }
+    
+    calls
+}
+
 /// Parse tool calls from an LLM response that uses XML-style function calling.
 ///
 /// Expected format (common with system-prompt-guided tool use):
@@ -434,31 +592,77 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
             text_parts.push(before.trim().to_string());
         }
 
-        let Some(close_tag) = matching_tool_call_close_tag(open_tag) else {
-            break;
-        };
-
         let after_open = &remaining[start + open_tag.len()..];
-        if let Some(close_idx) = after_open.find(close_tag) {
-            let inner = &after_open[..close_idx];
-            let mut parsed_any = false;
-            let json_values = extract_json_values(inner);
-            for value in json_values {
-                let parsed_calls = parse_tool_calls_from_json_value(&value);
-                if !parsed_calls.is_empty() {
-                    parsed_any = true;
-                    calls.extend(parsed_calls);
+        
+        // Try to find closing tag first
+        if let Some(close_tag) = matching_tool_call_close_tag(open_tag) {
+            if let Some(close_idx) = after_open.find(close_tag) {
+                let inner = &after_open[..close_idx];
+                let mut parsed_any = false;
+                let json_values = extract_json_values(inner);
+                for value in json_values {
+                    let parsed_calls = parse_tool_calls_from_json_value(&value);
+                    if !parsed_calls.is_empty() {
+                        parsed_any = true;
+                        calls.extend(parsed_calls);
+                    }
                 }
-            }
 
-            if !parsed_any {
-                tracing::warn!("Malformed <tool_call> JSON: expected tool-call object in tag body");
-            }
+                if !parsed_any {
+                    tracing::warn!("Malformed  Nueva JSON: expected tool-call object in tag body");
+                }
 
-            remaining = &after_open[close_idx + close_tag.len()..];
-        } else {
-            break;
+                remaining = &after_open[close_idx + close_tag.len()..];
+                continue;
+            }
         }
+        
+        // Fallback: Handle unclosed <toolcall> tags (common with some models like GLM)
+        // Try to extract JSON that starts immediately after the tag
+        if open_tag == "<toolcall>" || open_tag == "<tool-call>" {
+            // Find the JSON object - look for balanced braces
+            if let Some(json_end) = find_json_end(after_open) {
+                let inner = &after_open[..json_end];
+                let json_values = extract_json_values(inner);
+                for value in json_values {
+                    let parsed_calls = parse_tool_calls_from_json_value(&value);
+                    if !parsed_calls.is_empty() {
+                        tracing::debug!("Parsed tool call from unclosed tag");
+                        calls.extend(parsed_calls);
+                    }
+                }
+                remaining = &after_open[json_end..];
+                continue;
+            }
+        }
+        
+        break;
+    }
+
+    // ── GLM-style tool calls ─────────────────────────────────────────
+    // GLM models use proprietary formats like:
+    // - browser_open/url>https://example.com
+    // - shell/command>ls -la
+    // - http_request/url>https://api.example.com
+    // Parse these after tag-based parsing to handle GLM's unique format
+    let glm_calls = parse_glm_style_tool_calls(remaining);
+    if !glm_calls.is_empty() {
+        // Remove the GLM-style calls from remaining text
+        let mut cleaned_text = remaining.to_string();
+        for call in &glm_calls {
+            // Remove the raw GLM format from text
+            if let Some(glmline) = call.raw_text.as_ref() {
+                cleaned_text = cleaned_text.replace(glmline, "");
+            }
+        }
+        if !cleaned_text.trim().is_empty() {
+            text_parts.push(cleaned_text.trim().to_string());
+        }
+        calls.extend(glm_calls.iter().map(|c| ParsedToolCall {
+            name: c.name.clone(),
+            arguments: c.arguments.clone(),
+        }));
+        remaining = "";
     }
 
     // SECURITY: We do NOT fall back to extracting arbitrary JSON from the response
