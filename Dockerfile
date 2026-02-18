@@ -9,7 +9,7 @@ WORKDIR /app
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && apt-get install -y \
-        pkg-config \
+    pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 # 1. Copy manifests and toolchain pin to cache dependencies with the same compiler
@@ -26,6 +26,7 @@ RUN rm -rf src benches
 
 # 2. Copy only build-relevant source paths (avoid cache-busting on docs/tests/scripts)
 COPY src/ src/
+COPY benches/ benches/
 COPY firmware/ firmware/
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
