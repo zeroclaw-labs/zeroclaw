@@ -60,7 +60,7 @@ fn confirm_save_progress(config: &Config, auto_save: &mut bool) -> Result<()> {
     if *auto_save {
         config.save()?;
         // Minimal feedback for auto-save
-        // println!("  {} Saved", style("✓").dim()); 
+        // println!("  {} Saved", style("✓").dim());
         return Ok(());
     }
 
@@ -72,7 +72,10 @@ fn confirm_save_progress(config: &Config, auto_save: &mut bool) -> Result<()> {
     {
         *auto_save = true;
         config.save()?;
-        println!("  {} Progress saved (auto-save enabled).", style("✓").green());
+        println!(
+            "  {} Progress saved (auto-save enabled).",
+            style("✓").green()
+        );
     }
     Ok(())
 }
@@ -107,9 +110,14 @@ pub fn run_wizard() -> Result<Config> {
 
     // 2. Provider
     print_step(2, 9, "AI Provider & API Key");
-    let (provider, api_key, model, provider_api_url) = setup_provider(&config.workspace_dir, Some(&config))?;
+    let (provider, api_key, model, provider_api_url) =
+        setup_provider(&config.workspace_dir, Some(&config))?;
     config.default_provider = Some(provider);
-    config.api_key = if api_key.is_empty() { None } else { Some(api_key) };
+    config.api_key = if api_key.is_empty() {
+        None
+    } else {
+        Some(api_key)
+    };
     config.default_model = Some(model);
     config.api_url = provider_api_url;
     confirm_save_progress(&config, &mut auto_save_enabled)?;
@@ -1362,14 +1370,14 @@ fn setup_workspace(existing: Option<&Config>) -> Result<(PathBuf, PathBuf)> {
     if let Some(cfg) = existing {
         // If we have an existing workspace that isn't the default, default to "No" for "Use default workspace?"
         // and pre-fill the custom path.
-        let workspaces_match = cfg.workspace_dir.parent() == Some(&default_dir) 
-             || cfg.workspace_dir == default_dir.join("workspace");
-             
+        let workspaces_match = cfg.workspace_dir.parent() == Some(&default_dir)
+            || cfg.workspace_dir == default_dir.join("workspace");
+
         if !workspaces_match {
-             use_default = false;
-             if let Some(parent) = cfg.workspace_dir.parent() {
-                 current_default = parent.to_path_buf();
-             }
+            use_default = false;
+            if let Some(parent) = cfg.workspace_dir.parent() {
+                current_default = parent.to_path_buf();
+            }
         }
     }
 
@@ -1379,7 +1387,11 @@ fn setup_workspace(existing: Option<&Config>) -> Result<(PathBuf, PathBuf)> {
     ));
 
     if let Some(cfg) = existing {
-         println!("  {} Found existing workspace: {}", style("ℹ").blue(), style(cfg.workspace_dir.display()).dim());
+        println!(
+            "  {} Found existing workspace: {}",
+            style("ℹ").blue(),
+            style(cfg.workspace_dir.display()).dim()
+        );
     }
 
     let use_default = Confirm::new()
@@ -1415,7 +1427,10 @@ fn setup_workspace(existing: Option<&Config>) -> Result<(PathBuf, PathBuf)> {
 // ── Step 2: Provider & API Key ───────────────────────────────────
 
 #[allow(clippy::too_many_lines)]
-fn setup_provider(workspace_dir: &Path, existing: Option<&Config>) -> Result<(String, String, String, Option<String>)> {
+fn setup_provider(
+    workspace_dir: &Path,
+    existing: Option<&Config>,
+) -> Result<(String, String, String, Option<String>)> {
     // ── Shortcut for existing provider ──
     if let Some(cfg) = existing {
         if let Some(provider) = &cfg.default_provider {
@@ -2126,7 +2141,11 @@ fn setup_tool_mode(existing: Option<&Config>) -> Result<(ComposioConfig, Secrets
     ];
 
     let default_wb = if let Some(cfg) = existing {
-        if cfg.composio.enabled { 1 } else { 0 }
+        if cfg.composio.enabled {
+            1
+        } else {
+            0
+        }
     } else {
         0
     };
@@ -2280,7 +2299,7 @@ fn setup_hardware(existing: Option<&Config>) -> Result<HardwareConfig> {
     ];
 
     let mut recommended = hardware::recommended_wizard_default(&devices);
-    
+
     // Override recommendation with existing config if present
     if let Some(cfg) = existing {
         recommended = match cfg.hardware.transport_mode() {
@@ -2305,12 +2324,15 @@ fn setup_hardware(existing: Option<&Config>) -> Result<HardwareConfig> {
             .iter()
             .filter(|d| d.transport == hardware::HardwareTransport::Serial)
             .collect();
-            
+
         // Attempt to find index of existing serial port
         let mut default_port_idx = 0;
         if let Some(cfg) = existing {
             if let Some(existing_port) = &cfg.hardware.serial_port {
-                if let Some(idx) = serial_devices.iter().position(|d| d.device_path.as_deref() == Some(existing_port)) {
+                if let Some(idx) = serial_devices
+                    .iter()
+                    .position(|d| d.device_path.as_deref() == Some(existing_port))
+                {
                     default_port_idx = idx;
                 }
             }
@@ -2336,11 +2358,14 @@ fn setup_hardware(existing: Option<&Config>) -> Result<HardwareConfig> {
 
             hw_config.serial_port = serial_devices[port_idx].device_path.clone();
         } else if serial_devices.is_empty() {
-             let default_manual = if let Some(cfg) = existing {
-                 cfg.hardware.serial_port.clone().unwrap_or_else(|| "/dev/ttyUSB0".into())
-             } else {
-                 "/dev/ttyUSB0".into()
-             };
+            let default_manual = if let Some(cfg) = existing {
+                cfg.hardware
+                    .serial_port
+                    .clone()
+                    .unwrap_or_else(|| "/dev/ttyUSB0".into())
+            } else {
+                "/dev/ttyUSB0".into()
+            };
             // User chose serial but no device discovered — ask for manual path
             let manual_port: String = Input::new()
                 .with_prompt("  Serial port path (e.g. /dev/ttyUSB0)")
@@ -2357,7 +2382,7 @@ fn setup_hardware(existing: Option<&Config>) -> Result<HardwareConfig> {
             "230400",
             "Custom",
         ];
-        
+
         // Find existing baud rate index
         let mut default_baud_idx = 0;
         if let Some(cfg) = existing {
@@ -2369,7 +2394,7 @@ fn setup_hardware(existing: Option<&Config>) -> Result<HardwareConfig> {
                 _ => 4, // Custom
             };
         }
-        
+
         let baud_idx = Select::new()
             .with_prompt("  Serial baud rate")
             .items(&baud_options)
@@ -2381,11 +2406,11 @@ fn setup_hardware(existing: Option<&Config>) -> Result<HardwareConfig> {
             2 => 57600,
             3 => 230_400,
             4 => {
-                 let default_custom = if let Some(cfg) = existing {
-                     cfg.hardware.baud_rate
-                 } else {
-                     115_200
-                 };
+                let default_custom = if let Some(cfg) = existing {
+                    cfg.hardware.baud_rate
+                } else {
+                    115_200
+                };
                 let custom: String = Input::new()
                     .with_prompt("  Custom baud rate")
                     .default(default_custom.to_string())
@@ -2401,9 +2426,12 @@ fn setup_hardware(existing: Option<&Config>) -> Result<HardwareConfig> {
         && hw_config.probe_target.is_none()
     {
         let default_target = if let Some(cfg) = existing {
-             cfg.hardware.probe_target.clone().unwrap_or_else(|| "STM32F411CEUx".into())
+            cfg.hardware
+                .probe_target
+                .clone()
+                .unwrap_or_else(|| "STM32F411CEUx".into())
         } else {
-             "STM32F411CEUx".into()
+            "STM32F411CEUx".into()
         };
         let target: String = Input::new()
             .with_prompt("  Target MCU chip (e.g. STM32F411CEUx, nRF52840_xxAA)")
@@ -2415,9 +2443,9 @@ fn setup_hardware(existing: Option<&Config>) -> Result<HardwareConfig> {
     // ── Datasheet RAG ──
     if hw_config.enabled {
         let default_datasheets = if let Some(cfg) = existing {
-             cfg.hardware.workspace_datasheets
+            cfg.hardware.workspace_datasheets
         } else {
-             true
+            true
         };
         let datasheets = Confirm::new()
             .with_prompt("  Enable datasheet RAG? (index PDF schematics for AI pin lookups)")
@@ -2575,9 +2603,12 @@ fn setup_memory(existing: Option<&Config>) -> Result<MemoryConfig> {
 
     let mut default_idx = 0;
     if let Some(cfg) = existing {
-         if let Some(idx) = selectable_memory_backends().iter().position(|b| b.key == cfg.memory.backend) {
-             default_idx = idx;
-         }
+        if let Some(idx) = selectable_memory_backends()
+            .iter()
+            .position(|b| b.key == cfg.memory.backend)
+        {
+            default_idx = idx;
+        }
     }
 
     let choice = Select::new()
@@ -2588,7 +2619,7 @@ fn setup_memory(existing: Option<&Config>) -> Result<MemoryConfig> {
 
     let backend = backend_key_from_choice(choice);
     let profile = memory_backend_profile(backend);
-    
+
     let default_autosave = if let Some(cfg) = existing {
         cfg.memory.auto_save
     } else {
