@@ -171,8 +171,24 @@ struct Choice {
 struct ResponseMessage {
     #[serde(default)]
     content: Option<String>,
+    /// Reasoning/thinking models (e.g. Qwen3, GLM-4) may return their output
+    /// in `reasoning_content` instead of `content`. Used as automatic fallback.
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<ToolCall>>,
+}
+
+impl ResponseMessage {
+    /// Extract text content, falling back to `reasoning_content` when `content`
+    /// is missing or empty. Reasoning/thinking models (Qwen3, GLM-4, etc.)
+    /// often return their output solely in `reasoning_content`.
+    fn effective_content(&self) -> String {
+        match &self.content {
+            Some(c) if !c.is_empty() => c.clone(),
+            _ => self.reasoning_content.clone().unwrap_or_default(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -245,6 +261,9 @@ struct StreamChoice {
 struct StreamDelta {
     #[serde(default)]
     content: Option<String>,
+    /// Reasoning/thinking models may stream output via `reasoning_content`.
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 /// Parse SSE (Server-Sent Events) stream from OpenAI-compatible providers.
@@ -273,6 +292,10 @@ fn parse_sse_line(line: &str) -> StreamResult<Option<String>> {
         if let Some(choice) = chunk.choices.first() {
             if let Some(content) = &choice.delta.content {
                 return Ok(Some(content.clone()));
+            }
+            // Fallback to reasoning_content for thinking models
+            if let Some(reasoning) = &choice.delta.reasoning_content {
+                return Ok(Some(reasoning.clone()));
             }
         }
     }
@@ -529,10 +552,10 @@ impl Provider for OpenAiCompatibleProvider {
                         .map_or(false, |t| !t.is_empty())
                 {
                     serde_json::to_string(&c.message)
-                        .unwrap_or_else(|_| c.message.content.unwrap_or_default())
+                        .unwrap_or_else(|_| c.message.effective_content())
                 } else {
-                    // No tool calls, return content as-is
-                    c.message.content.unwrap_or_default()
+                    // No tool calls, return content (with reasoning_content fallback)
+                    c.message.effective_content()
                 }
             })
             .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))
@@ -617,10 +640,10 @@ impl Provider for OpenAiCompatibleProvider {
                         .map_or(false, |t| !t.is_empty())
                 {
                     serde_json::to_string(&c.message)
-                        .unwrap_or_else(|_| c.message.content.unwrap_or_default())
+                        .unwrap_or_else(|_| c.message.effective_content())
                 } else {
-                    // No tool calls, return content as-is
-                    c.message.content.unwrap_or_default()
+                    // No tool calls, return content (with reasoning_content fallback)
+                    c.message.effective_content()
                 }
             })
             .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))
@@ -1149,5 +1172,97 @@ mod tests {
         let provider = make_provider("test", "https://example.com", None);
         let result = provider.warmup().await;
         assert!(result.is_ok());
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // Reasoning model fallback tests (reasoning_content)
+    // ══════════════════════════════════════════════════════════
+
+    #[test]
+    fn reasoning_content_fallback_when_content_empty() {
+        // Reasoning models (Qwen3, GLM-4) return content: "" with reasoning_content populated
+        let json = r#"{"choices":[{"message":{"content":"","reasoning_content":"Thinking output here"}}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let msg = &resp.choices[0].message;
+        assert_eq!(msg.effective_content(), "Thinking output here");
+    }
+
+    #[test]
+    fn reasoning_content_fallback_when_content_null() {
+        // Some models may return content: null with reasoning_content
+        let json =
+            r#"{"choices":[{"message":{"content":null,"reasoning_content":"Fallback text"}}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let msg = &resp.choices[0].message;
+        assert_eq!(msg.effective_content(), "Fallback text");
+    }
+
+    #[test]
+    fn reasoning_content_fallback_when_content_missing() {
+        // content field absent entirely, reasoning_content present
+        let json = r#"{"choices":[{"message":{"reasoning_content":"Only reasoning"}}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let msg = &resp.choices[0].message;
+        assert_eq!(msg.effective_content(), "Only reasoning");
+    }
+
+    #[test]
+    fn reasoning_content_not_used_when_content_present() {
+        // Normal model: content populated, reasoning_content should be ignored
+        let json = r#"{"choices":[{"message":{"content":"Normal response","reasoning_content":"Should be ignored"}}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let msg = &resp.choices[0].message;
+        assert_eq!(msg.effective_content(), "Normal response");
+    }
+
+    #[test]
+    fn reasoning_content_both_absent_returns_empty() {
+        // Neither content nor reasoning_content — returns empty string
+        let json = r#"{"choices":[{"message":{}}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let msg = &resp.choices[0].message;
+        assert_eq!(msg.effective_content(), "");
+    }
+
+    #[test]
+    fn reasoning_content_ignored_by_normal_models() {
+        // Standard response without reasoning_content still works
+        let json = r#"{"choices":[{"message":{"content":"Hello from Venice!"}}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let msg = &resp.choices[0].message;
+        assert!(msg.reasoning_content.is_none());
+        assert_eq!(msg.effective_content(), "Hello from Venice!");
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // SSE streaming reasoning_content fallback tests
+    // ══════════════════════════════════════════════════════════
+
+    #[test]
+    fn parse_sse_line_with_content() {
+        let line = r#"data: {"choices":[{"delta":{"content":"hello"}}]}"#;
+        let result = parse_sse_line(line).unwrap();
+        assert_eq!(result, Some("hello".to_string()));
+    }
+
+    #[test]
+    fn parse_sse_line_with_reasoning_content() {
+        let line = r#"data: {"choices":[{"delta":{"reasoning_content":"thinking..."}}]}"#;
+        let result = parse_sse_line(line).unwrap();
+        assert_eq!(result, Some("thinking...".to_string()));
+    }
+
+    #[test]
+    fn parse_sse_line_with_both_prefers_content() {
+        let line = r#"data: {"choices":[{"delta":{"content":"real answer","reasoning_content":"thinking..."}}]}"#;
+        let result = parse_sse_line(line).unwrap();
+        assert_eq!(result, Some("real answer".to_string()));
+    }
+
+    #[test]
+    fn parse_sse_line_done_sentinel() {
+        let line = "data: [DONE]";
+        let result = parse_sse_line(line).unwrap();
+        assert_eq!(result, None);
     }
 }
