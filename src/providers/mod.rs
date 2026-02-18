@@ -18,11 +18,22 @@ pub use traits::{
 
 use compatible::{AuthStyle, OpenAiCompatibleProvider};
 use reliable::ReliableProvider;
+use serde::Deserialize;
 use std::path::PathBuf;
 
 const MAX_API_ERROR_CHARS: usize = 200;
 const MINIMAX_INTL_BASE_URL: &str = "https://api.minimax.io/v1";
 const MINIMAX_CN_BASE_URL: &str = "https://api.minimaxi.com/v1";
+const MINIMAX_OAUTH_GLOBAL_TOKEN_ENDPOINT: &str = "https://api.minimax.io/oauth/token";
+const MINIMAX_OAUTH_CN_TOKEN_ENDPOINT: &str = "https://api.minimaxi.com/oauth/token";
+const MINIMAX_OAUTH_PLACEHOLDER: &str = "minimax-oauth";
+const MINIMAX_OAUTH_CN_PLACEHOLDER: &str = "minimax-oauth-cn";
+const MINIMAX_OAUTH_TOKEN_ENV: &str = "MINIMAX_OAUTH_TOKEN";
+const MINIMAX_API_KEY_ENV: &str = "MINIMAX_API_KEY";
+const MINIMAX_OAUTH_REFRESH_TOKEN_ENV: &str = "MINIMAX_OAUTH_REFRESH_TOKEN";
+const MINIMAX_OAUTH_REGION_ENV: &str = "MINIMAX_OAUTH_REGION";
+const MINIMAX_OAUTH_CLIENT_ID_ENV: &str = "MINIMAX_OAUTH_CLIENT_ID";
+const MINIMAX_OAUTH_DEFAULT_CLIENT_ID: &str = "78257093-7e40-4613-99e0-527b14b39113";
 const GLM_GLOBAL_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
 const GLM_CN_BASE_URL: &str = "https://open.bigmodel.cn/api/paas/v4";
 const MOONSHOT_INTL_BASE_URL: &str = "https://api.moonshot.ai/v1";
@@ -36,12 +47,22 @@ const ZAI_CN_BASE_URL: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
 pub(crate) fn is_minimax_intl_alias(name: &str) -> bool {
     matches!(
         name,
-        "minimax" | "minimax-intl" | "minimax-io" | "minimax-global"
+        "minimax"
+            | "minimax-intl"
+            | "minimax-io"
+            | "minimax-global"
+            | "minimax-oauth"
+            | "minimax-portal"
+            | "minimax-oauth-global"
+            | "minimax-portal-global"
     )
 }
 
 pub(crate) fn is_minimax_cn_alias(name: &str) -> bool {
-    matches!(name, "minimax-cn" | "minimaxi")
+    matches!(
+        name,
+        "minimax-cn" | "minimaxi" | "minimax-oauth-cn" | "minimax-portal-cn"
+    )
 }
 
 pub(crate) fn is_minimax_alias(name: &str) -> bool {
@@ -108,6 +129,152 @@ pub(crate) fn is_zai_alias(name: &str) -> bool {
 
 pub(crate) fn is_qianfan_alias(name: &str) -> bool {
     matches!(name, "qianfan" | "baidu")
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MinimaxOauthRegion {
+    Global,
+    Cn,
+}
+
+impl MinimaxOauthRegion {
+    fn token_endpoint(self) -> &'static str {
+        match self {
+            Self::Global => MINIMAX_OAUTH_GLOBAL_TOKEN_ENDPOINT,
+            Self::Cn => MINIMAX_OAUTH_CN_TOKEN_ENDPOINT,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MinimaxOauthRefreshResponse {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    access_token: Option<String>,
+    #[serde(default)]
+    base_resp: Option<MinimaxOauthBaseResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MinimaxOauthBaseResponse {
+    #[serde(default)]
+    status_msg: Option<String>,
+}
+
+fn read_non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn is_minimax_oauth_placeholder(value: &str) -> bool {
+    value.eq_ignore_ascii_case(MINIMAX_OAUTH_PLACEHOLDER)
+        || value.eq_ignore_ascii_case(MINIMAX_OAUTH_CN_PLACEHOLDER)
+}
+
+fn minimax_oauth_region(name: &str) -> MinimaxOauthRegion {
+    if let Some(region) = read_non_empty_env(MINIMAX_OAUTH_REGION_ENV) {
+        let normalized = region.to_ascii_lowercase();
+        if matches!(normalized.as_str(), "cn" | "china") {
+            return MinimaxOauthRegion::Cn;
+        }
+        if matches!(normalized.as_str(), "global" | "intl" | "international") {
+            return MinimaxOauthRegion::Global;
+        }
+    }
+
+    if is_minimax_cn_alias(name) {
+        MinimaxOauthRegion::Cn
+    } else {
+        MinimaxOauthRegion::Global
+    }
+}
+
+fn minimax_oauth_client_id() -> String {
+    read_non_empty_env(MINIMAX_OAUTH_CLIENT_ID_ENV)
+        .unwrap_or_else(|| MINIMAX_OAUTH_DEFAULT_CLIENT_ID.to_string())
+}
+
+fn resolve_minimax_static_credential() -> Option<String> {
+    read_non_empty_env(MINIMAX_OAUTH_TOKEN_ENV).or_else(|| read_non_empty_env(MINIMAX_API_KEY_ENV))
+}
+
+fn refresh_minimax_oauth_access_token(name: &str, refresh_token: &str) -> anyhow::Result<String> {
+    let region = minimax_oauth_region(name);
+    let endpoint = region.token_endpoint();
+    let client_id = minimax_oauth_client_id();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_else(|_| reqwest::blocking::Client::new());
+
+    let response = client
+        .post(endpoint)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Accept", "application/json")
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", client_id.as_str()),
+        ])
+        .send()
+        .map_err(|error| anyhow::anyhow!("MiniMax OAuth refresh request failed: {error}"))?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .unwrap_or_else(|_| "<failed to read MiniMax OAuth response body>".to_string());
+
+    let parsed = serde_json::from_str::<MinimaxOauthRefreshResponse>(&body).ok();
+
+    if !status.is_success() {
+        let detail = parsed
+            .as_ref()
+            .and_then(|payload| payload.base_resp.as_ref())
+            .and_then(|base| base.status_msg.as_deref())
+            .filter(|msg| !msg.trim().is_empty())
+            .unwrap_or(body.as_str());
+        anyhow::bail!("MiniMax OAuth refresh failed (HTTP {status}): {detail}");
+    }
+
+    if let Some(payload) = parsed {
+        if let Some(status_text) = payload.status.as_deref() {
+            if !status_text.eq_ignore_ascii_case("success") {
+                let detail = payload
+                    .base_resp
+                    .as_ref()
+                    .and_then(|base| base.status_msg.as_deref())
+                    .unwrap_or(status_text);
+                anyhow::bail!("MiniMax OAuth refresh failed: {detail}");
+            }
+        }
+
+        if let Some(token) = payload
+            .access_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        {
+            return Ok(token.to_string());
+        }
+    }
+
+    anyhow::bail!("MiniMax OAuth refresh response missing access_token");
+}
+
+fn resolve_minimax_oauth_refresh_token(name: &str) -> Option<String> {
+    let refresh_token = read_non_empty_env(MINIMAX_OAUTH_REFRESH_TOKEN_ENV)?;
+
+    match refresh_minimax_oauth_access_token(name, &refresh_token) {
+        Ok(token) => Some(token),
+        Err(error) => {
+            tracing::warn!(provider = name, error = %error, "MiniMax OAuth refresh failed");
+            None
+        }
+    }
 }
 
 pub(crate) fn canonical_china_provider_name(name: &str) -> Option<&'static str> {
@@ -291,11 +458,27 @@ pub async fn api_error(provider: &str, response: reqwest::Response) -> anyhow::E
 ///
 /// For Anthropic, the provider-specific env var is `ANTHROPIC_OAUTH_TOKEN` (for setup-tokens)
 /// followed by `ANTHROPIC_API_KEY` (for regular API keys).
+///
+/// For MiniMax, OAuth mode supports `api_key = "minimax-oauth"`, resolving credentials from
+/// `MINIMAX_OAUTH_TOKEN` first, then `MINIMAX_API_KEY`, and finally
+/// `MINIMAX_OAUTH_REFRESH_TOKEN` (automatic access-token refresh).
 fn resolve_provider_credential(name: &str, credential_override: Option<&str>) -> Option<String> {
+    let mut minimax_oauth_placeholder_requested = false;
+
     if let Some(raw_override) = credential_override {
         let trimmed_override = raw_override.trim();
         if !trimmed_override.is_empty() {
-            return Some(trimmed_override.to_owned());
+            if is_minimax_alias(name) && is_minimax_oauth_placeholder(trimmed_override) {
+                minimax_oauth_placeholder_requested = true;
+                if let Some(credential) = resolve_minimax_static_credential() {
+                    return Some(credential);
+                }
+                if let Some(credential) = resolve_minimax_oauth_refresh_token(name) {
+                    return Some(credential);
+                }
+            } else {
+                return Some(trimmed_override.to_owned());
+            }
         }
     }
 
@@ -318,7 +501,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
             vec!["KIMI_CODE_API_KEY", "MOONSHOT_API_KEY"]
         }
         name if is_glm_alias(name) => vec!["GLM_API_KEY"],
-        name if is_minimax_alias(name) => vec!["MINIMAX_API_KEY"],
+        name if is_minimax_alias(name) => vec![MINIMAX_OAUTH_TOKEN_ENV, MINIMAX_API_KEY_ENV],
         name if is_qianfan_alias(name) => vec!["QIANFAN_API_KEY"],
         name if is_qwen_alias(name) => vec!["DASHSCOPE_API_KEY"],
         name if is_zai_alias(name) => vec!["ZAI_API_KEY"],
@@ -339,6 +522,16 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
                 return Some(value.to_string());
             }
         }
+    }
+
+    if is_minimax_alias(name) {
+        if let Some(credential) = resolve_minimax_oauth_refresh_token(name) {
+            return Some(credential);
+        }
+    }
+
+    if minimax_oauth_placeholder_requested && is_minimax_alias(name) {
+        return None;
     }
 
     for env_var in ["ZEROCLAW_API_KEY", "API_KEY"] {
@@ -832,7 +1025,17 @@ pub fn list_providers() -> Vec<ProviderInfo> {
         ProviderInfo {
             name: "minimax",
             display_name: "MiniMax",
-            aliases: &[],
+            aliases: &[
+                "minimax-intl",
+                "minimax-io",
+                "minimax-global",
+                "minimax-cn",
+                "minimaxi",
+                "minimax-oauth",
+                "minimax-oauth-cn",
+                "minimax-portal",
+                "minimax-portal-cn",
+            ],
             local: false,
         },
         ProviderInfo {
@@ -938,10 +1141,71 @@ pub fn list_providers() -> Vec<ProviderInfo> {
 mod tests {
     use super::*;
 
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            let original = std::env::var(key).ok();
+            match value {
+                Some(next) => std::env::set_var(key, next),
+                None => std::env::remove_var(key),
+            }
+
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(original) = self.original.as_deref() {
+                std::env::set_var(self.key, original);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
     #[test]
     fn resolve_provider_credential_prefers_explicit_argument() {
         let resolved = resolve_provider_credential("openrouter", Some("  explicit-key  "));
         assert_eq!(resolved, Some("explicit-key".to_string()));
+    }
+
+    #[test]
+    fn resolve_provider_credential_uses_minimax_oauth_env_for_placeholder() {
+        let _oauth_guard = EnvGuard::set(MINIMAX_OAUTH_TOKEN_ENV, Some("oauth-token"));
+        let _api_guard = EnvGuard::set(MINIMAX_API_KEY_ENV, Some("api-key"));
+        let _refresh_guard = EnvGuard::set(MINIMAX_OAUTH_REFRESH_TOKEN_ENV, None);
+
+        let resolved = resolve_provider_credential("minimax", Some(MINIMAX_OAUTH_PLACEHOLDER));
+
+        assert_eq!(resolved.as_deref(), Some("oauth-token"));
+    }
+
+    #[test]
+    fn resolve_provider_credential_falls_back_to_minimax_api_key_for_placeholder() {
+        let _oauth_guard = EnvGuard::set(MINIMAX_OAUTH_TOKEN_ENV, None);
+        let _api_guard = EnvGuard::set(MINIMAX_API_KEY_ENV, Some("api-key"));
+        let _refresh_guard = EnvGuard::set(MINIMAX_OAUTH_REFRESH_TOKEN_ENV, None);
+
+        let resolved = resolve_provider_credential("minimax", Some(MINIMAX_OAUTH_PLACEHOLDER));
+
+        assert_eq!(resolved.as_deref(), Some("api-key"));
+    }
+
+    #[test]
+    fn resolve_provider_credential_placeholder_ignores_generic_api_key_fallback() {
+        let _oauth_guard = EnvGuard::set(MINIMAX_OAUTH_TOKEN_ENV, None);
+        let _api_guard = EnvGuard::set(MINIMAX_API_KEY_ENV, None);
+        let _refresh_guard = EnvGuard::set(MINIMAX_OAUTH_REFRESH_TOKEN_ENV, None);
+        let _generic_guard = EnvGuard::set("API_KEY", Some("generic-key"));
+
+        let resolved = resolve_provider_credential("minimax", Some(MINIMAX_OAUTH_PLACEHOLDER));
+
+        assert!(resolved.is_none());
     }
 
     #[test]
@@ -952,6 +1216,8 @@ mod tests {
         assert!(is_glm_alias("bigmodel"));
         assert!(is_minimax_alias("minimax-io"));
         assert!(is_minimax_alias("minimaxi"));
+        assert!(is_minimax_alias("minimax-oauth"));
+        assert!(is_minimax_alias("minimax-portal-cn"));
         assert!(is_qwen_alias("dashscope"));
         assert!(is_qwen_alias("qwen-us"));
         assert!(is_zai_alias("z.ai"));
@@ -1128,8 +1394,13 @@ mod tests {
         assert!(create_provider("minimax", Some("key")).is_ok());
         assert!(create_provider("minimax-intl", Some("key")).is_ok());
         assert!(create_provider("minimax-io", Some("key")).is_ok());
+        assert!(create_provider("minimax-global", Some("key")).is_ok());
         assert!(create_provider("minimax-cn", Some("key")).is_ok());
         assert!(create_provider("minimaxi", Some("key")).is_ok());
+        assert!(create_provider("minimax-oauth", Some("key")).is_ok());
+        assert!(create_provider("minimax-oauth-cn", Some("key")).is_ok());
+        assert!(create_provider("minimax-portal", Some("key")).is_ok());
+        assert!(create_provider("minimax-portal-cn", Some("key")).is_ok());
     }
 
     #[test]

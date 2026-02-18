@@ -36,7 +36,7 @@ Runtime resolution order is:
 | `opencode` | `opencode-zen` | No | `OPENCODE_API_KEY` |
 | `zai` | `z.ai` | No | `ZAI_API_KEY` |
 | `glm` | `zhipu` | No | `GLM_API_KEY` |
-| `minimax` | — | No | `MINIMAX_API_KEY` |
+| `minimax` | `minimax-intl`, `minimax-io`, `minimax-global`, `minimax-cn`, `minimaxi`, `minimax-oauth`, `minimax-oauth-cn`, `minimax-portal`, `minimax-portal-cn` | No | `MINIMAX_OAUTH_TOKEN`, `MINIMAX_API_KEY` |
 | `bedrock` | `aws-bedrock` | No | (use config/`API_KEY` fallback) |
 | `qianfan` | `baidu` | No | `QIANFAN_API_KEY` |
 | `qwen` | `dashscope`, `qwen-intl`, `dashscope-intl`, `qwen-us`, `dashscope-us` | No | `DASHSCOPE_API_KEY` |
@@ -72,6 +72,26 @@ default_provider = "custom:https://your-api.example.com"
 ```toml
 default_provider = "anthropic-custom:https://your-api.example.com"
 ```
+
+## MiniMax OAuth Setup (config.toml)
+
+Set the MiniMax provider and OAuth placeholder in config:
+
+```toml
+default_provider = "minimax-oauth"
+api_key = "minimax-oauth"
+```
+
+Then provide one of the following credentials via environment variables:
+
+- `MINIMAX_OAUTH_TOKEN` (preferred, direct access token)
+- `MINIMAX_API_KEY` (legacy/static token)
+- `MINIMAX_OAUTH_REFRESH_TOKEN` (auto-refreshes access token at startup)
+
+Optional:
+
+- `MINIMAX_OAUTH_REGION=global` or `cn` (defaults by provider alias)
+- `MINIMAX_OAUTH_CLIENT_ID` to override the default OAuth client id
 
 ## Model Routing (`hint:<name>`)
 
