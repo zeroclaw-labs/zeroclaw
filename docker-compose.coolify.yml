@@ -17,9 +17,10 @@ services:
 
     environment:
       # Provider: moonshot (Kimi models)
-      - MOONSHOT_API_KEY=${MOONSHOT_API_KEY}
-      - PROVIDER=${PROVIDER:-moonshot}
-      - ZEROCLAW_MODEL=${ZEROCLAW_MODEL:-kimi-k2.5}
+      # NOTE: Coolify injects these from its Environment Variables UI
+      - MOONSHOT_API_KEY
+      - PROVIDER=moonshot
+      - ZEROCLAW_MODEL=kimi-k2.5
 
       # Allow public bind inside Docker (required for container networking)
       - ZEROCLAW_ALLOW_PUBLIC_BIND=true
@@ -34,7 +35,7 @@ services:
       - zeroclaw-data:/zeroclaw-data
 
     ports:
-      - "${HOST_PORT:-3000}:3000"
+      - "3000:3000"
 
     deploy:
       resources:
