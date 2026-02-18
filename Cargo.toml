@@ -87,19 +87,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 chrono-tz = "0.10"
 cron = "0.15"
 
-
 # Interactive CLI prompts
 dialoguer = { version = "0.12", features = ["fuzzy-select", "password"] }
 console = "0.16"
-
-
-# rand is already at 0.9 above, keeping it consolidated there or reusing
-# base64 is already at 0.22 above
-
-# Config
-# directories is already at 6.0
-# toml is already at 1.0
-
 
 # Hardware discovery (device path globbing)
 glob = "0.3"
