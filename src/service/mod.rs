@@ -631,7 +631,7 @@ fn warn_if_binary_in_home(exe_path: &Path) {
 }
 
 /// Generate OpenRC init script content (pure function for testability)
-fn generate_openrc_script(exe_path: &Path, config_path: &str) -> String {
+fn generate_openrc_script(exe_path: &Path, config_dir: &Path) -> String {
     format!(
         r#"#!/sbin/openrc-run
 
@@ -639,13 +639,15 @@ name="zeroclaw"
 description="ZeroClaw daemon"
 
 command="{}"
-command_args="daemon --config {}"
+command_args="--config-dir {} daemon"
 command_background="yes"
 command_user="zeroclaw:zeroclaw"
 pidfile="/run/${{RC_SVCNAME}}.pid"
 umask 027
 output_log="/var/log/zeroclaw/access.log"
 error_log="/var/log/zeroclaw/error.log"
+env ZEROCLAW_CONFIG_DIR="{}"
+env ZEROCLAW_WORKSPACE="{}"
 
 depend() {{
     need net
@@ -653,8 +655,20 @@ depend() {{
 }}
 "#,
         exe_path.display(),
-        config_path
+        config_dir.display(),
+        config_dir.display(),
+        config_dir.join("workspace").display()
     )
+}
+
+fn resolve_openrc_executable() -> Result<PathBuf> {
+    let preferred = Path::new("/usr/local/bin/zeroclaw");
+    if preferred.exists() {
+        return Ok(preferred.to_path_buf());
+    }
+
+    let exe = std::env::current_exe().context("Failed to resolve current executable")?;
+    Ok(exe)
 }
 
 fn install_linux_openrc(config: &Config) -> Result<()> {
@@ -667,10 +681,11 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
 
     ensure_zeroclaw_user()?;
 
-    let exe = std::env::current_exe().context("Failed to resolve current executable")?;
+    let exe = resolve_openrc_executable()?;
     warn_if_binary_in_home(&exe);
 
     let config_dir = Path::new("/etc/zeroclaw");
+    let workspace_dir = config_dir.join("workspace");
     let log_dir = Path::new("/var/log/zeroclaw");
 
     if !config_dir.exists() {
@@ -684,6 +699,23 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
             )?;
         }
         println!("✅ Created directory: {}", config_dir.display());
+    }
+
+    if !workspace_dir.exists() {
+        fs::create_dir_all(&workspace_dir)
+            .with_context(|| format!("Failed to create {}", workspace_dir.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&workspace_dir, fs::Permissions::from_mode(0o750)).with_context(
+                || format!("Failed to set permissions on {}", workspace_dir.display()),
+            )?;
+        }
+        chown_to_zeroclaw(&workspace_dir)?;
+        println!(
+            "✅ Created directory: {} (owned by zeroclaw:zeroclaw)",
+            workspace_dir.display()
+        );
     }
 
     let created_log_dir = !log_dir.exists();
@@ -707,7 +739,7 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
         );
     }
 
-    let init_script = generate_openrc_script(&exe, "/etc/zeroclaw/config.toml");
+    let init_script = generate_openrc_script(&exe, config_dir);
     let init_path = Path::new("/etc/init.d/zeroclaw");
     fs::write(init_path, init_script)
         .with_context(|| format!("Failed to write {}", init_path.display()))?;
@@ -927,13 +959,15 @@ mod tests {
         use std::path::PathBuf;
 
         let exe_path = PathBuf::from("/usr/local/bin/zeroclaw");
-        let script = generate_openrc_script(&exe_path, "/etc/zeroclaw/config.toml");
+        let script = generate_openrc_script(&exe_path, Path::new("/etc/zeroclaw"));
 
         assert!(script.starts_with("#!/sbin/openrc-run"));
         assert!(script.contains("name=\"zeroclaw\""));
         assert!(script.contains("description=\"ZeroClaw daemon\""));
         assert!(script.contains("command=\"/usr/local/bin/zeroclaw\""));
-        assert!(script.contains("command_args=\"daemon --config /etc/zeroclaw/config.toml\""));
+        assert!(script.contains("command_args=\"--config-dir /etc/zeroclaw daemon\""));
+        assert!(script.contains("env ZEROCLAW_CONFIG_DIR=\"/etc/zeroclaw\""));
+        assert!(script.contains("env ZEROCLAW_WORKSPACE=\"/etc/zeroclaw/workspace\""));
         assert!(script.contains("command_background=\"yes\""));
         assert!(script.contains("command_user=\"zeroclaw:zeroclaw\""));
         assert!(script.contains("pidfile=\"/run/${RC_SVCNAME}.pid\""));

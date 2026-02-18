@@ -93,6 +93,9 @@ pub use zeroclaw::{HardwareCommands, PeripheralCommands};
 #[command(version = "0.1.0")]
 #[command(about = "The fastest, smallest AI assistant.", long_about = None)]
 struct Cli {
+    #[arg(long, global = true)]
+    config_dir: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -665,6 +668,13 @@ async fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
+
+    if let Some(config_dir) = &cli.config_dir {
+        if config_dir.trim().is_empty() {
+            bail!("--config-dir cannot be empty");
+        }
+        std::env::set_var("ZEROCLAW_CONFIG_DIR", config_dir);
+    }
 
     // Completions must remain stdout-only and should not load config or initialize logging.
     // This avoids warnings/log lines corrupting sourced completion scripts.

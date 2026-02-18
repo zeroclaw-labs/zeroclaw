@@ -321,7 +321,7 @@ zeroclaw service install
 zeroclaw service status
 zeroclaw service restart
 
-# On Alpine (OpenRC): sudo zeroclaw service install --service-init=openrc
+# On Alpine (OpenRC): sudo zeroclaw service --service-init=openrc install
 
 # Migrate memory from OpenClaw (safe preview first)
 zeroclaw migrate openclaw --dry-run
@@ -931,9 +931,12 @@ zeroclaw service install
 zeroclaw service start
 
 # Alpine with OpenRC (system-wide, requires sudo)
-sudo zeroclaw service install --service-init=openrc
+sudo zeroclaw service --service-init=openrc install
 sudo rc-update add zeroclaw default
 sudo rc-service zeroclaw start
+
+# Note: --service-init is a service-level flag and must come before the subcommand
+# OpenRC installs set ZEROCLAW_CONFIG_DIR=/etc/zeroclaw for the service
 ```
 
 For full OpenRC setup instructions, see [docs/network-deployment.md](docs/network-deployment.md#7-openrc-alpine-linux-service).
