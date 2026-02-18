@@ -644,7 +644,8 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
             remaining = &after_open[close_idx + close_tag.len()..];
         } else {
             if let Some(json_end) = find_json_end(after_open) {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&after_open[..json_end])
+                if let Ok(value) =
+                    serde_json::from_str::<serde_json::Value>(&after_open[..json_end])
                 {
                     let parsed_calls = parse_tool_calls_from_json_value(&value);
                     if !parsed_calls.is_empty() {
