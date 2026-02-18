@@ -495,6 +495,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "groq" => "llama-3.3-70b-versatile".into(),
         "deepseek" => "deepseek-chat".into(),
         "gemini" => "gemini-2.5-pro".into(),
+        "kimi-code" => "kimi-for-coding".into(),
         _ => "anthropic/claude-sonnet-4.5".into(),
     }
 }
@@ -1427,6 +1428,10 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
             ("bedrock", "Amazon Bedrock — AWS managed models"),
         ],
         3 => vec![
+            (
+                "kimi-code",
+                "Kimi Code — coding-optimized Kimi API (KimiCLI)",
+            ),
             ("moonshot", "Moonshot — Kimi API (China endpoint)"),
             (
                 "moonshot-intl",
@@ -4611,6 +4616,7 @@ mod tests {
         assert_eq!(default_model_for_provider("zai-cn"), "glm-5");
         assert_eq!(default_model_for_provider("gemini"), "gemini-2.5-pro");
         assert_eq!(default_model_for_provider("google"), "gemini-2.5-pro");
+        assert_eq!(default_model_for_provider("kimi-code"), "kimi-for-coding");
         assert_eq!(
             default_model_for_provider("google-gemini"),
             "gemini-2.5-pro"
