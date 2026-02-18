@@ -4083,8 +4083,10 @@ fn print_summary(config: &Config) {
             );
             println!(
                 "       {}",
-                style("or: zeroclaw auth paste-token --provider anthropic --auth-kind authorization")
-                    .yellow()
+                style(
+                    "or: zeroclaw auth paste-token --provider anthropic --auth-kind authorization"
+                )
+                .yellow()
             );
         } else {
             let env_var = provider_env_var(provider);

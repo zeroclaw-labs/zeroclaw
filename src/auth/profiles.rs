@@ -41,7 +41,8 @@ impl TokenSet {
     pub fn is_expiring_within(&self, skew: Duration) -> bool {
         match self.expires_at {
             Some(expires_at) => {
-                let now_plus_skew = Utc::now() + chrono::Duration::from_std(skew).unwrap_or_default();
+                let now_plus_skew =
+                    Utc::now() + chrono::Duration::from_std(skew).unwrap_or_default();
                 expires_at <= now_plus_skew
             }
             None => false,
@@ -180,7 +181,8 @@ impl AuthProfilesStore {
             return Ok(false);
         }
 
-        data.active_profiles.retain(|_, active| active != profile_id);
+        data.active_profiles
+            .retain(|_, active| active != profile_id);
         data.updated_at = Utc::now();
         self.save_locked(&data)?;
         Ok(true)
@@ -234,7 +236,8 @@ impl AuthProfilesStore {
 
         let mut profiles = BTreeMap::new();
         for (id, p) in &mut persisted.profiles {
-            let (access_token, access_migrated) = self.decrypt_optional(p.access_token.as_deref())?;
+            let (access_token, access_migrated) =
+                self.decrypt_optional(p.access_token.as_deref())?;
             let (refresh_token, refresh_migrated) =
                 self.decrypt_optional(p.refresh_token.as_deref())?;
             let (id_token, id_migrated) = self.decrypt_optional(p.id_token.as_deref())?;
@@ -370,12 +373,13 @@ impl AuthProfilesStore {
             return Ok(PersistedAuthProfiles::default());
         }
 
-        let mut persisted: PersistedAuthProfiles = serde_json::from_slice(&bytes).with_context(|| {
-            format!(
-                "Failed to parse auth profile store at {}",
-                self.path.display()
-            )
-        })?;
+        let mut persisted: PersistedAuthProfiles =
+            serde_json::from_slice(&bytes).with_context(|| {
+                format!(
+                    "Failed to parse auth profile store at {}",
+                    self.path.display()
+                )
+            })?;
 
         if persisted.schema_version == 0 {
             persisted.schema_version = CURRENT_SCHEMA_VERSION;
@@ -402,7 +406,8 @@ impl AuthProfilesStore {
             })?;
         }
 
-        let json = serde_json::to_vec_pretty(persisted).context("Failed to serialize auth profiles")?;
+        let json =
+            serde_json::to_vec_pretty(persisted).context("Failed to serialize auth profiles")?;
         let tmp_name = format!(
             "{}.tmp.{}.{}",
             PROFILES_FILENAME,
@@ -576,9 +581,7 @@ fn profile_kind_to_string(kind: AuthProfileKind) -> &'static str {
 }
 
 fn parse_optional_datetime(value: Option<&str>) -> Result<Option<DateTime<Utc>>> {
-    value
-        .map(parse_datetime)
-        .transpose()
+    value.map(parse_datetime).transpose()
 }
 
 fn parse_datetime(value: &str) -> Result<DateTime<Utc>> {
@@ -602,7 +605,10 @@ mod tests {
 
     #[test]
     fn profile_id_format() {
-        assert_eq!(profile_id("openai-codex", "default"), "openai-codex:default");
+        assert_eq!(
+            profile_id("openai-codex", "default"),
+            "openai-codex:default"
+        );
     }
 
     #[test]
