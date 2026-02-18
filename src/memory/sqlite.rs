@@ -461,10 +461,16 @@ impl Memory for SqliteMemory {
             }
         }
 
-        // If hybrid returned nothing, fall back to LIKE search
+        // If hybrid returned nothing, fall back to LIKE search.
+        // Cap keyword count to bound the number of distinct SQL shapes
+        // so the query cache (prepared-statement cache) stays effective.
         if results.is_empty() {
-            let keywords: Vec<String> =
-                query.split_whitespace().map(|w| format!("%{w}%")).collect();
+            const MAX_LIKE_KEYWORDS: usize = 8;
+            let keywords: Vec<String> = query
+                .split_whitespace()
+                .take(MAX_LIKE_KEYWORDS)
+                .map(|w| format!("%{w}%"))
+                .collect();
             if !keywords.is_empty() {
                 let conditions: Vec<String> = keywords
                     .iter()
