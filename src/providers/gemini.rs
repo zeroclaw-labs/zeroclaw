@@ -169,6 +169,24 @@ impl GeminiProvider {
         }
     }
 
+    /// Create a Gemini provider pre-authenticated with an OAuth access token.
+    ///
+    /// This bypasses the normal API-key resolution and forces the provider to
+    /// use the `OAuthToken` auth path (Bearer header + cloudcode-pa endpoint).
+    /// Used by the Antigravity / Gemini CLI OAuth flows that have already
+    /// obtained an access token.
+    pub fn new_with_oauth_token(access_token: &str) -> Self {
+        let auth = Self::normalize_non_empty(access_token).map(GeminiAuth::OAuthToken);
+        Self {
+            auth,
+            client: Client::builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| Client::new()),
+        }
+    }
+
     fn normalize_non_empty(value: &str) -> Option<String> {
         let trimmed = value.trim();
         if trimmed.is_empty() {

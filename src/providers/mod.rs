@@ -518,11 +518,22 @@ pub fn create_provider_with_url(
             )))
         }
         "antigravity" | "google-antigravity" => {
-            // Google Antigravity uses Cloudcode PA endpoint (Anthropic-compatible API via Google)
-            let ag_key = key.map(|k| k.to_string()).or_else(|| {
+            // Google Antigravity uses Cloudcode PA endpoint with OAuth Bearer token.
+            // The credential is a JSON string {"token":"...","projectId":"..."} — extract
+            // the access_token and use the OAuth auth path so the provider hits the
+            // cloudcode-pa endpoint with Authorization: Bearer instead of ?key=.
+            let ag_json = key.map(|k| k.to_string()).or_else(|| {
                 crate::auth::antigravity_oauth::try_load_cached_token()
             });
-            Ok(Box::new(gemini::GeminiProvider::new(ag_key.as_deref())))
+            let access_token = ag_json.and_then(|json| {
+                serde_json::from_str::<serde_json::Value>(&json)
+                    .ok()
+                    .and_then(|v| v.get("token")?.as_str().map(String::from))
+            });
+            match access_token {
+                Some(token) => Ok(Box::new(gemini::GeminiProvider::new_with_oauth_token(&token))),
+                None => Ok(Box::new(gemini::GeminiProvider::new(None))),
+            }
         }
 
         // ── Bring Your Own Provider (custom URL) ───────────

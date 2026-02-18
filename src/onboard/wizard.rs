@@ -463,6 +463,7 @@ fn canonical_provider_name(provider_name: &str) -> &str {
         "together" => "together-ai",
         "google" | "google-gemini" | "gemini-cli-oauth" => "gemini",
         "anthropic-setup-token" => "anthropic",
+        "openai-codex" => "codex",
         "google-antigravity" => "antigravity",
         _ => provider_name,
     }
@@ -2273,14 +2274,18 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
         selected_model
     };
 
+    // Return the canonical provider name so the factory can recognise it.
+    // e.g. "gemini-cli-oauth" → "gemini", "anthropic-setup-token" → "anthropic"
+    let final_provider = canonical_provider_name(provider_name);
+
     println!(
         "  {} Provider: {} | Model: {}",
         style("✓").green().bold(),
-        style(provider_name).green(),
+        style(final_provider).green(),
         style(&model).green()
     );
 
-    Ok((provider_name.to_string(), api_key, model, provider_api_url))
+    Ok((final_provider.to_string(), api_key, model, provider_api_url))
 }
 
 /// Map provider name to its conventional env var

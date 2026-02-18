@@ -185,11 +185,13 @@ pub fn open_url_in_browser(url: &str) {
 /// Write content to a file with owner-only permissions (0o600 on Unix).
 ///
 /// Uses `spawn_blocking` to avoid blocking the async runtime.
-pub async fn write_file_secure(path: &Path, content: &str) {
+/// Returns an error if the directory cannot be created, the file cannot
+/// be written, or the blocking task panics.
+pub async fn write_file_secure(path: &Path, content: &str) -> Result<()> {
     let path = path.to_path_buf();
     let content = content.to_string();
 
-    let result = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -217,11 +219,11 @@ pub async fn write_file_secure(path: &Path, content: &str) {
 
         Ok(())
     })
-    .await;
+    .await
+    .context("credential file write task panicked")?
+    .context("failed to write credential file")?;
 
-    if let Err(e) = result {
-        tracing::warn!("failed to write secure file: {e}");
-    }
+    Ok(())
 }
 
 /// OAuth credentials stored to / loaded from disk.

@@ -117,11 +117,11 @@ pub async fn login_antigravity_oauth() -> Result<String> {
         wait_for_oauth_callback(CALLBACK_PORT, CALLBACK_TIMEOUT_SECS).await?
     };
 
-    // Verify state for CSRF protection
-    if let Some(ref cb_state) = callback.state {
-        if cb_state != &pkce.state {
-            anyhow::bail!("OAuth state mismatch: possible CSRF attack");
-        }
+    // Verify state for CSRF protection (mandatory)
+    match callback.state {
+        Some(ref cb_state) if cb_state == &pkce.state => {}
+        Some(_) => anyhow::bail!("OAuth state mismatch: possible CSRF attack"),
+        None => anyhow::bail!("OAuth callback missing state parameter: possible CSRF attack"),
     }
 
     // Exchange authorization code for tokens
@@ -131,7 +131,7 @@ pub async fn login_antigravity_oauth() -> Result<String> {
     // Cache credentials to disk
     let cache_path = credentials_path();
     let json = serde_json::to_string_pretty(&creds)?;
-    write_file_secure(&cache_path, &json).await;
+    write_file_secure(&cache_path, &json).await?;
 
     println!("  \u{2705} Antigravity authentication successful!");
     println!("  Default model: {}", console::style(DEFAULT_MODEL).green());

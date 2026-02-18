@@ -110,11 +110,11 @@ pub async fn login_gemini_cli_oauth() -> Result<String> {
         wait_for_oauth_callback(CALLBACK_PORT, CALLBACK_TIMEOUT_SECS).await?
     };
 
-    // Verify state for CSRF protection
-    if let Some(ref cb_state) = callback.state {
-        if cb_state != &pkce.state {
-            anyhow::bail!("OAuth state mismatch: possible CSRF attack");
-        }
+    // Verify state for CSRF protection (mandatory)
+    match callback.state {
+        Some(ref cb_state) if cb_state == &pkce.state => {}
+        Some(_) => anyhow::bail!("OAuth state mismatch: possible CSRF attack"),
+        None => anyhow::bail!("OAuth callback missing state parameter: possible CSRF attack"),
     }
 
     // Exchange authorization code for tokens
@@ -250,7 +250,7 @@ async fn save_gemini_cli_credentials(creds: &OAuthCredentials) -> Result<()> {
     });
 
     let json = serde_json::to_string_pretty(&cli_creds)?;
-    write_file_secure(&path, &json).await;
+    write_file_secure(&path, &json).await?;
 
     tracing::info!("Gemini CLI credentials saved to {}", path.display());
     Ok(())
