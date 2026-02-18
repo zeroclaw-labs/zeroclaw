@@ -452,6 +452,34 @@ fn extract_responses_text(response: ResponsesResponse) -> Option<String> {
     None
 }
 
+fn compact_sanitized_body_snippet(body: &str) -> String {
+    super::sanitize_api_error(body)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn parse_chat_response_body(provider_name: &str, body: &str) -> anyhow::Result<ApiChatResponse> {
+    serde_json::from_str::<ApiChatResponse>(body).map_err(|error| {
+        let snippet = compact_sanitized_body_snippet(body);
+        anyhow::anyhow!(
+            "{provider_name} API returned an unexpected chat-completions payload: {error}; body={snippet}"
+        )
+    })
+}
+
+fn parse_responses_response_body(
+    provider_name: &str,
+    body: &str,
+) -> anyhow::Result<ResponsesResponse> {
+    serde_json::from_str::<ResponsesResponse>(body).map_err(|error| {
+        let snippet = compact_sanitized_body_snippet(body);
+        anyhow::anyhow!(
+            "{provider_name} Responses API returned an unexpected payload: {error}; body={snippet}"
+        )
+    })
+}
+
 impl OpenAiCompatibleProvider {
     fn apply_auth_header(
         &self,
@@ -494,7 +522,8 @@ impl OpenAiCompatibleProvider {
             anyhow::bail!("{} Responses API error: {error}", self.name);
         }
 
-        let responses: ResponsesResponse = response.json().await?;
+        let body = response.text().await?;
+        let responses = parse_responses_response_body(&self.name, &body)?;
 
         extract_responses_text(responses)
             .ok_or_else(|| anyhow::anyhow!("No response from {} Responses API", self.name))
@@ -573,7 +602,8 @@ impl Provider for OpenAiCompatibleProvider {
             anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
         }
 
-        let chat_response: ApiChatResponse = response.json().await?;
+        let body = response.text().await?;
+        let chat_response = parse_chat_response_body(&self.name, &body)?;
 
         chat_response
             .choices
@@ -663,7 +693,8 @@ impl Provider for OpenAiCompatibleProvider {
             return Err(super::api_error(&self.name, response).await);
         }
 
-        let chat_response: ApiChatResponse = response.json().await?;
+        let body = response.text().await?;
+        let chat_response = parse_chat_response_body(&self.name, &body)?;
 
         chat_response
             .choices
@@ -737,7 +768,8 @@ impl Provider for OpenAiCompatibleProvider {
             return Err(super::api_error(&self.name, response).await);
         }
 
-        let chat_response: ApiChatResponse = response.json().await?;
+        let body = response.text().await?;
+        let chat_response = parse_chat_response_body(&self.name, &body)?;
         let choice = chat_response
             .choices
             .into_iter()
@@ -1031,6 +1063,30 @@ mod tests {
         let json = r#"{"choices":[]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         assert!(resp.choices.is_empty());
+    }
+
+    #[test]
+    fn parse_chat_response_body_reports_sanitized_snippet() {
+        let body = r#"{"choices":"invalid","api_key":"sk-test-secret-value"}"#;
+        let err = parse_chat_response_body("custom", body).expect_err("payload should fail");
+        let msg = err.to_string();
+
+        assert!(msg.contains("custom API returned an unexpected chat-completions payload"));
+        assert!(msg.contains("body="));
+        assert!(msg.contains("[REDACTED]"));
+        assert!(!msg.contains("sk-test-secret-value"));
+    }
+
+    #[test]
+    fn parse_responses_response_body_reports_sanitized_snippet() {
+        let body = r#"{"output_text":123,"api_key":"sk-another-secret"}"#;
+        let err = parse_responses_response_body("custom", body).expect_err("payload should fail");
+        let msg = err.to_string();
+
+        assert!(msg.contains("custom Responses API returned an unexpected payload"));
+        assert!(msg.contains("body="));
+        assert!(msg.contains("[REDACTED]"));
+        assert!(!msg.contains("sk-another-secret"));
     }
 
     #[test]

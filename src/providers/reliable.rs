@@ -22,7 +22,37 @@ fn is_non_retryable(err: &anyhow::Error) -> bool {
             }
         }
     }
-    false
+
+    let msg_lower = msg.to_lowercase();
+    let auth_failure_hints = [
+        "invalid api key",
+        "incorrect api key",
+        "missing api key",
+        "api key not set",
+        "authentication failed",
+        "auth failed",
+        "unauthorized",
+        "forbidden",
+        "permission denied",
+        "access denied",
+        "invalid token",
+    ];
+
+    if auth_failure_hints
+        .iter()
+        .any(|hint| msg_lower.contains(hint))
+    {
+        return true;
+    }
+
+    let model_catalog_mismatch = msg_lower.contains("model")
+        && (msg_lower.contains("not found")
+            || msg_lower.contains("unknown")
+            || msg_lower.contains("unsupported")
+            || msg_lower.contains("does not exist")
+            || msg_lower.contains("invalid"));
+
+    model_catalog_mismatch
 }
 
 /// Check if an error is a rate-limit (429) error.
@@ -68,6 +98,37 @@ fn parse_retry_after_ms(err: &anyhow::Error) -> Option<u64> {
         }
     }
     None
+}
+
+fn failure_reason(rate_limited: bool, non_retryable: bool) -> &'static str {
+    if rate_limited {
+        "rate_limited"
+    } else if non_retryable {
+        "non_retryable"
+    } else {
+        "retryable"
+    }
+}
+
+fn compact_error_detail(err: &anyhow::Error) -> String {
+    super::sanitize_api_error(&err.to_string())
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn push_failure(
+    failures: &mut Vec<String>,
+    provider_name: &str,
+    model: &str,
+    attempt: u32,
+    max_attempts: u32,
+    reason: &str,
+    error_detail: &str,
+) {
+    failures.push(format!(
+        "provider={provider_name} model={model} attempt {attempt}/{max_attempts}: {reason}; error={error_detail}"
+    ));
 }
 
 /// Provider wrapper with retry, fallback, auth rotation, and model failover.
@@ -185,25 +246,25 @@ impl Provider for ReliableProvider {
                         Err(e) => {
                             let non_retryable = is_non_retryable(&e);
                             let rate_limited = is_rate_limited(&e);
+                            let failure_reason = failure_reason(rate_limited, non_retryable);
+                            let error_detail = compact_error_detail(&e);
 
-                            let failure_reason = if rate_limited {
-                                "rate_limited"
-                            } else if non_retryable {
-                                "non_retryable"
-                            } else {
-                                "retryable"
-                            };
-                            failures.push(format!(
-                                "provider={provider_name} model={current_model} attempt {}/{}: {failure_reason}",
+                            push_failure(
+                                &mut failures,
+                                provider_name,
+                                current_model,
                                 attempt + 1,
-                                self.max_retries + 1
-                            ));
+                                self.max_retries + 1,
+                                failure_reason,
+                                &error_detail,
+                            );
 
                             // On rate-limit, try rotating API key
                             if rate_limited {
                                 if let Some(new_key) = self.rotate_key() {
                                     tracing::info!(
                                         provider = provider_name,
+                                        error = %error_detail,
                                         "Rate limited, rotated API key (key ending ...{})",
                                         &new_key[new_key.len().saturating_sub(4)..]
                                     );
@@ -214,6 +275,7 @@ impl Provider for ReliableProvider {
                                 tracing::warn!(
                                     provider = provider_name,
                                     model = *current_model,
+                                    error = %error_detail,
                                     "Non-retryable error, moving on"
                                 );
                                 break;
@@ -226,6 +288,8 @@ impl Provider for ReliableProvider {
                                     model = *current_model,
                                     attempt = attempt + 1,
                                     backoff_ms = wait,
+                                    reason = failure_reason,
+                                    error = %error_detail,
                                     "Provider call failed, retrying"
                                 );
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
@@ -290,24 +354,24 @@ impl Provider for ReliableProvider {
                         Err(e) => {
                             let non_retryable = is_non_retryable(&e);
                             let rate_limited = is_rate_limited(&e);
+                            let failure_reason = failure_reason(rate_limited, non_retryable);
+                            let error_detail = compact_error_detail(&e);
 
-                            let failure_reason = if rate_limited {
-                                "rate_limited"
-                            } else if non_retryable {
-                                "non_retryable"
-                            } else {
-                                "retryable"
-                            };
-                            failures.push(format!(
-                                "provider={provider_name} model={current_model} attempt {}/{}: {failure_reason}",
+                            push_failure(
+                                &mut failures,
+                                provider_name,
+                                current_model,
                                 attempt + 1,
-                                self.max_retries + 1
-                            ));
+                                self.max_retries + 1,
+                                failure_reason,
+                                &error_detail,
+                            );
 
                             if rate_limited {
                                 if let Some(new_key) = self.rotate_key() {
                                     tracing::info!(
                                         provider = provider_name,
+                                        error = %error_detail,
                                         "Rate limited, rotated API key (key ending ...{})",
                                         &new_key[new_key.len().saturating_sub(4)..]
                                     );
@@ -318,6 +382,7 @@ impl Provider for ReliableProvider {
                                 tracing::warn!(
                                     provider = provider_name,
                                     model = *current_model,
+                                    error = %error_detail,
                                     "Non-retryable error, moving on"
                                 );
                                 break;
@@ -330,6 +395,8 @@ impl Provider for ReliableProvider {
                                     model = *current_model,
                                     attempt = attempt + 1,
                                     backoff_ms = wait,
+                                    reason = failure_reason,
+                                    error = %error_detail,
                                     "Provider call failed, retrying"
                                 );
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
@@ -394,24 +461,24 @@ impl Provider for ReliableProvider {
                         Err(e) => {
                             let non_retryable = is_non_retryable(&e);
                             let rate_limited = is_rate_limited(&e);
+                            let failure_reason = failure_reason(rate_limited, non_retryable);
+                            let error_detail = compact_error_detail(&e);
 
-                            let failure_reason = if rate_limited {
-                                "rate_limited"
-                            } else if non_retryable {
-                                "non_retryable"
-                            } else {
-                                "retryable"
-                            };
-                            failures.push(format!(
-                                "{provider_name}/{current_model} attempt {}/{}: {failure_reason}",
+                            push_failure(
+                                &mut failures,
+                                provider_name,
+                                current_model,
                                 attempt + 1,
-                                self.max_retries + 1
-                            ));
+                                self.max_retries + 1,
+                                failure_reason,
+                                &error_detail,
+                            );
 
                             if rate_limited {
                                 if let Some(new_key) = self.rotate_key() {
                                     tracing::info!(
                                         provider = provider_name,
+                                        error = %error_detail,
                                         "Rate limited, rotated API key (key ending ...{})",
                                         &new_key[new_key.len().saturating_sub(4)..]
                                     );
@@ -422,6 +489,7 @@ impl Provider for ReliableProvider {
                                 tracing::warn!(
                                     provider = provider_name,
                                     model = *current_model,
+                                    error = %error_detail,
                                     "Non-retryable error, moving on"
                                 );
                                 break;
@@ -434,6 +502,8 @@ impl Provider for ReliableProvider {
                                     model = *current_model,
                                     attempt = attempt + 1,
                                     backoff_ms = wait,
+                                    reason = failure_reason,
+                                    error = %error_detail,
                                     "Provider call failed, retrying"
                                 );
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
@@ -716,6 +786,9 @@ mod tests {
         assert!(msg.contains("All providers/models failed"));
         assert!(msg.contains("provider=p1 model=test"));
         assert!(msg.contains("provider=p2 model=test"));
+        assert!(msg.contains("error=p1 error"));
+        assert!(msg.contains("error=p2 error"));
+        assert!(msg.contains("retryable"));
     }
 
     #[test]
@@ -724,6 +797,16 @@ mod tests {
         assert!(is_non_retryable(&anyhow::anyhow!("401 Unauthorized")));
         assert!(is_non_retryable(&anyhow::anyhow!("403 Forbidden")));
         assert!(is_non_retryable(&anyhow::anyhow!("404 Not Found")));
+        assert!(is_non_retryable(&anyhow::anyhow!(
+            "invalid api key provided"
+        )));
+        assert!(is_non_retryable(&anyhow::anyhow!("authentication failed")));
+        assert!(is_non_retryable(&anyhow::anyhow!(
+            "model glm-4.7 not found"
+        )));
+        assert!(is_non_retryable(&anyhow::anyhow!(
+            "unsupported model: glm-4.7"
+        )));
         assert!(!is_non_retryable(&anyhow::anyhow!("429 Too Many Requests")));
         assert!(!is_non_retryable(&anyhow::anyhow!("408 Request Timeout")));
         assert!(!is_non_retryable(&anyhow::anyhow!(
@@ -732,6 +815,38 @@ mod tests {
         assert!(!is_non_retryable(&anyhow::anyhow!("502 Bad Gateway")));
         assert!(!is_non_retryable(&anyhow::anyhow!("timeout")));
         assert!(!is_non_retryable(&anyhow::anyhow!("connection reset")));
+        assert!(!is_non_retryable(&anyhow::anyhow!(
+            "model overloaded, try again later"
+        )));
+    }
+
+    #[tokio::test]
+    async fn aggregated_error_marks_non_retryable_model_mismatch_with_details() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![(
+                "custom".into(),
+                Box::new(MockProvider {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: usize::MAX,
+                    response: "never",
+                    error: "unsupported model: glm-4.7",
+                }),
+            )],
+            3,
+            1,
+        );
+
+        let err = provider
+            .simple_chat("hello", "glm-4.7", 0.0)
+            .await
+            .expect_err("provider should fail");
+        let msg = err.to_string();
+
+        assert!(msg.contains("non_retryable"));
+        assert!(msg.contains("error=unsupported model: glm-4.7"));
+        // Non-retryable errors should not consume retry budget.
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
