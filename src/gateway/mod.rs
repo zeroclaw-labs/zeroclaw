@@ -367,12 +367,16 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         });
 
     // WhatsApp channel (if configured)
-    let whatsapp_channel: Option<Arc<WhatsAppChannel>> =
-        config.channels_config.whatsapp.as_ref().map(|wa| {
+    let whatsapp_channel: Option<Arc<WhatsAppChannel>> = config
+        .channels_config
+        .whatsapp
+        .as_ref()
+        .filter(|wa| wa.is_cloud_config())
+        .map(|wa| {
             Arc::new(WhatsAppChannel::new(
-                wa.access_token.clone(),
-                wa.phone_number_id.clone(),
-                wa.verify_token.clone(),
+                wa.access_token.clone().unwrap_or_default(),
+                wa.phone_number_id.clone().unwrap_or_default(),
+                wa.verify_token.clone().unwrap_or_default(),
                 wa.allowed_numbers.clone(),
             ))
         });
