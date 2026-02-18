@@ -486,7 +486,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "groq" => "llama-3.3-70b-versatile".into(),
         "deepseek" => "deepseek-chat".into(),
         "gemini" => "gemini-2.5-pro".into(),
-        "google-antigravity" => "google-antigravity/claude-opus-4-6-thinking".into(),
+        "google-antigravity" => "claude-opus-4-6-thinking".into(),
         _ => "anthropic/claude-sonnet-4.5".into(),
     }
 }
@@ -1912,26 +1912,14 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
         ],
         "google-antigravity" => vec![
             (
-                "google-antigravity/claude-opus-4-6-thinking",
+                "claude-opus-4-6-thinking",
                 "Claude Opus 4.6 Thinking (recommended)",
             ),
-            (
-                "google-antigravity/claude-opus-4-5-thinking",
-                "Claude Opus 4.5 Thinking",
-            ),
-            (
-                "google-antigravity/claude-sonnet-4-5-thinking",
-                "Claude Sonnet 4.5 Thinking",
-            ),
-            ("google-antigravity/gemini-3-flash", "Gemini 3 Flash (fast)"),
-            (
-                "google-antigravity/gemini-3-pro-high",
-                "Gemini 3 Pro High (best quality)",
-            ),
-            (
-                "google-antigravity/gemini-3-pro-low",
-                "Gemini 3 Pro Low (cost-efficient)",
-            ),
+            ("claude-opus-4-5-thinking", "Claude Opus 4.5 Thinking"),
+            ("claude-sonnet-4-5-thinking", "Claude Sonnet 4.5 Thinking"),
+            ("gemini-3-flash", "Gemini 3 Flash (fast)"),
+            ("gemini-3-pro-high", "Gemini 3 Pro High (best quality)"),
+            ("gemini-3-pro-low", "Gemini 3 Pro Low (cost-efficient)"),
         ],
         "gemini" | "google" | "google-gemini" => vec![
             ("gemini-2.0-flash", "Gemini 2.0 Flash (fast, recommended)"),
