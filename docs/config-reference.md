@@ -50,12 +50,22 @@ Notes:
 
 Top-level channel options are configured under `channels_config`.
 
+| Key | Default | Purpose |
+|---|---|---|
+| `message_timeout_secs` | `300` | Timeout in seconds for processing a single channel message (LLM + tools) |
+
 Examples:
 
 - `[channels_config.telegram]`
 - `[channels_config.discord]`
 - `[channels_config.whatsapp]`
 - `[channels_config.email]`
+
+Notes:
+
+- Default `300s` is optimized for on-device LLMs (Ollama) which are slower than cloud APIs.
+- If using cloud APIs (OpenAI, Anthropic, etc.), you can reduce this to `60` or lower.
+- When a timeout occurs, users receive: `⚠️ Request timed out while waiting for the model. Please try again.`
 
 See detailed channel matrix and allowlist behavior in [channels-reference.md](channels-reference.md).
 

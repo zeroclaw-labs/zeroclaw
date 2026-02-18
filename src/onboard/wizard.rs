@@ -2444,23 +2444,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
     print_bullet("CLI is always available. Connect more channels now.");
     println!();
 
-    let mut config = ChannelsConfig {
-        cli: true,
-        telegram: None,
-        discord: None,
-        slack: None,
-        mattermost: None,
-        webhook: None,
-        imessage: None,
-        matrix: None,
-        signal: None,
-        whatsapp: None,
-        email: None,
-        irc: None,
-        lark: None,
-        dingtalk: None,
-        qq: None,
-    };
+    let mut config = ChannelsConfig::default();
 
     loop {
         let options = vec![
