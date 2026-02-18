@@ -74,7 +74,7 @@ install_system_deps() {
         run_privileged apt-get update -qq
         run_privileged apt-get install -y build-essential pkg-config git curl
       elif have_cmd dnf; then
-        run_privileged dnf groupinstall -y "Development Tools"
+        run_privileged dnf group install -y development-tools
         run_privileged dnf install -y pkg-config git curl
       else
         warn "Unsupported Linux distribution. Install compiler toolchain + pkg-config + git + curl manually."
