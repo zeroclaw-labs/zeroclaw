@@ -1251,7 +1251,9 @@ impl Channel for TelegramChannel {
             .and_then(|id| id.as_i64())
             .map(|id| id.to_string());
 
-        self.last_draft_edit.lock().insert(chat_id.to_string(), std::time::Instant::now());
+        self.last_draft_edit
+            .lock()
+            .insert(chat_id.to_string(), std::time::Instant::now());
 
         Ok(message_id)
     }
@@ -1313,7 +1315,9 @@ impl Channel for TelegramChannel {
             .await?;
 
         if resp.status().is_success() {
-            self.last_draft_edit.lock().insert(chat_id.clone(), std::time::Instant::now());
+            self.last_draft_edit
+                .lock()
+                .insert(chat_id.clone(), std::time::Instant::now());
         } else {
             let status = resp.status();
             let err = resp.text().await.unwrap_or_default();
@@ -1337,7 +1341,9 @@ impl Channel for TelegramChannel {
                 Ok(id) => id,
                 Err(e) => {
                     tracing::warn!("Invalid Telegram message_id '{message_id}': {e}");
-                    return self.send_text_chunks(text, &chat_id, thread_id.as_deref()).await;
+                    return self
+                        .send_text_chunks(text, &chat_id, thread_id.as_deref())
+                        .await;
                 }
             };
 
@@ -1362,7 +1368,9 @@ impl Channel for TelegramChannel {
             Ok(id) => id,
             Err(e) => {
                 tracing::warn!("Invalid Telegram message_id '{message_id}': {e}");
-                return self.send_text_chunks(text, &chat_id, thread_id.as_deref()).await;
+                return self
+                    .send_text_chunks(text, &chat_id, thread_id.as_deref())
+                    .await;
             }
         };
 
@@ -1639,6 +1647,65 @@ mod tests {
 
         let guard = ch.typing_handle.lock();
         assert!(guard.is_some());
+    }
+
+    #[test]
+    fn supports_draft_updates_respects_stream_mode() {
+        let off = TelegramChannel::new("fake-token".into(), vec!["*".into()]);
+        assert!(!off.supports_draft_updates());
+
+        let partial = TelegramChannel::new("fake-token".into(), vec!["*".into()])
+            .with_streaming(StreamMode::Partial, 750);
+        assert!(partial.supports_draft_updates());
+        assert_eq!(partial.draft_update_interval_ms, 750);
+    }
+
+    #[tokio::test]
+    async fn send_draft_returns_none_when_stream_mode_off() {
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()]);
+        let id = ch
+            .send_draft(&SendMessage::new("draft", "123"))
+            .await
+            .unwrap();
+        assert!(id.is_none());
+    }
+
+    #[tokio::test]
+    async fn update_draft_rate_limit_short_circuits_network() {
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()])
+            .with_streaming(StreamMode::Partial, 60_000);
+        ch.last_draft_edit
+            .lock()
+            .insert("123".to_string(), std::time::Instant::now());
+
+        let result = ch.update_draft("123", "42", "delta text").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn update_draft_utf8_truncation_is_safe_for_multibyte_text() {
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()])
+            .with_streaming(StreamMode::Partial, 0);
+        let long_emoji_text = "😀".repeat(TELEGRAM_MAX_MESSAGE_LENGTH + 20);
+
+        // Invalid message_id returns early after building display_text.
+        // This asserts truncation never panics on UTF-8 boundaries.
+        let result = ch
+            .update_draft("123", "not-a-number", &long_emoji_text)
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn finalize_draft_invalid_message_id_falls_back_to_chunk_send() {
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()])
+            .with_streaming(StreamMode::Partial, 0);
+        let long_text = "a".repeat(TELEGRAM_MAX_MESSAGE_LENGTH + 64);
+
+        // For oversized text + invalid draft message_id, finalize_draft should
+        // fall back to chunked send instead of returning early.
+        let result = ch.finalize_draft("123", "not-a-number", &long_text).await;
+        assert!(result.is_err());
     }
 
     #[test]
