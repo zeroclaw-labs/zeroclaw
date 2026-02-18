@@ -407,6 +407,120 @@ fn extract_json_values(input: &str) -> Vec<serde_json::Value> {
     values
 }
 
+/// Find the end position of a JSON object by tracking balanced braces.
+fn find_json_end(input: &str) -> Option<usize> {
+    let trimmed = input.trim_start();
+    let offset = input.len() - trimmed.len();
+
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+
+    let mut depth = 0;
+    let mut in_string = false;
+    let mut escape_next = false;
+
+    for (i, ch) in trimmed.char_indices() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+
+        match ch {
+            '\\' if in_string => escape_next = true,
+            '"' => in_string = !in_string,
+            '{' if !in_string => depth += 1,
+            '}' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(offset + i + ch.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+/// Parse GLM-style tool calls from response text.
+/// GLM uses proprietary formats like:
+/// - `browser_open/url>https://example.com`
+/// - `shell/command>ls -la`
+/// - `http_request/url>https://api.example.com`
+fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value, Option<String>)> {
+    let mut calls = Vec::new();
+
+    let tool_aliases: std::collections::HashMap<&str, &str> = [
+        ("browser_open", "shell"),
+        ("browser", "shell"),
+        ("web_search", "shell"),
+        ("http_request", "http_request"),
+        ("http", "http_request"),
+        ("shell", "shell"),
+        ("bash", "shell"),
+    ]
+    .iter()
+    .cloned()
+    .collect();
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        // Format: tool_name/param>value or tool_name/{json}
+        if let Some(pos) = line.find('/') {
+            let tool_part = &line[..pos];
+            let rest = &line[pos + 1..];
+
+            if tool_part.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                let tool_name = tool_aliases.get(tool_part).unwrap_or(&tool_part);
+
+                if let Some(gt_pos) = rest.find('>') {
+                    let param_name = rest[..gt_pos].trim();
+                    let value = rest[gt_pos + 1..].trim();
+
+                    let arguments = match *tool_name {
+                        "shell" => {
+                            if param_name == "url" || value.starts_with("http") {
+                                serde_json::json!({"command": format!("curl -s '{}'", value)})
+                            } else {
+                                serde_json::json!({"command": value})
+                            }
+                        }
+                        "http_request" => {
+                            serde_json::json!({"url": value, "method": "GET"})
+                        }
+                        _ => serde_json::json!({param_name: value}),
+                    };
+
+                    calls.push((tool_name.to_string(), arguments, Some(line.to_string())));
+                    continue;
+                }
+
+                if rest.starts_with('{') {
+                    if let Ok(json_args) = serde_json::from_str::<serde_json::Value>(rest) {
+                        calls.push((tool_name.to_string(), json_args, Some(line.to_string())));
+                    }
+                }
+            }
+        }
+
+        // Plain URL
+        if line.starts_with("http://") || line.starts_with("https://") {
+            calls.push((
+                "shell".to_string(),
+                serde_json::json!({"command": format!("curl -s '{}'", line)}),
+                Some(line.to_string()),
+            ));
+        }
+    }
+
+    calls
+}
+
 /// Parse tool calls from an LLM response that uses XML-style function calling.
 ///
 /// Expected format (common with system-prompt-guided tool use):
@@ -507,6 +621,27 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                 md_text_parts.push(after.trim().to_string());
             }
             text_parts = md_text_parts;
+            remaining = "";
+        }
+    }
+
+    // GLM-style tool calls (browser_open/url>https://..., shell/command>ls, etc.)
+    if calls.is_empty() {
+        let glm_calls = parse_glm_style_tool_calls(remaining);
+        if !glm_calls.is_empty() {
+            let mut cleaned_text = remaining.to_string();
+            for (name, args, raw) in &glm_calls {
+                calls.push(ParsedToolCall {
+                    name: name.clone(),
+                    arguments: args.clone(),
+                });
+                if let Some(r) = raw {
+                    cleaned_text = cleaned_text.replace(r, "");
+                }
+            }
+            if !cleaned_text.trim().is_empty() {
+                text_parts.push(cleaned_text.trim().to_string());
+            }
             remaining = "";
         }
     }
@@ -1239,7 +1374,9 @@ pub async fn run(
                     continue;
                 }
                 "/clear" | "/new" => {
-                    println!("This will clear the current conversation and delete all session memory.");
+                    println!(
+                        "This will clear the current conversation and delete all session memory."
+                    );
                     println!("Core memories (long-term facts/preferences) will be preserved.");
                     print!("Continue? [y/N] ");
                     let _ = std::io::stdout().flush();
@@ -1258,10 +1395,7 @@ pub async fn run(
                     // Clear conversation and daily memory
                     let mut cleared = 0;
                     for category in [MemoryCategory::Conversation, MemoryCategory::Daily] {
-                        let entries = mem
-                            .list(Some(&category), None)
-                            .await
-                            .unwrap_or_default();
+                        let entries = mem.list(Some(&category), None).await.unwrap_or_default();
                         for entry in entries {
                             if mem.forget(&entry.key).await.unwrap_or(false) {
                                 cleared += 1;
@@ -2143,5 +2277,78 @@ Done."#;
         ]);
         let result = parse_tool_calls_from_json_value(&value);
         assert_eq!(result.len(), 2);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // GLM-Style Tool Call Parsing
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn parse_glm_style_browser_open_url() {
+        let response = "browser_open/url>https://example.com";
+        let calls = parse_glm_style_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "shell");
+        assert!(calls[0].1["command"].as_str().unwrap().contains("curl"));
+        assert!(calls[0].1["command"]
+            .as_str()
+            .unwrap()
+            .contains("example.com"));
+    }
+
+    #[test]
+    fn parse_glm_style_shell_command() {
+        let response = "shell/command>ls -la";
+        let calls = parse_glm_style_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "shell");
+        assert_eq!(calls[0].1["command"], "ls -la");
+    }
+
+    #[test]
+    fn parse_glm_style_http_request() {
+        let response = "http_request/url>https://api.example.com/data";
+        let calls = parse_glm_style_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "http_request");
+        assert_eq!(calls[0].1["url"], "https://api.example.com/data");
+        assert_eq!(calls[0].1["method"], "GET");
+    }
+
+    #[test]
+    fn parse_glm_style_plain_url() {
+        let response = "https://example.com/api";
+        let calls = parse_glm_style_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "shell");
+        assert!(calls[0].1["command"].as_str().unwrap().contains("curl"));
+    }
+
+    #[test]
+    fn parse_glm_style_json_args() {
+        let response = r#"shell/{"command": "echo hello"}"#;
+        let calls = parse_glm_style_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "shell");
+        assert_eq!(calls[0].1["command"], "echo hello");
+    }
+
+    #[test]
+    fn parse_glm_style_multiple_calls() {
+        let response = r#"shell/command>ls
+browser_open/url>https://example.com"#;
+        let calls = parse_glm_style_tool_calls(response);
+        assert_eq!(calls.len(), 2);
+    }
+
+    #[test]
+    fn parse_glm_style_tool_call_integration() {
+        // Integration test: GLM format should be parsed in parse_tool_calls
+        let response = "Checking...\nbrowser_open/url>https://example.com\nDone";
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert!(text.contains("Checking"));
+        assert!(text.contains("Done"));
     }
 }
