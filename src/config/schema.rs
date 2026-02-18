@@ -1449,9 +1449,6 @@ pub enum StreamMode {
     Off,
     /// Update a draft message with every flush interval.
     Partial,
-    /// Update a draft message in larger chunks (reserved for future use;
-    /// currently behaves the same as `Partial`).
-    Block,
 }
 
 fn default_draft_update_interval_ms() -> u64 {

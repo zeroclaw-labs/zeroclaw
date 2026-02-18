@@ -10,8 +10,7 @@ pub use schema::{
     PeripheralBoardConfig, PeripheralsConfig, QueryClassificationConfig, ReliabilityConfig,
     ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig,
     SecretsConfig, SecurityConfig, SlackConfig, StreamMode, TelegramConfig, TunnelConfig,
-    WebSearchConfig,
-    WebhookConfig,
+    WebSearchConfig, WebhookConfig,
 };
 
 #[cfg(test)]
