@@ -21,9 +21,7 @@ impl AnthropicAuthKind {
     pub fn from_metadata_value(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "api-key" | "x-api-key" | "apikey" => Some(Self::ApiKey),
-            "authorization" | "bearer" | "auth-token" | "oauth" => {
-                Some(Self::Authorization)
-            }
+            "authorization" | "bearer" | "auth-token" | "oauth" => Some(Self::Authorization),
             _ => None,
         }
     }

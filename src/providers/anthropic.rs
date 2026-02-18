@@ -6,7 +6,6 @@ use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 
 pub struct AnthropicProvider {
     credential: Option<String>,
@@ -408,6 +407,7 @@ impl Provider for AnthropicProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::anthropic_token::{detect_auth_kind, AnthropicAuthKind};
 
     #[test]
     fn creates_with_key() {

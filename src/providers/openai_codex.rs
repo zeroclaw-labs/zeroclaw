@@ -195,7 +195,7 @@ fn extract_stream_event_text(event: &Value, saw_delta: bool) -> Option<String> {
         Some("response.output_text.done") if !saw_delta => {
             nonempty_preserve(event.get("text").and_then(Value::as_str))
         }
-        Some("response.completed") | Some("response.done") => event
+        Some("response.completed" | "response.done") => event
             .get("response")
             .and_then(|value| serde_json::from_value::<ResponsesResponse>(value.clone()).ok())
             .and_then(|response| extract_responses_text(&response)),
