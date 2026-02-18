@@ -205,7 +205,7 @@ jobs:
                   DOCS_RESULT: ${{ needs.docs-quality.result }}
               with:
                   script: |
-                      const script = require('./scripts/ci/lint_feedback.js');
+                      const script = require('./.github/workflows/scripts/lint_feedback.js');
                       await script({github, context, core});
 
     workflow-owner-approval:
@@ -217,91 +217,17 @@ jobs:
             contents: read
             pull-requests: read
         steps:
+            - name: Checkout repository
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
             - name: Require owner approval for workflow file changes
               uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
               env:
                   WORKFLOW_OWNER_LOGINS: ${{ vars.WORKFLOW_OWNER_LOGINS }}
               with:
                   script: |
-                      const owner = context.repo.owner;
-                      const repo = context.repo.repo;
-                      const prNumber = context.payload.pull_request?.number;
-                      const prAuthor = context.payload.pull_request?.user?.login?.toLowerCase() || "";
-                      if (!prNumber) {
-                        core.setFailed("Missing pull_request context.");
-                        return;
-                      }
-
-                      const baseOwners = ["theonlyhennygod", "willsarg"];
-                      const configuredOwners = (process.env.WORKFLOW_OWNER_LOGINS || "")
-                        .split(",")
-                        .map((login) => login.trim().toLowerCase())
-                        .filter(Boolean);
-                      const ownerAllowlist = [...new Set([...baseOwners, ...configuredOwners])];
-
-                      if (ownerAllowlist.length === 0) {
-                        core.setFailed("Workflow owner allowlist is empty.");
-                        return;
-                      }
-
-                      core.info(`Workflow owner allowlist: ${ownerAllowlist.join(", ")}`);
-
-                      const files = await github.paginate(github.rest.pulls.listFiles, {
-                        owner,
-                        repo,
-                        pull_number: prNumber,
-                        per_page: 100,
-                      });
-
-                      const workflowFiles = files
-                        .map((file) => file.filename)
-                        .filter((name) => name.startsWith(".github/workflows/"));
-
-                      if (workflowFiles.length === 0) {
-                        core.info("No workflow files changed in this PR.");
-                        return;
-                      }
-
-                      core.info(`Workflow files changed:\n- ${workflowFiles.join("\n- ")}`);
-
-                      if (prAuthor && ownerAllowlist.includes(prAuthor)) {
-                        core.info(`Workflow PR authored by allowlisted owner: @${prAuthor}`);
-                        return;
-                      }
-
-                      const reviews = await github.paginate(github.rest.pulls.listReviews, {
-                        owner,
-                        repo,
-                        pull_number: prNumber,
-                        per_page: 100,
-                      });
-
-                      const latestReviewByUser = new Map();
-                      for (const review of reviews) {
-                        const login = review.user?.login;
-                        if (!login) continue;
-                        latestReviewByUser.set(login.toLowerCase(), review.state);
-                      }
-
-                      const approvedUsers = [...latestReviewByUser.entries()]
-                        .filter(([, state]) => state === "APPROVED")
-                        .map(([login]) => login);
-
-                      if (approvedUsers.length === 0) {
-                        core.setFailed("Workflow files changed but no approving review is present.");
-                        return;
-                      }
-
-                      const ownerApprover = approvedUsers.find((login) => ownerAllowlist.includes(login));
-                      if (!ownerApprover) {
-                        core.setFailed(
-                          `Workflow files changed. Approvals found (${approvedUsers.join(", ")}), but none match workflow owner allowlist.`,
-                        );
-                        return;
-                      }
-
-                      core.info(`Workflow owner approval present: @${ownerApprover}`);
-
+                    const script = require('./.github/workflows/scripts/ci_workflow_owner_approval.js');
+                    await script({ github, context, core });
     ci-required:
         name: CI Required Gate
         if: always()

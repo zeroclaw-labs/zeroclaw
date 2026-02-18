@@ -105,9 +105,11 @@ jobs:
             - name: Generate SBOM (CycloneDX)
               run: |
                   syft dir:. --source-name zeroclaw -o cyclonedx-json=artifacts/zeroclaw.cdx.json -o spdx-json=artifacts/zeroclaw.spdx.json
-                  echo "### SBOM Generated" >> "$GITHUB_STEP_SUMMARY"
-                  echo "- CycloneDX: zeroclaw.cdx.json" >> "$GITHUB_STEP_SUMMARY"
-                  echo "- SPDX: zeroclaw.spdx.json" >> "$GITHUB_STEP_SUMMARY"
+                  {
+                    echo "### SBOM Generated"
+                    echo "- CycloneDX: zeroclaw.cdx.json"
+                    echo "- SPDX: zeroclaw.spdx.json"
+                  } >> "$GITHUB_STEP_SUMMARY"
 
             - name: Generate SHA256 checksums
               run: |
