@@ -5,6 +5,7 @@ pub mod otel;
 pub mod traits;
 pub mod verbose;
 
+#[allow(unused_imports)]
 pub use self::log::LogObserver;
 #[allow(unused_imports)]
 pub use self::multi::MultiObserver;

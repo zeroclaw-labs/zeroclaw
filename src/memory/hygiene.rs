@@ -502,10 +502,10 @@ mod tests {
         let workspace = tmp.path();
 
         let mem = SqliteMemory::new(workspace).unwrap();
-        mem.store("conv_old", "outdated", MemoryCategory::Conversation)
+        mem.store("conv_old", "outdated", MemoryCategory::Conversation, None)
             .await
             .unwrap();
-        mem.store("core_keep", "durable", MemoryCategory::Core)
+        mem.store("core_keep", "durable", MemoryCategory::Core, None)
             .await
             .unwrap();
         drop(mem);

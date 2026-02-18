@@ -1,4 +1,4 @@
-use super::traits::{Channel, ChannelMessage};
+use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use tokio::io::{self, AsyncBufReadExt, BufReader};
 use uuid::Uuid;
@@ -18,8 +18,8 @@ impl Channel for CliChannel {
         "cli"
     }
 
-    async fn send(&self, message: &str, _recipient: &str) -> anyhow::Result<()> {
-        println!("{message}");
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        println!("{}", message.content);
         Ok(())
     }
 
@@ -40,6 +40,7 @@ impl Channel for CliChannel {
             let msg = ChannelMessage {
                 id: Uuid::new_v4().to_string(),
                 sender: "user".to_string(),
+                reply_target: "user".to_string(),
                 content: line,
                 channel: "cli".to_string(),
                 timestamp: std::time::SystemTime::now()
@@ -68,14 +69,26 @@ mod tests {
     #[tokio::test]
     async fn cli_channel_send_does_not_panic() {
         let ch = CliChannel::new();
-        let result = ch.send("hello", "user").await;
+        let result = ch
+            .send(&SendMessage {
+                content: "hello".into(),
+                recipient: "user".into(),
+                subject: None,
+            })
+            .await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn cli_channel_send_empty_message() {
         let ch = CliChannel::new();
-        let result = ch.send("", "").await;
+        let result = ch
+            .send(&SendMessage {
+                content: String::new(),
+                recipient: String::new(),
+                subject: None,
+            })
+            .await;
         assert!(result.is_ok());
     }
 
@@ -90,12 +103,14 @@ mod tests {
         let msg = ChannelMessage {
             id: "test-id".into(),
             sender: "user".into(),
+            reply_target: "user".into(),
             content: "hello".into(),
             channel: "cli".into(),
             timestamp: 1_234_567_890,
         };
         assert_eq!(msg.id, "test-id");
         assert_eq!(msg.sender, "user");
+        assert_eq!(msg.reply_target, "user");
         assert_eq!(msg.content, "hello");
         assert_eq!(msg.channel, "cli");
         assert_eq!(msg.timestamp, 1_234_567_890);
@@ -106,6 +121,7 @@ mod tests {
         let msg = ChannelMessage {
             id: "id".into(),
             sender: "s".into(),
+            reply_target: "s".into(),
             content: "c".into(),
             channel: "ch".into(),
             timestamp: 0,

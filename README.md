@@ -11,14 +11,19 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" /></a>
+  <a href="NOTICE"><img src="https://img.shields.io/badge/contributors-27+-green.svg" alt="Contributors" /></a>
   <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=flat&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
 </p>
+<p align="center">
+Built by students and members of the Harvard, MIT, and Sundai.Club communities.
+</p>
 
-Fast, small, and fully autonomous AI assistant infrastructure — deploy anywhere, swap anything.
+<p align="center">
+  <strong>Fast, small, and fully autonomous AI assistant infrastructure</strong><br />
+  Deploy anywhere. Swap anything.
+</p>
 
-```
-~3.4MB binary · <10ms startup · 1,017 tests · 22+ providers · 8 traits · Pluggable everything
-```
+<p align="center"><code>~3.4MB binary · &lt;10ms startup · 1,017 tests · 23+ providers · 8 traits · Pluggable everything</code></p>
 
 ### ✨ Features
 
@@ -119,7 +124,7 @@ ls -lh target/release/zeroclaw
 
 - **Docker** — required only if using the [Docker sandboxed runtime](#runtime-support-current) (`runtime.kind = "docker"`). Install via your package manager or [docker.com](https://docs.docker.com/engine/install/).
 
-> **Low-memory boards (e.g., Raspberry Pi 3, 1GB RAM):** see [Build troubleshooting](#build-troubleshooting-linux-openssl-errors) and use `CARGO_BUILD_JOBS=1 cargo build --release` if the kernel kills rustc during compilation.
+> **Note:** The default `cargo build --release` uses `codegen-units=1` for compatibility with low-memory devices (e.g., Raspberry Pi 3 with 1GB RAM). For faster builds on powerful machines, use `cargo build --profile release-fast`.
 
 </details>
 
@@ -131,6 +136,9 @@ git clone https://github.com/zeroclaw-labs/zeroclaw.git
 cd zeroclaw
 cargo build --release --locked
 cargo install --path . --force --locked
+
+# Ensure ~/.cargo/bin is in your PATH
+export PATH="$HOME/.cargo/bin:$PATH"
 
 # Quick setup (no prompts)
 zeroclaw onboard --api-key sk-... --provider openrouter
@@ -163,6 +171,9 @@ zeroclaw doctor
 # Check channel health
 zeroclaw channel doctor
 
+# Bind a Telegram identity into allowlist
+zeroclaw channel bind-telegram 123456789
+
 # Get integration setup details
 zeroclaw integrations info Telegram
 
@@ -187,8 +198,8 @@ Every subsystem is a **trait** — swap implementations with a config change, ze
 
 | Subsystem | Trait | Ships with | Extend |
 |-----------|-------|------------|--------|
-| **AI Models** | `Provider` | 22+ providers (OpenRouter, Anthropic, OpenAI, Ollama, Venice, Groq, Mistral, xAI, DeepSeek, Together, Fireworks, Perplexity, Cohere, Bedrock, etc.) | `custom:https://your-api.com` — any OpenAI-compatible API |
-| **Channels** | `Channel` | CLI, Telegram, Discord, Slack, iMessage, Matrix, WhatsApp, Webhook | Any messaging API |
+| **AI Models** | `Provider` | 23+ providers (OpenRouter, Anthropic, OpenAI, Ollama, Venice, Groq, Mistral, xAI, DeepSeek, Together, Fireworks, Perplexity, Cohere, Bedrock, Astrai, etc.) | `custom:https://your-api.com` — any OpenAI-compatible API |
+| **Channels** | `Channel` | CLI, Telegram, Discord, Slack, Mattermost, iMessage, Matrix, WhatsApp, Webhook | Any messaging API |
 | **Memory** | `Memory` | SQLite with hybrid search (FTS5 + vector cosine similarity), Lucid bridge (CLI sync + SQLite fallback), Markdown | Any persistence backend |
 | **Tools** | `Tool` | shell, file_read, file_write, memory_store, memory_recall, memory_forget, browser_open (Brave + allowlist), browser (agent-browser / rust-native), composio (optional) | Any capability |
 | **Observability** | `Observer` | Noop, Log, Multi | Prometheus, OTel |
@@ -257,7 +268,7 @@ ZeroClaw enforces security at **every layer** — not just the sandbox. It passe
 
 > **Run your own nmap:** `nmap -p 1-65535 <your-host>` — ZeroClaw binds to localhost only, so nothing is exposed unless you explicitly configure a tunnel.
 
-### Channel allowlists (Telegram / Discord / Slack)
+### Channel allowlists (Telegram / Discord / Slack / Mattermost)
 
 Inbound sender policy is now consistent:
 
@@ -272,7 +283,21 @@ Recommended low-friction setup (secure + fast):
 - **Telegram:** allowlist your own `@username` (without `@`) and/or your numeric Telegram user ID.
 - **Discord:** allowlist your own Discord user ID.
 - **Slack:** allowlist your own Slack member ID (usually starts with `U`).
+- **Mattermost:** uses standard API v4. Allowlists use Mattermost user IDs.
 - Use `"*"` only for temporary open testing.
+
+Telegram operator-approval flow:
+
+1. Keep `[channels_config.telegram].allowed_users = []` for deny-by-default startup.
+2. Unauthorized users receive a hint with a copyable operator command:
+   `zeroclaw channel bind-telegram <IDENTITY>`.
+3. Operator runs that command locally, then user retries sending a message.
+
+If you need a one-shot manual approval, run:
+
+```bash
+zeroclaw channel bind-telegram 123456789
+```
 
 If you're not sure which identity to use:
 
@@ -286,6 +311,21 @@ rerun channel setup only:
 ```bash
 zeroclaw onboard --channels-only
 ```
+
+### Telegram media replies
+
+Telegram routing now replies to the source **chat ID** from incoming updates (instead of usernames),
+which avoids `Bad Request: chat not found` failures.
+
+For non-text replies, ZeroClaw can send Telegram attachments when the assistant includes markers:
+
+- `[IMAGE:<path-or-url>]`
+- `[DOCUMENT:<path-or-url>]`
+- `[VIDEO:<path-or-url>]`
+- `[AUDIO:<path-or-url>]`
+- `[VOICE:<path-or-url>]`
+
+Paths can be local files (for example `/tmp/screenshot.png`) or HTTPS URLs.
 
 ### WhatsApp Business Cloud API Setup
 
@@ -417,6 +457,57 @@ format = "openclaw"             # "openclaw" (default, markdown files) or "aieos
 # aieos_inline = '{"identity":{"names":{"first":"Nova"}}}'  # inline AIEOS JSON
 ```
 
+### Ollama Local and Remote Endpoints
+
+ZeroClaw uses one provider key (`ollama`) for both local and remote Ollama deployments:
+
+- Local Ollama: keep `api_url` unset, run `ollama serve`, and use models like `llama3.2`.
+- Remote Ollama endpoint (including Ollama Cloud): set `api_url` to the remote endpoint and set `api_key` (or `OLLAMA_API_KEY`) when required.
+- Optional `:cloud` suffix: model IDs like `qwen3:cloud` are normalized to `qwen3` before the request.
+
+Example remote configuration:
+
+```toml
+default_provider = "ollama"
+default_model = "qwen3:cloud"
+api_url = "https://ollama.com"
+api_key = "ollama_api_key_here"
+```
+
+## Python Companion Package (`zeroclaw-tools`)
+
+For LLM providers with inconsistent native tool calling (e.g., GLM-5/Zhipu), ZeroClaw ships a Python companion package with **LangGraph-based tool calling** for guaranteed consistency:
+
+```bash
+pip install zeroclaw-tools
+```
+
+```python
+from zeroclaw_tools import create_agent, shell, file_read
+from langchain_core.messages import HumanMessage
+
+# Works with any OpenAI-compatible provider
+agent = create_agent(
+    tools=[shell, file_read],
+    model="glm-5",
+    api_key="your-key",
+    base_url="https://api.z.ai/api/coding/paas/v4"
+)
+
+result = await agent.ainvoke({
+    "messages": [HumanMessage(content="List files in /tmp")]
+})
+print(result["messages"][-1].content)
+```
+
+**Why use it:**
+- **Consistent tool calling** across all providers (even those with poor native support)
+- **Automatic tool loop** — keeps calling tools until the task is complete
+- **Easy extensibility** — add custom tools with `@tool` decorator
+- **Discord bot integration** included (Telegram planned)
+
+See [`python/README.md`](python/README.md) for full documentation.
+
 ## Identity System (AIEOS Support)
 
 ZeroClaw supports **identity-agnostic** AI personas through two formats:
@@ -511,14 +602,15 @@ See [aieos.org](https://aieos.org) for the full schema and live examples.
 | `doctor` | Diagnose daemon/scheduler/channel freshness |
 | `status` | Show full system status |
 | `channel doctor` | Run health checks for configured channels |
+| `channel bind-telegram <IDENTITY>` | Add one Telegram username/user ID to allowlist |
 | `integrations info <name>` | Show setup/status details for one integration |
 
 ## Development
 
 ```bash
 cargo build              # Dev build
-cargo build --release    # Release build (~3.4MB)
-CARGO_BUILD_JOBS=1 cargo build --release    # Low-memory fallback (Raspberry Pi 3, 1GB RAM)
+cargo build --release    # Release build (codegen-units=1, works on all devices including Raspberry Pi)
+cargo build --profile release-fast    # Faster build (codegen-units=8, requires 16GB+ RAM)
 cargo test               # 1,017 tests
 cargo clippy             # Lint (0 warnings)
 cargo fmt                # Format
@@ -563,9 +655,9 @@ For high-throughput collaboration and consistent reviews:
 - CI ownership and triage map: [docs/ci-map.md](docs/ci-map.md)
 - Security disclosure policy: [SECURITY.md](SECURITY.md)
 
-## Support
+## Support ZeroClaw
 
-ZeroClaw is an open-source project maintained with passion. If you find it useful and would like to support its continued development, hardware for testing, and coffee for the maintainer, you can support me here:
+If ZeroClaw helps your work and you want to support ongoing development, you can donate here:
 
 <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=for-the-badge&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
 
@@ -582,7 +674,7 @@ We're building in the open because the best ideas come from everywhere. If you'r
 
 ## License
 
-MIT — see [LICENSE](LICENSE)
+MIT — see [LICENSE](LICENSE) and [NOTICE](NOTICE) for contributor attribution
 
 ## Contributing
 
@@ -595,7 +687,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Implement a trait, submit a PR:
 - New `Memory` → `src/memory/`
 - New `Tunnel` → `src/tunnel/`
 - New `Skill` → `~/.zeroclaw/workspace/skills/<name>/`
-
 
 ---
 

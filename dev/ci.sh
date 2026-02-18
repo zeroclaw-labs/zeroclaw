@@ -11,10 +11,30 @@ else
 fi
 
 compose_cmd=(docker compose -f "$COMPOSE_FILE")
+SMOKE_CACHE_DIR="${SMOKE_CACHE_DIR:-.cache/buildx-smoke}"
 
 run_in_ci() {
   local cmd="$1"
   "${compose_cmd[@]}" run --rm local-ci bash -c "$cmd"
+}
+
+build_smoke_image() {
+  if docker buildx version >/dev/null 2>&1; then
+    mkdir -p "$SMOKE_CACHE_DIR"
+    local build_args=(
+      --load
+      --target dev
+      --cache-to "type=local,dest=$SMOKE_CACHE_DIR,mode=max"
+      -t zeroclaw-local-smoke:latest
+      .
+    )
+    if [ -f "$SMOKE_CACHE_DIR/index.json" ]; then
+      build_args=(--cache-from "type=local,src=$SMOKE_CACHE_DIR" "${build_args[@]}")
+    fi
+    docker buildx build "${build_args[@]}"
+  else
+    DOCKER_BUILDKIT=1 docker build --target dev -t zeroclaw-local-smoke:latest .
+  fi
 }
 
 print_help() {
@@ -28,6 +48,7 @@ Commands:
   shell         Open an interactive shell inside the CI container
   lint          Run rustfmt + clippy correctness gate (container only)
   lint-strict   Run rustfmt + full clippy warnings gate (container only)
+  lint-delta    Run strict lint delta gate on changed Rust lines (container only)
   test          Run cargo test (container only)
   build         Run release build smoke check (container only)
   audit         Run cargo audit (container only)
@@ -54,11 +75,15 @@ case "$1" in
     ;;
 
   lint)
-    run_in_ci "cargo fmt --all -- --check && cargo clippy --locked --all-targets -- -D clippy::correctness"
+    run_in_ci "./scripts/ci/rust_quality_gate.sh"
     ;;
 
   lint-strict)
-    run_in_ci "cargo fmt --all -- --check && cargo clippy --locked --all-targets -- -D warnings"
+    run_in_ci "./scripts/ci/rust_quality_gate.sh --strict"
+    ;;
+
+  lint-delta)
+    run_in_ci "./scripts/ci/rust_strict_delta_gate.sh"
     ;;
 
   test)
@@ -83,17 +108,17 @@ case "$1" in
     ;;
 
   docker-smoke)
-    docker build --target dev -t zeroclaw-local-smoke:latest .
+    build_smoke_image
     docker run --rm zeroclaw-local-smoke:latest --version
     ;;
 
   all)
-    run_in_ci "cargo fmt --all -- --check && cargo clippy --locked --all-targets -- -D clippy::correctness"
+    run_in_ci "./scripts/ci/rust_quality_gate.sh"
     run_in_ci "cargo test --locked --verbose"
     run_in_ci "cargo build --release --locked --verbose"
     run_in_ci "cargo deny check licenses sources"
     run_in_ci "cargo audit"
-    docker build --target dev -t zeroclaw-local-smoke:latest .
+    build_smoke_image
     docker run --rm zeroclaw-local-smoke:latest --version
     ;;
 

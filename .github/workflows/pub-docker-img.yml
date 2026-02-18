@@ -1,8 +1,7 @@
-name: Docker
+name: Pub Docker Img
 
 on:
     push:
-        branches: [main]
         tags: ["v*"]
     pull_request:
         branches: [main]
@@ -11,7 +10,7 @@ on:
             - "docker-compose.yml"
             - "dev/docker-compose.yml"
             - "dev/sandbox/**"
-            - ".github/workflows/docker.yml"
+            - ".github/workflows/pub-docker-img.yml"
     workflow_dispatch:
 
 concurrency:
@@ -35,7 +34,7 @@ jobs:
               uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
             - name: Setup Blacksmith Builder
-              uses: useblacksmith/setup-docker-builder@v1
+              uses: useblacksmith/setup-docker-builder@ef12d5b165b596e3aa44ea8198d8fde563eab402 # v1
 
             - name: Extract metadata (tags, labels)
               id: meta
@@ -46,11 +45,13 @@ jobs:
                       type=ref,event=pr
 
             - name: Build smoke image
-              uses: useblacksmith/build-push-action@v2
+              uses: useblacksmith/build-push-action@30c71162f16ea2c27c3e21523255d209b8b538c1 # v2
               with:
                   context: .
                   push: false
                   load: true
+                  provenance: false
+                  sbom: false
                   tags: zeroclaw-pr-smoke:latest
                   labels: ${{ steps.meta.outputs.labels }}
                   platforms: linux/amd64
@@ -60,7 +61,7 @@ jobs:
 
     publish:
         name: Build and Push Docker Image
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         runs-on: blacksmith-2vcpu-ubuntu-2404
         timeout-minutes: 25
         permissions:
@@ -71,7 +72,7 @@ jobs:
               uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
             - name: Setup Blacksmith Builder
-              uses: useblacksmith/setup-docker-builder@v1
+              uses: useblacksmith/setup-docker-builder@ef12d5b165b596e3aa44ea8198d8fde563eab402 # v1
 
             - name: Log in to Container Registry
               uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
@@ -102,7 +103,7 @@ jobs:
                   echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
 
             - name: Build and push Docker image
-              uses: useblacksmith/build-push-action@v2
+              uses: useblacksmith/build-push-action@30c71162f16ea2c27c3e21523255d209b8b538c1 # v2
               with:
                   context: .
                   push: true

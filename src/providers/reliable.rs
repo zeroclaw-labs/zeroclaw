@@ -1,6 +1,7 @@
-use super::traits::ChatMessage;
+use super::traits::{ChatMessage, ChatResponse, StreamChunk, StreamOptions, StreamResult};
 use super::Provider;
 use async_trait::async_trait;
+use futures_util::{stream, StreamExt};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -143,8 +144,8 @@ impl Provider for ReliableProvider {
     async fn warmup(&self) -> anyhow::Result<()> {
         for (name, provider) in &self.providers {
             tracing::info!(provider = name, "Warming up provider connection pool");
-            if let Err(e) = provider.warmup().await {
-                tracing::warn!(provider = name, "Warmup failed (non-fatal): {e}");
+            if provider.warmup().await.is_err() {
+                tracing::warn!(provider = name, "Warmup failed (non-fatal)");
             }
         }
         Ok(())
@@ -185,8 +186,15 @@ impl Provider for ReliableProvider {
                             let non_retryable = is_non_retryable(&e);
                             let rate_limited = is_rate_limited(&e);
 
+                            let failure_reason = if rate_limited {
+                                "rate_limited"
+                            } else if non_retryable {
+                                "non_retryable"
+                            } else {
+                                "retryable"
+                            };
                             failures.push(format!(
-                                "{provider_name}/{current_model} attempt {}/{}: {e}",
+                                "provider={provider_name} model={current_model} attempt {}/{}: {failure_reason}",
                                 attempt + 1,
                                 self.max_retries + 1
                             ));
@@ -283,8 +291,15 @@ impl Provider for ReliableProvider {
                             let non_retryable = is_non_retryable(&e);
                             let rate_limited = is_rate_limited(&e);
 
+                            let failure_reason = if rate_limited {
+                                "rate_limited"
+                            } else if non_retryable {
+                                "non_retryable"
+                            } else {
+                                "retryable"
+                            };
                             failures.push(format!(
-                                "{provider_name}/{current_model} attempt {}/{}: {e}",
+                                "provider={provider_name} model={current_model} attempt {}/{}: {failure_reason}",
                                 attempt + 1,
                                 self.max_retries + 1
                             ));
@@ -337,6 +352,183 @@ impl Provider for ReliableProvider {
             failures.join("\n")
         )
     }
+
+    fn supports_native_tools(&self) -> bool {
+        self.providers
+            .first()
+            .map(|(_, p)| p.supports_native_tools())
+            .unwrap_or(false)
+    }
+
+    async fn chat_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ChatResponse> {
+        let models = self.model_chain(model);
+        let mut failures = Vec::new();
+
+        for current_model in &models {
+            for (provider_name, provider) in &self.providers {
+                let mut backoff_ms = self.base_backoff_ms;
+
+                for attempt in 0..=self.max_retries {
+                    match provider
+                        .chat_with_tools(messages, tools, current_model, temperature)
+                        .await
+                    {
+                        Ok(resp) => {
+                            if attempt > 0 || *current_model != model {
+                                tracing::info!(
+                                    provider = provider_name,
+                                    model = *current_model,
+                                    attempt,
+                                    original_model = model,
+                                    "Provider recovered (failover/retry)"
+                                );
+                            }
+                            return Ok(resp);
+                        }
+                        Err(e) => {
+                            let non_retryable = is_non_retryable(&e);
+                            let rate_limited = is_rate_limited(&e);
+
+                            let failure_reason = if rate_limited {
+                                "rate_limited"
+                            } else if non_retryable {
+                                "non_retryable"
+                            } else {
+                                "retryable"
+                            };
+                            failures.push(format!(
+                                "{provider_name}/{current_model} attempt {}/{}: {failure_reason}",
+                                attempt + 1,
+                                self.max_retries + 1
+                            ));
+
+                            if rate_limited {
+                                if let Some(new_key) = self.rotate_key() {
+                                    tracing::info!(
+                                        provider = provider_name,
+                                        "Rate limited, rotated API key (key ending ...{})",
+                                        &new_key[new_key.len().saturating_sub(4)..]
+                                    );
+                                }
+                            }
+
+                            if non_retryable {
+                                tracing::warn!(
+                                    provider = provider_name,
+                                    model = *current_model,
+                                    "Non-retryable error, moving on"
+                                );
+                                break;
+                            }
+
+                            if attempt < self.max_retries {
+                                let wait = self.compute_backoff(backoff_ms, &e);
+                                tracing::warn!(
+                                    provider = provider_name,
+                                    model = *current_model,
+                                    attempt = attempt + 1,
+                                    backoff_ms = wait,
+                                    "Provider call failed, retrying"
+                                );
+                                tokio::time::sleep(Duration::from_millis(wait)).await;
+                                backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+                            }
+                        }
+                    }
+                }
+
+                tracing::warn!(
+                    provider = provider_name,
+                    model = *current_model,
+                    "Exhausted retries, trying next provider/model"
+                );
+            }
+        }
+
+        anyhow::bail!(
+            "All providers/models failed. Attempts:\n{}",
+            failures.join("\n")
+        )
+    }
+
+    fn supports_streaming(&self) -> bool {
+        self.providers.iter().any(|(_, p)| p.supports_streaming())
+    }
+
+    fn stream_chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        // Try each provider/model combination for streaming
+        // For streaming, we use the first provider that supports it and has streaming enabled
+        for (provider_name, provider) in &self.providers {
+            if !provider.supports_streaming() || !options.enabled {
+                continue;
+            }
+
+            // Clone provider data for the stream
+            let provider_clone = provider_name.clone();
+
+            // Try the first model in the chain for streaming
+            let current_model = match self.model_chain(model).first() {
+                Some(m) => m.to_string(),
+                None => model.to_string(),
+            };
+
+            // For streaming, we attempt once and propagate errors
+            // The caller can retry the entire request if needed
+            let stream = provider.stream_chat_with_system(
+                system_prompt,
+                message,
+                &current_model,
+                temperature,
+                options,
+            );
+
+            // Use a channel to bridge the stream with logging
+            let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
+
+            tokio::spawn(async move {
+                let mut stream = stream;
+                while let Some(chunk) = stream.next().await {
+                    if let Err(ref e) = chunk {
+                        tracing::warn!(
+                            provider = provider_clone,
+                            model = current_model,
+                            "Streaming error: {e}"
+                        );
+                    }
+                    if tx.send(chunk).await.is_err() {
+                        break; // Receiver dropped
+                    }
+                }
+            });
+
+            // Convert channel receiver to stream
+            return stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|chunk| (chunk, rx))
+            })
+            .boxed();
+        }
+
+        // No streaming support available
+        stream::once(async move {
+            Err(super::traits::StreamError::Provider(
+                "No provider supports streaming".to_string(),
+            ))
+        })
+        .boxed()
+    }
 }
 
 #[cfg(test)]
@@ -384,7 +576,7 @@ mod tests {
     /// Mock that records which model was used for each call.
     struct ModelAwareMock {
         calls: Arc<AtomicUsize>,
-        models_seen: std::sync::Mutex<Vec<String>>,
+        models_seen: parking_lot::Mutex<Vec<String>>,
         fail_models: Vec<&'static str>,
         response: &'static str,
     }
@@ -399,7 +591,7 @@ mod tests {
             _temperature: f64,
         ) -> anyhow::Result<String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            self.models_seen.lock().unwrap().push(model.to_string());
+            self.models_seen.lock().push(model.to_string());
             if self.fail_models.contains(&model) {
                 anyhow::bail!("500 model {} unavailable", model);
             }
@@ -522,8 +714,8 @@ mod tests {
             .expect_err("all providers should fail");
         let msg = err.to_string();
         assert!(msg.contains("All providers/models failed"));
-        assert!(msg.contains("p1"));
-        assert!(msg.contains("p2"));
+        assert!(msg.contains("provider=p1 model=test"));
+        assert!(msg.contains("provider=p2 model=test"));
     }
 
     #[test]
@@ -652,7 +844,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let mock = Arc::new(ModelAwareMock {
             calls: Arc::clone(&calls),
-            models_seen: std::sync::Mutex::new(Vec::new()),
+            models_seen: parking_lot::Mutex::new(Vec::new()),
             fail_models: vec!["claude-opus"],
             response: "ok from sonnet",
         });
@@ -676,7 +868,7 @@ mod tests {
             .unwrap();
         assert_eq!(result, "ok from sonnet");
 
-        let seen = mock.models_seen.lock().unwrap();
+        let seen = mock.models_seen.lock();
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0], "claude-opus");
         assert_eq!(seen[1], "claude-sonnet");
@@ -687,7 +879,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let mock = Arc::new(ModelAwareMock {
             calls: Arc::clone(&calls),
-            models_seen: std::sync::Mutex::new(Vec::new()),
+            models_seen: parking_lot::Mutex::new(Vec::new()),
             fail_models: vec!["model-a", "model-b", "model-c"],
             response: "never",
         });
@@ -711,7 +903,7 @@ mod tests {
             .expect_err("all models should fail");
         assert!(err.to_string().contains("All providers/models failed"));
 
-        let seen = mock.models_seen.lock().unwrap();
+        let seen = mock.models_seen.lock();
         assert_eq!(seen.len(), 3);
     }
 

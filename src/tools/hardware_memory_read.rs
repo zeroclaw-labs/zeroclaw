@@ -96,8 +96,10 @@ impl Tool for HardwareMemoryReadTool {
             .unwrap_or("0x20000000");
         let _address = parse_hex_address(address_str).unwrap_or(NUCLEO_RAM_BASE);
 
-        let length = args.get("length").and_then(|v| v.as_u64()).unwrap_or(128) as usize;
-        let _length = length.min(256).max(1);
+        let requested_length = args.get("length").and_then(|v| v.as_u64()).unwrap_or(128);
+        let _length = usize::try_from(requested_length)
+            .unwrap_or(256)
+            .clamp(1, 256);
 
         #[cfg(feature = "probe")]
         {

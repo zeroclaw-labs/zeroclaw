@@ -1,0 +1,72 @@
+name: Test Fuzz
+
+on:
+    schedule:
+        - cron: "0 2 * * 0" # Weekly Sunday 2am UTC
+    workflow_dispatch:
+        inputs:
+            fuzz_seconds:
+                description: "Seconds to run each fuzz target"
+                required: false
+                default: "300"
+
+concurrency:
+    group: fuzz-${{ github.ref }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+    issues: write
+
+env:
+    CARGO_TERM_COLOR: always
+
+jobs:
+    fuzz:
+        name: Fuzz (${{ matrix.target }})
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        timeout-minutes: 60
+        strategy:
+            fail-fast: false
+            matrix:
+                target:
+                    - fuzz_config_parse
+                    - fuzz_tool_params
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: nightly
+                  components: llvm-tools-preview
+
+            - name: Install cargo-fuzz
+              run: cargo install cargo-fuzz --locked
+
+            - name: Run fuzz target
+              run: |
+                  SECONDS="${{ github.event.inputs.fuzz_seconds || '300' }}"
+                  echo "Fuzzing ${{ matrix.target }} for ${SECONDS}s"
+                  cargo +nightly fuzz run ${{ matrix.target }} -- \
+                    -max_total_time="${SECONDS}" \
+                    -max_len=4096
+              continue-on-error: true
+              id: fuzz
+
+            - name: Upload crash artifacts
+              if: failure() || steps.fuzz.outcome == 'failure'
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+              with:
+                  name: fuzz-crashes-${{ matrix.target }}
+                  path: fuzz/artifacts/${{ matrix.target }}/
+                  retention-days: 30
+                  if-no-files-found: ignore
+
+            - name: Report fuzz results
+              run: |
+                  echo "### Fuzz: ${{ matrix.target }}" >> "$GITHUB_STEP_SUMMARY"
+                  if [ "${{ steps.fuzz.outcome }}" = "failure" ]; then
+                    echo "- :x: Crashes found — see artifacts" >> "$GITHUB_STEP_SUMMARY"
+                  else
+                    echo "- :white_check_mark: No crashes found" >> "$GITHUB_STEP_SUMMARY"
+                  fi

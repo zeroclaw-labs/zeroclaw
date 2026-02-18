@@ -1,4 +1,4 @@
-name: Rust Package Security Audit
+name: Sec Audit
 
 on:
     push:
@@ -16,6 +16,7 @@ permissions:
     contents: read
     security-events: write
     actions: read
+    checks: write
 
 env:
     CARGO_TERM_COLOR: always
@@ -28,14 +29,9 @@ jobs:
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
-            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-
-            - name: Install cargo-audit
-              run: cargo install --locked cargo-audit --version 0.22.1
-
-            - name: Run cargo-audit
-              run: cargo audit
+            - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+              with:
+                  token: ${{ secrets.GITHUB_TOKEN }}
 
     deny:
         name: License & Supply Chain

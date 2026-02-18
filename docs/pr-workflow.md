@@ -41,6 +41,7 @@ Maintain these branch protection rules on `main`:
 - Require check `CI Required Gate`.
 - Require pull request reviews before merge.
 - Require CODEOWNERS review for protected paths.
+- For `.github/workflows/**`, require owner approval via `CI Required Gate` (`WORKFLOW_OWNER_LOGINS`) and keep branch/ruleset bypass limited to org owners.
 - Dismiss stale approvals when new commits are pushed.
 - Restrict force-push on protected branches.
 
@@ -49,12 +50,13 @@ Maintain these branch protection rules on `main`:
 ### Step A: Intake
 
 - Contributor opens PR with full `.github/pull_request_template.md`.
-- `PR Labeler` applies scope/path labels + size labels + risk labels + module labels (for example `channel:telegram`, `provider:kimi`, `tool:shell`) and contributor tiers by merged PR count (`experienced` >=10, `principal` >=20, `distinguished` >=50), while de-duplicating less-specific scope labels when a more specific module label is present.
+- `PR Labeler` applies scope/path labels + size labels + risk labels + module labels (for example `channel:telegram`, `provider:kimi`, `tool:shell`) and contributor tiers by merged PR count (`trusted` >=5, `experienced` >=10, `principal` >=20, `distinguished` >=50), while de-duplicating less-specific scope labels when a more specific module label is present.
 - For all module prefixes, module labels are compacted to reduce noise: one specific module keeps `prefix:component`, but multiple specifics collapse to the base scope label `prefix`.
 - Label ordering is priority-first: `risk:*` -> `size:*` -> contributor tier -> module/path labels.
+- Maintainers can run `PR Labeler` manually (`workflow_dispatch`) in `audit` mode for drift visibility or `repair` mode to normalize managed label metadata repository-wide.
 - Hovering a label in GitHub shows its auto-managed description (rule/threshold summary).
 - Managed label colors are arranged by display order to create a smooth gradient across long label rows.
-- `Auto Response` posts first-time guidance and handles label-driven routing for low-signal items.
+- `PR Auto Responder` posts first-time guidance, handles label-driven routing for low-signal items, and auto-applies issue contributor tiers using the same thresholds as `PR Labeler` (`trusted` >=5, `experienced` >=10, `principal` >=20, `distinguished` >=50).
 
 ### Step B: Validation
 
@@ -158,7 +160,7 @@ Issue triage discipline:
 
 Automation side-effect guards:
 
-- `Auto Response` deduplicates label-based comments to avoid spam.
+- `PR Auto Responder` deduplicates label-based comments to avoid spam.
 - Automated close routes are limited to issues, not PRs.
 - Maintainers can freeze automated risk recalculation with `risk: manual` when context demands human override.
 
@@ -243,7 +245,7 @@ Label discipline:
 - Path labels identify subsystem ownership quickly.
 - Size labels drive batching strategy.
 - Risk labels drive review depth (`risk: low/medium/high`).
-- Module labels (`<module>:<component>`) improve reviewer routing for integration-specific changes and future newly-added modules.
+- Module labels (`<module>: <component>`) improve reviewer routing for integration-specific changes and future newly-added modules.
 - `risk: manual` allows maintainers to preserve a human risk judgment when automation lacks context.
 - `no-stale` is reserved for accepted-but-blocked work.
 

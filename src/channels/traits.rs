@@ -5,9 +5,42 @@ use async_trait::async_trait;
 pub struct ChannelMessage {
     pub id: String,
     pub sender: String,
+    pub reply_target: String,
     pub content: String,
     pub channel: String,
     pub timestamp: u64,
+}
+
+/// Message to send through a channel
+#[derive(Debug, Clone)]
+pub struct SendMessage {
+    pub content: String,
+    pub recipient: String,
+    pub subject: Option<String>,
+}
+
+impl SendMessage {
+    /// Create a new message with content and recipient
+    pub fn new(content: impl Into<String>, recipient: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            recipient: recipient.into(),
+            subject: None,
+        }
+    }
+
+    /// Create a new message with content, recipient, and subject
+    pub fn with_subject(
+        content: impl Into<String>,
+        recipient: impl Into<String>,
+        subject: impl Into<String>,
+    ) -> Self {
+        Self {
+            content: content.into(),
+            recipient: recipient.into(),
+            subject: Some(subject.into()),
+        }
+    }
 }
 
 /// Core channel trait — implement for any messaging platform
@@ -17,7 +50,7 @@ pub trait Channel: Send + Sync {
     fn name(&self) -> &str;
 
     /// Send a message through this channel
-    async fn send(&self, message: &str, recipient: &str) -> anyhow::Result<()>;
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()>;
 
     /// Start listening for incoming messages (long-running)
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()>;
@@ -51,7 +84,7 @@ mod tests {
             "dummy"
         }
 
-        async fn send(&self, _message: &str, _recipient: &str) -> anyhow::Result<()> {
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
             Ok(())
         }
 
@@ -62,6 +95,7 @@ mod tests {
             tx.send(ChannelMessage {
                 id: "1".into(),
                 sender: "tester".into(),
+                reply_target: "tester".into(),
                 content: "hello".into(),
                 channel: "dummy".into(),
                 timestamp: 123,
@@ -76,6 +110,7 @@ mod tests {
         let message = ChannelMessage {
             id: "42".into(),
             sender: "alice".into(),
+            reply_target: "alice".into(),
             content: "ping".into(),
             channel: "dummy".into(),
             timestamp: 999,
@@ -84,6 +119,7 @@ mod tests {
         let cloned = message.clone();
         assert_eq!(cloned.id, "42");
         assert_eq!(cloned.sender, "alice");
+        assert_eq!(cloned.reply_target, "alice");
         assert_eq!(cloned.content, "ping");
         assert_eq!(cloned.channel, "dummy");
         assert_eq!(cloned.timestamp, 999);
@@ -96,7 +132,10 @@ mod tests {
         assert!(channel.health_check().await);
         assert!(channel.start_typing("bob").await.is_ok());
         assert!(channel.stop_typing("bob").await.is_ok());
-        assert!(channel.send("hello", "bob").await.is_ok());
+        assert!(channel
+            .send(&SendMessage::new("hello", "bob"))
+            .await
+            .is_ok());
     }
 
     #[tokio::test]

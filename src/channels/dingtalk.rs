@@ -1,4 +1,4 @@
-use super::traits::{Channel, ChannelMessage};
+use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
@@ -7,7 +7,9 @@ use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
-/// DingTalk (钉钉) channel — connects via Stream Mode WebSocket for real-time messages.
+const DINGTALK_BOT_CALLBACK_TOPIC: &str = "/v1.0/im/bot/messages/get";
+
+/// DingTalk channel — connects via Stream Mode WebSocket for real-time messages.
 /// Replies are sent through per-message session webhook URLs.
 pub struct DingTalkChannel {
     client_id: String,
@@ -41,11 +43,46 @@ impl DingTalkChannel {
         self.allowed_users.iter().any(|u| u == "*" || u == user_id)
     }
 
+    fn parse_stream_data(frame: &serde_json::Value) -> Option<serde_json::Value> {
+        match frame.get("data") {
+            Some(serde_json::Value::String(raw)) => serde_json::from_str(raw).ok(),
+            Some(serde_json::Value::Object(_)) => frame.get("data").cloned(),
+            _ => None,
+        }
+    }
+
+    fn resolve_chat_id(data: &serde_json::Value, sender_id: &str) -> String {
+        let is_private_chat = data
+            .get("conversationType")
+            .and_then(|value| {
+                value
+                    .as_str()
+                    .map(|v| v == "1")
+                    .or_else(|| value.as_i64().map(|v| v == 1))
+            })
+            .unwrap_or(true);
+
+        if is_private_chat {
+            sender_id.to_string()
+        } else {
+            data.get("conversationId")
+                .and_then(|c| c.as_str())
+                .unwrap_or(sender_id)
+                .to_string()
+        }
+    }
+
     /// Register a connection with DingTalk's gateway to get a WebSocket endpoint.
     async fn register_connection(&self) -> anyhow::Result<GatewayResponse> {
         let body = serde_json::json!({
             "clientId": self.client_id,
             "clientSecret": self.client_secret,
+            "subscriptions": [
+                {
+                    "type": "CALLBACK",
+                    "topic": DINGTALK_BOT_CALLBACK_TOPIC,
+                }
+            ],
         });
 
         let resp = self
@@ -72,20 +109,22 @@ impl Channel for DingTalkChannel {
         "dingtalk"
     }
 
-    async fn send(&self, message: &str, recipient: &str) -> anyhow::Result<()> {
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let webhooks = self.session_webhooks.read().await;
-        let webhook_url = webhooks.get(recipient).ok_or_else(|| {
+        let webhook_url = webhooks.get(&message.recipient).ok_or_else(|| {
             anyhow::anyhow!(
-                "No session webhook found for chat {recipient}. \
-                 The user must send a message first to establish a session."
+                "No session webhook found for chat {}. \
+                 The user must send a message first to establish a session.",
+                message.recipient
             )
         })?;
 
+        let title = message.subject.as_deref().unwrap_or("ZeroClaw");
         let body = serde_json::json!({
             "msgtype": "markdown",
             "markdown": {
-                "title": "ZeroClaw",
-                "text": message,
+                "title": title,
+                "text": message.content,
             }
         });
 
@@ -154,13 +193,14 @@ impl Channel for DingTalkChannel {
                         break;
                     }
                 }
-                "EVENT" => {
-                    // Parse the chatbot callback data from the event
-                    let data_str = frame.get("data").and_then(|d| d.as_str()).unwrap_or("{}");
-
-                    let data: serde_json::Value = match serde_json::from_str(data_str) {
-                        Ok(v) => v,
-                        Err(_) => continue,
+                "EVENT" | "CALLBACK" => {
+                    // Parse the chatbot callback data from the frame.
+                    let data = match Self::parse_stream_data(&frame) {
+                        Some(v) => v,
+                        None => {
+                            tracing::debug!("DingTalk: frame has no parseable data payload");
+                            continue;
+                        }
                     };
 
                     // Extract message content
@@ -187,25 +227,16 @@ impl Channel for DingTalkChannel {
                         continue;
                     }
 
-                    let conversation_type = data
-                        .get("conversationType")
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("1");
-
-                    // Private chat uses sender ID, group chat uses conversation ID
-                    let chat_id = if conversation_type == "1" {
-                        sender_id.to_string()
-                    } else {
-                        data.get("conversationId")
-                            .and_then(|c| c.as_str())
-                            .unwrap_or(sender_id)
-                            .to_string()
-                    };
+                    // Private chat uses sender ID, group chat uses conversation ID.
+                    let chat_id = Self::resolve_chat_id(&data, sender_id);
 
                     // Store session webhook for later replies
                     if let Some(webhook) = data.get("sessionWebhook").and_then(|w| w.as_str()) {
+                        let webhook = webhook.to_string();
                         let mut webhooks = self.session_webhooks.write().await;
-                        webhooks.insert(chat_id.clone(), webhook.to_string());
+                        // Use both keys so reply routing works for both group and private flows.
+                        webhooks.insert(chat_id.clone(), webhook.clone());
+                        webhooks.insert(sender_id.to_string(), webhook);
                     }
 
                     // Acknowledge the event
@@ -229,6 +260,7 @@ impl Channel for DingTalkChannel {
                     let channel_msg = ChannelMessage {
                         id: Uuid::new_v4().to_string(),
                         sender: sender_id.to_string(),
+                        reply_target: chat_id,
                         content: content.to_string(),
                         channel: "dingtalk".to_string(),
                         timestamp: std::time::SystemTime::now()
@@ -304,5 +336,39 @@ client_secret = "secret"
 "#;
         let config: crate::config::schema::DingTalkConfig = toml::from_str(toml_str).unwrap();
         assert!(config.allowed_users.is_empty());
+    }
+
+    #[test]
+    fn parse_stream_data_supports_string_payload() {
+        let frame = serde_json::json!({
+            "data": "{\"text\":{\"content\":\"hello\"}}"
+        });
+        let parsed = DingTalkChannel::parse_stream_data(&frame).unwrap();
+        assert_eq!(
+            parsed.get("text").and_then(|v| v.get("content")),
+            Some(&serde_json::json!("hello"))
+        );
+    }
+
+    #[test]
+    fn parse_stream_data_supports_object_payload() {
+        let frame = serde_json::json!({
+            "data": {"text": {"content": "hello"}}
+        });
+        let parsed = DingTalkChannel::parse_stream_data(&frame).unwrap();
+        assert_eq!(
+            parsed.get("text").and_then(|v| v.get("content")),
+            Some(&serde_json::json!("hello"))
+        );
+    }
+
+    #[test]
+    fn resolve_chat_id_handles_numeric_group_conversation_type() {
+        let data = serde_json::json!({
+            "conversationType": 2,
+            "conversationId": "cid-group",
+        });
+        let chat_id = DingTalkChannel::resolve_chat_id(&data, "staff-1");
+        assert_eq!(chat_id, "cid-group");
     }
 }

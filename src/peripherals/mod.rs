@@ -27,7 +27,9 @@ pub mod rpi;
 pub use traits::Peripheral;
 
 use crate::config::{Config, PeripheralBoardConfig, PeripheralsConfig};
-use crate::tools::{HardwareMemoryMapTool, Tool};
+#[cfg(feature = "hardware")]
+use crate::tools::HardwareMemoryMapTool;
+use crate::tools::Tool;
 use anyhow::Result;
 
 /// List configured boards from config (no connection yet).
@@ -91,7 +93,7 @@ pub fn handle_command(cmd: crate::PeripheralCommands, config: &Config) -> Result
                 board: board.clone(),
                 transport: transport.to_string(),
                 path: path_opt,
-                baud: 115200,
+                baud: 115_200,
             });
             cfg.save()?;
             println!("Added {} at {}. Restart daemon to apply.", board, path);

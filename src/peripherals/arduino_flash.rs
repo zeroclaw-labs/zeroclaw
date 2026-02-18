@@ -38,6 +38,9 @@ pub fn ensure_arduino_cli() -> Result<()> {
             anyhow::bail!("brew install arduino-cli failed. Install manually: https://arduino.github.io/arduino-cli/");
         }
         println!("arduino-cli installed.");
+        if !arduino_cli_available() {
+            anyhow::bail!("arduino-cli still not found after install. Ensure it's in PATH.");
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -55,9 +58,7 @@ pub fn ensure_arduino_cli() -> Result<()> {
         anyhow::bail!("arduino-cli not installed.");
     }
 
-    if !arduino_cli_available() {
-        anyhow::bail!("arduino-cli still not found after install. Ensure it's in PATH.");
-    }
+    #[allow(unreachable_code)]
     Ok(())
 }
 

@@ -87,7 +87,7 @@ mod tests {
     #[tokio::test]
     async fn forget_existing() {
         let (_tmp, mem) = test_mem();
-        mem.store("temp", "temporary", MemoryCategory::Conversation)
+        mem.store("temp", "temporary", MemoryCategory::Conversation, None)
             .await
             .unwrap();
 

@@ -1,0 +1,314 @@
+name: CI Run
+
+on:
+    push:
+        branches: [main]
+    pull_request:
+        branches: [main]
+
+concurrency:
+    group: ci-${{ github.event.pull_request.number || github.sha }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+
+env:
+    CARGO_TERM_COLOR: always
+
+jobs:
+    changes:
+        name: Detect Change Scope
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        outputs:
+            docs_only: ${{ steps.scope.outputs.docs_only }}
+            docs_changed: ${{ steps.scope.outputs.docs_changed }}
+            rust_changed: ${{ steps.scope.outputs.rust_changed }}
+            workflow_changed: ${{ steps.scope.outputs.workflow_changed }}
+            docs_files: ${{ steps.scope.outputs.docs_files }}
+            base_sha: ${{ steps.scope.outputs.base_sha }}
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+              with:
+                  fetch-depth: 0
+
+            - name: Detect docs-only changes
+              id: scope
+              shell: bash
+              env:
+                  EVENT_NAME: ${{ github.event_name }}
+                  BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+              run: ./scripts/ci/detect_change_scope.sh
+
+    lint:
+        name: Lint Gate (Format + Clippy)
+        needs: [changes]
+        if: needs.changes.outputs.rust_changed == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full'))
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        timeout-minutes: 20
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+              with:
+                  fetch-depth: 0
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+                  components: rustfmt, clippy
+            - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
+            - name: Run rust quality gate
+              run: ./scripts/ci/rust_quality_gate.sh
+
+    lint-strict-delta:
+        name: Lint Gate (Strict Delta)
+        needs: [changes]
+        if: needs.changes.outputs.rust_changed == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full'))
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        timeout-minutes: 25
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+              with:
+                  fetch-depth: 0
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+                  components: clippy
+            - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
+            - name: Run strict lint delta gate
+              env:
+                  BASE_SHA: ${{ needs.changes.outputs.base_sha }}
+              run: ./scripts/ci/rust_strict_delta_gate.sh
+
+    test:
+        name: Test
+        needs: [changes, lint, lint-strict-delta]
+        if: needs.changes.outputs.rust_changed == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && needs.lint.result == 'success' && needs.lint-strict-delta.result == 'success'
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        timeout-minutes: 30
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+            - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
+            - name: Run tests
+              run: cargo test --locked --verbose
+
+    build:
+        name: Build (Smoke)
+        needs: [changes]
+        if: needs.changes.outputs.rust_changed == 'true'
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        timeout-minutes: 20
+
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+            - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
+            - name: Build release binary
+              run: cargo build --release --locked --verbose
+
+    docs-only:
+        name: Docs-Only Fast Path
+        needs: [changes]
+        if: needs.changes.outputs.docs_only == 'true'
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        steps:
+            - name: Skip heavy jobs for docs-only change
+              run: echo "Docs-only change detected. Rust lint/test/build skipped."
+
+    non-rust:
+        name: Non-Rust Fast Path
+        needs: [changes]
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.rust_changed != 'true'
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        steps:
+            - name: Skip Rust jobs for non-Rust change scope
+              run: echo "No Rust-impacting files changed. Rust lint/test/build skipped."
+
+    docs-quality:
+        name: Docs Quality
+        needs: [changes]
+        if: needs.changes.outputs.docs_changed == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full'))
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        timeout-minutes: 15
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+              with:
+                  fetch-depth: 0
+
+            - name: Markdown lint (changed lines only)
+              env:
+                  BASE_SHA: ${{ needs.changes.outputs.base_sha }}
+                  DOCS_FILES: ${{ needs.changes.outputs.docs_files }}
+              run: ./scripts/ci/docs_quality_gate.sh
+
+            - name: Collect added links
+              id: collect_links
+              shell: bash
+              env:
+                  BASE_SHA: ${{ needs.changes.outputs.base_sha }}
+                  DOCS_FILES: ${{ needs.changes.outputs.docs_files }}
+              run: |
+                  set -euo pipefail
+                  python3 ./scripts/ci/collect_changed_links.py \
+                    --base "$BASE_SHA" \
+                    --docs-files "$DOCS_FILES" \
+                    --output .ci-added-links.txt
+                  count=$(wc -l < .ci-added-links.txt | tr -d ' ')
+                  echo "count=$count" >> "$GITHUB_OUTPUT"
+                  if [ "$count" -gt 0 ]; then
+                    echo "Added links queued for check:"
+                    cat .ci-added-links.txt
+                  else
+                    echo "No added links found in changed docs lines."
+                  fi
+
+            - name: Link check (offline, added links only)
+              if: steps.collect_links.outputs.count != '0'
+              uses: lycheeverse/lychee-action@a8c4c7cb88f0c7386610c35eb25108e448569cb0 # v2
+              with:
+                  fail: true
+                  args: >-
+                      --offline
+                      --no-progress
+                      --format detailed
+                      .ci-added-links.txt
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Skip link check (no added links)
+              if: steps.collect_links.outputs.count == '0'
+              run: echo "No added links in changed docs lines. Link check skipped."
+
+    lint-feedback:
+        name: Lint Feedback
+        if: github.event_name == 'pull_request'
+        needs: [changes, lint, lint-strict-delta, docs-quality]
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        permissions:
+            contents: read
+            pull-requests: write
+            issues: write
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - name: Post actionable lint failure summary
+              if: always()
+              uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+              env:
+                  RUST_CHANGED: ${{ needs.changes.outputs.rust_changed }}
+                  DOCS_CHANGED: ${{ needs.changes.outputs.docs_changed }}
+                  LINT_RESULT: ${{ needs.lint.result }}
+                  LINT_DELTA_RESULT: ${{ needs.lint-strict-delta.result }}
+                  DOCS_RESULT: ${{ needs.docs-quality.result }}
+              with:
+                  script: |
+                      const script = require('./.github/workflows/scripts/lint_feedback.js');
+                      await script({github, context, core});
+
+    workflow-owner-approval:
+        name: Workflow Owner Approval
+        needs: [changes]
+        if: github.event_name == 'pull_request' && needs.changes.outputs.workflow_changed == 'true'
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        permissions:
+            contents: read
+            pull-requests: read
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - name: Require owner approval for workflow file changes
+              uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+              env:
+                  WORKFLOW_OWNER_LOGINS: ${{ vars.WORKFLOW_OWNER_LOGINS }}
+              with:
+                  script: |
+                    const script = require('./.github/workflows/scripts/ci_workflow_owner_approval.js');
+                    await script({ github, context, core });
+    ci-required:
+        name: CI Required Gate
+        if: always()
+        needs: [changes, lint, lint-strict-delta, test, build, docs-only, non-rust, docs-quality, lint-feedback, workflow-owner-approval]
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        steps:
+            - name: Enforce required status
+              shell: bash
+              run: |
+                  set -euo pipefail
+
+                  event_name="${{ github.event_name }}"
+                  rust_changed="${{ needs.changes.outputs.rust_changed }}"
+                  docs_changed="${{ needs.changes.outputs.docs_changed }}"
+                  workflow_changed="${{ needs.changes.outputs.workflow_changed }}"
+                  docs_result="${{ needs.docs-quality.result }}"
+                  workflow_owner_result="${{ needs.workflow-owner-approval.result }}"
+
+                  if [ "${{ needs.changes.outputs.docs_only }}" = "true" ]; then
+                    echo "workflow_owner_approval=${workflow_owner_result}"
+                    if [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
+                      echo "Workflow files changed but workflow owner approval gate did not pass."
+                      exit 1
+                    fi
+                    if [ "$event_name" != "pull_request" ] && [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
+                      echo "Docs-only push changed docs, but docs-quality did not pass."
+                      exit 1
+                    fi
+                    echo "Docs-only fast path passed."
+                    exit 0
+                  fi
+
+                  if [ "$rust_changed" != "true" ]; then
+                    echo "rust_changed=false (non-rust fast path)"
+                    echo "workflow_owner_approval=${workflow_owner_result}"
+                    if [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
+                      echo "Workflow files changed but workflow owner approval gate did not pass."
+                      exit 1
+                    fi
+                    if [ "$event_name" != "pull_request" ] && [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
+                      echo "Non-rust push changed docs, but docs-quality did not pass."
+                      exit 1
+                    fi
+                    echo "Non-rust fast path passed."
+                    exit 0
+                  fi
+
+                  lint_result="${{ needs.lint.result }}"
+                  lint_strict_delta_result="${{ needs.lint-strict-delta.result }}"
+                  test_result="${{ needs.test.result }}"
+                  build_result="${{ needs.build.result }}"
+
+                  echo "lint=${lint_result}"
+                  echo "lint_strict_delta=${lint_strict_delta_result}"
+                  echo "test=${test_result}"
+                  echo "build=${build_result}"
+                  echo "docs=${docs_result}"
+                  echo "workflow_owner_approval=${workflow_owner_result}"
+
+                  if [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
+                    echo "Workflow files changed but workflow owner approval gate did not pass."
+                    exit 1
+                  fi
+
+                  if [ "$event_name" = "pull_request" ]; then
+                    if [ "$build_result" != "success" ]; then
+                      echo "Required PR build job did not pass."
+                      exit 1
+                    fi
+                    echo "PR required checks passed."
+                    exit 0
+                  fi
+
+                  if [ "$lint_result" != "success" ] || [ "$lint_strict_delta_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ]; then
+                    echo "Required push CI jobs did not pass."
+                    exit 1
+                  fi
+
+                  if [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
+                    echo "Push changed docs, but docs-quality did not pass."
+                    exit 1
+                  fi
+
+                  echo "Push required checks passed."

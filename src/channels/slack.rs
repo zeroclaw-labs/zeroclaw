@@ -1,4 +1,4 @@
-use super::traits::{Channel, ChannelMessage};
+use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 
 /// Slack channel — polls conversations.history via Web API
@@ -51,10 +51,10 @@ impl Channel for SlackChannel {
         "slack"
     }
 
-    async fn send(&self, message: &str, channel: &str) -> anyhow::Result<()> {
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let body = serde_json::json!({
-            "channel": channel,
-            "text": message
+            "channel": message.recipient,
+            "text": message.content
         });
 
         let resp = self
@@ -161,6 +161,7 @@ impl Channel for SlackChannel {
                     let channel_msg = ChannelMessage {
                         id: format!("slack_{channel_id}_{ts}"),
                         sender: user.to_string(),
+                        reply_target: channel_id.clone(),
                         content: text.to_string(),
                         channel: "slack".to_string(),
                         timestamp: std::time::SystemTime::now()

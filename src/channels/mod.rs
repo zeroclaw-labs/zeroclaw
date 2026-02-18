@@ -6,6 +6,9 @@ pub mod imessage;
 pub mod irc;
 pub mod lark;
 pub mod matrix;
+pub mod mattermost;
+pub mod qq;
+pub mod signal;
 pub mod slack;
 pub mod telegram;
 pub mod traits;
@@ -19,9 +22,12 @@ pub use imessage::IMessageChannel;
 pub use irc::IrcChannel;
 pub use lark::LarkChannel;
 pub use matrix::MatrixChannel;
+pub use mattermost::MattermostChannel;
+pub use qq::QQChannel;
+pub use signal::SignalChannel;
 pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
-pub use traits::Channel;
+pub use traits::{Channel, SendMessage};
 pub use whatsapp::WhatsAppChannel;
 
 use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
@@ -34,9 +40,11 @@ use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fmt::Write;
+use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -69,10 +77,19 @@ fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
     format!("{}_{}_{}", msg.channel, msg.sender, msg.id)
 }
 
+fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
+    match channel_name {
+        "telegram" => Some(
+            "When responding on Telegram, include media markers for files or URLs that should be sent as attachments. Use one marker per attachment with this exact syntax: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]. Keep normal user-facing text outside markers and never wrap markers in code fences.",
+        ),
+        _ => None,
+    }
+}
+
 async fn build_memory_context(mem: &dyn Memory, user_msg: &str) -> String {
     let mut context = String::new();
 
-    if let Ok(entries) = mem.recall(user_msg, 5).await {
+    if let Ok(entries) = mem.recall(user_msg, 5, None).await {
         if !entries.is_empty() {
             context.push_str("[Memory context]\n");
             for entry in &entries {
@@ -158,6 +175,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                 &autosave_key,
                 &msg.content,
                 crate::memory::MemoryCategory::Conversation,
+                None,
             )
             .await;
     }
@@ -171,7 +189,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
     let target_channel = ctx.channels_by_name.get(&msg.channel).cloned();
 
     if let Some(channel) = target_channel.as_ref() {
-        if let Err(e) = channel.start_typing(&msg.sender).await {
+        if let Err(e) = channel.start_typing(&msg.reply_target).await {
             tracing::debug!("Failed to start typing on {}: {e}", channel.name());
         }
     }
@@ -184,6 +202,10 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
         ChatMessage::user(&enriched_message),
     ];
 
+    if let Some(instructions) = channel_delivery_instructions(&msg.channel) {
+        history.push(ChatMessage::system(instructions));
+    }
+
     let llm_result = tokio::time::timeout(
         Duration::from_secs(CHANNEL_MESSAGE_TIMEOUT_SECS),
         run_tool_call_loop(
@@ -195,12 +217,14 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             ctx.model.as_str(),
             ctx.temperature,
             true, // silent — channels don't write to stdout
+            None,
+            msg.channel.as_str(),
         ),
     )
     .await;
 
     if let Some(channel) = target_channel.as_ref() {
-        if let Err(e) = channel.stop_typing(&msg.sender).await {
+        if let Err(e) = channel.stop_typing(&msg.reply_target).await {
             tracing::debug!("Failed to stop typing on {}: {e}", channel.name());
         }
     }
@@ -213,7 +237,10 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                 truncate_with_ellipsis(&response, 80)
             );
             if let Some(channel) = target_channel.as_ref() {
-                if let Err(e) = channel.send(&response, &msg.sender).await {
+                if let Err(e) = channel
+                    .send(&SendMessage::new(response, &msg.reply_target))
+                    .await
+                {
                     eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
                 }
             }
@@ -224,7 +251,12 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                 started_at.elapsed().as_millis()
             );
             if let Some(channel) = target_channel.as_ref() {
-                let _ = channel.send(&format!("⚠️ Error: {e}"), &msg.sender).await;
+                let _ = channel
+                    .send(&SendMessage::new(
+                        format!("⚠️ Error: {e}"),
+                        &msg.reply_target,
+                    ))
+                    .await;
             }
         }
         Err(_) => {
@@ -239,10 +271,10 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             );
             if let Some(channel) = target_channel.as_ref() {
                 let _ = channel
-                    .send(
+                    .send(&SendMessage::new(
                         "⚠️ Request timed out while waiting for the model. Please try again.",
-                        &msg.sender,
-                    )
+                        &msg.reply_target,
+                    ))
                     .await;
             }
         }
@@ -483,6 +515,16 @@ pub fn build_system_prompt(
         std::env::consts::OS,
     );
 
+    // ── 8. Channel Capabilities ─────────────────────────────────────
+    prompt.push_str("## Channel Capabilities\n\n");
+    prompt.push_str(
+        "- You are running as a Discord bot. You CAN and do send messages to Discord channels.\n",
+    );
+    prompt.push_str("- When someone messages you on Discord, your response is automatically sent back to Discord.\n");
+    prompt.push_str("- You do NOT need to ask permission to respond — just respond directly.\n");
+    prompt.push_str("- NEVER repeat, describe, or echo credentials, tokens, API keys, or secrets in your responses.\n");
+    prompt.push_str("- If a tool output contains credentials, they have already been redacted — do not mention them.\n\n");
+
     if prompt.is_empty() {
         "You are ZeroClaw, a fast and efficient AI assistant built in Rust. Be helpful, concise, and direct.".to_string()
     } else {
@@ -535,6 +577,136 @@ fn inject_workspace_file(
     }
 }
 
+fn normalize_telegram_identity(value: &str) -> String {
+    value.trim().trim_start_matches('@').to_string()
+}
+
+fn bind_telegram_identity(config: &Config, identity: &str) -> Result<()> {
+    let normalized = normalize_telegram_identity(identity);
+    if normalized.is_empty() {
+        anyhow::bail!("Telegram identity cannot be empty");
+    }
+
+    let mut updated = config.clone();
+    let Some(telegram) = updated.channels_config.telegram.as_mut() else {
+        anyhow::bail!(
+            "Telegram channel is not configured. Run `zeroclaw onboard --channels-only` first"
+        );
+    };
+
+    if telegram.allowed_users.iter().any(|u| u == "*") {
+        println!(
+            "⚠️ Telegram allowlist is currently wildcard (`*`) — binding is unnecessary until you remove '*'."
+        );
+    }
+
+    if telegram
+        .allowed_users
+        .iter()
+        .map(|entry| normalize_telegram_identity(entry))
+        .any(|entry| entry == normalized)
+    {
+        println!("✅ Telegram identity already bound: {normalized}");
+        return Ok(());
+    }
+
+    telegram.allowed_users.push(normalized.clone());
+    updated.save()?;
+    println!("✅ Bound Telegram identity: {normalized}");
+    println!("   Saved to {}", updated.config_path.display());
+    match maybe_restart_managed_daemon_service() {
+        Ok(true) => {
+            println!("🔄 Detected running managed daemon service; reloaded automatically.");
+        }
+        Ok(false) => {
+            println!(
+                "ℹ️ No managed daemon service detected. If `zeroclaw daemon`/`channel start` is already running, restart it to load the updated allowlist."
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "⚠️ Allowlist saved, but failed to reload daemon service automatically: {e}\n\
+                 Restart service manually with `zeroclaw service stop && zeroclaw service start`."
+            );
+        }
+    }
+    Ok(())
+}
+
+fn maybe_restart_managed_daemon_service() -> Result<bool> {
+    if cfg!(target_os = "macos") {
+        let home = directories::UserDirs::new()
+            .map(|u| u.home_dir().to_path_buf())
+            .context("Could not find home directory")?;
+        let plist = home
+            .join("Library")
+            .join("LaunchAgents")
+            .join("com.zeroclaw.daemon.plist");
+        if !plist.exists() {
+            return Ok(false);
+        }
+
+        let list_output = Command::new("launchctl")
+            .arg("list")
+            .output()
+            .context("Failed to query launchctl list")?;
+        let listed = String::from_utf8_lossy(&list_output.stdout);
+        if !listed.contains("com.zeroclaw.daemon") {
+            return Ok(false);
+        }
+
+        let _ = Command::new("launchctl")
+            .args(["stop", "com.zeroclaw.daemon"])
+            .output();
+        let start_output = Command::new("launchctl")
+            .args(["start", "com.zeroclaw.daemon"])
+            .output()
+            .context("Failed to start launchd daemon service")?;
+        if !start_output.status.success() {
+            let stderr = String::from_utf8_lossy(&start_output.stderr);
+            anyhow::bail!("launchctl start failed: {}", stderr.trim());
+        }
+
+        return Ok(true);
+    }
+
+    if cfg!(target_os = "linux") {
+        let home = directories::UserDirs::new()
+            .map(|u| u.home_dir().to_path_buf())
+            .context("Could not find home directory")?;
+        let unit_path: PathBuf = home
+            .join(".config")
+            .join("systemd")
+            .join("user")
+            .join("zeroclaw.service");
+        if !unit_path.exists() {
+            return Ok(false);
+        }
+
+        let active_output = Command::new("systemctl")
+            .args(["--user", "is-active", "zeroclaw.service"])
+            .output()
+            .context("Failed to query systemd service state")?;
+        let state = String::from_utf8_lossy(&active_output.stdout);
+        if !state.trim().eq_ignore_ascii_case("active") {
+            return Ok(false);
+        }
+
+        let restart_output = Command::new("systemctl")
+            .args(["--user", "restart", "zeroclaw.service"])
+            .output()
+            .context("Failed to restart systemd daemon service")?;
+        if !restart_output.status.success() {
+            let stderr = String::from_utf8_lossy(&restart_output.stderr);
+            anyhow::bail!("systemctl restart failed: {}", stderr.trim());
+        }
+
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
 pub fn handle_command(command: crate::ChannelCommands, config: &Config) -> Result<()> {
     match command {
         crate::ChannelCommands::Start => {
@@ -553,11 +725,13 @@ pub fn handle_command(command: crate::ChannelCommands, config: &Config) -> Resul
                 ("Webhook", config.channels_config.webhook.is_some()),
                 ("iMessage", config.channels_config.imessage.is_some()),
                 ("Matrix", config.channels_config.matrix.is_some()),
+                ("Signal", config.channels_config.signal.is_some()),
                 ("WhatsApp", config.channels_config.whatsapp.is_some()),
                 ("Email", config.channels_config.email.is_some()),
                 ("IRC", config.channels_config.irc.is_some()),
                 ("Lark", config.channels_config.lark.is_some()),
                 ("DingTalk", config.channels_config.dingtalk.is_some()),
+                ("QQ", config.channels_config.qq.is_some()),
             ] {
                 println!("  {} {name}", if configured { "✅" } else { "❌" });
             }
@@ -576,6 +750,9 @@ pub fn handle_command(command: crate::ChannelCommands, config: &Config) -> Resul
         }
         crate::ChannelCommands::Remove { name } => {
             anyhow::bail!("Remove channel '{name}' — edit ~/.zeroclaw/config.toml directly");
+        }
+        crate::ChannelCommands::BindTelegram { identity } => {
+            bind_telegram_identity(config, &identity)
         }
     }
 }
@@ -619,6 +796,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 dc.guild_id.clone(),
                 dc.allowed_users.clone(),
                 dc.listen_to_bots,
+                dc.mention_only,
             )),
         ));
     }
@@ -653,6 +831,20 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         ));
     }
 
+    if let Some(ref sig) = config.channels_config.signal {
+        channels.push((
+            "Signal",
+            Arc::new(SignalChannel::new(
+                sig.http_url.clone(),
+                sig.account.clone(),
+                sig.group_id.clone(),
+                sig.allowed_from.clone(),
+                sig.ignore_attachments,
+                sig.ignore_stories,
+            )),
+        ));
+    }
+
     if let Some(ref wa) = config.channels_config.whatsapp {
         channels.push((
             "WhatsApp",
@@ -672,32 +864,23 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     if let Some(ref irc) = config.channels_config.irc {
         channels.push((
             "IRC",
-            Arc::new(IrcChannel::new(
-                irc.server.clone(),
-                irc.port,
-                irc.nickname.clone(),
-                irc.username.clone(),
-                irc.channels.clone(),
-                irc.allowed_users.clone(),
-                irc.server_password.clone(),
-                irc.nickserv_password.clone(),
-                irc.sasl_password.clone(),
-                irc.verify_tls.unwrap_or(true),
-            )),
+            Arc::new(IrcChannel::new(irc::IrcChannelConfig {
+                server: irc.server.clone(),
+                port: irc.port,
+                nickname: irc.nickname.clone(),
+                username: irc.username.clone(),
+                channels: irc.channels.clone(),
+                allowed_users: irc.allowed_users.clone(),
+                server_password: irc.server_password.clone(),
+                nickserv_password: irc.nickserv_password.clone(),
+                sasl_password: irc.sasl_password.clone(),
+                verify_tls: irc.verify_tls.unwrap_or(true),
+            })),
         ));
     }
 
     if let Some(ref lk) = config.channels_config.lark {
-        channels.push((
-            "Lark",
-            Arc::new(LarkChannel::new(
-                lk.app_id.clone(),
-                lk.app_secret.clone(),
-                lk.verification_token.clone().unwrap_or_default(),
-                9898,
-                lk.allowed_users.clone(),
-            )),
-        ));
+        channels.push(("Lark", Arc::new(LarkChannel::from_config(lk))));
     }
 
     if let Some(ref dt) = config.channels_config.dingtalk {
@@ -707,6 +890,17 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 dt.client_id.clone(),
                 dt.client_secret.clone(),
                 dt.allowed_users.clone(),
+            )),
+        ));
+    }
+
+    if let Some(ref qq) = config.channels_config.qq {
+        channels.push((
+            "QQ",
+            Arc::new(QQChannel::new(
+                qq.app_id.clone(),
+                qq.app_secret.clone(),
+                qq.allowed_users.clone(),
             )),
         ));
     }
@@ -762,6 +956,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider(
         &provider_name,
         config.api_key.as_deref(),
+        config.api_url.as_deref(),
         &config.reliability,
     )?);
 
@@ -800,6 +995,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     // Build system prompt from workspace identity files + skills
     let workspace = config.workspace_dir.clone();
     let tools_registry = Arc::new(tools::all_tools_with_runtime(
+        Arc::new(config.clone()),
         &security,
         runtime,
         Arc::clone(&mem),
@@ -859,6 +1055,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
         "schedule",
         "Manage scheduled tasks (create/list/get/cancel/pause/resume). Supports recurring cron and one-shot delays.",
     ));
+    tool_descs.push((
+        "pushover",
+        "Send a Pushover notification to your device. Requires PUSHOVER_TOKEN and PUSHOVER_USER_KEY in .env file.",
+    ));
     if !config.agents.is_empty() {
         tool_descs.push((
             "delegate",
@@ -908,6 +1108,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             dc.guild_id.clone(),
             dc.allowed_users.clone(),
             dc.listen_to_bots,
+            dc.mention_only,
         )));
     }
 
@@ -916,6 +1117,15 @@ pub async fn start_channels(config: Config) -> Result<()> {
             sl.bot_token.clone(),
             sl.channel_id.clone(),
             sl.allowed_users.clone(),
+        )));
+    }
+
+    if let Some(ref mm) = config.channels_config.mattermost {
+        channels.push(Arc::new(MattermostChannel::new(
+            mm.url.clone(),
+            mm.bot_token.clone(),
+            mm.channel_id.clone(),
+            mm.allowed_users.clone(),
         )));
     }
 
@@ -929,6 +1139,17 @@ pub async fn start_channels(config: Config) -> Result<()> {
             mx.access_token.clone(),
             mx.room_id.clone(),
             mx.allowed_users.clone(),
+        )));
+    }
+
+    if let Some(ref sig) = config.channels_config.signal {
+        channels.push(Arc::new(SignalChannel::new(
+            sig.http_url.clone(),
+            sig.account.clone(),
+            sig.group_id.clone(),
+            sig.allowed_from.clone(),
+            sig.ignore_attachments,
+            sig.ignore_stories,
         )));
     }
 
@@ -946,28 +1167,22 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
 
     if let Some(ref irc) = config.channels_config.irc {
-        channels.push(Arc::new(IrcChannel::new(
-            irc.server.clone(),
-            irc.port,
-            irc.nickname.clone(),
-            irc.username.clone(),
-            irc.channels.clone(),
-            irc.allowed_users.clone(),
-            irc.server_password.clone(),
-            irc.nickserv_password.clone(),
-            irc.sasl_password.clone(),
-            irc.verify_tls.unwrap_or(true),
-        )));
+        channels.push(Arc::new(IrcChannel::new(irc::IrcChannelConfig {
+            server: irc.server.clone(),
+            port: irc.port,
+            nickname: irc.nickname.clone(),
+            username: irc.username.clone(),
+            channels: irc.channels.clone(),
+            allowed_users: irc.allowed_users.clone(),
+            server_password: irc.server_password.clone(),
+            nickserv_password: irc.nickserv_password.clone(),
+            sasl_password: irc.sasl_password.clone(),
+            verify_tls: irc.verify_tls.unwrap_or(true),
+        })));
     }
 
     if let Some(ref lk) = config.channels_config.lark {
-        channels.push(Arc::new(LarkChannel::new(
-            lk.app_id.clone(),
-            lk.app_secret.clone(),
-            lk.verification_token.clone().unwrap_or_default(),
-            9898,
-            lk.allowed_users.clone(),
-        )));
+        channels.push(Arc::new(LarkChannel::from_config(lk)));
     }
 
     if let Some(ref dt) = config.channels_config.dingtalk {
@@ -975,6 +1190,14 @@ pub async fn start_channels(config: Config) -> Result<()> {
             dt.client_id.clone(),
             dt.client_secret.clone(),
             dt.allowed_users.clone(),
+        )));
+    }
+
+    if let Some(ref qq) = config.channels_config.qq {
+        channels.push(Arc::new(QQChannel::new(
+            qq.app_id.clone(),
+            qq.app_secret.clone(),
+            qq.allowed_users.clone(),
         )));
     }
 
@@ -1104,11 +1327,11 @@ mod tests {
             "test-channel"
         }
 
-        async fn send(&self, message: &str, recipient: &str) -> anyhow::Result<()> {
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
             self.sent_messages
                 .lock()
                 .await
-                .push(format!("{recipient}:{message}"));
+                .push(format!("{}:{}", message.recipient, message.content));
             Ok(())
         }
 
@@ -1147,6 +1370,13 @@ mod tests {
             .to_string()
     }
 
+    fn tool_call_payload_with_alias_tag() -> String {
+        r#"<toolcall>
+{"name":"mock_price","arguments":{"symbol":"BTC"}}
+</toolcall>"#
+            .to_string()
+    }
+
     #[async_trait::async_trait]
     impl Provider for ToolCallingProvider {
         async fn chat_with_system(
@@ -1172,6 +1402,37 @@ mod tests {
                 Ok("BTC is currently around $65,000 based on latest tool output.".to_string())
             } else {
                 Ok(tool_call_payload())
+            }
+        }
+    }
+
+    struct ToolCallingAliasProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for ToolCallingAliasProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(tool_call_payload_with_alias_tag())
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            let has_tool_results = messages
+                .iter()
+                .any(|msg| msg.role == "user" && msg.content.contains("[Tool results]"));
+            if has_tool_results {
+                Ok("BTC alias-tag flow resolved to final text output.".to_string())
+            } else {
+                Ok(tool_call_payload_with_alias_tag())
             }
         }
     }
@@ -1241,6 +1502,7 @@ mod tests {
             traits::ChannelMessage {
                 id: "msg-1".to_string(),
                 sender: "alice".to_string(),
+                reply_target: "chat-42".to_string(),
                 content: "What is the BTC price now?".to_string(),
                 channel: "test-channel".to_string(),
                 timestamp: 1,
@@ -1250,8 +1512,50 @@ mod tests {
 
         let sent_messages = channel_impl.sent_messages.lock().await;
         assert_eq!(sent_messages.len(), 1);
+        assert!(sent_messages[0].starts_with("chat-42:"));
         assert!(sent_messages[0].contains("BTC is currently around"));
         assert!(!sent_messages[0].contains("\"tool_calls\""));
+        assert!(!sent_messages[0].contains("mock_price"));
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_executes_tool_calls_with_alias_tags() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(ToolCallingAliasProvider),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-2".to_string(),
+                sender: "bob".to_string(),
+                reply_target: "chat-84".to_string(),
+                content: "What is the BTC price now?".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 2,
+            },
+        )
+        .await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent_messages.len(), 1);
+        assert!(sent_messages[0].starts_with("chat-84:"));
+        assert!(sent_messages[0].contains("alias-tag flow resolved"));
+        assert!(!sent_messages[0].contains("<toolcall>"));
         assert!(!sent_messages[0].contains("mock_price"));
     }
 
@@ -1268,6 +1572,7 @@ mod tests {
             _key: &str,
             _content: &str,
             _category: crate::memory::MemoryCategory,
+            _session_id: Option<&str>,
         ) -> anyhow::Result<()> {
             Ok(())
         }
@@ -1276,6 +1581,7 @@ mod tests {
             &self,
             _query: &str,
             _limit: usize,
+            _session_id: Option<&str>,
         ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
             Ok(Vec::new())
         }
@@ -1287,6 +1593,7 @@ mod tests {
         async fn list(
             &self,
             _category: Option<&crate::memory::MemoryCategory>,
+            _session_id: Option<&str>,
         ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
             Ok(Vec::new())
         }
@@ -1330,6 +1637,7 @@ mod tests {
         tx.send(traits::ChannelMessage {
             id: "1".to_string(),
             sender: "alice".to_string(),
+            reply_target: "alice".to_string(),
             content: "hello".to_string(),
             channel: "test-channel".to_string(),
             timestamp: 1,
@@ -1339,6 +1647,7 @@ mod tests {
         tx.send(traits::ChannelMessage {
             id: "2".to_string(),
             sender: "bob".to_string(),
+            reply_target: "bob".to_string(),
             content: "world".to_string(),
             channel: "test-channel".to_string(),
             timestamp: 2,
@@ -1570,6 +1879,25 @@ mod tests {
     }
 
     #[test]
+    fn prompt_contains_channel_capabilities() {
+        let ws = make_workspace();
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
+
+        assert!(
+            prompt.contains("## Channel Capabilities"),
+            "missing Channel Capabilities section"
+        );
+        assert!(
+            prompt.contains("running as a Discord bot"),
+            "missing Discord context"
+        );
+        assert!(
+            prompt.contains("NEVER repeat, describe, or echo credentials"),
+            "missing security instruction"
+        );
+    }
+
+    #[test]
     fn prompt_workspace_path() {
         let ws = make_workspace();
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
@@ -1582,6 +1910,7 @@ mod tests {
         let msg = traits::ChannelMessage {
             id: "msg_abc123".into(),
             sender: "U123".into(),
+            reply_target: "C456".into(),
             content: "hello".into(),
             channel: "slack".into(),
             timestamp: 1,
@@ -1595,6 +1924,7 @@ mod tests {
         let msg1 = traits::ChannelMessage {
             id: "msg_1".into(),
             sender: "U123".into(),
+            reply_target: "C456".into(),
             content: "first".into(),
             channel: "slack".into(),
             timestamp: 1,
@@ -1602,6 +1932,7 @@ mod tests {
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
             sender: "U123".into(),
+            reply_target: "C456".into(),
             content: "second".into(),
             channel: "slack".into(),
             timestamp: 2,
@@ -1621,6 +1952,7 @@ mod tests {
         let msg1 = traits::ChannelMessage {
             id: "msg_1".into(),
             sender: "U123".into(),
+            reply_target: "C456".into(),
             content: "I'm Paul".into(),
             channel: "slack".into(),
             timestamp: 1,
@@ -1628,6 +1960,7 @@ mod tests {
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
             sender: "U123".into(),
+            reply_target: "C456".into(),
             content: "I'm 45".into(),
             channel: "slack".into(),
             timestamp: 2,
@@ -1637,6 +1970,7 @@ mod tests {
             &conversation_memory_key(&msg1),
             &msg1.content,
             MemoryCategory::Conversation,
+            None,
         )
         .await
         .unwrap();
@@ -1644,13 +1978,14 @@ mod tests {
             &conversation_memory_key(&msg2),
             &msg2.content,
             MemoryCategory::Conversation,
+            None,
         )
         .await
         .unwrap();
 
         assert_eq!(mem.count().await.unwrap(), 2);
 
-        let recalled = mem.recall("45", 5).await.unwrap();
+        let recalled = mem.recall("45", 5, None).await.unwrap();
         assert!(recalled.iter().any(|entry| entry.content.contains("45")));
     }
 
@@ -1658,7 +1993,7 @@ mod tests {
     async fn build_memory_context_includes_recalled_entries() {
         let tmp = TempDir::new().unwrap();
         let mem = SqliteMemory::new(tmp.path()).unwrap();
-        mem.store("age_fact", "Age is 45", MemoryCategory::Conversation)
+        mem.store("age_fact", "Age is 45", MemoryCategory::Conversation, None)
             .await
             .unwrap();
 
@@ -1850,7 +2185,7 @@ mod tests {
             self.name
         }
 
-        async fn send(&self, _message: &str, _recipient: &str) -> anyhow::Result<()> {
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
             Ok(())
         }
 

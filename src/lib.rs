@@ -39,6 +39,7 @@ use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 
 pub mod agent;
+pub mod approval;
 pub mod channels;
 pub mod config;
 pub mod cost;
@@ -104,6 +105,11 @@ pub enum ChannelCommands {
         /// Channel name to remove
         name: String,
     },
+    /// Bind a Telegram identity (username or numeric user ID) into allowlist
+    BindTelegram {
+        /// Telegram identity to allow (username without '@' or numeric user ID)
+        identity: String,
+    },
 }
 
 /// Skills management subcommands
@@ -147,6 +153,23 @@ pub enum CronCommands {
     Add {
         /// Cron expression
         expression: String,
+        /// Optional IANA timezone (e.g. America/Los_Angeles)
+        #[arg(long)]
+        tz: Option<String>,
+        /// Command to run
+        command: String,
+    },
+    /// Add a one-shot scheduled task at an RFC3339 timestamp
+    AddAt {
+        /// One-shot timestamp in RFC3339 format
+        at: String,
+        /// Command to run
+        command: String,
+    },
+    /// Add a fixed-interval scheduled task
+    AddEvery {
+        /// Interval in milliseconds
+        every_ms: u64,
         /// Command to run
         command: String,
     },

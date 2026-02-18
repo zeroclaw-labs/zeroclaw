@@ -66,7 +66,7 @@ fn deploy_remote(host: &str, bridge_dir: &std::path::Path) -> Result<()> {
             "arduino-app-cli",
             "app",
             "start",
-            &format!("~/ArduinoApps/zeroclaw-uno-q-bridge"),
+            "~/ArduinoApps/zeroclaw-uno-q-bridge",
         ])
         .status()
         .context("arduino-app-cli start failed")?;
