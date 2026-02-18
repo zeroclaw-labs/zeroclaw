@@ -11,4 +11,7 @@ For board integration, firmware flow, and peripheral architecture.
 
 ## Datasheets
 
-- Board/chip datasheets: [../datasheets](../datasheets)
+- Datasheet index: [../datasheets](../datasheets)
+- STM32 Nucleo-F401RE: [../datasheets/nucleo-f401re.md](../datasheets/nucleo-f401re.md)
+- Arduino Uno: [../datasheets/arduino-uno.md](../datasheets/arduino-uno.md)
+- ESP32: [../datasheets/esp32.md](../datasheets/esp32.md)

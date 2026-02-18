@@ -22,13 +22,16 @@ Last refreshed: **February 18, 2026**.
 - [getting-started/README.md](getting-started/README.md)
 - [one-click-bootstrap.md](one-click-bootstrap.md)
 
-### 2) Command/Config References
+### 2) Command/Config References & Integrations
 
 - [reference/README.md](reference/README.md)
 - [commands-reference.md](commands-reference.md)
 - [providers-reference.md](providers-reference.md)
 - [channels-reference.md](channels-reference.md)
 - [config-reference.md](config-reference.md)
+- [custom-providers.md](custom-providers.md)
+- [zai-glm-setup.md](zai-glm-setup.md)
+- [langgraph-integration.md](langgraph-integration.md)
 
 ### 3) Operations & Deployment
 
@@ -55,6 +58,9 @@ Last refreshed: **February 18, 2026**.
 - [adding-boards-and-tools.md](adding-boards-and-tools.md)
 - [nucleo-setup.md](nucleo-setup.md)
 - [arduino-uno-q-setup.md](arduino-uno-q-setup.md)
+- [datasheets/nucleo-f401re.md](datasheets/nucleo-f401re.md)
+- [datasheets/arduino-uno.md](datasheets/arduino-uno.md)
+- [datasheets/esp32.md](datasheets/esp32.md)
 
 ### 6) Contribution & CI
 

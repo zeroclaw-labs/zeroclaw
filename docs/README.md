@@ -14,6 +14,9 @@ Localized hubs: [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · 
 | Bootstrap in one command | [one-click-bootstrap.md](one-click-bootstrap.md) |
 | Find commands by task | [commands-reference.md](commands-reference.md) |
 | Check config defaults and keys quickly | [config-reference.md](config-reference.md) |
+| Configure custom providers/endpoints | [custom-providers.md](custom-providers.md) |
+| Configure Z.AI / GLM provider | [zai-glm-setup.md](zai-glm-setup.md) |
+| Use LangGraph integration patterns | [langgraph-integration.md](langgraph-integration.md) |
 | Operate runtime (day-2 runbook) | [operations-runbook.md](operations-runbook.md) |
 | Troubleshoot install/runtime/channel issues | [troubleshooting.md](troubleshooting.md) |
 | Run Matrix encrypted-room setup and diagnostics | [matrix-e2ee-guide.md](matrix-e2ee-guide.md) |
@@ -50,6 +53,9 @@ Localized hubs: [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · 
 - [channels-reference.md](channels-reference.md) — channel capabilities and setup paths
 - [matrix-e2ee-guide.md](matrix-e2ee-guide.md) — Matrix encrypted-room (E2EE) setup and no-response diagnostics
 - [config-reference.md](config-reference.md) — high-signal config keys and secure defaults
+- [custom-providers.md](custom-providers.md) — custom provider/base URL integration templates
+- [zai-glm-setup.md](zai-glm-setup.md) — Z.AI/GLM setup and endpoint matrix
+- [langgraph-integration.md](langgraph-integration.md) — fallback integration for model/tool-calling edge cases
 - [operations-runbook.md](operations-runbook.md) — day-2 runtime operations and rollback flow
 - [troubleshooting.md](troubleshooting.md) — common failure signatures and recovery steps
 
