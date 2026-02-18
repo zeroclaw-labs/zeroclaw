@@ -275,16 +275,38 @@ impl SqliteMemory {
         Ok(results)
     }
 
-    /// Vector similarity search: scan embeddings and compute cosine similarity
+    /// Vector similarity search: scan embeddings and compute cosine similarity.
+    ///
+    /// Accepts optional `category` and `session_id` filters to reduce the
+    /// number of rows (and BLOB bytes) loaded from disk, avoiding a full-table
+    /// scan when the caller already knows the scope of interest.
     fn vector_search(
         conn: &Connection,
         query_embedding: &[f32],
         limit: usize,
+        category: Option<&str>,
+        session_id: Option<&str>,
     ) -> anyhow::Result<Vec<(String, f32)>> {
-        let mut stmt =
-            conn.prepare("SELECT id, embedding FROM memories WHERE embedding IS NOT NULL")?;
+        let mut sql =
+            "SELECT id, embedding FROM memories WHERE embedding IS NOT NULL".to_string();
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let mut idx = 1;
 
-        let rows = stmt.query_map([], |row| {
+        if let Some(cat) = category {
+            sql.push_str(&format!(" AND category = ?{idx}"));
+            param_values.push(Box::new(cat.to_string()));
+            idx += 1;
+        }
+        if let Some(sid) = session_id {
+            sql.push_str(&format!(" AND session_id = ?{idx}"));
+            param_values.push(Box::new(sid.to_string()));
+        }
+
+        let mut stmt = conn.prepare(&sql)?;
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(AsRef::as_ref).collect();
+
+        let rows = stmt.query_map(params_ref.as_slice(), |row| {
             let id: String = row.get(0)?;
             let blob: Vec<u8> = row.get(1)?;
             Ok((id, blob))
@@ -407,7 +429,7 @@ impl Memory for SqliteMemory {
 
         // Vector similarity search (if embeddings available)
         let vector_results = if let Some(ref qe) = query_embedding {
-            Self::vector_search(&conn, qe, limit * 2).unwrap_or_default()
+            Self::vector_search(&conn, qe, limit * 2, None, session_id).unwrap_or_default()
         } else {
             Vec::new()
         };
