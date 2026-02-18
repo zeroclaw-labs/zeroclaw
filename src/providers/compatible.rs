@@ -241,9 +241,9 @@ struct ResponsesContent {
     text: Option<String>,
 }
 
-// ═══════════════════════════════════════════════════════════════
+// ---------------------------------------------------------------
 // Streaming support (SSE parser)
-// ═══════════════════════════════════════════════════════════════
+// ---------------------------------------------------------------
 
 /// Server-Sent Event stream chunk for OpenAI-compatible streaming.
 #[derive(Debug, Deserialize)]
@@ -291,7 +291,9 @@ fn parse_sse_line(line: &str) -> StreamResult<Option<String>> {
         // Extract content from delta
         if let Some(choice) = chunk.choices.first() {
             if let Some(content) = &choice.delta.content {
-                return Ok(Some(content.clone()));
+                if !content.is_empty() {
+                    return Ok(Some(content.clone()));
+                }
             }
             // Fallback to reasoning_content for thinking models
             if let Some(reasoning) = &choice.delta.reasoning_content {
@@ -976,9 +978,9 @@ mod tests {
         );
     }
 
-    // ══════════════════════════════════════════════════════════
+    // ----------------------------------------------------------
     // Custom endpoint path tests (Issue #114)
-    // ══════════════════════════════════════════════════════════
+    // ----------------------------------------------------------
 
     #[test]
     fn chat_completions_url_standard_openai() {
@@ -1123,9 +1125,9 @@ mod tests {
         );
     }
 
-    // ══════════════════════════════════════════════════════════
+    // ----------------------------------------------------------
     // Provider-specific endpoint tests (Issue #167)
-    // ══════════════════════════════════════════════════════════
+    // ----------------------------------------------------------
 
     #[test]
     fn chat_completions_url_zai() {
@@ -1174,9 +1176,9 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // ══════════════════════════════════════════════════════════
+    // ----------------------------------------------------------
     // Reasoning model fallback tests (reasoning_content)
-    // ══════════════════════════════════════════════════════════
+    // ----------------------------------------------------------
 
     #[test]
     fn reasoning_content_fallback_when_content_empty() {
@@ -1217,7 +1219,7 @@ mod tests {
 
     #[test]
     fn reasoning_content_both_absent_returns_empty() {
-        // Neither content nor reasoning_content — returns empty string
+        // Neither content nor reasoning_content - returns empty string
         let json = r#"{"choices":[{"message":{}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
@@ -1234,9 +1236,9 @@ mod tests {
         assert_eq!(msg.effective_content(), "Hello from Venice!");
     }
 
-    // ══════════════════════════════════════════════════════════
+    // ----------------------------------------------------------
     // SSE streaming reasoning_content fallback tests
-    // ══════════════════════════════════════════════════════════
+    // ----------------------------------------------------------
 
     #[test]
     fn parse_sse_line_with_content() {
@@ -1257,6 +1259,14 @@ mod tests {
         let line = r#"data: {"choices":[{"delta":{"content":"real answer","reasoning_content":"thinking..."}}]}"#;
         let result = parse_sse_line(line).unwrap();
         assert_eq!(result, Some("real answer".to_string()));
+    }
+
+    #[test]
+    fn parse_sse_line_with_empty_content_falls_back_to_reasoning_content() {
+        let line =
+            r#"data: {"choices":[{"delta":{"content":"","reasoning_content":"thinking..."}}]}"#;
+        let result = parse_sse_line(line).unwrap();
+        assert_eq!(result, Some("thinking...".to_string()));
     }
 
     #[test]
