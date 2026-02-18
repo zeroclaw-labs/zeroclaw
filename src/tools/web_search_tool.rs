@@ -21,10 +21,10 @@ impl WebSearchTool {
         timeout_secs: u64,
     ) -> Self {
         Self {
-            provider,
+            provider: provider.trim().to_lowercase(),
             brave_api_key,
-            max_results,
-            timeout_secs,
+            max_results: max_results.clamp(1, 10),
+            timeout_secs: timeout_secs.max(1),
         }
     }
 
@@ -79,17 +79,8 @@ impl WebSearchTool {
 
         for i in 0..count {
             let caps = &link_matches[i];
-            let mut url_str = caps[1].to_string();
+            let url_str = decode_ddg_redirect_url(&caps[1]);
             let title = strip_tags(&caps[2]);
-
-            // Decode DDG redirect URL
-            if url_str.contains("uddg=") {
-                if let Ok(decoded) = urlencoding::decode(&url_str) {
-                    if let Some(idx) = decoded.find("uddg=") {
-                        url_str = decoded[idx + 5..].to_string();
-                    }
-                }
-            }
 
             lines.push(format!("{}. {}", i + 1, title.trim()));
             lines.push(format!("   {}", url_str.trim()));
@@ -173,6 +164,18 @@ impl WebSearchTool {
     }
 }
 
+fn decode_ddg_redirect_url(raw_url: &str) -> String {
+    if let Some(index) = raw_url.find("uddg=") {
+        let encoded = &raw_url[index + 5..];
+        let encoded = encoded.split('&').next().unwrap_or(encoded);
+        if let Ok(decoded) = urlencoding::decode(encoded) {
+            return decoded.into_owned();
+        }
+    }
+
+    raw_url.to_string()
+}
+
 fn strip_tags(content: &str) -> String {
     let re = Regex::new(r"<[^>]+>").unwrap();
     re.replace_all(content, "").to_string()
@@ -213,7 +216,7 @@ impl Tool for WebSearchTool {
 
         tracing::info!("Searching web for: {}", query);
 
-        let result = match self.provider.to_lowercase().as_str() {
+        let result = match self.provider.as_str() {
             "duckduckgo" | "ddg" => self.search_duckduckgo(query).await?,
             "brave" => self.search_brave(query).await?,
             _ => anyhow::bail!("Unknown search provider: {}", self.provider),
@@ -276,6 +279,29 @@ mod tests {
         let result = tool.parse_duckduckgo_results(html, "test").unwrap();
         assert!(result.contains("Example Title"));
         assert!(result.contains("https://example.com"));
+    }
+
+    #[test]
+    fn test_parse_duckduckgo_results_decodes_redirect_url() {
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let html = r#"
+            <a class="result__a" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpath%3Fa%3D1&amp;rut=test">Example Title</a>
+            <a class="result__snippet">This is a description</a>
+        "#;
+        let result = tool.parse_duckduckgo_results(html, "test").unwrap();
+        assert!(result.contains("https://example.com/path?a=1"));
+        assert!(!result.contains("rut=test"));
+    }
+
+    #[test]
+    fn test_constructor_clamps_web_search_limits() {
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 0, 0);
+        let html = r#"
+            <a class="result__a" href="https://example.com">Example Title</a>
+            <a class="result__snippet">This is a description</a>
+        "#;
+        let result = tool.parse_duckduckgo_results(html, "test").unwrap();
+        assert!(result.contains("Example Title"));
     }
 
     #[tokio::test]
