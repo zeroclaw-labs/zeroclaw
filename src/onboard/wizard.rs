@@ -1,4 +1,7 @@
-use crate::config::schema::{DingTalkConfig, IrcConfig, QQConfig, StreamMode, WhatsAppConfig};
+use crate::config::schema::{
+    default_nostr_relays, DingTalkConfig, IrcConfig, NostrConfig, QQConfig, StreamMode,
+    WhatsAppConfig,
+};
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
     HeartbeatConfig, IMessageConfig, MatrixConfig, MemoryConfig, ObservabilityConfig,
@@ -2481,6 +2484,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
         lark: None,
         dingtalk: None,
         qq: None,
+        nostr: None,
     };
 
     loop {
@@ -2565,13 +2569,21 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     "— Tencent QQ Bot"
                 }
             ),
+            format!(
+                "Nostr      {}",
+                if config.nostr.is_some() {
+                    "✅ connected"
+                } else {
+                    "— NIP-04/NIP-17 DMs"
+                }
+            ),
             "Done — finish setup".to_string(),
         ];
 
         let choice = Select::new()
             .with_prompt("  Connect a channel (or Done to continue)")
             .items(&options)
-            .default(10)
+            .default(11)
             .interact()?;
 
         match choice {
@@ -3432,6 +3444,94 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     allowed_users,
                 });
             }
+            10 => {
+                // ── Nostr ──
+                println!();
+                println!(
+                    "  {} {}",
+                    style("Nostr Setup").white().bold(),
+                    style("— private messages via NIP-04 & NIP-17").dim()
+                );
+                print_bullet("ZeroClaw will listen for encrypted DMs on Nostr relays.");
+                print_bullet("You need a Nostr private key (hex or nsec) and at least one relay.");
+                println!();
+
+                let private_key: String = Input::new()
+                    .with_prompt("  Private key (hex or nsec1...)")
+                    .interact_text()?;
+
+                if private_key.trim().is_empty() {
+                    println!("  {} Skipped", style("→").dim());
+                    continue;
+                }
+
+                // Validate the key immediately
+                match nostr_sdk::Keys::parse(private_key.trim()) {
+                    Ok(keys) => {
+                        println!(
+                            "  {} Key valid — public key: {}",
+                            style("✅").green().bold(),
+                            style(keys.public_key().to_hex()).cyan()
+                        );
+                    }
+                    Err(_) => {
+                        println!(
+                            "  {} Invalid private key — check format and try again",
+                            style("❌").red().bold()
+                        );
+                        continue;
+                    }
+                }
+
+                let default_relays = default_nostr_relays().join(",");
+                let relays_str: String = Input::new()
+                    .with_prompt("  Relay URLs (comma-separated, Enter for defaults)")
+                    .default(default_relays)
+                    .interact_text()?;
+
+                let relays: Vec<String> = relays_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+
+                print_bullet("Allowlist pubkeys that can message the bot (hex or npub).");
+                print_bullet("Use '*' to allow anyone (not recommended for production).");
+
+                let pubkeys_str: String = Input::new()
+                    .with_prompt("  Allowed pubkeys (comma-separated, or * for all)")
+                    .allow_empty(true)
+                    .interact_text()?;
+
+                let allowed_pubkeys: Vec<String> = if pubkeys_str.trim() == "*" {
+                    vec!["*".into()]
+                } else {
+                    pubkeys_str
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                };
+
+                if allowed_pubkeys.is_empty() {
+                    println!(
+                        "  {} No pubkeys allowlisted — inbound messages will be denied until you add pubkeys or '*'.",
+                        style("⚠").yellow().bold()
+                    );
+                }
+
+                config.nostr = Some(NostrConfig {
+                    private_key: private_key.trim().to_string(),
+                    relays: relays.clone(),
+                    allowed_pubkeys,
+                });
+
+                println!(
+                    "  {} Nostr configured with {} relay(s)",
+                    style("✅").green().bold(),
+                    style(relays.len()).cyan()
+                );
+            }
             _ => break, // Done
         }
         println!();
@@ -3471,6 +3571,9 @@ fn setup_channels() -> Result<ChannelsConfig> {
     }
     if config.qq.is_some() {
         active.push("QQ");
+    }
+    if config.nostr.is_some() {
+        active.push("Nostr");
     }
 
     println!(

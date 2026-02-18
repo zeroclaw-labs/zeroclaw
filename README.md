@@ -308,7 +308,7 @@ Every subsystem is a **trait** — swap implementations with a config change, ze
 | Subsystem | Trait | Ships with | Extend |
 |-----------|-------|------------|--------|
 | **AI Models** | `Provider` | Provider catalog via `zeroclaw providers` (currently 28 built-ins + aliases, plus custom endpoints) | `custom:https://your-api.com` (OpenAI-compatible) or `anthropic-custom:https://your-api.com` |
-| **Channels** | `Channel` | CLI, Telegram, Discord, Slack, Mattermost, iMessage, Matrix, Signal, WhatsApp, Email, IRC, Lark, DingTalk, QQ, Webhook | Any messaging API |
+| **Channels** | `Channel` | CLI, Telegram, Discord, Slack, Mattermost, iMessage, Matrix, Signal, WhatsApp, Email, IRC, Lark, DingTalk, QQ, Nostr, Webhook | Any messaging API |
 | **Memory** | `Memory` | SQLite hybrid search, PostgreSQL backend (configurable storage provider), Lucid bridge, Markdown files, explicit `none` backend, snapshot/hydrate, optional response cache | Any persistence backend |
 | **Tools** | `Tool` | shell/file/memory, cron/schedule, git, pushover, browser, http_request, screenshot/image_info, composio (opt-in), delegate, hardware tools | Any capability |
 | **Observability** | `Observer` | Noop, Log, Multi | Prometheus, OTel |
@@ -407,6 +407,7 @@ Recommended low-friction setup (secure + fast):
 - **Discord:** allowlist your own Discord user ID.
 - **Slack:** allowlist your own Slack member ID (usually starts with `U`).
 - **Mattermost:** uses standard API v4. Allowlists use Mattermost user IDs.
+- **Nostr:** allowlist sender public keys (hex or npub). Supports NIP-04 and NIP-17 DMs.
 - Use `"*"` only for temporary open testing.
 
 Telegram operator-approval flow:

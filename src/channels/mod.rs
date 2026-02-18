@@ -7,6 +7,7 @@ pub mod irc;
 pub mod lark;
 pub mod matrix;
 pub mod mattermost;
+pub mod nostr;
 pub mod qq;
 pub mod signal;
 pub mod slack;
@@ -23,6 +24,7 @@ pub use irc::IrcChannel;
 pub use lark::LarkChannel;
 pub use matrix::MatrixChannel;
 pub use mattermost::MattermostChannel;
+pub use nostr::NostrChannel;
 pub use qq::QQChannel;
 pub use signal::SignalChannel;
 pub use slack::SlackChannel;
@@ -892,6 +894,7 @@ pub fn handle_command(command: crate::ChannelCommands, config: &Config) -> Resul
                 ("Lark", config.channels_config.lark.is_some()),
                 ("DingTalk", config.channels_config.dingtalk.is_some()),
                 ("QQ", config.channels_config.qq.is_some()),
+                ("Nostr", config.channels_config.nostr.is_some()),
             ] {
                 println!("  {} {name}", if configured { "✅" } else { "❌" });
             }
@@ -1066,6 +1069,15 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 qq.app_secret.clone(),
                 qq.allowed_users.clone(),
             )),
+        ));
+    }
+
+    if let Some(ref ns) = config.channels_config.nostr {
+        channels.push((
+            "Nostr",
+            Arc::new(
+                NostrChannel::new(&ns.private_key, ns.relays.clone(), &ns.allowed_pubkeys).await?,
+            ),
         ));
     }
 
@@ -1374,6 +1386,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
             qq.app_secret.clone(),
             qq.allowed_users.clone(),
         )));
+    }
+
+    if let Some(ref ns) = config.channels_config.nostr {
+        channels.push(Arc::new(
+            NostrChannel::new(&ns.private_key, ns.relays.clone(), &ns.allowed_pubkeys).await?,
+        ));
     }
 
     if channels.is_empty() {

@@ -1482,6 +1482,7 @@ pub struct ChannelsConfig {
     pub lark: Option<LarkConfig>,
     pub dingtalk: Option<DingTalkConfig>,
     pub qq: Option<QQConfig>,
+    pub nostr: Option<NostrConfig>,
 }
 
 impl Default for ChannelsConfig {
@@ -1502,6 +1503,7 @@ impl Default for ChannelsConfig {
             lark: None,
             dingtalk: None,
             qq: None,
+            nostr: None,
         }
     }
 }
@@ -1883,6 +1885,28 @@ pub struct QQConfig {
     pub allowed_users: Vec<String>,
 }
 
+/// Nostr channel configuration (NIP-04 + NIP-17 private messages)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NostrConfig {
+    /// Private key in hex or nsec bech32 format
+    pub private_key: String,
+    /// Relay URLs (wss://). Defaults to popular public relays if omitted.
+    #[serde(default = "default_nostr_relays")]
+    pub relays: Vec<String>,
+    /// Allowed sender public keys (hex or npub). Empty = deny all, "*" = allow all
+    #[serde(default)]
+    pub allowed_pubkeys: Vec<String>,
+}
+
+pub fn default_nostr_relays() -> Vec<String> {
+    vec![
+        "wss://relay.damus.io".to_string(),
+        "wss://nos.lol".to_string(),
+        "wss://relay.primal.net".to_string(),
+        "wss://relay.snort.social".to_string(),
+    ]
+}
+
 // ── Config impl ──────────────────────────────────────────────────
 
 impl Default for Config {
@@ -2097,6 +2121,19 @@ fn decrypt_optional_secret(
     Ok(())
 }
 
+fn decrypt_secret(
+    store: &crate::security::SecretStore,
+    value: &mut String,
+    field_name: &str,
+) -> Result<()> {
+    if crate::security::SecretStore::is_encrypted(value) {
+        *value = store
+            .decrypt(value)
+            .with_context(|| format!("Failed to decrypt {field_name}"))?;
+    }
+    Ok(())
+}
+
 fn encrypt_optional_secret(
     store: &crate::security::SecretStore,
     value: &mut Option<String>,
@@ -2110,6 +2147,19 @@ fn encrypt_optional_secret(
                     .with_context(|| format!("Failed to encrypt {field_name}"))?,
             );
         }
+    }
+    Ok(())
+}
+
+fn encrypt_secret(
+    store: &crate::security::SecretStore,
+    value: &mut String,
+    field_name: &str,
+) -> Result<()> {
+    if !crate::security::SecretStore::is_encrypted(value) {
+        *value = store
+            .encrypt(value)
+            .with_context(|| format!("Failed to encrypt {field_name}"))?;
     }
     Ok(())
 }
@@ -2189,6 +2239,15 @@ impl Config {
             for agent in config.agents.values_mut() {
                 decrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
             }
+
+            if let Some(ref mut ns) = config.channels_config.nostr {
+                decrypt_secret(
+                    &store,
+                    &mut ns.private_key,
+                    "config.channels_config.nostr.private_key",
+                )?;
+            }
+
             config.apply_env_overrides();
             Ok(config)
         } else {
@@ -2402,6 +2461,14 @@ impl Config {
 
         for agent in config_to_save.agents.values_mut() {
             encrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
+        }
+
+        if let Some(ref mut ns) = config_to_save.channels_config.nostr {
+            encrypt_secret(
+                &store,
+                &mut ns.private_key,
+                "config.channels_config.nostr.private_key",
+            )?;
         }
 
         let toml_str =
@@ -2668,6 +2735,7 @@ default_temperature = 0.7
                 lark: None,
                 dingtalk: None,
                 qq: None,
+                nostr: None,
             },
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -3147,6 +3215,7 @@ tool_dispatcher = "xml"
             lark: None,
             dingtalk: None,
             qq: None,
+            nostr: None,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -3310,6 +3379,7 @@ channel_id = "C123"
             lark: None,
             dingtalk: None,
             qq: None,
+            nostr: None,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();

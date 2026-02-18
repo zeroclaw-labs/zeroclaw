@@ -220,6 +220,7 @@ fn has_supervised_channels(config: &Config) -> bool {
         || config.channels_config.irc.is_some()
         || config.channels_config.lark.is_some()
         || config.channels_config.dingtalk.is_some()
+        || config.channels_config.nostr.is_some()
 }
 
 #[cfg(test)]

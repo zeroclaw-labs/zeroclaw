@@ -32,6 +32,7 @@ zeroclaw channel bind-telegram <IDENTITY>
 | `Lark` | `[channels_config.lark]` | `allowed_users` | Manual config |
 | `DingTalk` | `[channels_config.dingtalk]` | `allowed_users` | `zeroclaw onboard` |
 | `QQ` | `[channels_config.qq]` | `allowed_users` | `zeroclaw onboard` |
+| `Nostr` | `[channels_config.nostr]` | `allowed_pubkeys` | `zeroclaw onboard` |
 
 ## Deny-by-Default Rules
 
@@ -90,6 +91,20 @@ allowed_users = ["ou_abc"]
 receive_mode = "websocket"   # or "webhook"
 # port = 3100                  # required only when receive_mode = "webhook"
 ```
+
+### Nostr
+
+```toml
+[channels_config.nostr]
+private_key = "nsec1..."                   # hex or nsec bech32 (encrypted at rest)
+# relays default to relay.damus.io, nos.lol, relay.primal.net, relay.snort.social
+# relays = ["wss://relay.damus.io", "wss://nos.lol"]
+allowed_pubkeys = ["hex-or-npub"]          # empty = deny all, "*" = allow all
+```
+
+Nostr supports both NIP-04 (legacy encrypted DMs) and NIP-17 (gift-wrapped private messages).
+Replies automatically use the same protocol the sender used. The private key is encrypted at rest
+via the `SecretStore` when `secrets.encrypt = true` (the default).
 
 ## Operational Notes
 

@@ -94,6 +94,9 @@ console = "0.16"
 # Hardware discovery (device path globbing)
 glob = "0.3"
 
+# Nostr protocol (NIP-04 + NIP-17 private messages)
+nostr-sdk = { version = "0.44", default-features = false, features = ["nip04", "nip59"] }
+
 # Discord WebSocket gateway
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }

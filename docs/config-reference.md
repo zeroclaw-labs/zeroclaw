@@ -45,6 +45,7 @@ Examples:
 - `[channels_config.discord]`
 - `[channels_config.whatsapp]`
 - `[channels_config.email]`
+- `[channels_config.nostr]`
 
 See detailed channel matrix and allowlist behavior in [channels-reference.md](channels-reference.md).
 
