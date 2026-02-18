@@ -686,7 +686,8 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
         println!("✅ Created directory: {}", config_dir.display());
     }
 
-    if !log_dir.exists() {
+    let created_log_dir = !log_dir.exists();
+    if created_log_dir {
         fs::create_dir_all(log_dir)
             .with_context(|| format!("Failed to create {}", log_dir.display()))?;
         #[cfg(unix)]
@@ -695,7 +696,11 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
             fs::set_permissions(log_dir, fs::Permissions::from_mode(0o750))
                 .with_context(|| format!("Failed to set permissions on {}", log_dir.display()))?;
         }
-        chown_to_zeroclaw(log_dir)?;
+    }
+
+    chown_to_zeroclaw(log_dir)?;
+
+    if created_log_dir {
         println!(
             "✅ Created directory: {} (owned by zeroclaw:zeroclaw)",
             log_dir.display()
