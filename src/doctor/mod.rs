@@ -765,4 +765,44 @@ mod tests {
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.starts_with(".zeroclaw_doctor_probe_")));
     }
+
+    #[test]
+    fn config_validation_reports_delegate_agents_in_sorted_order() {
+        let mut config = Config::default();
+        config.agents.insert(
+            "zeta".into(),
+            crate::config::DelegateAgentConfig {
+                provider: "totally-fake".into(),
+                model: "model-z".into(),
+                system_prompt: None,
+                api_key: None,
+                temperature: None,
+                max_depth: 3,
+            },
+        );
+        config.agents.insert(
+            "alpha".into(),
+            crate::config::DelegateAgentConfig {
+                provider: "totally-fake".into(),
+                model: "model-a".into(),
+                system_prompt: None,
+                api_key: None,
+                temperature: None,
+                max_depth: 3,
+            },
+        );
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+
+        let agent_messages: Vec<_> = items
+            .iter()
+            .filter(|item| item.message.starts_with("agent \""))
+            .map(|item| item.message.as_str())
+            .collect();
+
+        assert_eq!(agent_messages.len(), 2);
+        assert!(agent_messages[0].contains("agent \"alpha\""));
+        assert!(agent_messages[1].contains("agent \"zeta\""));
+    }
 }
