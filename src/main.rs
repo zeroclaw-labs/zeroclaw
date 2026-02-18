@@ -849,7 +849,7 @@ fn format_expiry(profile: &auth::profiles::AuthProfile) -> String {
     match profile
         .token_set
         .as_ref()
-        .and_then(|token_set| token_set.expires_at.as_ref().cloned())
+        .and_then(|token_set| token_set.expires_at)
     {
         Some(ts) => {
             let now = chrono::Utc::now();

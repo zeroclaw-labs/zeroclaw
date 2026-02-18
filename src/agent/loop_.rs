@@ -999,10 +999,10 @@ pub(crate) async fn run_tool_call_loop(
                 let mut chunk = String::new();
                 for word in display_text.split_inclusive(char::is_whitespace) {
                     chunk.push_str(word);
-                    if chunk.len() >= STREAM_CHUNK_MIN_CHARS {
-                        if tx.send(std::mem::take(&mut chunk)).await.is_err() {
-                            break; // receiver dropped
-                        }
+                    if chunk.len() >= STREAM_CHUNK_MIN_CHARS
+                        && tx.send(std::mem::take(&mut chunk)).await.is_err()
+                    {
+                        break; // receiver dropped
                     }
                 }
                 if !chunk.is_empty() {

@@ -369,7 +369,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                     .conversation_histories
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                let turns = histories.entry(history_key).or_insert_with(Vec::new);
+                let turns = histories.entry(history_key).or_default();
                 turns.push(ChatMessage::user(&enriched_message));
                 turns.push(ChatMessage::assistant(&response));
                 // Trim to MAX_CHANNEL_HISTORY (keep recent turns)

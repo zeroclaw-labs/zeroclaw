@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use chrono::Local;
 use parking_lot::Mutex;
 use rusqlite::{params, Connection};
+use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -342,12 +343,12 @@ impl SqliteMemory {
         let mut idx = 1;
 
         if let Some(cat) = category {
-            sql.push_str(&format!(" AND category = ?{idx}"));
+            let _ = write!(sql, " AND category = ?{idx}");
             param_values.push(Box::new(cat.to_string()));
             idx += 1;
         }
         if let Some(sid) = session_id {
-            sql.push_str(&format!(" AND session_id = ?{idx}"));
+            let _ = write!(sql, " AND session_id = ?{idx}");
             param_values.push(Box::new(sid.to_string()));
         }
 
