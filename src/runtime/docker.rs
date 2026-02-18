@@ -248,7 +248,11 @@ mod tests {
             result.is_err(),
             "mounting filesystem root (/) must be refused"
         );
-        assert!(result.unwrap_err().to_string().contains("root"));
+        let error_chain = format!("{:#}", result.unwrap_err());
+        assert!(
+            error_chain.contains("root"),
+            "expected root-mount error chain, got: {error_chain}"
+        );
     }
 
     #[test]
