@@ -1336,6 +1336,7 @@ pub async fn run(
         model: model_name.to_string(),
         duration,
         tokens_used: None,
+        cost_usd: None,
     });
 
     Ok(final_output)

@@ -703,20 +703,94 @@ async fn handle_webhook(
             .await;
     }
 
+    let provider_label = state
+        .config
+        .lock()
+        .default_provider
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    let model_label = state.model.clone();
+    let started_at = Instant::now();
+
+    state
+        .observer
+        .record_event(&crate::observability::ObserverEvent::AgentStart {
+            provider: provider_label.clone(),
+            model: model_label.clone(),
+        });
+    state
+        .observer
+        .record_event(&crate::observability::ObserverEvent::LlmRequest {
+            provider: provider_label.clone(),
+            model: model_label.clone(),
+            messages_count: 1,
+        });
+
     match state
         .provider
         .simple_chat(message, &state.model, state.temperature)
         .await
     {
         Ok(response) => {
+            let duration = started_at.elapsed();
+            state
+                .observer
+                .record_event(&crate::observability::ObserverEvent::LlmResponse {
+                    provider: provider_label.clone(),
+                    model: model_label.clone(),
+                    duration,
+                    success: true,
+                    error_message: None,
+                });
+            state.observer.record_metric(
+                &crate::observability::traits::ObserverMetric::RequestLatency(duration),
+            );
+            state
+                .observer
+                .record_event(&crate::observability::ObserverEvent::AgentEnd {
+                    provider: provider_label,
+                    model: model_label,
+                    duration,
+                    tokens_used: None,
+                    cost_usd: None,
+                });
+
             let body = serde_json::json!({"response": response, "model": state.model});
             (StatusCode::OK, Json(body))
         }
         Err(e) => {
-            tracing::error!(
-                "Webhook provider error: {}",
-                providers::sanitize_api_error(&e.to_string())
+            let duration = started_at.elapsed();
+            let sanitized = providers::sanitize_api_error(&e.to_string());
+
+            state
+                .observer
+                .record_event(&crate::observability::ObserverEvent::LlmResponse {
+                    provider: provider_label.clone(),
+                    model: model_label.clone(),
+                    duration,
+                    success: false,
+                    error_message: Some(sanitized.clone()),
+                });
+            state.observer.record_metric(
+                &crate::observability::traits::ObserverMetric::RequestLatency(duration),
             );
+            state
+                .observer
+                .record_event(&crate::observability::ObserverEvent::Error {
+                    component: "gateway".to_string(),
+                    message: sanitized.clone(),
+                });
+            state
+                .observer
+                .record_event(&crate::observability::ObserverEvent::AgentEnd {
+                    provider: provider_label,
+                    model: model_label,
+                    duration,
+                    tokens_used: None,
+                    cost_usd: None,
+                });
+
+            tracing::error!("Webhook provider error: {}", sanitized);
             let err = serde_json::json!({"error": "LLM request failed"});
             (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
         }
@@ -936,6 +1010,72 @@ mod tests {
     fn app_state_is_clone() {
         fn assert_clone<T: Clone>() {}
         assert_clone::<AppState>();
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_returns_hint_when_prometheus_is_disabled() {
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider: Arc::new(MockProvider::default()),
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            observer: Arc::new(crate::observability::NoopObserver),
+        };
+
+        let response = handle_metrics(State(state)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some(PROMETHEUS_CONTENT_TYPE)
+        );
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("Prometheus backend not enabled"));
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_renders_prometheus_output() {
+        let prom = Arc::new(crate::observability::PrometheusObserver::new());
+        crate::observability::Observer::record_event(
+            prom.as_ref(),
+            &crate::observability::ObserverEvent::HeartbeatTick,
+        );
+
+        let observer: Arc<dyn crate::observability::Observer> = prom;
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider: Arc::new(MockProvider::default()),
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            observer,
+        };
+
+        let response = handle_metrics(State(state)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("zeroclaw_heartbeat_ticks_total 1"));
     }
 
     #[test]
