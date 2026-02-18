@@ -2078,6 +2078,12 @@ impl Config {
                 "config.browser.computer_use.api_key",
             )?;
 
+            decrypt_optional_secret(
+                &store,
+                &mut config.web_search.brave_api_key,
+                "config.web_search.brave_api_key",
+            )?;
+
             for agent in config.agents.values_mut() {
                 decrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
             }
@@ -2182,6 +2188,55 @@ impl Config {
                 }
             }
         }
+
+        // Web search enabled: ZEROCLAW_WEB_SEARCH_ENABLED or WEB_SEARCH_ENABLED
+        if let Ok(enabled) = std::env::var("ZEROCLAW_WEB_SEARCH_ENABLED")
+            .or_else(|_| std::env::var("WEB_SEARCH_ENABLED"))
+        {
+            self.web_search.enabled = enabled == "1" || enabled.eq_ignore_ascii_case("true");
+        }
+
+        // Web search provider: ZEROCLAW_WEB_SEARCH_PROVIDER or WEB_SEARCH_PROVIDER
+        if let Ok(provider) = std::env::var("ZEROCLAW_WEB_SEARCH_PROVIDER")
+            .or_else(|_| std::env::var("WEB_SEARCH_PROVIDER"))
+        {
+            let provider = provider.trim();
+            if !provider.is_empty() {
+                self.web_search.provider = provider.to_string();
+            }
+        }
+
+        // Brave API key: ZEROCLAW_BRAVE_API_KEY or BRAVE_API_KEY
+        if let Ok(api_key) =
+            std::env::var("ZEROCLAW_BRAVE_API_KEY").or_else(|_| std::env::var("BRAVE_API_KEY"))
+        {
+            let api_key = api_key.trim();
+            if !api_key.is_empty() {
+                self.web_search.brave_api_key = Some(api_key.to_string());
+            }
+        }
+
+        // Web search max results: ZEROCLAW_WEB_SEARCH_MAX_RESULTS or WEB_SEARCH_MAX_RESULTS
+        if let Ok(max_results) = std::env::var("ZEROCLAW_WEB_SEARCH_MAX_RESULTS")
+            .or_else(|_| std::env::var("WEB_SEARCH_MAX_RESULTS"))
+        {
+            if let Ok(max_results) = max_results.parse::<usize>() {
+                if (1..=10).contains(&max_results) {
+                    self.web_search.max_results = max_results;
+                }
+            }
+        }
+
+        // Web search timeout: ZEROCLAW_WEB_SEARCH_TIMEOUT_SECS or WEB_SEARCH_TIMEOUT_SECS
+        if let Ok(timeout_secs) = std::env::var("ZEROCLAW_WEB_SEARCH_TIMEOUT_SECS")
+            .or_else(|_| std::env::var("WEB_SEARCH_TIMEOUT_SECS"))
+        {
+            if let Ok(timeout_secs) = timeout_secs.parse::<u64>() {
+                if timeout_secs > 0 {
+                    self.web_search.timeout_secs = timeout_secs;
+                }
+            }
+        }
     }
 
     pub fn save(&self) -> Result<()> {
@@ -2204,6 +2259,12 @@ impl Config {
             &store,
             &mut config_to_save.browser.computer_use.api_key,
             "config.browser.computer_use.api_key",
+        )?;
+
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.web_search.brave_api_key,
+            "config.web_search.brave_api_key",
         )?;
 
         for agent in config_to_save.agents.values_mut() {
@@ -2469,6 +2530,7 @@ default_temperature = 0.7
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             http_request: HttpRequestConfig::default(),
+            web_search: WebSearchConfig::default(),
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
@@ -2579,6 +2641,7 @@ tool_dispatcher = "xml"
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             http_request: HttpRequestConfig::default(),
+            web_search: WebSearchConfig::default(),
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
@@ -2619,6 +2682,7 @@ tool_dispatcher = "xml"
         config.api_key = Some("root-credential".into());
         config.composio.api_key = Some("composio-credential".into());
         config.browser.computer_use.api_key = Some("browser-credential".into());
+        config.web_search.brave_api_key = Some("brave-credential".into());
 
         config.agents.insert(
             "worker".into(),
@@ -2658,6 +2722,15 @@ tool_dispatcher = "xml"
         assert_eq!(
             store.decrypt(browser_encrypted).unwrap(),
             "browser-credential"
+        );
+
+        let web_search_encrypted = stored.web_search.brave_api_key.as_deref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(
+            web_search_encrypted
+        ));
+        assert_eq!(
+            store.decrypt(web_search_encrypted).unwrap(),
+            "brave-credential"
         );
 
         let worker = stored.agents.get("worker").unwrap();
@@ -3759,6 +3832,54 @@ default_model = "legacy-model"
         assert_eq!(config.gateway.port, original_port);
 
         std::env::remove_var("PORT");
+    }
+
+    #[test]
+    fn env_override_web_search_config() {
+        let _env_guard = env_override_test_guard();
+        let mut config = Config::default();
+
+        std::env::set_var("WEB_SEARCH_ENABLED", "false");
+        std::env::set_var("WEB_SEARCH_PROVIDER", "brave");
+        std::env::set_var("WEB_SEARCH_MAX_RESULTS", "7");
+        std::env::set_var("WEB_SEARCH_TIMEOUT_SECS", "20");
+        std::env::set_var("BRAVE_API_KEY", "brave-test-key");
+
+        config.apply_env_overrides();
+
+        assert!(!config.web_search.enabled);
+        assert_eq!(config.web_search.provider, "brave");
+        assert_eq!(config.web_search.max_results, 7);
+        assert_eq!(config.web_search.timeout_secs, 20);
+        assert_eq!(
+            config.web_search.brave_api_key.as_deref(),
+            Some("brave-test-key")
+        );
+
+        std::env::remove_var("WEB_SEARCH_ENABLED");
+        std::env::remove_var("WEB_SEARCH_PROVIDER");
+        std::env::remove_var("WEB_SEARCH_MAX_RESULTS");
+        std::env::remove_var("WEB_SEARCH_TIMEOUT_SECS");
+        std::env::remove_var("BRAVE_API_KEY");
+    }
+
+    #[test]
+    fn env_override_web_search_invalid_values_ignored() {
+        let _env_guard = env_override_test_guard();
+        let mut config = Config::default();
+        let original_max_results = config.web_search.max_results;
+        let original_timeout = config.web_search.timeout_secs;
+
+        std::env::set_var("WEB_SEARCH_MAX_RESULTS", "99");
+        std::env::set_var("WEB_SEARCH_TIMEOUT_SECS", "0");
+
+        config.apply_env_overrides();
+
+        assert_eq!(config.web_search.max_results, original_max_results);
+        assert_eq!(config.web_search.timeout_secs, original_timeout);
+
+        std::env::remove_var("WEB_SEARCH_MAX_RESULTS");
+        std::env::remove_var("WEB_SEARCH_TIMEOUT_SECS");
     }
 
     #[test]
