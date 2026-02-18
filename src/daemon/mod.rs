@@ -71,6 +71,25 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         ));
     }
 
+    if config.nodes.enabled {
+        let nodes_cfg = config.clone();
+        handles.push(spawn_component_supervisor(
+            "nodes",
+            initial_backoff,
+            max_backoff,
+            move || {
+                let cfg = nodes_cfg.clone();
+                async move {
+                    let server = crate::nodes::NodeServer::new(cfg.nodes);
+                    server.start().await
+                }
+            },
+        ));
+    } else {
+        crate::health::mark_component_ok("nodes");
+        tracing::info!("Nodes disabled; node server not started");
+    }
+
     if config.cron.enabled {
         let scheduler_cfg = config.clone();
         handles.push(spawn_component_supervisor(

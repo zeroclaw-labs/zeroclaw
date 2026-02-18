@@ -71,6 +71,9 @@ rand = "0.9"
 # Fast mutexes that don't poison on panic
 parking_lot = "0.12"
 
+# System information for node monitoring
+sysinfo = "0.33"
+
 # Async traits
 async-trait = "0.1"
 

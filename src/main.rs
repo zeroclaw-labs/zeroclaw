@@ -58,6 +58,7 @@ mod identity;
 mod integrations;
 mod memory;
 mod migration;
+mod nodes;
 mod observability;
 mod onboard;
 mod peripherals;
@@ -239,6 +240,34 @@ enum Commands {
         #[command(subcommand)]
         peripheral_command: zeroclaw::PeripheralCommands,
     },
+
+    /// Manage remote nodes for multi-node management
+    Node {
+        #[command(subcommand)]
+        node_command: NodeCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum NodeCommands {
+    /// Generate a pairing code for node connection
+    GenerateCode,
+    /// Connect this node to a remote gateway
+    Connect {
+        /// Gateway WebSocket URL (e.g. ws://gateway-host:8765)
+        #[arg(long)]
+        server: String,
+
+        /// 6-digit pairing code
+        #[arg(long)]
+        code: String,
+
+        /// Node name (default: hostname)
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// List connected nodes
+    List,
 }
 
 #[derive(Subcommand, Debug)]
@@ -710,7 +739,89 @@ async fn main() -> Result<()> {
         Commands::Peripheral { peripheral_command } => {
             peripherals::handle_command(peripheral_command.clone(), &config)
         }
+
+        Commands::Node { node_command } => {
+            handle_node_command(node_command, &config).await
+        }
     }
+}
+
+async fn handle_node_command(command: NodeCommands, config: &Config) -> Result<()> {
+    match command {
+        NodeCommands::GenerateCode => {
+            if !config.nodes.enabled {
+                anyhow::bail!("Nodes are not enabled. Set [nodes] enabled = true in config.toml");
+            }
+
+            let server = crate::nodes::NodeServer::new(config.nodes.clone());
+            let code = server.generate_pairing_code();
+
+            println!("✅ Pairing code generated: {}", code);
+            println!("⏰ Expires in {} seconds", config.nodes.pairing_timeout_secs);
+            println!();
+            println!("On your remote node, run:");
+            println!("  zeroclaw node connect --server ws://{}:{} --code {}",
+                config.gateway.host,
+                config.nodes.listen_port,
+                code
+            );
+        }
+
+        NodeCommands::Connect { server, code, name } => {
+            let hostname = hostname::get()
+                .ok()
+                .and_then(|h| h.into_string().ok())
+                .unwrap_or_else(|| "unknown".to_string());
+
+            let node_name = name.unwrap_or_else(|| hostname.clone());
+
+            let platform = if cfg!(target_os = "windows") {
+                "windows".to_string()
+            } else if cfg!(target_os = "macos") {
+                "macos".to_string()
+            } else {
+                "linux".to_string()
+            };
+
+            let client = crate::nodes::connect_to_server(
+                server,
+                node_name,
+                Some(hostname),
+                platform,
+            );
+
+            println!("🔗 Connecting to {}", server);
+            let node_id = client.connect_with_code(code).await?;
+
+            println!("✅ Connected as node: {}", node_id);
+            println!("🚀 Starting node loop...");
+
+            client.run().await?;
+        }
+
+        NodeCommands::List => {
+            if !config.nodes.enabled {
+                anyhow::bail!("Nodes are not enabled. Set [nodes] enabled = true in config.toml");
+            }
+
+            let server = crate::nodes::NodeServer::new(config.nodes.clone());
+            let nodes = server.list_nodes();
+
+            if nodes.is_empty() {
+                println!("No nodes connected");
+            } else {
+                println!("Connected nodes:");
+                for node in nodes {
+                    println!("  - {} ({})", node.name, node.id);
+                    println!("    Platform: {}", node.platform);
+                    println!("    Hostname: {}", node.hostname.unwrap_or_else(|| "N/A".to_string()));
+                    println!("    Connected: {}", node.connected_at);
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -100,6 +100,72 @@ pub struct Config {
     /// Hardware configuration (wizard-driven physical world setup).
     #[serde(default)]
     pub hardware: HardwareConfig,
+
+    /// Node management configuration for multi-node support.
+    #[serde(default)]
+    pub nodes: NodesConfig,
+}
+
+// ── Nodes Config ────────────────────────────────────────────────
+
+/// Configuration for multi-node management via WebSocket.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodesConfig {
+    /// Enable node server
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// WebSocket listen port
+    #[serde(default = "default_nodes_port")]
+    pub listen_port: u16,
+
+    /// Pairing timeout in seconds
+    #[serde(default = "default_pairing_timeout")]
+    pub pairing_timeout_secs: u64,
+
+    /// Maximum number of concurrent node connections (default: 100)
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
+
+    /// Authorized nodes (optional, for pre-authorization)
+    #[serde(default)]
+    pub authorized: Vec<AuthorizedNode>,
+}
+
+/// Authorized node configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthorizedNode {
+    /// Node ID
+    pub id: String,
+    /// Node name
+    pub name: String,
+    /// Optional public key for authentication
+    #[serde(default)]
+    pub public_key: Option<String>,
+}
+
+fn default_nodes_port() -> u16 {
+    8765
+}
+
+fn default_pairing_timeout() -> u64 {
+    300
+}
+
+fn default_max_connections() -> usize {
+    100
+}
+
+impl Default for NodesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_port: default_nodes_port(),
+            pairing_timeout_secs: default_pairing_timeout(),
+            max_connections: default_max_connections(),
+            authorized: vec![],
+        }
+    }
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -1852,6 +1918,7 @@ impl Default for Config {
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            nodes: NodesConfig::default(),
             query_classification: QueryClassificationConfig::default(),
         }
     }

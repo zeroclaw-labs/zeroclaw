@@ -19,6 +19,9 @@ pub mod image_info;
 pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
+pub mod nodes_list;
+pub mod nodes_run;
+pub mod nodes_status;
 pub mod pushover;
 pub mod schedule;
 pub mod schema;
@@ -48,6 +51,9 @@ pub use image_info::ImageInfoTool;
 pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
+pub use nodes_list::NodesListTool;
+pub use nodes_run::NodesRunTool;
+pub use nodes_status::NodesStatusTool;
 pub use pushover::PushoverTool;
 pub use schedule::ScheduleTool;
 #[allow(unused_imports)]
@@ -229,6 +235,14 @@ pub fn all_tools_with_runtime(
             delegate_fallback_credential,
             security.clone(),
         )));
+    }
+
+    // Add node management tools when enabled
+    if config.nodes.enabled {
+        let node_server = Arc::new(crate::nodes::NodeServer::new(config.nodes.clone()));
+        tools.push(Box::new(NodesListTool::new(node_server.clone())));
+        tools.push(Box::new(NodesRunTool::new(node_server.clone())));
+        tools.push(Box::new(NodesStatusTool::new(node_server)));
     }
 
     tools
