@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use directories::UserDirs;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
