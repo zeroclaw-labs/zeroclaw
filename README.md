@@ -776,7 +776,7 @@ See [aieos.org](https://aieos.org) for the full schema and live examples.
 | `service` | Manage user-level background service |
 | `doctor` | Diagnose daemon/scheduler/channel freshness |
 | `status` | Show full system status |
-| `cron` | Manage scheduled tasks (`list/add/add-at/add-every/once/remove/pause/resume`) |
+| `cron` | Manage scheduled tasks (`list/add/add-at/add-every/once/remove/update/pause/resume`) |
 | `models` | Refresh provider model catalogs (`models refresh`) |
 | `providers` | List supported providers and aliases |
 | `channel` | List/start/doctor channels and bind Telegram identities |
