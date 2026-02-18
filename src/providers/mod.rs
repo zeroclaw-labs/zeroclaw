@@ -308,6 +308,8 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "vercel" | "vercel-ai" => vec!["VERCEL_API_KEY"],
         "cloudflare" | "cloudflare-ai" => vec!["CLOUDFLARE_API_KEY"],
         "astrai" => vec!["ASTRAI_API_KEY"],
+        "codex" | "openai-codex" => vec!["OPENAI_CODEX_TOKEN", "CHATGPT_TOKEN", "OPENAI_API_KEY"],
+        "antigravity" | "google-antigravity" => vec!["GOOGLE_ANTIGRAVITY_TOKEN"],
         _ => vec![],
     };
 
@@ -501,6 +503,27 @@ pub fn create_provider_with_url(
         "astrai" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Astrai", "https://as-trai.com/v1", key, AuthStyle::Bearer,
         ))),
+
+        // ── OAuth-authenticated providers ────────────────────
+        "codex" | "openai-codex" => {
+            // OpenAI Codex uses ChatGPT backend API with Bearer token
+            let codex_key = key.map(|k| k.to_string()).or_else(|| {
+                crate::auth::codex_oauth::try_load_cached_token()
+            });
+            Ok(Box::new(OpenAiCompatibleProvider::new(
+                "OpenAI Codex",
+                "https://chatgpt.com/backend-api",
+                codex_key.as_deref(),
+                AuthStyle::Bearer,
+            )))
+        }
+        "antigravity" | "google-antigravity" => {
+            // Google Antigravity uses Cloudcode PA endpoint (Anthropic-compatible API via Google)
+            let ag_key = key.map(|k| k.to_string()).or_else(|| {
+                crate::auth::antigravity_oauth::try_load_cached_token()
+            });
+            Ok(Box::new(gemini::GeminiProvider::new(ag_key.as_deref())))
+        }
 
         // ── Bring Your Own Provider (custom URL) ───────────
         // Format: "custom:https://your-api.com" or "custom:http://localhost:1234"
