@@ -479,10 +479,7 @@ pub fn create_provider_with_url(
             Ok(Box::new(copilot::CopilotProvider::new(api_key)))
         },
         "google-antigravity" | "antigravity" => {
-            Ok(Box::new(anthropic::AnthropicProvider::with_base_url_bearer(
-                key,
-                Some("https://cloudcode-pa.googleapis.com"),
-            )))
+            Ok(Box::new(gemini::GeminiProvider::with_antigravity_token(key)))
         }
         "lmstudio" | "lm-studio" => {
             let lm_studio_key = api_key
@@ -980,6 +977,12 @@ mod tests {
         assert!(create_provider("google-gemini", Some("test-key")).is_ok());
         // Should also work without key (will try CLI auth)
         assert!(create_provider("gemini", None).is_ok());
+    }
+
+    #[test]
+    fn factory_google_antigravity() {
+        assert!(create_provider("google-antigravity", Some("oauth-token")).is_ok());
+        assert!(create_provider("antigravity", Some("oauth-token")).is_ok());
     }
 
     // ── OpenAI-compatible providers ──────────────────────────

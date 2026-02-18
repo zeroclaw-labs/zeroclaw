@@ -3,7 +3,7 @@
 //! - Gemini CLI OAuth tokens (reuse existing ~/.gemini/ authentication)
 //! - Google Cloud ADC (`GOOGLE_APPLICATION_CREDENTIALS`)
 
-use crate::providers::traits::Provider;
+use crate::providers::traits::{ChatMessage, Provider};
 use async_trait::async_trait;
 use directories::UserDirs;
 use reqwest::Client;
@@ -13,6 +13,7 @@ use std::path::PathBuf;
 /// Gemini provider supporting multiple authentication methods.
 pub struct GeminiProvider {
     auth: Option<GeminiAuth>,
+    antigravity_project_id: Option<String>,
     client: Client,
 }
 
@@ -28,6 +29,10 @@ enum GeminiAuth {
     EnvGoogleKey(String),
     /// OAuth access token from Gemini CLI: sent as `Authorization: Bearer`.
     OAuthToken(String),
+    /// Google Antigravity OAuth token: Bearer auth against the
+    /// `daily-cloudcode-pa.sandbox.googleapis.com` endpoint with standard
+    /// Gemini `generateContent` URL format.
+    AntigravityToken(String),
 }
 
 impl GeminiAuth {
@@ -39,18 +44,14 @@ impl GeminiAuth {
         )
     }
 
-    /// Whether this credential is an OAuth token from Gemini CLI.
-    fn is_oauth(&self) -> bool {
-        matches!(self, GeminiAuth::OAuthToken(_))
-    }
-
     /// The raw credential string.
     fn credential(&self) -> &str {
         match self {
             GeminiAuth::ExplicitKey(s)
             | GeminiAuth::EnvGeminiKey(s)
             | GeminiAuth::EnvGoogleKey(s)
-            | GeminiAuth::OAuthToken(s) => s,
+            | GeminiAuth::OAuthToken(s)
+            | GeminiAuth::AntigravityToken(s) => s,
         }
     }
 }
@@ -68,26 +69,42 @@ struct GenerateContentRequest {
     generation_config: GenerationConfig,
 }
 
-/// Request envelope for the internal cloudcode-pa API.
-/// OAuth tokens from Gemini CLI are scoped for this endpoint.
+/// Inner request body nested under `request` in the internal cloudcode-pa API.
+/// Mirrors `VertexGenerateContentRequest` from the Gemini CLI source.
 #[derive(Debug, Serialize)]
-struct InternalGenerateContentRequest {
-    model: String,
+struct InternalRequestBody {
+    contents: Vec<Content>,
     #[serde(rename = "generationConfig")]
     generation_config: GenerationConfig,
-    contents: Vec<Content>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "systemInstruction", skip_serializing_if = "Option::is_none")]
     system_instruction: Option<Content>,
 }
 
+/// Outer request envelope for the internal cloudcode-pa API (`/v1internal:generateContent`).
+///
+/// Mirrors `CAGenerateContentRequest` from the Gemini CLI source:
+/// ```json
+/// { "model": "...", "project": "...", "request": { "contents": [...], "generationConfig": {...} } }
+/// ```
+/// The `generationConfig` / `contents` / `systemInstruction` fields must be nested under
+/// `request`, not at the top level — sending them at the top level results in 400
+/// "Unknown name" errors.
 #[derive(Debug, Serialize)]
+struct InternalGenerateContentRequest {
+    model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
+    request: InternalRequestBody,
+}
+
+#[derive(Debug, Serialize, Clone)]
 struct Content {
     #[serde(skip_serializing_if = "Option::is_none")]
     role: Option<String>,
     parts: Vec<Part>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct Part {
     text: String,
 }
@@ -143,6 +160,16 @@ const CLOUDCODE_PA_ENDPOINT: &str = "https://cloudcode-pa.googleapis.com/v1inter
 /// Public API endpoint for API key users.
 const PUBLIC_API_ENDPOINT: &str = "https://generativelanguage.googleapis.com/v1beta";
 
+/// Antigravity API endpoint for Google Cloud Code Assist.
+/// Uses the same `v1internal:generateContent` format as Gemini CLI OAuth,
+/// but routed to the sandbox endpoint.
+const ANTIGRAVITY_ENDPOINT: &str = "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal";
+const CODE_ASSIST_USER_AGENT: &str = "google-api-rust-client/0.1";
+const CODE_ASSIST_API_CLIENT: &str = "google-cloud-sdk vscode_cloudshelleditor/0.1";
+const CODE_ASSIST_CLIENT_METADATA: &str =
+    r#"{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}"#;
+const ANTIGRAVITY_PROJECT_ID_FILE: &str = "google_antigravity_project_id";
+
 impl GeminiProvider {
     /// Create a new Gemini provider.
     ///
@@ -161,6 +188,29 @@ impl GeminiProvider {
 
         Self {
             auth: resolved_auth,
+            antigravity_project_id: None,
+            client: Client::builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| Client::new()),
+        }
+    }
+
+    /// Create a Gemini provider with a Google Antigravity OAuth token.
+    ///
+    /// Routes requests through `daily-cloudcode-pa.sandbox.googleapis.com`
+    /// using the standard Gemini `models/{model}:generateContent` URL format
+    /// with Bearer auth. This endpoint serves both Anthropic (Claude) and
+    /// Gemini models via the Google Cloud Code Assist API.
+    pub fn with_antigravity_token(token: Option<&str>) -> Self {
+        let resolved_auth = token
+            .and_then(Self::normalize_non_empty)
+            .map(GeminiAuth::AntigravityToken);
+
+        Self {
+            auth: resolved_auth,
+            antigravity_project_id: Self::resolve_antigravity_project_id(),
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
                 .connect_timeout(std::time::Duration::from_secs(10))
@@ -182,6 +232,61 @@ impl GeminiProvider {
         std::env::var(name)
             .ok()
             .and_then(|value| Self::normalize_non_empty(&value))
+    }
+
+    fn resolve_antigravity_project_id() -> Option<String> {
+        Self::load_non_empty_env("GOOGLE_ANTIGRAVITY_PROJECT_ID")
+            .or_else(|| Self::load_non_empty_env("GOOGLE_CLOUD_PROJECT"))
+            .or_else(|| Self::load_non_empty_env("GCLOUD_PROJECT"))
+            .or_else(Self::load_antigravity_project_id_from_file)
+    }
+
+    fn load_antigravity_project_id_from_file() -> Option<String> {
+        let default_dir = crate::config::schema::default_config_dir().ok()?;
+        let config_dir = match crate::config::schema::resolve_active_config_dir(&default_dir) {
+            Some(dir) => {
+                tracing::debug!(
+                    config_dir = %dir.display(),
+                    "Using active workspace config directory for Antigravity project ID"
+                );
+                dir
+            }
+            None => {
+                tracing::debug!(
+                    default_dir = %default_dir.display(),
+                    "No active workspace marker found, using default config directory"
+                );
+                default_dir
+            }
+        };
+        let path = config_dir.join(ANTIGRAVITY_PROJECT_ID_FILE);
+        match std::fs::read_to_string(&path) {
+            Ok(content) => Self::normalize_non_empty(&content),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                tracing::debug!(
+                    path = %path.display(),
+                    "Antigravity project ID file not found"
+                );
+                None
+            }
+            Err(err) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    error = %err,
+                    "Failed to read Antigravity project ID file"
+                );
+                None
+            }
+        }
+    }
+
+    fn apply_internal_headers(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        request
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header("User-Agent", CODE_ASSIST_USER_AGENT)
+            .header("X-Goog-Api-Client", CODE_ASSIST_API_CLIENT)
+            .header("Client-Metadata", CODE_ASSIST_CLIENT_METADATA)
     }
 
     /// Try to load OAuth access token from Gemini CLI's cached credentials.
@@ -237,6 +342,7 @@ impl GeminiProvider {
             Some(GeminiAuth::EnvGeminiKey(_)) => "GEMINI_API_KEY env var",
             Some(GeminiAuth::EnvGoogleKey(_)) => "GOOGLE_API_KEY env var",
             Some(GeminiAuth::OAuthToken(_)) => "Gemini CLI OAuth",
+            Some(GeminiAuth::AntigravityToken(_)) => "Google Antigravity OAuth",
             None => "none",
         }
     }
@@ -266,6 +372,11 @@ impl GeminiProvider {
                 // not the URL path.
                 format!("{CLOUDCODE_PA_ENDPOINT}:generateContent")
             }
+            GeminiAuth::AntigravityToken(_) => {
+                // Antigravity uses the same v1internal format as Gemini CLI,
+                // with the model in the request body, not the URL path.
+                format!("{ANTIGRAVITY_ENDPOINT}:generateContent")
+            }
             _ => {
                 let model_name = Self::format_model_name(model);
                 let base_url = format!("{PUBLIC_API_ENDPOINT}/{model_name}:generateContent");
@@ -279,6 +390,37 @@ impl GeminiProvider {
         }
     }
 
+    /// Build an `InternalGenerateContentRequest` for the `/v1internal:generateContent` endpoint.
+    ///
+    /// The correct shape (matching `CAGenerateContentRequest` in Gemini CLI) is:
+    /// ```json
+    /// {
+    ///   "model": "models/...",
+    ///   "project": "<optional>",
+    ///   "request": {
+    ///     "contents": [...],
+    ///     "generationConfig": {...},
+    ///     "systemInstruction": {...}
+    ///   }
+    /// }
+    /// ```
+    /// Sending `contents`/`generationConfig` at the top level causes 400 "Unknown name" errors.
+    fn build_internal_request(
+        request: &GenerateContentRequest,
+        model: &str,
+        project_id: Option<&str>,
+    ) -> InternalGenerateContentRequest {
+        InternalGenerateContentRequest {
+            model: Self::format_model_name(model),
+            project: project_id.map(ToString::to_string),
+            request: InternalRequestBody {
+                contents: request.contents.clone(),
+                generation_config: request.generation_config.clone(),
+                system_instruction: request.system_instruction.clone(),
+            },
+        }
+    }
+
     fn build_generate_content_request(
         &self,
         auth: &GeminiAuth,
@@ -287,43 +429,149 @@ impl GeminiProvider {
         model: &str,
     ) -> reqwest::RequestBuilder {
         match auth {
-            GeminiAuth::OAuthToken(token) => {
-                // Internal API expects the model in the request body envelope
-                let internal_request = InternalGenerateContentRequest {
-                    model: Self::format_model_name(model),
-                    generation_config: request.generation_config.clone(),
-                    contents: request
-                        .contents
-                        .iter()
-                        .map(|c| Content {
-                            role: c.role.clone(),
-                            parts: c
-                                .parts
-                                .iter()
-                                .map(|p| Part {
-                                    text: p.text.clone(),
-                                })
-                                .collect(),
-                        })
-                        .collect(),
-                    system_instruction: request.system_instruction.as_ref().map(|si| Content {
-                        role: si.role.clone(),
-                        parts: si
-                            .parts
-                            .iter()
-                            .map(|p| Part {
-                                text: p.text.clone(),
-                            })
-                            .collect(),
-                    }),
+            GeminiAuth::OAuthToken(token) | GeminiAuth::AntigravityToken(token) => {
+                // Internal Code Assist API: model + nested `request` envelope.
+                // Antigravity may include a project ID; standard OAuth does not.
+                let project_id = if matches!(auth, GeminiAuth::AntigravityToken(_)) {
+                    self.antigravity_project_id.as_deref()
+                } else {
+                    None
                 };
-                self.client
-                    .post(url)
-                    .json(&internal_request)
+                let internal = Self::build_internal_request(request, model, project_id);
+                Self::apply_internal_headers(self.client.post(url))
+                    .json(&internal)
                     .bearer_auth(token)
             }
             _ => self.client.post(url).json(request),
         }
+    }
+
+    /// Convert ChatMessage slice to Gemini API format.
+    ///
+    /// System messages become `system_instruction` (first one wins).
+    /// Assistant messages map to `"model"` role (Gemini convention).
+    /// Tool results map to `"user"` role (non-native-tool mode).
+    fn convert_chat_messages(messages: &[ChatMessage]) -> (Option<Content>, Vec<Content>) {
+        let mut system_instruction: Option<Content> = None;
+        let mut contents: Vec<Content> = Vec::new();
+
+        for msg in messages {
+            match msg.role.as_str() {
+                "system" => {
+                    if system_instruction.is_none() {
+                        system_instruction = Some(Content {
+                            role: None,
+                            parts: vec![Part {
+                                text: msg.content.clone(),
+                            }],
+                        });
+                    }
+                }
+                "assistant" => {
+                    // Gemini API uses "model" role for assistant messages.
+                    contents.push(Content {
+                        role: Some("model".to_string()),
+                        parts: vec![Part {
+                            text: msg.content.clone(),
+                        }],
+                    });
+                }
+                "tool" => {
+                    // Tool results are sent as user messages in non-native-tool mode.
+                    contents.push(Content {
+                        role: Some("user".to_string()),
+                        parts: vec![Part {
+                            text: msg.content.clone(),
+                        }],
+                    });
+                }
+                _ => {
+                    // "user" and any other role → user message
+                    contents.push(Content {
+                        role: Some("user".to_string()),
+                        parts: vec![Part {
+                            text: msg.content.clone(),
+                        }],
+                    });
+                }
+            }
+        }
+
+        (system_instruction, contents)
+    }
+
+    /// Process a Gemini API response, handling errors and extracting text.
+    ///
+    /// Shared by `chat_with_system` and `chat_with_history` to avoid
+    /// duplicating error-handling logic (401/403 specializations, sanitization).
+    async fn handle_response(
+        &self,
+        response: reqwest::Response,
+        auth: &GeminiAuth,
+    ) -> anyhow::Result<String> {
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_default();
+            let sanitized = crate::providers::sanitize_api_error(&error_text);
+            tracing::debug!(
+                %status,
+                error_text = %sanitized,
+                "Gemini API returned error"
+            );
+
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                match auth {
+                    GeminiAuth::AntigravityToken(_) => {
+                        anyhow::bail!(
+                            "Google Antigravity OAuth token invalid or expired (401 Unauthorized). \
+                             Re-run `zeroclaw onboard --interactive` to refresh login, \
+                             or set a fresh GOOGLE_ANTIGRAVITY_ACCESS_TOKEN."
+                        );
+                    }
+                    GeminiAuth::OAuthToken(_) => {
+                        anyhow::bail!(
+                            "Gemini CLI OAuth token invalid or expired (401 Unauthorized). \
+                             Re-run `gemini` to refresh ~/.gemini/oauth_creds.json."
+                        );
+                    }
+                    _ => {}
+                }
+            }
+
+            if status == reqwest::StatusCode::FORBIDDEN
+                && matches!(auth, GeminiAuth::AntigravityToken(_))
+                && (error_text.contains("SUBSCRIPTION_REQUIRED")
+                    || error_text.contains("Gemini Code Assist license"))
+            {
+                let project = self
+                    .antigravity_project_id
+                    .as_deref()
+                    .unwrap_or("auto-detected");
+                anyhow::bail!(
+                    "Google Antigravity project lacks Gemini Code Assist license \
+                     (403 Forbidden SUBSCRIPTION_REQUIRED). Current project: {project}. \
+                     Request license: https://cloud.google.com/gemini/docs/codeassist/request-license \
+                     . If you have another licensed project, set GOOGLE_ANTIGRAVITY_PROJECT_ID."
+                );
+            }
+
+            anyhow::bail!("Gemini API error ({status}): {sanitized}");
+        }
+
+        let result: GenerateContentResponse = response.json().await?;
+
+        // Check for API error in response body
+        if let Some(err) = result.error {
+            anyhow::bail!("Gemini API error: {}", err.message);
+        }
+
+        // Extract text from response
+        result
+            .candidates
+            .and_then(|c| c.into_iter().next())
+            .and_then(|c| c.content.parts.into_iter().next())
+            .and_then(|p| p.text)
+            .ok_or_else(|| anyhow::anyhow!("No response from Gemini"))
     }
 }
 
@@ -375,33 +623,87 @@ impl Provider for GeminiProvider {
             .send()
             .await?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Gemini API error ({status}): {error_text}");
-        }
-
-        let result: GenerateContentResponse = response.json().await?;
-
-        // Check for API error in response body
-        if let Some(err) = result.error {
-            anyhow::bail!("Gemini API error: {}", err.message);
-        }
-
-        // Extract text from response
-        result
-            .candidates
-            .and_then(|c| c.into_iter().next())
-            .and_then(|c| c.content.parts.into_iter().next())
-            .and_then(|p| p.text)
-            .ok_or_else(|| anyhow::anyhow!("No response from Gemini"))
+        self.handle_response(response, auth).await
     }
+
+    async fn chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<String> {
+        let auth = self.auth.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Gemini API key not found. Options:\n\
+                 1. Set GEMINI_API_KEY env var\n\
+                 2. Run `gemini` CLI to authenticate (tokens will be reused)\n\
+                 3. Get an API key from https://aistudio.google.com/app/apikey\n\
+                 4. Run `zeroclaw onboard` to configure"
+            )
+        })?;
+
+        let (system_instruction, contents) = Self::convert_chat_messages(messages);
+
+        if contents.is_empty() {
+            anyhow::bail!("No user or assistant messages provided");
+        }
+
+        let request = GenerateContentRequest {
+            contents,
+            system_instruction,
+            generation_config: GenerationConfig {
+                temperature,
+                max_output_tokens: 8192,
+            },
+        };
+
+        let url = Self::build_generate_content_url(model, auth);
+
+        let response = self
+            .build_generate_content_request(auth, &url, &request, model)
+            .send()
+            .await?;
+
+        self.handle_response(response, auth).await
+    }
+
+    // TODO: Implement native function calling for Gemini/Antigravity.
+    //
+    // The Antigravity endpoint (cloudcode-pa.googleapis.com/v1internal) supports
+    // Gemini-format function calling (functionDeclarations / functionCall / functionResponse).
+    // Verified via gemini-cli issues: https://github.com/google-gemini/gemini-cli/issues/9535
+    //
+    // To enable native tool calling:
+    // 1. Add `tools` field (Vec<FunctionDeclaration>) to GenerateContentRequest / InternalRequestBody
+    // 2. Add `functionCall` field to ResponsePart
+    // 3. Override `supports_native_tools() -> true`
+    // 4. Implement `chat_with_tools()` converting OpenAI-format tool defs to functionDeclarations
+    // 5. Parse functionCall responses into ChatResponse::tool_calls
+    // 6. Handle functionResponse in convert_chat_messages (role mapping)
+    //
+    // Until implemented, agent loop uses prompt-based tool calling (functional but less reliable).
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use reqwest::header::AUTHORIZATION;
+
+    fn make_test_request() -> GenerateContentRequest {
+        GenerateContentRequest {
+            contents: vec![Content {
+                role: Some("user".into()),
+                parts: vec![Part {
+                    text: "hello".into(),
+                }],
+            }],
+            system_instruction: None,
+            generation_config: GenerationConfig {
+                temperature: 0.7,
+                max_output_tokens: 8192,
+            },
+        }
+    }
 
     #[test]
     fn normalize_non_empty_trims_and_filters() {
@@ -449,6 +751,7 @@ mod tests {
     fn auth_source_explicit_key() {
         let provider = GeminiProvider {
             auth: Some(GeminiAuth::ExplicitKey("key".into())),
+            antigravity_project_id: None,
             client: Client::new(),
         };
         assert_eq!(provider.auth_source(), "config");
@@ -458,6 +761,7 @@ mod tests {
     fn auth_source_none_without_credentials() {
         let provider = GeminiProvider {
             auth: None,
+            antigravity_project_id: None,
             client: Client::new(),
         };
         assert_eq!(provider.auth_source(), "none");
@@ -467,6 +771,7 @@ mod tests {
     fn auth_source_oauth() {
         let provider = GeminiProvider {
             auth: Some(GeminiAuth::OAuthToken("ya29.mock".into())),
+            antigravity_project_id: None,
             client: Client::new(),
         };
         assert_eq!(provider.auth_source(), "Gemini CLI OAuth");
@@ -513,23 +818,12 @@ mod tests {
     fn oauth_request_uses_bearer_auth_header() {
         let provider = GeminiProvider {
             auth: Some(GeminiAuth::OAuthToken("ya29.mock-token".into())),
+            antigravity_project_id: None,
             client: Client::new(),
         };
         let auth = GeminiAuth::OAuthToken("ya29.mock-token".into());
         let url = GeminiProvider::build_generate_content_url("gemini-2.0-flash", &auth);
-        let body = GenerateContentRequest {
-            contents: vec![Content {
-                role: Some("user".into()),
-                parts: vec![Part {
-                    text: "hello".into(),
-                }],
-            }],
-            system_instruction: None,
-            generation_config: GenerationConfig {
-                temperature: 0.7,
-                max_output_tokens: 8192,
-            },
-        };
+        let body = make_test_request();
 
         let request = provider
             .build_generate_content_request(&auth, &url, &body, "gemini-2.0-flash")
@@ -549,23 +843,12 @@ mod tests {
     fn api_key_request_does_not_set_bearer_header() {
         let provider = GeminiProvider {
             auth: Some(GeminiAuth::ExplicitKey("api-key-123".into())),
+            antigravity_project_id: None,
             client: Client::new(),
         };
         let auth = GeminiAuth::ExplicitKey("api-key-123".into());
         let url = GeminiProvider::build_generate_content_url("gemini-2.0-flash", &auth);
-        let body = GenerateContentRequest {
-            contents: vec![Content {
-                role: Some("user".into()),
-                parts: vec![Part {
-                    text: "hello".into(),
-                }],
-            }],
-            system_instruction: None,
-            generation_config: GenerationConfig {
-                temperature: 0.7,
-                max_output_tokens: 8192,
-            },
-        };
+        let body = make_test_request();
 
         let request = provider
             .build_generate_content_request(&auth, &url, &body, "gemini-2.0-flash")
@@ -573,6 +856,100 @@ mod tests {
             .unwrap();
 
         assert!(request.headers().get(AUTHORIZATION).is_none());
+    }
+
+    #[test]
+    fn auth_source_antigravity() {
+        let provider = GeminiProvider {
+            auth: Some(GeminiAuth::AntigravityToken("ya29.test".into())),
+            antigravity_project_id: None,
+            client: Client::new(),
+        };
+        assert_eq!(provider.auth_source(), "Google Antigravity OAuth");
+    }
+
+    #[test]
+    fn antigravity_url_uses_sandbox_endpoint_v1internal() {
+        let auth = GeminiAuth::AntigravityToken("ya29.test-token".into());
+        let url = GeminiProvider::build_generate_content_url("claude-opus-4-6-thinking", &auth);
+        assert!(url.starts_with("https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal"));
+        assert!(url.ends_with(":generateContent"));
+        // v1internal format: model is in the body, not the URL
+        assert!(!url.contains("models/"));
+        assert!(!url.contains("?key="));
+    }
+
+    #[test]
+    fn antigravity_request_uses_internal_body_with_bearer() {
+        let provider = GeminiProvider {
+            auth: Some(GeminiAuth::AntigravityToken(
+                "ya29.antigravity-token".into(),
+            )),
+            antigravity_project_id: None,
+            client: Client::new(),
+        };
+        let auth = GeminiAuth::AntigravityToken("ya29.antigravity-token".into());
+        let url = GeminiProvider::build_generate_content_url("claude-opus-4-6-thinking", &auth);
+        let body = make_test_request();
+
+        let request = provider
+            .build_generate_content_request(&auth, &url, &body, "claude-opus-4-6-thinking")
+            .build()
+            .unwrap();
+
+        // Verify Bearer auth header
+        assert_eq!(
+            request
+                .headers()
+                .get(AUTHORIZATION)
+                .and_then(|h| h.to_str().ok()),
+            Some("Bearer ya29.antigravity-token")
+        );
+
+        // Verify InternalGenerateContentRequest body (model in body)
+        let req_body = request.body().unwrap().as_bytes().unwrap();
+        let body_str = std::str::from_utf8(req_body).unwrap();
+        assert!(body_str.contains("\"generationConfig\""));
+        assert!(body_str.contains("\"contents\""));
+        assert!(body_str.contains("\"model\":\"models/claude-opus-4-6-thinking\""));
+    }
+
+    #[test]
+    fn antigravity_request_includes_project_when_configured() {
+        let provider = GeminiProvider {
+            auth: Some(GeminiAuth::AntigravityToken(
+                "ya29.antigravity-token".into(),
+            )),
+            antigravity_project_id: Some("licensed-project-123".into()),
+            client: Client::new(),
+        };
+        let auth = GeminiAuth::AntigravityToken("ya29.antigravity-token".into());
+        let url = GeminiProvider::build_generate_content_url("gemini-3-flash", &auth);
+        let body = make_test_request();
+
+        let request = provider
+            .build_generate_content_request(&auth, &url, &body, "gemini-3-flash")
+            .build()
+            .unwrap();
+
+        let req_body = request.body().unwrap().as_bytes().unwrap();
+        let body_str = std::str::from_utf8(req_body).unwrap();
+        assert!(body_str.contains("\"project\":\"licensed-project-123\""));
+    }
+
+    #[test]
+    fn with_antigravity_token_creates_antigravity_auth() {
+        let provider = GeminiProvider::with_antigravity_token(Some("ya29.test"));
+        assert!(matches!(
+            provider.auth,
+            Some(GeminiAuth::AntigravityToken(ref t)) if t == "ya29.test"
+        ));
+    }
+
+    #[test]
+    fn with_antigravity_token_rejects_empty() {
+        let provider = GeminiProvider::with_antigravity_token(Some(""));
+        assert!(provider.auth.is_none());
     }
 
     #[test]
@@ -604,26 +981,36 @@ mod tests {
     }
 
     #[test]
-    fn internal_request_includes_model() {
+    fn internal_request_includes_model_nested_under_request() {
         let request = InternalGenerateContentRequest {
             model: "models/gemini-3-pro-preview".to_string(),
-            generation_config: GenerationConfig {
-                temperature: 0.7,
-                max_output_tokens: 8192,
-            },
-            contents: vec![Content {
-                role: Some("user".to_string()),
-                parts: vec![Part {
-                    text: "Hello".to_string(),
+            project: None,
+            request: InternalRequestBody {
+                generation_config: GenerationConfig {
+                    temperature: 0.7,
+                    max_output_tokens: 8192,
+                },
+                contents: vec![Content {
+                    role: Some("user".to_string()),
+                    parts: vec![Part {
+                        text: "Hello".to_string(),
+                    }],
                 }],
-            }],
-            system_instruction: None,
+                system_instruction: None,
+            },
         };
 
         let json = serde_json::to_string(&request).unwrap();
+        // Model is at top level
         assert!(json.contains("\"model\":\"models/gemini-3-pro-preview\""));
+        // Contents and generationConfig are nested under "request"
+        assert!(json.contains("\"request\":{"));
         assert!(json.contains("\"role\":\"user\""));
         assert!(json.contains("\"temperature\":0.7"));
+        // Must NOT have contents/generationConfig at top level
+        assert!(
+            !json.starts_with("{\"model\":\"models/gemini-3-pro-preview\",\"generationConfig\"")
+        );
     }
 
     #[test]
@@ -664,5 +1051,61 @@ mod tests {
         let response: GenerateContentResponse = serde_json::from_str(json).unwrap();
         assert!(response.error.is_some());
         assert_eq!(response.error.unwrap().message, "Invalid API key");
+    }
+
+    #[test]
+    fn convert_chat_messages_maps_roles_correctly() {
+        let messages = vec![
+            ChatMessage::system("Be helpful"),
+            ChatMessage::user("Hello"),
+            ChatMessage::assistant("Hi there"),
+            ChatMessage::user("What is 2+2?"),
+        ];
+        let (system, contents) = GeminiProvider::convert_chat_messages(&messages);
+
+        assert!(system.is_some());
+        assert_eq!(system.unwrap().parts[0].text, "Be helpful");
+        // 3 non-system messages: user, model (assistant), user
+        assert_eq!(contents.len(), 3);
+        assert_eq!(contents[0].role.as_deref(), Some("user"));
+        assert_eq!(contents[1].role.as_deref(), Some("model"));
+        assert_eq!(contents[2].role.as_deref(), Some("user"));
+    }
+
+    #[test]
+    fn convert_chat_messages_tool_becomes_user() {
+        let messages = vec![
+            ChatMessage::user("Use a tool"),
+            ChatMessage::tool("{\"result\": \"done\"}"),
+        ];
+        let (system, contents) = GeminiProvider::convert_chat_messages(&messages);
+
+        assert!(system.is_none());
+        assert_eq!(contents.len(), 2);
+        assert_eq!(contents[0].role.as_deref(), Some("user"));
+        assert_eq!(contents[1].role.as_deref(), Some("user"));
+        assert_eq!(contents[1].parts[0].text, "{\"result\": \"done\"}");
+    }
+
+    #[test]
+    fn convert_chat_messages_empty_returns_empty() {
+        let (system, contents) = GeminiProvider::convert_chat_messages(&[]);
+        assert!(system.is_none());
+        assert!(contents.is_empty());
+    }
+
+    #[test]
+    fn convert_chat_messages_multiple_system_uses_first() {
+        let messages = vec![
+            ChatMessage::system("First system"),
+            ChatMessage::user("Hello"),
+            ChatMessage::system("Second system"),
+        ];
+        let (system, contents) = GeminiProvider::convert_chat_messages(&messages);
+
+        assert!(system.is_some());
+        assert_eq!(system.unwrap().parts[0].text, "First system");
+        // Second system message is ignored; only user message in contents
+        assert_eq!(contents.len(), 1);
     }
 }
