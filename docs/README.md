@@ -1,0 +1,78 @@
+# ZeroClaw Documentation Hub
+
+This page is the primary entry point for the documentation system.
+
+Last refreshed: **February 18, 2026**.
+
+Localized hubs: [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Русский](README.ru.md).
+
+## Start Here
+
+| I want to… | Read this |
+|---|---|
+| Install and run ZeroClaw quickly | [README.md (Quick Start)](../README.md#quick-start) |
+| Bootstrap in one command | [one-click-bootstrap.md](one-click-bootstrap.md) |
+| Find commands by task | [commands-reference.md](commands-reference.md) |
+| Check config defaults and keys quickly | [config-reference.md](config-reference.md) |
+| Operate runtime (day-2 runbook) | [operations-runbook.md](operations-runbook.md) |
+| Troubleshoot install/runtime/channel issues | [troubleshooting.md](troubleshooting.md) |
+| Browse docs by category | [SUMMARY.md](SUMMARY.md) |
+| See project PR/issue docs snapshot | [project-triage-snapshot-2026-02-18.md](project-triage-snapshot-2026-02-18.md) |
+
+## Quick Decision Tree (10 seconds)
+
+- Need first-time setup or install? → [getting-started/README.md](getting-started/README.md)
+- Need exact CLI/config keys? → [reference/README.md](reference/README.md)
+- Need production/service operations? → [operations/README.md](operations/README.md)
+- Seeing failures or regressions? → [troubleshooting.md](troubleshooting.md)
+- Working on security hardening or roadmap? → [security/README.md](security/README.md)
+- Working with boards/peripherals? → [hardware/README.md](hardware/README.md)
+- Contributing/reviewing/CI workflow? → [contributing/README.md](contributing/README.md)
+- Want the full map? → [SUMMARY.md](SUMMARY.md)
+
+## Collections (Recommended)
+
+- Getting started: [getting-started/README.md](getting-started/README.md)
+- Reference catalogs: [reference/README.md](reference/README.md)
+- Operations & deployment: [operations/README.md](operations/README.md)
+- Security docs: [security/README.md](security/README.md)
+- Hardware/peripherals: [hardware/README.md](hardware/README.md)
+- Contributing/CI: [contributing/README.md](contributing/README.md)
+- Project snapshots: [project/README.md](project/README.md)
+
+## By Audience
+
+### Users / Operators
+
+- [commands-reference.md](commands-reference.md) — command lookup by workflow
+- [providers-reference.md](providers-reference.md) — provider IDs, aliases, credential env vars
+- [channels-reference.md](channels-reference.md) — channel capabilities and setup paths
+- [config-reference.md](config-reference.md) — high-signal config keys and secure defaults
+- [operations-runbook.md](operations-runbook.md) — day-2 runtime operations and rollback flow
+- [troubleshooting.md](troubleshooting.md) — common failure signatures and recovery steps
+
+### Contributors / Maintainers
+
+- [../CONTRIBUTING.md](../CONTRIBUTING.md)
+- [pr-workflow.md](pr-workflow.md)
+- [reviewer-playbook.md](reviewer-playbook.md)
+- [ci-map.md](ci-map.md)
+- [actions-source-policy.md](actions-source-policy.md)
+
+### Security / Reliability
+
+> Note: this area includes proposal/roadmap docs. For current behavior, start with [config-reference.md](config-reference.md), [operations-runbook.md](operations-runbook.md), and [troubleshooting.md](troubleshooting.md).
+
+- [security/README.md](security/README.md)
+- [agnostic-security.md](agnostic-security.md)
+- [frictionless-security.md](frictionless-security.md)
+- [sandboxing.md](sandboxing.md)
+- [audit-logging.md](audit-logging.md)
+- [resource-limits.md](resource-limits.md)
+- [security-roadmap.md](security-roadmap.md)
+
+## System Navigation & Governance
+
+- Unified TOC: [SUMMARY.md](SUMMARY.md)
+- Documentation inventory/classification: [docs-inventory.md](docs-inventory.md)
+- Project triage snapshot: [project-triage-snapshot-2026-02-18.md](project-triage-snapshot-2026-02-18.md)

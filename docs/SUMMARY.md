@@ -1,0 +1,72 @@
+# ZeroClaw Docs Summary (Unified TOC)
+
+This file is the canonical table of contents for the documentation system.
+
+Last refreshed: **February 18, 2026**.
+
+## Language Entry
+
+- English README: [../README.md](../README.md)
+- Chinese README: [../README.zh-CN.md](../README.zh-CN.md)
+- Japanese README: [../README.ja.md](../README.ja.md)
+- Russian README: [../README.ru.md](../README.ru.md)
+- English Docs Hub: [README.md](README.md)
+- Chinese Docs Hub: [README.zh-CN.md](README.zh-CN.md)
+- Japanese Docs Hub: [README.ja.md](README.ja.md)
+- Russian Docs Hub: [README.ru.md](README.ru.md)
+
+## Collections
+
+### 1) Getting Started
+
+- [getting-started/README.md](getting-started/README.md)
+- [one-click-bootstrap.md](one-click-bootstrap.md)
+
+### 2) Command/Config References
+
+- [reference/README.md](reference/README.md)
+- [commands-reference.md](commands-reference.md)
+- [providers-reference.md](providers-reference.md)
+- [channels-reference.md](channels-reference.md)
+- [config-reference.md](config-reference.md)
+
+### 3) Operations & Deployment
+
+- [operations/README.md](operations/README.md)
+- [operations-runbook.md](operations-runbook.md)
+- [troubleshooting.md](troubleshooting.md)
+- [network-deployment.md](network-deployment.md)
+- [mattermost-setup.md](mattermost-setup.md)
+
+### 4) Security Design & Proposals
+
+- [security/README.md](security/README.md)
+- [agnostic-security.md](agnostic-security.md)
+- [frictionless-security.md](frictionless-security.md)
+- [sandboxing.md](sandboxing.md)
+- [resource-limits.md](resource-limits.md)
+- [audit-logging.md](audit-logging.md)
+- [security-roadmap.md](security-roadmap.md)
+
+### 5) Hardware & Peripherals
+
+- [hardware/README.md](hardware/README.md)
+- [hardware-peripherals-design.md](hardware-peripherals-design.md)
+- [adding-boards-and-tools.md](adding-boards-and-tools.md)
+- [nucleo-setup.md](nucleo-setup.md)
+- [arduino-uno-q-setup.md](arduino-uno-q-setup.md)
+
+### 6) Contribution & CI
+
+- [contributing/README.md](contributing/README.md)
+- [../CONTRIBUTING.md](../CONTRIBUTING.md)
+- [pr-workflow.md](pr-workflow.md)
+- [reviewer-playbook.md](reviewer-playbook.md)
+- [ci-map.md](ci-map.md)
+- [actions-source-policy.md](actions-source-policy.md)
+
+### 7) Project Status & Snapshot
+
+- [project/README.md](project/README.md)
+- [project-triage-snapshot-2026-02-18.md](project-triage-snapshot-2026-02-18.md)
+- [docs-inventory.md](docs-inventory.md)

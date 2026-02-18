@@ -19,11 +19,41 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 </p>
 
 <p align="center">
+  🌐 <strong>Languages:</strong> <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.ru.md">Русский</a>
+</p>
+
+<p align="center">
+  <a href="#quick-start">Getting Started</a> |
+  <a href="bootstrap.sh">One-Click Setup</a> |
+  <a href="docs/README.md">Documentation</a> |
+  <a href="docs/SUMMARY.md">Docs TOC</a> |
+  <a href="docs/commands-reference.md">Commands</a> |
+  <a href="docs/config-reference.md">Config</a> |
+  <a href="docs/providers-reference.md">Providers</a> |
+  <a href="docs/channels-reference.md">Channels</a> |
+  <a href="docs/operations-runbook.md">Runbook</a> |
+  <a href="docs/troubleshooting.md">Troubleshooting</a> |
+  <a href="CONTRIBUTING.md">Contributing</a> |
+  <a href="SECURITY.md">Security</a>
+</p>
+
+<p align="center">
+  <strong>Quick Routes:</strong>
+  <a href="docs/getting-started/README.md">Setup</a> ·
+  <a href="docs/reference/README.md">Reference</a> ·
+  <a href="docs/operations/README.md">Operations</a> ·
+  <a href="docs/troubleshooting.md">Troubleshoot</a> ·
+  <a href="docs/security/README.md">Security</a> ·
+  <a href="docs/hardware/README.md">Hardware</a> ·
+  <a href="docs/contributing/README.md">Contribute</a>
+</p>
+
+<p align="center">
   <strong>Fast, small, and fully autonomous AI assistant infrastructure</strong><br />
   Deploy anywhere. Swap anything.
 </p>
 
-<p align="center"><code>~3.4MB binary · &lt;10ms startup · 1,017 tests · 23+ providers · 8 traits · Pluggable everything</code></p>
+<p align="center"><code>Trait-driven architecture · secure-by-default runtime · provider/channel/tool swappable · pluggable everything</code></p>
 
 ### ✨ Features
 
@@ -39,25 +69,11 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 - **Fully swappable:** core systems are traits (providers, channels, tools, memory, tunnels).
 - **No lock-in:** OpenAI-compatible provider support + pluggable custom endpoints.
 
-## Benchmark Snapshot (ZeroClaw vs OpenClaw)
+## Benchmark Snapshot (Reproducible)
 
-Local machine quick benchmark (macOS arm64, Feb 2026) normalized for 0.8GHz edge hardware.
+Benchmark claims can drift as code and toolchains evolve, so this section focuses on reproducible local measurement.
 
-| | OpenClaw | NanoBot | PicoClaw | ZeroClaw 🦀 |
-|---|---|---|---|---|
-| **Language** | TypeScript | Python | Go | **Rust** |
-| **RAM** | > 1GB | > 100MB | < 10MB | **< 5MB** |
-| **Startup (0.8GHz core)** | > 500s | > 30s | < 1s | **< 10ms** |
-| **Binary Size** | ~28MB (dist) | N/A (Scripts) | ~8MB | **3.4 MB** |
-| **Cost** | Mac Mini $599 | Linux SBC ~$50 | Linux Board $10 | **Any hardware $10** |
-
-> Notes: ZeroClaw results measured with `/usr/bin/time -l` on release builds. OpenClaw requires Node.js runtime (~390MB overhead). PicoClaw and ZeroClaw are static binaries.
-
-<p align="center">
-  <img src="zero-claw.jpeg" alt="ZeroClaw vs OpenClaw Comparison" width="800" />
-</p>
-
-Reproduce ZeroClaw numbers locally:
+Measure your current build locally:
 
 ```bash
 cargo build --release
@@ -66,6 +82,12 @@ ls -lh target/release/zeroclaw
 /usr/bin/time -l target/release/zeroclaw --help
 /usr/bin/time -l target/release/zeroclaw status
 ```
+
+Example sample (macOS arm64, measured on February 18, 2026):
+
+- Release binary size: `8.8M`
+- `zeroclaw --help`: about `0.02s` real time, ~`3.9MB` peak memory footprint
+- `zeroclaw status`: about `0.01s` real time, ~`4.1MB` peak memory footprint
 
 ## Prerequisites
 
@@ -139,6 +161,29 @@ curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/scripts
 
 ## Quick Start
 
+### One-click bootstrap
+
+```bash
+# Recommended: clone then run local bootstrap script
+git clone https://github.com/zeroclaw-labs/zeroclaw.git
+cd zeroclaw
+./bootstrap.sh
+
+# Optional: bootstrap dependencies + Rust on fresh machines
+./bootstrap.sh --install-system-deps --install-rust
+
+# Optional: run onboarding in the same flow
+./bootstrap.sh --onboard --api-key "sk-..." --provider openrouter
+```
+
+Remote one-liner (review first in security-sensitive environments):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/scripts/bootstrap.sh | bash
+```
+
+Details: [`docs/one-click-bootstrap.md`](docs/one-click-bootstrap.md) (toolchain mode may request `sudo` for system packages).
+
 ```bash
 git clone https://github.com/zeroclaw-labs/zeroclaw.git
 cd zeroclaw
@@ -164,7 +209,7 @@ zeroclaw agent -m "Hello, ZeroClaw!"
 zeroclaw agent
 
 # Start the gateway (webhook server)
-zeroclaw gateway                # default: 127.0.0.1:8080
+zeroclaw gateway                # default: 127.0.0.1:3000
 zeroclaw gateway --port 0       # random port (security hardened)
 
 # Start full autonomous runtime
@@ -255,18 +300,18 @@ Every subsystem is a **trait** — swap implementations with a config change, ze
 
 | Subsystem | Trait | Ships with | Extend |
 |-----------|-------|------------|--------|
-| **AI Models** | `Provider` | 23+ providers (OpenRouter, Anthropic, OpenAI, Ollama, Venice, Groq, Mistral, xAI, DeepSeek, Together, Fireworks, Perplexity, Cohere, Bedrock, Astrai, etc.) | `custom:https://your-api.com` — any OpenAI-compatible API |
-| **Channels** | `Channel` | CLI, Telegram, Discord, Slack, Mattermost, iMessage, Matrix, WhatsApp, Webhook | Any messaging API |
-| **Memory** | `Memory` | SQLite with hybrid search (FTS5 + vector cosine similarity), Lucid bridge (CLI sync + SQLite fallback), Markdown | Any persistence backend |
-| **Tools** | `Tool` | shell, file_read, file_write, memory_store, memory_recall, memory_forget, browser_open (Brave + allowlist), browser (agent-browser / rust-native), composio (optional) | Any capability |
+| **AI Models** | `Provider` | Provider catalog via `zeroclaw providers` (currently 28 built-ins + aliases, plus custom endpoints) | `custom:https://your-api.com` (OpenAI-compatible) or `anthropic-custom:https://your-api.com` |
+| **Channels** | `Channel` | CLI, Telegram, Discord, Slack, Mattermost, iMessage, Matrix, Signal, WhatsApp, Email, IRC, Lark, DingTalk, QQ, Webhook | Any messaging API |
+| **Memory** | `Memory` | SQLite hybrid search, Lucid bridge, Markdown files, explicit `none` backend, snapshot/hydrate, optional response cache | Any persistence backend |
+| **Tools** | `Tool` | shell/file/memory, cron/schedule, git, pushover, browser, http_request, screenshot/image_info, composio (opt-in), delegate, hardware tools | Any capability |
 | **Observability** | `Observer` | Noop, Log, Multi | Prometheus, OTel |
-| **Runtime** | `RuntimeAdapter` | Native, Docker (sandboxed) | WASM (planned; unsupported kinds fail fast) |
+| **Runtime** | `RuntimeAdapter` | Native, Docker (sandboxed) | Additional runtimes can be added via adapter; unsupported kinds fail fast |
 | **Security** | `SecurityPolicy` | Gateway pairing, sandbox, allowlists, rate limits, filesystem scoping, encrypted secrets | — |
 | **Identity** | `IdentityConfig` | OpenClaw (markdown), AIEOS v1.1 (JSON) | Any identity format |
 | **Tunnel** | `Tunnel` | None, Cloudflare, Tailscale, ngrok, Custom | Any tunnel binary |
 | **Heartbeat** | Engine | HEARTBEAT.md periodic tasks | — |
 | **Skills** | Loader | TOML manifests + SKILL.md instructions | Community skill packs |
-| **Integrations** | Registry | 50+ integrations across 9 categories | Plugin system |
+| **Integrations** | Registry | 70+ integrations across 9 categories | Plugin system |
 
 ### Runtime support (current)
 
@@ -295,7 +340,7 @@ The agent automatically recalls, saves, and manages memory via tools.
 [memory]
 backend = "sqlite"          # "sqlite", "lucid", "markdown", "none"
 auto_save = true
-embedding_provider = "openai"
+embedding_provider = "none"  # "none", "openai", "custom:https://..."
 vector_weight = 0.7
 keyword_weight = 0.3
 
@@ -328,7 +373,7 @@ ZeroClaw enforces security at **every layer** — not just the sandbox. It passe
 
 > **Run your own nmap:** `nmap -p 1-65535 <your-host>` — ZeroClaw binds to localhost only, so nothing is exposed unless you explicitly configure a tunnel.
 
-### Channel allowlists (Telegram / Discord / Slack / Mattermost)
+### Channel allowlists (deny-by-default)
 
 Inbound sender policy is now consistent:
 
@@ -412,7 +457,7 @@ WhatsApp uses Meta's Cloud API with webhooks (push-based, not polling):
 
 4. **Start the gateway with a tunnel:**
    ```bash
-   zeroclaw gateway --port 8080
+   zeroclaw gateway --port 3000
    ```
    WhatsApp requires HTTPS, so use a tunnel (ngrok, Cloudflare, Tailscale Funnel).
 
@@ -431,7 +476,7 @@ Config: `~/.zeroclaw/config.toml` (created by `onboard`)
 ```toml
 api_key = "sk-..."
 default_provider = "openrouter"
-default_model = "anthropic/claude-sonnet-4-20250514"
+default_model = "anthropic/claude-sonnet-4"
 default_temperature = 0.7
 
 # Custom OpenAI-compatible endpoint
@@ -443,13 +488,15 @@ default_temperature = 0.7
 [memory]
 backend = "sqlite"              # "sqlite", "lucid", "markdown", "none"
 auto_save = true
-embedding_provider = "openai"   # "openai", "noop"
+embedding_provider = "none"     # "none", "openai", "custom:https://..."
 vector_weight = 0.7
 keyword_weight = 0.3
 
 # backend = "none" disables persistent memory via no-op backend
 
 [gateway]
+port = 3000                      # default
+host = "127.0.0.1"              # default
 require_pairing = true          # require pairing code on first connect
 allow_public_bind = false       # refuse 0.0.0.0 without tunnel
 
@@ -652,28 +699,32 @@ See [aieos.org](https://aieos.org) for the full schema and live examples.
 |----------|--------|------|-------------|
 | `/health` | GET | None | Health check (always public, no secrets leaked) |
 | `/pair` | POST | `X-Pairing-Code` header | Exchange one-time code for bearer token |
-| `/webhook` | POST | `Authorization: Bearer <token>` | Send message: `{"message": "your prompt"}` |
+| `/webhook` | POST | `Authorization: Bearer <token>` | Send message: `{"message": "your prompt"}`; optional `X-Idempotency-Key` |
 | `/whatsapp` | GET | Query params | Meta webhook verification (hub.mode, hub.verify_token, hub.challenge) |
-| `/whatsapp` | POST | None (Meta signature) | WhatsApp incoming message webhook |
+| `/whatsapp` | POST | Meta signature (`X-Hub-Signature-256`) when app secret is configured | WhatsApp incoming message webhook |
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
 | `onboard` | Quick setup (default) |
-| `onboard --interactive` | Full interactive 7-step wizard |
-| `onboard --channels-only` | Reconfigure channels/allowlists only (fast repair flow) |
-| `agent -m "..."` | Single message mode |
-| `agent` | Interactive chat mode |
-| `gateway` | Start webhook server (default: `127.0.0.1:8080`) |
-| `gateway --port 0` | Random port mode |
+| `agent` | Interactive or single-message chat mode |
+| `gateway` | Start webhook server (default: `127.0.0.1:3000`) |
 | `daemon` | Start long-running autonomous runtime |
-| `service install/start/stop/status/uninstall` | Manage user-level background service |
+| `service` | Manage user-level background service |
 | `doctor` | Diagnose daemon/scheduler/channel freshness |
 | `status` | Show full system status |
-| `channel doctor` | Run health checks for configured channels |
-| `channel bind-telegram <IDENTITY>` | Add one Telegram username/user ID to allowlist |
-| `integrations info <name>` | Show setup/status details for one integration |
+| `cron` | Manage scheduled tasks (`list/add/add-at/add-every/once/remove/pause/resume`) |
+| `models` | Refresh provider model catalogs (`models refresh`) |
+| `providers` | List supported providers and aliases |
+| `channel` | List/start/doctor channels and bind Telegram identities |
+| `integrations` | Inspect integration setup details |
+| `skills` | List/install/remove skills |
+| `migrate` | Import data from other runtimes (`migrate openclaw`) |
+| `hardware` | USB discover/introspect/info commands |
+| `peripheral` | Manage and flash hardware peripherals |
+
+For a task-oriented command guide, see [`docs/commands-reference.md`](docs/commands-reference.md).
 
 ## Development
 
@@ -681,8 +732,8 @@ See [aieos.org](https://aieos.org) for the full schema and live examples.
 cargo build              # Dev build
 cargo build --release    # Release build (codegen-units=1, works on all devices including Raspberry Pi)
 cargo build --profile release-fast    # Faster build (codegen-units=8, requires 16GB+ RAM)
-cargo test               # 1,017 tests
-cargo clippy             # Lint (0 warnings)
+cargo test               # Run full test suite
+cargo clippy --locked --all-targets -- -D clippy::correctness
 cargo fmt                # Format
 
 # Run the SQLite vs Markdown benchmark
@@ -717,7 +768,20 @@ git push --no-verify
 
 ## Collaboration & Docs
 
-For high-throughput collaboration and consistent reviews:
+Start from the docs hub for a task-based map:
+
+- Documentation hub: [`docs/README.md`](docs/README.md)
+- Unified docs TOC: [`docs/SUMMARY.md`](docs/SUMMARY.md)
+- Commands reference: [`docs/commands-reference.md`](docs/commands-reference.md)
+- Config reference: [`docs/config-reference.md`](docs/config-reference.md)
+- Providers reference: [`docs/providers-reference.md`](docs/providers-reference.md)
+- Channels reference: [`docs/channels-reference.md`](docs/channels-reference.md)
+- Operations runbook: [`docs/operations-runbook.md`](docs/operations-runbook.md)
+- Troubleshooting: [`docs/troubleshooting.md`](docs/troubleshooting.md)
+- Docs inventory/classification: [`docs/docs-inventory.md`](docs/docs-inventory.md)
+- PR/Issue triage snapshot (as of February 18, 2026): [`docs/project-triage-snapshot-2026-02-18.md`](docs/project-triage-snapshot-2026-02-18.md)
+
+Core collaboration references:
 
 - Contribution guide: [CONTRIBUTING.md](CONTRIBUTING.md)
 - PR workflow policy: [docs/pr-workflow.md](docs/pr-workflow.md)

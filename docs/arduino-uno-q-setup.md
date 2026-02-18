@@ -130,7 +130,7 @@ allowed_users = ["*"]
 
 [gateway]
 host = "127.0.0.1"
-port = 8080
+port = 3000
 allow_public_bind = false
 
 [agent]
@@ -145,7 +145,7 @@ compact_context = true
 ssh arduino@<UNO_Q_IP>
 
 # Run daemon (Telegram polling works over WiFi)
-zeroclaw daemon --host 127.0.0.1 --port 8080
+zeroclaw daemon --host 127.0.0.1 --port 3000
 ```
 
 **At this point:** Telegram chat works. Send messages to your bot — ZeroClaw responds. No GPIO yet.
@@ -184,7 +184,7 @@ transport = "bridge"
 ### 5.3 Run ZeroClaw
 
 ```bash
-zeroclaw daemon --host 127.0.0.1 --port 8080
+zeroclaw daemon --host 127.0.0.1 --port 3000
 ```
 
 Now when you message your Telegram bot *"Turn on the LED"* or *"Set pin 13 high"*, ZeroClaw uses `gpio_write` via the Bridge.
@@ -203,7 +203,7 @@ Now when you message your Telegram bot *"Turn on the LED"* or *"Set pin 13 high"
 | 6 | `cargo build --release --no-default-features` |
 | 7 | `zeroclaw onboard --api-key KEY --provider openrouter` |
 | 8 | Edit `~/.zeroclaw/config.toml` (add Telegram bot_token) |
-| 9 | `zeroclaw daemon --host 127.0.0.1 --port 8080` |
+| 9 | `zeroclaw daemon --host 127.0.0.1 --port 3000` |
 | 10 | Message your Telegram bot — it responds |
 
 ---

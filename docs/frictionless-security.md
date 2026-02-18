@@ -1,5 +1,10 @@
 # Frictionless Security: Zero Impact on Wizard
 
+> ⚠️ **Status: Proposal / Roadmap**
+>
+> This document describes proposed approaches and may include hypothetical commands or config.
+> For current runtime behavior, see [config-reference.md](config-reference.md), [operations-runbook.md](operations-runbook.md), and [troubleshooting.md](troubleshooting.md).
+
 ## Core Principle
 > **"Security features should be like airbags — present, protective, and invisible until needed."**
 
