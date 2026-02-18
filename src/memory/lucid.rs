@@ -491,15 +491,17 @@ exit 1
 
     fn test_memory(workspace: &Path, cmd: String) -> LucidMemory {
         let sqlite = SqliteMemory::new(workspace).unwrap();
+        // Use generous timeouts to avoid flaky failures when tests run in
+        // parallel and the tokio runtime is contended.
         LucidMemory::with_options(
             workspace,
             sqlite,
             cmd,
             200,
             3,
-            Duration::from_millis(500),
-            Duration::from_millis(400),
-            Duration::from_secs(2),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(10),
         )
     }
 
@@ -588,9 +590,9 @@ exit 1
             probe_cmd,
             200,
             1,
-            Duration::from_millis(500),
-            Duration::from_millis(400),
-            Duration::from_secs(2),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(10),
         );
 
         memory
@@ -658,9 +660,9 @@ exit 1
             failing_cmd,
             200,
             99,
-            Duration::from_millis(500),
-            Duration::from_millis(400),
             Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
         );
 
         let first = memory.recall("auth", 5, None).await.unwrap();

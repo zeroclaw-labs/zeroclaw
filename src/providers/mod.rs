@@ -380,6 +380,20 @@ pub fn create_provider_with_url(
         // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)
         "ollama" => Ok(Box::new(ollama::OllamaProvider::new(api_url, key))),
         "gemini" | "google" | "google-gemini" => {
+            // When the key is a JSON string with a "token" field (produced by
+            // Gemini CLI OAuth or the zeroclaw onboard flow), extract the
+            // access_token and use the OAuth auth path so we hit the
+            // cloudcode-pa endpoint with Bearer auth instead of ?key=.
+            if let Some(json_key) = key {
+                if let Some(access_token) = serde_json::from_str::<serde_json::Value>(json_key)
+                    .ok()
+                    .and_then(|v| v.get("token")?.as_str().map(String::from))
+                {
+                    return Ok(Box::new(gemini::GeminiProvider::new_with_oauth_token(
+                        &access_token,
+                    )));
+                }
+            }
             Ok(Box::new(gemini::GeminiProvider::new(key)))
         }
 
@@ -519,20 +533,39 @@ pub fn create_provider_with_url(
         }
         "antigravity" | "google-antigravity" => {
             // Google Antigravity uses Cloudcode PA endpoint with OAuth Bearer token.
-            // The credential is a JSON string {"token":"...","projectId":"..."} — extract
-            // the access_token and use the OAuth auth path so the provider hits the
-            // cloudcode-pa endpoint with Authorization: Bearer instead of ?key=.
-            let ag_json = key.map(|k| k.to_string()).or_else(|| {
+            // The credential may be:
+            //   - a JSON string {"token":"...","projectId":"..."} from the OAuth flow
+            //   - a plain Bearer token string
+            // In both cases we use the OAuth auth path (cloudcode-pa + Bearer).
+            let ag_cred = key.map(|k| k.to_string()).or_else(|| {
                 crate::auth::antigravity_oauth::try_load_cached_token()
             });
-            let access_token = ag_json.and_then(|json| {
-                serde_json::from_str::<serde_json::Value>(&json)
-                    .ok()
-                    .and_then(|v| v.get("token")?.as_str().map(String::from))
-            });
-            match access_token {
-                Some(token) => Ok(Box::new(gemini::GeminiProvider::new_with_oauth_token(&token))),
-                None => Ok(Box::new(gemini::GeminiProvider::new(None))),
+            match ag_cred {
+                Some(cred) => {
+                    // Try to extract token from JSON; fall back to using the
+                    // raw string as a Bearer token if it is not JSON.
+                    let access_token =
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&cred) {
+                            v.get("token")
+                                .and_then(|t| t.as_str())
+                                .map(String::from)
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "Antigravity credential is JSON but missing \"token\" field. \
+                                         Re-run `zeroclaw onboard --interactive` to re-authenticate."
+                                    )
+                                })?
+                        } else {
+                            cred
+                        };
+                    Ok(Box::new(gemini::GeminiProvider::new_with_oauth_token(
+                        &access_token,
+                    )))
+                }
+                None => anyhow::bail!(
+                    "No Antigravity credential found. Set GOOGLE_ANTIGRAVITY_TOKEN or \
+                     run `zeroclaw onboard --interactive` to authenticate."
+                ),
             }
         }
 
@@ -881,6 +914,19 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             name: "nvidia",
             display_name: "NVIDIA NIM",
             aliases: &["nvidia-nim", "build.nvidia.com"],
+            local: false,
+        },
+        // ── OAuth-authenticated providers ────────────────────
+        ProviderInfo {
+            name: "codex",
+            display_name: "OpenAI Codex",
+            aliases: &["openai-codex"],
+            local: false,
+        },
+        ProviderInfo {
+            name: "antigravity",
+            display_name: "Google Antigravity (Cloud Code Assist)",
+            aliases: &["google-antigravity"],
             local: false,
         },
     ]
