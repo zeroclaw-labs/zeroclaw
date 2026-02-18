@@ -35,6 +35,8 @@ jobs:
           cp docs/SUMMARY_zh.md docs/SUMMARY.md
           # 使用中文配置（替换默认 book.toml）
           cp book_zh.toml book.toml
+          # 删除旧的多语言重定向页面，避免覆盖 mdBook 生成的 index.html
+          rm -f docs/index.html
           mdbook build -d book
 
       - name: Deploy
