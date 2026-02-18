@@ -61,7 +61,7 @@ pub struct EmailConfig {
     pub from_address: String,
     /// IDLE timeout in seconds before re-establishing connection (default: 1740 = 29 minutes)
     /// RFC 2177 recommends clients restart IDLE every 29 minutes
-    #[serde(default = "default_idle_timeout")]
+    #[serde(default = "default_idle_timeout", alias = "poll_interval_secs")]
     pub idle_timeout_secs: u64,
     /// Allowed sender addresses/domains (empty = deny all, ["*"] = allow all)
     #[serde(default)]
@@ -196,7 +196,7 @@ impl EmailChannel {
         // Connect TCP
         let tcp = TcpStream::connect(&addr).await?;
 
-        // Establish TLS using native-tls
+        // Establish TLS using rustls
         let certs = RootCertStore {
             roots: webpki_roots::TLS_SERVER_ROOTS.into(),
         };
@@ -420,17 +420,21 @@ impl EmailChannel {
     ) -> Result<()> {
         let messages = self.fetch_unseen(session).await?;
 
-        let mut seen = self.seen_messages.lock().await;
         for email in messages {
-            if seen.contains(&email.msg_id) {
-                continue;
-            }
             // Check allowlist
             if !self.is_sender_allowed(&email.sender) {
                 warn!("Blocked email from {}", email.sender);
                 continue;
             }
-            seen.insert(email.msg_id.clone());
+
+            let is_new = {
+                let mut seen = self.seen_messages.lock().await;
+                seen.insert(email.msg_id.clone())
+            };
+            if !is_new {
+                continue;
+            }
+
             let msg = ChannelMessage {
                 id: email.msg_id,
                 reply_target: email.sender.clone(),
@@ -917,6 +921,20 @@ mod tests {
         }"#;
         let config: EmailConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.idle_timeout_secs, 900);
+    }
+
+    #[test]
+    fn idle_timeout_deserializes_legacy_poll_interval_alias() {
+        let json = r#"{
+            "imap_host": "imap.test.com",
+            "smtp_host": "smtp.test.com",
+            "username": "user",
+            "password": "pass",
+            "from_address": "bot@test.com",
+            "poll_interval_secs": 120
+        }"#;
+        let config: EmailConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.idle_timeout_secs, 120);
     }
 
     #[test]
