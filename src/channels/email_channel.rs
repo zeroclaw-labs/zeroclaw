@@ -63,9 +63,6 @@ pub struct EmailConfig {
     /// RFC 2177 recommends clients restart IDLE every 29 minutes
     #[serde(default = "default_idle_timeout")]
     pub idle_timeout_secs: u64,
-    /// Fallback poll interval in seconds when IDLE is not supported (default: 60)
-    #[serde(default = "default_poll_interval")]
-    pub poll_interval_secs: u64,
     /// Allowed sender addresses/domains (empty = deny all, ["*"] = allow all)
     #[serde(default)]
     pub allowed_senders: Vec<String>,
@@ -82,9 +79,6 @@ fn default_imap_folder() -> String {
 }
 fn default_idle_timeout() -> u64 {
     1740 // 29 minutes per RFC 2177
-}
-fn default_poll_interval() -> u64 {
-    60
 }
 fn default_true() -> bool {
     true
@@ -103,7 +97,6 @@ impl Default for EmailConfig {
             password: String::new(),
             from_address: String::new(),
             idle_timeout_secs: default_idle_timeout(),
-            poll_interval_secs: default_poll_interval(),
             allowed_senders: Vec::new(),
         }
     }
@@ -603,7 +596,6 @@ mod tests {
         assert_eq!(config.password, "");
         assert_eq!(config.from_address, "");
         assert_eq!(config.idle_timeout_secs, 1740);
-        assert_eq!(config.poll_interval_secs, 60);
         assert!(config.allowed_senders.is_empty());
     }
 
@@ -620,7 +612,6 @@ mod tests {
             password: "pass123".to_string(),
             from_address: "bot@example.com".to_string(),
             idle_timeout_secs: 1200,
-            poll_interval_secs: 30,
             allowed_senders: vec!["allowed@example.com".to_string()],
         };
         assert_eq!(config.imap_host, "imap.example.com");
@@ -641,7 +632,6 @@ mod tests {
             password: "secret".to_string(),
             from_address: "bot@test.com".to_string(),
             idle_timeout_secs: 1740,
-            poll_interval_secs: 120,
             allowed_senders: vec!["*".to_string()],
         };
         let cloned = config.clone();
@@ -868,11 +858,6 @@ mod tests {
     }
 
     #[test]
-    fn default_poll_interval_returns_60() {
-        assert_eq!(default_poll_interval(), 60);
-    }
-
-    #[test]
     fn default_true_returns_true() {
         assert!(default_true());
     }
@@ -892,7 +877,6 @@ mod tests {
             password: "password123".to_string(),
             from_address: "bot@example.com".to_string(),
             idle_timeout_secs: 1740,
-            poll_interval_secs: 30,
             allowed_senders: vec!["allowed@example.com".to_string()],
         };
 
@@ -919,7 +903,30 @@ mod tests {
         assert_eq!(config.smtp_port, 465); // default
         assert!(config.smtp_tls); // default
         assert_eq!(config.idle_timeout_secs, 1740); // default
-        assert_eq!(config.poll_interval_secs, 60); // default
+    }
+
+    #[test]
+    fn idle_timeout_deserializes_explicit_value() {
+        let json = r#"{
+            "imap_host": "imap.test.com",
+            "smtp_host": "smtp.test.com",
+            "username": "user",
+            "password": "pass",
+            "from_address": "bot@test.com",
+            "idle_timeout_secs": 900
+        }"#;
+        let config: EmailConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.idle_timeout_secs, 900);
+    }
+
+    #[test]
+    fn idle_timeout_propagates_to_channel() {
+        let config = EmailConfig {
+            idle_timeout_secs: 600,
+            ..Default::default()
+        };
+        let channel = EmailChannel::new(config);
+        assert_eq!(channel.config.idle_timeout_secs, 600);
     }
 
     #[test]
