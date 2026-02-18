@@ -13,6 +13,8 @@ pub struct Instance {
     pub workspace_dir: Option<String>,
     pub archived_at: Option<String>,
     pub migration_run_id: Option<String>,
+    /// Best-effort PID cache. The pidfile on disk is authoritative.
+    pub pid: Option<u32>,
 }
 
 /// SQLite-backed registry for managing ZeroClaw instances.
@@ -73,6 +75,17 @@ impl Registry {
             "CREATE INDEX IF NOT EXISTS idx_instances_migration_run_id ON instances(migration_run_id);",
         )?;
 
+        // Migration: add pid column if missing (pre-phase7 DBs lack it).
+        let has_pid_column = conn
+            .prepare("PRAGMA table_info(instances)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .any(|col| col == "pid");
+
+        if !has_pid_column {
+            conn.execute_batch("ALTER TABLE instances ADD COLUMN pid INTEGER;")?;
+        }
+
         Ok(())
     }
 
@@ -98,7 +111,7 @@ impl Registry {
     pub fn get_instance(&self, id: &str) -> Result<Option<Instance>> {
         self.conn
             .query_row(
-                "SELECT id, name, status, port, config_path, workspace_dir, archived_at, migration_run_id
+                "SELECT id, name, status, port, config_path, workspace_dir, archived_at, migration_run_id, pid
                  FROM instances WHERE id = ?1",
                 params![id],
                 |row| {
@@ -111,6 +124,7 @@ impl Registry {
                         workspace_dir: row.get(5)?,
                         archived_at: row.get(6)?,
                         migration_run_id: row.get(7)?,
+                        pid: row.get::<_, Option<i64>>(8)?.map(|p| p as u32),
                     })
                 },
             )
@@ -122,7 +136,7 @@ impl Registry {
     pub fn get_instance_by_name(&self, name: &str) -> Result<Option<Instance>> {
         self.conn
             .query_row(
-                "SELECT id, name, status, port, config_path, workspace_dir, archived_at, migration_run_id
+                "SELECT id, name, status, port, config_path, workspace_dir, archived_at, migration_run_id, pid
                  FROM instances WHERE name = ?1 AND archived_at IS NULL",
                 params![name],
                 |row| {
@@ -135,6 +149,7 @@ impl Registry {
                         workspace_dir: row.get(5)?,
                         archived_at: row.get(6)?,
                         migration_run_id: row.get(7)?,
+                        pid: row.get::<_, Option<i64>>(8)?.map(|p| p as u32),
                     })
                 },
             )
@@ -146,7 +161,7 @@ impl Registry {
     pub fn find_archived_instance_by_name(&self, name: &str) -> Result<Option<Instance>> {
         self.conn
             .query_row(
-                "SELECT id, name, status, port, config_path, workspace_dir, archived_at, migration_run_id
+                "SELECT id, name, status, port, config_path, workspace_dir, archived_at, migration_run_id, pid
                  FROM instances WHERE name = ?1 AND archived_at IS NOT NULL",
                 params![name],
                 |row| {
@@ -159,6 +174,7 @@ impl Registry {
                         workspace_dir: row.get(5)?,
                         archived_at: row.get(6)?,
                         migration_run_id: row.get(7)?,
+                        pid: row.get::<_, Option<i64>>(8)?.map(|p| p as u32),
                     })
                 },
             )
@@ -219,6 +235,21 @@ impl Registry {
         Ok(())
     }
 
+    /// Update the cached PID for an instance (best-effort cache; pidfile is authoritative).
+    pub fn update_pid(&self, id: &str, pid: Option<u32>) -> Result<()> {
+        let rows = self
+            .conn
+            .execute(
+                "UPDATE instances SET pid = ?1 WHERE id = ?2",
+                params![pid.map(|p| p as i64), id],
+            )
+            .context("Failed to update instance PID")?;
+        if rows == 0 {
+            anyhow::bail!("No instance with id '{id}'");
+        }
+        Ok(())
+    }
+
     /// Borrow the underlying connection (for rollback operations).
     pub fn conn(&self) -> &Connection {
         &self.conn
@@ -227,7 +258,7 @@ impl Registry {
     /// List all non-archived instances.
     pub fn list_instances(&self) -> Result<Vec<Instance>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, status, port, config_path, workspace_dir, archived_at, migration_run_id
+            "SELECT id, name, status, port, config_path, workspace_dir, archived_at, migration_run_id, pid
              FROM instances WHERE archived_at IS NULL ORDER BY name",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -240,6 +271,7 @@ impl Registry {
                 workspace_dir: row.get(5)?,
                 archived_at: row.get(6)?,
                 migration_run_id: row.get(7)?,
+                pid: row.get::<_, Option<i64>>(8)?.map(|p| p as u32),
             })
         })?;
         let mut instances = Vec::new();
@@ -410,5 +442,30 @@ mod tests {
         let list = reg.list_instances().unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, "active");
+    }
+
+    #[test]
+    fn update_pid_roundtrip() {
+        let reg = Registry::open_in_memory().unwrap();
+        reg.create_instance("id-1", "agent", 18801, "/c.toml", None, None)
+            .unwrap();
+
+        // Initially None
+        assert!(reg.get_instance("id-1").unwrap().unwrap().pid.is_none());
+
+        // Set PID
+        reg.update_pid("id-1", Some(12345)).unwrap();
+        assert_eq!(reg.get_instance("id-1").unwrap().unwrap().pid, Some(12345));
+
+        // Clear PID
+        reg.update_pid("id-1", None).unwrap();
+        assert!(reg.get_instance("id-1").unwrap().unwrap().pid.is_none());
+    }
+
+    #[test]
+    fn update_pid_errors_on_missing_instance() {
+        let reg = Registry::open_in_memory().unwrap();
+        let err = reg.update_pid("nonexistent", Some(123)).unwrap_err();
+        assert!(err.to_string().contains("No instance"));
     }
 }

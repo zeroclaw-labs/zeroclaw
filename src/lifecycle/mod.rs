@@ -8,6 +8,51 @@ use std::process::Command;
 
 use crate::db::{Instance, Registry};
 
+// ── Typed lifecycle errors ─────────────────────────────────────
+
+/// Typed error for lifecycle operations, enabling HTTP handlers to
+/// pattern-match on variants and return correct status codes.
+#[derive(Debug)]
+pub enum LifecycleError {
+    /// Instance not found in registry.
+    NotFound(String),
+    /// Instance is already running.
+    AlreadyRunning(String),
+    /// Instance is not running (cannot stop).
+    NotRunning(String),
+    /// Lifecycle lock is held by another operation.
+    LockHeld,
+    /// Any other error.
+    Internal(anyhow::Error),
+}
+
+impl std::fmt::Display for LifecycleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound(name) => write!(f, "No instance named '{name}'"),
+            Self::AlreadyRunning(name) => write!(f, "Instance '{name}' is already running"),
+            Self::NotRunning(name) => write!(f, "Instance '{name}' is not running"),
+            Self::LockHeld => write!(f, "Lifecycle lock held (concurrent operation in progress)"),
+            Self::Internal(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+
+impl std::error::Error for LifecycleError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Internal(e) => Some(e.as_ref()),
+            _ => None,
+        }
+    }
+}
+
+impl From<anyhow::Error> for LifecycleError {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Internal(e)
+    }
+}
+
 /// PID file name within each instance directory.
 const PID_FILE: &str = "daemon.pid";
 
@@ -34,9 +79,19 @@ const POST_SPAWN_CHECK_MS: u64 = 300;
 
 // ── Lifecycle lock ──────────────────────────────────────────────
 
+/// Result type for lifecycle lock acquisition that distinguishes
+/// contention from real IO errors.
+pub enum LockOutcome {
+    /// Lock acquired successfully.
+    Acquired(fs::File),
+    /// Lock is held by another process (EWOULDBLOCK).
+    Contended,
+}
+
 /// Acquire per-instance lifecycle lock (non-blocking flock).
-/// Returns the lock file handle (holds lock until dropped).
-fn acquire_lifecycle_lock(instance_dir: &Path) -> Result<fs::File> {
+/// Returns `LockOutcome::Acquired(file)` on success, `LockOutcome::Contended`
+/// if another process holds it, or `Err` for real IO/permission errors.
+pub fn try_lifecycle_lock(instance_dir: &Path) -> Result<LockOutcome> {
     let lock_path = instance_dir.join(LIFECYCLE_LOCK);
     let lock = fs::OpenOptions::new()
         .create(true)
@@ -46,17 +101,34 @@ fn acquire_lifecycle_lock(instance_dir: &Path) -> Result<fs::File> {
 
     let ret = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if ret != 0 {
-        bail!("Lifecycle lock held (concurrent start/stop in progress?)");
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        if errno == libc::EWOULDBLOCK {
+            return Ok(LockOutcome::Contended);
+        }
+        // Real error (permission, invalid fd, etc.)
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("flock failed on {}", lock_path.display()));
     }
 
-    Ok(lock)
+    Ok(LockOutcome::Acquired(lock))
+}
+
+/// Convenience wrapper: acquire lock or bail with clear error.
+/// Used by lifecycle operations that must hold the lock to proceed.
+pub fn acquire_lifecycle_lock(instance_dir: &Path) -> Result<fs::File> {
+    match try_lifecycle_lock(instance_dir)? {
+        LockOutcome::Acquired(f) => Ok(f),
+        LockOutcome::Contended => {
+            bail!("Lifecycle lock held (concurrent start/stop in progress?)")
+        }
+    }
 }
 
 // ── Instance directory resolution ───────────────────────────────
 
 /// Resolve the instance directory from registry data.
 /// The config_path is `<instance_dir>/config.toml`, so parent is the instance dir.
-fn instance_dir_from(instance: &Instance) -> PathBuf {
+pub fn instance_dir_from(instance: &Instance) -> PathBuf {
     PathBuf::from(&instance.config_path)
         .parent()
         .map_or_else(|| PathBuf::from("."), PathBuf::from)
@@ -65,7 +137,7 @@ fn instance_dir_from(instance: &Instance) -> PathBuf {
 // ── PID file management ────────────────────────────────────────
 
 /// Read PID from the instance's pidfile. Returns None if file doesn't exist.
-fn read_pid(instance_dir: &Path) -> Result<Option<u32>> {
+pub fn read_pid(instance_dir: &Path) -> Result<Option<u32>> {
     let pid_path = instance_dir.join(PID_FILE);
     match fs::read_to_string(&pid_path) {
         Ok(content) => {
@@ -81,14 +153,14 @@ fn read_pid(instance_dir: &Path) -> Result<Option<u32>> {
 }
 
 /// Write PID to the instance's pidfile.
-fn write_pid(instance_dir: &Path, pid: u32) -> Result<()> {
+pub fn write_pid(instance_dir: &Path, pid: u32) -> Result<()> {
     let pid_path = instance_dir.join(PID_FILE);
     fs::write(&pid_path, pid.to_string())
         .with_context(|| format!("Failed to write PID file: {}", pid_path.display()))
 }
 
 /// Remove the PID file. No error if already absent.
-fn remove_pid(instance_dir: &Path) -> Result<()> {
+pub fn remove_pid(instance_dir: &Path) -> Result<()> {
     let pid_path = instance_dir.join(PID_FILE);
     match fs::remove_file(&pid_path) {
         Ok(()) => Ok(()),
@@ -120,7 +192,7 @@ pub fn is_pid_alive(pid: u32) -> bool {
 /// Only trusts `/proc/<pid>/environ` (exact ZEROCLAW_HOME match).
 /// If environ is unreadable, returns false (safe default: refuse to act on
 /// a process we can't positively identify).
-fn verify_pid_ownership(pid: u32, expected_instance_dir: &Path) -> Result<bool> {
+pub fn verify_pid_ownership(pid: u32, expected_instance_dir: &Path) -> Result<bool> {
     let environ_path = format!("/proc/{pid}/environ");
     match fs::read(&environ_path) {
         Ok(data) => {
@@ -174,7 +246,7 @@ fn zeroclaw_bin() -> Result<PathBuf> {
 // ── Log management ─────────────────────────────────────────────
 
 /// Log file path for an instance.
-fn log_path(instance_dir: &Path) -> PathBuf {
+pub fn log_path(instance_dir: &Path) -> PathBuf {
     instance_dir.join(LOG_DIR).join(LOG_FILE)
 }
 
@@ -206,9 +278,9 @@ fn kill_child_best_effort(pid: u32) {
 }
 
 /// Stop a running instance. Caller must hold the lifecycle lock.
-fn stop_inner(registry: &Registry, instance: &Instance, inst_dir: &Path) -> Result<()> {
+fn stop_inner(registry: &Registry, instance: &Instance, inst_dir: &Path) -> Result<(), LifecycleError> {
     let pid = read_pid(inst_dir)?
-        .ok_or_else(|| anyhow::anyhow!("Instance '{}' is not running (no PID file)", instance.name))?;
+        .ok_or_else(|| LifecycleError::NotRunning(instance.name.clone()))?;
 
     if !is_pid_alive(pid) {
         tracing::info!("Process {pid} already dead, cleaning up");
@@ -220,19 +292,21 @@ fn stop_inner(registry: &Registry, instance: &Instance, inst_dir: &Path) -> Resu
 
     // Verify ownership before sending any signal
     if !verify_pid_ownership(pid, inst_dir)? {
-        bail!(
+        return Err(LifecycleError::Internal(anyhow::anyhow!(
             "PID {pid} is alive but does NOT belong to instance '{}'. \
              Refusing to send signal. Remove {} manually if you're sure.",
             instance.name,
             inst_dir.join(PID_FILE).display()
-        );
+        )));
     }
 
     // Send SIGTERM
     let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
     if ret != 0 {
         let err = std::io::Error::last_os_error();
-        bail!("Failed to send SIGTERM to PID {pid}: {err}");
+        return Err(LifecycleError::Internal(anyhow::anyhow!(
+            "Failed to send SIGTERM to PID {pid}: {err}"
+        )));
     }
 
     // Wait for graceful shutdown
@@ -252,11 +326,11 @@ fn stop_inner(registry: &Registry, instance: &Instance, inst_dir: &Path) -> Resu
             // Wait and verify SIGKILL took effect
             std::thread::sleep(std::time::Duration::from_millis(500));
             if is_pid_alive(pid) {
-                bail!(
+                return Err(LifecycleError::Internal(anyhow::anyhow!(
                     "PID {pid} survived SIGKILL. Process may be in uninterruptible state. \
                      PID file preserved at {}",
                     inst_dir.join(PID_FILE).display()
-                );
+                )));
             }
             break;
         }
@@ -265,21 +339,24 @@ fn stop_inner(registry: &Registry, instance: &Instance, inst_dir: &Path) -> Resu
 
     remove_pid(inst_dir)?;
     registry.update_status(&instance.id, "stopped")?;
+
+    // Best-effort: clear PID cache in DB
+    if let Err(e) = registry.update_pid(&instance.id, None) {
+        tracing::warn!("Failed to clear PID cache in DB (non-fatal): {e:#}");
+    }
+
     println!("Stopped instance '{}' (was PID {pid})", instance.name);
     Ok(())
 }
 
 /// Start an instance by spawning `zeroclaw daemon`. Caller must hold the lifecycle lock.
-fn start_inner(registry: &Registry, instance: &Instance, inst_dir: &Path) -> Result<()> {
+fn start_inner(registry: &Registry, instance: &Instance, inst_dir: &Path) -> Result<(), LifecycleError> {
     // Check for existing PID
     if let Some(pid) = read_pid(inst_dir)? {
         if is_pid_alive(pid) {
             let owned = verify_pid_ownership(pid, inst_dir)?;
             if owned {
-                bail!(
-                    "Instance '{}' is already running (PID {pid})",
-                    instance.name
-                );
+                return Err(LifecycleError::AlreadyRunning(instance.name.clone()));
             }
             tracing::warn!("Stale PID {pid} (not owned by this instance), clearing");
         } else {
@@ -290,7 +367,7 @@ fn start_inner(registry: &Registry, instance: &Instance, inst_dir: &Path) -> Res
 
     // Rotate logs
     let logs_dir = inst_dir.join(LOG_DIR);
-    fs::create_dir_all(&logs_dir)?;
+    fs::create_dir_all(&logs_dir).context("Failed to create log directory")?;
     rotate_logs(inst_dir)?;
 
     // Spawn daemon
@@ -300,7 +377,7 @@ fn start_inner(registry: &Registry, instance: &Instance, inst_dir: &Path) -> Res
         .append(true)
         .open(log_path(inst_dir))
         .context("Failed to open log file")?;
-    let log_file_err = log_file.try_clone()?;
+    let log_file_err = log_file.try_clone().context("Failed to clone log file handle")?;
 
     let mut child = Command::new(&bin)
         .arg("daemon")
@@ -326,12 +403,12 @@ fn start_inner(registry: &Registry, instance: &Instance, inst_dir: &Path) -> Res
         Ok(Some(exit_status)) => {
             // Child already exited -- startup failed
             let log_hint = log_path(inst_dir);
-            bail!(
+            return Err(LifecycleError::Internal(anyhow::anyhow!(
                 "Daemon for '{}' exited immediately ({}). Check logs at {}",
                 instance.name,
                 exit_status,
                 log_hint.display()
-            );
+            )));
         }
         Ok(None) => {
             // Still running -- good
@@ -339,23 +416,32 @@ fn start_inner(registry: &Registry, instance: &Instance, inst_dir: &Path) -> Res
         Err(e) => {
             // Can't check status -- kill and bail
             kill_child_best_effort(pid);
-            bail!(
+            return Err(LifecycleError::Internal(anyhow::anyhow!(
                 "Failed to check daemon status after spawn for '{}': {e}",
                 instance.name
-            );
+            )));
         }
     }
 
     // Write PID and update status. If either fails, kill the orphan.
     if let Err(e) = write_pid(inst_dir, pid) {
         kill_child_best_effort(pid);
-        return Err(e.context("Failed to write PID file; killed spawned daemon"));
+        return Err(LifecycleError::Internal(
+            e.context("Failed to write PID file; killed spawned daemon"),
+        ));
     }
 
     if let Err(e) = registry.update_status(&instance.id, "running") {
         kill_child_best_effort(pid);
         let _ = remove_pid(inst_dir); // best-effort cleanup
-        return Err(e.context("Failed to update DB status; killed spawned daemon"));
+        return Err(LifecycleError::Internal(
+            e.context("Failed to update DB status; killed spawned daemon"),
+        ));
+    }
+
+    // Best-effort: cache PID in DB for supervisor queries
+    if let Err(e) = registry.update_pid(&instance.id, Some(pid)) {
+        tracing::warn!("Failed to cache PID in DB (non-fatal): {e:#}");
     }
 
     println!(
@@ -367,37 +453,48 @@ fn start_inner(registry: &Registry, instance: &Instance, inst_dir: &Path) -> Res
 
 // ── Public API ─────────────────────────────────────────────────
 
+/// Acquire the lifecycle lock, mapping the outcome to `LifecycleError`.
+fn require_lifecycle_lock(inst_dir: &Path) -> Result<fs::File, LifecycleError> {
+    match try_lifecycle_lock(inst_dir).map_err(LifecycleError::Internal)? {
+        LockOutcome::Acquired(f) => Ok(f),
+        LockOutcome::Contended => Err(LifecycleError::LockHeld),
+    }
+}
+
 /// Start a registered instance by name.
-pub fn start_instance(registry: &Registry, name: &str) -> Result<()> {
+pub fn start_instance(registry: &Registry, name: &str) -> Result<(), LifecycleError> {
     let instance = registry
-        .get_instance_by_name(name)?
-        .ok_or_else(|| anyhow::anyhow!("No instance named '{name}'"))?;
+        .get_instance_by_name(name)
+        .map_err(LifecycleError::Internal)?
+        .ok_or_else(|| LifecycleError::NotFound(name.to_string()))?;
 
     let inst_dir = instance_dir_from(&instance);
-    let _lock = acquire_lifecycle_lock(&inst_dir)?;
+    let _lock = require_lifecycle_lock(&inst_dir)?;
     start_inner(registry, &instance, &inst_dir)
 }
 
 /// Stop a running instance by name.
-pub fn stop_instance(registry: &Registry, name: &str) -> Result<()> {
+pub fn stop_instance(registry: &Registry, name: &str) -> Result<(), LifecycleError> {
     let instance = registry
-        .get_instance_by_name(name)?
-        .ok_or_else(|| anyhow::anyhow!("No instance named '{name}'"))?;
+        .get_instance_by_name(name)
+        .map_err(LifecycleError::Internal)?
+        .ok_or_else(|| LifecycleError::NotFound(name.to_string()))?;
 
     let inst_dir = instance_dir_from(&instance);
-    let _lock = acquire_lifecycle_lock(&inst_dir)?;
+    let _lock = require_lifecycle_lock(&inst_dir)?;
     stop_inner(registry, &instance, &inst_dir)
 }
 
 /// Restart an instance (stop if running, then start). Holds a single lifecycle
 /// lock for the entire operation to prevent races.
-pub fn restart_instance(registry: &Registry, name: &str) -> Result<()> {
+pub fn restart_instance(registry: &Registry, name: &str) -> Result<(), LifecycleError> {
     let instance = registry
-        .get_instance_by_name(name)?
-        .ok_or_else(|| anyhow::anyhow!("No instance named '{name}'"))?;
+        .get_instance_by_name(name)
+        .map_err(LifecycleError::Internal)?
+        .ok_or_else(|| LifecycleError::NotFound(name.to_string()))?;
 
     let inst_dir = instance_dir_from(&instance);
-    let _lock = acquire_lifecycle_lock(&inst_dir)?;
+    let _lock = require_lifecycle_lock(&inst_dir)?;
 
     // Stop if running
     if let Some(pid) = read_pid(&inst_dir)? {
@@ -415,7 +512,7 @@ pub fn restart_instance(registry: &Registry, name: &str) -> Result<()> {
 
 /// Determine live status of an instance from its PID file.
 /// Returns (status_string, optional_pid).
-fn live_status(instance_dir: &Path) -> Result<(String, Option<u32>)> {
+pub fn live_status(instance_dir: &Path) -> Result<(String, Option<u32>)> {
     match read_pid(instance_dir)? {
         Some(pid) if is_pid_alive(pid) => {
             let owned = verify_pid_ownership(pid, instance_dir).unwrap_or(false);
@@ -652,6 +749,7 @@ mod tests {
             workspace_dir: None,
             archived_at: None,
             migration_run_id: None,
+            pid: None,
         };
         let dir = instance_dir_from(&inst);
         assert_eq!(

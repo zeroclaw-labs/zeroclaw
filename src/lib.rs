@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 pub mod agent;
 pub mod channels;
 pub mod config;
+pub mod cp;
 pub mod cron;
 pub mod daemon;
 pub mod db;

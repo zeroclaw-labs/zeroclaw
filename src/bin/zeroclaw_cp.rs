@@ -1,8 +1,10 @@
 use anyhow::{bail, Context as _, Result};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 use zeroclaw::config::zeroclaw_home;
+use zeroclaw::cp;
 use zeroclaw::db::Registry;
 use zeroclaw::lifecycle;
 use zeroclaw::migrate;
@@ -175,7 +177,11 @@ fn main() -> Result<()> {
     let cmd = parse_args()?;
 
     match cmd {
-        CliCommand::Serve => run_server(),
+        CliCommand::Serve => tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("Failed to build tokio runtime")?
+            .block_on(run_server()),
         CliCommand::Start { name } => run_start(&name),
         CliCommand::Stop { name } => run_stop(&name),
         CliCommand::Restart { name } => run_restart(&name),
@@ -213,17 +219,17 @@ fn open_registry() -> Result<Registry> {
 
 fn run_start(name: &str) -> Result<()> {
     let registry = open_registry()?;
-    lifecycle::start_instance(&registry, name)
+    lifecycle::start_instance(&registry, name).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 fn run_stop(name: &str) -> Result<()> {
     let registry = open_registry()?;
-    lifecycle::stop_instance(&registry, name)
+    lifecycle::stop_instance(&registry, name).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 fn run_restart(name: &str) -> Result<()> {
     let registry = open_registry()?;
-    lifecycle::restart_instance(&registry, name)
+    lifecycle::restart_instance(&registry, name).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 fn run_status(name: Option<&str>) -> Result<()> {
@@ -237,7 +243,7 @@ fn run_logs(name: &str, lines: usize, follow: bool) -> Result<()> {
     lifecycle::show_logs(&inst_dir, lines, follow)
 }
 
-fn run_server() -> Result<()> {
+async fn run_server() -> Result<()> {
     let cp = cp_dir();
     std::fs::create_dir_all(&cp)?;
     let inst_dir = instances_dir(&cp);
@@ -267,29 +273,70 @@ fn run_server() -> Result<()> {
             inst.name, inst.id, inst.port, inst.status
         );
     }
+    drop(registry); // close DB connection; per-request connections from here
 
-    // TODO: actual HTTP server for instance management (Phase 7)
-    println!("\nServer ready. Press Ctrl+C to stop.");
+    let db_path = Arc::new(registry_path(&cp));
 
-    // Block until signal
-    let (tx, rx) = std::sync::mpsc::channel();
-    ctrlc_channel(tx);
-    let _ = rx.recv();
-    println!("\nShutting down.");
+    // Run startup reconciliation (supervisor)
+    let db_path_reconcile = db_path.clone();
+    tokio::task::spawn_blocking(move || {
+        cp::supervisor::startup_reconcile(&db_path_reconcile);
+    })
+    .await?;
 
+    // Bind listener
+    let port: u16 = std::env::var("ZEROCLAW_CP_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(18800);
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
+        .await
+        .with_context(|| format!("Failed to bind to port {port}"))?;
+    println!("Listening on http://127.0.0.1:{port}");
+
+    // Shutdown coordination
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // Spawn supervisor
+    let supervisor_handle = tokio::spawn(cp::supervisor::run_supervisor(
+        db_path.clone(),
+        shutdown_rx,
+    ));
+
+    // Build router
+    let state = cp::server::CpState { db_path };
+    let app = cp::server::build_router(state);
+
+    println!("Server ready. Press Ctrl+C to stop.");
+
+    // Serve with graceful shutdown
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .context("Server error")?;
+
+    // Signal supervisor to stop
+    let _ = shutdown_tx.send(true);
+    let _ = supervisor_handle.await;
+
+    println!("Shut down.");
     Ok(())
 }
 
-fn ctrlc_channel(tx: std::sync::mpsc::Sender<()>) {
-    let _ = std::thread::spawn(move || {
-        // Simple signal handling: wait for SIGINT/SIGTERM
-        use std::io::Read;
-        let mut stdin = std::io::stdin();
-        let mut buf = [0u8; 1];
-        // This blocks until stdin closes (Ctrl+C sends SIGINT which kills the process)
-        let _ = stdin.read(&mut buf);
-        let _ = tx.send(());
-    });
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    let mut sigterm =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to register SIGTERM handler");
+
+    tokio::select! {
+        _ = ctrl_c => {
+            tracing::info!("Received SIGINT");
+        }
+        _ = sigterm.recv() => {
+            tracing::info!("Received SIGTERM");
+        }
+    }
 }
 
 fn run_migration(config_path: &Path, dry_run: bool) -> Result<()> {
