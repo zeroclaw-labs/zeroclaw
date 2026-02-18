@@ -138,10 +138,31 @@ Use the nodes_run tool to execute "ls -la" on node "abc-123-def" with default ti
 
 ### `nodes_status`
 
-Get detailed status information for a specific node.
+Get status information for a specific node or overall server status.
 
 **Parameters:**
-- `node_id` (required): Node ID to query
+- `node_id` (optional): Node ID to query. If not provided, returns overall server status.
+
+**With node_id:**
+Returns detailed node information including:
+- Node metadata (id, name, hostname, platform)
+- Status: `online` (active < 60s), `idle` (60-180s), `offline` (> 180s)
+- Seconds since last activity
+
+**Without node_id:**
+Returns server overview:
+- Total nodes count
+- Online/idle/offline breakdown
+- List of all nodes with status
+
+**Examples:**
+```
+# Get overall status
+Use nodes_status tool
+
+# Get specific node
+Use nodes_status tool with node_id "abc-123"
+```
 
 ## Security
 
