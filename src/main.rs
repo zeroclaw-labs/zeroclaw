@@ -242,6 +242,18 @@ enum Commands {
         #[command(subcommand)]
         peripheral_command: zeroclaw::PeripheralCommands,
     },
+
+    /// Manage configuration
+    Config {
+        #[command(subcommand)]
+        config_command: ConfigCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigCommands {
+    /// Dump the full configuration JSON Schema to stdout
+    Schema,
 }
 
 #[derive(Subcommand, Debug)]
@@ -766,6 +778,18 @@ async fn main() -> Result<()> {
         Commands::Peripheral { peripheral_command } => {
             peripherals::handle_command(peripheral_command.clone(), &config)
         }
+
+        Commands::Config { config_command } => match config_command {
+            ConfigCommands::Schema => {
+                let schema = schemars::schema_for!(config::Config);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&schema)
+                        .expect("failed to serialize JSON Schema")
+                );
+                Ok(())
+            }
+        },
     }
 }
 

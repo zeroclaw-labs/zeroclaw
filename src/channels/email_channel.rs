@@ -20,6 +20,7 @@ use lettre::{Message, SmtpTransport, Transport};
 use mail_parser::{MessageParser, MimeHeaders};
 use rustls::{ClientConfig, RootCertStore};
 use rustls_pki_types::DnsName;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -35,7 +36,7 @@ use uuid::Uuid;
 use super::traits::{Channel, ChannelMessage, SendMessage};
 
 /// Email channel configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct EmailConfig {
     /// IMAP server hostname
     pub imap_host: String,

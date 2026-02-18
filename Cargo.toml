@@ -37,6 +37,9 @@ directories = "6.0"
 toml = "1.0"
 shellexpand = "3.1"
 
+# JSON Schema generation for config export
+schemars = "1.2"
+
 # Logging - minimal
 tracing = { version = "0.1", default-features = false }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }
