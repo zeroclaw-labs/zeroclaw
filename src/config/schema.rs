@@ -1858,9 +1858,11 @@ pub(crate) fn persist_active_workspace_config_dir(config_dir: &Path) -> Result<(
 
 fn resolve_config_dir_for_workspace(workspace_dir: &Path) -> (PathBuf, PathBuf) {
     let workspace_config_dir = workspace_dir.to_path_buf();
-    let workspace_dir = workspace_dir.join("workspace").to_path_buf();
     if workspace_config_dir.join("config.toml").exists() {
-        return (workspace_config_dir, workspace_dir);
+        return (
+            workspace_config_dir.clone(),
+            workspace_config_dir.join("workspace"),
+        );
     }
 
     let legacy_config_dir = workspace_dir
@@ -1879,7 +1881,10 @@ fn resolve_config_dir_for_workspace(workspace_dir: &Path) -> (PathBuf, PathBuf) 
         }
     }
 
-    (workspace_config_dir, workspace_dir)
+    (
+        workspace_config_dir.clone(),
+        workspace_config_dir.join("workspace"),
+    )
 }
 
 fn decrypt_optional_secret(
@@ -3376,7 +3381,7 @@ default_temperature = 0.7
 
         let config = Config::load_or_init().unwrap();
 
-        assert_eq!(config.workspace_dir, workspace_dir);
+        assert_eq!(config.workspace_dir, workspace_dir.join("workspace"));
         assert_eq!(config.config_path, workspace_dir.join("config.toml"));
         assert!(workspace_dir.join("config.toml").exists());
 
@@ -3509,7 +3514,7 @@ default_model = "legacy-model"
 
         let config = Config::load_or_init().unwrap();
 
-        assert_eq!(config.workspace_dir, env_workspace_dir);
+        assert_eq!(config.workspace_dir, env_workspace_dir.join("workspace"));
         assert_eq!(config.config_path, env_workspace_dir.join("config.toml"));
 
         std::env::remove_var("ZEROCLAW_WORKSPACE");
