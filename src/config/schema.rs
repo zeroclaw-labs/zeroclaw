@@ -2136,16 +2136,34 @@ pub struct SignalConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WhatsAppConfig {
-    /// Access token from Meta Business Suite
-    pub access_token: String,
-    /// Phone number ID from Meta Business API
-    pub phone_number_id: String,
+    /// Access token from Meta Business Suite (Cloud API mode)
+    #[serde(default)]
+    pub access_token: Option<String>,
+    /// Phone number ID from Meta Business API (Cloud API mode)
+    #[serde(default)]
+    pub phone_number_id: Option<String>,
     /// Webhook verify token (you define this, Meta sends it back for verification)
-    pub verify_token: String,
+    /// Only used in Cloud API mode
+    #[serde(default)]
+    pub verify_token: Option<String>,
     /// App secret from Meta Business Suite (for webhook signature verification)
     /// Can also be set via `ZEROCLAW_WHATSAPP_APP_SECRET` environment variable
+    /// Only used in Cloud API mode
     #[serde(default)]
     pub app_secret: Option<String>,
+    /// Session database path for WhatsApp Web client (Web mode)
+    /// When set, enables native WhatsApp Web mode with wa-rs
+    #[serde(default)]
+    pub session_path: Option<String>,
+    /// Phone number for pair code linking (Web mode, optional)
+    /// Format: country code + number (e.g., "15551234567")
+    /// If not set, QR code pairing will be used
+    #[serde(default)]
+    pub pair_phone: Option<String>,
+    /// Custom pair code for linking (Web mode, optional)
+    /// Leave empty to let WhatsApp generate one
+    #[serde(default)]
+    pub pair_code: Option<String>,
     /// Allowed phone numbers (E.164 format: +1234567890) or "*" for all
     #[serde(default)]
     pub allowed_numbers: Vec<String>,
@@ -2163,6 +2181,31 @@ pub struct LinqConfig {
     /// Allowed sender handles (phone numbers) or "*" for all
     #[serde(default)]
     pub allowed_senders: Vec<String>,
+}
+
+impl WhatsAppConfig {
+    /// Detect which backend to use based on config fields.
+    /// Returns "cloud" if phone_number_id is set, "web" if session_path is set.
+    pub fn backend_type(&self) -> &'static str {
+        if self.phone_number_id.is_some() {
+            "cloud"
+        } else if self.session_path.is_some() {
+            "web"
+        } else {
+            // Default to Cloud API for backward compatibility
+            "cloud"
+        }
+    }
+
+    /// Check if this is a valid Cloud API config
+    pub fn is_cloud_config(&self) -> bool {
+        self.phone_number_id.is_some() && self.access_token.is_some() && self.verify_token.is_some()
+    }
+
+    /// Check if this is a valid Web config
+    pub fn is_web_config(&self) -> bool {
+        self.session_path.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -3909,32 +3952,38 @@ channel_id = "C123"
     #[test]
     fn whatsapp_config_serde() {
         let wc = WhatsAppConfig {
-            access_token: "EAABx...".into(),
-            phone_number_id: "123456789".into(),
-            verify_token: "my-verify-token".into(),
+            access_token: Some("EAABx...".into()),
+            phone_number_id: Some("123456789".into()),
+            verify_token: Some("my-verify-token".into()),
             app_secret: None,
+            session_path: None,
+            pair_phone: None,
+            pair_code: None,
             allowed_numbers: vec!["+1234567890".into(), "+9876543210".into()],
         };
         let json = serde_json::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.access_token, "EAABx...");
-        assert_eq!(parsed.phone_number_id, "123456789");
-        assert_eq!(parsed.verify_token, "my-verify-token");
+        assert_eq!(parsed.access_token, Some("EAABx...".into()));
+        assert_eq!(parsed.phone_number_id, Some("123456789".into()));
+        assert_eq!(parsed.verify_token, Some("my-verify-token".into()));
         assert_eq!(parsed.allowed_numbers.len(), 2);
     }
 
     #[test]
     fn whatsapp_config_toml_roundtrip() {
         let wc = WhatsAppConfig {
-            access_token: "tok".into(),
-            phone_number_id: "12345".into(),
-            verify_token: "verify".into(),
+            access_token: Some("tok".into()),
+            phone_number_id: Some("12345".into()),
+            verify_token: Some("verify".into()),
             app_secret: Some("secret123".into()),
+            session_path: None,
+            pair_phone: None,
+            pair_code: None,
             allowed_numbers: vec!["+1".into()],
         };
         let toml_str = toml::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
-        assert_eq!(parsed.phone_number_id, "12345");
+        assert_eq!(parsed.phone_number_id, Some("12345".into()));
         assert_eq!(parsed.allowed_numbers, vec!["+1"]);
     }
 
@@ -3948,10 +3997,13 @@ channel_id = "C123"
     #[test]
     fn whatsapp_config_wildcard_allowed() {
         let wc = WhatsAppConfig {
-            access_token: "tok".into(),
-            phone_number_id: "123".into(),
-            verify_token: "ver".into(),
+            access_token: Some("tok".into()),
+            phone_number_id: Some("123".into()),
+            verify_token: Some("ver".into()),
             app_secret: None,
+            session_path: None,
+            pair_phone: None,
+            pair_code: None,
             allowed_numbers: vec!["*".into()],
         };
         let toml_str = toml::to_string(&wc).unwrap();
@@ -3972,10 +4024,13 @@ channel_id = "C123"
             matrix: None,
             signal: None,
             whatsapp: Some(WhatsAppConfig {
-                access_token: "tok".into(),
-                phone_number_id: "123".into(),
-                verify_token: "ver".into(),
+                access_token: Some("tok".into()),
+                phone_number_id: Some("123".into()),
+                verify_token: Some("ver".into()),
                 app_secret: None,
+                session_path: None,
+                pair_phone: None,
+                pair_code: None,
                 allowed_numbers: vec!["+1".into()],
             }),
             linq: None,
@@ -3990,7 +4045,7 @@ channel_id = "C123"
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
         assert!(parsed.whatsapp.is_some());
         let wa = parsed.whatsapp.unwrap();
-        assert_eq!(wa.phone_number_id, "123");
+        assert_eq!(wa.phone_number_id, Some("123".into()));
         assert_eq!(wa.allowed_numbers, vec!["+1"]);
     }
 

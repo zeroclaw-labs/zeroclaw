@@ -14,6 +14,10 @@ pub mod slack;
 pub mod telegram;
 pub mod traits;
 pub mod whatsapp;
+#[cfg(feature = "whatsapp-web")]
+pub mod whatsapp_storage;
+#[cfg(feature = "whatsapp-web")]
+pub mod whatsapp_web;
 
 pub use cli::CliChannel;
 pub use dingtalk::DingTalkChannel;
@@ -31,6 +35,8 @@ pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
 pub use traits::{Channel, SendMessage};
 pub use whatsapp::WhatsAppChannel;
+#[cfg(feature = "whatsapp-web")]
+pub use whatsapp_web::WhatsAppWebChannel;
 
 use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
 use crate::config::Config;
@@ -1384,15 +1390,49 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     }
 
     if let Some(ref wa) = config.channels_config.whatsapp {
-        channels.push((
-            "WhatsApp",
-            Arc::new(WhatsAppChannel::new(
-                wa.access_token.clone(),
-                wa.phone_number_id.clone(),
-                wa.verify_token.clone(),
-                wa.allowed_numbers.clone(),
-            )),
-        ));
+        // Runtime negotiation: detect backend type from config
+        match wa.backend_type() {
+            "cloud" => {
+                // Cloud API mode: requires phone_number_id, access_token, verify_token
+                if wa.is_cloud_config() {
+                    channels.push((
+                        "WhatsApp",
+                        Arc::new(WhatsAppChannel::new(
+                            wa.access_token.clone().unwrap_or_default(),
+                            wa.phone_number_id.clone().unwrap_or_default(),
+                            wa.verify_token.clone().unwrap_or_default(),
+                            wa.allowed_numbers.clone(),
+                        )),
+                    ));
+                } else {
+                    tracing::warn!("WhatsApp Cloud API configured but missing required fields (phone_number_id, access_token, verify_token)");
+                }
+            }
+            "web" => {
+                // Web mode: requires session_path
+                #[cfg(feature = "whatsapp-web")]
+                if wa.is_web_config() {
+                    channels.push((
+                        "WhatsApp",
+                        Arc::new(WhatsAppWebChannel::new(
+                            wa.session_path.clone().unwrap_or_default(),
+                            wa.pair_phone.clone(),
+                            wa.pair_code.clone(),
+                            wa.allowed_numbers.clone(),
+                        )),
+                    ));
+                } else {
+                    tracing::warn!("WhatsApp Web configured but session_path not set");
+                }
+                #[cfg(not(feature = "whatsapp-web"))]
+                {
+                    tracing::warn!("WhatsApp Web backend requires 'whatsapp-web' feature. Enable with: cargo build --features whatsapp-web");
+                }
+            }
+            _ => {
+                tracing::warn!("WhatsApp config invalid: neither phone_number_id (Cloud API) nor session_path (Web) is set");
+            }
+        }
     }
 
     if let Some(ref lq) = config.channels_config.linq {
@@ -1718,12 +1758,43 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
 
     if let Some(ref wa) = config.channels_config.whatsapp {
-        channels.push(Arc::new(WhatsAppChannel::new(
-            wa.access_token.clone(),
-            wa.phone_number_id.clone(),
-            wa.verify_token.clone(),
-            wa.allowed_numbers.clone(),
-        )));
+        // Runtime negotiation: detect backend type from config
+        match wa.backend_type() {
+            "cloud" => {
+                // Cloud API mode: requires phone_number_id, access_token, verify_token
+                if wa.is_cloud_config() {
+                    channels.push(Arc::new(WhatsAppChannel::new(
+                        wa.access_token.clone().unwrap_or_default(),
+                        wa.phone_number_id.clone().unwrap_or_default(),
+                        wa.verify_token.clone().unwrap_or_default(),
+                        wa.allowed_numbers.clone(),
+                    )));
+                } else {
+                    tracing::warn!("WhatsApp Cloud API configured but missing required fields (phone_number_id, access_token, verify_token)");
+                }
+            }
+            "web" => {
+                // Web mode: requires session_path
+                #[cfg(feature = "whatsapp-web")]
+                if wa.is_web_config() {
+                    channels.push(Arc::new(WhatsAppWebChannel::new(
+                        wa.session_path.clone().unwrap_or_default(),
+                        wa.pair_phone.clone(),
+                        wa.pair_code.clone(),
+                        wa.allowed_numbers.clone(),
+                    )));
+                } else {
+                    tracing::warn!("WhatsApp Web configured but session_path not set");
+                }
+                #[cfg(not(feature = "whatsapp-web"))]
+                {
+                    tracing::warn!("WhatsApp Web backend requires 'whatsapp-web' feature. Enable with: cargo build --features whatsapp-web");
+                }
+            }
+            _ => {
+                tracing::warn!("WhatsApp config invalid: neither phone_number_id (Cloud API) nor session_path (Web) is set");
+            }
+        }
     }
 
     if let Some(ref lq) = config.channels_config.linq {

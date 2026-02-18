@@ -3148,10 +3148,13 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 };
 
                 config.whatsapp = Some(WhatsAppConfig {
-                    access_token: access_token.trim().to_string(),
-                    phone_number_id: phone_number_id.trim().to_string(),
-                    verify_token: verify_token.trim().to_string(),
+                    access_token: Some(access_token.trim().to_string()),
+                    phone_number_id: Some(phone_number_id.trim().to_string()),
+                    verify_token: Some(verify_token.trim().to_string()),
                     app_secret: None, // Can be set via ZEROCLAW_WHATSAPP_APP_SECRET env var
+                    session_path: None,
+                    pair_phone: None,
+                    pair_code: None,
                     allowed_numbers,
                 });
             }
