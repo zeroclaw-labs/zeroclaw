@@ -26,7 +26,7 @@ pub struct Pkce {
 
 /// Generate PKCE code verifier, challenge (S256), and state.
 pub fn generate_pkce() -> Pkce {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
     // code_verifier: 32 random bytes → base64url
     let mut verifier_bytes = [0u8; 32];
@@ -348,7 +348,7 @@ mod tests {
             TokenPollResult::Success(t) => {
                 assert_eq!(t.access_token, "tok_abc");
                 assert_eq!(t.refresh_token, "ref_abc");
-                assert_eq!(t.expired_in, 1700000000);
+                assert_eq!(t.expired_in, 1_700_000_000);
                 assert_eq!(t.resource_url.as_deref(), Some("https://example.com"));
                 assert_eq!(t.notification_message.as_deref(), Some("Welcome"));
             }

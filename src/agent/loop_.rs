@@ -1214,7 +1214,9 @@ pub async fn run(
                     continue;
                 }
                 "/clear" | "/new" => {
-                    println!("This will clear the current conversation and delete all session memory.");
+                    println!(
+                        "This will clear the current conversation and delete all session memory."
+                    );
                     println!("Core memories (long-term facts/preferences) will be preserved.");
                     print!("Continue? [y/N] ");
                     let _ = std::io::stdout().flush();
@@ -1233,10 +1235,7 @@ pub async fn run(
                     // Clear conversation and daily memory
                     let mut cleared = 0;
                     for category in [MemoryCategory::Conversation, MemoryCategory::Daily] {
-                        let entries = mem
-                            .list(Some(&category), None)
-                            .await
-                            .unwrap_or_default();
+                        let entries = mem.list(Some(&category), None).await.unwrap_or_default();
                         for entry in entries {
                             if mem.forget(&entry.key).await.unwrap_or(false) {
                                 cleared += 1;

@@ -422,7 +422,7 @@ pub fn create_provider_with_url(
         }
         name if is_minimax_intl_alias(name) => {
             Ok(Box::new(anthropic::AnthropicProvider::with_base_url_bearer(
-                key.as_deref(),
+                key,
                 Some("https://api.minimax.io/anthropic"),
             )))
         }

@@ -10,8 +10,8 @@ use crate::memory::{
 };
 use crate::providers::{
     canonical_china_provider_name, is_glm_alias, is_glm_cn_alias, is_minimax_alias,
-    is_minimax_cn_alias, is_minimax_intl_alias, is_moonshot_alias, is_qianfan_alias,
-    is_qwen_alias, is_zai_alias, is_zai_cn_alias,
+    is_minimax_cn_alias, is_minimax_intl_alias, is_moonshot_alias, is_qianfan_alias, is_qwen_alias,
+    is_zai_alias, is_zai_cn_alias,
 };
 use anyhow::{bail, Context, Result};
 use console::style;
@@ -1417,10 +1417,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
             ),
             ("glm", "GLM — ChatGLM / Zhipu (international endpoint)"),
             ("glm-cn", "GLM — ChatGLM / Zhipu (China endpoint)"),
-            (
-                "minimax",
-                "MiniMax — OAuth login (api.minimax.io)",
-            ),
+            ("minimax", "MiniMax — OAuth login (api.minimax.io)"),
             ("minimax-cn", "MiniMax — China endpoint (api.minimaxi.com)"),
             ("qwen", "Qwen — DashScope China endpoint"),
             ("qwen-intl", "Qwen — DashScope international endpoint"),

@@ -536,7 +536,9 @@ mod tests {
         );
         let request = provider
             .apply_auth(
-                provider.client.get("https://api.minimax.io/anthropic/v1/messages"),
+                provider
+                    .client
+                    .get("https://api.minimax.io/anthropic/v1/messages"),
                 "minimax-access-token",
             )
             .build()
