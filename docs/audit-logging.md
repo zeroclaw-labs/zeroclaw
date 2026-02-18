@@ -1,5 +1,10 @@
 # Audit Logging for ZeroClaw
 
+> ⚠️ **Status: Proposal / Roadmap**
+>
+> This document describes proposed approaches and may include hypothetical commands or config.
+> For current runtime behavior, see [config-reference.md](config-reference.md), [operations-runbook.md](operations-runbook.md), and [troubleshooting.md](troubleshooting.md).
+
 ## Problem
 ZeroClaw logs actions but lacks tamper-evident audit trails for:
 - Who executed what command

@@ -1,0 +1,19 @@
+ZeroClaw
+Copyright 2025 ZeroClaw Labs
+
+This product includes software developed at ZeroClaw Labs (https://github.com/zeroclaw-labs).
+
+Contributors
+============
+
+This NOTICE file is maintained by repository automation.
+For the latest contributor list, see the repository contributors page:
+https://github.com/zeroclaw-labs/zeroclaw/graphs/contributors
+
+Third-Party Dependencies
+========================
+
+This project uses third-party libraries and components,
+each licensed under their respective terms.
+
+See Cargo.lock for a complete dependency list.

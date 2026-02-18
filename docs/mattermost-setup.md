@@ -18,10 +18,10 @@ ZeroClaw supports native integration with Mattermost via its REST API v4. This i
 
 ## Configuration
 
-Add the following to your `config.toml` under the `[channels]` section:
+Add the following to your `config.toml` under the `[channels_config]` section:
 
 ```toml
-[channels.mattermost]
+[channels_config.mattermost]
 url = "https://mm.your-domain.com"
 bot_token = "your-bot-access-token"
 channel_id = "your-channel-id"

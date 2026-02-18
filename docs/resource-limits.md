@@ -1,5 +1,10 @@
 # Resource Limits for ZeroClaw
 
+> ⚠️ **Status: Proposal / Roadmap**
+>
+> This document describes proposed approaches and may include hypothetical commands or config.
+> For current runtime behavior, see [config-reference.md](config-reference.md), [operations-runbook.md](operations-runbook.md), and [troubleshooting.md](troubleshooting.md).
+
 ## Problem
 ZeroClaw has rate limiting (20 actions/hour) but no resource caps. A runaway agent could:
 - Exhaust available memory
