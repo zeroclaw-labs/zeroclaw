@@ -416,10 +416,17 @@ mod tests {
     }
 
     #[test]
-    fn generate_token_has_prefix() {
+    fn generate_token_has_prefix_and_hex_payload() {
         let token = generate_token();
-        assert!(token.starts_with("zc_"));
-        assert!(token.len() > 10);
+        let payload = token
+            .strip_prefix("zc_")
+            .expect("Generated token should include zc_ prefix");
+
+        assert_eq!(payload.len(), 64, "Token payload should be 32 bytes in hex");
+        assert!(
+            payload.chars().all(|c| c.is_ascii_hexdigit()),
+            "Token payload should be lowercase hex"
+        );
     }
 
     // ── Brute force protection ───────────────────────────────
