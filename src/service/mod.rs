@@ -738,15 +738,13 @@ name="zeroclaw"
 description="ZeroClaw daemon"
 
 command="{}"
-command_args="daemon"
+command_args="--config-dir {} daemon"
 command_background="yes"
 command_user="zeroclaw:zeroclaw"
 pidfile="/run/${{RC_SVCNAME}}.pid"
 umask 027
 output_log="/var/log/zeroclaw/access.log"
 error_log="/var/log/zeroclaw/error.log"
-env ZEROCLAW_CONFIG_DIR="{}"
-env ZEROCLAW_WORKSPACE="{}"
 
 depend() {{
     need net
@@ -754,8 +752,7 @@ depend() {{
 }}
 "#,
         exe_path.display(),
-        config_dir.display(),
-        config_dir.join("workspace").display()
+        config_dir.display()
     )
 }
 
@@ -1093,9 +1090,9 @@ mod tests {
         assert!(script.contains("name=\"zeroclaw\""));
         assert!(script.contains("description=\"ZeroClaw daemon\""));
         assert!(script.contains("command=\"/usr/local/bin/zeroclaw\""));
-        assert!(script.contains("command_args=\"daemon\""));
-        assert!(script.contains("env ZEROCLAW_CONFIG_DIR=\"/etc/zeroclaw\""));
-        assert!(script.contains("env ZEROCLAW_WORKSPACE=\"/etc/zeroclaw/workspace\""));
+        assert!(script.contains("command_args=\"--config-dir /etc/zeroclaw daemon\""));
+        assert!(!script.contains("env ZEROCLAW_CONFIG_DIR"));
+        assert!(!script.contains("env ZEROCLAW_WORKSPACE"));
         assert!(script.contains("command_background=\"yes\""));
         assert!(script.contains("command_user=\"zeroclaw:zeroclaw\""));
         assert!(script.contains("pidfile=\"/run/${RC_SVCNAME}.pid\""));
