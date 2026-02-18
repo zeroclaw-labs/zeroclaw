@@ -324,6 +324,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "opencode" | "opencode-zen" => vec!["OPENCODE_API_KEY"],
         "vercel" | "vercel-ai" => vec!["VERCEL_API_KEY"],
         "cloudflare" | "cloudflare-ai" => vec!["CLOUDFLARE_API_KEY"],
+        "ovhcloud" | "ovh" => vec!["OVH_AI_ENDPOINTS_ACCESS_TOKEN"],
         "astrai" => vec!["ASTRAI_API_KEY"],
         _ => vec![],
     };
@@ -405,7 +406,7 @@ pub fn create_provider_with_url(
         // ── Primary providers (custom implementations) ───────
         "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(key))),
         "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(key))),
-        "openai" => Ok(Box::new(openai::OpenAiProvider::new(key))),
+        "openai" => Ok(Box::new(openai::OpenAiProvider::with_base_url(api_url, key))),
         // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)
         "ollama" => Ok(Box::new(ollama::OllamaProvider::new(api_url, key))),
         "gemini" | "google" | "google-gemini" => {
@@ -525,6 +526,12 @@ pub fn create_provider_with_url(
         // ── AI inference routers ─────────────────────────────
         "astrai" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Astrai", "https://as-trai.com/v1", key, AuthStyle::Bearer,
+        ))),
+
+        // ── Cloud AI endpoints ───────────────────────────────
+        "ovhcloud" | "ovh" => Ok(Box::new(openai::OpenAiProvider::with_base_url(
+            Some("https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"),
+            key,
         ))),
 
         // ── Bring Your Own Provider (custom URL) ───────────
@@ -898,6 +905,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             name: "nvidia",
             display_name: "NVIDIA NIM",
             aliases: &["nvidia-nim", "build.nvidia.com"],
+            local: false,
+        },
+        ProviderInfo {
+            name: "ovhcloud",
+            display_name: "OVHcloud AI Endpoints",
+            aliases: &["ovh"],
             local: false,
         },
     ]
@@ -1413,6 +1426,7 @@ mod tests {
             "copilot",
             "nvidia",
             "astrai",
+            "ovhcloud",
         ];
         for name in providers {
             assert!(

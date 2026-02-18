@@ -8,6 +8,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 pub struct OpenAiProvider {
+    base_url: String,
     credential: Option<String>,
     client: Client,
 }
@@ -136,7 +137,16 @@ impl NativeResponseMessage {
 
 impl OpenAiProvider {
     pub fn new(credential: Option<&str>) -> Self {
+        Self::with_base_url(None, credential)
+    }
+
+    /// Create a provider with an optional custom base URL.
+    /// Defaults to `https://api.openai.com/v1` when `base_url` is `None`.
+    pub fn with_base_url(base_url: Option<&str>, credential: Option<&str>) -> Self {
         Self {
+            base_url: base_url
+                .map(|u| u.trim_end_matches('/').to_string())
+                .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
             credential: credential.map(ToString::to_string),
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
@@ -281,7 +291,7 @@ impl Provider for OpenAiProvider {
 
         let response = self
             .client
-            .post("https://api.openai.com/v1/chat/completions")
+            .post(format!("{}/chat/completions", self.base_url))
             .header("Authorization", format!("Bearer {credential}"))
             .json(&request)
             .send()
@@ -322,7 +332,7 @@ impl Provider for OpenAiProvider {
 
         let response = self
             .client
-            .post("https://api.openai.com/v1/chat/completions")
+            .post(format!("{}/chat/completions", self.base_url))
             .header("Authorization", format!("Bearer {credential}"))
             .json(&native_request)
             .send()
@@ -349,7 +359,7 @@ impl Provider for OpenAiProvider {
     async fn warmup(&self) -> anyhow::Result<()> {
         if let Some(credential) = self.credential.as_ref() {
             self.client
-                .get("https://api.openai.com/v1/models")
+                .get(format!("{}/models", self.base_url))
                 .header("Authorization", format!("Bearer {credential}"))
                 .send()
                 .await?
