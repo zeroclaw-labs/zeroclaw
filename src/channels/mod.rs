@@ -1111,10 +1111,6 @@ async fn process_channel_message(
             return;
         }
     };
-
-    let memory_context =
-        build_memory_context(ctx.memory.as_ref(), &msg.content, ctx.min_relevance_score).await;
-
     if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
         let autosave_key = conversation_memory_key(&msg);
         let _ = ctx
@@ -1128,14 +1124,15 @@ async fn process_channel_message(
             .await;
     }
 
-    let enriched_message = if memory_context.is_empty() {
-        msg.content.clone()
-    } else {
-        format!("{memory_context}{}", msg.content)
-    };
-
     println!("  ⏳ Processing message...");
     let started_at = Instant::now();
+
+    let had_prior_history = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&history_key)
+        .is_some_and(|turns| !turns.is_empty());
 
     // Preserve user turn before the LLM call so interrupted requests keep context.
     append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
@@ -1149,11 +1146,16 @@ async fn process_channel_message(
         .cloned()
         .unwrap_or_default();
     let mut prior_turns = normalize_cached_channel_turns(prior_turns_raw);
-    // Keep persisted history clean (raw user text), but inject memory context
-    // for the current provider call by enriching the newest user turn only.
-    if let Some(last_turn) = prior_turns.last_mut() {
-        if last_turn.role == "user" {
-            last_turn.content = enriched_message.clone();
+
+    // Only enrich with memory context when there is no prior conversation
+    // history. Follow-up turns already include context from previous messages.
+    if !had_prior_history {
+        let memory_context =
+            build_memory_context(ctx.memory.as_ref(), &msg.content, ctx.min_relevance_score).await;
+        if let Some(last_turn) = prior_turns.last_mut() {
+            if last_turn.role == "user" && !memory_context.is_empty() {
+                last_turn.content = format!("{memory_context}{}", msg.content);
+            }
         }
     }
 
