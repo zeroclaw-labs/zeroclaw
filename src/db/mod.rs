@@ -204,6 +204,21 @@ impl Registry {
         Ok(None)
     }
 
+    /// Update the status of an instance by ID.
+    pub fn update_status(&self, id: &str, status: &str) -> Result<()> {
+        let rows = self
+            .conn
+            .execute(
+                "UPDATE instances SET status = ?1 WHERE id = ?2",
+                params![status, id],
+            )
+            .context("Failed to update instance status")?;
+        if rows == 0 {
+            anyhow::bail!("No instance with id '{id}'");
+        }
+        Ok(())
+    }
+
     /// Borrow the underlying connection (for rollback operations).
     pub fn conn(&self) -> &Connection {
         &self.conn
@@ -354,6 +369,28 @@ mod tests {
             .unwrap();
         let new_inst = reg.get_instance("new-1").unwrap().unwrap();
         assert_eq!(new_inst.migration_run_id.as_deref(), Some("run-123"));
+    }
+
+    #[test]
+    fn update_status_changes_instance_status() {
+        let reg = Registry::open_in_memory().unwrap();
+        reg.create_instance("id-1", "agent", 18801, "/c.toml", None, None)
+            .unwrap();
+
+        assert_eq!(reg.get_instance("id-1").unwrap().unwrap().status, "stopped");
+
+        reg.update_status("id-1", "running").unwrap();
+        assert_eq!(reg.get_instance("id-1").unwrap().unwrap().status, "running");
+
+        reg.update_status("id-1", "stopped").unwrap();
+        assert_eq!(reg.get_instance("id-1").unwrap().unwrap().status, "stopped");
+    }
+
+    #[test]
+    fn update_status_errors_on_missing_instance() {
+        let reg = Registry::open_in_memory().unwrap();
+        let err = reg.update_status("nonexistent", "running").unwrap_err();
+        assert!(err.to_string().contains("No instance"));
     }
 
     #[test]

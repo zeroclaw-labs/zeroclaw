@@ -26,6 +26,7 @@ pub mod health;
 pub mod heartbeat;
 pub mod identity;
 pub mod integrations;
+pub mod lifecycle;
 pub mod memory;
 pub mod migrate;
 pub mod migration;

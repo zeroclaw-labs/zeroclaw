@@ -1,23 +1,38 @@
-use anyhow::{bail, Result};
-use std::path::PathBuf;
+use anyhow::{bail, Context as _, Result};
+use std::path::{Path, PathBuf};
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 use zeroclaw::config::zeroclaw_home;
 use zeroclaw::db::Registry;
+use zeroclaw::lifecycle;
 use zeroclaw::migrate;
 
 const USAGE: &str = "\
 Usage: zeroclaw-cp [command]
 
 Commands:
-  serve                                   Start the control plane server (default)
+  serve                                    Start the control plane server (default)
+  start <name>                             Start an instance
+  stop <name>                              Stop an instance
+  restart <name>                           Restart an instance
+  status [<name>]                          Show instance status (all or one)
+  logs <name> [-n <lines>] [-f]            Show instance logs
   migrate from-openclaw <path> [--dry-run] Migrate agents from OpenClaw config
 
 Options:
-  -h, --help                              Show this help message";
+  -h, --help                               Show this help message";
 
 enum CliCommand {
     Serve,
+    Start { name: String },
+    Stop { name: String },
+    Restart { name: String },
+    Status { name: Option<String> },
+    Logs {
+        name: String,
+        lines: usize,
+        follow: bool,
+    },
     Migrate { path: PathBuf, dry_run: bool },
 }
 
@@ -39,9 +54,87 @@ fn parse_args() -> Result<CliCommand> {
             }
             Ok(CliCommand::Serve)
         }
+        "start" => {
+            let name = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("Missing instance name\n{USAGE}"))?;
+            if args.len() > 2 {
+                bail!("Unexpected arguments after instance name\n{USAGE}");
+            }
+            Ok(CliCommand::Start {
+                name: name.clone(),
+            })
+        }
+        "stop" => {
+            let name = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("Missing instance name\n{USAGE}"))?;
+            if args.len() > 2 {
+                bail!("Unexpected arguments after instance name\n{USAGE}");
+            }
+            Ok(CliCommand::Stop {
+                name: name.clone(),
+            })
+        }
+        "restart" => {
+            let name = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("Missing instance name\n{USAGE}"))?;
+            if args.len() > 2 {
+                bail!("Unexpected arguments after instance name\n{USAGE}");
+            }
+            Ok(CliCommand::Restart {
+                name: name.clone(),
+            })
+        }
+        "status" => {
+            let name = args.get(1).cloned();
+            if args.len() > 2 {
+                bail!("Unexpected arguments after instance name\n{USAGE}");
+            }
+            Ok(CliCommand::Status { name })
+        }
+        "logs" => parse_logs(&args[1..]),
         "migrate" => parse_migrate(&args[1..]),
         other => bail!("Unknown command: {other}\n{USAGE}"),
     }
+}
+
+fn parse_logs(args: &[String]) -> Result<CliCommand> {
+    if args.is_empty() {
+        bail!("Missing instance name\n{USAGE}");
+    }
+
+    let name = args[0].clone();
+    let mut lines = lifecycle::DEFAULT_LOG_LINES;
+    let mut follow = false;
+    let mut i = 1;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "-f" | "--follow" => {
+                follow = true;
+                i += 1;
+            }
+            "-n" | "--lines" => {
+                let val = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow::anyhow!("Missing value for -n\n{USAGE}"))?;
+                lines = val
+                    .parse()
+                    .with_context(|| format!("Invalid line count: {val}"))?;
+                i += 2;
+            }
+            s if s.starts_with('-') => bail!("Unknown flag: {s}\n{USAGE}"),
+            s => bail!("Unexpected argument: {s}\n{USAGE}"),
+        }
+    }
+
+    Ok(CliCommand::Logs {
+        name,
+        lines,
+        follow,
+    })
 }
 
 fn parse_migrate(args: &[String]) -> Result<CliCommand> {
@@ -83,6 +176,15 @@ fn main() -> Result<()> {
 
     match cmd {
         CliCommand::Serve => run_server(),
+        CliCommand::Start { name } => run_start(&name),
+        CliCommand::Stop { name } => run_stop(&name),
+        CliCommand::Restart { name } => run_restart(&name),
+        CliCommand::Status { name } => run_status(name.as_deref()),
+        CliCommand::Logs {
+            name,
+            lines,
+            follow,
+        } => run_logs(&name, lines, follow),
         CliCommand::Migrate { path, dry_run } => run_migration(&path, dry_run),
     }
 }
@@ -100,7 +202,40 @@ fn registry_path(cp: &Path) -> PathBuf {
     cp.join("registry.db")
 }
 
-use std::path::Path;
+/// Open the registry (creating CP dirs if needed).
+fn open_registry() -> Result<Registry> {
+    let cp = cp_dir();
+    std::fs::create_dir_all(&cp)?;
+    let inst_dir = instances_dir(&cp);
+    std::fs::create_dir_all(&inst_dir)?;
+    Registry::open(&registry_path(&cp))
+}
+
+fn run_start(name: &str) -> Result<()> {
+    let registry = open_registry()?;
+    lifecycle::start_instance(&registry, name)
+}
+
+fn run_stop(name: &str) -> Result<()> {
+    let registry = open_registry()?;
+    lifecycle::stop_instance(&registry, name)
+}
+
+fn run_restart(name: &str) -> Result<()> {
+    let registry = open_registry()?;
+    lifecycle::restart_instance(&registry, name)
+}
+
+fn run_status(name: Option<&str>) -> Result<()> {
+    let registry = open_registry()?;
+    lifecycle::show_status(&registry, name)
+}
+
+fn run_logs(name: &str, lines: usize, follow: bool) -> Result<()> {
+    let registry = open_registry()?;
+    let inst_dir = lifecycle::resolve_instance_dir(&registry, name)?;
+    lifecycle::show_logs(&inst_dir, lines, follow)
+}
 
 fn run_server() -> Result<()> {
     let cp = cp_dir();
@@ -133,7 +268,7 @@ fn run_server() -> Result<()> {
         );
     }
 
-    // TODO: actual HTTP server for instance management
+    // TODO: actual HTTP server for instance management (Phase 7)
     println!("\nServer ready. Press Ctrl+C to stop.");
 
     // Block until signal
@@ -210,5 +345,3 @@ fn run_migration(config_path: &Path, dry_run: bool) -> Result<()> {
 
     Ok(())
 }
-
-use anyhow::Context as _;
