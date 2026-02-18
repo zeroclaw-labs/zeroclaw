@@ -14,20 +14,13 @@
 
 <p align="center">
   <a href="bootstrap.sh">一键部署</a> |
+  <a href="docs/getting-started/README.md">安装入门</a> |
   <a href="docs/README.zh-CN.md">文档总览</a> |
-  <a href="docs/SUMMARY.md">文档目录</a> |
-  <a href="docs/commands-reference.md">命令参考</a> |
-  <a href="docs/config-reference.md">配置参考</a> |
-  <a href="docs/providers-reference.md">Provider 参考</a> |
-  <a href="docs/channels-reference.md">Channel 参考</a> |
-  <a href="docs/operations-runbook.md">运维手册</a> |
-  <a href="docs/troubleshooting.md">故障排查</a> |
-  <a href="CONTRIBUTING.md">贡献指南</a>
+  <a href="docs/SUMMARY.md">文档目录</a>
 </p>
 
 <p align="center">
   <strong>场景分流：</strong>
-  <a href="docs/getting-started/README.md">安装入门</a> ·
   <a href="docs/reference/README.md">参考手册</a> ·
   <a href="docs/operations/README.md">运维部署</a> ·
   <a href="docs/troubleshooting.md">故障排查</a> ·
@@ -52,10 +45,10 @@ ZeroClaw 是一个高性能、低资源占用、可组合的自主智能体运�
 
 ## 为什么选择 ZeroClaw
 
-- **轻量**：小体积二进制，低内存占用，启动快。
-- **可扩展**：支持 28+ 内置 provider（含别名）以及自定义兼容端点。
-- **可运维**：具备 `daemon`、`doctor`、`status`、`service` 等运维命令。
-- **可集成**：多渠道（Telegram、Discord、Slack、Matrix、WhatsApp、Email、IRC、Lark、DingTalk、QQ 等）与 70+ integrations。
+- **默认轻量运行时**：常见 CLI 与 `status` 工作流通常保持在几 MB 级内存范围。
+- **低成本部署友好**：面向低价板卡与小规格云主机设计，不依赖厚重运行时。
+- **冷启动很快**：Rust 单二进制让常用命令与守护进程启动更接近“秒开”。
+- **跨架构可移植**：同一套二进制优先流程覆盖 ARM / x86 / RISC-V，并保持 provider/channel/tool 可替换。
 
 ## 可复现基准（示例）
 
