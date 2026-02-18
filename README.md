@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>Zero overhead. Zero compromise. 100% Rust. 100% Agnostic.</strong><br>
-  ⚡️ <strong>Runs on $10 hardware with <5MB RAM: That's 99% less memory than OpenClaw and 98% cheaper than a Mac mini!</strong>
+  ⚡️ <strong>Runs on $10 hardware with <5MB RAM — 99% less memory than OpenClaw and 98% cheaper than a Mac mini!</strong>
 </p>
 
 <p align="center">
@@ -110,12 +110,15 @@ Example sample (macOS arm64, measured on February 18, 2026):
    During installation (or via the Visual Studio Installer), select the **"Desktop development with C++"** workload.
 
 2. **Rust toolchain:**
+   
    ```powershell
    winget install Rustlang.Rustup
    ```
+   
    After installation, open a new terminal and run `rustup default stable` to ensure the stable toolchain is active.
 
-3. **Verify** both are working:
+4. **Verify** both are working:
+   
    ```powershell
    rustc --version
    cargo --version
@@ -138,12 +141,15 @@ Example sample (macOS arm64, measured on February 18, 2026):
    - **macOS:** Install Xcode Command Line Tools: `xcode-select --install`
 
 2. **Rust toolchain:**
+
    ```bash
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
    ```
+   
    See [rustup.rs](https://rustup.rs) for details.
 
-3. **Verify** both are working:
+4. **Verify** both are working:
+   
    ```bash
    rustc --version
    cargo --version
@@ -302,7 +308,7 @@ zeroclaw agent --provider anthropic -m "hello"
 Every subsystem is a **trait** — swap implementations with a config change, zero code changes.
 
 <p align="center">
-  <img src="docs/architecture.svg" alt="ZeroClaw Architecture" width="900" />
+  <img src="docs/architecture.svg" alt="A Flowchart Explaining ZeroClaw Architecture" width="900" />
 </p>
 
 | Subsystem | Trait | Ships with | Extend |
@@ -467,6 +473,7 @@ WhatsApp uses Meta's Cloud API with webhooks (push-based, not polling):
    - **Verify Token:** You define this (any random string) — Meta will send it back during webhook verification
 
 3. **Configure ZeroClaw:**
+   
    ```toml
    [channels_config.whatsapp]
    access_token = "EAABx..."
@@ -475,19 +482,20 @@ WhatsApp uses Meta's Cloud API with webhooks (push-based, not polling):
    allowed_numbers = ["+1234567890"]  # E.164 format, or ["*"] for all
    ```
 
-4. **Start the gateway with a tunnel:**
+5. **Start the gateway with a tunnel:**
+   
    ```bash
    zeroclaw gateway --port 3000
    ```
    WhatsApp requires HTTPS, so use a tunnel (ngrok, Cloudflare, Tailscale Funnel).
 
-5. **Configure Meta webhook:**
+7. **Configure Meta webhook:**
    - In Meta Developer Console → WhatsApp → Configuration → Webhook
    - **Callback URL:** `https://your-tunnel-url/whatsapp`
    - **Verify Token:** Same as your `verify_token` in config
    - Subscribe to `messages` field
 
-6. **Test:** Send a message to your WhatsApp Business number — ZeroClaw will respond via the LLM.
+8. **Test:** Send a message to your WhatsApp Business number — ZeroClaw will respond via the LLM.
 
 ## Configuration
 
