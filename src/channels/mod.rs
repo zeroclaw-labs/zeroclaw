@@ -71,6 +71,7 @@ struct ChannelRuntimeContext {
     model: Arc<String>,
     temperature: f64,
     auto_save_memory: bool,
+    max_tool_iterations: usize,
 }
 
 fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
@@ -219,6 +220,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             true, // silent — channels don't write to stdout
             None,
             msg.channel.as_str(),
+            ctx.max_tool_iterations,
         ),
     )
     .await;
@@ -1271,6 +1273,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         model: Arc::new(model.clone()),
         temperature,
         auto_save_memory: config.memory.auto_save,
+        max_tool_iterations: config.agent.max_tool_iterations,
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -1495,6 +1498,7 @@ mod tests {
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            max_tool_iterations: 10,
         });
 
         process_channel_message(
@@ -1536,6 +1540,7 @@ mod tests {
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            max_tool_iterations: 10,
         });
 
         process_channel_message(
@@ -1631,6 +1636,7 @@ mod tests {
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            max_tool_iterations: 10,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);

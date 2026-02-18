@@ -15,8 +15,8 @@ use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 use uuid::Uuid;
 
-/// Maximum agentic tool-use iterations per user message to prevent runaway loops.
-const MAX_TOOL_ITERATIONS: usize = 10;
+/// Fallback maximum agentic tool-use iterations used when no config value is available.
+const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 
 static SENSITIVE_KEY_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSet::new([
@@ -540,6 +540,7 @@ pub(crate) async fn agent_turn(
         silent,
         None,
         "channel",
+        DEFAULT_MAX_TOOL_ITERATIONS,
     )
     .await
 }
@@ -558,6 +559,7 @@ pub(crate) async fn run_tool_call_loop(
     silent: bool,
     approval: Option<&ApprovalManager>,
     channel_name: &str,
+    max_tool_iterations: usize,
 ) -> Result<String> {
     // Build native tool definitions once if the provider supports them.
     let use_native_tools = provider.supports_native_tools() && !tools_registry.is_empty();
@@ -567,7 +569,7 @@ pub(crate) async fn run_tool_call_loop(
         Vec::new()
     };
 
-    for _iteration in 0..MAX_TOOL_ITERATIONS {
+    for _iteration in 0..max_tool_iterations {
         observer.record_event(&ObserverEvent::LlmRequest {
             provider: provider_name.to_string(),
             model: model.to_string(),
@@ -752,7 +754,10 @@ pub(crate) async fn run_tool_call_loop(
         history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
     }
 
-    anyhow::bail!("Agent exceeded maximum tool iterations ({MAX_TOOL_ITERATIONS})")
+        anyhow::bail!(
+            "Agent exceeded maximum tool iterations ({})",
+            max_tool_iterations
+        )
 }
 
 /// Build the tool instruction block for the system prompt so the LLM knows
@@ -1066,6 +1071,7 @@ pub async fn run(
             false,
             Some(&approval_manager),
             "cli",
+            config.agent.max_tool_iterations,
         )
         .await?;
         final_output = response.clone();
@@ -1145,6 +1151,7 @@ pub async fn run(
                 false,
                 Some(&approval_manager),
                 "cli",
+                config.agent.max_tool_iterations,
             )
             .await
             {
