@@ -62,7 +62,7 @@ ZeroClaw は、高速・省リソース・高拡張性を重視した自律エ�
 | **バイナリサイズ** | ~28MB（dist） | N/A（スクリプト） | ~8MB | **3.4 MB** |
 | **コスト** | Mac Mini $599 | Linux SBC ~$50 | Linux ボード $10 | **任意の $10 ハードウェア** |
 
-> 注記: ZeroClaw の結果は release ビルドを `/usr/bin/time -l` で計測したものです。OpenClaw は Node.js ランタイム（約390MBのオーバーヘッド）を必要とします。PicoClaw と ZeroClaw は静的バイナリです。
+> 注記: ZeroClaw の結果は release ビルドを `/usr/bin/time -l` で計測したものです。OpenClaw は Node.js ランタイム（約390MBのオーバーヘッド）を必要とし、NanoBot は Python ランタイム依存です。PicoClaw と ZeroClaw は静的バイナリです。
 
 <p align="center">
   <img src="zero-claw.jpeg" alt="ZeroClaw vs OpenClaw Comparison" width="800" />
