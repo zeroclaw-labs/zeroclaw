@@ -881,12 +881,10 @@ mod tests {
 
     #[test]
     fn should_cache_conversation_long() {
-        let mut messages = vec![
-            ChatMessage {
-                role: "system".to_string(),
-                content: "System prompt".to_string(),
-            },
-        ];
+        let mut messages = vec![ChatMessage {
+            role: "system".to_string(),
+            content: "System prompt".to_string(),
+        }];
         // Add 5 non-system messages
         for i in 0..5 {
             messages.push(ChatMessage {
