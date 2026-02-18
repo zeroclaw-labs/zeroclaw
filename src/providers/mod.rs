@@ -228,7 +228,7 @@ pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<
         "glm" | "zhipu" => Ok(Box::new(OpenAiCompatibleProvider::new_no_responses_fallback(
             "GLM", "https://api.z.ai/api/paas/v4", key, AuthStyle::Bearer,
         ))),
-        "minimax" => Ok(Box::new(anthropic::AnthropicProvider::with_base_url(
+        "minimax" => Ok(Box::new(anthropic::AnthropicProvider::with_base_url_bearer(
             key.as_deref(),
             Some("https://api.minimax.io/anthropic"),
         ))),
