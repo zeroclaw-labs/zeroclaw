@@ -239,7 +239,7 @@ pub struct TelegramChannel {
     typing_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     stream_mode: StreamMode,
     draft_update_interval_ms: u64,
-    last_draft_edit: Mutex<Option<std::time::Instant>>,
+    last_draft_edit: Mutex<std::collections::HashMap<String, std::time::Instant>>,
 }
 
 impl TelegramChannel {
@@ -263,7 +263,7 @@ impl TelegramChannel {
             client: reqwest::Client::new(),
             stream_mode: StreamMode::Off,
             draft_update_interval_ms: 1000,
-            last_draft_edit: Mutex::new(None),
+            last_draft_edit: Mutex::new(std::collections::HashMap::new()),
             typing_handle: Mutex::new(None),
         }
     }
@@ -1251,7 +1251,7 @@ impl Channel for TelegramChannel {
             .and_then(|id| id.as_i64())
             .map(|id| id.to_string());
 
-        *self.last_draft_edit.lock() = Some(std::time::Instant::now());
+        self.last_draft_edit.lock().insert(chat_id.to_string(), std::time::Instant::now());
 
         Ok(message_id)
     }
@@ -1262,10 +1262,11 @@ impl Channel for TelegramChannel {
         message_id: &str,
         text: &str,
     ) -> anyhow::Result<()> {
-        // Rate-limit edits
+        // Rate-limit edits per chat
         {
-            let last = self.last_draft_edit.lock();
-            if let Some(last_time) = *last {
+            let (chat_id_for_limit, _) = Self::parse_reply_target(recipient);
+            let last_edits = self.last_draft_edit.lock();
+            if let Some(last_time) = last_edits.get(&chat_id_for_limit) {
                 let elapsed = u64::try_from(last_time.elapsed().as_millis()).unwrap_or(u64::MAX);
                 if elapsed < self.draft_update_interval_ms {
                     return Ok(());
@@ -1275,16 +1276,32 @@ impl Channel for TelegramChannel {
 
         let (chat_id, _) = Self::parse_reply_target(recipient);
 
-        // Truncate to Telegram limit for mid-stream edits
+        // Truncate to Telegram limit for mid-stream edits (UTF-8 safe)
         let display_text = if text.len() > TELEGRAM_MAX_MESSAGE_LENGTH {
-            &text[..TELEGRAM_MAX_MESSAGE_LENGTH]
+            let mut end = 0;
+            for (idx, ch) in text.char_indices() {
+                let next = idx + ch.len_utf8();
+                if next > TELEGRAM_MAX_MESSAGE_LENGTH {
+                    break;
+                }
+                end = next;
+            }
+            &text[..end]
         } else {
             text
         };
 
+        let message_id_parsed = match message_id.parse::<i64>() {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!("Invalid Telegram message_id '{message_id}': {e}");
+                return Ok(());
+            }
+        };
+
         let body = serde_json::json!({
             "chat_id": chat_id,
-            "message_id": message_id.parse::<i64>().unwrap_or(0),
+            "message_id": message_id_parsed,
             "text": display_text,
         });
 
@@ -1296,7 +1313,7 @@ impl Channel for TelegramChannel {
             .await?;
 
         if resp.status().is_success() {
-            *self.last_draft_edit.lock() = Some(std::time::Instant::now());
+            self.last_draft_edit.lock().insert(chat_id.clone(), std::time::Instant::now());
         } else {
             let status = resp.status();
             let err = resp.text().await.unwrap_or_default();
@@ -1316,13 +1333,21 @@ impl Channel for TelegramChannel {
 
         // If text exceeds limit, delete draft and send as chunked messages
         if text.len() > TELEGRAM_MAX_MESSAGE_LENGTH {
+            let msg_id = match message_id.parse::<i64>() {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::warn!("Invalid Telegram message_id '{message_id}': {e}");
+                    return self.send_text_chunks(text, &chat_id, thread_id.as_deref()).await;
+                }
+            };
+
             // Delete the draft
             let _ = self
                 .client
                 .post(self.api_url("deleteMessage"))
                 .json(&serde_json::json!({
                     "chat_id": chat_id,
-                    "message_id": message_id.parse::<i64>().unwrap_or(0),
+                    "message_id": msg_id,
                 }))
                 .send()
                 .await;
@@ -1333,10 +1358,18 @@ impl Channel for TelegramChannel {
                 .await;
         }
 
+        let msg_id = match message_id.parse::<i64>() {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!("Invalid Telegram message_id '{message_id}': {e}");
+                return self.send_text_chunks(text, &chat_id, thread_id.as_deref()).await;
+            }
+        };
+
         // Try editing with Markdown formatting
         let mut body = serde_json::json!({
             "chat_id": chat_id,
-            "message_id": message_id.parse::<i64>().unwrap_or(0),
+            "message_id": msg_id,
             "text": text,
             "parse_mode": "Markdown",
         });
