@@ -753,6 +753,11 @@ pub struct MemoryConfig {
     /// Weight for keyword BM25 in hybrid search (0.0–1.0)
     #[serde(default = "default_keyword_weight")]
     pub keyword_weight: f64,
+    /// Minimum hybrid score (0.0–1.0) for a memory to be included in context.
+    /// Memories scoring below this threshold are dropped to prevent irrelevant
+    /// context from bleeding into conversations. Default: 0.4
+    #[serde(default = "default_min_relevance_score")]
+    pub min_relevance_score: f64,
     /// Max embedding cache entries before LRU eviction
     #[serde(default = "default_cache_size")]
     pub embedding_cache_size: usize,
@@ -811,10 +816,13 @@ fn default_embedding_dims() -> usize {
     1536
 }
 fn default_vector_weight() -> f64 {
-    0.7
+    0.4
 }
 fn default_keyword_weight() -> f64 {
-    0.3
+    0.6
+}
+fn default_min_relevance_score() -> f64 {
+    0.4
 }
 fn default_cache_size() -> usize {
     10_000
@@ -843,6 +851,7 @@ impl Default for MemoryConfig {
             embedding_dimensions: default_embedding_dims(),
             vector_weight: default_vector_weight(),
             keyword_weight: default_keyword_weight(),
+            min_relevance_score: default_min_relevance_score(),
             embedding_cache_size: default_cache_size(),
             chunk_max_tokens: default_chunk_size(),
             response_cache_enabled: false,

@@ -72,6 +72,7 @@ struct ChannelRuntimeContext {
     temperature: f64,
     auto_save_memory: bool,
     max_tool_iterations: usize,
+    min_relevance_score: f64,
 }
 
 fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
@@ -87,13 +88,25 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
     }
 }
 
-async fn build_memory_context(mem: &dyn Memory, user_msg: &str) -> String {
+async fn build_memory_context(
+    mem: &dyn Memory,
+    user_msg: &str,
+    min_relevance_score: f64,
+) -> String {
     let mut context = String::new();
 
     if let Ok(entries) = mem.recall(user_msg, 5, None).await {
-        if !entries.is_empty() {
+        let relevant: Vec<_> = entries
+            .iter()
+            .filter(|e| match e.score {
+                Some(score) => score >= min_relevance_score,
+                None => true, // keep entries without a score (e.g. non-vector backends)
+            })
+            .collect();
+
+        if !relevant.is_empty() {
             context.push_str("[Memory context]\n");
-            for entry in &entries {
+            for entry in &relevant {
                 let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
             }
             context.push('\n');
@@ -166,7 +179,8 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
         truncate_with_ellipsis(&msg.content, 80)
     );
 
-    let memory_context = build_memory_context(ctx.memory.as_ref(), &msg.content).await;
+    let memory_context =
+        build_memory_context(ctx.memory.as_ref(), &msg.content, ctx.min_relevance_score).await;
 
     if ctx.auto_save_memory {
         let autosave_key = conversation_memory_key(&msg);
@@ -1279,6 +1293,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         temperature,
         auto_save_memory: config.memory.auto_save,
         max_tool_iterations: config.agent.max_tool_iterations,
+        min_relevance_score: config.memory.min_relevance_score,
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -1504,6 +1519,7 @@ mod tests {
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 10,
+            min_relevance_score: 0.0,
         });
 
         process_channel_message(
@@ -1546,6 +1562,7 @@ mod tests {
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 10,
+            min_relevance_score: 0.0,
         });
 
         process_channel_message(
@@ -1642,6 +1659,7 @@ mod tests {
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 10,
+            min_relevance_score: 0.0,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -2008,7 +2026,7 @@ mod tests {
             .await
             .unwrap();
 
-        let context = build_memory_context(&mem, "age").await;
+        let context = build_memory_context(&mem, "age", 0.0).await;
         assert!(context.contains("[Memory context]"));
         assert!(context.contains("Age is 45"));
     }
