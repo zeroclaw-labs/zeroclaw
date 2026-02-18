@@ -470,8 +470,8 @@ fn check_zeroclaw_user() -> Result<()> {
 
     let (del_cmd, add_cmd) = if is_alpine {
         (
-            "deluser zeroclaw",
-            "adduser -S -s /sbin/nologin -H zeroclaw",
+            "deluser zeroclaw && delgroup zeroclaw",
+            "addgroup -S zeroclaw && adduser -S -s /sbin/nologin -H -D -G zeroclaw zeroclaw",
         )
     } else {
         ("userdel zeroclaw", "useradd -r -s /sbin/nologin zeroclaw")
@@ -541,8 +541,33 @@ fn ensure_zeroclaw_user() -> Result<()> {
     let is_alpine = Path::new("/etc/alpine-release").exists();
 
     if is_alpine {
+        let group_output = Command::new("getent").args(["group", "zeroclaw"]).output();
+        let group_exists = group_output.map(|o| o.status.success()).unwrap_or(false);
+
+        if !group_exists {
+            let output = Command::new("addgroup")
+                .args(["-S", "zeroclaw"])
+                .output()
+                .context("Failed to create zeroclaw group")?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                bail!("Failed to create zeroclaw group: {}", stderr.trim());
+            }
+            println!("✅ Created system group: zeroclaw");
+        }
+
         let output = Command::new("adduser")
-            .args(["-S", "-s", "/sbin/nologin", "-H", "-D", "zeroclaw"])
+            .args([
+                "-S",
+                "-s",
+                "/sbin/nologin",
+                "-H",
+                "-D",
+                "-G",
+                "zeroclaw",
+                "zeroclaw",
+            ])
             .output()
             .context("Failed to create zeroclaw user")?;
 
