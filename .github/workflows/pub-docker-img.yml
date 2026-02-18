@@ -43,7 +43,7 @@ env:
 jobs:
     pr-smoke:
         name: PR Docker Smoke
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
         runs-on: blacksmith-2vcpu-ubuntu-2404
         timeout-minutes: 25
         permissions:
@@ -56,6 +56,7 @@ jobs:
               uses: useblacksmith/setup-docker-builder@ef12d5b165b596e3aa44ea8198d8fde563eab402 # v1
 
             - name: Extract metadata (tags, labels)
+              if: github.event_name == 'pull_request'
               id: meta
               uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
               with:
@@ -72,7 +73,7 @@ jobs:
                   provenance: false
                   sbom: false
                   tags: zeroclaw-pr-smoke:latest
-                  labels: ${{ steps.meta.outputs.labels }}
+                  labels: ${{ steps.meta.outputs.labels || '' }}
                   platforms: linux/amd64
 
             - name: Verify image
