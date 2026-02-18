@@ -2,6 +2,30 @@
 
 MobileClaw turns an old Android phone into an on-device control center for your daily actions.
 
+MobileClaw is a lightweight autonomous AI agent with UI designed to run on Android devices:
+- a fast Rust-first core under the mobile UX layer
+- a small-footprint runtime model suitable for older/low-cost devices
+- modular architecture where providers/channels/tools/memory are swappable
+- broad provider and messaging ecosystem compatibility
+- secure-by-default design principles for tool and data handling
+
+MobileClaw uses ZeroClaw as its runtime foundation, adapted for Android-native assistant workflows.
+ZeroClaw is a lightweight, secure autonomous AI agent infrastructure designed as a high-performance alternative to OpenClaw.
+It is written in Rust and designed to run with a very low resource footprint.
+ZeroClaw upstream project: https://github.com/zeroclaw-labs/zeroclaw
+
+## What MobileClaw Core Inherits from ZeroClaw
+
+- Performance: ZeroClaw reported cold start under 10ms, with binary size around 3.4MB
+- Low footprint: ZeroClaw reported runtime memory usage under 5MB in minimal setups
+- Architecture: trait-based subsystem with swappable providers, channels, tools, and memory via configuration
+- Interoperability: support for 22+ providers and messaging APIs (including OpenAI, Anthropic, OpenRouter, Telegram, Discord, Slack)
+- Security: preemptive protocol focus to reduce leak risk before incidents occur
+
+Note: the numbers above describe the ZeroClaw core/runtime characteristics. 
+Full MobileClaw app behavior on a phone depends on Android, enabled capabilities, permissions, and active integrations.
+
+
 ## Watch the Demo
 
 [![MobileClaw demo video](https://img.youtube.com/vi/-3fpcQAL6II/maxresdefault.jpg)](https://youtu.be/-3fpcQAL6II)
@@ -78,12 +102,6 @@ adb reverse tcp:8081 tcp:8081
 3. Accept Android permission prompts.
 4. If using UI automation, enable Accessibility service from the in-app instructions.
 
-## Project Layout
-
-- `mobile-app/` - Android app (React Native + Expo)
-- `src/` - ZeroClaw runtime/core modules used across the project
-
-ZeroClaw upstream project: https://github.com/zeroclaw-labs/zeroclaw
 
 ## Notes
 
