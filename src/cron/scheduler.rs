@@ -643,7 +643,10 @@ mod tests {
 
         let (success, output) = run_agent_job(&config, &job).await;
         assert!(!success, "Agent job without provider key should fail");
-        assert!(!output.is_empty(), "Expected non-empty error output from failed agent job");
+        assert!(
+            !output.is_empty(),
+            "Expected non-empty error output from failed agent job"
+        );
     }
 
     #[tokio::test]

@@ -761,7 +761,10 @@ mod tests {
         // The error should be about git (not about autonomy/read-only mode)
         assert!(!result.success, "Expected failure due to missing git repo");
         let error_msg = result.error.as_deref().unwrap_or("");
-        assert!(!error_msg.is_empty(), "Expected a git-related error message");
+        assert!(
+            !error_msg.is_empty(),
+            "Expected a git-related error message"
+        );
         assert!(
             !error_msg.contains("read-only") && !error_msg.contains("autonomy"),
             "Error should be about git, not about autonomy restrictions: {error_msg}"
