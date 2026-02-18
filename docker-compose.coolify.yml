@@ -21,8 +21,8 @@ services:
       - DEEPSEEK_API_KEY
       - MOONSHOT_API_KEY
       # Default provider and model
-      - PROVIDER=deepseek
-      - ZEROCLAW_MODEL=deepseek-chat
+      - PROVIDER=moonshot-intl
+      - ZEROCLAW_MODEL=kimi-k2-turbo-preview
 
       # Allow public bind inside Docker (required for container networking)
       - ZEROCLAW_ALLOW_PUBLIC_BIND=true
