@@ -16,9 +16,11 @@ services:
     restart: unless-stopped
 
     environment:
-      # Provider: deepseek
       # NOTE: Coolify injects these from its Environment Variables UI
+      # Provider keys (add any you have)
       - DEEPSEEK_API_KEY
+      - MOONSHOT_API_KEY
+      # Default provider and model
       - PROVIDER=deepseek
       - ZEROCLAW_MODEL=deepseek-chat
 
