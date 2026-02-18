@@ -31,6 +31,7 @@ Runtime resolution order is:
 | `vercel` | `vercel-ai` | No | `VERCEL_API_KEY` |
 | `cloudflare` | `cloudflare-ai` | No | `CLOUDFLARE_API_KEY` |
 | `moonshot` | `kimi` | No | `MOONSHOT_API_KEY` |
+| `kimi-code` | `kimi_coding`, `kimi_for_coding` | No | `KIMI_CODE_API_KEY`, `MOONSHOT_API_KEY` |
 | `synthetic` | — | No | `SYNTHETIC_API_KEY` |
 | `opencode` | `opencode-zen` | No | `OPENCODE_API_KEY` |
 | `zai` | `z.ai` | No | `ZAI_API_KEY` |
@@ -50,6 +51,13 @@ Runtime resolution order is:
 | `copilot` | `github-copilot` | No | (use config/`API_KEY` fallback with GitHub token) |
 | `lmstudio` | `lm-studio` | Yes | (optional; local by default) |
 | `nvidia` | `nvidia-nim`, `build.nvidia.com` | No | `NVIDIA_API_KEY` |
+
+### Kimi Code Notes
+
+- Provider ID: `kimi-code`
+- Endpoint: `https://api.kimi.com/coding/v1`
+- Default onboarding model: `kimi-for-coding` (alternative: `kimi-k2.5`)
+- Runtime auto-adds `User-Agent: KimiCLI/0.77` for compatibility.
 
 ## Custom Endpoints
 
@@ -86,4 +94,3 @@ Then call with a hint model name (for example from tool or integration paths):
 ```text
 hint:reasoning
 ```
-
