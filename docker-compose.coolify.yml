@@ -22,7 +22,7 @@ services:
       - MOONSHOT_API_KEY
       # Default provider and model
       - PROVIDER=moonshot-intl
-      - ZEROCLAW_MODEL=kimi-k2-turbo-preview
+      - ZEROCLAW_MODEL=kimi-k2.5
 
       # Allow public bind inside Docker (required for container networking)
       - ZEROCLAW_ALLOW_PUBLIC_BIND=true
