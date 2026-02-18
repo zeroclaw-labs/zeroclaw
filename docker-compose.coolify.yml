@@ -1,0 +1,60 @@
+# ZeroClaw Docker Compose for Coolify
+# ─────────────────────────────────────
+# This file is used by Coolify for deployment.
+# Environment variables are set in Coolify UI.
+#
+# Domain: zc.nulab.cc
+# Provider: moonshot (Kimi K2.5)
+#
+# Required env vars (set in Coolify):
+#   MOONSHOT_API_KEY=your-moonshot-api-key
+
+services:
+  zeroclaw:
+    image: ghcr.io/zeroclaw-labs/zeroclaw:latest
+    container_name: zeroclaw
+    restart: unless-stopped
+
+    environment:
+      # Provider: moonshot (Kimi models)
+      - MOONSHOT_API_KEY=${MOONSHOT_API_KEY}
+      - PROVIDER=${PROVIDER:-moonshot}
+      - ZEROCLAW_MODEL=${ZEROCLAW_MODEL:-kimi-k2.5}
+
+      # Allow public bind inside Docker (required for container networking)
+      - ZEROCLAW_ALLOW_PUBLIC_BIND=true
+
+      # Optional: Additional provider keys for model routing
+      # - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      # - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      # - GROQ_API_KEY=${GROQ_API_KEY:-}
+      # - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+
+    volumes:
+      - zeroclaw-data:/zeroclaw-data
+
+    ports:
+      - "${HOST_PORT:-3000}:3000"
+
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+    healthcheck:
+      test: ["CMD", "zeroclaw", "status"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+    labels:
+      - coolify.managed=true
+      - autoheal=true
+
+volumes:
+  zeroclaw-data:
