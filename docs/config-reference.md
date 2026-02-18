@@ -16,6 +16,17 @@ Config file path:
 | `default_model` | `anthropic/claude-sonnet-4-6` | model routed through selected provider |
 | `default_temperature` | `0.7` | model temperature |
 
+## `[agent]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `max_tool_iterations` | `10` | Maximum tool-call loop turns per user message across CLI, gateway, and channels |
+
+Notes:
+
+- Setting `max_tool_iterations = 0` falls back to safe default `10`.
+- If a channel message exceeds this value, the runtime returns: `Agent exceeded maximum tool iterations (<value>)`.
+
 ## `[gateway]`
 
 | Key | Default | Purpose |
