@@ -10,6 +10,7 @@ use crate::security::SecurityPolicy;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use futures_util::{stream, StreamExt};
+use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::time::{self, Duration};
@@ -430,6 +431,9 @@ async fn run_job_command_with_timeout(
         .arg("-lc")
         .arg(&job.command)
         .current_dir(&config.workspace_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
     {

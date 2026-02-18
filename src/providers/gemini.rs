@@ -689,7 +689,10 @@ mod tests {
 
     #[tokio::test]
     async fn warmup_without_key_is_noop() {
-        let provider = GeminiProvider::new(None);
+        let provider = GeminiProvider {
+            auth: None,
+            client: Client::new(),
+        };
         let result = provider.warmup().await;
         assert!(result.is_ok());
     }
