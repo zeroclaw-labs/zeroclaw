@@ -38,8 +38,11 @@ default_model = "claude-sonnet-4"
 
 ### Environment Variables
 
+For `custom:` and `anthropic-custom:` providers, use the generic key env vars:
+
 ```bash
-export ANTHROPIC_API_KEY="your-api-key"
+export API_KEY="your-api-key"
+# or: export ZEROCLAW_API_KEY="your-api-key"
 zeroclaw agent
 ```
 
@@ -60,7 +63,7 @@ zeroclaw agent -m "test message"
 ### Authentication Errors
 
 - Verify API key is correct
-- Check endpoint URL format (must include `https://`)
+- Check endpoint URL format (must include `http://` or `https://`)
 - Ensure endpoint is accessible from your network
 
 ### Model Not Found
