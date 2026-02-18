@@ -424,7 +424,9 @@ mod tests {
 
         assert_eq!(payload.len(), 64, "Token payload should be 32 bytes in hex");
         assert!(
-            payload.chars().all(|c| c.is_ascii_hexdigit()),
+            payload
+                .chars()
+                .all(|c| c.is_ascii_digit() || matches!(c, 'a'..='f')),
             "Token payload should be lowercase hex"
         );
     }
