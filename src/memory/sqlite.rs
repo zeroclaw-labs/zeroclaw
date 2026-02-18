@@ -434,30 +434,57 @@ impl Memory for SqliteMemory {
             )
         };
 
-        // Fetch full entries for merged results
+        // Fetch full entries for merged results in a single batch query
+        // instead of one SELECT per result (N+1 → 1 round-trip).
         let mut results = Vec::new();
-        for scored in &merged {
-            let mut stmt = conn.prepare(
-                "SELECT id, key, content, category, created_at, session_id FROM memories WHERE id = ?1",
-            )?;
-            if let Ok(entry) = stmt.query_row(params![scored.id], |row| {
-                Ok(MemoryEntry {
-                    id: row.get(0)?,
-                    key: row.get(1)?,
-                    content: row.get(2)?,
-                    category: Self::str_to_category(&row.get::<_, String>(3)?),
-                    timestamp: row.get(4)?,
-                    session_id: row.get(5)?,
-                    score: Some(f64::from(scored.final_score)),
-                })
-            }) {
-                // Filter by session_id if requested
-                if let Some(sid) = session_id {
-                    if entry.session_id.as_deref() != Some(sid) {
-                        continue;
+        if !merged.is_empty() {
+            let placeholders: String = (1..=merged.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT id, key, content, category, created_at, session_id \
+                 FROM memories WHERE id IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let id_params: Vec<Box<dyn rusqlite::types::ToSql>> = merged
+                .iter()
+                .map(|s| Box::new(s.id.clone()) as Box<dyn rusqlite::types::ToSql>)
+                .collect();
+            let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+                id_params.iter().map(AsRef::as_ref).collect();
+            let rows = stmt.query_map(params_ref.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?, row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?, row.get::<_, Option<String>>(5)?))
+            })?;
+
+            // Index fetched rows by id for O(1) lookup
+            let mut entry_map = std::collections::HashMap::new();
+            for row in rows {
+                let (id, key, content, cat, ts, sid) = row?;
+                entry_map.insert(id, (key, content, cat, ts, sid));
+            }
+
+            // Reassemble in merge-ranked order, preserving relevance ordering
+            for scored in &merged {
+                if let Some((key, content, cat, ts, sid)) = entry_map.remove(&scored.id) {
+                    let entry = MemoryEntry {
+                        id: scored.id.clone(),
+                        key,
+                        content,
+                        category: Self::str_to_category(&cat),
+                        timestamp: ts,
+                        session_id: sid,
+                        score: Some(f64::from(scored.final_score)),
+                    };
+                    if let Some(filter_sid) = session_id {
+                        if entry.session_id.as_deref() != Some(filter_sid) {
+                            continue;
+                        }
                     }
+                    results.push(entry);
                 }
-                results.push(entry);
             }
         }
 
