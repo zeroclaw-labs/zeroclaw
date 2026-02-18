@@ -460,9 +460,12 @@ mod tests {
 
     #[test]
     fn response_with_unicode() {
-        let json = r#"{"choices":[{"message":{"content":"こんにちは 🦀"}}]}"#;
+        let json = r#"{"choices":[{"message":{"content":"Hello \u03A9"}}]}"#;
         let resp: ChatResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.choices[0].message.effective_content(), "こんにちは 🦀");
+        assert_eq!(
+            resp.choices[0].message.effective_content(),
+            "Hello \u{03A9}"
+        );
     }
 
     #[test]
@@ -483,9 +486,9 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // ══════════════════════════════════════════════════════════
+    // ----------------------------------------------------------
     // Reasoning model fallback tests (reasoning_content)
-    // ══════════════════════════════════════════════════════════
+    // ----------------------------------------------------------
 
     #[test]
     fn reasoning_content_fallback_empty_content() {
