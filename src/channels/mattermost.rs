@@ -1,6 +1,7 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use anyhow::{bail, Result};
 use async_trait::async_trait;
+use parking_lot::Mutex;
 
 /// Mattermost channel — polls channel posts via REST API v4.
 /// Mattermost is API-compatible with many Slack patterns but uses a dedicated v4 structure.
@@ -9,12 +10,12 @@ pub struct MattermostChannel {
     bot_token: String,
     channel_id: Option<String>,
     allowed_users: Vec<String>,
-    /// When true, replies thread on the original post's root_id.
-    /// When false (default), replies go to the channel root.
+    /// When true (default), replies thread on the original post's root_id.
+    /// When false, replies go to the channel root.
     thread_replies: bool,
     client: reqwest::Client,
     /// Handle for the background typing-indicator loop (aborted on stop_typing).
-    typing_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    typing_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl MattermostChannel {
@@ -34,7 +35,7 @@ impl MattermostChannel {
             allowed_users,
             thread_replies,
             client: reqwest::Client::new(),
-            typing_handle: std::sync::Mutex::new(None),
+            typing_handle: Mutex::new(None),
         }
     }
 
@@ -195,8 +196,10 @@ impl Channel for MattermostChannel {
         let base_url = self.base_url.clone();
 
         // recipient is "channel_id" or "channel_id:root_id"
-        let channel_id = recipient.split(':').next().unwrap_or(recipient).to_string();
-        let parent_id = recipient.split(':').nth(1).map(String::from);
+        let (channel_id, parent_id) = match recipient.split_once(':') {
+            Some((channel, parent)) => (channel.to_string(), Some(parent.to_string())),
+            None => (recipient.to_string(), None),
+        };
 
         let handle = tokio::spawn(async move {
             let url = format!("{base_url}/api/v4/users/me/typing");
@@ -225,18 +228,16 @@ impl Channel for MattermostChannel {
             }
         });
 
-        if let Ok(mut guard) = self.typing_handle.lock() {
-            *guard = Some(handle);
-        }
+        let mut guard = self.typing_handle.lock();
+        *guard = Some(handle);
 
         Ok(())
     }
 
     async fn stop_typing(&self, _recipient: &str) -> Result<()> {
-        if let Ok(mut guard) = self.typing_handle.lock() {
-            if let Some(handle) = guard.take() {
-                handle.abort();
-            }
+        let mut guard = self.typing_handle.lock();
+        if let Some(handle) = guard.take() {
+            handle.abort();
         }
         Ok(())
     }
@@ -315,8 +316,7 @@ mod tests {
 
     #[test]
     fn mattermost_parse_post_basic() {
-        let ch =
-            MattermostChannel::new("url".into(), "token".into(), None, vec!["*".into()], false);
+        let ch = MattermostChannel::new("url".into(), "token".into(), None, vec!["*".into()], true);
         let post = json!({
             "id": "post123",
             "user_id": "user456",
@@ -330,7 +330,7 @@ mod tests {
             .unwrap();
         assert_eq!(msg.sender, "user456");
         assert_eq!(msg.content, "hello world");
-        assert_eq!(msg.reply_target, "chan789"); // Channel-level reply (thread_replies=false)
+        assert_eq!(msg.reply_target, "chan789:post123"); // Default threaded reply
     }
 
     #[test]

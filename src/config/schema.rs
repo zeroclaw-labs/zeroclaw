@@ -1499,8 +1499,8 @@ pub struct MattermostConfig {
     pub channel_id: Option<String>,
     #[serde(default)]
     pub allowed_users: Vec<String>,
-    /// When true, replies thread on the original post. When false (default),
-    /// replies go to the channel root.
+    /// When true (default), replies thread on the original post.
+    /// When false, replies go to the channel root.
     #[serde(default)]
     pub thread_replies: Option<bool>,
 }
