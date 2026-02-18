@@ -232,7 +232,7 @@ Use Git worktrees to isolate concurrent agent/human tracks safely and predictabl
 - Keep each worktree on a single branch; do not mix unrelated edits in one worktree.
 - Run validation commands inside the corresponding worktree before commit/PR.
 - Name worktrees clearly by scope (for example: `wt/ci-hardening`, `wt/provider-fix`) and remove stale worktrees when no longer needed.
-- PR checkpoint rules from section 6.3 still apply to worktree-based development.
+- PR checkpoint rules from section 6.1 still apply to worktree-based development.
 
 ### 6.3 Code Naming Contract (Required)
 
