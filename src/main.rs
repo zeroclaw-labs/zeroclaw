@@ -784,8 +784,7 @@ async fn main() -> Result<()> {
                 let schema = schemars::schema_for!(config::Config);
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&schema)
-                        .expect("failed to serialize JSON Schema")
+                    serde_json::to_string_pretty(&schema).expect("failed to serialize JSON Schema")
                 );
                 Ok(())
             }
