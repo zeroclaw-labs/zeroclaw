@@ -13,7 +13,6 @@ pub struct WhatsAppChannel {
     endpoint_id: String,
     verify_token: String,
     allowed_numbers: Vec<String>,
-    client: reqwest::Client,
 }
 
 impl WhatsAppChannel {
@@ -28,8 +27,11 @@ impl WhatsAppChannel {
             endpoint_id,
             verify_token,
             allowed_numbers,
-            client: reqwest::Client::new(),
         }
+    }
+
+    fn http_client(&self) -> reqwest::Client {
+        crate::config::build_runtime_proxy_client("channel.whatsapp")
     }
 
     /// Check if a phone number is allowed (E.164 format: +1234567890)
@@ -164,7 +166,7 @@ impl Channel for WhatsAppChannel {
         });
 
         let resp = self
-            .client
+            .http_client()
             .post(&url)
             .bearer_auth(&self.access_token)
             .header("Content-Type", "application/json")
@@ -201,7 +203,7 @@ impl Channel for WhatsAppChannel {
         // Check if we can reach the WhatsApp API
         let url = format!("https://graph.facebook.com/v18.0/{}", self.endpoint_id);
 
-        self.client
+        self.http_client()
             .get(&url)
             .bearer_auth(&self.access_token)
             .send()

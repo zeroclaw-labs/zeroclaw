@@ -43,7 +43,6 @@ impl EmbeddingProvider for NoopEmbedding {
 // ── OpenAI-compatible embedding provider ─────────────────────
 
 pub struct OpenAiEmbedding {
-    client: reqwest::Client,
     base_url: String,
     api_key: String,
     model: String,
@@ -53,12 +52,15 @@ pub struct OpenAiEmbedding {
 impl OpenAiEmbedding {
     pub fn new(base_url: &str, api_key: &str, model: &str, dims: usize) -> Self {
         Self {
-            client: reqwest::Client::new(),
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
             model: model.to_string(),
             dims,
         }
+    }
+
+    fn http_client(&self) -> reqwest::Client {
+        crate::config::build_runtime_proxy_client("memory.embeddings")
     }
 
     fn has_explicit_api_path(&self) -> bool {
@@ -112,7 +114,7 @@ impl EmbeddingProvider for OpenAiEmbedding {
         });
 
         let resp = self
-            .client
+            .http_client()
             .post(self.embeddings_url())
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")

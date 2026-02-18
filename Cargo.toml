@@ -23,7 +23,7 @@ tokio = { version = "1.42", default-features = false, features = ["rt-multi-thre
 tokio-util = { version = "0.7", default-features = false }
 
 # HTTP client - minimal features
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "multipart", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "multipart", "stream", "socks"] }
 
 # Serialization
 serde = { version = "1.0", default-features = false, features = ["derive"] }

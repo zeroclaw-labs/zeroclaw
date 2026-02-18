@@ -1,30 +1,21 @@
 use super::traits::{Tool, ToolResult};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
-use reqwest::Client;
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 const PUSHOVER_API_URL: &str = "https://api.pushover.net/1/messages.json";
 const PUSHOVER_REQUEST_TIMEOUT_SECS: u64 = 15;
 
 pub struct PushoverTool {
-    client: Client,
     security: Arc<SecurityPolicy>,
     workspace_dir: PathBuf,
 }
 
 impl PushoverTool {
     pub fn new(security: Arc<SecurityPolicy>, workspace_dir: PathBuf) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(PUSHOVER_REQUEST_TIMEOUT_SECS))
-            .build()
-            .unwrap_or_else(|_| Client::new());
-
         Self {
-            client,
             security,
             workspace_dir,
         }
@@ -182,12 +173,12 @@ impl Tool for PushoverTool {
             form = form.text("sound", sound);
         }
 
-        let response = self
-            .client
-            .post(PUSHOVER_API_URL)
-            .multipart(form)
-            .send()
-            .await?;
+        let client = crate::config::build_runtime_proxy_client_with_timeouts(
+            "tool.pushover",
+            PUSHOVER_REQUEST_TIMEOUT_SECS,
+            10,
+        );
+        let response = client.post(PUSHOVER_API_URL).multipart(form).send().await?;
 
         let status = response.status();
         let body = response.text().await.unwrap_or_default();

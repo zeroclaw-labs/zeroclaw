@@ -736,7 +736,7 @@ impl BrowserTool {
             }
         });
 
-        let client = reqwest::Client::new();
+        let client = crate::config::build_runtime_proxy_client("tool.browser");
         let mut request = client
             .post(endpoint)
             .timeout(Duration::from_millis(self.computer_use.timeout_ms))

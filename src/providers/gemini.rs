@@ -13,7 +13,6 @@ use std::path::PathBuf;
 /// Gemini provider supporting multiple authentication methods.
 pub struct GeminiProvider {
     auth: Option<GeminiAuth>,
-    client: Client,
 }
 
 /// Resolved credential — the variant determines both the HTTP auth method
@@ -161,11 +160,6 @@ impl GeminiProvider {
 
         Self {
             auth: resolved_auth,
-            client: Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
         }
     }
 
@@ -279,6 +273,10 @@ impl GeminiProvider {
         }
     }
 
+    fn http_client(&self) -> Client {
+        crate::config::build_runtime_proxy_client_with_timeouts("provider.gemini", 120, 10)
+    }
+
     fn build_generate_content_request(
         &self,
         auth: &GeminiAuth,
@@ -286,6 +284,7 @@ impl GeminiProvider {
         request: &GenerateContentRequest,
         model: &str,
     ) -> reqwest::RequestBuilder {
+        let req = self.http_client().post(url).json(request);
         match auth {
             GeminiAuth::OAuthToken(token) => {
                 // Internal API expects the model in the request body envelope
@@ -317,12 +316,12 @@ impl GeminiProvider {
                             .collect(),
                     }),
                 };
-                self.client
+                self.http_client()
                     .post(url)
                     .json(&internal_request)
                     .bearer_auth(token)
             }
-            _ => self.client.post(url).json(request),
+            _ => req,
         }
     }
 }
@@ -408,7 +407,7 @@ impl Provider for GeminiProvider {
                 "https://generativelanguage.googleapis.com/v1beta/models".to_string()
             };
 
-            let mut request = self.client.get(&url);
+            let mut request = self.http_client().get(&url);
             if let GeminiAuth::OAuthToken(token) = auth {
                 request = request.bearer_auth(token);
             }
@@ -470,17 +469,13 @@ mod tests {
     fn auth_source_explicit_key() {
         let provider = GeminiProvider {
             auth: Some(GeminiAuth::ExplicitKey("key".into())),
-            client: Client::new(),
         };
         assert_eq!(provider.auth_source(), "config");
     }
 
     #[test]
     fn auth_source_none_without_credentials() {
-        let provider = GeminiProvider {
-            auth: None,
-            client: Client::new(),
-        };
+        let provider = GeminiProvider { auth: None };
         assert_eq!(provider.auth_source(), "none");
     }
 
@@ -488,7 +483,6 @@ mod tests {
     fn auth_source_oauth() {
         let provider = GeminiProvider {
             auth: Some(GeminiAuth::OAuthToken("ya29.mock".into())),
-            client: Client::new(),
         };
         assert_eq!(provider.auth_source(), "Gemini CLI OAuth");
     }
@@ -534,7 +528,6 @@ mod tests {
     fn oauth_request_uses_bearer_auth_header() {
         let provider = GeminiProvider {
             auth: Some(GeminiAuth::OAuthToken("ya29.mock-token".into())),
-            client: Client::new(),
         };
         let auth = GeminiAuth::OAuthToken("ya29.mock-token".into());
         let url = GeminiProvider::build_generate_content_url("gemini-2.0-flash", &auth);
@@ -570,7 +563,6 @@ mod tests {
     fn api_key_request_does_not_set_bearer_header() {
         let provider = GeminiProvider {
             auth: Some(GeminiAuth::ExplicitKey("api-key-123".into())),
-            client: Client::new(),
         };
         let auth = GeminiAuth::ExplicitKey("api-key-123".into());
         let url = GeminiProvider::build_generate_content_url("gemini-2.0-flash", &auth);
@@ -689,10 +681,7 @@ mod tests {
 
     #[tokio::test]
     async fn warmup_without_key_is_noop() {
-        let provider = GeminiProvider {
-            auth: None,
-            client: Client::new(),
-        };
+        let provider = GeminiProvider { auth: None };
         let result = provider.warmup().await;
         assert!(result.is_ok());
     }

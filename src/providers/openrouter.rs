@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 
 pub struct OpenRouterProvider {
     credential: Option<String>,
-    client: Client,
 }
 
 #[derive(Debug, Serialize)]
@@ -113,11 +112,6 @@ impl OpenRouterProvider {
     pub fn new(credential: Option<&str>) -> Self {
         Self {
             credential: credential.map(ToString::to_string),
-            client: Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
         }
     }
 
@@ -225,6 +219,10 @@ impl OpenRouterProvider {
             tool_calls,
         }
     }
+
+    fn http_client(&self) -> Client {
+        crate::config::build_runtime_proxy_client_with_timeouts("provider.openrouter", 120, 10)
+    }
 }
 
 #[async_trait]
@@ -233,7 +231,7 @@ impl Provider for OpenRouterProvider {
         // Hit a lightweight endpoint to establish TLS + HTTP/2 connection pool.
         // This prevents the first real chat request from timing out on cold start.
         if let Some(credential) = self.credential.as_ref() {
-            self.client
+            self.http_client()
                 .get("https://openrouter.ai/api/v1/auth/key")
                 .header("Authorization", format!("Bearer {credential}"))
                 .send()
@@ -274,7 +272,7 @@ impl Provider for OpenRouterProvider {
         };
 
         let response = self
-            .client
+            .http_client()
             .post("https://openrouter.ai/api/v1/chat/completions")
             .header("Authorization", format!("Bearer {credential}"))
             .header(
@@ -324,7 +322,7 @@ impl Provider for OpenRouterProvider {
         };
 
         let response = self
-            .client
+            .http_client()
             .post("https://openrouter.ai/api/v1/chat/completions")
             .header("Authorization", format!("Bearer {credential}"))
             .header(
@@ -372,7 +370,7 @@ impl Provider for OpenRouterProvider {
         };
 
         let response = self
-            .client
+            .http_client()
             .post("https://openrouter.ai/api/v1/chat/completions")
             .header("Authorization", format!("Bearer {credential}"))
             .header(
@@ -460,7 +458,7 @@ impl Provider for OpenRouterProvider {
         };
 
         let response = self
-            .client
+            .http_client()
             .post("https://openrouter.ai/api/v1/chat/completions")
             .header("Authorization", format!("Bearer {credential}"))
             .header(

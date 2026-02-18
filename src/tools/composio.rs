@@ -24,7 +24,6 @@ pub struct ComposioTool {
     api_key: String,
     default_entity_id: String,
     security: Arc<SecurityPolicy>,
-    client: Client,
 }
 
 impl ComposioTool {
@@ -37,12 +36,11 @@ impl ComposioTool {
             api_key: api_key.to_string(),
             default_entity_id: normalize_entity_id(default_entity_id.unwrap_or("default")),
             security,
-            client: Client::builder()
-                .timeout(std::time::Duration::from_secs(60))
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
         }
+    }
+
+    fn client(&self) -> Client {
+        crate::config::build_runtime_proxy_client_with_timeouts("tool.composio", 60, 10)
     }
 
     /// List available Composio apps/actions for the authenticated user.
@@ -68,7 +66,7 @@ impl ComposioTool {
 
     async fn list_actions_v3(&self, app_name: Option<&str>) -> anyhow::Result<Vec<ComposioAction>> {
         let url = format!("{COMPOSIO_API_BASE_V3}/tools");
-        let mut req = self.client.get(&url).header("x-api-key", &self.api_key);
+        let mut req = self.client().get(&url).header("x-api-key", &self.api_key);
 
         req = req.query(&[("limit", "200")]);
         if let Some(app) = app_name.map(str::trim).filter(|app| !app.is_empty()) {
@@ -95,7 +93,7 @@ impl ComposioTool {
         }
 
         let resp = self
-            .client
+            .client()
             .get(&url)
             .header("x-api-key", &self.api_key)
             .send()
@@ -180,7 +178,7 @@ impl ComposioTool {
         );
 
         let resp = self
-            .client
+            .client()
             .post(&url)
             .header("x-api-key", &self.api_key)
             .json(&body)
@@ -216,7 +214,7 @@ impl ComposioTool {
         }
 
         let resp = self
-            .client
+            .client()
             .post(&url)
             .header("x-api-key", &self.api_key)
             .json(&body)
@@ -288,7 +286,7 @@ impl ComposioTool {
         });
 
         let resp = self
-            .client
+            .client()
             .post(&url)
             .header("x-api-key", &self.api_key)
             .json(&body)
@@ -321,7 +319,7 @@ impl ComposioTool {
         });
 
         let resp = self
-            .client
+            .client()
             .post(&url)
             .header("x-api-key", &self.api_key)
             .json(&body)
@@ -345,7 +343,7 @@ impl ComposioTool {
         let url = format!("{COMPOSIO_API_BASE_V3}/auth_configs");
 
         let resp = self
-            .client
+            .client()
             .get(&url)
             .header("x-api-key", &self.api_key)
             .query(&[

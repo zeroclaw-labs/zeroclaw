@@ -15,7 +15,6 @@ pub struct DingTalkChannel {
     client_id: String,
     client_secret: String,
     allowed_users: Vec<String>,
-    client: reqwest::Client,
     /// Per-chat session webhooks for sending replies (chatID -> webhook URL).
     /// DingTalk provides a unique webhook URL with each incoming message.
     session_webhooks: Arc<RwLock<HashMap<String, String>>>,
@@ -34,9 +33,12 @@ impl DingTalkChannel {
             client_id,
             client_secret,
             allowed_users,
-            client: reqwest::Client::new(),
             session_webhooks: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    fn http_client(&self) -> reqwest::Client {
+        crate::config::build_runtime_proxy_client("channel.dingtalk")
     }
 
     fn is_user_allowed(&self, user_id: &str) -> bool {
@@ -86,7 +88,7 @@ impl DingTalkChannel {
         });
 
         let resp = self
-            .client
+            .http_client()
             .post("https://api.dingtalk.com/v1.0/gateway/connections/open")
             .json(&body)
             .send()
@@ -128,7 +130,12 @@ impl Channel for DingTalkChannel {
             }
         });
 
-        let resp = self.client.post(webhook_url).json(&body).send().await?;
+        let resp = self
+            .http_client()
+            .post(webhook_url)
+            .json(&body)
+            .send()
+            .await?;
 
         if !resp.status().is_success() {
             let status = resp.status();

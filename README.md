@@ -834,11 +834,19 @@ Start from the docs hub for a task-based map:
 
 Core collaboration references:
 
+- Documentation index: [docs/README.md](docs/README.md)
+- Documentation template: [docs/doc-template.md](docs/doc-template.md)
+- Documentation change checklist: [docs/README.md#4-documentation-change-checklist](docs/README.md#4-documentation-change-checklist)
 - Contribution guide: [CONTRIBUTING.md](CONTRIBUTING.md)
 - PR workflow policy: [docs/pr-workflow.md](docs/pr-workflow.md)
 - Reviewer playbook (triage + deep review): [docs/reviewer-playbook.md](docs/reviewer-playbook.md)
 - CI ownership and triage map: [docs/ci-map.md](docs/ci-map.md)
 - Security disclosure policy: [SECURITY.md](SECURITY.md)
+
+For deployment and runtime operations:
+
+- Network deployment guide: [docs/network-deployment.md](docs/network-deployment.md)
+- Proxy agent playbook: [docs/proxy-agent-playbook.md](docs/proxy-agent-playbook.md)
 
 ## Support ZeroClaw
 

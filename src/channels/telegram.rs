@@ -357,6 +357,10 @@ impl TelegramChannel {
         }
     }
 
+    fn http_client(&self) -> reqwest::Client {
+        crate::config::build_runtime_proxy_client("channel.telegram")
+    }
+
     fn normalize_identity(value: &str) -> String {
         value.trim().trim_start_matches('@').to_string()
     }
@@ -448,7 +452,7 @@ impl TelegramChannel {
     }
 
     async fn fetch_bot_username(&self) -> anyhow::Result<String> {
-        let resp = self.client.get(self.api_url("getMe")).send().await?;
+        let resp = self.http_client().get(self.api_url("getMe")).send().await?;
 
         if !resp.status().is_success() {
             anyhow::bail!("Failed to fetch bot info: {}", resp.status());
@@ -857,7 +861,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
 
             let markdown_resp = self
-                .client
+                .http_client()
                 .post(self.api_url("sendMessage"))
                 .json(&markdown_body)
                 .send()
@@ -887,7 +891,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 plain_body["message_thread_id"] = serde_json::Value::String(tid.to_string());
             }
             let plain_resp = self
-                .client
+                .http_client()
                 .post(self.api_url("sendMessage"))
                 .json(&plain_body)
                 .send()
@@ -936,7 +940,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         let resp = self
-            .client
+            .http_client()
             .post(self.api_url(method))
             .json(&body)
             .send()
@@ -1029,7 +1033,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         let resp = self
-            .client
+            .http_client()
             .post(self.api_url("sendDocument"))
             .multipart(form)
             .send()
@@ -1068,7 +1072,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         let resp = self
-            .client
+            .http_client()
             .post(self.api_url("sendDocument"))
             .multipart(form)
             .send()
@@ -1112,7 +1116,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         let resp = self
-            .client
+            .http_client()
             .post(self.api_url("sendPhoto"))
             .multipart(form)
             .send()
@@ -1151,7 +1155,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         let resp = self
-            .client
+            .http_client()
             .post(self.api_url("sendPhoto"))
             .multipart(form)
             .send()
@@ -1195,7 +1199,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         let resp = self
-            .client
+            .http_client()
             .post(self.api_url("sendVideo"))
             .multipart(form)
             .send()
@@ -1239,7 +1243,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         let resp = self
-            .client
+            .http_client()
             .post(self.api_url("sendAudio"))
             .multipart(form)
             .send()
@@ -1283,7 +1287,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         let resp = self
-            .client
+            .http_client()
             .post(self.api_url("sendVoice"))
             .multipart(form)
             .send()
@@ -1320,7 +1324,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         let resp = self
-            .client
+            .http_client()
             .post(self.api_url("sendDocument"))
             .json(&body)
             .send()
@@ -1357,7 +1361,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         let resp = self
-            .client
+            .http_client()
             .post(self.api_url("sendPhoto"))
             .json(&body)
             .send()
@@ -1685,7 +1689,7 @@ impl Channel for TelegramChannel {
                 "allowed_updates": ["message"]
             });
 
-            let resp = match self.client.post(&url).json(&body).send().await {
+            let resp = match self.http_client().post(&url).json(&body).send().await {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!("Telegram poll error: {e}");
@@ -1750,7 +1754,7 @@ Ensure only one `zeroclaw` process is using this bot token."
                         "action": "typing"
                     });
                     let _ = self
-                        .client
+                        .http_client()
                         .post(self.api_url("sendChatAction"))
                         .json(&typing_body)
                         .send()
@@ -1769,7 +1773,7 @@ Ensure only one `zeroclaw` process is using this bot token."
 
         match tokio::time::timeout(
             timeout_duration,
-            self.client.get(self.api_url("getMe")).send(),
+            self.http_client().get(self.api_url("getMe")).send(),
         )
         .await
         {
@@ -1788,7 +1792,7 @@ Ensure only one `zeroclaw` process is using this bot token."
     async fn start_typing(&self, recipient: &str) -> anyhow::Result<()> {
         self.stop_typing(recipient).await?;
 
-        let client = self.client.clone();
+        let client = self.http_client();
         let url = self.api_url("sendChatAction");
         let chat_id = recipient.to_string();
 

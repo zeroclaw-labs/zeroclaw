@@ -12,7 +12,6 @@ pub struct MatrixChannel {
     access_token: String,
     room_id: String,
     allowed_users: Vec<String>,
-    client: Client,
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,8 +78,11 @@ impl MatrixChannel {
             access_token,
             room_id,
             allowed_users,
-            client: Client::new(),
         }
+    }
+
+    fn http_client(&self) -> Client {
+        crate::config::build_runtime_proxy_client("channel.matrix")
     }
 
     fn is_user_allowed(&self, sender: &str) -> bool {
@@ -95,7 +97,7 @@ impl MatrixChannel {
     async fn get_my_user_id(&self) -> anyhow::Result<String> {
         let url = format!("{}/_matrix/client/v3/account/whoami", self.homeserver);
         let resp = self
-            .client
+            .http_client()
             .get(&url)
             .header("Authorization", format!("Bearer {}", self.access_token))
             .send()
@@ -130,7 +132,7 @@ impl Channel for MatrixChannel {
         });
 
         let resp = self
-            .client
+            .http_client()
             .put(&url)
             .header("Authorization", format!("Bearer {}", self.access_token))
             .json(&body)
@@ -157,7 +159,7 @@ impl Channel for MatrixChannel {
         );
 
         let resp = self
-            .client
+            .http_client()
             .get(&url)
             .header("Authorization", format!("Bearer {}", self.access_token))
             .send()
@@ -179,7 +181,7 @@ impl Channel for MatrixChannel {
             );
 
             let resp = self
-                .client
+                .http_client()
                 .get(&url)
                 .header("Authorization", format!("Bearer {}", self.access_token))
                 .send()
@@ -250,7 +252,7 @@ impl Channel for MatrixChannel {
     async fn health_check(&self) -> bool {
         let url = format!("{}/_matrix/client/v3/account/whoami", self.homeserver);
         let Ok(resp) = self
-            .client
+            .http_client()
             .get(&url)
             .header("Authorization", format!("Bearer {}", self.access_token))
             .send()

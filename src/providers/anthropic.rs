@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 pub struct AnthropicProvider {
     credential: Option<String>,
     base_url: String,
-    client: Client,
 }
 
 #[derive(Debug, Serialize)]
@@ -161,11 +160,6 @@ impl AnthropicProvider {
                 .filter(|k| !k.is_empty())
                 .map(ToString::to_string),
             base_url,
-            client: Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
         }
     }
 
@@ -404,6 +398,10 @@ impl AnthropicProvider {
             tool_calls,
         }
     }
+
+    fn http_client(&self) -> Client {
+        crate::config::build_runtime_proxy_client_with_timeouts("provider.anthropic", 120, 10)
+    }
 }
 
 #[async_trait]
@@ -433,7 +431,7 @@ impl Provider for AnthropicProvider {
         };
 
         let mut request = self
-            .client
+            .http_client()
             .post(format!("{}/v1/messages", self.base_url))
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
@@ -480,7 +478,7 @@ impl Provider for AnthropicProvider {
         };
 
         let req = self
-            .client
+            .http_client()
             .post(format!("{}/v1/messages", self.base_url))
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
@@ -502,7 +500,7 @@ impl Provider for AnthropicProvider {
     async fn warmup(&self) -> anyhow::Result<()> {
         if let Some(credential) = self.credential.as_ref() {
             let mut request = self
-                .client
+                .http_client()
                 .post(format!("{}/v1/messages", self.base_url))
                 .header("anthropic-version", "2023-06-01");
             request = self.apply_auth(request, credential);
@@ -594,7 +592,9 @@ mod tests {
         let provider = AnthropicProvider::new(None);
         let request = provider
             .apply_auth(
-                provider.client.get("https://api.anthropic.com/v1/models"),
+                provider
+                    .http_client()
+                    .get("https://api.anthropic.com/v1/models"),
                 "sk-ant-oat01-test-token",
             )
             .build()
@@ -622,7 +622,9 @@ mod tests {
         let provider = AnthropicProvider::new(None);
         let request = provider
             .apply_auth(
-                provider.client.get("https://api.anthropic.com/v1/models"),
+                provider
+                    .http_client()
+                    .get("https://api.anthropic.com/v1/models"),
                 "sk-ant-api-key",
             )
             .build()
