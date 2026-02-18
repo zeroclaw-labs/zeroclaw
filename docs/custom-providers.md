@@ -70,6 +70,15 @@ zeroclaw agent -m "test message"
 
 - Confirm model name matches provider's available models
 - Check provider documentation for exact model identifiers
+- Ensure endpoint and model family match. Some custom gateways only expose a subset of models.
+- Verify available models from the same endpoint and key you configured:
+
+```bash
+curl -sS https://your-api.com/models \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+- If the gateway does not implement `/models`, send a minimal chat request and inspect the provider's returned model error text.
 
 ### Connection Issues
 
