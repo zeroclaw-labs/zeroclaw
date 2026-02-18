@@ -268,9 +268,7 @@ impl GeminiProvider {
             }
             _ => {
                 let model_name = Self::format_model_name(model);
-                let base_url = format!(
-                    "{PUBLIC_API_ENDPOINT}/{model_name}:generateContent"
-                );
+                let base_url = format!("{PUBLIC_API_ENDPOINT}/{model_name}:generateContent");
 
                 if auth.is_api_key() {
                     format!("{base_url}?key={}", auth.credential())
@@ -294,16 +292,35 @@ impl GeminiProvider {
                 let internal_request = InternalGenerateContentRequest {
                     model: Self::format_model_name(model),
                     generation_config: request.generation_config.clone(),
-                    contents: request.contents.iter().map(|c| Content {
-                        role: c.role.clone(),
-                        parts: c.parts.iter().map(|p| Part { text: p.text.clone() }).collect(),
-                    }).collect(),
+                    contents: request
+                        .contents
+                        .iter()
+                        .map(|c| Content {
+                            role: c.role.clone(),
+                            parts: c
+                                .parts
+                                .iter()
+                                .map(|p| Part {
+                                    text: p.text.clone(),
+                                })
+                                .collect(),
+                        })
+                        .collect(),
                     system_instruction: request.system_instruction.as_ref().map(|si| Content {
                         role: si.role.clone(),
-                        parts: si.parts.iter().map(|p| Part { text: p.text.clone() }).collect(),
+                        parts: si
+                            .parts
+                            .iter()
+                            .map(|p| Part {
+                                text: p.text.clone(),
+                            })
+                            .collect(),
                     }),
                 };
-                self.client.post(url).json(&internal_request).bearer_auth(token)
+                self.client
+                    .post(url)
+                    .json(&internal_request)
+                    .bearer_auth(token)
             }
             _ => self.client.post(url).json(request),
         }
