@@ -1458,17 +1458,21 @@ pub async fn run(
     } else {
         None
     };
-    let mut system_prompt = crate::channels::build_system_prompt(
+    let native_tools = provider.supports_native_tools();
+    let mut system_prompt = crate::channels::build_system_prompt_with_mode(
         &config.workspace_dir,
         model_name,
         &tool_descs,
         &skills,
         Some(&config.identity),
         bootstrap_max_chars,
+        native_tools,
     );
 
-    // Append structured tool-use instructions with schemas
-    system_prompt.push_str(&build_tool_instructions(&tools_registry));
+    // Append structured tool-use instructions with schemas (only for non-native providers)
+    if !native_tools {
+        system_prompt.push_str(&build_tool_instructions(&tools_registry));
+    }
 
     // ── Approval manager (supervised mode) ───────────────────────
     let approval_manager = ApprovalManager::from_config(&config.autonomy);
@@ -1823,15 +1827,19 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     } else {
         None
     };
-    let mut system_prompt = crate::channels::build_system_prompt(
+    let native_tools = provider.supports_native_tools();
+    let mut system_prompt = crate::channels::build_system_prompt_with_mode(
         &config.workspace_dir,
         &model_name,
         &tool_descs,
         &skills,
         Some(&config.identity),
         bootstrap_max_chars,
+        native_tools,
     );
-    system_prompt.push_str(&build_tool_instructions(&tools_registry));
+    if !native_tools {
+        system_prompt.push_str(&build_tool_instructions(&tools_registry));
+    }
 
     let mem_context = build_context(mem.as_ref(), message, config.memory.min_relevance_score).await;
     let rag_limit = if config.agent.compact_context { 2 } else { 5 };

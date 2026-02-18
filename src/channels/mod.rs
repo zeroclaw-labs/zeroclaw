@@ -1559,6 +1559,26 @@ pub fn build_system_prompt(
     identity_config: Option<&crate::config::IdentityConfig>,
     bootstrap_max_chars: Option<usize>,
 ) -> String {
+    build_system_prompt_with_mode(
+        workspace_dir,
+        model_name,
+        tools,
+        skills,
+        identity_config,
+        bootstrap_max_chars,
+        false,
+    )
+}
+
+pub fn build_system_prompt_with_mode(
+    workspace_dir: &std::path::Path,
+    model_name: &str,
+    tools: &[(&str, &str)],
+    skills: &[crate::skills::Skill],
+    identity_config: Option<&crate::config::IdentityConfig>,
+    bootstrap_max_chars: Option<usize>,
+    native_tools: bool,
+) -> String {
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
 
@@ -1594,12 +1614,21 @@ pub fn build_system_prompt(
     }
 
     // ── 1c. Action instruction (avoid meta-summary) ───────────────
-    prompt.push_str(
-        "## Your Task\n\n\
-         When the user sends a message, ACT on it. Use the tools to fulfill their request.\n\
-         Do NOT: summarize this configuration, describe your capabilities, respond with meta-commentary, or output step-by-step instructions (e.g. \"1. First... 2. Next...\").\n\
-         Instead: emit actual <tool_call> tags when you need to act. Just do what they ask.\n\n",
-    );
+    if native_tools {
+        prompt.push_str(
+            "## Your Task\n\n\
+             When the user sends a message, respond naturally. Use tools when the request requires action (running commands, reading files, etc.).\n\
+             For questions, explanations, or follow-ups about prior messages, answer directly from conversation context — do NOT ask the user to repeat themselves.\n\
+             Do NOT: summarize this configuration, describe your capabilities, or output step-by-step meta-commentary.\n\n",
+        );
+    } else {
+        prompt.push_str(
+            "## Your Task\n\n\
+             When the user sends a message, ACT on it. Use the tools to fulfill their request.\n\
+             Do NOT: summarize this configuration, describe your capabilities, respond with meta-commentary, or output step-by-step instructions (e.g. \"1. First... 2. Next...\").\n\
+             Instead: emit actual <tool_call> tags when you need to act. Just do what they ask.\n\n",
+        );
+    }
 
     // ── 2. Safety ───────────────────────────────────────────────
     prompt.push_str("## Safety\n\n");
@@ -2318,15 +2347,19 @@ pub async fn start_channels(config: Config) -> Result<()> {
     } else {
         None
     };
-    let mut system_prompt = build_system_prompt(
+    let native_tools = provider.supports_native_tools();
+    let mut system_prompt = build_system_prompt_with_mode(
         &workspace,
         &model,
         &tool_descs,
         &skills,
         Some(&config.identity),
         bootstrap_max_chars,
+        native_tools,
     );
-    system_prompt.push_str(&build_tool_instructions(tools_registry.as_ref()));
+    if !native_tools {
+        system_prompt.push_str(&build_tool_instructions(tools_registry.as_ref()));
+    }
 
     if !skills.is_empty() {
         println!(
