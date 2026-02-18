@@ -25,21 +25,12 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 <p align="center">
   <a href="#quick-start">Getting Started</a> |
   <a href="bootstrap.sh">One-Click Setup</a> |
-  <a href="docs/README.md">Documentation</a> |
-  <a href="docs/SUMMARY.md">Docs TOC</a> |
-  <a href="docs/commands-reference.md">Commands</a> |
-  <a href="docs/config-reference.md">Config</a> |
-  <a href="docs/providers-reference.md">Providers</a> |
-  <a href="docs/channels-reference.md">Channels</a> |
-  <a href="docs/operations-runbook.md">Runbook</a> |
-  <a href="docs/troubleshooting.md">Troubleshooting</a> |
-  <a href="CONTRIBUTING.md">Contributing</a> |
-  <a href="SECURITY.md">Security</a>
+  <a href="docs/README.md">Docs Hub</a> |
+  <a href="docs/SUMMARY.md">Docs TOC</a>
 </p>
 
 <p align="center">
   <strong>Quick Routes:</strong>
-  <a href="docs/getting-started/README.md">Setup</a> ·
   <a href="docs/reference/README.md">Reference</a> ·
   <a href="docs/operations/README.md">Operations</a> ·
   <a href="docs/troubleshooting.md">Troubleshoot</a> ·
@@ -57,10 +48,10 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 
 ### ✨ Features
 
-- 🏎️ **Ultra-Lightweight:** <5MB Memory footprint — 99% smaller than OpenClaw core.
-- 💰 **Minimal Cost:** Efficient enough to run on $10 Hardware — 98% cheaper than a Mac mini.
-- ⚡ **Lightning Fast:** 400X Faster startup time, boot in <10ms (under 1s even on 0.6GHz cores).
-- 🌍 **True Portability:** Single self-contained binary across ARM, x86, and RISC-V.
+- 🏎️ **Lean Runtime by Default:** Common CLI and status workflows run in a few-megabyte memory envelope on release builds.
+- 💰 **Cost-Efficient Deployment:** Designed for low-cost boards and small cloud instances without heavyweight runtime dependencies.
+- ⚡ **Fast Cold Starts:** Single-binary Rust runtime keeps command and daemon startup near-instant for daily operations.
+- 🌍 **Portable Architecture:** One binary-first workflow across ARM, x86, and RISC-V with swappable providers/channels/tools.
 
 ### Why teams pick ZeroClaw
 

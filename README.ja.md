@@ -14,20 +14,13 @@
 
 <p align="center">
   <a href="bootstrap.sh">ワンクリック導入</a> |
+  <a href="docs/getting-started/README.md">導入ガイド</a> |
   <a href="docs/README.ja.md">ドキュメントハブ</a> |
-  <a href="docs/SUMMARY.md">Docs TOC</a> |
-  <a href="docs/commands-reference.md">コマンド</a> |
-  <a href="docs/config-reference.md">設定リファレンス</a> |
-  <a href="docs/providers-reference.md">Provider 参考</a> |
-  <a href="docs/channels-reference.md">Channel 参考</a> |
-  <a href="docs/operations-runbook.md">運用ガイド</a> |
-  <a href="docs/troubleshooting.md">トラブル対応</a> |
-  <a href="CONTRIBUTING.md">貢献ガイド</a>
+  <a href="docs/SUMMARY.md">Docs TOC</a>
 </p>
 
 <p align="center">
   <strong>クイック分流：</strong>
-  <a href="docs/getting-started/README.md">導入</a> ·
   <a href="docs/reference/README.md">参照</a> ·
   <a href="docs/operations/README.md">運用</a> ·
   <a href="docs/troubleshooting.md">障害対応</a> ·
@@ -52,10 +45,10 @@ ZeroClaw は、高速・省リソース・高拡張性を重視した自律エ�
 
 ## ZeroClaw が選ばれる理由
 
-- **軽量**: 小さいバイナリ、低メモリ、速い起動
-- **拡張性**: 28+ の built-in provider（エイリアス含む）+ custom endpoint
-- **運用性**: `daemon` / `doctor` / `status` / `service` で保守しやすい
-- **統合性**: 多チャネル + 70+ integrations
+- **軽量ランタイムを標準化**: CLI や `status` などの常用操作は数MB級メモリで動作。
+- **低コスト環境に適合**: 低価格ボードや小規模クラウドでも、重い実行基盤なしで運用可能。
+- **高速コールドスタート**: Rust 単一バイナリにより、主要コマンドと daemon 起動が非常に速い。
+- **高い移植性**: ARM / x86 / RISC-V を同じ運用モデルで扱え、provider/channel/tool を差し替え可能。
 
 ## 再現可能な計測（例）
 
