@@ -274,6 +274,8 @@ pub struct AppState {
     pub whatsapp: Option<Arc<WhatsAppChannel>>,
     /// `WhatsApp` app secret for webhook signature verification (`X-Hub-Signature-256`)
     pub whatsapp_app_secret: Option<Arc<str>>,
+    /// Observability backend for metrics scraping
+    pub observer: Arc<dyn crate::observability::Observer>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -295,19 +297,25 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let actual_port = listener.local_addr()?.port();
     let display_addr = format!("{host}:{actual_port}");
 
-    let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider(
+    let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider_with_options(
         config.default_provider.as_deref().unwrap_or("openrouter"),
         config.api_key.as_deref(),
         config.api_url.as_deref(),
         &config.reliability,
+        &providers::ProviderRuntimeOptions {
+            auth_profile_override: None,
+            zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
+            secrets_encrypt: config.secrets.encrypt,
+        },
     )?);
     let model = config
         .default_model
         .clone()
         .unwrap_or_else(|| "anthropic/claude-sonnet-4".into());
     let temperature = config.default_temperature;
-    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory(
+    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
         &config.memory,
+        Some(&config.storage.provider.config),
         &config.workspace_dir,
         config.api_key.as_deref(),
     )?);
@@ -433,6 +441,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         println!("  POST /whatsapp  — WhatsApp message webhook");
     }
     println!("  GET  /health    — health check");
+    println!("  GET  /metrics   — Prometheus metrics");
     if let Some(code) = pairing.pairing_code() {
         println!();
         println!("  🔐 PAIRING REQUIRED — use this one-time code:");
@@ -450,6 +459,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     crate::health::mark_component_ok("gateway");
 
     // Build shared state
+    let observer: Arc<dyn crate::observability::Observer> =
+        Arc::from(crate::observability::create_observer(&config.observability));
+
     let state = AppState {
         config: config_state,
         provider,
@@ -464,11 +476,13 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         idempotency_store,
         whatsapp: whatsapp_channel,
         whatsapp_app_secret,
+        observer,
     };
 
     // Build router with middleware
     let app = Router::new()
         .route("/health", get(handle_health))
+        .route("/metrics", get(handle_metrics))
         .route("/pair", post(handle_pair))
         .route("/webhook", post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
@@ -502,6 +516,29 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
         "runtime": crate::health::snapshot_json(),
     });
     Json(body)
+}
+
+/// Prometheus content type for text exposition format.
+const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+
+/// GET /metrics — Prometheus text exposition format
+async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let body = if let Some(prom) = state
+        .observer
+        .as_ref()
+        .as_any()
+        .downcast_ref::<crate::observability::PrometheusObserver>()
+    {
+        prom.encode()
+    } else {
+        String::from("# Prometheus backend not enabled. Set [observability] backend = \"prometheus\" in config.\n")
+    };
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)],
+        body,
+    )
 }
 
 /// POST /pair — exchange one-time code for bearer token
@@ -672,20 +709,94 @@ async fn handle_webhook(
             .await;
     }
 
+    let provider_label = state
+        .config
+        .lock()
+        .default_provider
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    let model_label = state.model.clone();
+    let started_at = Instant::now();
+
+    state
+        .observer
+        .record_event(&crate::observability::ObserverEvent::AgentStart {
+            provider: provider_label.clone(),
+            model: model_label.clone(),
+        });
+    state
+        .observer
+        .record_event(&crate::observability::ObserverEvent::LlmRequest {
+            provider: provider_label.clone(),
+            model: model_label.clone(),
+            messages_count: 1,
+        });
+
     match state
         .provider
         .simple_chat(message, &state.model, state.temperature)
         .await
     {
         Ok(response) => {
+            let duration = started_at.elapsed();
+            state
+                .observer
+                .record_event(&crate::observability::ObserverEvent::LlmResponse {
+                    provider: provider_label.clone(),
+                    model: model_label.clone(),
+                    duration,
+                    success: true,
+                    error_message: None,
+                });
+            state.observer.record_metric(
+                &crate::observability::traits::ObserverMetric::RequestLatency(duration),
+            );
+            state
+                .observer
+                .record_event(&crate::observability::ObserverEvent::AgentEnd {
+                    provider: provider_label,
+                    model: model_label,
+                    duration,
+                    tokens_used: None,
+                    cost_usd: None,
+                });
+
             let body = serde_json::json!({"response": response, "model": state.model});
             (StatusCode::OK, Json(body))
         }
         Err(e) => {
-            tracing::error!(
-                "Webhook provider error: {}",
-                providers::sanitize_api_error(&e.to_string())
+            let duration = started_at.elapsed();
+            let sanitized = providers::sanitize_api_error(&e.to_string());
+
+            state
+                .observer
+                .record_event(&crate::observability::ObserverEvent::LlmResponse {
+                    provider: provider_label.clone(),
+                    model: model_label.clone(),
+                    duration,
+                    success: false,
+                    error_message: Some(sanitized.clone()),
+                });
+            state.observer.record_metric(
+                &crate::observability::traits::ObserverMetric::RequestLatency(duration),
             );
+            state
+                .observer
+                .record_event(&crate::observability::ObserverEvent::Error {
+                    component: "gateway".to_string(),
+                    message: sanitized.clone(),
+                });
+            state
+                .observer
+                .record_event(&crate::observability::ObserverEvent::AgentEnd {
+                    provider: provider_label,
+                    model: model_label,
+                    duration,
+                    tokens_used: None,
+                    cost_usd: None,
+                });
+
+            tracing::error!("Webhook provider error: {}", sanitized);
             let err = serde_json::json!({"error": "LLM request failed"});
             (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
         }
@@ -905,6 +1016,74 @@ mod tests {
     fn app_state_is_clone() {
         fn assert_clone<T: Clone>() {}
         assert_clone::<AppState>();
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_returns_hint_when_prometheus_is_disabled() {
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider: Arc::new(MockProvider::default()),
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            observer: Arc::new(crate::observability::NoopObserver),
+        };
+
+        let response = handle_metrics(State(state)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some(PROMETHEUS_CONTENT_TYPE)
+        );
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("Prometheus backend not enabled"));
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_renders_prometheus_output() {
+        let prom = Arc::new(crate::observability::PrometheusObserver::new());
+        crate::observability::Observer::record_event(
+            prom.as_ref(),
+            &crate::observability::ObserverEvent::HeartbeatTick,
+        );
+
+        let observer: Arc<dyn crate::observability::Observer> = prom;
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider: Arc::new(MockProvider::default()),
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            observer,
+        };
+
+        let response = handle_metrics(State(state)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("zeroclaw_heartbeat_ticks_total 1"));
     }
 
     #[test]
@@ -1247,6 +1426,7 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            observer: Arc::new(crate::observability::NoopObserver),
         };
 
         let mut headers = HeaderMap::new();
@@ -1302,6 +1482,7 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            observer: Arc::new(crate::observability::NoopObserver),
         };
 
         let headers = HeaderMap::new();
@@ -1366,6 +1547,7 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            observer: Arc::new(crate::observability::NoopObserver),
         };
 
         let response = handle_webhook(
@@ -1403,6 +1585,7 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            observer: Arc::new(crate::observability::NoopObserver),
         };
 
         let mut headers = HeaderMap::new();
@@ -1443,6 +1626,7 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            observer: Arc::new(crate::observability::NoopObserver),
         };
 
         let mut headers = HeaderMap::new();

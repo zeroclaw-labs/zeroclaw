@@ -2,7 +2,7 @@ use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{self, Observer, ObserverEvent};
-use crate::providers::{self, ChatMessage, Provider, ToolCall};
+use crate::providers::{self, ChatMessage, ChatRequest, Provider, ToolCall};
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
@@ -15,8 +15,12 @@ use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 use uuid::Uuid;
 
-/// Maximum agentic tool-use iterations per user message to prevent runaway loops.
-const MAX_TOOL_ITERATIONS: usize = 10;
+/// Minimum characters per chunk when relaying LLM text to a streaming draft.
+const STREAM_CHUNK_MIN_CHARS: usize = 80;
+
+/// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
+/// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
+const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 
 static SENSITIVE_KEY_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSet::new([
@@ -72,8 +76,10 @@ fn scrub_credentials(input: &str) -> String {
         .to_string()
 }
 
-/// Trigger auto-compaction when non-system message count exceeds this threshold.
-const MAX_HISTORY_MESSAGES: usize = 50;
+/// Default trigger for auto-compaction when non-system message count exceeds this threshold.
+/// Prefer passing the config-driven value via `run_tool_call_loop`; this constant is only
+/// used when callers omit the parameter.
+const DEFAULT_MAX_HISTORY_MESSAGES: usize = 50;
 
 /// Keep this many most-recent non-system messages after compaction.
 const COMPACTION_KEEP_RECENT_MESSAGES: usize = 20;
@@ -107,7 +113,7 @@ fn autosave_memory_key(prefix: &str) -> String {
 
 /// Trim conversation history to prevent unbounded growth.
 /// Preserves the system prompt (first message if role=system) and the most recent messages.
-fn trim_history(history: &mut Vec<ChatMessage>) {
+fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
     // Nothing to trim if within limit
     let has_system = history.first().map_or(false, |m| m.role == "system");
     let non_system_count = if has_system {
@@ -116,12 +122,12 @@ fn trim_history(history: &mut Vec<ChatMessage>) {
         history.len()
     };
 
-    if non_system_count <= MAX_HISTORY_MESSAGES {
+    if non_system_count <= max_history {
         return;
     }
 
     let start = if has_system { 1 } else { 0 };
-    let to_remove = non_system_count - MAX_HISTORY_MESSAGES;
+    let to_remove = non_system_count - max_history;
     history.drain(start..start + to_remove);
 }
 
@@ -153,6 +159,7 @@ async fn auto_compact_history(
     history: &mut Vec<ChatMessage>,
     provider: &dyn Provider,
     model: &str,
+    max_history: usize,
 ) -> Result<bool> {
     let has_system = history.first().map_or(false, |m| m.role == "system");
     let non_system_count = if has_system {
@@ -161,7 +168,7 @@ async fn auto_compact_history(
         history.len()
     };
 
-    if non_system_count <= MAX_HISTORY_MESSAGES {
+    if non_system_count <= max_history {
         return Ok(false);
     }
 
@@ -197,15 +204,25 @@ async fn auto_compact_history(
     Ok(true)
 }
 
-/// Build context preamble by searching memory for relevant entries
-async fn build_context(mem: &dyn Memory, user_msg: &str) -> String {
+/// Build context preamble by searching memory for relevant entries.
+/// Entries with a hybrid score below `min_relevance_score` are dropped to
+/// prevent unrelated memories from bleeding into the conversation.
+async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f64) -> String {
     let mut context = String::new();
 
     // Pull relevant memories for this message
     if let Ok(entries) = mem.recall(user_msg, 5, None).await {
-        if !entries.is_empty() {
+        let relevant: Vec<_> = entries
+            .iter()
+            .filter(|e| match e.score {
+                Some(score) => score >= min_relevance_score,
+                None => true,
+            })
+            .collect();
+
+        if !relevant.is_empty() {
             context.push_str("[Memory context]\n");
-            for entry in &entries {
+            for entry in &relevant {
                 let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
             }
             context.push('\n');
@@ -329,7 +346,7 @@ fn parse_tool_calls_from_json_value(value: &serde_json::Value) -> Vec<ParsedTool
     calls
 }
 
-const TOOL_CALL_OPEN_TAGS: [&str; 3] = ["<tool_call>", "<toolcall>", "<tool-call>"];
+const TOOL_CALL_OPEN_TAGS: [&str; 4] = ["<tool_call>", "<toolcall>", "<tool-call>", "<invoke>"];
 
 fn find_first_tag<'a>(haystack: &str, tags: &'a [&'a str]) -> Option<(usize, &'a str)> {
     tags.iter()
@@ -342,7 +359,44 @@ fn matching_tool_call_close_tag(open_tag: &str) -> Option<&'static str> {
         "<tool_call>" => Some("</tool_call>"),
         "<toolcall>" => Some("</toolcall>"),
         "<tool-call>" => Some("</tool-call>"),
+        "<invoke>" => Some("</invoke>"),
         _ => None,
+    }
+}
+
+fn extract_first_json_value_with_end(input: &str) -> Option<(serde_json::Value, usize)> {
+    let trimmed = input.trim_start();
+    let trim_offset = input.len().saturating_sub(trimmed.len());
+
+    for (byte_idx, ch) in trimmed.char_indices() {
+        if ch != '{' && ch != '[' {
+            continue;
+        }
+
+        let slice = &trimmed[byte_idx..];
+        let mut stream = serde_json::Deserializer::from_str(slice).into_iter::<serde_json::Value>();
+        if let Some(Ok(value)) = stream.next() {
+            let consumed = stream.byte_offset();
+            if consumed > 0 {
+                return Some((value, trim_offset + byte_idx + consumed));
+            }
+        }
+    }
+
+    None
+}
+
+fn strip_leading_close_tags(mut input: &str) -> &str {
+    loop {
+        let trimmed = input.trim_start();
+        if !trimmed.starts_with("</") {
+            return trimmed;
+        }
+
+        let Some(close_end) = trimmed.find('>') else {
+            return "";
+        };
+        input = &trimmed[close_end + 1..];
     }
 }
 
@@ -391,6 +445,138 @@ fn extract_json_values(input: &str) -> Vec<serde_json::Value> {
     }
 
     values
+}
+
+/// Find the end position of a JSON object by tracking balanced braces.
+fn find_json_end(input: &str) -> Option<usize> {
+    let trimmed = input.trim_start();
+    let offset = input.len() - trimmed.len();
+
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+
+    let mut depth = 0;
+    let mut in_string = false;
+    let mut escape_next = false;
+
+    for (i, ch) in trimmed.char_indices() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+
+        match ch {
+            '\\' if in_string => escape_next = true,
+            '"' => in_string = !in_string,
+            '{' if !in_string => depth += 1,
+            '}' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(offset + i + ch.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+/// Parse GLM-style tool calls from response text.
+/// GLM uses proprietary formats like:
+/// - `browser_open/url>https://example.com`
+/// - `shell/command>ls -la`
+/// - `http_request/url>https://api.example.com`
+fn map_glm_tool_alias(tool_name: &str) -> &str {
+    match tool_name {
+        "browser_open" | "browser" | "web_search" | "shell" | "bash" => "shell",
+        "http_request" | "http" => "http_request",
+        _ => tool_name,
+    }
+}
+
+fn build_curl_command(url: &str) -> Option<String> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return None;
+    }
+
+    if url.chars().any(char::is_whitespace) {
+        return None;
+    }
+
+    let escaped = url.replace('\'', r#"'\\''"#);
+    Some(format!("curl -s '{}'", escaped))
+}
+
+fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value, Option<String>)> {
+    let mut calls = Vec::new();
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        // Format: tool_name/param>value or tool_name/{json}
+        if let Some(pos) = line.find('/') {
+            let tool_part = &line[..pos];
+            let rest = &line[pos + 1..];
+
+            if tool_part.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                let tool_name = map_glm_tool_alias(tool_part);
+
+                if let Some(gt_pos) = rest.find('>') {
+                    let param_name = rest[..gt_pos].trim();
+                    let value = rest[gt_pos + 1..].trim();
+
+                    let arguments = match tool_name {
+                        "shell" => {
+                            if param_name == "url" {
+                                let Some(command) = build_curl_command(value) else {
+                                    continue;
+                                };
+                                serde_json::json!({"command": command})
+                            } else if value.starts_with("http://") || value.starts_with("https://")
+                            {
+                                if let Some(command) = build_curl_command(value) {
+                                    serde_json::json!({"command": command})
+                                } else {
+                                    serde_json::json!({"command": value})
+                                }
+                            } else {
+                                serde_json::json!({"command": value})
+                            }
+                        }
+                        "http_request" => {
+                            serde_json::json!({"url": value, "method": "GET"})
+                        }
+                        _ => serde_json::json!({param_name: value}),
+                    };
+
+                    calls.push((tool_name.to_string(), arguments, Some(line.to_string())));
+                    continue;
+                }
+
+                if rest.starts_with('{') {
+                    if let Ok(json_args) = serde_json::from_str::<serde_json::Value>(rest) {
+                        calls.push((tool_name.to_string(), json_args, Some(line.to_string())));
+                    }
+                }
+            }
+        }
+
+        // Plain URL
+        if let Some(command) = build_curl_command(line) {
+            calls.push((
+                "shell".to_string(),
+                serde_json::json!({"command": command}),
+                Some(line.to_string()),
+            ));
+        }
+    }
+
+    calls
 }
 
 /// Parse tool calls from an LLM response that uses XML-style function calling.
@@ -457,6 +643,29 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
 
             remaining = &after_open[close_idx + close_tag.len()..];
         } else {
+            if let Some(json_end) = find_json_end(after_open) {
+                if let Ok(value) =
+                    serde_json::from_str::<serde_json::Value>(&after_open[..json_end])
+                {
+                    let parsed_calls = parse_tool_calls_from_json_value(&value);
+                    if !parsed_calls.is_empty() {
+                        calls.extend(parsed_calls);
+                        remaining = strip_leading_close_tags(&after_open[json_end..]);
+                        continue;
+                    }
+                }
+            }
+
+            if let Some((value, consumed_end)) = extract_first_json_value_with_end(after_open) {
+                let parsed_calls = parse_tool_calls_from_json_value(&value);
+                if !parsed_calls.is_empty() {
+                    calls.extend(parsed_calls);
+                    remaining = strip_leading_close_tags(&after_open[consumed_end..]);
+                    continue;
+                }
+            }
+
+            remaining = &remaining[start..];
             break;
         }
     }
@@ -466,8 +675,10 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     // ```tool_call ... </tool_call> instead of structured API calls or XML tags.
     if calls.is_empty() {
         static MD_TOOL_CALL_RE: LazyLock<Regex> = LazyLock::new(|| {
-            Regex::new(r"(?s)```tool[_-]?call\s*\n(.*?)(?:```|</tool[_-]?call>|</toolcall>)")
-                .unwrap()
+            Regex::new(
+                r"(?s)```(?:tool[_-]?call|invoke)\s*\n(.*?)(?:```|</tool[_-]?call>|</toolcall>|</invoke>)",
+            )
+            .unwrap()
         });
         let mut md_text_parts: Vec<String> = Vec::new();
         let mut last_end = 0;
@@ -497,6 +708,27 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         }
     }
 
+    // GLM-style tool calls (browser_open/url>https://..., shell/command>ls, etc.)
+    if calls.is_empty() {
+        let glm_calls = parse_glm_style_tool_calls(remaining);
+        if !glm_calls.is_empty() {
+            let mut cleaned_text = remaining.to_string();
+            for (name, args, raw) in &glm_calls {
+                calls.push(ParsedToolCall {
+                    name: name.clone(),
+                    arguments: args.clone(),
+                });
+                if let Some(r) = raw {
+                    cleaned_text = cleaned_text.replace(r, "");
+                }
+            }
+            if !cleaned_text.trim().is_empty() {
+                text_parts.push(cleaned_text.trim().to_string());
+            }
+            remaining = "";
+        }
+    }
+
     // SECURITY: We do NOT fall back to extracting arbitrary JSON from the response
     // here. That would enable prompt injection attacks where malicious content
     // (e.g., in emails, files, or web pages) could include JSON that mimics a
@@ -504,6 +736,7 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     // 1. OpenAI-style JSON with a "tool_calls" array
     // 2. ZeroClaw tool-call tags (<tool_call>, <toolcall>, <tool-call>)
     // 3. Markdown code blocks with tool_call/toolcall/tool-call language
+    // 4. Explicit GLM line-based call formats (e.g. `shell/command>...`)
     // This ensures only the LLM's intentional tool calls are executed.
 
     // Remaining text after last tool call
@@ -593,6 +826,7 @@ pub(crate) async fn agent_turn(
     model: &str,
     temperature: f64,
     silent: bool,
+    max_tool_iterations: usize,
 ) -> Result<String> {
     run_tool_call_loop(
         provider,
@@ -605,6 +839,8 @@ pub(crate) async fn agent_turn(
         silent,
         None,
         "channel",
+        max_tool_iterations,
+        None,
     )
     .await
 }
@@ -623,16 +859,20 @@ pub(crate) async fn run_tool_call_loop(
     silent: bool,
     approval: Option<&ApprovalManager>,
     channel_name: &str,
+    max_tool_iterations: usize,
+    on_delta: Option<tokio::sync::mpsc::Sender<String>>,
 ) -> Result<String> {
-    // Build native tool definitions once if the provider supports them.
-    let use_native_tools = provider.supports_native_tools() && !tools_registry.is_empty();
-    let tool_definitions = if use_native_tools {
-        tools_to_openai_format(tools_registry)
+    let max_iterations = if max_tool_iterations == 0 {
+        DEFAULT_MAX_TOOL_ITERATIONS
     } else {
-        Vec::new()
+        max_tool_iterations
     };
 
-    for _iteration in 0..MAX_TOOL_ITERATIONS {
+    let tool_specs: Vec<crate::tools::ToolSpec> =
+        tools_registry.iter().map(|tool| tool.spec()).collect();
+    let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
+
+    for _iteration in 0..max_iterations {
         observer.record_event(&ObserverEvent::LlmRequest {
             provider: provider_name.to_string(),
             model: model.to_string(),
@@ -641,101 +881,73 @@ pub(crate) async fn run_tool_call_loop(
 
         let llm_started_at = Instant::now();
 
-        // Choose between native tool-call API and prompt-based tool use.
-        // `native_tool_calls` preserves the structured ToolCall vec (with IDs) so
-        // that tool results can later be sent back as proper `role: tool` messages.
+        // Unified path via Provider::chat so provider-specific native tool logic
+        // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
+        let request_tools = if use_native_tools {
+            Some(tool_specs.as_slice())
+        } else {
+            None
+        };
+
         let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
-            if use_native_tools {
-                match provider
-                    .chat_with_tools(history, &tool_definitions, model, temperature)
-                    .await
-                {
-                    Ok(resp) => {
-                        observer.record_event(&ObserverEvent::LlmResponse {
-                            provider: provider_name.to_string(),
-                            model: model.to_string(),
-                            duration: llm_started_at.elapsed(),
-                            success: true,
-                            error_message: None,
-                        });
-                        let response_text = resp.text_or_empty().to_string();
-                        let mut calls = parse_structured_tool_calls(&resp.tool_calls);
-                        let mut parsed_text = String::new();
+            match provider
+                .chat(
+                    ChatRequest {
+                        messages: history,
+                        tools: request_tools,
+                    },
+                    model,
+                    temperature,
+                )
+                .await
+            {
+                Ok(resp) => {
+                    observer.record_event(&ObserverEvent::LlmResponse {
+                        provider: provider_name.to_string(),
+                        model: model.to_string(),
+                        duration: llm_started_at.elapsed(),
+                        success: true,
+                        error_message: None,
+                    });
 
-                        if calls.is_empty() {
-                            let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
-                            if !fallback_text.is_empty() {
-                                parsed_text = fallback_text;
-                            }
-                            calls = fallback_calls;
+                    let response_text = resp.text_or_empty().to_string();
+                    let mut calls = parse_structured_tool_calls(&resp.tool_calls);
+                    let mut parsed_text = String::new();
+
+                    if calls.is_empty() {
+                        let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
+                        if !fallback_text.is_empty() {
+                            parsed_text = fallback_text;
                         }
-
-                        // Use JSON format for native tools so convert_messages()
-                        // can reconstruct proper NativeMessage with tool_calls.
-                        let assistant_history_content = if resp.tool_calls.is_empty() {
-                            response_text.clone()
-                        } else {
-                            build_native_assistant_history(&response_text, &resp.tool_calls)
-                        };
-
-                        let native_calls = resp.tool_calls;
-                        (
-                            response_text,
-                            parsed_text,
-                            calls,
-                            assistant_history_content,
-                            native_calls,
-                        )
+                        calls = fallback_calls;
                     }
-                    Err(e) => {
-                        observer.record_event(&ObserverEvent::LlmResponse {
-                            provider: provider_name.to_string(),
-                            model: model.to_string(),
-                            duration: llm_started_at.elapsed(),
-                            success: false,
-                            error_message: Some(crate::providers::sanitize_api_error(
-                                &e.to_string(),
-                            )),
-                        });
-                        return Err(e);
-                    }
+
+                    // Preserve native tool call IDs in assistant history so role=tool
+                    // follow-up messages can reference the exact call id.
+                    let assistant_history_content = if resp.tool_calls.is_empty() {
+                        response_text.clone()
+                    } else {
+                        build_native_assistant_history(&response_text, &resp.tool_calls)
+                    };
+
+                    let native_calls = resp.tool_calls;
+                    (
+                        response_text,
+                        parsed_text,
+                        calls,
+                        assistant_history_content,
+                        native_calls,
+                    )
                 }
-            } else {
-                match provider
-                    .chat_with_history(history, model, temperature)
-                    .await
-                {
-                    Ok(resp) => {
-                        observer.record_event(&ObserverEvent::LlmResponse {
-                            provider: provider_name.to_string(),
-                            model: model.to_string(),
-                            duration: llm_started_at.elapsed(),
-                            success: true,
-                            error_message: None,
-                        });
-                        let response_text = resp;
-                        let assistant_history_content = response_text.clone();
-                        let (parsed_text, calls) = parse_tool_calls(&response_text);
-                        (
-                            response_text,
-                            parsed_text,
-                            calls,
-                            assistant_history_content,
-                            Vec::new(),
-                        )
-                    }
-                    Err(e) => {
-                        observer.record_event(&ObserverEvent::LlmResponse {
-                            provider: provider_name.to_string(),
-                            model: model.to_string(),
-                            duration: llm_started_at.elapsed(),
-                            success: false,
-                            error_message: Some(crate::providers::sanitize_api_error(
-                                &e.to_string(),
-                            )),
-                        });
-                        return Err(e);
-                    }
+                Err(e) => {
+                    observer.record_event(&ObserverEvent::LlmResponse {
+                        provider: provider_name.to_string(),
+                        model: model.to_string(),
+                        duration: llm_started_at.elapsed(),
+                        success: false,
+                        error_message: Some(crate::providers::sanitize_api_error(&e.to_string())),
+                    });
+                    return Err(e);
                 }
             };
 
@@ -746,7 +958,25 @@ pub(crate) async fn run_tool_call_loop(
         };
 
         if tool_calls.is_empty() {
-            // No tool calls — this is the final response
+            // No tool calls — this is the final response.
+            // If a streaming sender is provided, relay the text in small chunks
+            // so the channel can progressively update the draft message.
+            if let Some(ref tx) = on_delta {
+                // Split on whitespace boundaries, accumulating chunks of at least
+                // STREAM_CHUNK_MIN_CHARS characters for progressive draft updates.
+                let mut chunk = String::new();
+                for word in display_text.split_inclusive(char::is_whitespace) {
+                    chunk.push_str(word);
+                    if chunk.len() >= STREAM_CHUNK_MIN_CHARS
+                        && tx.send(std::mem::take(&mut chunk)).await.is_err()
+                    {
+                        break; // receiver dropped
+                    }
+                }
+                if !chunk.is_empty() {
+                    let _ = tx.send(chunk).await;
+                }
+            }
             history.push(ChatMessage::assistant(response_text.clone()));
             return Ok(display_text);
         }
@@ -850,7 +1080,7 @@ pub(crate) async fn run_tool_call_loop(
         }
     }
 
-    anyhow::bail!("Agent exceeded maximum tool iterations ({MAX_TOOL_ITERATIONS})")
+    anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
 }
 
 /// Build the tool instruction block for the system prompt so the LLM knows
@@ -903,8 +1133,9 @@ pub async fn run(
     ));
 
     // ── Memory (the brain) ────────────────────────────────────────
-    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory(
+    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
         &config.memory,
+        Some(&config.storage.provider.config),
         &config.workspace_dir,
         config.api_key.as_deref(),
     )?);
@@ -1135,7 +1366,8 @@ pub async fn run(
         }
 
         // Inject memory + hardware RAG context into user message
-        let mem_context = build_context(mem.as_ref(), &msg).await;
+        let mem_context =
+            build_context(mem.as_ref(), &msg, config.memory.min_relevance_score).await;
         let rag_limit = if config.agent.compact_context { 2 } else { 5 };
         let hw_context = hardware_rag
             .as_ref()
@@ -1164,6 +1396,8 @@ pub async fn run(
             false,
             Some(&approval_manager),
             "cli",
+            config.agent.max_tool_iterations,
+            None,
         )
         .await?;
         final_output = response.clone();
@@ -1214,7 +1448,9 @@ pub async fn run(
                     continue;
                 }
                 "/clear" | "/new" => {
-                    println!("This will clear the current conversation and delete all session memory.");
+                    println!(
+                        "This will clear the current conversation and delete all session memory."
+                    );
                     println!("Core memories (long-term facts/preferences) will be preserved.");
                     print!("Continue? [y/N] ");
                     let _ = std::io::stdout().flush();
@@ -1233,10 +1469,7 @@ pub async fn run(
                     // Clear conversation and daily memory
                     let mut cleared = 0;
                     for category in [MemoryCategory::Conversation, MemoryCategory::Daily] {
-                        let entries = mem
-                            .list(Some(&category), None)
-                            .await
-                            .unwrap_or_default();
+                        let entries = mem.list(Some(&category), None).await.unwrap_or_default();
                         for entry in entries {
                             if mem.forget(&entry.key).await.unwrap_or(false) {
                                 cleared += 1;
@@ -1262,7 +1495,8 @@ pub async fn run(
             }
 
             // Inject memory + hardware RAG context into user message
-            let mem_context = build_context(mem.as_ref(), &user_input).await;
+            let mem_context =
+                build_context(mem.as_ref(), &user_input, config.memory.min_relevance_score).await;
             let rag_limit = if config.agent.compact_context { 2 } else { 5 };
             let hw_context = hardware_rag
                 .as_ref()
@@ -1288,6 +1522,8 @@ pub async fn run(
                 false,
                 Some(&approval_manager),
                 "cli",
+                config.agent.max_tool_iterations,
+                None,
             )
             .await
             {
@@ -1309,8 +1545,13 @@ pub async fn run(
             observer.record_event(&ObserverEvent::TurnComplete);
 
             // Auto-compaction before hard trimming to preserve long-context signal.
-            if let Ok(compacted) =
-                auto_compact_history(&mut history, provider.as_ref(), model_name).await
+            if let Ok(compacted) = auto_compact_history(
+                &mut history,
+                provider.as_ref(),
+                model_name,
+                config.agent.max_history_messages,
+            )
+            .await
             {
                 if compacted {
                     println!("🧹 Auto-compaction complete");
@@ -1318,7 +1559,7 @@ pub async fn run(
             }
 
             // Hard cap as a safety net.
-            trim_history(&mut history);
+            trim_history(&mut history, config.agent.max_history_messages);
 
             if config.memory.auto_save {
                 let summary = truncate_with_ellipsis(&response, 100);
@@ -1332,6 +1573,8 @@ pub async fn run(
 
     let duration = start.elapsed();
     observer.record_event(&ObserverEvent::AgentEnd {
+        provider: provider_name.to_string(),
+        model: model_name.to_string(),
         duration,
         tokens_used: None,
         cost_usd: None,
@@ -1351,8 +1594,9 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &config.autonomy,
         &config.workspace_dir,
     ));
-    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory(
+    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
         &config.memory,
+        Some(&config.storage.provider.config),
         &config.workspace_dir,
         config.api_key.as_deref(),
     )?);
@@ -1471,7 +1715,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     );
     system_prompt.push_str(&build_tool_instructions(&tools_registry));
 
-    let mem_context = build_context(mem.as_ref(), message).await;
+    let mem_context = build_context(mem.as_ref(), message, config.memory.min_relevance_score).await;
     let rag_limit = if config.agent.compact_context { 2 } else { 5 };
     let hw_context = hardware_rag
         .as_ref()
@@ -1498,6 +1742,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &model_name,
         config.default_temperature,
         true,
+        config.agent.max_tool_iterations,
     )
     .await
 }
@@ -1705,6 +1950,25 @@ Tail"#;
     }
 
     #[test]
+    fn parse_tool_calls_handles_markdown_invoke_fence() {
+        let response = r#"Checking.
+```invoke
+{"name": "shell", "arguments": {"command": "date"}}
+```
+Done."#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "date"
+        );
+        assert!(text.contains("Checking."));
+        assert!(text.contains("Done."));
+    }
+
+    #[test]
     fn parse_tool_calls_handles_toolcall_tag_alias() {
         let response = r#"<toolcall>
 {"name": "shell", "arguments": {"command": "date"}}
@@ -1737,15 +2001,63 @@ Tail"#;
     }
 
     #[test]
-    fn parse_tool_calls_does_not_cross_match_alias_tags() {
+    fn parse_tool_calls_handles_invoke_tag_alias() {
+        let response = r#"<invoke>
+{"name": "shell", "arguments": {"command": "uptime"}}
+</invoke>"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "uptime"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_recovers_unclosed_tool_call_with_json() {
+        let response = r#"I will call the tool now.
+<tool_call>
+{"name": "shell", "arguments": {"command": "uptime -p"}}"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.contains("I will call the tool now."));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "uptime -p"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_recovers_mismatched_close_tag() {
+        let response = r#"<tool_call>
+{"name": "shell", "arguments": {"command": "uptime"}}
+</arg_value>"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "uptime"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_recovers_cross_alias_closing_tags() {
         let response = r#"<toolcall>
 {"name": "shell", "arguments": {"command": "date"}}
 </tool_call>"#;
 
         let (text, calls) = parse_tool_calls(response);
-        assert!(calls.is_empty());
-        assert!(text.contains("<toolcall>"));
-        assert!(text.contains("</tool_call>"));
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
     }
 
     #[test]
@@ -1811,22 +2123,25 @@ Tail"#;
     #[test]
     fn trim_history_preserves_system_prompt() {
         let mut history = vec![ChatMessage::system("system prompt")];
-        for i in 0..MAX_HISTORY_MESSAGES + 20 {
+        for i in 0..DEFAULT_MAX_HISTORY_MESSAGES + 20 {
             history.push(ChatMessage::user(format!("msg {i}")));
         }
         let original_len = history.len();
-        assert!(original_len > MAX_HISTORY_MESSAGES + 1);
+        assert!(original_len > DEFAULT_MAX_HISTORY_MESSAGES + 1);
 
-        trim_history(&mut history);
+        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
 
         // System prompt preserved
         assert_eq!(history[0].role, "system");
         assert_eq!(history[0].content, "system prompt");
         // Trimmed to limit
-        assert_eq!(history.len(), MAX_HISTORY_MESSAGES + 1); // +1 for system
-                                                             // Most recent messages preserved
+        assert_eq!(history.len(), DEFAULT_MAX_HISTORY_MESSAGES + 1); // +1 for system
+                                                                     // Most recent messages preserved
         let last = &history[history.len() - 1];
-        assert_eq!(last.content, format!("msg {}", MAX_HISTORY_MESSAGES + 19));
+        assert_eq!(
+            last.content,
+            format!("msg {}", DEFAULT_MAX_HISTORY_MESSAGES + 19)
+        );
     }
 
     #[test]
@@ -1836,7 +2151,7 @@ Tail"#;
             ChatMessage::user("hello"),
             ChatMessage::assistant("hi"),
         ];
-        trim_history(&mut history);
+        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
         assert_eq!(history.len(), 3);
     }
 
@@ -1960,22 +2275,22 @@ Done."#;
     fn trim_history_with_no_system_prompt() {
         // Recovery: History without system prompt should trim correctly
         let mut history = vec![];
-        for i in 0..MAX_HISTORY_MESSAGES + 20 {
+        for i in 0..DEFAULT_MAX_HISTORY_MESSAGES + 20 {
             history.push(ChatMessage::user(format!("msg {i}")));
         }
-        trim_history(&mut history);
-        assert_eq!(history.len(), MAX_HISTORY_MESSAGES);
+        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
+        assert_eq!(history.len(), DEFAULT_MAX_HISTORY_MESSAGES);
     }
 
     #[test]
     fn trim_history_preserves_role_ordering() {
         // Recovery: After trimming, role ordering should remain consistent
         let mut history = vec![ChatMessage::system("system")];
-        for i in 0..MAX_HISTORY_MESSAGES + 10 {
+        for i in 0..DEFAULT_MAX_HISTORY_MESSAGES + 10 {
             history.push(ChatMessage::user(format!("user {i}")));
             history.push(ChatMessage::assistant(format!("assistant {i}")));
         }
-        trim_history(&mut history);
+        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
         assert_eq!(history[0].role, "system");
         assert_eq!(history[history.len() - 1].role, "assistant");
     }
@@ -1984,7 +2299,7 @@ Done."#;
     fn trim_history_with_only_system_prompt() {
         // Recovery: Only system prompt should not be trimmed
         let mut history = vec![ChatMessage::system("system prompt")];
-        trim_history(&mut history);
+        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
         assert_eq!(history.len(), 1);
     }
 
@@ -2048,10 +2363,10 @@ Done."#;
     // ═══════════════════════════════════════════════════════════════════════
 
     const _: () = {
-        assert!(MAX_TOOL_ITERATIONS > 0);
-        assert!(MAX_TOOL_ITERATIONS <= 100);
-        assert!(MAX_HISTORY_MESSAGES > 0);
-        assert!(MAX_HISTORY_MESSAGES <= 1000);
+        assert!(DEFAULT_MAX_TOOL_ITERATIONS > 0);
+        assert!(DEFAULT_MAX_TOOL_ITERATIONS <= 100);
+        assert!(DEFAULT_MAX_HISTORY_MESSAGES > 0);
+        assert!(DEFAULT_MAX_HISTORY_MESSAGES <= 1000);
     };
 
     #[test]
@@ -2105,5 +2420,95 @@ Done."#;
         ]);
         let result = parse_tool_calls_from_json_value(&value);
         assert_eq!(result.len(), 2);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // GLM-Style Tool Call Parsing
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn parse_glm_style_browser_open_url() {
+        let response = "browser_open/url>https://example.com";
+        let calls = parse_glm_style_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "shell");
+        assert!(calls[0].1["command"].as_str().unwrap().contains("curl"));
+        assert!(calls[0].1["command"]
+            .as_str()
+            .unwrap()
+            .contains("example.com"));
+    }
+
+    #[test]
+    fn parse_glm_style_shell_command() {
+        let response = "shell/command>ls -la";
+        let calls = parse_glm_style_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "shell");
+        assert_eq!(calls[0].1["command"], "ls -la");
+    }
+
+    #[test]
+    fn parse_glm_style_http_request() {
+        let response = "http_request/url>https://api.example.com/data";
+        let calls = parse_glm_style_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "http_request");
+        assert_eq!(calls[0].1["url"], "https://api.example.com/data");
+        assert_eq!(calls[0].1["method"], "GET");
+    }
+
+    #[test]
+    fn parse_glm_style_plain_url() {
+        let response = "https://example.com/api";
+        let calls = parse_glm_style_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "shell");
+        assert!(calls[0].1["command"].as_str().unwrap().contains("curl"));
+    }
+
+    #[test]
+    fn parse_glm_style_json_args() {
+        let response = r#"shell/{"command": "echo hello"}"#;
+        let calls = parse_glm_style_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "shell");
+        assert_eq!(calls[0].1["command"], "echo hello");
+    }
+
+    #[test]
+    fn parse_glm_style_multiple_calls() {
+        let response = r#"shell/command>ls
+browser_open/url>https://example.com"#;
+        let calls = parse_glm_style_tool_calls(response);
+        assert_eq!(calls.len(), 2);
+    }
+
+    #[test]
+    fn parse_glm_style_tool_call_integration() {
+        // Integration test: GLM format should be parsed in parse_tool_calls
+        let response = "Checking...\nbrowser_open/url>https://example.com\nDone";
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert!(text.contains("Checking"));
+        assert!(text.contains("Done"));
+    }
+
+    #[test]
+    fn parse_glm_style_rejects_non_http_url_param() {
+        let response = "browser_open/url>javascript:alert(1)";
+        let calls = parse_glm_style_tool_calls(response);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_unclosed_tool_call_tag() {
+        let response = "<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}}\nDone";
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "pwd");
+        assert_eq!(text, "Done");
     }
 }

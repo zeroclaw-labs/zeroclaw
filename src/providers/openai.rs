@@ -8,8 +8,8 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 pub struct OpenAiProvider {
+    base_url: String,
     credential: Option<String>,
-    client: Client,
 }
 
 #[derive(Debug, Serialize)]
@@ -37,7 +37,20 @@ struct Choice {
 
 #[derive(Debug, Deserialize)]
 struct ResponseMessage {
-    content: String,
+    #[serde(default)]
+    content: Option<String>,
+    /// Reasoning/thinking models may return output in `reasoning_content`.
+    #[serde(default)]
+    reasoning_content: Option<String>,
+}
+
+impl ResponseMessage {
+    fn effective_content(&self) -> String {
+        match &self.content {
+            Some(c) if !c.is_empty() => c.clone(),
+            _ => self.reasoning_content.clone().unwrap_or_default(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -105,19 +118,35 @@ struct NativeChoice {
 struct NativeResponseMessage {
     #[serde(default)]
     content: Option<String>,
+    /// Reasoning/thinking models may return output in `reasoning_content`.
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<NativeToolCall>>,
 }
 
+impl NativeResponseMessage {
+    fn effective_content(&self) -> Option<String> {
+        match &self.content {
+            Some(c) if !c.is_empty() => Some(c.clone()),
+            _ => self.reasoning_content.clone(),
+        }
+    }
+}
+
 impl OpenAiProvider {
     pub fn new(credential: Option<&str>) -> Self {
+        Self::with_base_url(None, credential)
+    }
+
+    /// Create a provider with an optional custom base URL.
+    /// Defaults to `https://api.openai.com/v1` when `base_url` is `None`.
+    pub fn with_base_url(base_url: Option<&str>, credential: Option<&str>) -> Self {
         Self {
+            base_url: base_url
+                .map(|u| u.trim_end_matches('/').to_string())
+                .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
             credential: credential.map(ToString::to_string),
-            client: Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
         }
     }
 
@@ -205,6 +234,7 @@ impl OpenAiProvider {
     }
 
     fn parse_native_response(message: NativeResponseMessage) -> ProviderChatResponse {
+        let text = message.effective_content();
         let tool_calls = message
             .tool_calls
             .unwrap_or_default()
@@ -216,10 +246,11 @@ impl OpenAiProvider {
             })
             .collect::<Vec<_>>();
 
-        ProviderChatResponse {
-            text: message.content,
-            tool_calls,
-        }
+        ProviderChatResponse { text, tool_calls }
+    }
+
+    fn http_client(&self) -> Client {
+        crate::config::build_runtime_proxy_client_with_timeouts("provider.openai", 120, 10)
     }
 }
 
@@ -257,8 +288,8 @@ impl Provider for OpenAiProvider {
         };
 
         let response = self
-            .client
-            .post("https://api.openai.com/v1/chat/completions")
+            .http_client()
+            .post(format!("{}/chat/completions", self.base_url))
             .header("Authorization", format!("Bearer {credential}"))
             .json(&request)
             .send()
@@ -274,7 +305,7 @@ impl Provider for OpenAiProvider {
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message.content)
+            .map(|c| c.message.effective_content())
             .ok_or_else(|| anyhow::anyhow!("No response from OpenAI"))
     }
 
@@ -298,8 +329,8 @@ impl Provider for OpenAiProvider {
         };
 
         let response = self
-            .client
-            .post("https://api.openai.com/v1/chat/completions")
+            .http_client()
+            .post(format!("{}/chat/completions", self.base_url))
             .header("Authorization", format!("Bearer {credential}"))
             .json(&native_request)
             .send()
@@ -321,6 +352,18 @@ impl Provider for OpenAiProvider {
 
     fn supports_native_tools(&self) -> bool {
         true
+    }
+
+    async fn warmup(&self) -> anyhow::Result<()> {
+        if let Some(credential) = self.credential.as_ref() {
+            self.http_client()
+                .get(format!("{}/models", self.base_url))
+                .header("Authorization", format!("Bearer {credential}"))
+                .send()
+                .await?
+                .error_for_status()?;
+        }
+        Ok(())
     }
 }
 
@@ -405,7 +448,7 @@ mod tests {
         let json = r#"{"choices":[{"message":{"content":"Hi!"}}]}"#;
         let resp: ChatResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.choices.len(), 1);
-        assert_eq!(resp.choices[0].message.content, "Hi!");
+        assert_eq!(resp.choices[0].message.effective_content(), "Hi!");
     }
 
     #[test]
@@ -420,14 +463,17 @@ mod tests {
         let json = r#"{"choices":[{"message":{"content":"A"}},{"message":{"content":"B"}}]}"#;
         let resp: ChatResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.choices.len(), 2);
-        assert_eq!(resp.choices[0].message.content, "A");
+        assert_eq!(resp.choices[0].message.effective_content(), "A");
     }
 
     #[test]
     fn response_with_unicode() {
-        let json = r#"{"choices":[{"message":{"content":"こんにちは 🦀"}}]}"#;
+        let json = r#"{"choices":[{"message":{"content":"Hello \u03A9"}}]}"#;
         let resp: ChatResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.choices[0].message.content, "こんにちは 🦀");
+        assert_eq!(
+            resp.choices[0].message.effective_content(),
+            "Hello \u{03A9}"
+        );
     }
 
     #[test]
@@ -435,6 +481,60 @@ mod tests {
         let long = "x".repeat(100_000);
         let json = format!(r#"{{"choices":[{{"message":{{"content":"{long}"}}}}]}}"#);
         let resp: ChatResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(resp.choices[0].message.content.len(), 100_000);
+        assert_eq!(
+            resp.choices[0].message.content.as_ref().unwrap().len(),
+            100_000
+        );
+    }
+
+    #[tokio::test]
+    async fn warmup_without_key_is_noop() {
+        let provider = OpenAiProvider::new(None);
+        let result = provider.warmup().await;
+        assert!(result.is_ok());
+    }
+
+    // ----------------------------------------------------------
+    // Reasoning model fallback tests (reasoning_content)
+    // ----------------------------------------------------------
+
+    #[test]
+    fn reasoning_content_fallback_empty_content() {
+        let json = r#"{"choices":[{"message":{"content":"","reasoning_content":"Thinking..."}}]}"#;
+        let resp: ChatResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.choices[0].message.effective_content(), "Thinking...");
+    }
+
+    #[test]
+    fn reasoning_content_fallback_null_content() {
+        let json =
+            r#"{"choices":[{"message":{"content":null,"reasoning_content":"Thinking..."}}]}"#;
+        let resp: ChatResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.choices[0].message.effective_content(), "Thinking...");
+    }
+
+    #[test]
+    fn reasoning_content_not_used_when_content_present() {
+        let json = r#"{"choices":[{"message":{"content":"Hello","reasoning_content":"Ignored"}}]}"#;
+        let resp: ChatResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.choices[0].message.effective_content(), "Hello");
+    }
+
+    #[test]
+    fn native_response_reasoning_content_fallback() {
+        let json =
+            r#"{"choices":[{"message":{"content":"","reasoning_content":"Native thinking"}}]}"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let msg = &resp.choices[0].message;
+        assert_eq!(msg.effective_content(), Some("Native thinking".to_string()));
+    }
+
+    #[test]
+    fn native_response_reasoning_content_ignored_when_content_present() {
+        let json =
+            r#"{"choices":[{"message":{"content":"Real answer","reasoning_content":"Ignored"}}]}"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let msg = &resp.choices[0].message;
+        assert_eq!(msg.effective_content(), Some("Real answer".to_string()));
     }
 }

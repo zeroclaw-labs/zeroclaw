@@ -407,4 +407,62 @@ mod tests {
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
+
+    // ── §5.1 TOCTOU / symlink file write protection tests ────
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_write_blocks_symlink_target_file() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join("zeroclaw_test_file_write_symlink_target");
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+
+        // Create a file outside and symlink to it inside workspace
+        tokio::fs::write(outside.join("target.txt"), "original")
+            .await
+            .unwrap();
+        symlink(outside.join("target.txt"), workspace.join("linked.txt")).unwrap();
+
+        let tool = FileWriteTool::new(test_security(workspace.clone()));
+        let result = tool
+            .execute(json!({"path": "linked.txt", "content": "overwritten"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success, "writing through symlink must be blocked");
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("symlink"),
+            "error should mention symlink"
+        );
+
+        // Verify original file was not modified
+        let content = tokio::fs::read_to_string(outside.join("target.txt"))
+            .await
+            .unwrap();
+        assert_eq!(content, "original", "original file must not be modified");
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn file_write_blocks_null_byte_in_path() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_null");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let tool = FileWriteTool::new(test_security(dir.clone()));
+        let result = tool
+            .execute(json!({"path": "file\u{0000}.txt", "content": "bad"}))
+            .await
+            .unwrap();
+        assert!(!result.success, "paths with null bytes must be blocked");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
 }

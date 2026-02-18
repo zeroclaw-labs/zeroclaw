@@ -1,0 +1,67 @@
+[package]
+name = "zeroclaw-robot-kit"
+version = "0.1.0"
+edition = "2021"
+authors = ["theonlyhennygod"]
+license = "MIT"
+description = "Robot control toolkit for ZeroClaw - drive, vision, speech, sensors, safety"
+repository = "https://github.com/zeroclaw-labs/zeroclaw"
+readme = "README.md"
+keywords = ["robotics", "raspberry-pi", "ai", "agent", "ros2"]
+categories = ["science::robotics", "embedded", "hardware-support"]
+
+[features]
+default = ["safety"]
+# Core features
+safety = []           # Safety monitor (recommended!)
+ros2 = []             # ROS2 integration
+gpio = ["dep:rppal"]  # Direct GPIO control (Pi only)
+# Optional hardware
+lidar = []            # LIDAR support
+vision = []           # Camera + vision model
+
+[dependencies]
+# Re-use zeroclaw's tool trait (optional - can also be standalone)
+# zeroclaw = { path = "../..", optional = true }
+
+# Async runtime
+tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "time", "sync", "process", "fs", "io-util"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# HTTP client (for Ollama vision)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Base64 encoding (for image data)
+base64 = "0.22"
+
+# Async traits
+async-trait = "0.1"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Logging
+tracing = "0.1"
+
+# Time handling
+chrono = { version = "0.4", features = ["clock", "std"] }
+
+# User directories
+directories = "5.0"
+
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# GPIO (Raspberry Pi only, optional)
+rppal = { version = "0.19", optional = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3.14"
+
+[package.metadata.docs.rs]
+all-features = true

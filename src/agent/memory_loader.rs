@@ -10,18 +10,23 @@ pub trait MemoryLoader: Send + Sync {
 
 pub struct DefaultMemoryLoader {
     limit: usize,
+    min_relevance_score: f64,
 }
 
 impl Default for DefaultMemoryLoader {
     fn default() -> Self {
-        Self { limit: 5 }
+        Self {
+            limit: 5,
+            min_relevance_score: 0.4,
+        }
     }
 }
 
 impl DefaultMemoryLoader {
-    pub fn new(limit: usize) -> Self {
+    pub fn new(limit: usize, min_relevance_score: f64) -> Self {
         Self {
             limit: limit.max(1),
+            min_relevance_score,
         }
     }
 }
@@ -40,8 +45,19 @@ impl MemoryLoader for DefaultMemoryLoader {
 
         let mut context = String::from("[Memory context]\n");
         for entry in entries {
+            if let Some(score) = entry.score {
+                if score < self.min_relevance_score {
+                    continue;
+                }
+            }
             let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
         }
+
+        // If all entries were below threshold, return empty
+        if context == "[Memory context]\n" {
+            return Ok(String::new());
+        }
+
         context.push('\n');
         Ok(context)
     }

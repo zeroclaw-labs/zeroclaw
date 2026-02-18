@@ -2,14 +2,33 @@ name: Pub Docker Img
 
 on:
     push:
+        branches: [main]
         tags: ["v*"]
+        paths:
+            - "Dockerfile"
+            - ".dockerignore"
+            - "Cargo.toml"
+            - "Cargo.lock"
+            - "rust-toolchain.toml"
+            - "src/**"
+            - "crates/**"
+            - "benches/**"
+            - "firmware/**"
+            - "dev/config.template.toml"
+            - ".github/workflows/pub-docker-img.yml"
     pull_request:
         branches: [main]
         paths:
             - "Dockerfile"
-            - "docker-compose.yml"
-            - "dev/docker-compose.yml"
-            - "dev/sandbox/**"
+            - ".dockerignore"
+            - "Cargo.toml"
+            - "Cargo.lock"
+            - "rust-toolchain.toml"
+            - "src/**"
+            - "crates/**"
+            - "benches/**"
+            - "firmware/**"
+            - "dev/config.template.toml"
             - ".github/workflows/pub-docker-img.yml"
     workflow_dispatch:
 
@@ -24,7 +43,7 @@ env:
 jobs:
     pr-smoke:
         name: PR Docker Smoke
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
         runs-on: blacksmith-2vcpu-ubuntu-2404
         timeout-minutes: 25
         permissions:
@@ -37,6 +56,7 @@ jobs:
               uses: useblacksmith/setup-docker-builder@ef12d5b165b596e3aa44ea8198d8fde563eab402 # v1
 
             - name: Extract metadata (tags, labels)
+              if: github.event_name == 'pull_request'
               id: meta
               uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
               with:
@@ -53,7 +73,7 @@ jobs:
                   provenance: false
                   sbom: false
                   tags: zeroclaw-pr-smoke:latest
-                  labels: ${{ steps.meta.outputs.labels }}
+                  labels: ${{ steps.meta.outputs.labels || '' }}
                   platforms: linux/amd64
 
             - name: Verify image
@@ -61,7 +81,7 @@ jobs:
 
     publish:
         name: Build and Push Docker Image
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        if: (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))) && github.repository == 'zeroclaw-labs/zeroclaw'
         runs-on: blacksmith-2vcpu-ubuntu-2404
         timeout-minutes: 25
         permissions:
@@ -108,4 +128,65 @@ jobs:
                   context: .
                   push: true
                   tags: ${{ steps.meta.outputs.tags }}
-                  platforms: ${{ startsWith(github.ref, 'refs/tags/') && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
+                  platforms: ${{ startsWith(github.ref, 'refs/tags/v') && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
+
+            - name: Set GHCR package visibility to public
+              shell: bash
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  set -euo pipefail
+                  owner="${GITHUB_REPOSITORY_OWNER,,}"
+                  repo="${GITHUB_REPOSITORY#*/}"
+
+                  # Package path can vary depending on repository/package linkage.
+                  candidates=(
+                    "$repo"
+                    "${owner}%2F${repo}"
+                  )
+
+                  for scope in orgs users; do
+                    for pkg in "${candidates[@]}"; do
+                      code="$(curl -sS -o /tmp/ghcr-visibility.json -w "%{http_code}" \
+                        -X PATCH \
+                        -H "Authorization: Bearer ${GH_TOKEN}" \
+                        -H "Accept: application/vnd.github+json" \
+                        -H "X-GitHub-Api-Version: 2022-11-28" \
+                        "https://api.github.com/${scope}/${owner}/packages/container/${pkg}/visibility" \
+                        -d '{"visibility":"public"}' || true)"
+
+                      if [ "$code" = "200" ] || [ "$code" = "204" ]; then
+                        echo "GHCR package visibility is public (${scope}/${owner}/${pkg})."
+                        exit 0
+                      fi
+
+                      echo "Visibility attempt ${scope}/${owner}/${pkg} returned HTTP ${code}."
+                    done
+                  done
+
+                  echo "::warning::Unable to update GHCR visibility via API in this run; proceeding to direct anonymous pull verification."
+
+            - name: Verify anonymous GHCR pull access
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  token_resp="$(curl -sS "https://ghcr.io/token?scope=repository:${GITHUB_REPOSITORY}:pull")"
+                  token="$(echo "$token_resp" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')"
+
+                  if [ -z "$token" ]; then
+                    echo "::error::Anonymous GHCR token request failed: $token_resp"
+                    exit 1
+                  fi
+
+                  code="$(curl -sS -o /tmp/ghcr-manifest.json -w "%{http_code}" \
+                    -H "Authorization: Bearer ${token}" \
+                    -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
+                    "https://ghcr.io/v2/${GITHUB_REPOSITORY}/manifests/latest")"
+
+                  if [ "$code" != "200" ]; then
+                    echo "::error::Anonymous manifest pull failed with HTTP ${code}"
+                    cat /tmp/ghcr-manifest.json || true
+                    exit 1
+                  fi
+
+                  echo "Anonymous GHCR pull access verified."

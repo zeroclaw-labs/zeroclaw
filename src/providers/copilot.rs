@@ -161,7 +161,6 @@ pub struct CopilotProvider {
     /// Mutex ensures only one caller refreshes tokens at a time,
     /// preventing duplicate device flow prompts or redundant API calls.
     refresh_lock: Arc<Mutex<Option<CachedApiKey>>>,
-    http: Client,
     token_dir: PathBuf,
 }
 
@@ -204,13 +203,12 @@ impl CopilotProvider {
                 .filter(|token| !token.is_empty())
                 .map(String::from),
             refresh_lock: Arc::new(Mutex::new(None)),
-            http: Client::builder()
-                .timeout(Duration::from_secs(120))
-                .connect_timeout(Duration::from_secs(10))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
             token_dir,
         }
+    }
+
+    fn http_client(&self) -> Client {
+        crate::config::build_runtime_proxy_client_with_timeouts("provider.copilot", 120, 10)
     }
 
     /// Required headers for Copilot API requests (editor identification).
@@ -326,7 +324,7 @@ impl CopilotProvider {
         };
 
         let mut req = self
-            .http
+            .http_client()
             .post(&url)
             .header("Authorization", format!("Bearer {token}"))
             .json(&request);
@@ -438,7 +436,7 @@ impl CopilotProvider {
     /// Run GitHub OAuth device code flow.
     async fn device_code_login(&self) -> anyhow::Result<String> {
         let response: DeviceCodeResponse = self
-            .http
+            .http_client()
             .post(GITHUB_DEVICE_CODE_URL)
             .header("Accept", "application/json")
             .json(&serde_json::json!({
@@ -467,7 +465,7 @@ impl CopilotProvider {
             tokio::time::sleep(poll_interval).await;
 
             let token_response: AccessTokenResponse = self
-                .http
+                .http_client()
                 .post(GITHUB_ACCESS_TOKEN_URL)
                 .header("Accept", "application/json")
                 .json(&serde_json::json!({
@@ -502,7 +500,7 @@ impl CopilotProvider {
 
     /// Exchange a GitHub access token for a Copilot API key.
     async fn exchange_for_api_key(&self, access_token: &str) -> anyhow::Result<ApiKeyInfo> {
-        let mut request = self.http.get(GITHUB_API_KEY_URL);
+        let mut request = self.http_client().get(GITHUB_API_KEY_URL);
         for (header, value) in &Self::COPILOT_HEADERS {
             request = request.header(*header, *value);
         }

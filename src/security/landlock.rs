@@ -231,4 +231,31 @@ mod tests {
             ))),
         }
     }
+
+    // ── §1.1 Landlock stub tests ──────────────────────────────
+
+    #[cfg(not(all(feature = "sandbox-landlock", target_os = "linux")))]
+    #[test]
+    fn landlock_stub_wrap_command_returns_unsupported() {
+        let sandbox = LandlockSandbox;
+        let mut cmd = std::process::Command::new("echo");
+        let result = sandbox.wrap_command(&mut cmd);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    #[cfg(not(all(feature = "sandbox-landlock", target_os = "linux")))]
+    #[test]
+    fn landlock_stub_new_returns_unsupported() {
+        let result = LandlockSandbox::new();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    #[cfg(not(all(feature = "sandbox-landlock", target_os = "linux")))]
+    #[test]
+    fn landlock_stub_probe_returns_unsupported() {
+        let result = LandlockSandbox::probe();
+        assert!(result.is_err());
+    }
 }

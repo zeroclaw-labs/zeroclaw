@@ -617,4 +617,71 @@ mod tests {
         assert_eq!(caps.fuel_override, 0);
         assert_eq!(caps.memory_override_mb, 0);
     }
+
+    // ── §3.1 / §3.2 WASM fuel & memory exhaustion tests ─────
+
+    #[test]
+    fn wasm_fuel_limit_enforced_in_config() {
+        let rt = WasmRuntime::new(default_config());
+        let caps = WasmCapabilities::default();
+        let fuel = rt.effective_fuel(&caps);
+        assert!(
+            fuel > 0,
+            "default fuel limit must be > 0 to prevent infinite loops"
+        );
+    }
+
+    #[test]
+    fn wasm_memory_limit_enforced_in_config() {
+        let rt = WasmRuntime::new(default_config());
+        let caps = WasmCapabilities::default();
+        let mem_bytes = rt.effective_memory_bytes(&caps);
+        assert!(
+            mem_bytes > 0,
+            "default memory limit must be > 0"
+        );
+        assert!(
+            mem_bytes <= 4096 * 1024 * 1024,
+            "default memory must not exceed 4 GB safety limit"
+        );
+    }
+
+    #[test]
+    fn wasm_zero_fuel_override_uses_default() {
+        let rt = WasmRuntime::new(default_config());
+        let caps = WasmCapabilities {
+            fuel_override: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            rt.effective_fuel(&caps),
+            1_000_000,
+            "fuel_override=0 must use config default"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_memory_just_above_limit() {
+        let mut cfg = default_config();
+        cfg.memory_limit_mb = 4097;
+        let rt = WasmRuntime::new(cfg);
+        let err = rt.validate_config().unwrap_err();
+        assert!(err.to_string().contains("4 GB safety limit"));
+    }
+
+    #[test]
+    fn execute_module_stub_returns_error_without_feature() {
+        if !WasmRuntime::is_available() {
+            let dir = tempfile::tempdir().unwrap();
+            let tools_dir = dir.path().join("tools/wasm");
+            std::fs::create_dir_all(&tools_dir).unwrap();
+            std::fs::write(tools_dir.join("test.wasm"), b"\0asm\x01\0\0\0").unwrap();
+
+            let rt = WasmRuntime::new(default_config());
+            let caps = WasmCapabilities::default();
+            let result = rt.execute_module("test", dir.path(), &caps);
+            assert!(result.is_err());
+            assert!(result.unwrap_err().to_string().contains("not available"));
+        }
+    }
 }

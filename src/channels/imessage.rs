@@ -146,15 +146,67 @@ end tell"#
             );
         }
 
-        // Track the last ROWID we've seen
-        let mut last_rowid = get_max_rowid(&db_path).await.unwrap_or(0);
+        // Open a persistent read-only connection instead of creating
+        // a new one on every 3-second poll cycle.
+        let path = db_path.to_path_buf();
+        let conn = tokio::task::spawn_blocking(move || -> anyhow::Result<Connection> {
+            Ok(Connection::open_with_flags(
+                &path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?)
+        })
+        .await??;
+
+        // Track the last ROWID we've seen (shuttle conn in and out)
+        let (mut conn, initial_rowid) =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<(Connection, i64)> {
+                let rowid = {
+                    let mut stmt =
+                        conn.prepare("SELECT MAX(ROWID) FROM message WHERE is_from_me = 0")?;
+                    let rowid: Option<i64> = stmt.query_row([], |row| row.get(0))?;
+                    rowid.unwrap_or(0)
+                };
+                Ok((conn, rowid))
+            })
+            .await??;
+        let mut last_rowid = initial_rowid;
 
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(self.poll_interval_secs)).await;
 
-            let new_messages = fetch_new_messages(&db_path, last_rowid).await;
+            let since = last_rowid;
+            let (returned_conn, poll_result) = tokio::task::spawn_blocking(
+                move || -> (Connection, anyhow::Result<Vec<(i64, String, String)>>) {
+                    let result = (|| -> anyhow::Result<Vec<(i64, String, String)>> {
+                        let mut stmt = conn.prepare(
+                            "SELECT m.ROWID, h.id, m.text \
+                     FROM message m \
+                     JOIN handle h ON m.handle_id = h.ROWID \
+                     WHERE m.ROWID > ?1 \
+                     AND m.is_from_me = 0 \
+                     AND m.text IS NOT NULL \
+                     ORDER BY m.ROWID ASC \
+                     LIMIT 20",
+                        )?;
+                        let rows = stmt.query_map([since], |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                            ))
+                        })?;
+                        let results = rows.collect::<Result<Vec<_>, _>>()?;
+                        Ok(results)
+                    })();
 
-            match new_messages {
+                    (conn, result)
+                },
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("iMessage poll worker join error: {e}"))?;
+            conn = returned_conn;
+
+            match poll_result {
                 Ok(messages) => {
                     for (rowid, sender, text) in messages {
                         if rowid > last_rowid {

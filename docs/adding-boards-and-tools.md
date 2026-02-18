@@ -11,7 +11,7 @@ zeroclaw peripheral add arduino-uno /dev/cu.usbmodem12345
 zeroclaw peripheral add rpi-gpio native   # for Raspberry Pi GPIO (Linux)
 
 # Restart daemon to apply
-zeroclaw daemon --host 127.0.0.1 --port 8080
+zeroclaw daemon --host 127.0.0.1 --port 3000
 ```
 
 ## Supported Boards
@@ -31,7 +31,7 @@ Edit `~/.zeroclaw/config.toml`:
 ```toml
 [peripherals]
 enabled = true
-datasheet_dir = "docs/datasheets"   # optional: RAG for "turn on red led" → pin 13
+datasheet_dir = "docs/datasheets" # optional: RAG for "turn on red led" → pin 13
 
 [[peripherals.boards]]
 board = "nucleo-f401re"

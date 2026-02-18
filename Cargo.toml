@@ -1,5 +1,5 @@
 [workspace]
-members = ["."]
+members = [".", "crates/robot-kit"]
 resolver = "2"
 
 [package]
@@ -20,9 +20,13 @@ clap = { version = "4.5", features = ["derive"] }
 
 # Async runtime - feature-optimized for size
 tokio = { version = "1.42", default-features = false, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync", "process", "io-std", "fs", "signal"] }
+tokio-util = { version = "0.7", default-features = false }
 
 # HTTP client - minimal features
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "multipart", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "multipart", "stream", "socks"] }
+
+# Matrix client + E2EE decryption
+matrix-sdk = { version = "0.16", default-features = false, features = ["e2e-encryption", "rustls-tls"] }
 
 # Serialization
 serde = { version = "1.0", default-features = false, features = ["derive"] }
@@ -42,6 +46,9 @@ prometheus = { version = "0.14", default-features = false }
 
 # Base64 encoding (screenshots, image data)
 base64 = "0.22"
+
+# URL encoding for web search
+urlencoding = "2.1"
 
 # Optional Rust-native browser automation backend
 fantoccini = { version = "0.22.0", optional = true, default-features = false, features = ["rustls-tls"] }
@@ -77,7 +84,8 @@ ring = "0.17"
 prost = { version = "0.14", default-features = false }
 
 # Memory / persistence
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+postgres = { version = "0.19", features = ["with-chrono-0_4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 chrono-tz = "0.10"
 cron = "0.15"
@@ -95,12 +103,15 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 futures = "0.3"
 regex = "1.10"
 hostname = "0.4.2"
-lettre = { version = "0.11.19", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }
-mail-parser = "0.11.2"
 rustls = "0.23"
 rustls-pki-types = "1.14.0"
 tokio-rustls = "0.26.4"
 webpki-roots = "1.0.6"
+
+# email
+lettre = { version = "0.11.19", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }
+mail-parser = "0.11.2"
+async-imap = { version = "0.11",features = ["runtime-tokio"], default-features = false }
 
 # HTTP server (gateway) — replaces raw TCP for proper HTTP/1.1 compliance
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "ws"] }
@@ -169,7 +180,6 @@ strip = true
 panic = "abort"
 
 [dev-dependencies]
-tokio-test = "0.4"
 tempfile = "3.14"
 criterion = { version = "0.5", features = ["async_tokio"] }
 

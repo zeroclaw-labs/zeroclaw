@@ -142,7 +142,6 @@ pub struct LarkChannel {
     use_feishu: bool,
     /// How to receive events: WebSocket long-connection or HTTP webhook.
     receive_mode: crate::config::schema::LarkReceiveMode,
-    client: reqwest::Client,
     /// Cached tenant access token
     tenant_token: Arc<RwLock<Option<String>>>,
     /// Dedup set: WS message_ids seen in last ~30 min to prevent double-dispatch
@@ -165,7 +164,6 @@ impl LarkChannel {
             allowed_users,
             use_feishu: true,
             receive_mode: crate::config::schema::LarkReceiveMode::default(),
-            client: reqwest::Client::new(),
             tenant_token: Arc::new(RwLock::new(None)),
             ws_seen_ids: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -183,6 +181,10 @@ impl LarkChannel {
         ch.use_feishu = config.use_feishu;
         ch.receive_mode = config.receive_mode.clone();
         ch
+    }
+
+    fn http_client(&self) -> reqwest::Client {
+        crate::config::build_runtime_proxy_client("channel.lark")
     }
 
     fn api_base(&self) -> &'static str {
@@ -212,7 +214,7 @@ impl LarkChannel {
     /// POST /callback/ws/endpoint → (wss_url, client_config)
     async fn get_ws_endpoint(&self) -> anyhow::Result<(String, WsClientConfig)> {
         let resp = self
-            .client
+            .http_client()
             .post(format!("{}/callback/ws/endpoint", self.ws_base()))
             .header("locale", if self.use_feishu { "zh" } else { "en" })
             .json(&serde_json::json!({
@@ -488,7 +490,7 @@ impl LarkChannel {
             "app_secret": self.app_secret,
         });
 
-        let resp = self.client.post(&url).json(&body).send().await?;
+        let resp = self.http_client().post(&url).json(&body).send().await?;
         let data: serde_json::Value = resp.json().await?;
 
         let code = data.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
@@ -642,7 +644,7 @@ impl Channel for LarkChannel {
         });
 
         let resp = self
-            .client
+            .http_client()
             .post(&url)
             .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json; charset=utf-8")
@@ -655,7 +657,7 @@ impl Channel for LarkChannel {
             self.invalidate_token().await;
             let new_token = self.get_tenant_access_token().await?;
             let retry_resp = self
-                .client
+                .http_client()
                 .post(&url)
                 .header("Authorization", format!("Bearer {new_token}"))
                 .header("Content-Type", "application/json; charset=utf-8")

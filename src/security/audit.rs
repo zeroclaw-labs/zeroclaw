@@ -332,4 +332,92 @@ mod tests {
         assert!(!tmp.path().join("audit.log").exists());
         Ok(())
     }
+
+    // ── §8.1 Log rotation tests ─────────────────────────────
+
+    #[test]
+    fn audit_logger_writes_event_when_enabled() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+        let event = AuditEvent::new(AuditEventType::CommandExecution)
+            .with_actor("cli".to_string(), None, None)
+            .with_action("ls".to_string(), "low".to_string(), false, true);
+
+        logger.log(&event)?;
+
+        let log_path = tmp.path().join("audit.log");
+        assert!(log_path.exists(), "audit log file must be created");
+
+        let content = std::fs::read_to_string(&log_path)?;
+        assert!(!content.is_empty(), "audit log must not be empty");
+
+        let parsed: AuditEvent = serde_json::from_str(content.trim())?;
+        assert!(parsed.action.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn audit_log_command_event_writes_structured_entry() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+
+        logger.log_command_event(CommandExecutionLog {
+            channel: "telegram",
+            command: "echo test",
+            risk_level: "low",
+            approved: false,
+            allowed: true,
+            success: true,
+            duration_ms: 42,
+        })?;
+
+        let log_path = tmp.path().join("audit.log");
+        let content = std::fs::read_to_string(&log_path)?;
+        let parsed: AuditEvent = serde_json::from_str(content.trim())?;
+
+        let action = parsed.action.unwrap();
+        assert_eq!(action.command, Some("echo test".to_string()));
+        assert_eq!(action.risk_level, Some("low".to_string()));
+        assert!(action.allowed);
+
+        let result = parsed.result.unwrap();
+        assert!(result.success);
+        assert_eq!(result.duration_ms, Some(42));
+        Ok(())
+    }
+
+    #[test]
+    fn audit_rotation_creates_numbered_backup() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            max_size_mb: 0, // Force rotation on first write
+            ..Default::default()
+        };
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+
+        // Write initial content that triggers rotation
+        let log_path = tmp.path().join("audit.log");
+        std::fs::write(&log_path, "initial content\n")?;
+
+        let event = AuditEvent::new(AuditEventType::CommandExecution);
+        logger.log(&event)?;
+
+        let rotated = format!("{}.1.log", log_path.display());
+        assert!(
+            std::path::Path::new(&rotated).exists(),
+            "rotation must create .1.log backup"
+        );
+        Ok(())
+    }
 }

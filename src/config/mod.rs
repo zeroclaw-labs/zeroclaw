@@ -2,14 +2,18 @@ pub mod schema;
 
 #[allow(unused_imports)]
 pub use schema::{
+    apply_runtime_proxy_to_builder, build_runtime_proxy_client,
+    build_runtime_proxy_client_with_timeouts, runtime_proxy_config, set_runtime_proxy_config,
     AgentConfig, AuditConfig, AutonomyConfig, BrowserComputerUseConfig, BrowserConfig,
-    ChannelsConfig, ComposioConfig, Config, CostConfig, CronConfig, DelegateAgentConfig,
-    DiscordConfig, DockerRuntimeConfig, GatewayConfig, HardwareConfig, HardwareTransport,
-    HeartbeatConfig, HttpRequestConfig, IMessageConfig, IdentityConfig, LarkConfig, MatrixConfig,
-    MemoryConfig, ModelRouteConfig, ObservabilityConfig, PeripheralBoardConfig, PeripheralsConfig,
+    ChannelsConfig, ClassificationRule, ComposioConfig, Config, CostConfig, CronConfig,
+    DelegateAgentConfig, DiscordConfig, DockerRuntimeConfig, GatewayConfig, HardwareConfig,
+    HardwareTransport, HeartbeatConfig, HttpRequestConfig, IMessageConfig, IdentityConfig,
+    LarkConfig, MatrixConfig, MemoryConfig, ModelRouteConfig, ObservabilityConfig,
+    PeripheralBoardConfig, PeripheralsConfig, ProxyConfig, ProxyScope, QueryClassificationConfig,
     ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig,
-    SchedulerConfig, SecretsConfig, SecurityConfig, SlackConfig, TelegramConfig, TunnelConfig,
-    WebhookConfig,
+    SchedulerConfig, SecretsConfig, SecurityConfig, SlackConfig, StorageConfig,
+    StorageProviderConfig, StorageProviderSection, StreamMode, TelegramConfig, TunnelConfig,
+    WebSearchConfig, WebhookConfig,
 };
 
 #[cfg(test)]
@@ -30,6 +34,9 @@ mod tests {
         let telegram = TelegramConfig {
             bot_token: "token".into(),
             allowed_users: vec!["alice".into()],
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1000,
+            mention_only: false,
         };
 
         let discord = DiscordConfig {

@@ -29,3 +29,4 @@ venv/
 *.key
 *.pem
 credentials.json
+.worktrees/

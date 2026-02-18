@@ -7,11 +7,14 @@
 // The Composio API key is stored in the encrypted secret store.
 
 use super::traits::{Tool, ToolResult};
+use crate::security::policy::ToolOperation;
+use crate::security::SecurityPolicy;
 use anyhow::Context;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::sync::Arc;
 
 const COMPOSIO_API_BASE_V2: &str = "https://backend.composio.dev/api/v2";
 const COMPOSIO_API_BASE_V3: &str = "https://backend.composio.dev/api/v3";
@@ -20,20 +23,24 @@ const COMPOSIO_API_BASE_V3: &str = "https://backend.composio.dev/api/v3";
 pub struct ComposioTool {
     api_key: String,
     default_entity_id: String,
-    client: Client,
+    security: Arc<SecurityPolicy>,
 }
 
 impl ComposioTool {
-    pub fn new(api_key: &str, default_entity_id: Option<&str>) -> Self {
+    pub fn new(
+        api_key: &str,
+        default_entity_id: Option<&str>,
+        security: Arc<SecurityPolicy>,
+    ) -> Self {
         Self {
             api_key: api_key.to_string(),
             default_entity_id: normalize_entity_id(default_entity_id.unwrap_or("default")),
-            client: Client::builder()
-                .timeout(std::time::Duration::from_secs(60))
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
+            security,
         }
+    }
+
+    fn client(&self) -> Client {
+        crate::config::build_runtime_proxy_client_with_timeouts("tool.composio", 60, 10)
     }
 
     /// List available Composio apps/actions for the authenticated user.
@@ -59,7 +66,7 @@ impl ComposioTool {
 
     async fn list_actions_v3(&self, app_name: Option<&str>) -> anyhow::Result<Vec<ComposioAction>> {
         let url = format!("{COMPOSIO_API_BASE_V3}/tools");
-        let mut req = self.client.get(&url).header("x-api-key", &self.api_key);
+        let mut req = self.client().get(&url).header("x-api-key", &self.api_key);
 
         req = req.query(&[("limit", "200")]);
         if let Some(app) = app_name.map(str::trim).filter(|app| !app.is_empty()) {
@@ -86,7 +93,7 @@ impl ComposioTool {
         }
 
         let resp = self
-            .client
+            .client()
             .get(&url)
             .header("x-api-key", &self.api_key)
             .send()
@@ -171,7 +178,7 @@ impl ComposioTool {
         );
 
         let resp = self
-            .client
+            .client()
             .post(&url)
             .header("x-api-key", &self.api_key)
             .json(&body)
@@ -207,7 +214,7 @@ impl ComposioTool {
         }
 
         let resp = self
-            .client
+            .client()
             .post(&url)
             .header("x-api-key", &self.api_key)
             .json(&body)
@@ -279,7 +286,7 @@ impl ComposioTool {
         });
 
         let resp = self
-            .client
+            .client()
             .post(&url)
             .header("x-api-key", &self.api_key)
             .json(&body)
@@ -312,7 +319,7 @@ impl ComposioTool {
         });
 
         let resp = self
-            .client
+            .client()
             .post(&url)
             .header("x-api-key", &self.api_key)
             .json(&body)
@@ -336,7 +343,7 @@ impl ComposioTool {
         let url = format!("{COMPOSIO_API_BASE_V3}/auth_configs");
 
         let resp = self
-            .client
+            .client()
             .get(&url)
             .header("x-api-key", &self.api_key)
             .query(&[
@@ -481,6 +488,17 @@ impl Tool for ComposioTool {
             }
 
             "execute" => {
+                if let Err(error) = self
+                    .security
+                    .enforce_tool_operation(ToolOperation::Act, "composio.execute")
+                {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(error),
+                    });
+                }
+
                 let action_name = args
                     .get("tool_slug")
                     .or_else(|| args.get("action_name"))
@@ -515,6 +533,17 @@ impl Tool for ComposioTool {
             }
 
             "connect" => {
+                if let Err(error) = self
+                    .security
+                    .enforce_tool_operation(ToolOperation::Act, "composio.connect")
+                {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(error),
+                    });
+                }
+
                 let app = args.get("app").and_then(|v| v.as_str());
                 let auth_config_id = args.get("auth_config_id").and_then(|v| v.as_str());
 
@@ -734,25 +763,30 @@ pub struct ComposioAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::{AutonomyLevel, SecurityPolicy};
+
+    fn test_security() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy::default())
+    }
 
     // ── Constructor ───────────────────────────────────────────
 
     #[test]
     fn composio_tool_has_correct_name() {
-        let tool = ComposioTool::new("test-key", None);
+        let tool = ComposioTool::new("test-key", None, test_security());
         assert_eq!(tool.name(), "composio");
     }
 
     #[test]
     fn composio_tool_has_description() {
-        let tool = ComposioTool::new("test-key", None);
+        let tool = ComposioTool::new("test-key", None, test_security());
         assert!(!tool.description().is_empty());
         assert!(tool.description().contains("1000+"));
     }
 
     #[test]
     fn composio_tool_schema_has_required_fields() {
-        let tool = ComposioTool::new("test-key", None);
+        let tool = ComposioTool::new("test-key", None, test_security());
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["action"].is_object());
         assert!(schema["properties"]["action_name"].is_object());
@@ -767,7 +801,7 @@ mod tests {
 
     #[test]
     fn composio_tool_spec_roundtrip() {
-        let tool = ComposioTool::new("test-key", None);
+        let tool = ComposioTool::new("test-key", None, test_security());
         let spec = tool.spec();
         assert_eq!(spec.name, "composio");
         assert!(spec.parameters.is_object());
@@ -777,14 +811,14 @@ mod tests {
 
     #[tokio::test]
     async fn execute_missing_action_returns_error() {
-        let tool = ComposioTool::new("test-key", None);
+        let tool = ComposioTool::new("test-key", None, test_security());
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn execute_unknown_action_returns_error() {
-        let tool = ComposioTool::new("test-key", None);
+        let tool = ComposioTool::new("test-key", None, test_security());
         let result = tool.execute(json!({"action": "unknown"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("Unknown action"));
@@ -792,16 +826,60 @@ mod tests {
 
     #[tokio::test]
     async fn execute_without_action_name_returns_error() {
-        let tool = ComposioTool::new("test-key", None);
+        let tool = ComposioTool::new("test-key", None, test_security());
         let result = tool.execute(json!({"action": "execute"})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn connect_without_target_returns_error() {
-        let tool = ComposioTool::new("test-key", None);
+        let tool = ComposioTool::new("test-key", None, test_security());
         let result = tool.execute(json!({"action": "connect"})).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn execute_blocked_in_readonly_mode() {
+        let readonly = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            ..SecurityPolicy::default()
+        });
+        let tool = ComposioTool::new("test-key", None, readonly);
+        let result = tool
+            .execute(json!({
+                "action": "execute",
+                "action_name": "GITHUB_LIST_REPOS"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("read-only mode"));
+    }
+
+    #[tokio::test]
+    async fn execute_blocked_when_rate_limited() {
+        let limited = Arc::new(SecurityPolicy {
+            max_actions_per_hour: 0,
+            ..SecurityPolicy::default()
+        });
+        let tool = ComposioTool::new("test-key", None, limited);
+        let result = tool
+            .execute(json!({
+                "action": "execute",
+                "action_name": "GITHUB_LIST_REPOS"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Rate limit exceeded"));
     }
 
     // ── API response parsing ──────────────────────────────────

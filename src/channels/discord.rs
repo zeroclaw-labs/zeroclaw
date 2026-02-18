@@ -13,7 +13,6 @@ pub struct DiscordChannel {
     allowed_users: Vec<String>,
     listen_to_bots: bool,
     mention_only: bool,
-    client: reqwest::Client,
     typing_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
@@ -31,9 +30,12 @@ impl DiscordChannel {
             allowed_users,
             listen_to_bots,
             mention_only,
-            client: reqwest::Client::new(),
             typing_handle: Mutex::new(None),
         }
+    }
+
+    fn http_client(&self) -> reqwest::Client {
+        crate::config::build_runtime_proxy_client("channel.discord")
     }
 
     /// Check if a Discord user ID is in the allowlist.
@@ -198,7 +200,7 @@ impl Channel for DiscordChannel {
             let body = json!({ "content": chunk });
 
             let resp = self
-                .client
+                .http_client()
                 .post(&url)
                 .header("Authorization", format!("Bot {}", self.bot_token))
                 .json(&body)
@@ -229,7 +231,7 @@ impl Channel for DiscordChannel {
 
         // Get Gateway URL
         let gw_resp: serde_json::Value = self
-            .client
+            .http_client()
             .get("https://discord.com/api/v10/gateway/bot")
             .header("Authorization", format!("Bot {}", self.bot_token))
             .send()
@@ -406,7 +408,7 @@ impl Channel for DiscordChannel {
                             channel_id.clone()
                         },
                         content: clean_content,
-                        channel: channel_id,
+                        channel: "discord".to_string(),
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
@@ -424,7 +426,7 @@ impl Channel for DiscordChannel {
     }
 
     async fn health_check(&self) -> bool {
-        self.client
+        self.http_client()
             .get("https://discord.com/api/v10/users/@me")
             .header("Authorization", format!("Bot {}", self.bot_token))
             .send()
@@ -436,7 +438,7 @@ impl Channel for DiscordChannel {
     async fn start_typing(&self, recipient: &str) -> anyhow::Result<()> {
         self.stop_typing(recipient).await?;
 
-        let client = self.client.clone();
+        let client = self.http_client();
         let token = self.bot_token.clone();
         let channel_id = recipient.to_string();
 

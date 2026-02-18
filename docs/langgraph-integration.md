@@ -132,7 +132,7 @@ agent = create_agent(
 
 ```python
 agent = create_agent(
-    model="anthropic/claude-3.5-sonnet",
+    model="anthropic/claude-sonnet-4-6",
     api_key="your-openrouter-key",
     base_url="https://openrouter.ai/api/v1"
 )

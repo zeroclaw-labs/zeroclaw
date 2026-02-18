@@ -24,6 +24,13 @@ pub enum CommandRiskLevel {
     High,
 }
 
+/// Classifies whether a tool operation is read-only or side-effecting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolOperation {
+    Read,
+    Act,
+}
+
 /// Sliding-window action tracker for rate limiting.
 #[derive(Debug)]
 pub struct ActionTracker {
@@ -530,6 +537,33 @@ impl SecurityPolicy {
         self.autonomy != AutonomyLevel::ReadOnly
     }
 
+    /// Enforce policy for a tool operation.
+    ///
+    /// Read operations are always allowed by autonomy/rate gates.
+    /// Act operations require non-readonly autonomy and available action budget.
+    pub fn enforce_tool_operation(
+        &self,
+        operation: ToolOperation,
+        operation_name: &str,
+    ) -> Result<(), String> {
+        match operation {
+            ToolOperation::Read => Ok(()),
+            ToolOperation::Act => {
+                if !self.can_act() {
+                    return Err(format!(
+                        "Security policy: read-only mode, cannot perform '{operation_name}'"
+                    ));
+                }
+
+                if !self.record_action() {
+                    return Err("Rate limit exceeded: action budget exhausted".to_string());
+                }
+
+                Ok(())
+            }
+        }
+    }
+
     /// Record an action and check if the rate limit has been exceeded.
     /// Returns `true` if the action is allowed, `false` if rate-limited.
     pub fn record_action(&self) -> bool {
@@ -614,6 +648,35 @@ mod tests {
     #[test]
     fn can_act_full_true() {
         assert!(full_policy().can_act());
+    }
+
+    #[test]
+    fn enforce_tool_operation_read_allowed_in_readonly_mode() {
+        let p = readonly_policy();
+        assert!(p
+            .enforce_tool_operation(ToolOperation::Read, "memory_recall")
+            .is_ok());
+    }
+
+    #[test]
+    fn enforce_tool_operation_act_blocked_in_readonly_mode() {
+        let p = readonly_policy();
+        let err = p
+            .enforce_tool_operation(ToolOperation::Act, "memory_store")
+            .unwrap_err();
+        assert!(err.contains("read-only mode"));
+    }
+
+    #[test]
+    fn enforce_tool_operation_act_uses_rate_budget() {
+        let p = SecurityPolicy {
+            max_actions_per_hour: 0,
+            ..default_policy()
+        };
+        let err = p
+            .enforce_tool_operation(ToolOperation::Act, "memory_store")
+            .unwrap_err();
+        assert!(err.contains("Rate limit exceeded"));
     }
 
     // ── is_command_allowed ───────────────────────────────────
@@ -1324,5 +1387,113 @@ mod tests {
                 "Default forbidden_paths must include {dot}"
             );
         }
+    }
+
+    // ── §1.2 Path resolution / symlink bypass tests ──────────
+
+    #[test]
+    fn resolved_path_blocks_outside_workspace() {
+        let workspace = std::env::temp_dir().join("zeroclaw_test_resolved_path");
+        let _ = std::fs::create_dir_all(&workspace);
+
+        // Use the canonicalized workspace so starts_with checks match
+        let canonical_workspace = workspace
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.clone());
+
+        let policy = SecurityPolicy {
+            workspace_dir: canonical_workspace.clone(),
+            ..SecurityPolicy::default()
+        };
+
+        // A resolved path inside the workspace should be allowed
+        let inside = canonical_workspace.join("subdir").join("file.txt");
+        assert!(
+            policy.is_resolved_path_allowed(&inside),
+            "path inside workspace should be allowed"
+        );
+
+        // A resolved path outside the workspace should be blocked
+        let canonical_temp = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let outside = canonical_temp.join("outside_workspace_zeroclaw");
+        assert!(
+            !policy.is_resolved_path_allowed(&outside),
+            "path outside workspace must be blocked"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn resolved_path_blocks_root_escape() {
+        let policy = SecurityPolicy {
+            workspace_dir: PathBuf::from("/home/zeroclaw_user/project"),
+            ..SecurityPolicy::default()
+        };
+
+        assert!(
+            !policy.is_resolved_path_allowed(Path::new("/etc/passwd")),
+            "resolved path to /etc/passwd must be blocked"
+        );
+        assert!(
+            !policy.is_resolved_path_allowed(Path::new("/root/.bashrc")),
+            "resolved path to /root/.bashrc must be blocked"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_path_blocks_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join("zeroclaw_test_symlink_escape");
+        let workspace = root.join("workspace");
+        let outside = root.join("outside_target");
+
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        // Create a symlink inside workspace pointing outside
+        let link_path = workspace.join("escape_link");
+        symlink(&outside, &link_path).unwrap();
+
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        };
+
+        // The resolved symlink target should be outside workspace
+        let resolved = link_path.canonicalize().unwrap();
+        assert!(
+            !policy.is_resolved_path_allowed(&resolved),
+            "symlink-resolved path outside workspace must be blocked"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn is_path_allowed_blocks_null_bytes() {
+        let policy = default_policy();
+        assert!(
+            !policy.is_path_allowed("file\0.txt"),
+            "paths with null bytes must be blocked"
+        );
+    }
+
+    #[test]
+    fn is_path_allowed_blocks_url_encoded_traversal() {
+        let policy = default_policy();
+        assert!(
+            !policy.is_path_allowed("..%2fetc%2fpasswd"),
+            "URL-encoded path traversal must be blocked"
+        );
+        assert!(
+            !policy.is_path_allowed("subdir%2f..%2f..%2fetc"),
+            "URL-encoded parent dir traversal must be blocked"
+        );
     }
 }

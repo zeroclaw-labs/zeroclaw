@@ -144,8 +144,45 @@ Required:
 - `src/tools/` — tool execution surface (shell, file, memory, browser)
 - `src/peripherals/` — hardware peripherals (STM32, RPi GPIO); see `docs/hardware-peripherals-design.md`
 - `src/runtime/` — runtime adapters (currently native)
-- `docs/` — architecture + process docs
+- `docs/` — task-oriented documentation system (hubs, unified TOC, references, operations, security proposals, multilingual guides)
 - `.github/` — CI, templates, automation workflows
+
+## 4.1 Documentation System Contract (Required)
+
+Treat documentation as a first-class product surface, not a post-merge artifact.
+
+Canonical entry points:
+
+- root READMEs: `README.md`, `README.zh-CN.md`, `README.ja.md`, `README.ru.md`
+- docs hubs: `docs/README.md`, `docs/README.zh-CN.md`, `docs/README.ja.md`, `docs/README.ru.md`
+- unified TOC: `docs/SUMMARY.md`
+
+Collection indexes (category navigation):
+
+- `docs/getting-started/README.md`
+- `docs/reference/README.md`
+- `docs/operations/README.md`
+- `docs/security/README.md`
+- `docs/hardware/README.md`
+- `docs/contributing/README.md`
+- `docs/project/README.md`
+
+Runtime-contract references (must track behavior changes):
+
+- `docs/commands-reference.md`
+- `docs/providers-reference.md`
+- `docs/channels-reference.md`
+- `docs/config-reference.md`
+- `docs/operations-runbook.md`
+- `docs/troubleshooting.md`
+- `docs/one-click-bootstrap.md`
+
+Required docs governance rules:
+
+- Keep README/hub top navigation and quick routes intuitive and non-duplicative.
+- Keep EN/ZH/JA/RU entry-point parity when changing navigation architecture.
+- Keep proposal/roadmap docs explicitly labeled; avoid mixing proposal text into runtime-contract docs.
+- Keep project snapshots date-stamped and immutable once superseded by a newer date.
 
 ## 5) Risk Tiers by Path (Review Depth Contract)
 
@@ -170,11 +207,13 @@ When uncertain, classify as higher risk.
     - Code/risky changes: full relevant checks and focused scenarios.
 5. **Document impact**
     - Update docs/PR notes for behavior, risk, side effects, and rollback.
+    - If CLI/config/provider/channel behavior changed, update corresponding runtime-contract references.
+    - If docs entry points changed, keep EN/ZH/JA/RU README + docs-hub navigation aligned.
 6. **Respect queue hygiene**
     - If stacked PR: declare `Depends on #...`.
     - If replacing old PR: declare `Supersedes #...`.
 
-### 6.3 Branch / Commit / PR Flow (Required)
+### 6.1 Branch / Commit / PR Flow (Required)
 
 All contributors (human or agent) must follow the same collaboration flow:
 
@@ -185,7 +224,7 @@ All contributors (human or agent) must follow the same collaboration flow:
 - Merge via PR controls (squash/rebase/merge as repository policy allows).
 - Branch deletion after merge is optional; long-lived branches are allowed when intentionally maintained.
 
-### 6.4 Worktree Workflow (Required for Multi-Track Agent Work)
+### 6.2 Worktree Workflow (Required for Multi-Track Agent Work)
 
 Use Git worktrees to isolate concurrent agent/human tracks safely and predictably:
 
@@ -193,9 +232,9 @@ Use Git worktrees to isolate concurrent agent/human tracks safely and predictabl
 - Keep each worktree on a single branch; do not mix unrelated edits in one worktree.
 - Run validation commands inside the corresponding worktree before commit/PR.
 - Name worktrees clearly by scope (for example: `wt/ci-hardening`, `wt/provider-fix`) and remove stale worktrees when no longer needed.
-- PR checkpoint rules from section 6.3 still apply to worktree-based development.
+- PR checkpoint rules from section 6.1 still apply to worktree-based development.
 
-### 6.1 Code Naming Contract (Required)
+### 6.3 Code Naming Contract (Required)
 
 Apply these naming rules for all code changes unless a subsystem has a stronger existing pattern.
 
@@ -206,7 +245,7 @@ Apply these naming rules for all code changes unless a subsystem has a stronger 
 - Name tests by behavior/outcome (`<subject>_<expected_behavior>`) and keep fixture identifiers neutral/project-scoped.
 - If identity-like naming is required in tests/examples, use ZeroClaw-native labels only (`ZeroClawAgent`, `zeroclaw_user`, `zeroclaw_node`).
 
-### 6.2 Architecture Boundary Contract (Required)
+### 6.4 Architecture Boundary Contract (Required)
 
 Use these rules to keep the trait/factory architecture stable under growth.
 
@@ -238,19 +277,28 @@ Use these rules to keep the trait/factory architecture stable under growth.
 - Validate and sanitize all inputs.
 - Return structured `ToolResult`; avoid panics in runtime path.
 
-### 5.4 Adding a Peripheral
+### 7.4 Adding a Peripheral
 
 - Implement `Peripheral` in `src/peripherals/`.
 - Peripherals expose `tools()` — each tool delegates to the hardware (GPIO, sensors, etc.).
 - Register board type in config schema if needed.
 - See `docs/hardware-peripherals-design.md` for protocol and firmware notes.
 
-### 5.5 Security / Runtime / Gateway Changes
+### 7.5 Security / Runtime / Gateway Changes
 
 - Include threat/risk notes and rollback strategy.
 - Add/update tests or validation evidence for failure modes and boundaries.
 - Keep observability useful but non-sensitive.
 - For `.github/workflows/**` changes, include Actions allowlist impact in PR notes and update `docs/actions-source-policy.md` when sources change.
+
+### 7.6 Docs System / README / IA Changes
+
+- Treat docs navigation as product UX: preserve clear pathing from README -> docs hub -> SUMMARY -> category index.
+- Keep top-level nav concise; avoid duplicative links across adjacent nav blocks.
+- When runtime surfaces change, update related references (`commands/providers/channels/config/runbook/troubleshooting`).
+- Keep multilingual entry-point parity for EN/ZH/JA/RU when nav or key wording changes.
+- For docs snapshots, add new date-stamped files for new sprints rather than rewriting historical context.
+
 
 ## 8) Validation Matrix
 
@@ -275,7 +323,10 @@ Notes:
 
 Additional expectations by change type:
 
-- **Docs/template-only**: run markdown lint and relevant doc checks.
+- **Docs/template-only**:
+    - run markdown lint and link-integrity checks
+    - if touching README/docs-hub/SUMMARY/collection indexes, verify EN/ZH/JA/RU navigation parity
+    - if touching bootstrap docs/scripts, run `bash -n bootstrap.sh scripts/bootstrap.sh scripts/install.sh`
 - **Workflow changes**: validate YAML syntax; run workflow lint/sanity checks when available.
 - **Security/runtime/gateway/tools**: include at least one boundary/failure-mode validation.
 
@@ -376,6 +427,16 @@ Co-authored-by: <Name B> <login_b@users.noreply.github.com>
 Reference docs:
 
 - `CONTRIBUTING.md`
+- `docs/README.md`
+- `docs/SUMMARY.md`
+- `docs/docs-inventory.md`
+- `docs/commands-reference.md`
+- `docs/providers-reference.md`
+- `docs/channels-reference.md`
+- `docs/config-reference.md`
+- `docs/operations-runbook.md`
+- `docs/troubleshooting.md`
+- `docs/one-click-bootstrap.md`
 - `docs/pr-workflow.md`
 - `docs/reviewer-playbook.md`
 - `docs/ci-map.md`

@@ -125,4 +125,71 @@ mod tests {
             assert_eq!(cmd.get_program().to_string_lossy(), "firejail");
         }
     }
+
+    // ── §1.1 Sandbox isolation flag tests ──────────────────────
+
+    #[test]
+    fn firejail_wrap_command_includes_all_security_flags() {
+        let sandbox = FirejailSandbox;
+        let mut cmd = Command::new("echo");
+        cmd.arg("test");
+        sandbox.wrap_command(&mut cmd).unwrap();
+
+        assert_eq!(
+            cmd.get_program().to_string_lossy(),
+            "firejail",
+            "wrapped command should use firejail as program"
+        );
+
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+
+        let expected_flags = [
+            "--private=home",
+            "--private-dev",
+            "--nosound",
+            "--no3d",
+            "--novideo",
+            "--nowheel",
+            "--notv",
+            "--noprofile",
+            "--quiet",
+        ];
+
+        for flag in &expected_flags {
+            assert!(
+                args.contains(&flag.to_string()),
+                "must include security flag: {flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn firejail_wrap_command_preserves_original_command() {
+        let sandbox = FirejailSandbox;
+        let mut cmd = Command::new("ls");
+        cmd.arg("-la");
+        cmd.arg("/workspace");
+        sandbox.wrap_command(&mut cmd).unwrap();
+
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+
+        assert!(
+            args.contains(&"ls".to_string()),
+            "original program must be passed as argument"
+        );
+        assert!(
+            args.contains(&"-la".to_string()),
+            "original args must be preserved"
+        );
+        assert!(
+            args.contains(&"/workspace".to_string()),
+            "original args must be preserved"
+        );
+    }
 }

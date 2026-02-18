@@ -4,6 +4,7 @@ pub mod copilot;
 pub mod gemini;
 pub mod ollama;
 pub mod openai;
+pub mod openai_codex;
 pub mod openrouter;
 pub mod reliable;
 pub mod router;
@@ -17,10 +18,22 @@ pub use traits::{
 
 use compatible::{AuthStyle, OpenAiCompatibleProvider};
 use reliable::ReliableProvider;
+use serde::Deserialize;
+use std::path::PathBuf;
 
 const MAX_API_ERROR_CHARS: usize = 200;
 const MINIMAX_INTL_BASE_URL: &str = "https://api.minimax.io/v1";
 const MINIMAX_CN_BASE_URL: &str = "https://api.minimaxi.com/v1";
+const MINIMAX_OAUTH_GLOBAL_TOKEN_ENDPOINT: &str = "https://api.minimax.io/oauth/token";
+const MINIMAX_OAUTH_CN_TOKEN_ENDPOINT: &str = "https://api.minimaxi.com/oauth/token";
+const MINIMAX_OAUTH_PLACEHOLDER: &str = "minimax-oauth";
+const MINIMAX_OAUTH_CN_PLACEHOLDER: &str = "minimax-oauth-cn";
+const MINIMAX_OAUTH_TOKEN_ENV: &str = "MINIMAX_OAUTH_TOKEN";
+const MINIMAX_API_KEY_ENV: &str = "MINIMAX_API_KEY";
+const MINIMAX_OAUTH_REFRESH_TOKEN_ENV: &str = "MINIMAX_OAUTH_REFRESH_TOKEN";
+const MINIMAX_OAUTH_REGION_ENV: &str = "MINIMAX_OAUTH_REGION";
+const MINIMAX_OAUTH_CLIENT_ID_ENV: &str = "MINIMAX_OAUTH_CLIENT_ID";
+const MINIMAX_OAUTH_DEFAULT_CLIENT_ID: &str = "78257093-7e40-4613-99e0-527b14b39113";
 const GLM_GLOBAL_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
 const GLM_CN_BASE_URL: &str = "https://open.bigmodel.cn/api/paas/v4";
 const MOONSHOT_INTL_BASE_URL: &str = "https://api.moonshot.ai/v1";
@@ -34,12 +47,22 @@ const ZAI_CN_BASE_URL: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
 pub(crate) fn is_minimax_intl_alias(name: &str) -> bool {
     matches!(
         name,
-        "minimax" | "minimax-intl" | "minimax-io" | "minimax-global"
+        "minimax"
+            | "minimax-intl"
+            | "minimax-io"
+            | "minimax-global"
+            | "minimax-oauth"
+            | "minimax-portal"
+            | "minimax-oauth-global"
+            | "minimax-portal-global"
     )
 }
 
 pub(crate) fn is_minimax_cn_alias(name: &str) -> bool {
-    matches!(name, "minimax-cn" | "minimaxi")
+    matches!(
+        name,
+        "minimax-cn" | "minimaxi" | "minimax-oauth-cn" | "minimax-portal-cn"
+    )
 }
 
 pub(crate) fn is_minimax_alias(name: &str) -> bool {
@@ -106,6 +129,152 @@ pub(crate) fn is_zai_alias(name: &str) -> bool {
 
 pub(crate) fn is_qianfan_alias(name: &str) -> bool {
     matches!(name, "qianfan" | "baidu")
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MinimaxOauthRegion {
+    Global,
+    Cn,
+}
+
+impl MinimaxOauthRegion {
+    fn token_endpoint(self) -> &'static str {
+        match self {
+            Self::Global => MINIMAX_OAUTH_GLOBAL_TOKEN_ENDPOINT,
+            Self::Cn => MINIMAX_OAUTH_CN_TOKEN_ENDPOINT,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MinimaxOauthRefreshResponse {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    access_token: Option<String>,
+    #[serde(default)]
+    base_resp: Option<MinimaxOauthBaseResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MinimaxOauthBaseResponse {
+    #[serde(default)]
+    status_msg: Option<String>,
+}
+
+fn read_non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn is_minimax_oauth_placeholder(value: &str) -> bool {
+    value.eq_ignore_ascii_case(MINIMAX_OAUTH_PLACEHOLDER)
+        || value.eq_ignore_ascii_case(MINIMAX_OAUTH_CN_PLACEHOLDER)
+}
+
+fn minimax_oauth_region(name: &str) -> MinimaxOauthRegion {
+    if let Some(region) = read_non_empty_env(MINIMAX_OAUTH_REGION_ENV) {
+        let normalized = region.to_ascii_lowercase();
+        if matches!(normalized.as_str(), "cn" | "china") {
+            return MinimaxOauthRegion::Cn;
+        }
+        if matches!(normalized.as_str(), "global" | "intl" | "international") {
+            return MinimaxOauthRegion::Global;
+        }
+    }
+
+    if is_minimax_cn_alias(name) {
+        MinimaxOauthRegion::Cn
+    } else {
+        MinimaxOauthRegion::Global
+    }
+}
+
+fn minimax_oauth_client_id() -> String {
+    read_non_empty_env(MINIMAX_OAUTH_CLIENT_ID_ENV)
+        .unwrap_or_else(|| MINIMAX_OAUTH_DEFAULT_CLIENT_ID.to_string())
+}
+
+fn resolve_minimax_static_credential() -> Option<String> {
+    read_non_empty_env(MINIMAX_OAUTH_TOKEN_ENV).or_else(|| read_non_empty_env(MINIMAX_API_KEY_ENV))
+}
+
+fn refresh_minimax_oauth_access_token(name: &str, refresh_token: &str) -> anyhow::Result<String> {
+    let region = minimax_oauth_region(name);
+    let endpoint = region.token_endpoint();
+    let client_id = minimax_oauth_client_id();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_else(|_| reqwest::blocking::Client::new());
+
+    let response = client
+        .post(endpoint)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Accept", "application/json")
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", client_id.as_str()),
+        ])
+        .send()
+        .map_err(|error| anyhow::anyhow!("MiniMax OAuth refresh request failed: {error}"))?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .unwrap_or_else(|_| "<failed to read MiniMax OAuth response body>".to_string());
+
+    let parsed = serde_json::from_str::<MinimaxOauthRefreshResponse>(&body).ok();
+
+    if !status.is_success() {
+        let detail = parsed
+            .as_ref()
+            .and_then(|payload| payload.base_resp.as_ref())
+            .and_then(|base| base.status_msg.as_deref())
+            .filter(|msg| !msg.trim().is_empty())
+            .unwrap_or(body.as_str());
+        anyhow::bail!("MiniMax OAuth refresh failed (HTTP {status}): {detail}");
+    }
+
+    if let Some(payload) = parsed {
+        if let Some(status_text) = payload.status.as_deref() {
+            if !status_text.eq_ignore_ascii_case("success") {
+                let detail = payload
+                    .base_resp
+                    .as_ref()
+                    .and_then(|base| base.status_msg.as_deref())
+                    .unwrap_or(status_text);
+                anyhow::bail!("MiniMax OAuth refresh failed: {detail}");
+            }
+        }
+
+        if let Some(token) = payload
+            .access_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        {
+            return Ok(token.to_string());
+        }
+    }
+
+    anyhow::bail!("MiniMax OAuth refresh response missing access_token");
+}
+
+fn resolve_minimax_oauth_refresh_token(name: &str) -> Option<String> {
+    let refresh_token = read_non_empty_env(MINIMAX_OAUTH_REFRESH_TOKEN_ENV)?;
+
+    match refresh_minimax_oauth_access_token(name, &refresh_token) {
+        Ok(token) => Some(token),
+        Err(error) => {
+            tracing::warn!(provider = name, error = %error, "MiniMax OAuth refresh failed");
+            None
+        }
+    }
 }
 
 pub(crate) fn canonical_china_provider_name(name: &str) -> Option<&'static str> {
@@ -175,6 +344,23 @@ fn zai_base_url(name: &str) -> Option<&'static str> {
         Some(ZAI_GLOBAL_BASE_URL)
     } else {
         None
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderRuntimeOptions {
+    pub auth_profile_override: Option<String>,
+    pub zeroclaw_dir: Option<PathBuf>,
+    pub secrets_encrypt: bool,
+}
+
+impl Default for ProviderRuntimeOptions {
+    fn default() -> Self {
+        Self {
+            auth_profile_override: None,
+            zeroclaw_dir: None,
+            secrets_encrypt: true,
+        }
     }
 }
 
@@ -272,11 +458,27 @@ pub async fn api_error(provider: &str, response: reqwest::Response) -> anyhow::E
 ///
 /// For Anthropic, the provider-specific env var is `ANTHROPIC_OAUTH_TOKEN` (for setup-tokens)
 /// followed by `ANTHROPIC_API_KEY` (for regular API keys).
+///
+/// For MiniMax, OAuth mode supports `api_key = "minimax-oauth"`, resolving credentials from
+/// `MINIMAX_OAUTH_TOKEN` first, then `MINIMAX_API_KEY`, and finally
+/// `MINIMAX_OAUTH_REFRESH_TOKEN` (automatic access-token refresh).
 fn resolve_provider_credential(name: &str, credential_override: Option<&str>) -> Option<String> {
+    let mut minimax_oauth_placeholder_requested = false;
+
     if let Some(raw_override) = credential_override {
         let trimmed_override = raw_override.trim();
         if !trimmed_override.is_empty() {
-            return Some(trimmed_override.to_owned());
+            if is_minimax_alias(name) && is_minimax_oauth_placeholder(trimmed_override) {
+                minimax_oauth_placeholder_requested = true;
+                if let Some(credential) = resolve_minimax_static_credential() {
+                    return Some(credential);
+                }
+                if let Some(credential) = resolve_minimax_oauth_refresh_token(name) {
+                    return Some(credential);
+                }
+            } else {
+                return Some(trimmed_override.to_owned());
+            }
         }
     }
 
@@ -295,8 +497,11 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "perplexity" => vec!["PERPLEXITY_API_KEY"],
         "cohere" => vec!["COHERE_API_KEY"],
         name if is_moonshot_alias(name) => vec!["MOONSHOT_API_KEY"],
+        "kimi-code" | "kimi_coding" | "kimi_for_coding" => {
+            vec!["KIMI_CODE_API_KEY", "MOONSHOT_API_KEY"]
+        }
         name if is_glm_alias(name) => vec!["GLM_API_KEY"],
-        name if is_minimax_alias(name) => vec!["MINIMAX_API_KEY"],
+        name if is_minimax_alias(name) => vec![MINIMAX_OAUTH_TOKEN_ENV, MINIMAX_API_KEY_ENV],
         name if is_qianfan_alias(name) => vec!["QIANFAN_API_KEY"],
         name if is_qwen_alias(name) => vec!["DASHSCOPE_API_KEY"],
         name if is_zai_alias(name) => vec!["ZAI_API_KEY"],
@@ -305,6 +510,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "opencode" | "opencode-zen" => vec!["OPENCODE_API_KEY"],
         "vercel" | "vercel-ai" => vec!["VERCEL_API_KEY"],
         "cloudflare" | "cloudflare-ai" => vec!["CLOUDFLARE_API_KEY"],
+        "ovhcloud" | "ovh" => vec!["OVH_AI_ENDPOINTS_ACCESS_TOKEN"],
         "astrai" => vec!["ASTRAI_API_KEY"],
         _ => vec![],
     };
@@ -316,6 +522,16 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
                 return Some(value.to_string());
             }
         }
+    }
+
+    if is_minimax_alias(name) {
+        if let Some(credential) = resolve_minimax_oauth_refresh_token(name) {
+            return Some(credential);
+        }
+    }
+
+    if minimax_oauth_placeholder_requested && is_minimax_alias(name) {
+        return None;
     }
 
     for env_var in ["ZEROCLAW_API_KEY", "API_KEY"] {
@@ -355,7 +571,21 @@ fn parse_custom_provider_url(
 
 /// Factory: create the right provider from config (without custom URL)
 pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<dyn Provider>> {
-    create_provider_with_url(name, api_key, None)
+    create_provider_with_options(name, api_key, &ProviderRuntimeOptions::default())
+}
+
+/// Factory: create provider with runtime options (auth profile override, state dir).
+pub fn create_provider_with_options(
+    name: &str,
+    api_key: Option<&str>,
+    options: &ProviderRuntimeOptions,
+) -> anyhow::Result<Box<dyn Provider>> {
+    match name {
+        "openai-codex" | "openai_codex" | "codex" => {
+            Ok(Box::new(openai_codex::OpenAiCodexProvider::new(options)))
+        }
+        _ => create_provider_with_url(name, api_key, None),
+    }
 }
 
 /// Factory: create the right provider from config with optional custom base URL
@@ -372,7 +602,7 @@ pub fn create_provider_with_url(
         // ── Primary providers (custom implementations) ───────
         "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(key))),
         "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(key))),
-        "openai" => Ok(Box::new(openai::OpenAiProvider::new(key))),
+        "openai" => Ok(Box::new(openai::OpenAiProvider::with_base_url(api_url, key))),
         // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)
         "ollama" => Ok(Box::new(ollama::OllamaProvider::new(api_url, key))),
         "gemini" | "google" | "google-gemini" => {
@@ -398,6 +628,15 @@ pub fn create_provider_with_url(
             key,
             AuthStyle::Bearer,
         ))),
+        "kimi-code" | "kimi_coding" | "kimi_for_coding" => Ok(Box::new(
+            OpenAiCompatibleProvider::new_with_user_agent(
+                "Kimi Code",
+                "https://api.kimi.com/coding/v1",
+                key,
+                AuthStyle::Bearer,
+                "KimiCLI/0.77",
+            ),
+        )),
         "synthetic" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Synthetic", "https://api.synthetic.com", key, AuthStyle::Bearer,
         ))),
@@ -494,6 +733,12 @@ pub fn create_provider_with_url(
             "Astrai", "https://as-trai.com/v1", key, AuthStyle::Bearer,
         ))),
 
+        // ── Cloud AI endpoints ───────────────────────────────
+        "ovhcloud" | "ovh" => Ok(Box::new(openai::OpenAiProvider::with_base_url(
+            Some("https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"),
+            key,
+        ))),
+
         // ── Bring Your Own Provider (custom URL) ───────────
         // Format: "custom:https://your-api.com" or "custom:http://localhost:1234"
         name if name.starts_with("custom:") => {
@@ -539,20 +784,40 @@ pub fn create_resilient_provider(
     api_url: Option<&str>,
     reliability: &crate::config::ReliabilityConfig,
 ) -> anyhow::Result<Box<dyn Provider>> {
+    create_resilient_provider_with_options(
+        primary_name,
+        api_key,
+        api_url,
+        reliability,
+        &ProviderRuntimeOptions::default(),
+    )
+}
+
+/// Create provider chain with retry/fallback behavior and auth runtime options.
+pub fn create_resilient_provider_with_options(
+    primary_name: &str,
+    api_key: Option<&str>,
+    api_url: Option<&str>,
+    reliability: &crate::config::ReliabilityConfig,
+    options: &ProviderRuntimeOptions,
+) -> anyhow::Result<Box<dyn Provider>> {
     let mut providers: Vec<(String, Box<dyn Provider>)> = Vec::new();
 
-    providers.push((
-        primary_name.to_string(),
-        create_provider_with_url(primary_name, api_key, api_url)?,
-    ));
+    let primary_provider = match primary_name {
+        "openai-codex" | "openai_codex" | "codex" => {
+            create_provider_with_options(primary_name, api_key, options)?
+        }
+        _ => create_provider_with_url(primary_name, api_key, api_url)?,
+    };
+    providers.push((primary_name.to_string(), primary_provider));
 
     for fallback in &reliability.fallback_providers {
         if fallback == primary_name || providers.iter().any(|(name, _)| name == fallback) {
             continue;
         }
 
-        // Fallback providers don't use the custom api_url (it's specific to primary)
-        match create_provider(fallback, api_key) {
+        // Fallback providers don't use the custom api_url (it's specific to primary).
+        match create_provider_with_options(fallback, api_key, options) {
             Ok(provider) => providers.push((fallback.clone(), provider)),
             Err(_error) => {
                 tracing::warn!(
@@ -685,6 +950,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             local: false,
         },
         ProviderInfo {
+            name: "openai-codex",
+            display_name: "OpenAI Codex (OAuth)",
+            aliases: &["openai_codex", "codex"],
+            local: false,
+        },
+        ProviderInfo {
             name: "ollama",
             display_name: "Ollama",
             aliases: &[],
@@ -722,6 +993,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             local: false,
         },
         ProviderInfo {
+            name: "kimi-code",
+            display_name: "Kimi Code",
+            aliases: &["kimi_coding", "kimi_for_coding"],
+            local: false,
+        },
+        ProviderInfo {
             name: "synthetic",
             display_name: "Synthetic",
             aliases: &[],
@@ -748,7 +1025,17 @@ pub fn list_providers() -> Vec<ProviderInfo> {
         ProviderInfo {
             name: "minimax",
             display_name: "MiniMax",
-            aliases: &[],
+            aliases: &[
+                "minimax-intl",
+                "minimax-io",
+                "minimax-global",
+                "minimax-cn",
+                "minimaxi",
+                "minimax-oauth",
+                "minimax-oauth-cn",
+                "minimax-portal",
+                "minimax-portal-cn",
+            ],
             local: false,
         },
         ProviderInfo {
@@ -841,6 +1128,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             aliases: &["nvidia-nim", "build.nvidia.com"],
             local: false,
         },
+        ProviderInfo {
+            name: "ovhcloud",
+            display_name: "OVHcloud AI Endpoints",
+            aliases: &["ovh"],
+            local: false,
+        },
     ]
 }
 
@@ -848,10 +1141,71 @@ pub fn list_providers() -> Vec<ProviderInfo> {
 mod tests {
     use super::*;
 
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            let original = std::env::var(key).ok();
+            match value {
+                Some(next) => std::env::set_var(key, next),
+                None => std::env::remove_var(key),
+            }
+
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(original) = self.original.as_deref() {
+                std::env::set_var(self.key, original);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
     #[test]
     fn resolve_provider_credential_prefers_explicit_argument() {
         let resolved = resolve_provider_credential("openrouter", Some("  explicit-key  "));
         assert_eq!(resolved, Some("explicit-key".to_string()));
+    }
+
+    #[test]
+    fn resolve_provider_credential_uses_minimax_oauth_env_for_placeholder() {
+        let _oauth_guard = EnvGuard::set(MINIMAX_OAUTH_TOKEN_ENV, Some("oauth-token"));
+        let _api_guard = EnvGuard::set(MINIMAX_API_KEY_ENV, Some("api-key"));
+        let _refresh_guard = EnvGuard::set(MINIMAX_OAUTH_REFRESH_TOKEN_ENV, None);
+
+        let resolved = resolve_provider_credential("minimax", Some(MINIMAX_OAUTH_PLACEHOLDER));
+
+        assert_eq!(resolved.as_deref(), Some("oauth-token"));
+    }
+
+    #[test]
+    fn resolve_provider_credential_falls_back_to_minimax_api_key_for_placeholder() {
+        let _oauth_guard = EnvGuard::set(MINIMAX_OAUTH_TOKEN_ENV, None);
+        let _api_guard = EnvGuard::set(MINIMAX_API_KEY_ENV, Some("api-key"));
+        let _refresh_guard = EnvGuard::set(MINIMAX_OAUTH_REFRESH_TOKEN_ENV, None);
+
+        let resolved = resolve_provider_credential("minimax", Some(MINIMAX_OAUTH_PLACEHOLDER));
+
+        assert_eq!(resolved.as_deref(), Some("api-key"));
+    }
+
+    #[test]
+    fn resolve_provider_credential_placeholder_ignores_generic_api_key_fallback() {
+        let _oauth_guard = EnvGuard::set(MINIMAX_OAUTH_TOKEN_ENV, None);
+        let _api_guard = EnvGuard::set(MINIMAX_API_KEY_ENV, None);
+        let _refresh_guard = EnvGuard::set(MINIMAX_OAUTH_REFRESH_TOKEN_ENV, None);
+        let _generic_guard = EnvGuard::set("API_KEY", Some("generic-key"));
+
+        let resolved = resolve_provider_credential("minimax", Some(MINIMAX_OAUTH_PLACEHOLDER));
+
+        assert!(resolved.is_none());
     }
 
     #[test]
@@ -862,6 +1216,8 @@ mod tests {
         assert!(is_glm_alias("bigmodel"));
         assert!(is_minimax_alias("minimax-io"));
         assert!(is_minimax_alias("minimaxi"));
+        assert!(is_minimax_alias("minimax-oauth"));
+        assert!(is_minimax_alias("minimax-portal-cn"));
         assert!(is_qwen_alias("dashscope"));
         assert!(is_qwen_alias("qwen-us"));
         assert!(is_zai_alias("z.ai"));
@@ -944,6 +1300,12 @@ mod tests {
     }
 
     #[test]
+    fn factory_openai_codex() {
+        let options = ProviderRuntimeOptions::default();
+        assert!(create_provider_with_options("openai-codex", None, &options).is_ok());
+    }
+
+    #[test]
     fn factory_ollama() {
         assert!(create_provider("ollama", None).is_ok());
         // Ollama may use API key when a remote endpoint is configured.
@@ -990,6 +1352,13 @@ mod tests {
     }
 
     #[test]
+    fn factory_kimi_code() {
+        assert!(create_provider("kimi-code", Some("key")).is_ok());
+        assert!(create_provider("kimi_coding", Some("key")).is_ok());
+        assert!(create_provider("kimi_for_coding", Some("key")).is_ok());
+    }
+
+    #[test]
     fn factory_synthetic() {
         assert!(create_provider("synthetic", Some("key")).is_ok());
     }
@@ -1025,8 +1394,13 @@ mod tests {
         assert!(create_provider("minimax", Some("key")).is_ok());
         assert!(create_provider("minimax-intl", Some("key")).is_ok());
         assert!(create_provider("minimax-io", Some("key")).is_ok());
+        assert!(create_provider("minimax-global", Some("key")).is_ok());
         assert!(create_provider("minimax-cn", Some("key")).is_ok());
         assert!(create_provider("minimaxi", Some("key")).is_ok());
+        assert!(create_provider("minimax-oauth", Some("key")).is_ok());
+        assert!(create_provider("minimax-oauth-cn", Some("key")).is_ok());
+        assert!(create_provider("minimax-portal", Some("key")).is_ok());
+        assert!(create_provider("minimax-portal-cn", Some("key")).is_ok());
     }
 
     #[test]
@@ -1321,7 +1695,9 @@ mod tests {
             "cloudflare",
             "moonshot",
             "moonshot-intl",
+            "kimi-code",
             "moonshot-cn",
+            "kimi-code",
             "synthetic",
             "opencode",
             "zai",
@@ -1348,6 +1724,7 @@ mod tests {
             "copilot",
             "nvidia",
             "astrai",
+            "ovhcloud",
         ];
         for name in providers {
             assert!(

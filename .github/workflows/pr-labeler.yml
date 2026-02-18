@@ -42,6 +42,8 @@ jobs:
             - name: Apply size/risk/module labels
               uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
               continue-on-error: true
+              env:
+                  LABEL_POLICY_PATH: .github/label-policy.json
               with:
                   script: |
                       const script = require('./.github/workflows/scripts/pr_labeler.js');

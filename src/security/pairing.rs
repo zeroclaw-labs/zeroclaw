@@ -176,14 +176,14 @@ fn generate_code() -> String {
 
 /// Generate a cryptographically-adequate bearer token with 256-bit entropy.
 ///
-/// Uses `rand::thread_rng()` which is backed by the OS CSPRNG
+/// Uses `rand::rng()` which is backed by the OS CSPRNG
 /// (/dev/urandom on Linux, BCryptGenRandom on Windows, SecRandomCopyBytes
 /// on macOS). The 32 random bytes (256 bits) are hex-encoded for a
 /// 64-character token, providing 256 bits of entropy.
 fn generate_token() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     format!("zc_{}", hex::encode(bytes))
 }
 
@@ -416,10 +416,19 @@ mod tests {
     }
 
     #[test]
-    fn generate_token_has_prefix() {
+    fn generate_token_has_prefix_and_hex_payload() {
         let token = generate_token();
-        assert!(token.starts_with("zc_"));
-        assert!(token.len() > 10);
+        let payload = token
+            .strip_prefix("zc_")
+            .expect("Generated token should include zc_ prefix");
+
+        assert_eq!(payload.len(), 64, "Token payload should be 32 bytes in hex");
+        assert!(
+            payload
+                .chars()
+                .all(|c| c.is_ascii_digit() || matches!(c, 'a'..='f')),
+            "Token payload should be lowercase hex"
+        );
     }
 
     // ── Brute force protection ───────────────────────────────

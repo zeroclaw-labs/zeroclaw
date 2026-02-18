@@ -33,6 +33,8 @@ pub struct Agent {
     skills: Vec<crate::skills::Skill>,
     auto_save: bool,
     history: Vec<ConversationMessage>,
+    classification_config: crate::config::QueryClassificationConfig,
+    available_hints: Vec<String>,
 }
 
 pub struct AgentBuilder {
@@ -50,6 +52,8 @@ pub struct AgentBuilder {
     identity_config: Option<crate::config::IdentityConfig>,
     skills: Option<Vec<crate::skills::Skill>>,
     auto_save: Option<bool>,
+    classification_config: Option<crate::config::QueryClassificationConfig>,
+    available_hints: Option<Vec<String>>,
 }
 
 impl AgentBuilder {
@@ -69,6 +73,8 @@ impl AgentBuilder {
             identity_config: None,
             skills: None,
             auto_save: None,
+            classification_config: None,
+            available_hints: None,
         }
     }
 
@@ -142,6 +148,19 @@ impl AgentBuilder {
         self
     }
 
+    pub fn classification_config(
+        mut self,
+        classification_config: crate::config::QueryClassificationConfig,
+    ) -> Self {
+        self.classification_config = Some(classification_config);
+        self
+    }
+
+    pub fn available_hints(mut self, available_hints: Vec<String>) -> Self {
+        self.available_hints = Some(available_hints);
+        self
+    }
+
     pub fn build(self) -> Result<Agent> {
         let tools = self
             .tools
@@ -181,6 +200,8 @@ impl AgentBuilder {
             skills: self.skills.unwrap_or_default(),
             auto_save: self.auto_save.unwrap_or(false),
             history: Vec::new(),
+            classification_config: self.classification_config.unwrap_or_default(),
+            available_hints: self.available_hints.unwrap_or_default(),
         })
     }
 }
@@ -208,8 +229,9 @@ impl Agent {
             &config.workspace_dir,
         ));
 
-        let memory: Arc<dyn Memory> = Arc::from(memory::create_memory(
+        let memory: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
             &config.memory,
+            Some(&config.storage.provider.config),
             &config.workspace_dir,
             config.api_key.as_deref(),
         )?);
@@ -265,18 +287,26 @@ impl Agent {
             _ => Box::new(XmlToolDispatcher),
         };
 
+        let available_hints: Vec<String> =
+            config.model_routes.iter().map(|r| r.hint.clone()).collect();
+
         Agent::builder()
             .provider(provider)
             .tools(tools)
             .memory(memory)
             .observer(observer)
             .tool_dispatcher(tool_dispatcher)
-            .memory_loader(Box::new(DefaultMemoryLoader::default()))
+            .memory_loader(Box::new(DefaultMemoryLoader::new(
+                5,
+                config.memory.min_relevance_score,
+            )))
             .prompt_builder(SystemPromptBuilder::with_defaults())
             .config(config.agent.clone())
             .model_name(model_name)
             .temperature(config.default_temperature)
             .workspace_dir(config.workspace_dir.clone())
+            .classification_config(config.query_classification.clone())
+            .available_hints(available_hints)
             .identity_config(config.identity.clone())
             .skills(crate::skills::load_skills(&config.workspace_dir))
             .auto_save(config.memory.auto_save)
@@ -377,6 +407,16 @@ impl Agent {
         results
     }
 
+    fn classify_model(&self, user_message: &str) -> String {
+        if let Some(hint) = super::classifier::classify(&self.classification_config, user_message) {
+            if self.available_hints.contains(&hint) {
+                tracing::info!(hint = hint.as_str(), "Auto-classified query");
+                return format!("hint:{hint}");
+            }
+        }
+        self.model_name.clone()
+    }
+
     pub async fn turn(&mut self, user_message: &str) -> Result<String> {
         if self.history.is_empty() {
             let system_prompt = self.build_system_prompt()?;
@@ -408,6 +448,8 @@ impl Agent {
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
+        let effective_model = self.classify_model(user_message);
+
         for _ in 0..self.config.max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
             let response = match self
@@ -421,7 +463,7 @@ impl Agent {
                             None
                         },
                     },
-                    &self.model_name,
+                    &effective_model,
                     self.temperature,
                 )
                 .await
@@ -544,8 +586,8 @@ pub async fn run(
         .to_string();
 
     agent.observer.record_event(&ObserverEvent::AgentStart {
-        provider: provider_name,
-        model: model_name,
+        provider: provider_name.clone(),
+        model: model_name.clone(),
     });
 
     if let Some(msg) = message {
@@ -556,6 +598,8 @@ pub async fn run(
     }
 
     agent.observer.record_event(&ObserverEvent::AgentEnd {
+        provider: provider_name,
+        model: model_name,
         duration: start.elapsed(),
         tokens_used: None,
         cost_usd: None,

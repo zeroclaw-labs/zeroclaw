@@ -5,6 +5,7 @@ pub mod hygiene;
 pub mod lucid;
 pub mod markdown;
 pub mod none;
+pub mod postgres;
 pub mod response_cache;
 pub mod snapshot;
 pub mod sqlite;
@@ -19,24 +20,28 @@ pub use backend::{
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
+pub use postgres::PostgresMemory;
 pub use response_cache::ResponseCache;
 pub use sqlite::SqliteMemory;
 pub use traits::Memory;
 #[allow(unused_imports)]
 pub use traits::{MemoryCategory, MemoryEntry};
 
-use crate::config::MemoryConfig;
+use crate::config::{MemoryConfig, StorageProviderConfig};
+use anyhow::Context;
 use std::path::Path;
 use std::sync::Arc;
 
-fn create_memory_with_sqlite_builder<F>(
+fn create_memory_with_builders<F, G>(
     backend_name: &str,
     workspace_dir: &Path,
     mut sqlite_builder: F,
+    mut postgres_builder: G,
     unknown_context: &str,
 ) -> anyhow::Result<Box<dyn Memory>>
 where
     F: FnMut() -> anyhow::Result<SqliteMemory>,
+    G: FnMut() -> anyhow::Result<PostgresMemory>,
 {
     match classify_memory_backend(backend_name) {
         MemoryBackendKind::Sqlite => Ok(Box::new(sqlite_builder()?)),
@@ -44,6 +49,7 @@ where
             let local = sqlite_builder()?;
             Ok(Box::new(LucidMemory::new(workspace_dir, local)))
         }
+        MemoryBackendKind::Postgres => Ok(Box::new(postgres_builder()?)),
         MemoryBackendKind::Markdown => Ok(Box::new(MarkdownMemory::new(workspace_dir))),
         MemoryBackendKind::None => Ok(Box::new(NoneMemory::new())),
         MemoryBackendKind::Unknown => {
@@ -55,19 +61,52 @@ where
     }
 }
 
+pub fn effective_memory_backend_name(
+    memory_backend: &str,
+    storage_provider: Option<&StorageProviderConfig>,
+) -> String {
+    if let Some(override_provider) = storage_provider
+        .map(|cfg| cfg.provider.trim())
+        .filter(|provider| !provider.is_empty())
+    {
+        return override_provider.to_ascii_lowercase();
+    }
+
+    memory_backend.trim().to_ascii_lowercase()
+}
+
 /// Factory: create the right memory backend from config
 pub fn create_memory(
     config: &MemoryConfig,
     workspace_dir: &Path,
     api_key: Option<&str>,
 ) -> anyhow::Result<Box<dyn Memory>> {
+    create_memory_with_storage(config, None, workspace_dir, api_key)
+}
+
+/// Factory: create memory with optional storage-provider override.
+pub fn create_memory_with_storage(
+    config: &MemoryConfig,
+    storage_provider: Option<&StorageProviderConfig>,
+    workspace_dir: &Path,
+    api_key: Option<&str>,
+) -> anyhow::Result<Box<dyn Memory>> {
+    let backend_name = effective_memory_backend_name(&config.backend, storage_provider);
+    let backend_kind = classify_memory_backend(&backend_name);
+
     // Best-effort memory hygiene/retention pass (throttled by state file).
     if let Err(e) = hygiene::run_if_due(config, workspace_dir) {
         tracing::warn!("memory hygiene skipped: {e}");
     }
 
     // If snapshot_on_hygiene is enabled, export core memories during hygiene.
-    if config.snapshot_enabled && config.snapshot_on_hygiene {
+    if config.snapshot_enabled
+        && config.snapshot_on_hygiene
+        && matches!(
+            backend_kind,
+            MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid
+        )
+    {
         if let Err(e) = snapshot::export_snapshot(workspace_dir) {
             tracing::warn!("memory snapshot skipped: {e}");
         }
@@ -77,7 +116,7 @@ pub fn create_memory(
     // restore the "soul" from the snapshot before creating the backend.
     if config.auto_hydrate
         && matches!(
-            classify_memory_backend(&config.backend),
+            backend_kind,
             MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid
         )
         && snapshot::should_hydrate(workspace_dir)
@@ -115,14 +154,38 @@ pub fn create_memory(
             config.vector_weight as f32,
             config.keyword_weight as f32,
             config.embedding_cache_size,
+            config.sqlite_open_timeout_secs,
         )?;
         Ok(mem)
     }
 
-    create_memory_with_sqlite_builder(
-        &config.backend,
+    fn build_postgres_memory(
+        storage_provider: Option<&StorageProviderConfig>,
+    ) -> anyhow::Result<PostgresMemory> {
+        let storage_provider = storage_provider
+            .context("memory backend 'postgres' requires [storage.provider.config] settings")?;
+        let db_url = storage_provider
+            .db_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .context(
+                "memory backend 'postgres' requires [storage.provider.config].db_url (or dbURL)",
+            )?;
+
+        PostgresMemory::new(
+            db_url,
+            &storage_provider.schema,
+            &storage_provider.table,
+            storage_provider.connect_timeout_secs,
+        )
+    }
+
+    create_memory_with_builders(
+        &backend_name,
         workspace_dir,
         || build_sqlite_memory(config, workspace_dir, api_key),
+        || build_postgres_memory(storage_provider),
         "",
     )
 }
@@ -137,10 +200,20 @@ pub fn create_memory_for_migration(
         );
     }
 
-    create_memory_with_sqlite_builder(
+    if matches!(
+        classify_memory_backend(backend),
+        MemoryBackendKind::Postgres
+    ) {
+        anyhow::bail!(
+            "memory migration for backend 'postgres' is unsupported; migrate with sqlite or markdown first"
+        );
+    }
+
+    create_memory_with_builders(
         backend,
         workspace_dir,
         || SqliteMemory::new(workspace_dir),
+        || anyhow::bail!("postgres backend is not available in migration context"),
         " during migration",
     )
 }
@@ -174,6 +247,7 @@ pub fn create_response_cache(config: &MemoryConfig, workspace_dir: &Path) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::StorageProviderConfig;
     use tempfile::TempDir;
 
     #[test]
@@ -245,5 +319,38 @@ mod tests {
             .err()
             .expect("backend=none should be rejected for migration");
         assert!(error.to_string().contains("disables persistence"));
+    }
+
+    #[test]
+    fn effective_backend_name_prefers_storage_override() {
+        let storage = StorageProviderConfig {
+            provider: "postgres".into(),
+            ..StorageProviderConfig::default()
+        };
+
+        assert_eq!(
+            effective_memory_backend_name("sqlite", Some(&storage)),
+            "postgres"
+        );
+    }
+
+    #[test]
+    fn factory_postgres_without_db_url_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: "postgres".into(),
+            ..MemoryConfig::default()
+        };
+
+        let storage = StorageProviderConfig {
+            provider: "postgres".into(),
+            db_url: None,
+            ..StorageProviderConfig::default()
+        };
+
+        let error = create_memory_with_storage(&cfg, Some(&storage), tmp.path(), None)
+            .err()
+            .expect("postgres without db_url should be rejected");
+        assert!(error.to_string().contains("db_url"));
     }
 }

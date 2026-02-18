@@ -7,3 +7,7 @@ cognitive-complexity-threshold = 30
 too-many-arguments-threshold = 10
 
 too-many-lines-threshold = 200
+
+# Some generated/test-only paths legitimately allocate larger local buffers.
+# Keep linting enabled while reducing false positives from those cases.
+array-size-threshold = 65536
