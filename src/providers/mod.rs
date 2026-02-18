@@ -2,6 +2,7 @@ pub mod anthropic;
 pub mod compatible;
 pub mod copilot;
 pub mod gemini;
+pub mod google_antigravity_oauth;
 pub mod minimax_portal_oauth;
 pub mod ollama;
 pub mod openai;
@@ -295,6 +296,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "fireworks" | "fireworks-ai" => vec!["FIREWORKS_API_KEY"],
         "perplexity" => vec!["PERPLEXITY_API_KEY"],
         "cohere" => vec!["COHERE_API_KEY"],
+        "google-antigravity" | "antigravity" => vec!["GOOGLE_ANTIGRAVITY_ACCESS_TOKEN"],
         name if is_moonshot_alias(name) => vec!["MOONSHOT_API_KEY"],
         name if is_glm_alias(name) => vec!["GLM_API_KEY"],
         name if is_minimax_intl_alias(name) => vec!["MINIMAX_PORTAL_ACCESS_TOKEN"],
@@ -476,6 +478,12 @@ pub fn create_provider_with_url(
         "copilot" | "github-copilot" => {
             Ok(Box::new(copilot::CopilotProvider::new(api_key)))
         },
+        "google-antigravity" | "antigravity" => {
+            Ok(Box::new(anthropic::AnthropicProvider::with_base_url_bearer(
+                key,
+                Some("https://cloudcode-pa.googleapis.com"),
+            )))
+        }
         "lmstudio" | "lm-studio" => {
             let lm_studio_key = api_key
                 .map(str::trim)
@@ -835,6 +843,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             name: "copilot",
             display_name: "GitHub Copilot",
             aliases: &["github-copilot"],
+            local: false,
+        },
+        ProviderInfo {
+            name: "google-antigravity",
+            display_name: "Google Antigravity",
+            aliases: &["antigravity"],
             local: false,
         },
         ProviderInfo {

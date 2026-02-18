@@ -486,6 +486,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "groq" => "llama-3.3-70b-versatile".into(),
         "deepseek" => "deepseek-chat".into(),
         "gemini" => "gemini-2.5-pro".into(),
+        "google-antigravity" => "google-antigravity/claude-opus-4-6-thinking".into(),
         _ => "anthropic/claude-sonnet-4.5".into(),
     }
 }
@@ -1365,7 +1366,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
         "⭐ Recommended (OpenRouter, Venice, Anthropic, OpenAI, Gemini)",
         "⚡ Fast inference (Groq, Fireworks, Together AI, NVIDIA NIM)",
         "🌐 Gateway / proxy (Vercel AI, Cloudflare AI, Amazon Bedrock)",
-        "🔬 Specialized (Moonshot/Kimi, GLM/Zhipu, MiniMax, Qwen/DashScope, Qianfan, Z.AI, Synthetic, OpenCode Zen, Cohere)",
+        "🔬 Specialized (Moonshot/Kimi, GLM/Zhipu, MiniMax, Qwen/DashScope, Qianfan, Z.AI, Synthetic, OpenCode Zen, Cohere, Google Antigravity)",
         "🏠 Local / private (Ollama — no API key needed)",
         "🔧 Custom — bring your own OpenAI-compatible API",
     ];
@@ -1428,6 +1429,10 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
             ("synthetic", "Synthetic — Synthetic AI models"),
             ("opencode", "OpenCode Zen — code-focused AI"),
             ("cohere", "Cohere — Command R+ & embeddings"),
+            (
+                "google-antigravity",
+                "Google Antigravity — Claude via Google Cloud (OAuth login)",
+            ),
         ],
         4 => vec![("ollama", "Ollama — local models (Llama, Mistral, Phi)")],
         _ => vec![], // Custom — handled below
@@ -1622,6 +1627,64 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
             } else {
                 print_bullet(
                     "Skipped OAuth login. Set MINIMAX_PORTAL_ACCESS_TOKEN later or rerun onboarding.",
+                );
+                String::new()
+            }
+        }
+    } else if provider_name == "google-antigravity" {
+        // Google Antigravity: run OAuth during onboarding
+        print_bullet("Google Antigravity uses Google OAuth login — no API key needed.");
+        print_bullet("You will authenticate via your browser.");
+        print_bullet("Or set GOOGLE_ANTIGRAVITY_ACCESS_TOKEN env var if you already have a token.");
+        println!();
+
+        let env_token = std::env::var("GOOGLE_ANTIGRAVITY_ACCESS_TOKEN")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+
+        if let Some(token) = env_token {
+            print_bullet(&format!(
+                "{} GOOGLE_ANTIGRAVITY_ACCESS_TOKEN detected!",
+                style("✓").green().bold()
+            ));
+            token
+        } else {
+            let login_now = Confirm::new()
+                .with_prompt("  Start Google Antigravity OAuth login now?")
+                .default(true)
+                .interact()?;
+
+            if login_now {
+                let credential = std::thread::spawn(|| -> Result<_> {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .context("failed to initialize runtime for Google Antigravity OAuth")?;
+                    rt.block_on(
+                        crate::providers::google_antigravity_oauth::login_google_antigravity(),
+                    )
+                })
+                .join()
+                .map_err(|_| anyhow::anyhow!("Google Antigravity OAuth thread panicked"))??;
+
+                if let Some(ref email) = credential.email {
+                    print_bullet(&format!(
+                        "{} Authenticated as {}",
+                        style("✓").green().bold(),
+                        style(email).cyan()
+                    ));
+                }
+                print_bullet(&format!(
+                    "{} Project ID: {}",
+                    style("✓").green().bold(),
+                    style(&credential.project_id).cyan()
+                ));
+
+                credential.access_token
+            } else {
+                print_bullet(
+                    "Skipped OAuth login. Set GOOGLE_ANTIGRAVITY_ACCESS_TOKEN later or rerun onboarding.",
                 );
                 String::new()
             }
@@ -1847,6 +1910,10 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
             ("codellama", "Code Llama"),
             ("phi3", "Phi-3 (small, fast)"),
         ],
+        "google-antigravity" => vec![(
+            "google-antigravity/claude-opus-4-6-thinking",
+            "Claude Opus 4.6 Thinking (recommended)",
+        )],
         "gemini" | "google" | "google-gemini" => vec![
             ("gemini-2.0-flash", "Gemini 2.0 Flash (fast, recommended)"),
             (
@@ -2060,6 +2127,7 @@ fn provider_env_var(name: &str) -> &'static str {
         "cloudflare" | "cloudflare-ai" => "CLOUDFLARE_API_KEY",
         "bedrock" | "aws-bedrock" => "AWS_ACCESS_KEY_ID",
         "gemini" => "GEMINI_API_KEY",
+        "google-antigravity" => "GOOGLE_ANTIGRAVITY_ACCESS_TOKEN",
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => "NVIDIA_API_KEY",
         "astrai" => "ASTRAI_API_KEY",
         _ => "API_KEY",
