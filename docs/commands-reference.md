@@ -80,6 +80,13 @@ Last verified: **February 18, 2026**.
 - `zeroclaw channel add <type> <json>`
 - `zeroclaw channel remove <name>`
 
+Runtime in-chat commands (Telegram/Discord while channel server is running):
+
+- `/models`
+- `/models <provider>`
+- `/model`
+- `/model <model-id>`
+
 `add/remove` currently route you back to managed setup/manual config paths (not full declarative mutators yet).
 
 ### `integrations`
@@ -118,4 +125,3 @@ To verify docs against your current binary quickly:
 zeroclaw --help
 zeroclaw <command> --help
 ```
-
