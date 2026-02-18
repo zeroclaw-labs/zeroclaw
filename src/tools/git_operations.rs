@@ -735,10 +735,7 @@ mod tests {
         });
         let tool = GitOperationsTool::new(security, tmp.path().to_path_buf());
 
-        let result = tool
-            .execute(json!({"operation": "branch"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"operation": "branch"})).await.unwrap();
         // Branch listing must not be blocked by read-only autonomy
         let error_msg = result.error.as_deref().unwrap_or("");
         assert!(

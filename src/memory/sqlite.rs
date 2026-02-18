@@ -337,8 +337,7 @@ impl SqliteMemory {
         category: Option<&str>,
         session_id: Option<&str>,
     ) -> anyhow::Result<Vec<(String, f32)>> {
-        let mut sql =
-            "SELECT id, embedding FROM memories WHERE embedding IS NOT NULL".to_string();
+        let mut sql = "SELECT id, embedding FROM memories WHERE embedding IS NOT NULL".to_string();
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         let mut idx = 1;
 
@@ -500,13 +499,11 @@ impl Memory for SqliteMemory {
             let session_ref = session_id.as_deref();
 
             // FTS5 BM25 keyword search
-            let keyword_results =
-                Self::fts5_search(&conn, &query, limit * 2).unwrap_or_default();
+            let keyword_results = Self::fts5_search(&conn, &query, limit * 2).unwrap_or_default();
 
             // Vector similarity search (if embeddings available)
             let vector_results = if let Some(ref qe) = query_embedding {
-                Self::vector_search(&conn, qe, limit * 2, None, session_ref)
-                    .unwrap_or_default()
+                Self::vector_search(&conn, qe, limit * 2, None, session_ref).unwrap_or_default()
             } else {
                 Vec::new()
             };
@@ -604,11 +601,7 @@ impl Memory for SqliteMemory {
                         .iter()
                         .enumerate()
                         .map(|(i, _)| {
-                            format!(
-                                "(content LIKE ?{} OR key LIKE ?{})",
-                                i * 2 + 1,
-                                i * 2 + 2
-                            )
+                            format!("(content LIKE ?{} OR key LIKE ?{})", i * 2 + 1, i * 2 + 2)
                         })
                         .collect();
                     let where_clause = conditions.join(" OR ");

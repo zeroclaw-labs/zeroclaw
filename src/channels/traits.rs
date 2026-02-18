@@ -70,6 +70,36 @@ pub trait Channel: Send + Sync {
     async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// Whether this channel supports progressive message updates via draft edits.
+    fn supports_draft_updates(&self) -> bool {
+        false
+    }
+
+    /// Send an initial draft message. Returns a platform-specific message ID for later edits.
+    async fn send_draft(&self, _message: &SendMessage) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Update a previously sent draft message with new accumulated content.
+    async fn update_draft(
+        &self,
+        _recipient: &str,
+        _message_id: &str,
+        _text: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Finalize a draft with the complete response (e.g. apply Markdown formatting).
+    async fn finalize_draft(
+        &self,
+        _recipient: &str,
+        _message_id: &str,
+        _text: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -134,6 +164,23 @@ mod tests {
         assert!(channel.stop_typing("bob").await.is_ok());
         assert!(channel
             .send(&SendMessage::new("hello", "bob"))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn default_draft_methods_return_success() {
+        let channel = DummyChannel;
+
+        assert!(!channel.supports_draft_updates());
+        assert!(channel
+            .send_draft(&SendMessage::new("draft", "bob"))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(channel.update_draft("bob", "msg_1", "text").await.is_ok());
+        assert!(channel
+            .finalize_draft("bob", "msg_1", "final text")
             .await
             .is_ok());
     }

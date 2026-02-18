@@ -1440,10 +1440,33 @@ impl Default for ChannelsConfig {
     }
 }
 
+/// Streaming mode for channels that support progressive message updates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum StreamMode {
+    /// No streaming -- send the complete response as a single message (default).
+    #[default]
+    Off,
+    /// Update a draft message with every flush interval.
+    Partial,
+    /// Update a draft message in larger chunks.
+    Block,
+}
+
+fn default_draft_update_interval_ms() -> u64 {
+    1000
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TelegramConfig {
     pub bot_token: String,
     pub allowed_users: Vec<String>,
+    /// Streaming mode for progressive response delivery via message edits.
+    #[serde(default)]
+    pub stream_mode: StreamMode,
+    /// Minimum interval (ms) between draft message edits to avoid rate limits.
+    #[serde(default = "default_draft_update_interval_ms")]
+    pub draft_update_interval_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2508,6 +2531,8 @@ default_temperature = 0.7
                 telegram: Some(TelegramConfig {
                     bot_token: "123:ABC".into(),
                     allowed_users: vec!["user1".into()],
+                    stream_mode: StreamMode::default(),
+                    draft_update_interval_ms: default_draft_update_interval_ms(),
                 }),
                 discord: None,
                 slack: None,
@@ -2779,11 +2804,23 @@ tool_dispatcher = "xml"
         let tc = TelegramConfig {
             bot_token: "123:XYZ".into(),
             allowed_users: vec!["alice".into(), "bob".into()],
+            stream_mode: StreamMode::Partial,
+            draft_update_interval_ms: 500,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.bot_token, "123:XYZ");
         assert_eq!(parsed.allowed_users.len(), 2);
+        assert_eq!(parsed.stream_mode, StreamMode::Partial);
+        assert_eq!(parsed.draft_update_interval_ms, 500);
+    }
+
+    #[test]
+    fn telegram_config_defaults_stream_off() {
+        let json = r#"{"bot_token":"tok","allowed_users":[]}"#;
+        let parsed: TelegramConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.stream_mode, StreamMode::Off);
+        assert_eq!(parsed.draft_update_interval_ms, 1000);
     }
 
     #[test]

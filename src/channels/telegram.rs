@@ -1,5 +1,5 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
-use crate::config::Config;
+use crate::config::{Config, StreamMode};
 use crate::security::pairing::PairingGuard;
 use anyhow::Context;
 use async_trait::async_trait;
@@ -237,6 +237,9 @@ pub struct TelegramChannel {
     pairing: Option<PairingGuard>,
     client: reqwest::Client,
     typing_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    stream_mode: StreamMode,
+    draft_update_interval_ms: u64,
+    last_draft_edit: Mutex<Option<std::time::Instant>>,
 }
 
 impl TelegramChannel {
@@ -258,7 +261,30 @@ impl TelegramChannel {
             allowed_users: Arc::new(RwLock::new(normalized_allowed)),
             pairing,
             client: reqwest::Client::new(),
+            stream_mode: StreamMode::Off,
+            draft_update_interval_ms: 1000,
+            last_draft_edit: Mutex::new(None),
             typing_handle: Mutex::new(None),
+        }
+    }
+
+    /// Configure streaming mode for progressive draft updates.
+    pub fn with_streaming(
+        mut self,
+        stream_mode: StreamMode,
+        draft_update_interval_ms: u64,
+    ) -> Self {
+        self.stream_mode = stream_mode;
+        self.draft_update_interval_ms = draft_update_interval_ms;
+        self
+    }
+
+    /// Parse reply_target into (chat_id, optional thread_id).
+    fn parse_reply_target(reply_target: &str) -> (String, Option<String>) {
+        if let Some((chat_id, thread_id)) = reply_target.split_once(':') {
+            (chat_id.to_string(), Some(thread_id.to_string()))
+        } else {
+            (reply_target.to_string(), None)
         }
     }
 
@@ -1180,6 +1206,170 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 impl Channel for TelegramChannel {
     fn name(&self) -> &str {
         "telegram"
+    }
+
+    fn supports_draft_updates(&self) -> bool {
+        self.stream_mode != StreamMode::Off
+    }
+
+    async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+        if self.stream_mode == StreamMode::Off {
+            return Ok(None);
+        }
+
+        let (chat_id, thread_id) = Self::parse_reply_target(&message.recipient);
+        let initial_text = if message.content.is_empty() {
+            "...".to_string()
+        } else {
+            message.content.clone()
+        };
+
+        let mut body = serde_json::json!({
+            "chat_id": chat_id,
+            "text": initial_text,
+        });
+        if let Some(tid) = thread_id {
+            body["message_thread_id"] = serde_json::Value::String(tid.to_string());
+        }
+
+        let resp = self
+            .client
+            .post(self.api_url("sendMessage"))
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Telegram sendMessage (draft) failed: {err}");
+        }
+
+        let resp_json: serde_json::Value = resp.json().await?;
+        let message_id = resp_json
+            .get("result")
+            .and_then(|r| r.get("message_id"))
+            .and_then(|id| id.as_i64())
+            .map(|id| id.to_string());
+
+        *self.last_draft_edit.lock() = Some(std::time::Instant::now());
+
+        Ok(message_id)
+    }
+
+    async fn update_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        // Rate-limit edits
+        {
+            let last = self.last_draft_edit.lock();
+            if let Some(last_time) = *last {
+                let elapsed = u64::try_from(last_time.elapsed().as_millis()).unwrap_or(u64::MAX);
+                if elapsed < self.draft_update_interval_ms {
+                    return Ok(());
+                }
+            }
+        }
+
+        let (chat_id, _) = Self::parse_reply_target(recipient);
+
+        // Truncate to Telegram limit for mid-stream edits
+        let display_text = if text.len() > TELEGRAM_MAX_MESSAGE_LENGTH {
+            &text[..TELEGRAM_MAX_MESSAGE_LENGTH]
+        } else {
+            text
+        };
+
+        let body = serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": message_id.parse::<i64>().unwrap_or(0),
+            "text": display_text,
+        });
+
+        let resp = self
+            .client
+            .post(self.api_url("editMessageText"))
+            .json(&body)
+            .send()
+            .await?;
+
+        if resp.status().is_success() {
+            *self.last_draft_edit.lock() = Some(std::time::Instant::now());
+        } else {
+            let status = resp.status();
+            let err = resp.text().await.unwrap_or_default();
+            tracing::debug!("Telegram editMessageText failed ({status}): {err}");
+        }
+
+        Ok(())
+    }
+
+    async fn finalize_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let (chat_id, thread_id) = Self::parse_reply_target(recipient);
+
+        // If text exceeds limit, delete draft and send as chunked messages
+        if text.len() > TELEGRAM_MAX_MESSAGE_LENGTH {
+            // Delete the draft
+            let _ = self
+                .client
+                .post(self.api_url("deleteMessage"))
+                .json(&serde_json::json!({
+                    "chat_id": chat_id,
+                    "message_id": message_id.parse::<i64>().unwrap_or(0),
+                }))
+                .send()
+                .await;
+
+            // Fall back to chunked send
+            return self
+                .send_text_chunks(text, &chat_id, thread_id.as_deref())
+                .await;
+        }
+
+        // Try editing with Markdown formatting
+        let mut body = serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": message_id.parse::<i64>().unwrap_or(0),
+            "text": text,
+            "parse_mode": "Markdown",
+        });
+
+        let resp = self
+            .client
+            .post(self.api_url("editMessageText"))
+            .json(&body)
+            .send()
+            .await?;
+
+        if resp.status().is_success() {
+            return Ok(());
+        }
+
+        // Markdown failed — retry without parse_mode
+        body.as_object_mut().unwrap().remove("parse_mode");
+
+        let resp = self
+            .client
+            .post(self.api_url("editMessageText"))
+            .json(&body)
+            .send()
+            .await?;
+
+        if resp.status().is_success() {
+            return Ok(());
+        }
+
+        // Edit failed entirely — fall back to new message
+        tracing::warn!("Telegram finalize_draft edit failed; falling back to sendMessage");
+        self.send_text_chunks(text, &chat_id, thread_id.as_deref())
+            .await
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {

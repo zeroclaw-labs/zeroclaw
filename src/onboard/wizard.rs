@@ -1,4 +1,4 @@
-use crate::config::schema::{DingTalkConfig, IrcConfig, QQConfig, WhatsAppConfig};
+use crate::config::schema::{DingTalkConfig, IrcConfig, QQConfig, StreamMode, WhatsAppConfig};
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
     HeartbeatConfig, IMessageConfig, MatrixConfig, MemoryConfig, ObservabilityConfig,
@@ -2665,6 +2665,8 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 config.telegram = Some(TelegramConfig {
                     bot_token: token,
                     allowed_users,
+                    stream_mode: StreamMode::default(),
+                    draft_update_interval_ms: 1000,
                 });
             }
             1 => {
