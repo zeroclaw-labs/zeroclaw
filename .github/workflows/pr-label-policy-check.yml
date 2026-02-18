@@ -1,4 +1,4 @@
-name: Label Policy Sanity
+name: PR Label Policy Check
 
 on:
     pull_request:

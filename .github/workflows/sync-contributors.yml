@@ -1,4 +1,4 @@
-name: Update Contributors NOTICE
+name: Sync Contributors
 
 on:
   workflow_dispatch:

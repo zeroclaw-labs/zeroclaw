@@ -1,4 +1,4 @@
-name: PR Hygiene
+name: PR Check Status
 
 on:
   schedule:

@@ -1,4 +1,4 @@
-name: Stale PR Check
+name: PR Check Stale
 
 on:
     schedule:

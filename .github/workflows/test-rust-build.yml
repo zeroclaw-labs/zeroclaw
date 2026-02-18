@@ -1,4 +1,4 @@
-name: Rust Reusable Job
+name: Test Rust Build
 
 on:
   workflow_call:

@@ -1,4 +1,4 @@
-name: Integration / E2E Tests
+name: Test E2E
 
 on:
     push:

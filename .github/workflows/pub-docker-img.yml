@@ -1,4 +1,4 @@
-name: Docker
+name: Pub Docker Img
 
 on:
     push:
