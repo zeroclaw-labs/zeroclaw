@@ -6,8 +6,8 @@ on:
       - main
     paths:
       - "docs/**"
-      - "book.toml"
-      - "README.md"
+      - "book_zh.toml"
+      - "README_zh-CN.md"
       - ".github/workflows/deploy-docs.yml"
 
 jobs:
@@ -26,24 +26,15 @@ jobs:
 
       - name: Preparing Source
         run: |
-          # Copy root READMEs to docs folder so mdBook can include them
-          cp README.md docs/README.md
+          # 将根目录中文 README 复制到 docs 文件夹供 mdBook 使用
           cp README_zh-CN.md docs/README_zh-CN.md
-
-      - name: Build Book (English)
-        run: mdbook build -d book/en
 
       - name: Build Book (Chinese)
         run: |
-          # Swap SUMMARY for Chinese build
+          # 使用中文 SUMMARY
           cp docs/SUMMARY_zh.md docs/SUMMARY.md
-          # Build using Chinese config
-          mdbook build -d book/zh -c book_zh.toml
-
-      - name: Finalize Deployment Structure
-        run: |
-          # Add root redirect
-          cp docs/index.html book/index.html
+          # 使用中文配置构建
+          mdbook build -d book -c book_zh.toml
 
       - name: Deploy
         uses: peaceiris/actions-gh-pages@v4
