@@ -1,17 +1,40 @@
-# ZeroClaw Channels Reference
+# Channels Reference
 
-This reference maps channel capabilities, config blocks, allowlist behavior, and setup paths.
+This document is the canonical reference for channel configuration in ZeroClaw.
 
-Last verified: **February 18, 2026**.
+For encrypted Matrix rooms, also read the dedicated runbook:
+- [Matrix E2EE Guide](./matrix-e2ee-guide.md)
 
-## Quick Commands
+## Quick Paths
 
-```bash
-zeroclaw channel list
-zeroclaw channel start
-zeroclaw channel doctor
-zeroclaw channel bind-telegram <IDENTITY>
+- Need a full config reference by channel: jump to [Per-Channel Config Examples](#4-per-channel-config-examples).
+- Need a no-response diagnosis flow: jump to [Troubleshooting Checklist](#6-troubleshooting-checklist).
+- Need Matrix encrypted-room help: use [Matrix E2EE Guide](./matrix-e2ee-guide.md).
+- Need deployment/network assumptions (polling vs webhook): use [Network Deployment](./network-deployment.md).
+
+## FAQ: Matrix setup passes but no reply
+
+This is the most common symptom (same class as issue #499). Check these in order:
+
+1. **Allowlist mismatch**: `allowed_users` does not include the sender (or is empty).
+2. **Wrong room target**: bot is not joined to the configured `room_id` / alias target room.
+3. **Token/account mismatch**: token is valid but belongs to another Matrix account.
+4. **E2EE device identity gap**: `whoami` does not return `device_id` and config does not provide one.
+5. **Key sharing/trust gap**: room keys were not shared to the bot device, so encrypted events cannot be decrypted.
+6. **Stale runtime state**: config changed but `zeroclaw daemon` was not restarted.
+
+---
+
+## 1. Configuration Namespace
+
+All channel settings live under `channels_config` in `~/.zeroclaw/config.toml`.
+
+```toml
+[channels_config]
+cli = true
 ```
+
+Each channel is enabled by creating its sub-table (for example, `[channels_config.telegram]`).
 
 ## In-Chat Runtime Model Switching (Telegram / Discord)
 
@@ -30,91 +53,287 @@ Notes:
 
 ## Channel Matrix
 
-| Channel | Config section | Access control field | Setup path |
-|---|---|---|---|
-| `CLI` | n/a (always enabled) | n/a | Built-in |
-| `Telegram` | `[channels_config.telegram]` | `allowed_users` | `zeroclaw onboard` |
-| `Discord` | `[channels_config.discord]` | `allowed_users` | `zeroclaw onboard` |
-| `Slack` | `[channels_config.slack]` | `allowed_users` | `zeroclaw onboard` |
-| `Mattermost` | `[channels_config.mattermost]` | `allowed_users` | Manual config |
-| `Webhook` | `[channels_config.webhook]` | n/a (`secret` optional) | `zeroclaw onboard` or manual |
-| `iMessage` | `[channels_config.imessage]` | `allowed_contacts` | `zeroclaw onboard` (macOS) |
-| `Matrix` | `[channels_config.matrix]` | `allowed_users` | `zeroclaw onboard` |
-| `Signal` | `[channels_config.signal]` | `allowed_from` | Manual config |
-| `WhatsApp` | `[channels_config.whatsapp]` | `allowed_numbers` | `zeroclaw onboard` |
-| `Email` | `[channels_config.email]` | `allowed_senders` | Manual config |
-| `IRC` | `[channels_config.irc]` | `allowed_users` | `zeroclaw onboard` |
-| `Lark` | `[channels_config.lark]` | `allowed_users` | Manual config |
-| `DingTalk` | `[channels_config.dingtalk]` | `allowed_users` | `zeroclaw onboard` |
-| `QQ` | `[channels_config.qq]` | `allowed_users` | `zeroclaw onboard` |
+---
 
-## Deny-by-Default Rules
+## 2. Delivery Modes at a Glance
 
-For channel allowlists, the runtime behavior is intentionally strict:
+| Channel | Receive mode | Public inbound port required? |
+|---|---|---|
+| CLI | local stdin/stdout | No |
+| Telegram | polling | No |
+| Discord | gateway/websocket | No |
+| Slack | events API | No (token-based channel flow) |
+| Mattermost | polling | No |
+| Matrix | sync API (supports E2EE) | No |
+| Signal | signal-cli HTTP bridge | No (local bridge endpoint) |
+| WhatsApp | webhook | Yes (public HTTPS callback) |
+| Webhook | gateway endpoint (`/webhook`) | Usually yes |
+| Email | IMAP polling + SMTP send | No |
+| IRC | IRC socket | No |
+| Lark/Feishu | websocket (default) or webhook | Webhook mode only |
+| DingTalk | stream mode | No |
+| QQ | bot gateway | No |
+| iMessage | local integration | No |
 
-- Empty allowlist (`[]`) means **deny all**.
-- Wildcard (`["*"]`) means **allow all**.
-- Explicit IDs are exact matches unless channel-specific docs state otherwise.
+---
 
-### Telegram pairing bootstrap
+## 3. Allowlist Semantics
 
-Telegram has a secure bootstrap flow:
+For channels with inbound sender allowlists:
 
-- Keep `allowed_users = []` to start in pairing mode.
-- Run `zeroclaw channel bind-telegram <IDENTITY>` to add one identity safely.
-- After binding, restart long-running channel processes if needed (`daemon` / `channel start`).
+- Empty allowlist: deny all inbound messages.
+- `"*"`: allow all inbound senders (use for temporary verification only).
+- Explicit list: allow only listed senders.
 
-## Minimal Config Examples
+Field names differ by channel:
 
-### Telegram
+- `allowed_users` (Telegram/Discord/Slack/Mattermost/Matrix/IRC/Lark/DingTalk/QQ)
+- `allowed_from` (Signal)
+- `allowed_numbers` (WhatsApp)
+- `allowed_senders` (Email)
+- `allowed_contacts` (iMessage)
+
+---
+
+## 4. Per-Channel Config Examples
+
+### 4.1 Telegram
 
 ```toml
 [channels_config.telegram]
-bot_token = "123456:ABCDEF"
-allowed_users = []
+bot_token = "123456:telegram-token"
+allowed_users = ["*"]
 ```
 
-### WhatsApp
+### 4.2 Discord
 
 ```toml
-[channels_config.whatsapp]
-access_token = "EAABx..."
-phone_number_id = "123456789012345"
-verify_token = "your-verify-token"
-allowed_numbers = ["+1234567890"]
+[channels_config.discord]
+bot_token = "discord-bot-token"
+guild_id = "123456789012345678"   # optional
+allowed_users = ["*"]
+listen_to_bots = false
+mention_only = false
 ```
 
-### Signal
+### 4.3 Slack
+
+```toml
+[channels_config.slack]
+bot_token = "xoxb-..."
+app_token = "xapp-..."             # optional
+channel_id = "C1234567890"         # optional
+allowed_users = ["*"]
+```
+
+### 4.4 Mattermost
+
+```toml
+[channels_config.mattermost]
+url = "https://mm.example.com"
+bot_token = "mattermost-token"
+channel_id = "channel-id"          # required for listening
+allowed_users = ["*"]
+```
+
+### 4.5 Matrix
+
+```toml
+[channels_config.matrix]
+homeserver = "https://matrix.example.com"
+access_token = "syt_..."
+user_id = "@zeroclaw:matrix.example.com"   # optional, recommended for E2EE
+device_id = "DEVICEID123"                  # optional, recommended for E2EE
+room_id = "!room:matrix.example.com"       # or room alias (#ops:matrix.example.com)
+allowed_users = ["*"]
+```
+
+See [Matrix E2EE Guide](./matrix-e2ee-guide.md) for encrypted-room troubleshooting.
+
+### 4.6 Signal
 
 ```toml
 [channels_config.signal]
 http_url = "http://127.0.0.1:8686"
 account = "+1234567890"
-allowed_from = ["+1987654321"]
-ignore_attachments = true
+group_id = "dm"                    # optional: "dm" / group id / omitted
+allowed_from = ["*"]
+ignore_attachments = false
 ignore_stories = true
 ```
 
-### Lark
+### 4.7 WhatsApp
+
+```toml
+[channels_config.whatsapp]
+access_token = "EAAB..."
+phone_number_id = "123456789012345"
+verify_token = "your-verify-token"
+app_secret = "your-app-secret"     # optional but recommended
+allowed_numbers = ["*"]
+```
+
+### 4.8 Webhook Channel Config (Gateway)
+
+`channels_config.webhook` enables webhook-specific gateway behavior.
+
+```toml
+[channels_config.webhook]
+port = 8080
+secret = "optional-shared-secret"
+```
+
+Run with gateway/daemon and verify `/health`.
+
+### 4.9 Email
+
+```toml
+[channels_config.email]
+imap_host = "imap.example.com"
+imap_port = 993
+imap_folder = "INBOX"
+smtp_host = "smtp.example.com"
+smtp_port = 465
+smtp_tls = true
+username = "bot@example.com"
+password = "email-password"
+from_address = "bot@example.com"
+poll_interval_secs = 60
+allowed_senders = ["*"]
+```
+
+### 4.10 IRC
+
+```toml
+[channels_config.irc]
+server = "irc.libera.chat"
+port = 6697
+nickname = "zeroclaw-bot"
+username = "zeroclaw"              # optional
+channels = ["#zeroclaw"]
+allowed_users = ["*"]
+server_password = ""                # optional
+nickserv_password = ""              # optional
+sasl_password = ""                  # optional
+verify_tls = true
+```
+
+### 4.11 Lark / Feishu
 
 ```toml
 [channels_config.lark]
 app_id = "cli_xxx"
 app_secret = "xxx"
-allowed_users = ["ou_abc"]
-receive_mode = "websocket"   # or "webhook"
-# port = 3100                  # required only when receive_mode = "webhook"
+encrypt_key = ""                    # optional
+verification_token = ""             # optional
+allowed_users = ["*"]
+use_feishu = false
+receive_mode = "websocket"          # or "webhook"
+port = 8081                          # required for webhook mode
 ```
 
-## Operational Notes
+### 4.12 DingTalk
 
-- `zeroclaw channel add/remove` is intentionally not a full config mutator yet; use `zeroclaw onboard` or edit `~/.zeroclaw/config.toml`.
-- `zeroclaw channel doctor` validates configured channel health and prints timeout/unhealthy status.
-- If `webhook` is configured, doctor guidance points to gateway health check (`GET /health`).
+```toml
+[channels_config.dingtalk]
+client_id = "ding-app-key"
+client_secret = "ding-app-secret"
+allowed_users = ["*"]
+```
 
-## Related Docs
+### 4.13 QQ
 
-- [README.md (Channel allowlists)](../README.md#channel-allowlists-deny-by-default)
-- [network-deployment.md](network-deployment.md)
-- [mattermost-setup.md](mattermost-setup.md)
-- [commands-reference.md](commands-reference.md)
+```toml
+[channels_config.qq]
+app_id = "qq-app-id"
+app_secret = "qq-app-secret"
+allowed_users = ["*"]
+```
+
+### 4.14 iMessage
+
+```toml
+[channels_config.imessage]
+allowed_contacts = ["*"]
+```
+
+---
+
+## 5. Validation Workflow
+
+1. Configure one channel with permissive allowlist (`"*"`) for initial verification.
+2. Run:
+
+```bash
+zeroclaw onboard --channels-only
+zeroclaw daemon
+```
+
+3. Send a message from an expected sender.
+4. Confirm a reply arrives.
+5. Tighten allowlist from `"*"` to explicit IDs.
+
+---
+
+## 6. Troubleshooting Checklist
+
+If a channel appears connected but does not respond:
+
+1. Confirm the sender identity is allowed by the correct allowlist field.
+2. Confirm bot account membership/permissions in target room/channel.
+3. Confirm tokens/secrets are valid (and not expired/revoked).
+4. Confirm transport mode assumptions:
+   - polling/websocket channels do not need public inbound HTTP
+   - webhook channels do need reachable HTTPS callback
+5. Restart `zeroclaw daemon` after config changes.
+
+For Matrix encrypted rooms specifically, use:
+- [Matrix E2EE Guide](./matrix-e2ee-guide.md)
+
+---
+
+## 7. Operations Appendix: Log Keywords Matrix
+
+Use this appendix for fast triage. Match log keywords first, then follow the troubleshooting steps above.
+
+### 7.1 Recommended capture command
+
+```bash
+RUST_LOG=info zeroclaw daemon 2>&1 | tee /tmp/zeroclaw.log
+```
+
+Then filter channel/gateway events:
+
+```bash
+rg -n "Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|DingTalk|QQ|iMessage|Webhook|Channel" /tmp/zeroclaw.log
+```
+
+### 7.2 Keyword table
+
+| Component | Startup / healthy signal | Authorization / policy signal | Transport / failure signal |
+|---|---|---|---|
+| Telegram | `Telegram channel listening for messages...` | `Telegram: ignoring message from unauthorized user:` | `Telegram poll error:` / `Telegram parse error:` / `Telegram polling conflict (409):` |
+| Discord | `Discord: connected and identified` | `Discord: ignoring message from unauthorized user:` | `Discord: received Reconnect (op 7)` / `Discord: received Invalid Session (op 9)` |
+| Slack | `Slack channel listening on #` | `Slack: ignoring message from unauthorized user:` | `Slack poll error:` / `Slack parse error:` |
+| Mattermost | `Mattermost channel listening on` | `Mattermost: ignoring message from unauthorized user:` | `Mattermost poll error:` / `Mattermost parse error:` |
+| Matrix | `Matrix channel listening on room` / `Matrix room ... is encrypted; E2EE decryption is enabled via matrix-sdk.` | `Matrix whoami failed; falling back to configured session hints for E2EE session restore:` / `Matrix whoami failed while resolving listener user_id; using configured user_id hint:` | `Matrix sync error: ... retrying...` |
+| Signal | `Signal channel listening via SSE on` | (allowlist checks are enforced by `allowed_from`) | `Signal SSE returned ...` / `Signal SSE connect error:` |
+| WhatsApp (channel) | `WhatsApp channel active (webhook mode).` | `WhatsApp: ignoring message from unauthorized number:` | `WhatsApp send failed:` |
+| Webhook / WhatsApp (gateway) | `WhatsApp webhook verified successfully` | `Webhook: rejected — not paired / invalid bearer token` / `Webhook: rejected request — invalid or missing X-Webhook-Secret` / `WhatsApp webhook verification failed — token mismatch` | `Webhook JSON parse error:` |
+| Email | `Email polling every ...` / `Email sent to ...` | `Blocked email from ...` | `Email poll failed:` / `Email poll task panicked:` |
+| IRC | `IRC channel connecting to ...` / `IRC registered as ...` | (allowlist checks are enforced by `allowed_users`) | `IRC SASL authentication failed (...)` / `IRC server does not support SASL...` / `IRC nickname ... is in use, trying ...` |
+| Lark / Feishu | `Lark: WS connected` / `Lark event callback server listening on` | `Lark WS: ignoring ... (not in allowed_users)` / `Lark: ignoring message from unauthorized user:` | `Lark: ping failed, reconnecting` / `Lark: heartbeat timeout, reconnecting` / `Lark: WS read error:` |
+| DingTalk | `DingTalk: connected and listening for messages...` | `DingTalk: ignoring message from unauthorized user:` | `DingTalk WebSocket error:` / `DingTalk: message channel closed` |
+| QQ | `QQ: connected and identified` | `QQ: ignoring C2C message from unauthorized user:` / `QQ: ignoring group message from unauthorized user:` | `QQ: received Reconnect (op 7)` / `QQ: received Invalid Session (op 9)` / `QQ: message channel closed` |
+| iMessage | `iMessage channel listening (AppleScript bridge)...` | (contact allowlist enforced by `allowed_contacts`) | `iMessage poll error:` |
+
+### 7.3 Runtime supervisor keywords
+
+If a specific channel task crashes or exits, the channel supervisor in `channels/mod.rs` emits:
+
+- `Channel <name> exited unexpectedly; restarting`
+- `Channel <name> error: ...; restarting`
+- `Channel message worker crashed:`
+
+These messages indicate automatic restart behavior is active, and you should inspect preceding logs for root cause.
+

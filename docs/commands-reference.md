@@ -71,6 +71,8 @@ Last verified: **February 18, 2026**.
 - `zeroclaw models refresh --provider <ID>`
 - `zeroclaw models refresh --force`
 
+`models refresh` currently supports live catalog refresh for provider IDs: `openrouter`, `openai`, `anthropic`, `groq`, `mistral`, `deepseek`, `xai`, `together-ai`, `gemini`, `ollama`, `astrai`, `venice`, `fireworks`, `cohere`, `moonshot`, `glm`, `zai`, `qwen`, and `nvidia`.
+
 ### `channel`
 
 - `zeroclaw channel list`

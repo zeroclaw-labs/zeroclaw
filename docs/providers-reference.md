@@ -59,6 +59,20 @@ Runtime resolution order is:
 - Default onboarding model: `kimi-for-coding` (alternative: `kimi-k2.5`)
 - Runtime auto-adds `User-Agent: KimiCLI/0.77` for compatibility.
 
+### NVIDIA NIM Notes
+
+- Canonical provider ID: `nvidia`
+- Aliases: `nvidia-nim`, `build.nvidia.com`
+- Base API URL: `https://integrate.api.nvidia.com/v1`
+- Model discovery: `zeroclaw models refresh --provider nvidia`
+
+Recommended starter model IDs (verified against NVIDIA API catalog on February 18, 2026):
+
+- `meta/llama-3.3-70b-instruct`
+- `deepseek-ai/deepseek-v3.2`
+- `nvidia/llama-3.3-nemotron-super-49b-v1.5`
+- `nvidia/llama-3.1-nemotron-ultra-253b-v1`
+
 ## Custom Endpoints
 
 - OpenAI-compatible endpoint:

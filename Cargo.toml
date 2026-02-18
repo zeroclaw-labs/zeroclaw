@@ -25,6 +25,9 @@ tokio-util = { version = "0.7", default-features = false }
 # HTTP client - minimal features
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "multipart", "stream", "socks"] }
 
+# Matrix client + E2EE decryption
+matrix-sdk = { version = "0.16", default-features = false, features = ["e2e-encryption", "rustls-tls"] }
+
 # Serialization
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
@@ -81,7 +84,7 @@ ring = "0.17"
 prost = { version = "0.14", default-features = false }
 
 # Memory / persistence
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
 postgres = { version = "0.19", features = ["with-chrono-0_4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 chrono-tz = "0.10"

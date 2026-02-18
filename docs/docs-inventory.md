@@ -46,6 +46,9 @@ Last reviewed: **February 18, 2026**.
 | `docs/providers-reference.md` | Current Reference | users/operators |
 | `docs/channels-reference.md` | Current Reference | users/operators |
 | `docs/config-reference.md` | Current Reference | operators |
+| `docs/custom-providers.md` | Current Integration Guide | integration developers |
+| `docs/zai-glm-setup.md` | Current Provider Setup Guide | users/operators |
+| `docs/langgraph-integration.md` | Current Integration Guide | integration developers |
 | `docs/operations-runbook.md` | Current Guide | operators |
 | `docs/troubleshooting.md` | Current Guide | users/operators |
 | `docs/network-deployment.md` | Current Guide | operators |
@@ -54,7 +57,9 @@ Last reviewed: **February 18, 2026**.
 | `docs/arduino-uno-q-setup.md` | Current Guide | hardware builders |
 | `docs/nucleo-setup.md` | Current Guide | hardware builders |
 | `docs/hardware-peripherals-design.md` | Current Design Spec | hardware contributors |
-| `docs/langgraph-integration.md` | Current Integration Guide | integration developers |
+| `docs/datasheets/nucleo-f401re.md` | Current Hardware Reference | hardware builders |
+| `docs/datasheets/arduino-uno.md` | Current Hardware Reference | hardware builders |
+| `docs/datasheets/esp32.md` | Current Hardware Reference | hardware builders |
 
 ## Policy / Process Docs
 

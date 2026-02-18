@@ -67,6 +67,52 @@ fn is_rate_limited(err: &anyhow::Error) -> bool {
         && (msg.contains("Too Many") || msg.contains("rate") || msg.contains("limit"))
 }
 
+/// Check if a 429 is a business/quota-plan error that retries cannot fix.
+///
+/// Examples:
+/// - plan does not include requested model
+/// - insufficient balance / package not active
+/// - known provider business codes (e.g. Z.AI: 1311, 1113)
+fn is_non_retryable_rate_limit(err: &anyhow::Error) -> bool {
+    if !is_rate_limited(err) {
+        return false;
+    }
+
+    let msg = err.to_string();
+    let lower = msg.to_lowercase();
+
+    let business_hints = [
+        "plan does not include",
+        "doesn't include",
+        "not include",
+        "insufficient balance",
+        "insufficient_balance",
+        "insufficient quota",
+        "insufficient_quota",
+        "quota exhausted",
+        "out of credits",
+        "no available package",
+        "package not active",
+        "purchase package",
+        "model not available for your plan",
+    ];
+
+    if business_hints.iter().any(|hint| lower.contains(hint)) {
+        return true;
+    }
+
+    // Known provider business codes observed for 429 where retry is futile.
+    for token in lower.split(|c: char| !c.is_ascii_digit()) {
+        if let Ok(code) = token.parse::<u16>() {
+            if matches!(code, 1113 | 1311) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 /// Try to extract a Retry-After value (in milliseconds) from an error message.
 /// Looks for patterns like `Retry-After: 5` or `retry_after: 2.5` in the error string.
 fn parse_retry_after_ms(err: &anyhow::Error) -> Option<u64> {
@@ -101,7 +147,9 @@ fn parse_retry_after_ms(err: &anyhow::Error) -> Option<u64> {
 }
 
 fn failure_reason(rate_limited: bool, non_retryable: bool) -> &'static str {
-    if rate_limited {
+    if rate_limited && non_retryable {
+        "rate_limited_non_retryable"
+    } else if rate_limited {
         "rate_limited"
     } else if non_retryable {
         "non_retryable"
@@ -244,7 +292,8 @@ impl Provider for ReliableProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
-                            let non_retryable = is_non_retryable(&e);
+                            let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
+                            let non_retryable = is_non_retryable(&e) || non_retryable_rate_limit;
                             let rate_limited = is_rate_limited(&e);
                             let failure_reason = failure_reason(rate_limited, non_retryable);
                             let error_detail = compact_error_detail(&e);
@@ -260,7 +309,7 @@ impl Provider for ReliableProvider {
                             );
 
                             // On rate-limit, try rotating API key
-                            if rate_limited {
+                            if rate_limited && !non_retryable_rate_limit {
                                 if let Some(new_key) = self.rotate_key() {
                                     tracing::info!(
                                         provider = provider_name,
@@ -352,7 +401,8 @@ impl Provider for ReliableProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
-                            let non_retryable = is_non_retryable(&e);
+                            let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
+                            let non_retryable = is_non_retryable(&e) || non_retryable_rate_limit;
                             let rate_limited = is_rate_limited(&e);
                             let failure_reason = failure_reason(rate_limited, non_retryable);
                             let error_detail = compact_error_detail(&e);
@@ -367,7 +417,7 @@ impl Provider for ReliableProvider {
                                 &error_detail,
                             );
 
-                            if rate_limited {
+                            if rate_limited && !non_retryable_rate_limit {
                                 if let Some(new_key) = self.rotate_key() {
                                     tracing::info!(
                                         provider = provider_name,
@@ -459,7 +509,8 @@ impl Provider for ReliableProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
-                            let non_retryable = is_non_retryable(&e);
+                            let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
+                            let non_retryable = is_non_retryable(&e) || non_retryable_rate_limit;
                             let rate_limited = is_rate_limited(&e);
                             let failure_reason = failure_reason(rate_limited, non_retryable);
                             let error_detail = compact_error_detail(&e);
@@ -474,7 +525,7 @@ impl Provider for ReliableProvider {
                                 &error_detail,
                             );
 
-                            if rate_limited {
+                            if rate_limited && !non_retryable_rate_limit {
                                 if let Some(new_key) = self.rotate_key() {
                                     tracing::info!(
                                         provider = provider_name,
@@ -1107,6 +1158,39 @@ mod tests {
     }
 
     #[test]
+    fn non_retryable_rate_limit_detects_plan_restricted_model() {
+        let err = anyhow::anyhow!(
+            "{}",
+            "API error (429 Too Many Requests): {\"code\":1311,\"message\":\"the current account plan does not include glm-5\"}"
+        );
+        assert!(
+            is_non_retryable_rate_limit(&err),
+            "plan-restricted 429 should skip retries"
+        );
+    }
+
+    #[test]
+    fn non_retryable_rate_limit_detects_insufficient_balance() {
+        let err = anyhow::anyhow!(
+            "{}",
+            "API error (429 Too Many Requests): {\"code\":1113,\"message\":\"insufficient balance\"}"
+        );
+        assert!(
+            is_non_retryable_rate_limit(&err),
+            "insufficient-balance 429 should skip retries"
+        );
+    }
+
+    #[test]
+    fn non_retryable_rate_limit_does_not_flag_generic_429() {
+        let err = anyhow::anyhow!("429 Too Many Requests: rate limit exceeded");
+        assert!(
+            !is_non_retryable_rate_limit(&err),
+            "generic rate-limit 429 should remain retryable"
+        );
+    }
+
+    #[test]
     fn compute_backoff_uses_retry_after() {
         let provider = ReliableProvider::new(vec![], 0, 500);
         let err = anyhow::anyhow!("429 Retry-After: 3");
@@ -1258,6 +1342,35 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "must not retry on 401 — should be exactly 1 call"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_retryable_rate_limit_skips_retries_for_plan_errors() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![(
+                "primary".into(),
+                Box::new(MockProvider {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: usize::MAX,
+                    response: "never",
+                    error: "API error (429 Too Many Requests): {\"code\":1311,\"message\":\"plan does not include glm-5\"}",
+                }),
+            )],
+            5,
+            1,
+        );
+
+        let result = provider.simple_chat("hello", "test", 0.0).await;
+        assert!(
+            result.is_err(),
+            "plan-restricted 429 should fail quickly without retrying"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "must not retry non-retryable 429 business errors"
         );
     }
 

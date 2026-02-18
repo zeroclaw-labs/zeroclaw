@@ -41,8 +41,8 @@ default_temperature = 0.7
 |-------|-------------|
 | `glm-5` | Default in onboarding; strongest reasoning |
 | `glm-4.7` | Strong general-purpose quality |
-| `glm-4-plus` | Stable baseline |
-| `glm-4-flash` | Lower-latency option |
+| `glm-4.6` | Balanced baseline |
+| `glm-4.5-air` | Lower-latency option |
 
 Model availability can vary by account/region, so use the `/models` API when in doubt.
 
@@ -106,7 +106,7 @@ The key format is `id.secret` (for example: `abc123.xyz789`).
 **Solution:**
 - Wait and retry
 - Check your Z.AI plan limits
-- Try `glm-4-flash` for lower latency and higher quota tolerance
+- Try `glm-4.5-air` for lower latency and higher quota tolerance
 
 ### Authentication Errors
 

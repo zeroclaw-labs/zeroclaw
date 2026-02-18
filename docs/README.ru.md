@@ -14,6 +14,9 @@
 | Установить одной командой | [one-click-bootstrap.md](one-click-bootstrap.md) |
 | Найти команды по задаче | [commands-reference.md](commands-reference.md) |
 | Проверить ключи конфигурации и дефолты | [config-reference.md](config-reference.md) |
+| Подключить кастомный provider / endpoint | [custom-providers.md](custom-providers.md) |
+| Настроить provider Z.AI / GLM | [zai-glm-setup.md](zai-glm-setup.md) |
+| Использовать интеграцию LangGraph | [langgraph-integration.md](langgraph-integration.md) |
 | Операционный runbook (day-2) | [operations-runbook.md](operations-runbook.md) |
 | Быстро устранить типовые проблемы | [troubleshooting.md](troubleshooting.md) |
 | Открыть общий TOC docs | [SUMMARY.md](SUMMARY.md) |
@@ -48,6 +51,9 @@
 - [providers-reference.md](providers-reference.md)
 - [channels-reference.md](channels-reference.md)
 - [config-reference.md](config-reference.md)
+- [custom-providers.md](custom-providers.md)
+- [zai-glm-setup.md](zai-glm-setup.md)
+- [langgraph-integration.md](langgraph-integration.md)
 - [operations-runbook.md](operations-runbook.md)
 - [troubleshooting.md](troubleshooting.md)
 
@@ -65,6 +71,7 @@
 
 - [security/README.md](security/README.md)
 - [agnostic-security.md](agnostic-security.md)
+- [frictionless-security.md](frictionless-security.md)
 - [sandboxing.md](sandboxing.md)
 - [resource-limits.md](resource-limits.md)
 - [audit-logging.md](audit-logging.md)
