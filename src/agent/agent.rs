@@ -544,8 +544,8 @@ pub async fn run(
         .to_string();
 
     agent.observer.record_event(&ObserverEvent::AgentStart {
-        provider: provider_name,
-        model: model_name,
+        provider: provider_name.clone(),
+        model: model_name.clone(),
     });
 
     if let Some(msg) = message {
@@ -556,6 +556,8 @@ pub async fn run(
     }
 
     agent.observer.record_event(&ObserverEvent::AgentEnd {
+        provider: provider_name,
+        model: model_name,
         duration: start.elapsed(),
         tokens_used: None,
         cost_usd: None,

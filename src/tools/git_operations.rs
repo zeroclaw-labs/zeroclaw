@@ -53,7 +53,7 @@ impl GitOperationsTool {
     fn requires_write_access(&self, operation: &str) -> bool {
         matches!(
             operation,
-            "commit" | "add" | "checkout" | "branch" | "stash" | "reset" | "revert"
+            "commit" | "add" | "checkout" | "stash" | "reset" | "revert"
         )
     }
 
@@ -667,6 +667,16 @@ mod tests {
     }
 
     #[test]
+    fn branch_is_not_write_gated() {
+        let tmp = TempDir::new().unwrap();
+        let tool = test_tool(tmp.path());
+
+        // Branch listing is read-only; it must not require write access
+        assert!(!tool.requires_write_access("branch"));
+        assert!(tool.is_read_only("branch"));
+    }
+
+    #[test]
     fn is_read_only_detection() {
         let tmp = TempDir::new().unwrap();
         let tool = test_tool(tmp.path());
@@ -674,6 +684,7 @@ mod tests {
         assert!(tool.is_read_only("status"));
         assert!(tool.is_read_only("diff"));
         assert!(tool.is_read_only("log"));
+        assert!(tool.is_read_only("branch"));
 
         assert!(!tool.is_read_only("commit"));
         assert!(!tool.is_read_only("add"));
@@ -706,6 +717,34 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("higher autonomy"));
+    }
+
+    #[tokio::test]
+    async fn allows_branch_listing_in_readonly_mode() {
+        let tmp = TempDir::new().unwrap();
+        // Initialize a git repository so the command can succeed
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            ..SecurityPolicy::default()
+        });
+        let tool = GitOperationsTool::new(security, tmp.path().to_path_buf());
+
+        let result = tool
+            .execute(json!({"operation": "branch"}))
+            .await
+            .unwrap();
+        // Branch listing must not be blocked by read-only autonomy
+        let error_msg = result.error.as_deref().unwrap_or("");
+        assert!(
+            !error_msg.contains("read-only") && !error_msg.contains("higher autonomy"),
+            "branch listing should not be blocked in read-only mode, got: {error_msg}"
+        );
     }
 
     #[tokio::test]

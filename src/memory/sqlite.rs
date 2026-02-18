@@ -1,13 +1,20 @@
 use super::embeddings::EmbeddingProvider;
 use super::traits::{Memory, MemoryCategory, MemoryEntry};
 use super::vector;
+use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Local;
 use parking_lot::Mutex;
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 use uuid::Uuid;
+
+/// Maximum allowed open timeout (seconds) to avoid unreasonable waits.
+const SQLITE_OPEN_TIMEOUT_CAP_SECS: u64 = 300;
 
 /// SQLite-backed persistent memory — the brain
 ///
@@ -34,15 +41,22 @@ impl SqliteMemory {
             0.7,
             0.3,
             10_000,
+            None,
         )
     }
 
+    /// Build SQLite memory with optional open timeout.
+    ///
+    /// If `open_timeout_secs` is `Some(n)`, opening the database is limited to `n` seconds
+    /// (capped at 300). Useful when the DB file may be locked or on slow storage.
+    /// `None` = wait indefinitely (default).
     pub fn with_embedder(
         workspace_dir: &Path,
         embedder: Arc<dyn EmbeddingProvider>,
         vector_weight: f32,
         keyword_weight: f32,
         cache_max: usize,
+        open_timeout_secs: Option<u64>,
     ) -> anyhow::Result<Self> {
         let db_path = workspace_dir.join("memory").join("brain.db");
 
@@ -50,7 +64,7 @@ impl SqliteMemory {
             std::fs::create_dir_all(parent)?;
         }
 
-        let conn = Connection::open(&db_path)?;
+        let conn = Self::open_connection(&db_path, open_timeout_secs)?;
 
         // ── Production-grade PRAGMA tuning ──────────────────────
         // WAL mode: concurrent reads during writes, crash-safe
@@ -76,6 +90,37 @@ impl SqliteMemory {
             keyword_weight,
             cache_max,
         })
+    }
+
+    /// Open SQLite connection, optionally with a timeout (for locked/slow storage).
+    fn open_connection(
+        db_path: &Path,
+        open_timeout_secs: Option<u64>,
+    ) -> anyhow::Result<Connection> {
+        let path_buf = db_path.to_path_buf();
+
+        let conn = if let Some(secs) = open_timeout_secs {
+            let capped = secs.min(SQLITE_OPEN_TIMEOUT_CAP_SECS);
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let result = Connection::open(&path_buf);
+                let _ = tx.send(result);
+            });
+            match rx.recv_timeout(Duration::from_secs(capped)) {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => return Err(e).context("SQLite failed to open database"),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    anyhow::bail!("SQLite connection open timed out after {} seconds", capped);
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    anyhow::bail!("SQLite open thread exited unexpectedly");
+                }
+            }
+        } else {
+            Connection::open(&path_buf).context("SQLite failed to open database")?
+        };
+
+        Ok(conn)
     }
 
     /// Initialize all tables: memories, FTS5, `embedding_cache`
@@ -1054,13 +1099,51 @@ mod tests {
         assert_eq!(new, 1);
     }
 
+    // ── Open timeout tests ────────────────────────────────────────
+
+    #[test]
+    fn open_with_timeout_succeeds_when_fast() {
+        let tmp = TempDir::new().unwrap();
+        let embedder = Arc::new(super::super::embeddings::NoopEmbedding);
+        let mem = SqliteMemory::with_embedder(tmp.path(), embedder, 0.7, 0.3, 1000, Some(5));
+        assert!(
+            mem.is_ok(),
+            "open with 5s timeout should succeed on fast path"
+        );
+        assert_eq!(mem.unwrap().name(), "sqlite");
+    }
+
+    #[tokio::test]
+    async fn open_with_timeout_store_recall_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::with_embedder(
+            tmp.path(),
+            Arc::new(super::super::embeddings::NoopEmbedding),
+            0.7,
+            0.3,
+            1000,
+            Some(2),
+        )
+        .unwrap();
+        mem.store(
+            "timeout_key",
+            "value with timeout",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        let entry = mem.get("timeout_key").await.unwrap().unwrap();
+        assert_eq!(entry.content, "value with timeout");
+    }
+
     // ── With-embedder constructor test ───────────────────────────
 
     #[test]
     fn with_embedder_noop() {
         let tmp = TempDir::new().unwrap();
         let embedder = Arc::new(super::super::embeddings::NoopEmbedding);
-        let mem = SqliteMemory::with_embedder(tmp.path(), embedder, 0.7, 0.3, 1000);
+        let mem = SqliteMemory::with_embedder(tmp.path(), embedder, 0.7, 0.3, 1000, None);
         assert!(mem.is_ok());
         assert_eq!(mem.unwrap().name(), "sqlite");
     }

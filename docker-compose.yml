@@ -49,10 +49,11 @@ services:
           cpus: '0.5'
           memory: 512M
 
-    # Health check
+    # Health check — uses lightweight status instead of full diagnostics.
+    # For images with curl, prefer: curl -f http://localhost:3000/health
     healthcheck:
-      test: ["CMD", "zeroclaw", "doctor"]
-      interval: 30s
+      test: ["CMD", "zeroclaw", "status"]
+      interval: 60s
       timeout: 10s
       retries: 3
       start_period: 10s

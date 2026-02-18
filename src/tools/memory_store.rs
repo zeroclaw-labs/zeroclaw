@@ -22,7 +22,7 @@ impl Tool for MemoryStoreTool {
     }
 
     fn description(&self) -> &str {
-        "Store a fact, preference, or note in long-term memory. Use category 'core' for permanent facts, 'daily' for session notes, 'conversation' for chat context."
+        "Store a fact, preference, or note in long-term memory. Use category 'core' for permanent facts, 'daily' for session notes, 'conversation' for chat context, or a custom category name."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -39,8 +39,7 @@ impl Tool for MemoryStoreTool {
                 },
                 "category": {
                     "type": "string",
-                    "enum": ["core", "daily", "conversation"],
-                    "description": "Memory category: core (permanent), daily (session), conversation (chat)"
+                    "description": "Memory category: 'core' (permanent), 'daily' (session), 'conversation' (chat), or a custom category name. Defaults to 'core'."
                 }
             },
             "required": ["key", "content"]
@@ -59,9 +58,10 @@ impl Tool for MemoryStoreTool {
             .ok_or_else(|| anyhow::anyhow!("Missing 'content' parameter"))?;
 
         let category = match args.get("category").and_then(|v| v.as_str()) {
+            Some("core") | None => MemoryCategory::Core,
             Some("daily") => MemoryCategory::Daily,
             Some("conversation") => MemoryCategory::Conversation,
-            _ => MemoryCategory::Core,
+            Some(other) => MemoryCategory::Custom(other.to_string()),
         };
 
         match self.memory.store(key, content, category, None).await {
@@ -126,6 +126,23 @@ mod tests {
             .await
             .unwrap();
         assert!(result.success);
+    }
+
+    #[tokio::test]
+    async fn store_with_custom_category() {
+        let (_tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem.clone());
+        let result = tool
+            .execute(
+                json!({"key": "proj_note", "content": "Uses async runtime", "category": "project"}),
+            )
+            .await
+            .unwrap();
+        assert!(result.success);
+
+        let entry = mem.get("proj_note").await.unwrap().unwrap();
+        assert_eq!(entry.content, "Uses async runtime");
+        assert_eq!(entry.category, MemoryCategory::Custom("project".into()));
     }
 
     #[tokio::test]

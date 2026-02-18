@@ -1,4 +1,5 @@
 use super::traits::{Observer, ObserverEvent, ObserverMetric};
+use std::any::Any;
 
 /// Zero-overhead observer — all methods compile to nothing
 pub struct NoopObserver;
@@ -12,6 +13,10 @@ impl Observer for NoopObserver {
 
     fn name(&self) -> &str {
         "noop"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -33,37 +38,25 @@ mod tests {
             provider: "test".into(),
             model: "test".into(),
         });
-        obs.record_event(&ObserverEvent::LlmRequest {
-            provider: "test".into(),
-            model: "test".into(),
-            messages_count: 2,
-        });
-        obs.record_event(&ObserverEvent::LlmResponse {
-            provider: "test".into(),
-            model: "test".into(),
-            duration: Duration::from_millis(1),
-            success: true,
-            error_message: None,
-        });
         obs.record_event(&ObserverEvent::AgentEnd {
+            provider: "test".into(),
+            model: "test".into(),
             duration: Duration::from_millis(100),
             tokens_used: Some(42),
             cost_usd: Some(0.001),
         });
         obs.record_event(&ObserverEvent::AgentEnd {
+            provider: "test".into(),
+            model: "test".into(),
             duration: Duration::ZERO,
             tokens_used: None,
             cost_usd: None,
-        });
-        obs.record_event(&ObserverEvent::ToolCallStart {
-            tool: "shell".into(),
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
             duration: Duration::from_secs(1),
             success: true,
         });
-        obs.record_event(&ObserverEvent::TurnComplete);
         obs.record_event(&ObserverEvent::ChannelMessage {
             channel: "cli".into(),
             direction: "inbound".into(),

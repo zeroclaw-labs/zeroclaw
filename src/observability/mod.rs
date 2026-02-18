@@ -2,6 +2,7 @@ pub mod log;
 pub mod multi;
 pub mod noop;
 pub mod otel;
+pub mod prometheus;
 pub mod traits;
 pub mod verbose;
 
@@ -11,6 +12,7 @@ pub use self::log::LogObserver;
 pub use self::multi::MultiObserver;
 pub use noop::NoopObserver;
 pub use otel::OtelObserver;
+pub use prometheus::PrometheusObserver;
 pub use traits::{Observer, ObserverEvent};
 #[allow(unused_imports)]
 pub use verbose::VerboseObserver;
@@ -21,6 +23,7 @@ use crate::config::ObservabilityConfig;
 pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
     match config.backend.as_str() {
         "log" => Box::new(LogObserver::new()),
+        "prometheus" => Box::new(PrometheusObserver::new()),
         "otel" | "opentelemetry" | "otlp" => {
             match OtelObserver::new(
                 config.otel_endpoint.as_deref(),
@@ -82,6 +85,15 @@ mod tests {
             ..ObservabilityConfig::default()
         };
         assert_eq!(create_observer(&cfg).name(), "log");
+    }
+
+    #[test]
+    fn factory_prometheus_returns_prometheus() {
+        let cfg = ObservabilityConfig {
+            backend: "prometheus".into(),
+            ..ObservabilityConfig::default()
+        };
+        assert_eq!(create_observer(&cfg).name(), "prometheus");
     }
 
     #[test]

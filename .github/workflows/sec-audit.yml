@@ -1,4 +1,4 @@
-name: Rust Package Security Audit
+name: Sec Audit
 
 on:
     push:

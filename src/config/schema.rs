@@ -479,6 +479,15 @@ pub struct GatewayConfig {
     #[serde(default = "default_webhook_rate_limit")]
     pub webhook_rate_limit_per_minute: u32,
 
+    /// Trust proxy-forwarded client IP headers (`X-Forwarded-For`, `X-Real-IP`).
+    /// Disabled by default; enable only behind a trusted reverse proxy.
+    #[serde(default)]
+    pub trust_forwarded_headers: bool,
+
+    /// Maximum distinct client keys tracked by gateway rate limiter maps.
+    #[serde(default = "default_gateway_rate_limit_max_keys")]
+    pub rate_limit_max_keys: usize,
+
     /// TTL for webhook idempotency keys.
     #[serde(default = "default_idempotency_ttl_secs")]
     pub idempotency_ttl_secs: u64,
@@ -486,6 +495,10 @@ pub struct GatewayConfig {
     /// Optional CORS origins (e.g. "*", "https://app.zeroclaw.local", or comma-separated).
     #[serde(default)]
     pub cors_origins: String,
+  
+    /// Maximum distinct idempotency keys retained in memory.
+    #[serde(default = "default_gateway_idempotency_max_keys")]
+    pub idempotency_max_keys: usize,
 }
 
 fn default_gateway_port() -> u16 {
@@ -508,6 +521,14 @@ fn default_idempotency_ttl_secs() -> u64 {
     300
 }
 
+fn default_gateway_rate_limit_max_keys() -> usize {
+    10_000
+}
+
+fn default_gateway_idempotency_max_keys() -> usize {
+    10_000
+}
+
 fn default_true() -> bool {
     true
 }
@@ -522,8 +543,11 @@ impl Default for GatewayConfig {
             paired_tokens: Vec::new(),
             pair_rate_limit_per_minute: default_pair_rate_limit(),
             webhook_rate_limit_per_minute: default_webhook_rate_limit(),
+            trust_forwarded_headers: false,
+            rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             cors_origins: String::new(),
+            idempotency_max_keys: default_gateway_idempotency_max_keys(),
         }
     }
 }
@@ -762,6 +786,12 @@ pub struct MemoryConfig {
     /// Auto-hydrate from MEMORY_SNAPSHOT.md when brain.db is missing
     #[serde(default = "default_true")]
     pub auto_hydrate: bool,
+
+    // ── SQLite backend options ─────────────────────────────────
+    /// For sqlite backend: max seconds to wait when opening the DB (e.g. file locked).
+    /// None = wait indefinitely (default). Recommended max: 300.
+    #[serde(default)]
+    pub sqlite_open_timeout_secs: Option<u64>,
 }
 
 fn default_embedding_provider() -> String {
@@ -826,6 +856,7 @@ impl Default for MemoryConfig {
             snapshot_enabled: false,
             snapshot_on_hygiene: false,
             auto_hydrate: true,
+            sqlite_open_timeout_secs: None,
         }
     }
 }
@@ -2260,6 +2291,7 @@ default_temperature = 0.7
         assert_eq!(m.archive_after_days, 7);
         assert_eq!(m.purge_after_days, 30);
         assert_eq!(m.conversation_retention_days, 30);
+        assert!(m.sqlite_open_timeout_secs.is_none());
     }
 
     #[test]
@@ -2951,7 +2983,10 @@ channel_id = "C123"
         );
         assert_eq!(g.pair_rate_limit_per_minute, 10);
         assert_eq!(g.webhook_rate_limit_per_minute, 60);
+        assert!(!g.trust_forwarded_headers);
+        assert_eq!(g.rate_limit_max_keys, 10_000);
         assert_eq!(g.idempotency_ttl_secs, 300);
+        assert_eq!(g.idempotency_max_keys, 10_000);
     }
 
     #[test]
@@ -2979,8 +3014,11 @@ channel_id = "C123"
             paired_tokens: vec!["zc_test_token".into()],
             pair_rate_limit_per_minute: 12,
             webhook_rate_limit_per_minute: 80,
+            trust_forwarded_headers: true,
+            rate_limit_max_keys: 2048,
             idempotency_ttl_secs: 600,
             cors_origins: "".into(),
+            idempotency_max_keys: 4096,
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();
@@ -2989,8 +3027,11 @@ channel_id = "C123"
         assert_eq!(parsed.paired_tokens, vec!["zc_test_token"]);
         assert_eq!(parsed.pair_rate_limit_per_minute, 12);
         assert_eq!(parsed.webhook_rate_limit_per_minute, 80);
+        assert!(parsed.trust_forwarded_headers);
+        assert_eq!(parsed.rate_limit_max_keys, 2048);
         assert_eq!(parsed.idempotency_ttl_secs, 600);
         assert_eq!(parsed.cors_origins, "");
+        assert_eq!(parsed.idempotency_max_keys, 4096);
     }
 
     #[test]
@@ -3629,6 +3670,9 @@ default_model = "legacy-model"
         assert!(g.require_pairing);
         assert!(!g.allow_public_bind);
         assert!(g.paired_tokens.is_empty());
+        assert!(!g.trust_forwarded_headers);
+        assert_eq!(g.rate_limit_max_keys, 10_000);
+        assert_eq!(g.idempotency_max_keys, 10_000);
     }
 
     // ── Peripherals config ───────────────────────────────────────

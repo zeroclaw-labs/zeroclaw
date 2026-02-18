@@ -25,6 +25,8 @@ pub enum ObserverEvent {
         error_message: Option<String>,
     },
     AgentEnd {
+        provider: String,
+        model: String,
         duration: Duration,
         tokens_used: Option<u64>,
         cost_usd: Option<f64>,
@@ -75,12 +77,7 @@ pub trait Observer: Send + Sync + 'static {
     fn name(&self) -> &str;
 
     /// Downcast to `Any` for backend-specific operations
-    fn as_any(&self) -> &dyn std::any::Any
-    where
-        Self: Sized,
-    {
-        self
-    }
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 #[cfg(test)]
@@ -108,6 +105,10 @@ mod tests {
 
         fn name(&self) -> &str {
             "dummy-observer"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
         }
     }
 

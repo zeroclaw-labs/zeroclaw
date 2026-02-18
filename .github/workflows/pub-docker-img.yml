@@ -1,4 +1,4 @@
-name: Docker
+name: Pub Docker Img
 
 on:
     push:
@@ -10,7 +10,7 @@ on:
             - "docker-compose.yml"
             - "dev/docker-compose.yml"
             - "dev/sandbox/**"
-            - ".github/workflows/docker.yml"
+            - ".github/workflows/pub-docker-img.yml"
     workflow_dispatch:
 
 concurrency:
@@ -50,6 +50,8 @@ jobs:
                   context: .
                   push: false
                   load: true
+                  provenance: false
+                  sbom: false
                   tags: zeroclaw-pr-smoke:latest
                   labels: ${{ steps.meta.outputs.labels }}
                   platforms: linux/amd64

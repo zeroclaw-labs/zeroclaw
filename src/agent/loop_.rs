@@ -461,12 +461,49 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         }
     }
 
+    // If XML tags found nothing, try markdown code blocks with tool_call language.
+    // Models behind OpenRouter sometimes output ```tool_call ... ``` or hybrid
+    // ```tool_call ... </tool_call> instead of structured API calls or XML tags.
+    if calls.is_empty() {
+        static MD_TOOL_CALL_RE: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"(?s)```tool[_-]?call\s*\n(.*?)(?:```|</tool[_-]?call>|</toolcall>)")
+                .unwrap()
+        });
+        let mut md_text_parts: Vec<String> = Vec::new();
+        let mut last_end = 0;
+
+        for cap in MD_TOOL_CALL_RE.captures_iter(response) {
+            let full_match = cap.get(0).unwrap();
+            let before = &response[last_end..full_match.start()];
+            if !before.trim().is_empty() {
+                md_text_parts.push(before.trim().to_string());
+            }
+            let inner = &cap[1];
+            let json_values = extract_json_values(inner);
+            for value in json_values {
+                let parsed_calls = parse_tool_calls_from_json_value(&value);
+                calls.extend(parsed_calls);
+            }
+            last_end = full_match.end();
+        }
+
+        if !calls.is_empty() {
+            let after = &response[last_end..];
+            if !after.trim().is_empty() {
+                md_text_parts.push(after.trim().to_string());
+            }
+            text_parts = md_text_parts;
+            remaining = "";
+        }
+    }
+
     // SECURITY: We do NOT fall back to extracting arbitrary JSON from the response
     // here. That would enable prompt injection attacks where malicious content
     // (e.g., in emails, files, or web pages) could include JSON that mimics a
     // tool call. Tool calls MUST be explicitly wrapped in either:
     // 1. OpenAI-style JSON with a "tool_calls" array
     // 2. ZeroClaw tool-call tags (<tool_call>, <toolcall>, <tool-call>)
+    // 3. Markdown code blocks with tool_call/toolcall/tool-call language
     // This ensures only the LLM's intentional tool calls are executed.
 
     // Remaining text after last tool call
@@ -486,6 +523,34 @@ fn parse_structured_tool_calls(tool_calls: &[ToolCall]) -> Vec<ParsedToolCall> {
                 .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
         })
         .collect()
+}
+
+/// Build assistant history entry in JSON format for native tool-call APIs.
+/// `convert_messages` in the OpenRouter provider parses this JSON to reconstruct
+/// the proper `NativeMessage` with structured `tool_calls`.
+fn build_native_assistant_history(text: &str, tool_calls: &[ToolCall]) -> String {
+    let calls_json: Vec<serde_json::Value> = tool_calls
+        .iter()
+        .map(|tc| {
+            serde_json::json!({
+                "id": tc.id,
+                "name": tc.name,
+                "arguments": tc.arguments,
+            })
+        })
+        .collect();
+
+    let content = if text.trim().is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::String(text.trim().to_string())
+    };
+
+    serde_json::json!({
+        "content": content,
+        "tool_calls": calls_json,
+    })
+    .to_string()
 }
 
 fn build_assistant_history_with_tool_calls(text: &str, tool_calls: &[ToolCall]) -> String {
@@ -577,7 +642,9 @@ pub(crate) async fn run_tool_call_loop(
         let llm_started_at = Instant::now();
 
         // Choose between native tool-call API and prompt-based tool use.
-        let (response_text, parsed_text, tool_calls, assistant_history_content) =
+        // `native_tool_calls` preserves the structured ToolCall vec (with IDs) so
+        // that tool results can later be sent back as proper `role: tool` messages.
+        let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
             if use_native_tools {
                 match provider
                     .chat_with_tools(history, &tool_definitions, model, temperature)
@@ -603,16 +670,22 @@ pub(crate) async fn run_tool_call_loop(
                             calls = fallback_calls;
                         }
 
+                        // Use JSON format for native tools so convert_messages()
+                        // can reconstruct proper NativeMessage with tool_calls.
                         let assistant_history_content = if resp.tool_calls.is_empty() {
                             response_text.clone()
                         } else {
-                            build_assistant_history_with_tool_calls(
-                                &response_text,
-                                &resp.tool_calls,
-                            )
+                            build_native_assistant_history(&response_text, &resp.tool_calls)
                         };
 
-                        (response_text, parsed_text, calls, assistant_history_content)
+                        let native_calls = resp.tool_calls;
+                        (
+                            response_text,
+                            parsed_text,
+                            calls,
+                            assistant_history_content,
+                            native_calls,
+                        )
                     }
                     Err(e) => {
                         observer.record_event(&ObserverEvent::LlmResponse {
@@ -643,7 +716,13 @@ pub(crate) async fn run_tool_call_loop(
                         let response_text = resp;
                         let assistant_history_content = response_text.clone();
                         let (parsed_text, calls) = parse_tool_calls(&response_text);
-                        (response_text, parsed_text, calls, assistant_history_content)
+                        (
+                            response_text,
+                            parsed_text,
+                            calls,
+                            assistant_history_content,
+                            Vec::new(),
+                        )
                     }
                     Err(e) => {
                         observer.record_event(&ObserverEvent::LlmResponse {
@@ -678,8 +757,11 @@ pub(crate) async fn run_tool_call_loop(
             let _ = std::io::stdout().flush();
         }
 
-        // Execute each tool call and build results
+        // Execute each tool call and build results.
+        // `individual_results` tracks per-call output so that native-mode history
+        // can emit one `role: tool` message per tool call with the correct ID.
         let mut tool_results = String::new();
+        let mut individual_results: Vec<String> = Vec::new();
         for call in &tool_calls {
             // ── Approval hook ────────────────────────────────
             if let Some(mgr) = approval {
@@ -699,9 +781,11 @@ pub(crate) async fn run_tool_call_loop(
                     mgr.record_decision(&call.name, &call.arguments, decision, channel_name);
 
                     if decision == ApprovalResponse::No {
+                        let denied = "Denied by user.".to_string();
+                        individual_results.push(denied.clone());
                         let _ = writeln!(
                             tool_results,
-                            "<tool_result name=\"{}\">\nDenied by user.\n</tool_result>",
+                            "<tool_result name=\"{}\">\n{denied}\n</tool_result>",
                             call.name
                         );
                         continue;
@@ -740,6 +824,7 @@ pub(crate) async fn run_tool_call_loop(
                 format!("Unknown tool: {}", call.name)
             };
 
+            individual_results.push(result.clone());
             let _ = writeln!(
                 tool_results,
                 "<tool_result name=\"{}\">\n{}\n</tool_result>",
@@ -747,9 +832,22 @@ pub(crate) async fn run_tool_call_loop(
             );
         }
 
-        // Add assistant message with tool calls + tool results to history
+        // Add assistant message with tool calls + tool results to history.
+        // Native mode: use JSON-structured messages so convert_messages() can
+        // reconstruct proper OpenAI-format tool_calls and tool result messages.
+        // Prompt mode: use XML-based text format as before.
         history.push(ChatMessage::assistant(assistant_history_content));
-        history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
+        if native_tool_calls.is_empty() {
+            history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
+        } else {
+            for (native_call, result) in native_tool_calls.iter().zip(individual_results.iter()) {
+                let tool_msg = serde_json::json!({
+                    "tool_call_id": native_call.id,
+                    "content": result,
+                });
+                history.push(ChatMessage::tool(tool_msg.to_string()));
+            }
+        }
     }
 
     anyhow::bail!("Agent exceeded maximum tool iterations ({MAX_TOOL_ITERATIONS})")
@@ -1082,7 +1180,7 @@ pub async fn run(
         }
     } else {
         println!("🦀 ZeroClaw Interactive Mode");
-        println!("Type /quit to exit.\n");
+        println!("Type /help for commands.\n");
         let cli = crate::channels::CliChannel::new();
 
         // Persistent conversation history across turns
@@ -1106,8 +1204,53 @@ pub async fn run(
             if user_input.is_empty() {
                 continue;
             }
-            if user_input == "/quit" || user_input == "/exit" {
-                break;
+            match user_input.as_str() {
+                "/quit" | "/exit" => break,
+                "/help" => {
+                    println!("Available commands:");
+                    println!("  /help        Show this help message");
+                    println!("  /clear /new  Clear conversation history");
+                    println!("  /quit /exit  Exit interactive mode\n");
+                    continue;
+                }
+                "/clear" | "/new" => {
+                    println!("This will clear the current conversation and delete all session memory.");
+                    println!("Core memories (long-term facts/preferences) will be preserved.");
+                    print!("Continue? [y/N] ");
+                    let _ = std::io::stdout().flush();
+
+                    let mut confirm = String::new();
+                    if std::io::stdin().read_line(&mut confirm).is_err() {
+                        continue;
+                    }
+                    if !matches!(confirm.trim().to_lowercase().as_str(), "y" | "yes") {
+                        println!("Cancelled.\n");
+                        continue;
+                    }
+
+                    history.clear();
+                    history.push(ChatMessage::system(&system_prompt));
+                    // Clear conversation and daily memory
+                    let mut cleared = 0;
+                    for category in [MemoryCategory::Conversation, MemoryCategory::Daily] {
+                        let entries = mem
+                            .list(Some(&category), None)
+                            .await
+                            .unwrap_or_default();
+                        for entry in entries {
+                            if mem.forget(&entry.key).await.unwrap_or(false) {
+                                cleared += 1;
+                            }
+                        }
+                    }
+                    if cleared > 0 {
+                        println!("Conversation cleared ({cleared} memory entries removed).\n");
+                    } else {
+                        println!("Conversation cleared.\n");
+                    }
+                    continue;
+                }
+                _ => {}
             }
 
             // Auto-save conversation turns
@@ -1189,6 +1332,8 @@ pub async fn run(
 
     let duration = start.elapsed();
     observer.record_event(&ObserverEvent::AgentEnd {
+        provider: provider_name.to_string(),
+        model: model_name.to_string(),
         duration,
         tokens_used: None,
         cost_usd: None,
@@ -1519,6 +1664,46 @@ I will now call the tool with this payload:
             calls[0].arguments.get("command").unwrap().as_str().unwrap(),
             "pwd"
         );
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_markdown_tool_call_fence() {
+        let response = r#"I'll check that.
+```tool_call
+{"name": "shell", "arguments": {"command": "pwd"}}
+```
+Done."#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "pwd"
+        );
+        assert!(text.contains("I'll check that."));
+        assert!(text.contains("Done."));
+        assert!(!text.contains("```tool_call"));
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_markdown_tool_call_hybrid_close_tag() {
+        let response = r#"Preface
+```tool-call
+{"name": "shell", "arguments": {"command": "date"}}
+</tool_call>
+Tail"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "date"
+        );
+        assert!(text.contains("Preface"));
+        assert!(text.contains("Tail"));
+        assert!(!text.contains("```tool-call"));
     }
 
     #[test]

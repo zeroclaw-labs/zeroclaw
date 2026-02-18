@@ -1,4 +1,4 @@
-name: Fuzz Testing
+name: Test Fuzz
 
 on:
     schedule:
