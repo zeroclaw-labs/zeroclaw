@@ -127,6 +127,12 @@ peripheral-rpi = ["rppal"]
 probe = ["dep:probe-rs"]
 # rag-pdf = PDF ingestion for datasheet RAG
 rag-pdf = ["dep:pdf-extract"]
+# browser-native = Rust-native browser automation via fantoccini/WebDriver
+browser-native = ["dep:fantoccini"]
+# sandbox-landlock = Landlock sandbox backend (Linux kernel 5.13+)
+sandbox-landlock = ["dep:landlock"]
+# sandbox-bubblewrap = Bubblewrap sandbox backend (Linux/macOS)
+sandbox-bubblewrap = []
 
 [profile.release]
 opt-level = "z"      # Optimize for size

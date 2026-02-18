@@ -489,10 +489,10 @@ pub(crate) async fn run_tool_call_loop(
         };
 
         let response_text = response;
-        let mut assistant_history_content = response_text.clone();
+        let assistant_history_content = response_text.clone();
         let (parsed_text, tool_calls) = parse_tool_calls(&response_text);
-        let mut parsed_text = parsed_text;
-        let mut tool_calls = tool_calls;
+        let parsed_text = parsed_text;
+        let tool_calls = tool_calls;
 
         if tool_calls.is_empty() {
             // No tool calls — this is the final response

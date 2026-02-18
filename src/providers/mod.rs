@@ -1,6 +1,7 @@
 pub mod anthropic;
 pub mod compatible;
 pub mod gemini;
+pub mod minimax_portal_oauth;
 pub mod ollama;
 pub mod openai;
 pub mod openrouter;
@@ -124,7 +125,7 @@ fn resolve_api_key(name: &str, api_key: Option<&str>) -> Option<String> {
         "cohere" => vec!["COHERE_API_KEY"],
         "moonshot" | "kimi" => vec!["MOONSHOT_API_KEY"],
         "glm" | "zhipu" => vec!["GLM_API_KEY"],
-        "minimax" => vec!["MINIMAX_API_KEY"],
+        "minimax" => vec!["MINIMAX_PORTAL_ACCESS_TOKEN"],
         "qianfan" | "baidu" => vec!["QIANFAN_API_KEY"],
         "qwen" | "dashscope" | "qwen-intl" | "dashscope-intl" | "qwen-us" | "dashscope-us" => {
             vec!["DASHSCOPE_API_KEY"]
@@ -227,11 +228,9 @@ pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<
         "glm" | "zhipu" => Ok(Box::new(OpenAiCompatibleProvider::new_no_responses_fallback(
             "GLM", "https://api.z.ai/api/paas/v4", key, AuthStyle::Bearer,
         ))),
-        "minimax" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "MiniMax",
-            "https://api.minimaxi.com/v1",
-            key,
-            AuthStyle::Bearer,
+        "minimax" => Ok(Box::new(anthropic::AnthropicProvider::with_base_url_bearer(
+            key.as_deref(),
+            Some("https://api.minimax.io/anthropic"),
         ))),
         "bedrock" | "aws-bedrock" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Amazon Bedrock",

@@ -10,7 +10,14 @@ use serde::{Deserialize, Serialize};
 pub struct AnthropicProvider {
     credential: Option<String>,
     base_url: String,
+    auth_mode: AuthMode,
     client: Client,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AuthMode {
+    Anthropic,
+    Bearer,
 }
 
 #[derive(Debug, Serialize)]
@@ -111,6 +118,18 @@ impl AnthropicProvider {
     }
 
     pub fn with_base_url(api_key: Option<&str>, base_url: Option<&str>) -> Self {
+        Self::with_base_url_and_auth_mode(api_key, base_url, AuthMode::Anthropic)
+    }
+
+    pub fn with_base_url_bearer(api_key: Option<&str>, base_url: Option<&str>) -> Self {
+        Self::with_base_url_and_auth_mode(api_key, base_url, AuthMode::Bearer)
+    }
+
+    fn with_base_url_and_auth_mode(
+        api_key: Option<&str>,
+        base_url: Option<&str>,
+        auth_mode: AuthMode,
+    ) -> Self {
         let base_url = base_url
             .map(|u| u.trim_end_matches('/'))
             .unwrap_or("https://api.anthropic.com")
@@ -121,6 +140,7 @@ impl AnthropicProvider {
                 .filter(|k| !k.is_empty())
                 .map(ToString::to_string),
             base_url,
+            auth_mode,
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
                 .connect_timeout(std::time::Duration::from_secs(10))
@@ -138,10 +158,15 @@ impl AnthropicProvider {
         request: reqwest::RequestBuilder,
         credential: &str,
     ) -> reqwest::RequestBuilder {
-        if Self::is_setup_token(credential) {
-            request.header("Authorization", format!("Bearer {credential}"))
-        } else {
-            request.header("x-api-key", credential)
+        match self.auth_mode {
+            AuthMode::Bearer => request.header("Authorization", format!("Bearer {credential}")),
+            AuthMode::Anthropic => {
+                if Self::is_setup_token(credential) {
+                    request.header("Authorization", format!("Bearer {credential}"))
+                } else {
+                    request.header("x-api-key", credential)
+                }
+            }
         }
     }
 
@@ -412,6 +437,7 @@ mod tests {
         assert!(p.credential.is_some());
         assert_eq!(p.credential.as_deref(), Some("sk-ant-test123"));
         assert_eq!(p.base_url, "https://api.anthropic.com");
+        assert_eq!(p.auth_mode, AuthMode::Anthropic);
     }
 
     #[test]
@@ -440,6 +466,17 @@ mod tests {
             AnthropicProvider::with_base_url(Some("sk-ant-test"), Some("https://api.example.com"));
         assert_eq!(p.base_url, "https://api.example.com");
         assert_eq!(p.credential.as_deref(), Some("sk-ant-test"));
+        assert_eq!(p.auth_mode, AuthMode::Anthropic);
+    }
+
+    #[test]
+    fn creates_with_custom_base_url_bearer_auth() {
+        let p = AnthropicProvider::with_base_url_bearer(
+            Some("minimax-oauth-token"),
+            Some("https://api.minimax.io/anthropic"),
+        );
+        assert_eq!(p.base_url, "https://api.minimax.io/anthropic");
+        assert_eq!(p.auth_mode, AuthMode::Bearer);
     }
 
     #[test]
@@ -472,6 +509,39 @@ mod tests {
     fn setup_token_detection_works() {
         assert!(AnthropicProvider::is_setup_token("sk-ant-oat01-abcdef"));
         assert!(!AnthropicProvider::is_setup_token("sk-ant-api-key"));
+    }
+
+    #[test]
+    fn anthropic_auth_mode_uses_x_api_key_for_regular_tokens() {
+        let provider = AnthropicProvider::new(Some("regular-token"));
+        let request = provider
+            .apply_auth(provider.client.get("https://example.com"), "regular-token")
+            .build()
+            .expect("request should build");
+
+        assert_eq!(request.headers().get("x-api-key").unwrap(), "regular-token");
+        assert!(request.headers().get("authorization").is_none());
+    }
+
+    #[test]
+    fn bearer_auth_mode_uses_authorization_header_for_minimax_tokens() {
+        let provider = AnthropicProvider::with_base_url_bearer(
+            Some("minimax-access-token"),
+            Some("https://api.minimax.io/anthropic"),
+        );
+        let request = provider
+            .apply_auth(
+                provider.client.get("https://api.minimax.io/anthropic/v1/messages"),
+                "minimax-access-token",
+            )
+            .build()
+            .expect("request should build");
+
+        assert_eq!(
+            request.headers().get("authorization").unwrap(),
+            "Bearer minimax-access-token"
+        );
+        assert!(request.headers().get("x-api-key").is_none());
     }
 
     #[tokio::test]

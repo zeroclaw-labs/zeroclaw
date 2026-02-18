@@ -7,6 +7,7 @@ pub mod prompt;
 
 #[allow(unused_imports)]
 pub use agent::{Agent, AgentBuilder};
+#[allow(unused_imports)]
 pub use loop_::{process_message, run};
 
 #[cfg(test)]
