@@ -127,7 +127,7 @@ Telegram uses **long-polling** by default:
 ```toml
 [channels_config.telegram]
 bot_token = "YOUR_BOT_TOKEN"
-allowed_users = []      # deny-by-default, bind identities explicitly
+allowed_users = []            # deny-by-default, bind identities explicitly
 ```
 
 Run `zeroclaw daemon` — Telegram channel starts automatically.

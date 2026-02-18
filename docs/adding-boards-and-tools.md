@@ -31,7 +31,7 @@ Edit `~/.zeroclaw/config.toml`:
 ```toml
 [peripherals]
 enabled = true
-datasheet_dir = "docs/datasheets"   # optional: RAG for "turn on red led" → pin 13
+datasheet_dir = "docs/datasheets" # optional: RAG for "turn on red led" → pin 13
 
 [[peripherals.boards]]
 board = "nucleo-f401re"

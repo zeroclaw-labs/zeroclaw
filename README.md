@@ -329,9 +329,9 @@ The agent automatically recalls, saves, and manages memory via tools.
 
 ```toml
 [memory]
-backend = "sqlite"          # "sqlite", "lucid", "markdown", "none"
+backend = "sqlite"             # "sqlite", "lucid", "markdown", "none"
 auto_save = true
-embedding_provider = "none"  # "none", "openai", "custom:https://..."
+embedding_provider = "none"    # "none", "openai", "custom:https://..."
 vector_weight = 0.7
 keyword_weight = 0.3
 
@@ -341,12 +341,12 @@ keyword_weight = 0.3
 # sqlite_open_timeout_secs = 30
 
 # Optional for backend = "lucid"
-# ZEROCLAW_LUCID_CMD=/usr/local/bin/lucid   # default: lucid
-# ZEROCLAW_LUCID_BUDGET=200                 # default: 200
-# ZEROCLAW_LUCID_LOCAL_HIT_THRESHOLD=3      # local hit count to skip external recall
-# ZEROCLAW_LUCID_RECALL_TIMEOUT_MS=120      # low-latency budget for lucid context recall
-# ZEROCLAW_LUCID_STORE_TIMEOUT_MS=800        # async sync timeout for lucid store
-# ZEROCLAW_LUCID_FAILURE_COOLDOWN_MS=15000   # cooldown after lucid failure to avoid repeated slow attempts
+# ZEROCLAW_LUCID_CMD=/usr/local/bin/lucid            # default: lucid
+# ZEROCLAW_LUCID_BUDGET=200                          # default: 200
+# ZEROCLAW_LUCID_LOCAL_HIT_THRESHOLD=3               # local hit count to skip external recall
+# ZEROCLAW_LUCID_RECALL_TIMEOUT_MS=120               # low-latency budget for lucid context recall
+# ZEROCLAW_LUCID_STORE_TIMEOUT_MS=800                # async sync timeout for lucid store
+# ZEROCLAW_LUCID_FAILURE_COOLDOWN_MS=15000           # cooldown after lucid failure to avoid repeated slow attempts
 ```
 
 ## Security
@@ -477,23 +477,23 @@ default_temperature = 0.7
 # default_provider = "anthropic-custom:https://your-api.com"
 
 [memory]
-backend = "sqlite"              # "sqlite", "lucid", "markdown", "none"
+backend = "sqlite"             # "sqlite", "lucid", "markdown", "none"
 auto_save = true
-embedding_provider = "none"     # "none", "openai", "custom:https://..."
+embedding_provider = "none"    # "none", "openai", "custom:https://..."
 vector_weight = 0.7
 keyword_weight = 0.3
 
 # backend = "none" disables persistent memory via no-op backend
 
 [gateway]
-port = 3000                      # default
-host = "127.0.0.1"              # default
-require_pairing = true          # require pairing code on first connect
-allow_public_bind = false       # refuse 0.0.0.0 without tunnel
+port = 3000                    # default
+host = "127.0.0.1"            # default
+require_pairing = true         # require pairing code on first connect
+allow_public_bind = false      # refuse 0.0.0.0 without tunnel
 
 [autonomy]
-level = "supervised"            # "readonly", "supervised", "full" (default: supervised)
-workspace_only = true           # default: true — scoped to workspace
+level = "supervised"           # "readonly", "supervised", "full" (default: supervised)
+workspace_only = true          # default: true — scoped to workspace
 allowed_commands = ["git", "npm", "cargo", "ls", "cat", "grep"]
 forbidden_paths = ["/etc", "/root", "/proc", "/sys", "~/.ssh", "~/.gnupg", "~/.aws"]
 
@@ -501,8 +501,8 @@ forbidden_paths = ["/etc", "/root", "/proc", "/sys", "~/.ssh", "~/.gnupg", "~/.a
 kind = "native"                # "native" or "docker"
 
 [runtime.docker]
-image = "alpine:3.20"          # container image for shell execution
-network = "none"               # docker network mode ("none", "bridge", etc.)
+image = "alpine:3.20"         # container image for shell execution
+network = "none"              # docker network mode ("none", "bridge", etc.)
 memory_limit_mb = 512          # optional memory limit in MB
 cpu_limit = 1.0                # optional CPU limit
 read_only_rootfs = true        # mount root filesystem as read-only
@@ -514,27 +514,27 @@ enabled = false
 interval_minutes = 30
 
 [tunnel]
-provider = "none"               # "none", "cloudflare", "tailscale", "ngrok", "custom"
+provider = "none"              # "none", "cloudflare", "tailscale", "ngrok", "custom"
 
 [secrets]
-encrypt = true                  # API keys encrypted with local key file
+encrypt = true                 # API keys encrypted with local key file
 
 [browser]
-enabled = false                        # opt-in browser_open + browser tools
-allowed_domains = ["docs.rs"]         # required when browser is enabled
-backend = "agent_browser"             # "agent_browser" (default), "rust_native", "computer_use", "auto"
-native_headless = true                 # applies when backend uses rust-native
+enabled = false                # opt-in browser_open + browser tools
+allowed_domains = ["docs.rs"]  # required when browser is enabled
+backend = "agent_browser"      # "agent_browser" (default), "rust_native", "computer_use", "auto"
+native_headless = true         # applies when backend uses rust-native
 native_webdriver_url = "http://127.0.0.1:9515" # WebDriver endpoint (chromedriver/selenium)
-# native_chrome_path = "/usr/bin/chromium"  # optional explicit browser binary for driver
+# native_chrome_path = "/usr/bin/chromium"      # optional explicit browser binary for driver
 
 [browser.computer_use]
-endpoint = "http://127.0.0.1:8787/v1/actions" # computer-use sidecar HTTP endpoint
-timeout_ms = 15000                    # per-action timeout
-allow_remote_endpoint = false         # secure default: only private/localhost endpoint
-window_allowlist = []                 # optional window title/process allowlist hints
-# api_key = "..."                    # optional bearer token for sidecar
-# max_coordinate_x = 3840             # optional coordinate guardrail
-# max_coordinate_y = 2160             # optional coordinate guardrail
+endpoint = "http://127.0.0.1:8787/v1/actions"   # computer-use sidecar HTTP endpoint
+timeout_ms = 15000            # per-action timeout
+allow_remote_endpoint = false  # secure default: only private/localhost endpoint
+window_allowlist = []          # optional window title/process allowlist hints
+# api_key = "..."              # optional bearer token for sidecar
+# max_coordinate_x = 3840      # optional coordinate guardrail
+# max_coordinate_y = 2160      # optional coordinate guardrail
 
 # Rust-native backend build flag:
 # cargo build --release --features browser-native
@@ -551,12 +551,12 @@ window_allowlist = []                 # optional window title/process allowlist 
 # Response: {"success": true, "data": {...}} or {"success": false, "error": "..."}
 
 [composio]
-enabled = false                 # opt-in: 1000+ OAuth apps via composio.dev
+enabled = false                # opt-in: 1000+ OAuth apps via composio.dev
 # api_key = "cmp_..."          # optional: stored encrypted when [secrets].encrypt = true
-entity_id = "default"         # default user_id for Composio tool calls
+entity_id = "default"          # default user_id for Composio tool calls
 
 [identity]
-format = "openclaw"             # "openclaw" (default, markdown files) or "aieos" (JSON)
+format = "openclaw"            # "openclaw" (default, markdown files) or "aieos" (JSON)
 # aieos_path = "identity.json"  # path to AIEOS JSON file (relative to workspace or absolute)
 # aieos_inline = '{"identity":{"names":{"first":"Nova"}}}'  # inline AIEOS JSON
 ```

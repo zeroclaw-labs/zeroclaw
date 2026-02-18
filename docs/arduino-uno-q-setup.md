@@ -118,7 +118,7 @@ nano ~/.zeroclaw/config.toml
 ```toml
 api_key = "YOUR_OPENROUTER_API_KEY"
 default_provider = "openrouter"
-default_model = "anthropic/claude-sonnet-4"
+default_model = "anthropic/claude-sonnet-4-6"
 
 [peripherals]
 enabled = false
