@@ -222,7 +222,10 @@ async fn e2e_single_tool_call_cycle() {
 
     let mut agent = build_agent(provider, vec![Box::new(EchoTool)]);
     let response = agent.turn("run echo").await.unwrap();
-    assert!(!response.is_empty(), "Expected non-empty response after tool execution");
+    assert!(
+        !response.is_empty(),
+        "Expected non-empty response after tool execution"
+    );
 }
 
 /// Validates multi-step tool chain: tool A → tool B → tool C → final response.
@@ -246,7 +249,10 @@ async fn e2e_multi_step_tool_chain() {
 
     let mut agent = build_agent(provider, vec![Box::new(counting_tool)]);
     let response = agent.turn("count twice").await.unwrap();
-    assert!(!response.is_empty(), "Expected non-empty response after tool chain");
+    assert!(
+        !response.is_empty(),
+        "Expected non-empty response after tool chain"
+    );
     assert_eq!(*count.lock().unwrap(), 2);
 }
 
@@ -268,7 +274,10 @@ async fn e2e_xml_dispatcher_tool_call() {
 
     let mut agent = build_agent_xml(provider, vec![Box::new(EchoTool)]);
     let response = agent.turn("test xml dispatch").await.unwrap();
-    assert!(!response.is_empty(), "Expected non-empty response from XML dispatcher");
+    assert!(
+        !response.is_empty(),
+        "Expected non-empty response from XML dispatcher"
+    );
 }
 
 /// Validates that multiple sequential turns maintain conversation coherence.
@@ -308,7 +317,10 @@ async fn e2e_unknown_tool_recovery() {
 
     let mut agent = build_agent(provider, vec![Box::new(EchoTool)]);
     let response = agent.turn("call missing tool").await.unwrap();
-    assert!(!response.is_empty(), "Expected non-empty response after unknown tool recovery");
+    assert!(
+        !response.is_empty(),
+        "Expected non-empty response after unknown tool recovery"
+    );
 }
 
 /// Validates parallel tool dispatch in a single response.
@@ -334,6 +346,9 @@ async fn e2e_parallel_tool_dispatch() {
 
     let mut agent = build_agent(provider, vec![Box::new(counting_tool)]);
     let response = agent.turn("run both").await.unwrap();
-    assert!(!response.is_empty(), "Expected non-empty response after parallel dispatch");
+    assert!(
+        !response.is_empty(),
+        "Expected non-empty response after parallel dispatch"
+    );
     assert_eq!(*count.lock().unwrap(), 2);
 }

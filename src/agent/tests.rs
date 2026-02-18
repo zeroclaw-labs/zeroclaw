@@ -363,7 +363,10 @@ async fn turn_returns_text_when_no_tools_called() {
     );
 
     let response = agent.turn("hi").await.unwrap();
-    assert!(!response.is_empty(), "Expected non-empty text response from provider");
+    assert!(
+        !response.is_empty(),
+        "Expected non-empty text response from provider"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -388,7 +391,10 @@ async fn turn_executes_single_tool_then_returns() {
     );
 
     let response = agent.turn("run echo").await.unwrap();
-    assert!(!response.is_empty(), "Expected non-empty response after tool execution");
+    assert!(
+        !response.is_empty(),
+        "Expected non-empty response after tool execution"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -425,7 +431,10 @@ async fn turn_handles_multi_step_tool_chain() {
     );
 
     let response = agent.turn("count 3 times").await.unwrap();
-    assert!(!response.is_empty(), "Expected non-empty response after multi-step chain");
+    assert!(
+        !response.is_empty(),
+        "Expected non-empty response after multi-step chain"
+    );
     assert_eq!(*count.lock().unwrap(), 3);
 }
 
@@ -486,7 +495,10 @@ async fn turn_handles_unknown_tool_gracefully() {
     );
 
     let response = agent.turn("use nonexistent").await.unwrap();
-    assert!(!response.is_empty(), "Expected non-empty response after unknown tool recovery");
+    assert!(
+        !response.is_empty(),
+        "Expected non-empty response after unknown tool recovery"
+    );
 
     // Verify the tool result mentioned "Unknown tool"
     let has_tool_result = agent.history().iter().any(|msg| match msg {
@@ -523,7 +535,10 @@ async fn turn_recovers_from_tool_failure() {
     );
 
     let response = agent.turn("try failing tool").await.unwrap();
-    assert!(!response.is_empty(), "Expected non-empty response after tool failure recovery");
+    assert!(
+        !response.is_empty(),
+        "Expected non-empty response after tool failure recovery"
+    );
 }
 
 #[tokio::test]
@@ -544,7 +559,10 @@ async fn turn_recovers_from_tool_error() {
     );
 
     let response = agent.turn("try panicking").await.unwrap();
-    assert!(!response.is_empty(), "Expected non-empty response after tool error recovery");
+    assert!(
+        !response.is_empty(),
+        "Expected non-empty response after tool error recovery"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -665,7 +683,10 @@ async fn xml_dispatcher_parses_and_loops() {
     );
 
     let response = agent.turn("test xml").await.unwrap();
-    assert!(!response.is_empty(), "Expected non-empty response from XML dispatcher");
+    assert!(
+        !response.is_empty(),
+        "Expected non-empty response from XML dispatcher"
+    );
 }
 
 #[tokio::test]
@@ -746,7 +767,10 @@ async fn turn_preserves_text_alongside_tool_calls() {
     );
 
     let response = agent.turn("check something").await.unwrap();
-    assert!(!response.is_empty(), "Expected non-empty final response after mixed text+tool");
+    assert!(
+        !response.is_empty(),
+        "Expected non-empty final response after mixed text+tool"
+    );
 
     // The intermediate text should be in history
     let has_intermediate = agent.history().iter().any(|msg| match msg {
@@ -792,7 +816,10 @@ async fn turn_handles_multiple_tools_in_one_response() {
     );
 
     let response = agent.turn("batch").await.unwrap();
-    assert!(!response.is_empty(), "Expected non-empty response after multi-tool batch");
+    assert!(
+        !response.is_empty(),
+        "Expected non-empty response after multi-tool batch"
+    );
     assert_eq!(
         *count.lock().unwrap(),
         3,
@@ -1264,5 +1291,8 @@ async fn run_single_delegates_to_turn() {
     let mut agent = build_agent_with(provider, vec![], Box::new(NativeToolDispatcher));
 
     let response = agent.run_single("test").await.unwrap();
-    assert!(!response.is_empty(), "Expected non-empty response from run_single");
+    assert!(
+        !response.is_empty(),
+        "Expected non-empty response from run_single"
+    );
 }
