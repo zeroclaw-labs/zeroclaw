@@ -16,13 +16,7 @@ permissions:
 jobs:
     intake:
         name: Intake Checks
-        runs-on: blacksmith-2vcpu-ubuntu-2404
-        timeout-minutes: 10
-        steps:
-            - name: Checkout repository
-              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-            - name: Run safe PR intake checks
+        runs-on: ubuntu-latest
               uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
               with:
                   script: |
