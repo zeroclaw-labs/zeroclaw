@@ -291,6 +291,13 @@ export async function executeToolDirective(
 
   try {
     const payload = defaultPayloadForTool(directive.tool, directive.arguments);
+    if (
+      directive.tool === "android_device.calls.start" ||
+      directive.tool === "android_device.sms.send" ||
+      directive.tool === "android_device.camera.capture"
+    ) {
+      payload.direct = config.security.directExecution;
+    }
     const output = await executeAndroidToolAction(action, payload);
     return {
       tool: directive.tool,

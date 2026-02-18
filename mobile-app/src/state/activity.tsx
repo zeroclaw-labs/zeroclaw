@@ -5,7 +5,7 @@ export type ActivityItem = {
   id: string;
   ts: number;
   kind: "action" | "message" | "log";
-  source: "chat" | "settings" | "integrations" | "device" | "security";
+  source: "chat" | "settings" | "integrations" | "device" | "security" | "runtime";
   title: string;
   detail?: string;
 };

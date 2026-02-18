@@ -20,7 +20,8 @@ import { log } from "./src/logger";
 import { ErrorBoundary } from "./src/state/ErrorBoundary";
 import { addActivity } from "./src/state/activity";
 import { loadSecurityConfig } from "./src/state/mobileclaw";
-import { subscribeIncomingCalls } from "./src/native/incomingCalls";
+import { subscribeIncomingDeviceEvents } from "./src/native/incomingCalls";
+import { applyRuntimeSupervisorConfig, reportRuntimeHookEvent, startRuntimeSupervisor } from "./src/runtime/supervisor";
 
 export default function App() {
   const [fontsLoaded] = Font.useFonts({
@@ -38,11 +39,12 @@ export default function App() {
   useEffect(() => {
     if (!fontsLoaded) return;
 
-    const unsubscribe = subscribeIncomingCalls((event) => {
+    const unsubscribe = subscribeIncomingDeviceEvents((event) => {
       void (async () => {
         const security = await loadSecurityConfig();
         if (!security.incomingCallHooks) return;
         const suffix = security.includeCallerNumber && event.phone.trim() ? event.phone.trim() : "redacted";
+        await reportRuntimeHookEvent("incoming_call", `${event.state} from ${suffix}`);
         await addActivity({
           kind: "action",
           source: "device",
@@ -50,9 +52,34 @@ export default function App() {
           detail: `${event.state} from ${suffix}`,
         });
       })();
+    }, (event) => {
+      void (async () => {
+        const security = await loadSecurityConfig();
+        if (!security.incomingSmsHooks) return;
+        await reportRuntimeHookEvent("incoming_sms", `from ${event.address || "unknown"}`);
+        await addActivity({
+          kind: "action",
+          source: "device",
+          title: "Incoming SMS hook",
+          detail: `from ${event.address || "unknown"}`,
+        });
+      })();
     });
 
     return () => unsubscribe();
+  }, [fontsLoaded]);
+
+  useEffect(() => {
+    if (!fontsLoaded) return;
+
+    void startRuntimeSupervisor("app_start");
+    const interval = setInterval(() => {
+      void applyRuntimeSupervisorConfig("heartbeat");
+    }, 30000);
+
+    return () => {
+      clearInterval(interval);
+    };
   }, [fontsLoaded]);
 
   if (!fontsLoaded) return null;

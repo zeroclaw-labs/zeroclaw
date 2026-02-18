@@ -11,9 +11,40 @@ import type { AgentTurnResult } from "./types";
 
 function stripSystemReminder(text: string): string {
   return String(text || "")
-    .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, "")
-    .replace(/<system-reminder>[\s\S]*$/gi, "")
+    .replace(/<[^>]*system\s*[-_ ]?reminder[^>]*>[\s\S]*?<\/[^>]*system\s*[-_ ]?reminder\s*>/gi, "")
+    .replace(/<[^>]*system\s*[-_ ]?reminder[^>]*>[\s\S]*$/gi, "")
+    .replace(/<\s*system-reminder\b[^>]*>[\s\S]*?<\s*\/\s*system-reminder\s*>/gi, "")
+    .replace(/<\s*system-reminder\b[^>]*>[\s\S]*$/gi, "")
     .trim();
+}
+
+function extractFirstUrl(text: string): string | null {
+  const match = String(text || "").match(/https?:\/\/[^\s)]+/i);
+  if (!match?.[0]) return null;
+  return match[0].replace(/[.,!?;:]+$/, "");
+}
+
+function isUrlReadingIntent(text: string): boolean {
+  const lower = String(text || "").toLowerCase();
+  return /\b(read|summarize|analyze|check|what is|what's in|follow)\b/.test(lower);
+}
+
+function htmlToPlainText(html: string): string {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+async function runStandardWebReadTool(url: string): Promise<string> {
+  const res = await fetch(url, { method: "GET" });
+  if (!res.ok) throw new Error(`Web fetch failed: HTTP ${res.status}`);
+  const contentType = String(res.headers.get("content-type") || "").toLowerCase();
+  const raw = await res.text();
+  const normalized = contentType.includes("text/html") ? htmlToPlainText(raw) : raw;
+  return normalized.slice(0, 24000);
 }
 
 async function renderHumanToolReply(
@@ -45,7 +76,7 @@ function makeSystemInstruction(enabledTools: string[], enabledIntegrations: stri
   const integrationList = enabledIntegrations.length ? enabledIntegrations.join(", ") : "none";
 
   return [
-    "You are ZeroClaw mobile runtime orchestrator.",
+    "You are MobileClaw: a lightweight autonomous AI agent with Mobile UX designed to run on Android devices.",
     "Do not pretend to execute device actions.",
     `Enabled tool ids: ${toolList}.`,
     `Enabled integrations: ${integrationList}.`,
@@ -54,6 +85,7 @@ function makeSystemInstruction(enabledTools: string[], enabledIntegrations: stri
     "- Read last calls/history -> android_device.userdata.call_log",
     "- Read SMS inbox/messages -> android_device.userdata.sms_inbox",
     "- List files/storage -> android_device.storage.files",
+    "- Read URL content -> standard web read tool (never android_device.browser.*)",
     "Never use call_log tool when user asks to place a call.",
     "If a device/tool action is needed, output ONLY valid JSON with this exact shape:",
     '{"type":"tool_call","tool":"<tool_id>","arguments":{}}',
@@ -183,6 +215,54 @@ export async function runAgentTurn(userPrompt: string): Promise<AgentTurnResult>
     { role: "system", content: system },
     { role: "user", content: userPrompt },
   ];
+
+  const requestedUrl = extractFirstUrl(userPrompt);
+  if (requestedUrl && isUrlReadingIntent(userPrompt) && security.preferStandardWebTool) {
+    try {
+      const pageText = await runStandardWebReadTool(requestedUrl);
+      await addActivity({
+        kind: "action",
+        source: "chat",
+        title: "Tool executed: standard.web_read",
+        detail: requestedUrl,
+      });
+
+      const reply = await runAgentChat(runtime, [
+        { role: "system", content: system },
+        { role: "user", content: userPrompt },
+        {
+          role: "user",
+          content:
+            `Web tool result for ${requestedUrl}:\n${pageText}\n\nRespond for a human user and do not include raw JSON.`,
+        },
+      ]);
+
+      return {
+        assistantText: stripSystemReminder(reply) || "I read the page and prepared the result.",
+        toolEvents: [
+          {
+            tool: "standard.web_read",
+            status: "executed",
+            detail: "Standard web read tool executed.",
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        assistantText:
+          error instanceof Error
+            ? `I could not read ${requestedUrl} with the standard web tool: ${error.message}`
+            : `I could not read ${requestedUrl} with the standard web tool.`,
+        toolEvents: [
+          {
+            tool: "standard.web_read",
+            status: "failed",
+            detail: error instanceof Error ? error.message : "Web read failed.",
+          },
+        ],
+      };
+    }
+  }
 
   const deterministicDirective = inferDirectiveFromPrompt(userPrompt, enabledTools);
   if (deterministicDirective) {

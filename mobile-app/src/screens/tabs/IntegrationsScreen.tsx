@@ -12,6 +12,7 @@ import {
   loadIntegrationsConfig,
   saveIntegrationsConfig,
 } from "../../state/mobileclaw";
+import { applyRuntimeSupervisorConfig } from "../../runtime/supervisor";
 
 function IntegrationCard(props: {
   name: string;
@@ -107,18 +108,18 @@ export function IntegrationsScreen() {
       "Create bot in Telegram via @BotFather and copy bot token.",
       "Start a chat with the bot and send /start.",
       "Read chat id from updates and paste it in Chat ID field.",
-      "Run ZeroClaw daemon with telegram channel enabled in config.",
+      "MobileClaw orchestrator auto-applies runtime config after save.",
     ],
     discord: [
       "Create Discord application and bot in Developer Portal.",
       "Enable message content intent and invite bot to your server.",
-      "Paste bot token and start ZeroClaw daemon.",
+      "Paste bot token and enable integration toggle.",
       "Restrict allowed users/channels in server policy.",
     ],
     slack: [
       "Create Slack app and add bot token scopes.",
       "Install app to workspace and copy Bot User OAuth token.",
-      "Paste token and enable Slack channel in ZeroClaw config.",
+      "Paste token and enable Slack integration toggle.",
       "Invite bot to target channels and test a message.",
     ],
     whatsapp: [
@@ -129,9 +130,9 @@ export function IntegrationsScreen() {
     ],
     composio: [
       "Create account at app.composio.dev and generate API key.",
-      "Paste key and enable Composio in ZeroClaw config.",
+      "Paste key and enable Composio integration toggle.",
       "Connect target SaaS tools in Composio dashboard.",
-      "Restart daemon so tools are loaded in runtime.",
+      "MobileClaw orchestrator auto-reloads runtime tools.",
     ],
   };
 
@@ -154,6 +155,13 @@ export function IntegrationsScreen() {
     if (!hydratedRef.current) return;
     const timer = setTimeout(() => {
       void saveIntegrationsConfig(form);
+      void applyRuntimeSupervisorConfig("integrations_saved");
+      void addActivity({
+        kind: "action",
+        source: "integrations",
+        title: "Integrations updated",
+        detail: "Runtime supervisor applied latest integration config",
+      });
       setSaveStatus("Saved locally");
     }, 300);
     return () => clearTimeout(timer);

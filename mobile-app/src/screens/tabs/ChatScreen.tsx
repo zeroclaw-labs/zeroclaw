@@ -1,7 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { View, ScrollView, TextInput, Pressable } from "react-native";
+import { View, ScrollView, TextInput, Pressable, Linking } from "react-native";
 import Animated, { FadeIn, SlideInLeft, SlideInRight } from "react-native-reanimated";
 import { useFocusEffect } from "@react-navigation/native";
+import Markdown from "react-native-markdown-display";
+import MarkdownIt from "markdown-it";
 
 import { Screen } from "../../../ui/primitives/Screen";
 import { Text } from "../../../ui/primitives/Text";
@@ -17,6 +19,7 @@ import { runAgentTurn } from "../../runtime/session";
 
 const BUBBLE_USER = SlideInRight.duration(280).springify().damping(18).stiffness(180);
 const BUBBLE_ASSISTANT = SlideInLeft.duration(280).springify().damping(18).stiffness(180);
+const MARKDOWN_NO_TABLES = new MarkdownIt({ breaks: true, linkify: true, typographer: true }).disable(["table"]);
 
 export function ChatScreen() {
   const toast = useToast();
@@ -70,65 +73,85 @@ export function ChatScreen() {
     return () => clearInterval(id);
   }, [busy]);
 
-  const renderMessageText = useCallback((text: string) => {
-    const lines = text.replace(/\r\n/g, "\n").split("\n");
-    const blocks: Array<{ type: "p" | "ul" | "ol"; items: string[] }> = [];
-    for (const raw of lines) {
-      const line = raw.trim();
-      if (!line) continue;
-      const ul = line.match(/^[-*•]\s+(.+)$/);
-      const ol = line.match(/^\d+[.)]\s+(.+)$/);
-      if (ul) {
-        const last = blocks[blocks.length - 1];
-        if (last && last.type === "ul") last.items.push(ul[1]);
-        else blocks.push({ type: "ul", items: [ul[1]] });
-        continue;
-      }
-      if (ol) {
-        const last = blocks[blocks.length - 1];
-        if (last && last.type === "ol") last.items.push(ol[1]);
-        else blocks.push({ type: "ol", items: [ol[1]] });
-        continue;
-      }
-      blocks.push({ type: "p", items: [line] });
-    }
+  const markdownStyles = useMemo(
+    () => ({
+      body: { color: theme.colors.base.text, fontFamily: theme.typography.body, fontSize: 15, lineHeight: 22 },
+      paragraph: { marginTop: 0, marginBottom: 8 },
+      heading1: { fontFamily: theme.typography.bodyMedium, fontSize: 24, lineHeight: 30, marginBottom: 8 },
+      heading2: { fontFamily: theme.typography.bodyMedium, fontSize: 20, lineHeight: 28, marginBottom: 8 },
+      heading3: { fontFamily: theme.typography.bodyMedium, fontSize: 18, lineHeight: 24, marginBottom: 6 },
+      heading4: { fontFamily: theme.typography.bodyMedium, fontSize: 16, lineHeight: 22, marginBottom: 6 },
+      heading5: { fontFamily: theme.typography.bodyMedium, fontSize: 15, lineHeight: 22, marginBottom: 6 },
+      heading6: { fontFamily: theme.typography.bodyMedium, fontSize: 14, lineHeight: 20, marginBottom: 6 },
+      bullet_list: { marginTop: 0, marginBottom: 8 },
+      ordered_list: { marginTop: 0, marginBottom: 8 },
+      list_item: { marginBottom: 4 },
+      blockquote: {
+        marginTop: 0,
+        marginBottom: 8,
+        paddingVertical: 8,
+        paddingHorizontal: 10,
+        borderLeftWidth: 3,
+        borderColor: theme.colors.stroke.subtle,
+        backgroundColor: theme.colors.surface.panel,
+      },
+      strong: { fontFamily: theme.typography.bodyMedium },
+      em: { fontStyle: "italic" },
+      code_inline: {
+        fontFamily: theme.typography.mono,
+        backgroundColor: theme.colors.surface.panel,
+        paddingHorizontal: 4,
+        paddingVertical: 2,
+      },
+      fence: {
+        fontFamily: theme.typography.mono,
+        backgroundColor: theme.colors.surface.panel,
+        borderWidth: 1,
+        borderColor: theme.colors.stroke.subtle,
+        borderRadius: 10,
+        paddingHorizontal: 10,
+        paddingVertical: 8,
+      },
+      code_block: {
+        fontFamily: theme.typography.mono,
+        backgroundColor: theme.colors.surface.panel,
+        borderWidth: 1,
+        borderColor: theme.colors.stroke.subtle,
+        borderRadius: 10,
+        paddingHorizontal: 10,
+        paddingVertical: 8,
+      },
+      link: { color: theme.colors.base.primary },
+      hr: { backgroundColor: theme.colors.stroke.subtle },
+    }),
+    [],
+  );
 
-    if (!blocks.length) {
+  const renderMessageText = useCallback(
+    (message: ChatMessage) => {
+      if (message.role !== "assistant") {
+        return (
+          <Text variant="body" style={{ lineHeight: 22 }}>
+            {message.text}
+          </Text>
+        );
+      }
+
       return (
-        <Text variant="body" style={{ lineHeight: 22 }}>
-          {text}
-        </Text>
+        <Markdown
+          markdownit={MARKDOWN_NO_TABLES}
+          style={markdownStyles}
+          onLinkPress={(url) => {
+            void Linking.openURL(url);
+            return false;
+          }}
+        >
+          {message.text}
+        </Markdown>
       );
-    }
-
-    return (
-      <View style={{ gap: 6 }}>
-        {blocks.map((b, bi) => {
-          if (b.type === "p") {
-            return (
-              <Text key={`p_${bi}`} variant="body" style={{ lineHeight: 22 }}>
-                {b.items.join(" ")}
-              </Text>
-            );
-          }
-          return (
-            <View key={`${b.type}_${bi}`} style={{ gap: 4 }}>
-              {b.items.map((it, ii) => (
-                <View key={`${bi}_${ii}`} style={{ flexDirection: "row", gap: 8 }}>
-                  <Text variant="body" style={{ lineHeight: 22, minWidth: 16 }}>
-                    {b.type === "ul" ? "•" : `${ii + 1}.`}
-                  </Text>
-                  <Text variant="body" style={{ lineHeight: 22, flex: 1 }}>
-                    {it}
-                  </Text>
-                </View>
-              ))}
-            </View>
-          );
-        })}
-      </View>
-    );
-  }, []);
+    },
+    [markdownStyles],
+  );
 
   const runTurnWithTimeout = useCallback(async (prompt: string) => {
     const timeoutMs = 90_000;
@@ -270,7 +293,7 @@ export function ChatScreen() {
                   borderColor: isUser ? theme.colors.alpha.userBubbleBorder : theme.colors.stroke.subtle,
                 }}
               >
-                {renderMessageText(m.text)}
+                {renderMessageText(m)}
               </View>
             );
             if (isNew) {

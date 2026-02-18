@@ -9,6 +9,13 @@ export type IncomingCallEvent = {
   ts: number;
 };
 
+export type IncomingSmsEvent = {
+  event: "incoming_sms";
+  address: string;
+  body: string;
+  ts: number;
+};
+
 function parseIncomingCallEvent(raw: string): IncomingCallEvent | null {
   try {
     const parsed = JSON.parse(raw) as Partial<IncomingCallEvent>;
@@ -24,22 +31,52 @@ function parseIncomingCallEvent(raw: string): IncomingCallEvent | null {
   }
 }
 
-export function subscribeIncomingCalls(onEvent: (event: IncomingCallEvent) => void): () => void {
+function parseIncomingSmsEvent(raw: string): IncomingSmsEvent | null {
+  try {
+    const parsed = JSON.parse(raw) as Partial<IncomingSmsEvent>;
+    if (parsed?.event !== "incoming_sms") return null;
+    return {
+      event: "incoming_sms",
+      address: String(parsed.address || ""),
+      body: String(parsed.body || ""),
+      ts: Number(parsed.ts || Date.now()),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function subscribeIncomingDeviceEvents(onCall: (event: IncomingCallEvent) => void, onSms: (event: IncomingSmsEvent) => void): () => void {
   if (Platform.OS !== "android") {
     return () => {};
   }
 
-  const sub = DeviceEventEmitter.addListener("mobileclaw_incoming_call", (raw: string) => {
+  const callSub = DeviceEventEmitter.addListener("mobileclaw_incoming_call", (raw: string) => {
     const parsed = parseIncomingCallEvent(String(raw || ""));
-    if (parsed) onEvent(parsed);
+    if (parsed) onCall(parsed);
+  });
+
+  const smsSub = DeviceEventEmitter.addListener("mobileclaw_incoming_sms", (raw: string) => {
+    const parsed = parseIncomingSmsEvent(String(raw || ""));
+    if (parsed) onSms(parsed);
   });
 
   void consumePendingAndroidAgentEvents().then((events) => {
     for (const raw of events) {
-      const parsed = parseIncomingCallEvent(raw);
-      if (parsed) onEvent(parsed);
+      const call = parseIncomingCallEvent(raw);
+      if (call) {
+        onCall(call);
+        continue;
+      }
+      const sms = parseIncomingSmsEvent(raw);
+      if (sms) {
+        onSms(sms);
+      }
     }
   });
 
-  return () => sub.remove();
+  return () => {
+    callSub.remove();
+    smsSub.remove();
+  };
 }
