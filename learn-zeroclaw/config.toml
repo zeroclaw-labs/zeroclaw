@@ -1,0 +1,58 @@
+workspace_dir = "/zeroclaw-data/workspace"
+config_path = "/zeroclaw-data/.zeroclaw/config.toml"
+api_key = ""
+default_provider = "openrouter"
+default_model = "anthropic/claude-sonnet-4"
+default_temperature = 0.7
+
+[memory]
+backend = "sqlite"
+auto_save = true
+
+# ── Autonomy / Security ──
+[autonomy]
+level = "full"
+workspace_only = true
+allowed_commands = ["git", "npm", "cargo", "ls", "cat", "grep", "find", "echo", "pwd", "wc", "head", "tail", "curl", "wget", "python3"]
+forbidden_paths = ["/etc", "/usr", "/bin", "/sbin", "/opt", "/boot", "/dev", "/proc", "/sys", "/var", "/tmp", "~/.ssh", "~/.gnupg", "~/.aws", "~/.config"]
+max_actions_per_hour = 200
+max_cost_per_day_cents = 5000
+
+[gateway]
+port = 3000
+host = "[::]"
+allow_public_bind = true
+require_pairing = true
+
+# ── Browser Tools (browser_open + browser) ──
+[browser]
+enabled = true
+allowed_domains = ["*"]
+backend = "rust_native"
+native_headless = false
+native_webdriver_url = "http://chrome:4444"
+
+[browser.computer_use]
+endpoint = "http://127.0.0.1:8787/v1/actions"
+timeout_ms = 15000
+allow_remote_endpoint = false
+
+# ── HTTP Request Tool ──
+[http_request]
+enabled = true
+allowed_domains = ["*"]
+max_response_size = 1048576
+timeout_secs = 30
+
+# ── Composio Integration ──
+[composio]
+enabled = true
+api_key = ""
+entity_id = "default"
+
+# ── Delegate Tool (multi-agent) ──
+[agents.assistant]
+provider = "openrouter"
+model = "anthropic/claude-sonnet-4"
+temperature = 0.7
+max_depth = 3
