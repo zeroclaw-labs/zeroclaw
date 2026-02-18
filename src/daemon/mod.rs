@@ -209,17 +209,37 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
 }
 
 fn has_supervised_channels(config: &Config) -> bool {
-    config.channels_config.telegram.is_some()
-        || config.channels_config.discord.is_some()
-        || config.channels_config.slack.is_some()
-        || config.channels_config.imessage.is_some()
-        || config.channels_config.matrix.is_some()
-        || config.channels_config.signal.is_some()
-        || config.channels_config.whatsapp.is_some()
-        || config.channels_config.email.is_some()
-        || config.channels_config.irc.is_some()
-        || config.channels_config.lark.is_some()
-        || config.channels_config.dingtalk.is_some()
+    let crate::config::ChannelsConfig {
+        cli: _,     // `cli` is used only when running the CLI manually
+        webhook: _, // Managed by the gateway
+        telegram,
+        discord,
+        slack,
+        mattermost,
+        imessage,
+        matrix,
+        signal,
+        whatsapp,
+        email,
+        irc,
+        lark,
+        dingtalk,
+        qq,
+    } = &config.channels_config;
+
+    telegram.is_some()
+        || discord.is_some()
+        || slack.is_some()
+        || mattermost.is_some()
+        || imessage.is_some()
+        || matrix.is_some()
+        || signal.is_some()
+        || whatsapp.is_some()
+        || email.is_some()
+        || irc.is_some()
+        || lark.is_some()
+        || dingtalk.is_some()
+        || qq.is_some()
 }
 
 #[cfg(test)]
