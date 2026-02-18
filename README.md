@@ -177,6 +177,9 @@ zeroclaw channel bind-telegram 123456789
 # Get integration setup details
 zeroclaw integrations info Telegram
 
+# Note: Channels (Telegram, Discord, Slack) require daemon to be running
+# zeroclaw daemon
+
 # Manage background service
 zeroclaw service install
 zeroclaw service status
@@ -374,6 +377,12 @@ default_provider = "openrouter"
 default_model = "anthropic/claude-sonnet-4-20250514"
 default_temperature = 0.7
 
+# Custom OpenAI-compatible endpoint
+# default_provider = "custom:https://your-api.com"
+
+# Custom Anthropic-compatible endpoint
+# default_provider = "anthropic-custom:https://your-api.com"
+
 [memory]
 backend = "sqlite"              # "sqlite", "lucid", "markdown", "none"
 auto_save = true
@@ -473,6 +482,10 @@ default_model = "qwen3:cloud"
 api_url = "https://ollama.com"
 api_key = "ollama_api_key_here"
 ```
+
+### Custom Provider Endpoints
+
+For detailed configuration of custom OpenAI-compatible and Anthropic-compatible endpoints, see [docs/custom-providers.md](docs/custom-providers.md).
 
 ## Python Companion Package (`zeroclaw-tools`)
 
