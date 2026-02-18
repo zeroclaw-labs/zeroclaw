@@ -6,7 +6,6 @@
 //! 3. All build-essential paths are NOT excluded
 //! 4. Pattern syntax is valid
 
-use std::fs;
 use std::path::Path;
 
 /// Paths that MUST be excluded from Docker build context (security/performance)
@@ -96,8 +95,8 @@ fn is_excluded(patterns: &[String], path: &str) -> bool {
     excluded
 }
 
-#[test]
-fn dockerignore_file_exists() {
+#[tokio::test]
+async fn dockerignore_file_exists() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(".dockerignore");
     assert!(
         path.exists(),
@@ -105,10 +104,12 @@ fn dockerignore_file_exists() {
     );
 }
 
-#[test]
-fn dockerignore_excludes_security_critical_paths() {
+#[tokio::test]
+async fn dockerignore_excludes_security_critical_paths() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(".dockerignore");
-    let content = fs::read_to_string(&path).expect("Failed to read .dockerignore");
+    let content = tokio::fs::read_to_string(&path)
+        .await
+        .expect("Failed to read .dockerignore");
     let patterns = parse_dockerignore(&content);
 
     for must_exclude in MUST_EXCLUDE {
@@ -129,10 +130,12 @@ fn dockerignore_excludes_security_critical_paths() {
     }
 }
 
-#[test]
-fn dockerignore_does_not_exclude_build_essentials() {
+#[tokio::test]
+async fn dockerignore_does_not_exclude_build_essentials() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(".dockerignore");
-    let content = fs::read_to_string(&path).expect("Failed to read .dockerignore");
+    let content = tokio::fs::read_to_string(&path)
+        .await
+        .expect("Failed to read .dockerignore");
     let patterns = parse_dockerignore(&content);
 
     for must_include in MUST_INCLUDE {
@@ -144,10 +147,12 @@ fn dockerignore_does_not_exclude_build_essentials() {
     }
 }
 
-#[test]
-fn dockerignore_excludes_git_directory() {
+#[tokio::test]
+async fn dockerignore_excludes_git_directory() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(".dockerignore");
-    let content = fs::read_to_string(&path).expect("Failed to read .dockerignore");
+    let content = tokio::fs::read_to_string(&path)
+        .await
+        .expect("Failed to read .dockerignore");
     let patterns = parse_dockerignore(&content);
 
     // .git directory and its contents must be excluded
@@ -162,10 +167,12 @@ fn dockerignore_excludes_git_directory() {
     );
 }
 
-#[test]
-fn dockerignore_excludes_target_directory() {
+#[tokio::test]
+async fn dockerignore_excludes_target_directory() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(".dockerignore");
-    let content = fs::read_to_string(&path).expect("Failed to read .dockerignore");
+    let content = tokio::fs::read_to_string(&path)
+        .await
+        .expect("Failed to read .dockerignore");
     let patterns = parse_dockerignore(&content);
 
     assert!(is_excluded(&patterns, "target"), "target must be excluded");
@@ -179,10 +186,12 @@ fn dockerignore_excludes_target_directory() {
     );
 }
 
-#[test]
-fn dockerignore_excludes_database_files() {
+#[tokio::test]
+async fn dockerignore_excludes_database_files() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(".dockerignore");
-    let content = fs::read_to_string(&path).expect("Failed to read .dockerignore");
+    let content = tokio::fs::read_to_string(&path)
+        .await
+        .expect("Failed to read .dockerignore");
     let patterns = parse_dockerignore(&content);
 
     assert!(
@@ -199,10 +208,12 @@ fn dockerignore_excludes_database_files() {
     );
 }
 
-#[test]
-fn dockerignore_excludes_markdown_files() {
+#[tokio::test]
+async fn dockerignore_excludes_markdown_files() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(".dockerignore");
-    let content = fs::read_to_string(&path).expect("Failed to read .dockerignore");
+    let content = tokio::fs::read_to_string(&path)
+        .await
+        .expect("Failed to read .dockerignore");
     let patterns = parse_dockerignore(&content);
 
     assert!(
@@ -219,10 +230,12 @@ fn dockerignore_excludes_markdown_files() {
     );
 }
 
-#[test]
-fn dockerignore_excludes_image_files() {
+#[tokio::test]
+async fn dockerignore_excludes_image_files() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(".dockerignore");
-    let content = fs::read_to_string(&path).expect("Failed to read .dockerignore");
+    let content = tokio::fs::read_to_string(&path)
+        .await
+        .expect("Failed to read .dockerignore");
     let patterns = parse_dockerignore(&content);
 
     assert!(
@@ -235,10 +248,12 @@ fn dockerignore_excludes_image_files() {
     );
 }
 
-#[test]
-fn dockerignore_excludes_env_files() {
+#[tokio::test]
+async fn dockerignore_excludes_env_files() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(".dockerignore");
-    let content = fs::read_to_string(&path).expect("Failed to read .dockerignore");
+    let content = tokio::fs::read_to_string(&path)
+        .await
+        .expect("Failed to read .dockerignore");
     let patterns = parse_dockerignore(&content);
 
     assert!(
@@ -247,10 +262,12 @@ fn dockerignore_excludes_env_files() {
     );
 }
 
-#[test]
-fn dockerignore_excludes_ci_configs() {
+#[tokio::test]
+async fn dockerignore_excludes_ci_configs() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(".dockerignore");
-    let content = fs::read_to_string(&path).expect("Failed to read .dockerignore");
+    let content = tokio::fs::read_to_string(&path)
+        .await
+        .expect("Failed to read .dockerignore");
     let patterns = parse_dockerignore(&content);
 
     assert!(
@@ -263,10 +280,12 @@ fn dockerignore_excludes_ci_configs() {
     );
 }
 
-#[test]
-fn dockerignore_has_valid_syntax() {
+#[tokio::test]
+async fn dockerignore_has_valid_syntax() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(".dockerignore");
-    let content = fs::read_to_string(&path).expect("Failed to read .dockerignore");
+    let content = tokio::fs::read_to_string(&path)
+        .await
+        .expect("Failed to read .dockerignore");
 
     for (line_num, line) in content.lines().enumerate() {
         let trimmed = line.trim();
@@ -294,8 +313,8 @@ fn dockerignore_has_valid_syntax() {
     }
 }
 
-#[test]
-fn dockerignore_pattern_matching_edge_cases() {
+#[tokio::test]
+async fn dockerignore_pattern_matching_edge_cases() {
     // Test the pattern matching logic itself
     let patterns = vec![
         ".git".to_string(),

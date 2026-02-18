@@ -75,7 +75,7 @@ impl Tool for ArduinoUploadTool {
         let sketch_dir = temp_dir.join(sketch_name);
         let ino_path = sketch_dir.join(format!("{}.ino", sketch_name));
 
-        if let Err(e) = std::fs::create_dir_all(&sketch_dir) {
+        if let Err(e) = tokio::fs::create_dir_all(&sketch_dir).await {
             return Ok(ToolResult {
                 success: false,
                 output: format!("Failed to create sketch dir: {}", e),
@@ -83,8 +83,8 @@ impl Tool for ArduinoUploadTool {
             });
         }
 
-        if let Err(e) = std::fs::write(&ino_path, code) {
-            let _ = std::fs::remove_dir_all(&temp_dir);
+        if let Err(e) = tokio::fs::write(&ino_path, code).await {
+            let _ = tokio::fs::remove_dir_all(&temp_dir).await;
             return Ok(ToolResult {
                 success: false,
                 output: format!("Failed to write sketch: {}", e),
@@ -103,7 +103,7 @@ impl Tool for ArduinoUploadTool {
         let compile_output = match compile {
             Ok(o) => o,
             Err(e) => {
-                let _ = std::fs::remove_dir_all(&temp_dir);
+                let _ = tokio::fs::remove_dir_all(&temp_dir).await;
                 return Ok(ToolResult {
                     success: false,
                     output: format!("arduino-cli compile failed: {}", e),
@@ -114,7 +114,7 @@ impl Tool for ArduinoUploadTool {
 
         if !compile_output.status.success() {
             let stderr = String::from_utf8_lossy(&compile_output.stderr);
-            let _ = std::fs::remove_dir_all(&temp_dir);
+            let _ = tokio::fs::remove_dir_all(&temp_dir).await;
             return Ok(ToolResult {
                 success: false,
                 output: format!("Compile failed:\n{}", stderr),
@@ -130,7 +130,7 @@ impl Tool for ArduinoUploadTool {
         let upload_output = match upload {
             Ok(o) => o,
             Err(e) => {
-                let _ = std::fs::remove_dir_all(&temp_dir);
+                let _ = tokio::fs::remove_dir_all(&temp_dir).await;
                 return Ok(ToolResult {
                     success: false,
                     output: format!("arduino-cli upload failed: {}", e),
@@ -139,7 +139,7 @@ impl Tool for ArduinoUploadTool {
             }
         };
 
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 
         if !upload_output.status.success() {
             let stderr = String::from_utf8_lossy(&upload_output.stderr);

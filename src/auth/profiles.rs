@@ -626,8 +626,8 @@ mod tests {
         assert!(!token_set.is_expiring_within(Duration::from_secs(1)));
     }
 
-    #[test]
-    fn store_roundtrip_with_encryption() {
+    #[tokio::test]
+    async fn store_roundtrip_with_encryption() {
         let tmp = TempDir::new().unwrap();
         let store = AuthProfilesStore::new(tmp.path(), true);
 
@@ -661,14 +661,14 @@ mod tests {
             Some("refresh-123")
         );
 
-        let raw = fs::read_to_string(store.path()).unwrap();
+        let raw = tokio::fs::read_to_string(store.path()).await.unwrap();
         assert!(raw.contains("enc2:"));
         assert!(!raw.contains("refresh-123"));
         assert!(!raw.contains("access-123"));
     }
 
-    #[test]
-    fn atomic_write_replaces_file() {
+    #[tokio::test]
+    async fn atomic_write_replaces_file() {
         let tmp = TempDir::new().unwrap();
         let store = AuthProfilesStore::new(tmp.path(), false);
 
@@ -678,7 +678,7 @@ mod tests {
         let path = store.path().to_path_buf();
         assert!(path.exists());
 
-        let contents = fs::read_to_string(path).unwrap();
+        let contents = tokio::fs::read_to_string(path).await.unwrap();
         assert!(contents.contains("\"schema_version\": 1"));
     }
 }

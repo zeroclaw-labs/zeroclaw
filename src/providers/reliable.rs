@@ -45,14 +45,12 @@ fn is_non_retryable(err: &anyhow::Error) -> bool {
         return true;
     }
 
-    let model_catalog_mismatch = msg_lower.contains("model")
+    msg_lower.contains("model")
         && (msg_lower.contains("not found")
             || msg_lower.contains("unknown")
             || msg_lower.contains("unsupported")
             || msg_lower.contains("does not exist")
-            || msg_lower.contains("invalid"));
-
-    model_catalog_mismatch
+            || msg_lower.contains("invalid"))
 }
 
 /// Check if an error is a rate-limit (429) error.

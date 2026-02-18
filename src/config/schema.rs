@@ -3358,8 +3358,8 @@ tool_dispatcher = "xml"
         assert_eq!(parsed.agent.tool_dispatcher, "xml");
     }
 
-    #[test]
-    fn config_save_and_load_tmpdir() {
+    #[tokio::test]
+    async fn config_save_and_load_tmpdir() {
         let dir = std::env::temp_dir().join("zeroclaw_test_config");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -3404,7 +3404,7 @@ tool_dispatcher = "xml"
         config.save().unwrap();
         assert!(config_path.exists());
 
-        let contents = fs::read_to_string(&config_path).unwrap();
+        let contents = tokio::fs::read_to_string(&config_path).await.unwrap();
         let loaded: Config = toml::from_str(&contents).unwrap();
         assert!(loaded
             .api_key
@@ -3419,8 +3419,8 @@ tool_dispatcher = "xml"
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn config_save_encrypts_nested_credentials() {
+    #[tokio::test]
+    async fn config_save_encrypts_nested_credentials() {
         let dir = std::env::temp_dir().join(format!(
             "zeroclaw_test_nested_credentials_{}",
             uuid::Uuid::new_v4()
@@ -3450,7 +3450,9 @@ tool_dispatcher = "xml"
 
         config.save().unwrap();
 
-        let contents = fs::read_to_string(config.config_path.clone()).unwrap();
+        let contents = tokio::fs::read_to_string(config.config_path.clone())
+            .await
+            .unwrap();
         let stored: Config = toml::from_str(&contents).unwrap();
         let store = crate::security::SecretStore::new(&dir, true);
 
@@ -3500,8 +3502,8 @@ tool_dispatcher = "xml"
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn config_save_atomic_cleanup() {
+    #[tokio::test]
+    async fn config_save_atomic_cleanup() {
         let dir =
             std::env::temp_dir().join(format!("zeroclaw_test_config_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
@@ -3518,7 +3520,7 @@ tool_dispatcher = "xml"
         config.default_model = Some("model-b".into());
         config.save().unwrap();
 
-        let contents = fs::read_to_string(&config_path).unwrap();
+        let contents = tokio::fs::read_to_string(&config_path).await.unwrap();
         assert!(contents.contains("model-b"));
 
         let names: Vec<String> = fs::read_dir(&dir)
