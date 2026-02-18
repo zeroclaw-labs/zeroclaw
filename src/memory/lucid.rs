@@ -608,7 +608,7 @@ exit 1
             .iter()
             .any(|e| e.content.contains("Rust should stay local-first")));
 
-        let context_calls = fs::read_to_string(&marker).unwrap_or_default();
+        let context_calls = tokio::fs::read_to_string(&marker).await.unwrap_or_default();
         assert!(
             context_calls.trim().is_empty(),
             "Expected local-hit short-circuit; got calls: {context_calls}"
@@ -669,7 +669,7 @@ exit 1
         assert!(first.is_empty());
         assert!(second.is_empty());
 
-        let calls = fs::read_to_string(&marker).unwrap_or_default();
+        let calls = tokio::fs::read_to_string(&marker).await.unwrap_or_default();
         assert_eq!(calls.lines().count(), 1);
     }
 }

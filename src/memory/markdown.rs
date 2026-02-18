@@ -229,7 +229,6 @@ impl Memory for MarkdownMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs as sync_fs;
     use tempfile::TempDir;
 
     fn temp_workspace() -> (TempDir, MarkdownMemory) {
@@ -256,7 +255,7 @@ mod tests {
         mem.store("pref", "User likes Rust", MemoryCategory::Core, None)
             .await
             .unwrap();
-        let content = sync_fs::read_to_string(mem.core_path()).unwrap();
+        let content = fs::read_to_string(mem.core_path()).await.unwrap();
         assert!(content.contains("User likes Rust"));
     }
 
@@ -267,7 +266,7 @@ mod tests {
             .await
             .unwrap();
         let path = mem.daily_path();
-        let content = sync_fs::read_to_string(path).unwrap();
+        let content = fs::read_to_string(path).await.unwrap();
         assert!(content.contains("Finished tests"));
     }
 

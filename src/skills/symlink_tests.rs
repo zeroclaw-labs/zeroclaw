@@ -4,21 +4,21 @@ mod tests {
     use std::path::Path;
     use tempfile::TempDir;
 
-    #[test]
-    fn test_skills_symlink_unix_edge_cases() {
+    #[tokio::test]
+    async fn test_skills_symlink_unix_edge_cases() {
         let tmp = TempDir::new().unwrap();
         let workspace_dir = tmp.path().join("workspace");
-        std::fs::create_dir_all(&workspace_dir).unwrap();
+        tokio::fs::create_dir_all(&workspace_dir).await.unwrap();
 
         let skills_path = skills_dir(&workspace_dir);
-        std::fs::create_dir_all(&skills_path).unwrap();
+        tokio::fs::create_dir_all(&skills_path).await.unwrap();
 
         // Test case 1: Valid symlink creation on Unix
         #[cfg(unix)]
         {
             let source_dir = tmp.path().join("source_skill");
-            std::fs::create_dir_all(&source_dir).unwrap();
-            std::fs::write(source_dir.join("SKILL.md"), "# Test Skill\nContent").unwrap();
+            tokio::fs::create_dir_all(&source_dir).await.unwrap();
+            tokio::fs::write(source_dir.join("SKILL.md"), "# Test Skill\nContent").await.unwrap();
 
             let dest_link = skills_path.join("linked_skill");
 
@@ -31,7 +31,7 @@ mod tests {
             assert!(dest_link.is_symlink());
 
             // Verify we can read through symlink
-            let content = std::fs::read_to_string(dest_link.join("SKILL.md"));
+            let content = tokio::fs::read_to_string(dest_link.join("SKILL.md")).await;
             assert!(content.is_ok());
             assert!(content.unwrap().contains("Test Skill"));
 
@@ -45,7 +45,7 @@ mod tests {
             );
 
             // But reading through it should fail
-            let content = std::fs::read_to_string(broken_link.join("SKILL.md"));
+            let content = tokio::fs::read_to_string(broken_link.join("SKILL.md")).await;
             assert!(content.is_err());
         }
 
@@ -53,7 +53,7 @@ mod tests {
         #[cfg(windows)]
         {
             let source_dir = tmp.path().join("source_skill");
-            std::fs::create_dir_all(&source_dir).unwrap();
+            tokio::fs::create_dir_all(&source_dir).await.unwrap();
 
             let dest_link = skills_path.join("linked_skill");
 
@@ -64,7 +64,7 @@ mod tests {
                 assert!(!dest_link.exists());
             } else {
                 // Clean up if it succeeded
-                let _ = std::fs::remove_dir(&dest_link);
+                let _ = tokio::fs::remove_dir(&dest_link).await;
             }
         }
 
@@ -80,21 +80,21 @@ mod tests {
         assert!(!empty_skills_path.exists());
     }
 
-    #[test]
-    fn test_skills_symlink_permissions_and_safety() {
+    #[tokio::test]
+    async fn test_skills_symlink_permissions_and_safety() {
         let tmp = TempDir::new().unwrap();
         let workspace_dir = tmp.path().join("workspace");
-        std::fs::create_dir_all(&workspace_dir).unwrap();
+        tokio::fs::create_dir_all(&workspace_dir).await.unwrap();
 
         let skills_path = skills_dir(&workspace_dir);
-        std::fs::create_dir_all(&skills_path).unwrap();
+        tokio::fs::create_dir_all(&skills_path).await.unwrap();
 
         #[cfg(unix)]
         {
             // Test case: Symlink outside workspace should be allowed (user responsibility)
             let outside_dir = tmp.path().join("outside_skill");
-            std::fs::create_dir_all(&outside_dir).unwrap();
-            std::fs::write(outside_dir.join("SKILL.md"), "# Outside Skill\nContent").unwrap();
+            tokio::fs::create_dir_all(&outside_dir).await.unwrap();
+            tokio::fs::write(outside_dir.join("SKILL.md"), "# Outside Skill\nContent").await.unwrap();
 
             let dest_link = skills_path.join("outside_skill");
             let result = std::os::unix::fs::symlink(&outside_dir, &dest_link);
@@ -104,7 +104,7 @@ mod tests {
             );
 
             // Should still be readable
-            let content = std::fs::read_to_string(dest_link.join("SKILL.md"));
+            let content = tokio::fs::read_to_string(dest_link.join("SKILL.md")).await;
             assert!(content.is_ok());
             assert!(content.unwrap().contains("Outside Skill"));
         }

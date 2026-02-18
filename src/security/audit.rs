@@ -335,8 +335,8 @@ mod tests {
 
     // ── §8.1 Log rotation tests ─────────────────────────────
 
-    #[test]
-    fn audit_logger_writes_event_when_enabled() -> Result<()> {
+    #[tokio::test]
+    async fn audit_logger_writes_event_when_enabled() -> Result<()> {
         let tmp = TempDir::new()?;
         let config = AuditConfig {
             enabled: true,
@@ -353,7 +353,7 @@ mod tests {
         let log_path = tmp.path().join("audit.log");
         assert!(log_path.exists(), "audit log file must be created");
 
-        let content = std::fs::read_to_string(&log_path)?;
+        let content = tokio::fs::read_to_string(&log_path).await?;
         assert!(!content.is_empty(), "audit log must not be empty");
 
         let parsed: AuditEvent = serde_json::from_str(content.trim())?;
@@ -361,8 +361,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn audit_log_command_event_writes_structured_entry() -> Result<()> {
+    #[tokio::test]
+    async fn audit_log_command_event_writes_structured_entry() -> Result<()> {
         let tmp = TempDir::new()?;
         let config = AuditConfig {
             enabled: true,
@@ -382,7 +382,7 @@ mod tests {
         })?;
 
         let log_path = tmp.path().join("audit.log");
-        let content = std::fs::read_to_string(&log_path)?;
+        let content = tokio::fs::read_to_string(&log_path).await?;
         let parsed: AuditEvent = serde_json::from_str(content.trim())?;
 
         let action = parsed.action.unwrap();

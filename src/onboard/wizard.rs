@@ -4537,8 +4537,8 @@ mod tests {
 
     // ── scaffold_workspace: personalization ─────────────────────
 
-    #[test]
-    fn scaffold_bakes_user_name_into_files() {
+    #[tokio::test]
+    async fn scaffold_bakes_user_name_into_files() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext {
             user_name: "Alice".into(),
@@ -4546,21 +4546,25 @@ mod tests {
         };
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let user_md = fs::read_to_string(tmp.path().join("USER.md")).unwrap();
+        let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
+            .await
+            .unwrap();
         assert!(
             user_md.contains("**Name:** Alice"),
             "USER.md should contain user name"
         );
 
-        let bootstrap = fs::read_to_string(tmp.path().join("BOOTSTRAP.md")).unwrap();
+        let bootstrap = tokio::fs::read_to_string(tmp.path().join("BOOTSTRAP.md"))
+            .await
+            .unwrap();
         assert!(
             bootstrap.contains("**Alice**"),
             "BOOTSTRAP.md should contain user name"
         );
     }
 
-    #[test]
-    fn scaffold_bakes_timezone_into_files() {
+    #[tokio::test]
+    async fn scaffold_bakes_timezone_into_files() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext {
             timezone: "US/Pacific".into(),
@@ -4568,21 +4572,25 @@ mod tests {
         };
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let user_md = fs::read_to_string(tmp.path().join("USER.md")).unwrap();
+        let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
+            .await
+            .unwrap();
         assert!(
             user_md.contains("**Timezone:** US/Pacific"),
             "USER.md should contain timezone"
         );
 
-        let bootstrap = fs::read_to_string(tmp.path().join("BOOTSTRAP.md")).unwrap();
+        let bootstrap = tokio::fs::read_to_string(tmp.path().join("BOOTSTRAP.md"))
+            .await
+            .unwrap();
         assert!(
             bootstrap.contains("US/Pacific"),
             "BOOTSTRAP.md should contain timezone"
         );
     }
 
-    #[test]
-    fn scaffold_bakes_agent_name_into_files() {
+    #[tokio::test]
+    async fn scaffold_bakes_agent_name_into_files() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext {
             agent_name: "Crabby".into(),
@@ -4590,39 +4598,49 @@ mod tests {
         };
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let identity = fs::read_to_string(tmp.path().join("IDENTITY.md")).unwrap();
+        let identity = tokio::fs::read_to_string(tmp.path().join("IDENTITY.md"))
+            .await
+            .unwrap();
         assert!(
             identity.contains("**Name:** Crabby"),
             "IDENTITY.md should contain agent name"
         );
 
-        let soul = fs::read_to_string(tmp.path().join("SOUL.md")).unwrap();
+        let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
+            .await
+            .unwrap();
         assert!(
             soul.contains("You are **Crabby**"),
             "SOUL.md should contain agent name"
         );
 
-        let agents = fs::read_to_string(tmp.path().join("AGENTS.md")).unwrap();
+        let agents = tokio::fs::read_to_string(tmp.path().join("AGENTS.md"))
+            .await
+            .unwrap();
         assert!(
             agents.contains("Crabby Personal Assistant"),
             "AGENTS.md should contain agent name"
         );
 
-        let heartbeat = fs::read_to_string(tmp.path().join("HEARTBEAT.md")).unwrap();
+        let heartbeat = tokio::fs::read_to_string(tmp.path().join("HEARTBEAT.md"))
+            .await
+            .unwrap();
         assert!(
             heartbeat.contains("Crabby"),
             "HEARTBEAT.md should contain agent name"
         );
 
-        let bootstrap = fs::read_to_string(tmp.path().join("BOOTSTRAP.md")).unwrap();
+        let bootstrap = tokio::fs::read_to_string(tmp.path().join("BOOTSTRAP.md"))
+            .await
+            .unwrap();
         assert!(
             bootstrap.contains("Introduce yourself as Crabby"),
             "BOOTSTRAP.md should contain agent name"
         );
     }
 
-    #[test]
-    fn scaffold_bakes_communication_style() {
+    #[tokio::test]
+    async fn scaffold_bakes_communication_style() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext {
             communication_style: "Be technical and detailed.".into(),
@@ -4630,19 +4648,25 @@ mod tests {
         };
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let soul = fs::read_to_string(tmp.path().join("SOUL.md")).unwrap();
+        let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
+            .await
+            .unwrap();
         assert!(
             soul.contains("Be technical and detailed."),
             "SOUL.md should contain communication style"
         );
 
-        let user_md = fs::read_to_string(tmp.path().join("USER.md")).unwrap();
+        let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
+            .await
+            .unwrap();
         assert!(
             user_md.contains("Be technical and detailed."),
             "USER.md should contain communication style"
         );
 
-        let bootstrap = fs::read_to_string(tmp.path().join("BOOTSTRAP.md")).unwrap();
+        let bootstrap = tokio::fs::read_to_string(tmp.path().join("BOOTSTRAP.md"))
+            .await
+            .unwrap();
         assert!(
             bootstrap.contains("Be technical and detailed."),
             "BOOTSTRAP.md should contain communication style"
@@ -4651,19 +4675,23 @@ mod tests {
 
     // ── scaffold_workspace: defaults when context is empty ──────
 
-    #[test]
-    fn scaffold_uses_defaults_for_empty_context() {
+    #[tokio::test]
+    async fn scaffold_uses_defaults_for_empty_context() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default(); // all empty
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let identity = fs::read_to_string(tmp.path().join("IDENTITY.md")).unwrap();
+        let identity = tokio::fs::read_to_string(tmp.path().join("IDENTITY.md"))
+            .await
+            .unwrap();
         assert!(
             identity.contains("**Name:** ZeroClaw"),
             "should default agent name to ZeroClaw"
         );
 
-        let user_md = fs::read_to_string(tmp.path().join("USER.md")).unwrap();
+        let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
+            .await
+            .unwrap();
         assert!(
             user_md.contains("**Name:** User"),
             "should default user name to User"
@@ -4673,7 +4701,9 @@ mod tests {
             "should default timezone to UTC"
         );
 
-        let soul = fs::read_to_string(tmp.path().join("SOUL.md")).unwrap();
+        let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
+            .await
+            .unwrap();
         assert!(
             soul.contains("Be warm, natural, and clear."),
             "should default communication style"
@@ -4682,8 +4712,8 @@ mod tests {
 
     // ── scaffold_workspace: skip existing files ─────────────────
 
-    #[test]
-    fn scaffold_does_not_overwrite_existing_files() {
+    #[tokio::test]
+    async fn scaffold_does_not_overwrite_existing_files() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext {
             user_name: "Bob".into(),
@@ -4697,7 +4727,7 @@ mod tests {
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
         // SOUL.md should be untouched
-        let soul = fs::read_to_string(&soul_path).unwrap();
+        let soul = tokio::fs::read_to_string(&soul_path).await.unwrap();
         assert!(
             soul.contains("Do not overwrite me"),
             "existing files should not be overwritten"
@@ -4708,14 +4738,16 @@ mod tests {
         );
 
         // But USER.md should be created fresh
-        let user_md = fs::read_to_string(tmp.path().join("USER.md")).unwrap();
+        let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
+            .await
+            .unwrap();
         assert!(user_md.contains("**Name:** Bob"));
     }
 
     // ── scaffold_workspace: idempotent ──────────────────────────
 
-    #[test]
-    fn scaffold_is_idempotent() {
+    #[tokio::test]
+    async fn scaffold_is_idempotent() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext {
             user_name: "Eve".into(),
@@ -4724,19 +4756,23 @@ mod tests {
         };
 
         scaffold_workspace(tmp.path(), &ctx).unwrap();
-        let soul_v1 = fs::read_to_string(tmp.path().join("SOUL.md")).unwrap();
+        let soul_v1 = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
+            .await
+            .unwrap();
 
         // Run again — should not change anything
         scaffold_workspace(tmp.path(), &ctx).unwrap();
-        let soul_v2 = fs::read_to_string(tmp.path().join("SOUL.md")).unwrap();
+        let soul_v2 = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
+            .await
+            .unwrap();
 
         assert_eq!(soul_v1, soul_v2, "scaffold should be idempotent");
     }
 
     // ── scaffold_workspace: all files are non-empty ─────────────
 
-    #[test]
-    fn scaffold_files_are_non_empty() {
+    #[tokio::test]
+    async fn scaffold_files_are_non_empty() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
         scaffold_workspace(tmp.path(), &ctx).unwrap();
@@ -4751,20 +4787,22 @@ mod tests {
             "BOOTSTRAP.md",
             "MEMORY.md",
         ] {
-            let content = fs::read_to_string(tmp.path().join(f)).unwrap();
+            let content = tokio::fs::read_to_string(tmp.path().join(f)).await.unwrap();
             assert!(!content.trim().is_empty(), "{f} should not be empty");
         }
     }
 
     // ── scaffold_workspace: AGENTS.md references on-demand memory
 
-    #[test]
-    fn agents_md_references_on_demand_memory() {
+    #[tokio::test]
+    async fn agents_md_references_on_demand_memory() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let agents = fs::read_to_string(tmp.path().join("AGENTS.md")).unwrap();
+        let agents = tokio::fs::read_to_string(tmp.path().join("AGENTS.md"))
+            .await
+            .unwrap();
         assert!(
             agents.contains("memory_recall"),
             "AGENTS.md should reference memory_recall for on-demand access"
@@ -4777,13 +4815,15 @@ mod tests {
 
     // ── scaffold_workspace: MEMORY.md warns about token cost ────
 
-    #[test]
-    fn memory_md_warns_about_token_cost() {
+    #[tokio::test]
+    async fn memory_md_warns_about_token_cost() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let memory = fs::read_to_string(tmp.path().join("MEMORY.md")).unwrap();
+        let memory = tokio::fs::read_to_string(tmp.path().join("MEMORY.md"))
+            .await
+            .unwrap();
         assert!(
             memory.contains("costs tokens"),
             "MEMORY.md should warn about token cost"
@@ -4796,13 +4836,15 @@ mod tests {
 
     // ── scaffold_workspace: TOOLS.md lists memory_forget ────────
 
-    #[test]
-    fn tools_md_lists_all_builtin_tools() {
+    #[tokio::test]
+    async fn tools_md_lists_all_builtin_tools() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let tools = fs::read_to_string(tmp.path().join("TOOLS.md")).unwrap();
+        let tools = tokio::fs::read_to_string(tmp.path().join("TOOLS.md"))
+            .await
+            .unwrap();
         for tool in &[
             "shell",
             "file_read",
@@ -4826,13 +4868,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn soul_md_includes_emoji_awareness_guidance() {
+    #[tokio::test]
+    async fn soul_md_includes_emoji_awareness_guidance() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let soul = fs::read_to_string(tmp.path().join("SOUL.md")).unwrap();
+        let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
+            .await
+            .unwrap();
         assert!(
             soul.contains("Use emojis naturally (0-2 max"),
             "SOUL.md should include emoji usage guidance"
@@ -4845,8 +4889,8 @@ mod tests {
 
     // ── scaffold_workspace: special characters in names ─────────
 
-    #[test]
-    fn scaffold_handles_special_characters_in_names() {
+    #[tokio::test]
+    async fn scaffold_handles_special_characters_in_names() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext {
             user_name: "José María".into(),
@@ -4856,17 +4900,21 @@ mod tests {
         };
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let user_md = fs::read_to_string(tmp.path().join("USER.md")).unwrap();
+        let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
+            .await
+            .unwrap();
         assert!(user_md.contains("José María"));
 
-        let soul = fs::read_to_string(tmp.path().join("SOUL.md")).unwrap();
+        let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
+            .await
+            .unwrap();
         assert!(soul.contains("ZeroClaw-v2"));
     }
 
     // ── scaffold_workspace: full personalization round-trip ─────
 
-    #[test]
-    fn scaffold_full_personalization() {
+    #[tokio::test]
+    async fn scaffold_full_personalization() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext {
             user_name: "Argenis".into(),
@@ -4879,27 +4927,39 @@ mod tests {
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
         // Verify every file got personalized
-        let identity = fs::read_to_string(tmp.path().join("IDENTITY.md")).unwrap();
+        let identity = tokio::fs::read_to_string(tmp.path().join("IDENTITY.md"))
+            .await
+            .unwrap();
         assert!(identity.contains("**Name:** Claw"));
 
-        let soul = fs::read_to_string(tmp.path().join("SOUL.md")).unwrap();
+        let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
+            .await
+            .unwrap();
         assert!(soul.contains("You are **Claw**"));
         assert!(soul.contains("Be friendly, human, and conversational"));
 
-        let user_md = fs::read_to_string(tmp.path().join("USER.md")).unwrap();
+        let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
+            .await
+            .unwrap();
         assert!(user_md.contains("**Name:** Argenis"));
         assert!(user_md.contains("**Timezone:** US/Eastern"));
         assert!(user_md.contains("Be friendly, human, and conversational"));
 
-        let agents = fs::read_to_string(tmp.path().join("AGENTS.md")).unwrap();
+        let agents = tokio::fs::read_to_string(tmp.path().join("AGENTS.md"))
+            .await
+            .unwrap();
         assert!(agents.contains("Claw Personal Assistant"));
 
-        let bootstrap = fs::read_to_string(tmp.path().join("BOOTSTRAP.md")).unwrap();
+        let bootstrap = tokio::fs::read_to_string(tmp.path().join("BOOTSTRAP.md"))
+            .await
+            .unwrap();
         assert!(bootstrap.contains("**Argenis**"));
         assert!(bootstrap.contains("US/Eastern"));
         assert!(bootstrap.contains("Introduce yourself as Claw"));
 
-        let heartbeat = fs::read_to_string(tmp.path().join("HEARTBEAT.md")).unwrap();
+        let heartbeat = tokio::fs::read_to_string(tmp.path().join("HEARTBEAT.md"))
+            .await
+            .unwrap();
         assert!(heartbeat.contains("Claw"));
     }
 

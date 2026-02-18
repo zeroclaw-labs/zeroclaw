@@ -1381,8 +1381,8 @@ mod tests {
         assert_eq!(normalize_max_keys(1, 10_000), 1);
     }
 
-    #[test]
-    fn persist_pairing_tokens_writes_config_tokens() {
+    #[tokio::test]
+    async fn persist_pairing_tokens_writes_config_tokens() {
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("config.toml");
         let workspace_path = temp.path().join("workspace");
@@ -1400,7 +1400,7 @@ mod tests {
         let shared_config = Arc::new(Mutex::new(config));
         persist_pairing_tokens(&shared_config, &guard).unwrap();
 
-        let saved = std::fs::read_to_string(config_path).unwrap();
+        let saved = tokio::fs::read_to_string(config_path).await.unwrap();
         let parsed: Config = toml::from_str(&saved).unwrap();
         assert_eq!(parsed.gateway.paired_tokens.len(), 1);
         let persisted = &parsed.gateway.paired_tokens[0];
