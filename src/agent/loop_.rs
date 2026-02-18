@@ -16,8 +16,7 @@ use std::time::Instant;
 use uuid::Uuid;
 
 /// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
-/// Prefer passing the config-driven value via `run_tool_call_loop`; this constant is only
-/// used when callers omit the parameter.
+/// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 
 static SENSITIVE_KEY_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
@@ -202,15 +201,25 @@ async fn auto_compact_history(
     Ok(true)
 }
 
-/// Build context preamble by searching memory for relevant entries
-async fn build_context(mem: &dyn Memory, user_msg: &str) -> String {
+/// Build context preamble by searching memory for relevant entries.
+/// Entries with a hybrid score below `min_relevance_score` are dropped to
+/// prevent unrelated memories from bleeding into the conversation.
+async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f64) -> String {
     let mut context = String::new();
 
     // Pull relevant memories for this message
     if let Ok(entries) = mem.recall(user_msg, 5, None).await {
-        if !entries.is_empty() {
+        let relevant: Vec<_> = entries
+            .iter()
+            .filter(|e| match e.score {
+                Some(score) => score >= min_relevance_score,
+                None => true,
+            })
+            .collect();
+
+        if !relevant.is_empty() {
             context.push_str("[Memory context]\n");
-            for entry in &entries {
+            for entry in &relevant {
                 let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
             }
             context.push('\n');
@@ -598,6 +607,7 @@ pub(crate) async fn agent_turn(
     model: &str,
     temperature: f64,
     silent: bool,
+    max_tool_iterations: usize,
 ) -> Result<String> {
     run_tool_call_loop(
         provider,
@@ -610,7 +620,7 @@ pub(crate) async fn agent_turn(
         silent,
         None,
         "channel",
-        DEFAULT_MAX_TOOL_ITERATIONS,
+        max_tool_iterations,
     )
     .await
 }
@@ -631,6 +641,12 @@ pub(crate) async fn run_tool_call_loop(
     channel_name: &str,
     max_tool_iterations: usize,
 ) -> Result<String> {
+    let max_iterations = if max_tool_iterations == 0 {
+        DEFAULT_MAX_TOOL_ITERATIONS
+    } else {
+        max_tool_iterations
+    };
+
     // Build native tool definitions once if the provider supports them.
     let use_native_tools = provider.supports_native_tools() && !tools_registry.is_empty();
     let tool_definitions = if use_native_tools {
@@ -639,7 +655,7 @@ pub(crate) async fn run_tool_call_loop(
         Vec::new()
     };
 
-    for _iteration in 0..max_tool_iterations {
+    for _iteration in 0..max_iterations {
         observer.record_event(&ObserverEvent::LlmRequest {
             provider: provider_name.to_string(),
             model: model.to_string(),
@@ -857,7 +873,7 @@ pub(crate) async fn run_tool_call_loop(
         }
     }
 
-    anyhow::bail!("Agent exceeded maximum tool iterations ({max_tool_iterations})")
+    anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
 }
 
 /// Build the tool instruction block for the system prompt so the LLM knows
@@ -1142,7 +1158,8 @@ pub async fn run(
         }
 
         // Inject memory + hardware RAG context into user message
-        let mem_context = build_context(mem.as_ref(), &msg).await;
+        let mem_context =
+            build_context(mem.as_ref(), &msg, config.memory.min_relevance_score).await;
         let rag_limit = if config.agent.compact_context { 2 } else { 5 };
         let hw_context = hardware_rag
             .as_ref()
@@ -1270,7 +1287,8 @@ pub async fn run(
             }
 
             // Inject memory + hardware RAG context into user message
-            let mem_context = build_context(mem.as_ref(), &user_input).await;
+            let mem_context =
+                build_context(mem.as_ref(), &user_input, config.memory.min_relevance_score).await;
             let rag_limit = if config.agent.compact_context { 2 } else { 5 };
             let hw_context = hardware_rag
                 .as_ref()
@@ -1487,7 +1505,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     );
     system_prompt.push_str(&build_tool_instructions(&tools_registry));
 
-    let mem_context = build_context(mem.as_ref(), message).await;
+    let mem_context = build_context(mem.as_ref(), message, config.memory.min_relevance_score).await;
     let rag_limit = if config.agent.compact_context { 2 } else { 5 };
     let hw_context = hardware_rag
         .as_ref()
@@ -1514,6 +1532,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &model_name,
         config.default_temperature,
         true,
+        config.agent.max_tool_iterations,
     )
     .await
 }

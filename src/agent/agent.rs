@@ -271,7 +271,10 @@ impl Agent {
             .memory(memory)
             .observer(observer)
             .tool_dispatcher(tool_dispatcher)
-            .memory_loader(Box::new(DefaultMemoryLoader::default()))
+            .memory_loader(Box::new(DefaultMemoryLoader::new(
+                5,
+                config.memory.min_relevance_score,
+            )))
             .prompt_builder(SystemPromptBuilder::with_defaults())
             .config(config.agent.clone())
             .model_name(model_name)
