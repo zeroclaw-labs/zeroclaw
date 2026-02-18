@@ -7,6 +7,7 @@ module.exports = async ({ github, context, core }) => {
   const pullRequest = context.payload.pull_request;
   const target = issue ?? pullRequest;
   async function loadContributorTierPolicy() {
+    const policyPath = process.env.LABEL_POLICY_PATH || ".github/label-policy.json";
     const fallback = {
       contributorTierColor: "2ED9FF",
       contributorTierRules: [
@@ -20,7 +21,7 @@ module.exports = async ({ github, context, core }) => {
       const { data } = await github.rest.repos.getContent({
         owner,
         repo,
-        path: ".github/label-policy.json",
+        path: policyPath,
         ref: context.payload.repository?.default_branch || "main",
       });
       const json = JSON.parse(Buffer.from(data.content, "base64").toString("utf8"));
@@ -34,7 +35,7 @@ module.exports = async ({ github, context, core }) => {
       }
       return { contributorTierColor, contributorTierRules };
     } catch (error) {
-      core.warning(`failed to load .github/label-policy.json, using fallback policy: ${error.message}`);
+      core.warning(`failed to load ${policyPath}, using fallback policy: ${error.message}`);
       return fallback;
     }
   }

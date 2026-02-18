@@ -26,6 +26,8 @@ jobs:
 
       - name: Apply contributor tier label for issue author
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          LABEL_POLICY_PATH: .github/label-policy.json
         with:
           script: |
             const script = require('./.github/workflows/scripts/pr_auto_response_contributor_tier.js');
