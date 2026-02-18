@@ -466,6 +466,16 @@ fn is_root() -> bool {
 /// Returns error if user exists but has unexpected properties.
 fn check_zeroclaw_user() -> Result<()> {
     let output = Command::new("getent").args(["passwd", "zeroclaw"]).output();
+    let is_alpine = Path::new("/etc/alpine-release").exists();
+
+    let (del_cmd, add_cmd) = if is_alpine {
+        (
+            "deluser zeroclaw",
+            "adduser -S -s /sbin/nologin -H zeroclaw",
+        )
+    } else {
+        ("userdel zeroclaw", "useradd -r -s /sbin/nologin zeroclaw")
+    };
 
     match output {
         Ok(output) if output.status.success() => {
@@ -479,18 +489,29 @@ fn check_zeroclaw_user() -> Result<()> {
 
                 if uid.parse::<u32>().unwrap_or(999) >= 1000 {
                     bail!(
-                        "User 'zeroclaw' exists but has unexpected UID {} (expected system UID < 1000). \
-                         Please recreate the user with: sudo userdel zeroclaw && sudo useradd -r -s /sbin/nologin zeroclaw",
-                        uid
+                        "User 'zeroclaw' exists but has unexpected UID {} (expected system UID < 1000).\n\
+                         Recreate with: sudo {} && sudo {}",
+                        uid, del_cmd, add_cmd
                     );
                 }
 
                 if !shell.contains("nologin") && !shell.contains("false") {
                     bail!(
-                        "User 'zeroclaw' exists but has unexpected shell '{}'. \
-                         Expected nologin/false for security. Please recreate the user with: \
-                         sudo usermod -s /sbin/nologin zeroclaw",
-                        shell
+                        "User 'zeroclaw' exists but has unexpected shell '{}'.\n\
+                         Expected nologin/false for security. Fix with: sudo {} && sudo {}",
+                        shell,
+                        del_cmd,
+                        add_cmd
+                    );
+                }
+
+                if !shell.contains("nologin") && !shell.contains("false") {
+                    bail!(
+                        "User 'zeroclaw' exists but has unexpected shell '{}'.\n\
+                         Expected nologin/false for security. Fix with: sudo {} && sudo {}",
+                        shell,
+                        del_cmd,
+                        add_cmd
                     );
                 }
 
@@ -507,6 +528,42 @@ fn check_zeroclaw_user() -> Result<()> {
         }
         _ => Ok(()),
     }
+}
+
+fn ensure_zeroclaw_user() -> Result<()> {
+    let output = Command::new("getent").args(["passwd", "zeroclaw"]).output();
+    if let Ok(output) = output {
+        if output.status.success() {
+            return check_zeroclaw_user();
+        }
+    }
+
+    let is_alpine = Path::new("/etc/alpine-release").exists();
+
+    if is_alpine {
+        let output = Command::new("adduser")
+            .args(["-S", "-s", "/sbin/nologin", "-H", "-D", "zeroclaw"])
+            .output()
+            .context("Failed to create zeroclaw user")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("Failed to create zeroclaw user: {}", stderr.trim());
+        }
+    } else {
+        let output = Command::new("useradd")
+            .args(["-r", "-s", "/sbin/nologin", "zeroclaw"])
+            .output()
+            .context("Failed to create zeroclaw user")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("Failed to create zeroclaw user: {}", stderr.trim());
+        }
+    }
+
+    println!("✅ Created system user: zeroclaw");
+    Ok(())
 }
 
 /// Change ownership of a path to zeroclaw:zeroclaw
@@ -583,7 +640,7 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
         );
     }
 
-    check_zeroclaw_user()?;
+    ensure_zeroclaw_user()?;
 
     let exe = std::env::current_exe().context("Failed to resolve current executable")?;
     warn_if_binary_in_home(&exe);
