@@ -1148,8 +1148,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .clone()
         .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
     let temperature = config.default_temperature;
-    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory(
+    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
         &config.memory,
+        Some(&config.storage.provider.config),
         &config.workspace_dir,
         config.api_key.as_deref(),
     )?);
@@ -1382,9 +1383,13 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     println!("🦀 ZeroClaw Channel Server");
     println!("  🤖 Model:    {model}");
+    let effective_backend = memory::effective_memory_backend_name(
+        &config.memory.backend,
+        Some(&config.storage.provider.config),
+    );
     println!(
         "  🧠 Memory:   {} (auto-save: {})",
-        config.memory.backend,
+        effective_backend,
         if config.memory.auto_save { "on" } else { "off" }
     );
     println!(

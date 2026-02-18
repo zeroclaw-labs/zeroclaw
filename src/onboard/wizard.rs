@@ -2,7 +2,7 @@ use crate::config::schema::{DingTalkConfig, IrcConfig, QQConfig, StreamMode, Wha
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
     HeartbeatConfig, IMessageConfig, MatrixConfig, MemoryConfig, ObservabilityConfig,
-    RuntimeConfig, SecretsConfig, SlackConfig, TelegramConfig, WebhookConfig,
+    RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig, TelegramConfig, WebhookConfig,
 };
 use crate::hardware::{self, HardwareConfig};
 use crate::memory::{
@@ -125,6 +125,7 @@ pub fn run_wizard() -> Result<Config> {
         cron: crate::config::CronConfig::default(),
         channels_config,
         memory: memory_config, // User-selected memory backend
+        storage: StorageConfig::default(),
         tunnel: tunnel_config,
         gateway: crate::config::GatewayConfig::default(),
         composio: composio_config,
@@ -347,6 +348,7 @@ pub fn run_quick_setup(
         cron: crate::config::CronConfig::default(),
         channels_config: ChannelsConfig::default(),
         memory: memory_config,
+        storage: StorageConfig::default(),
         tunnel: crate::config::TunnelConfig::default(),
         gateway: crate::config::GatewayConfig::default(),
         composio: ComposioConfig::default(),

@@ -576,6 +576,10 @@ async fn main() -> Result<()> {
             println!("📊 Observability:  {}", config.observability.backend);
             println!("🛡️  Autonomy:      {:?}", config.autonomy.level);
             println!("⚙️  Runtime:       {}", config.runtime.kind);
+            let effective_memory_backend = memory::effective_memory_backend_name(
+                &config.memory.backend,
+                Some(&config.storage.provider.config),
+            );
             println!(
                 "💓 Heartbeat:      {}",
                 if config.heartbeat.enabled {
@@ -586,7 +590,7 @@ async fn main() -> Result<()> {
             );
             println!(
                 "🧠 Memory:         {} (auto-save: {})",
-                config.memory.backend,
+                effective_memory_backend,
                 if config.memory.auto_save { "on" } else { "off" }
             );
 

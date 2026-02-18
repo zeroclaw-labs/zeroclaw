@@ -82,6 +82,7 @@ prost = { version = "0.14", default-features = false }
 
 # Memory / persistence
 rusqlite = { version = "0.38", features = ["bundled"] }
+postgres = { version = "0.19", features = ["with-chrono-0_4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 chrono-tz = "0.10"
 cron = "0.15"

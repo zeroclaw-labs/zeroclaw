@@ -229,8 +229,9 @@ impl Agent {
             &config.workspace_dir,
         ));
 
-        let memory: Arc<dyn Memory> = Arc::from(memory::create_memory(
+        let memory: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
             &config.memory,
+            Some(&config.storage.provider.config),
             &config.workspace_dir,
             config.api_key.as_deref(),
         )?);

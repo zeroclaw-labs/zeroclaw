@@ -64,6 +64,9 @@ pub struct Config {
     pub memory: MemoryConfig,
 
     #[serde(default)]
+    pub storage: StorageConfig,
+
+    #[serde(default)]
     pub tunnel: TunnelConfig,
 
     #[serde(default)]
@@ -771,10 +774,73 @@ impl Default for WebSearchConfig {
 
 // ── Memory ───────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StorageConfig {
+    #[serde(default)]
+    pub provider: StorageProviderSection,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StorageProviderSection {
+    #[serde(default)]
+    pub config: StorageProviderConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageProviderConfig {
+    /// Storage engine key (e.g. "postgres", "sqlite").
+    #[serde(default)]
+    pub provider: String,
+
+    /// Connection URL for remote providers.
+    /// Accepts legacy aliases: dbURL, database_url, databaseUrl.
+    #[serde(
+        default,
+        alias = "dbURL",
+        alias = "database_url",
+        alias = "databaseUrl"
+    )]
+    pub db_url: Option<String>,
+
+    /// Database schema for SQL backends.
+    #[serde(default = "default_storage_schema")]
+    pub schema: String,
+
+    /// Table name for memory entries.
+    #[serde(default = "default_storage_table")]
+    pub table: String,
+
+    /// Optional connection timeout in seconds for remote providers.
+    #[serde(default)]
+    pub connect_timeout_secs: Option<u64>,
+}
+
+fn default_storage_schema() -> String {
+    "public".into()
+}
+
+fn default_storage_table() -> String {
+    "memories".into()
+}
+
+impl Default for StorageProviderConfig {
+    fn default() -> Self {
+        Self {
+            provider: String::new(),
+            db_url: None,
+            schema: default_storage_schema(),
+            table: default_storage_table(),
+            connect_timeout_secs: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct MemoryConfig {
-    /// "sqlite" | "lucid" | "markdown" | "none" (`none` = explicit no-op memory)
+    /// "sqlite" | "lucid" | "postgres" | "markdown" | "none" (`none` = explicit no-op memory)
+    ///
+    /// `postgres` requires `[storage.provider.config]` with `db_url` (`dbURL` alias supported).
     pub backend: String,
     /// Auto-save conversation context to memory
     pub auto_save: bool,
@@ -1844,6 +1910,7 @@ impl Default for Config {
             cron: CronConfig::default(),
             channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
+            storage: StorageConfig::default(),
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
             composio: ComposioConfig::default(),
@@ -2113,6 +2180,12 @@ impl Config {
                 "config.web_search.brave_api_key",
             )?;
 
+            decrypt_optional_secret(
+                &store,
+                &mut config.storage.provider.config.db_url,
+                "config.storage.provider.config.db_url",
+            )?;
+
             for agent in config.agents.values_mut() {
                 decrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
             }
@@ -2266,6 +2339,31 @@ impl Config {
                 }
             }
         }
+
+        // Storage provider key (optional backend override): ZEROCLAW_STORAGE_PROVIDER
+        if let Ok(provider) = std::env::var("ZEROCLAW_STORAGE_PROVIDER") {
+            let provider = provider.trim();
+            if !provider.is_empty() {
+                self.storage.provider.config.provider = provider.to_string();
+            }
+        }
+
+        // Storage connection URL (for remote backends): ZEROCLAW_STORAGE_DB_URL
+        if let Ok(db_url) = std::env::var("ZEROCLAW_STORAGE_DB_URL") {
+            let db_url = db_url.trim();
+            if !db_url.is_empty() {
+                self.storage.provider.config.db_url = Some(db_url.to_string());
+            }
+        }
+
+        // Storage connect timeout: ZEROCLAW_STORAGE_CONNECT_TIMEOUT_SECS
+        if let Ok(timeout_secs) = std::env::var("ZEROCLAW_STORAGE_CONNECT_TIMEOUT_SECS") {
+            if let Ok(timeout_secs) = timeout_secs.parse::<u64>() {
+                if timeout_secs > 0 {
+                    self.storage.provider.config.connect_timeout_secs = Some(timeout_secs);
+                }
+            }
+        }
     }
 
     pub fn save(&self) -> Result<()> {
@@ -2294,6 +2392,12 @@ impl Config {
             &store,
             &mut config_to_save.web_search.brave_api_key,
             "config.web_search.brave_api_key",
+        )?;
+
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.storage.provider.config.db_url,
+            "config.storage.provider.config.db_url",
         )?;
 
         for agent in config_to_save.agents.values_mut() {
@@ -2484,6 +2588,16 @@ default_temperature = 0.7
     }
 
     #[test]
+    fn storage_provider_config_defaults() {
+        let storage = StorageConfig::default();
+        assert!(storage.provider.config.provider.is_empty());
+        assert!(storage.provider.config.db_url.is_none());
+        assert_eq!(storage.provider.config.schema, "public");
+        assert_eq!(storage.provider.config.table, "memories");
+        assert!(storage.provider.config.connect_timeout_secs.is_none());
+    }
+
+    #[test]
     fn channels_config_default() {
         let c = ChannelsConfig::default();
         assert!(c.cli);
@@ -2556,6 +2670,7 @@ default_temperature = 0.7
                 qq: None,
             },
             memory: MemoryConfig::default(),
+            storage: StorageConfig::default(),
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
             composio: ComposioConfig::default(),
@@ -2613,6 +2728,33 @@ default_temperature = 0.7
     }
 
     #[test]
+    fn storage_provider_dburl_alias_deserializes() {
+        let raw = r#"
+default_temperature = 0.7
+
+[storage.provider.config]
+provider = "postgres"
+dbURL = "postgres://postgres:postgres@localhost:5432/zeroclaw"
+schema = "public"
+table = "memories"
+connect_timeout_secs = 12
+"#;
+
+        let parsed: Config = toml::from_str(raw).unwrap();
+        assert_eq!(parsed.storage.provider.config.provider, "postgres");
+        assert_eq!(
+            parsed.storage.provider.config.db_url.as_deref(),
+            Some("postgres://postgres:postgres@localhost:5432/zeroclaw")
+        );
+        assert_eq!(parsed.storage.provider.config.schema, "public");
+        assert_eq!(parsed.storage.provider.config.table, "memories");
+        assert_eq!(
+            parsed.storage.provider.config.connect_timeout_secs,
+            Some(12)
+        );
+    }
+
+    #[test]
     fn agent_config_defaults() {
         let cfg = AgentConfig::default();
         assert!(!cfg.compact_context);
@@ -2667,6 +2809,7 @@ tool_dispatcher = "xml"
             cron: CronConfig::default(),
             channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
+            storage: StorageConfig::default(),
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
             composio: ComposioConfig::default(),
@@ -2715,6 +2858,7 @@ tool_dispatcher = "xml"
         config.composio.api_key = Some("composio-credential".into());
         config.browser.computer_use.api_key = Some("browser-credential".into());
         config.web_search.brave_api_key = Some("brave-credential".into());
+        config.storage.provider.config.db_url = Some("postgres://user:pw@host/db".into());
 
         config.agents.insert(
             "worker".into(),
@@ -2769,6 +2913,13 @@ tool_dispatcher = "xml"
         let worker_encrypted = worker.api_key.as_deref().unwrap();
         assert!(crate::security::SecretStore::is_encrypted(worker_encrypted));
         assert_eq!(store.decrypt(worker_encrypted).unwrap(), "agent-credential");
+
+        let storage_db_url = stored.storage.provider.config.db_url.as_deref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(storage_db_url));
+        assert_eq!(
+            store.decrypt(storage_db_url).unwrap(),
+            "postgres://user:pw@host/db"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -3925,6 +4076,32 @@ default_model = "legacy-model"
 
         std::env::remove_var("WEB_SEARCH_MAX_RESULTS");
         std::env::remove_var("WEB_SEARCH_TIMEOUT_SECS");
+    }
+
+    #[test]
+    fn env_override_storage_provider_config() {
+        let _env_guard = env_override_test_guard();
+        let mut config = Config::default();
+
+        std::env::set_var("ZEROCLAW_STORAGE_PROVIDER", "postgres");
+        std::env::set_var("ZEROCLAW_STORAGE_DB_URL", "postgres://example/db");
+        std::env::set_var("ZEROCLAW_STORAGE_CONNECT_TIMEOUT_SECS", "15");
+
+        config.apply_env_overrides();
+
+        assert_eq!(config.storage.provider.config.provider, "postgres");
+        assert_eq!(
+            config.storage.provider.config.db_url.as_deref(),
+            Some("postgres://example/db")
+        );
+        assert_eq!(
+            config.storage.provider.config.connect_timeout_secs,
+            Some(15)
+        );
+
+        std::env::remove_var("ZEROCLAW_STORAGE_PROVIDER");
+        std::env::remove_var("ZEROCLAW_STORAGE_DB_URL");
+        std::env::remove_var("ZEROCLAW_STORAGE_CONNECT_TIMEOUT_SECS");
     }
 
     #[test]

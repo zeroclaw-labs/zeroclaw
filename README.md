@@ -309,7 +309,7 @@ Every subsystem is a **trait** — swap implementations with a config change, ze
 |-----------|-------|------------|--------|
 | **AI Models** | `Provider` | Provider catalog via `zeroclaw providers` (currently 28 built-ins + aliases, plus custom endpoints) | `custom:https://your-api.com` (OpenAI-compatible) or `anthropic-custom:https://your-api.com` |
 | **Channels** | `Channel` | CLI, Telegram, Discord, Slack, Mattermost, iMessage, Matrix, Signal, WhatsApp, Email, IRC, Lark, DingTalk, QQ, Webhook | Any messaging API |
-| **Memory** | `Memory` | SQLite hybrid search, Lucid bridge, Markdown files, explicit `none` backend, snapshot/hydrate, optional response cache | Any persistence backend |
+| **Memory** | `Memory` | SQLite hybrid search, PostgreSQL backend (configurable storage provider), Lucid bridge, Markdown files, explicit `none` backend, snapshot/hydrate, optional response cache | Any persistence backend |
 | **Tools** | `Tool` | shell/file/memory, cron/schedule, git, pushover, browser, http_request, screenshot/image_info, composio (opt-in), delegate, hardware tools | Any capability |
 | **Observability** | `Observer` | Noop, Log, Multi | Prometheus, OTel |
 | **Runtime** | `RuntimeAdapter` | Native, Docker (sandboxed) | Additional runtimes can be added via adapter; unsupported kinds fail fast |
@@ -345,13 +345,24 @@ The agent automatically recalls, saves, and manages memory via tools.
 
 ```toml
 [memory]
-backend = "sqlite"             # "sqlite", "lucid", "markdown", "none"
+backend = "sqlite"             # "sqlite", "lucid", "postgres", "markdown", "none"
 auto_save = true
 embedding_provider = "none"    # "none", "openai", "custom:https://..."
 vector_weight = 0.7
 keyword_weight = 0.3
 
 # backend = "none" uses an explicit no-op memory backend (no persistence)
+
+# Optional: storage-provider override for remote memory backends.
+# When provider = "postgres", ZeroClaw uses PostgreSQL for memory persistence.
+# The db_url key also accepts alias `dbURL` for backward compatibility.
+#
+# [storage.provider.config]
+# provider = "postgres"
+# db_url = "postgres://user:password@host:5432/zeroclaw"
+# schema = "public"
+# table = "memories"
+# connect_timeout_secs = 15
 
 # Optional for backend = "sqlite": max seconds to wait when opening the DB (e.g. file locked). Omit or leave unset for no timeout.
 # sqlite_open_timeout_secs = 30
@@ -493,13 +504,21 @@ default_temperature = 0.7
 # default_provider = "anthropic-custom:https://your-api.com"
 
 [memory]
-backend = "sqlite"             # "sqlite", "lucid", "markdown", "none"
+backend = "sqlite"             # "sqlite", "lucid", "postgres", "markdown", "none"
 auto_save = true
 embedding_provider = "none"    # "none", "openai", "custom:https://..."
 vector_weight = 0.7
 keyword_weight = 0.3
 
 # backend = "none" disables persistent memory via no-op backend
+
+# Optional remote storage-provider override (PostgreSQL example)
+# [storage.provider.config]
+# provider = "postgres"
+# db_url = "postgres://user:password@host:5432/zeroclaw"
+# schema = "public"
+# table = "memories"
+# connect_timeout_secs = 15
 
 [gateway]
 port = 3000                    # default
