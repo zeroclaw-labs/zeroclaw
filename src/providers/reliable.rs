@@ -211,9 +211,11 @@ impl Provider for ReliableProvider {
                             }
 
                             if non_retryable {
+                                let sanitized_error = super::sanitize_api_error(&e.to_string());
                                 tracing::warn!(
                                     provider = provider_name,
                                     model = *current_model,
+                                    error = %sanitized_error,
                                     "Non-retryable error, moving on"
                                 );
                                 break;
@@ -315,9 +317,11 @@ impl Provider for ReliableProvider {
                             }
 
                             if non_retryable {
+                                let sanitized_error = super::sanitize_api_error(&e.to_string());
                                 tracing::warn!(
                                     provider = provider_name,
                                     model = *current_model,
+                                    error = %sanitized_error,
                                     "Non-retryable error, moving on"
                                 );
                                 break;
@@ -419,9 +423,11 @@ impl Provider for ReliableProvider {
                             }
 
                             if non_retryable {
+                                let sanitized_error = super::sanitize_api_error(&e.to_string());
                                 tracing::warn!(
                                     provider = provider_name,
                                     model = *current_model,
+                                    error = %sanitized_error,
                                     "Non-retryable error, moving on"
                                 );
                                 break;
