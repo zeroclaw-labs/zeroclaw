@@ -1301,6 +1301,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             mm.channel_id.clone(),
             mm.allowed_users.clone(),
             mm.thread_replies.unwrap_or(true),
+            mm.mention_only.unwrap_or(false),
         )));
     }
 

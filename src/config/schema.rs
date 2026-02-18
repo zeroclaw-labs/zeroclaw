@@ -1573,6 +1573,10 @@ pub struct MattermostConfig {
     /// When false, replies go to the channel root.
     #[serde(default)]
     pub thread_replies: Option<bool>,
+    /// When true, only respond to messages that @-mention the bot.
+    /// Other messages in the channel are silently ignored.
+    #[serde(default)]
+    pub mention_only: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

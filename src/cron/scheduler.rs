@@ -306,6 +306,7 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 mm.channel_id.clone(),
                 mm.allowed_users.clone(),
                 mm.thread_replies.unwrap_or(true),
+                mm.mention_only.unwrap_or(false),
             );
             channel.send(&SendMessage::new(output, target)).await?;
         }
