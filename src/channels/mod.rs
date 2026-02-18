@@ -1351,11 +1351,13 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     if let Some(ref mx) = config.channels_config.matrix {
         channels.push((
             "Matrix",
-            Arc::new(MatrixChannel::new(
+            Arc::new(MatrixChannel::new_with_session_hint(
                 mx.homeserver.clone(),
                 mx.access_token.clone(),
                 mx.room_id.clone(),
                 mx.allowed_users.clone(),
+                mx.user_id.clone(),
+                mx.device_id.clone(),
             )),
         ));
     }
@@ -1676,11 +1678,13 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
 
     if let Some(ref mx) = config.channels_config.matrix {
-        channels.push(Arc::new(MatrixChannel::new(
+        channels.push(Arc::new(MatrixChannel::new_with_session_hint(
             mx.homeserver.clone(),
             mx.access_token.clone(),
             mx.room_id.clone(),
             mx.allowed_users.clone(),
+            mx.user_id.clone(),
+            mx.device_id.clone(),
         )));
     }
 

@@ -2091,6 +2091,10 @@ pub struct IMessageConfig {
 pub struct MatrixConfig {
     pub homeserver: String,
     pub access_token: String,
+    #[serde(default)]
+    pub user_id: Option<String>,
+    #[serde(default)]
+    pub device_id: Option<String>,
     pub room_id: String,
     pub allowed_users: Vec<String>,
 }
@@ -3621,6 +3625,8 @@ tool_dispatcher = "xml"
         let mc = MatrixConfig {
             homeserver: "https://matrix.org".into(),
             access_token: "syt_token_abc".into(),
+            user_id: Some("@bot:matrix.org".into()),
+            device_id: Some("DEVICE123".into()),
             room_id: "!room123:matrix.org".into(),
             allowed_users: vec!["@user:matrix.org".into()],
         };
@@ -3628,6 +3634,8 @@ tool_dispatcher = "xml"
         let parsed: MatrixConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.homeserver, "https://matrix.org");
         assert_eq!(parsed.access_token, "syt_token_abc");
+        assert_eq!(parsed.user_id.as_deref(), Some("@bot:matrix.org"));
+        assert_eq!(parsed.device_id.as_deref(), Some("DEVICE123"));
         assert_eq!(parsed.room_id, "!room123:matrix.org");
         assert_eq!(parsed.allowed_users.len(), 1);
     }
@@ -3637,6 +3645,8 @@ tool_dispatcher = "xml"
         let mc = MatrixConfig {
             homeserver: "https://synapse.local:8448".into(),
             access_token: "tok".into(),
+            user_id: None,
+            device_id: None,
             room_id: "!abc:synapse.local".into(),
             allowed_users: vec!["@admin:synapse.local".into(), "*".into()],
         };
@@ -3644,6 +3654,21 @@ tool_dispatcher = "xml"
         let parsed: MatrixConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.homeserver, "https://synapse.local:8448");
         assert_eq!(parsed.allowed_users.len(), 2);
+    }
+
+    #[test]
+    fn matrix_config_backward_compatible_without_session_hints() {
+        let toml = r#"
+homeserver = "https://matrix.org"
+access_token = "tok"
+room_id = "!ops:matrix.org"
+allowed_users = ["@ops:matrix.org"]
+"#;
+
+        let parsed: MatrixConfig = toml::from_str(toml).unwrap();
+        assert_eq!(parsed.homeserver, "https://matrix.org");
+        assert!(parsed.user_id.is_none());
+        assert!(parsed.device_id.is_none());
     }
 
     #[test]
@@ -3709,6 +3734,8 @@ tool_dispatcher = "xml"
             matrix: Some(MatrixConfig {
                 homeserver: "https://m.org".into(),
                 access_token: "tok".into(),
+                user_id: None,
+                device_id: None,
                 room_id: "!r:m".into(),
                 allowed_users: vec!["@u:m".into()],
             }),

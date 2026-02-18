@@ -9,6 +9,7 @@ This document covers deploying ZeroClaw on a Raspberry Pi or other host on your 
 | Mode | Inbound port needed? | Use case |
 |------|----------------------|----------|
 | **Telegram polling** | No | ZeroClaw polls Telegram API; works from anywhere |
+| **Matrix sync (including E2EE)** | No | ZeroClaw syncs via Matrix client API; no inbound webhook required |
 | **Discord/Slack** | No | Same — outbound only |
 | **Gateway webhook** | Yes | POST /webhook, WhatsApp, etc. need a public URL |
 | **Gateway pairing** | Yes | If you pair clients via the gateway |
@@ -199,5 +200,7 @@ Configure Cloudflare Tunnel to forward to `127.0.0.1:3000`, then set your webhoo
 
 ## 7. References
 
+- [channels-reference.md](./channels-reference.md) — Channel configuration overview
+- [matrix-e2ee-guide.md](./matrix-e2ee-guide.md) — Matrix setup and encrypted-room troubleshooting
 - [hardware-peripherals-design.md](./hardware-peripherals-design.md) — Peripherals design
 - [adding-boards-and-tools.md](./adding-boards-and-tools.md) — Hardware setup and adding boards
