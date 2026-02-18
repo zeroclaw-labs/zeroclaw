@@ -3015,14 +3015,44 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         .header("Authorization", format!("Bearer {access_token_clone}"))
                         .send()?;
                     let ok = resp.status().is_success();
-                    Ok::<_, reqwest::Error>(ok)
+
+                    if !ok {
+                        return Ok::<_, reqwest::Error>((false, None, None));
+                    }
+
+                    let payload: Value = match resp.json() {
+                        Ok(payload) => payload,
+                        Err(_) => Value::Null,
+                    };
+                    let user_id = payload
+                        .get("user_id")
+                        .and_then(|value| value.as_str())
+                        .map(|value| value.to_string());
+                    let device_id = payload
+                        .get("device_id")
+                        .and_then(|value| value.as_str())
+                        .map(|value| value.to_string());
+
+                    Ok::<_, reqwest::Error>((true, user_id, device_id))
                 })
                 .join();
-                match thread_result {
-                    Ok(Ok(true)) => println!(
-                        "\r  {} Connection verified        ",
-                        style("✅").green().bold()
-                    ),
+
+                let (detected_user_id, detected_device_id) = match thread_result {
+                    Ok(Ok((true, user_id, device_id))) => {
+                        println!(
+                            "\r  {} Connection verified        ",
+                            style("✅").green().bold()
+                        );
+
+                        if device_id.is_none() {
+                            println!(
+                                "  {} Homeserver did not return device_id from whoami. If E2EE decryption fails, set channels.matrix.device_id manually in config.toml.",
+                                style("⚠️").yellow().bold()
+                            );
+                        }
+
+                        (user_id, device_id)
+                    }
                     _ => {
                         println!(
                             "\r  {} Connection failed — check homeserver URL and token",
@@ -3030,7 +3060,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         );
                         continue;
                     }
-                }
+                };
 
                 let room_id: String = Input::new()
                     .with_prompt("  Room ID (e.g. !abc123:matrix.org)")
@@ -3050,6 +3080,8 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 config.matrix = Some(MatrixConfig {
                     homeserver: homeserver.trim_end_matches('/').to_string(),
                     access_token,
+                    user_id: detected_user_id,
+                    device_id: detected_device_id,
                     room_id,
                     allowed_users,
                 });

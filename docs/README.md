@@ -16,6 +16,7 @@ Localized hubs: [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · 
 | Check config defaults and keys quickly | [config-reference.md](config-reference.md) |
 | Operate runtime (day-2 runbook) | [operations-runbook.md](operations-runbook.md) |
 | Troubleshoot install/runtime/channel issues | [troubleshooting.md](troubleshooting.md) |
+| Run Matrix encrypted-room setup and diagnostics | [matrix-e2ee-guide.md](matrix-e2ee-guide.md) |
 | Browse docs by category | [SUMMARY.md](SUMMARY.md) |
 | See project PR/issue docs snapshot | [project-triage-snapshot-2026-02-18.md](project-triage-snapshot-2026-02-18.md) |
 
@@ -47,6 +48,7 @@ Localized hubs: [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · 
 - [commands-reference.md](commands-reference.md) — command lookup by workflow
 - [providers-reference.md](providers-reference.md) — provider IDs, aliases, credential env vars
 - [channels-reference.md](channels-reference.md) — channel capabilities and setup paths
+- [matrix-e2ee-guide.md](matrix-e2ee-guide.md) — Matrix encrypted-room (E2EE) setup and no-response diagnostics
 - [config-reference.md](config-reference.md) — high-signal config keys and secure defaults
 - [operations-runbook.md](operations-runbook.md) — day-2 runtime operations and rollback flow
 - [troubleshooting.md](troubleshooting.md) — common failure signatures and recovery steps
