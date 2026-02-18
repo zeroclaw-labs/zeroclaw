@@ -4,7 +4,6 @@ use async_trait::async_trait;
 use nostr_sdk::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::RwLock;
 
 /// Protocol used by a sender, tracked so replies use the same protocol.
@@ -272,12 +271,11 @@ impl Channel for NostrChannel {
     }
 
     async fn health_check(&self) -> bool {
-        // Check if we can reach at least one relay within a timeout
-        let result = tokio::time::timeout(Duration::from_secs(10), async {
-            self.client.connect().await;
-        })
-        .await;
-        result.is_ok()
+        self.client
+            .relays()
+            .await
+            .values()
+            .any(|r| r.is_connected())
     }
 }
 
@@ -350,6 +348,15 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn health_check_false_with_no_relays() {
+        let keys = Keys::generate();
+        let ch = NostrChannel::new(&keys.secret_key().to_secret_hex(), vec![], &[])
+            .await
+            .unwrap();
+        assert!(!ch.health_check().await);
     }
 
     #[tokio::test]
