@@ -14,6 +14,8 @@ export function SecurityScreen() {
   const [highRiskActions, setHighRiskActions] = useState(DEFAULT_SECURITY.highRiskActions);
   const [incomingCallHooks, setIncomingCallHooks] = useState(DEFAULT_SECURITY.incomingCallHooks);
   const [includeCallerNumber, setIncludeCallerNumber] = useState(DEFAULT_SECURITY.includeCallerNumber);
+  const [directExecution, setDirectExecution] = useState(DEFAULT_SECURITY.directExecution);
+  const [preferStandardWebTool, setPreferStandardWebTool] = useState(DEFAULT_SECURITY.preferStandardWebTool);
   const [saveStatus, setSaveStatus] = useState("Loading...");
   const hydratedRef = useRef(false);
 
@@ -26,6 +28,8 @@ export function SecurityScreen() {
       setHighRiskActions(loaded.highRiskActions);
       setIncomingCallHooks(loaded.incomingCallHooks);
       setIncludeCallerNumber(loaded.includeCallerNumber);
+      setDirectExecution(loaded.directExecution);
+      setPreferStandardWebTool(loaded.preferStandardWebTool);
       hydratedRef.current = true;
       setSaveStatus("Autosave enabled");
     })();
@@ -37,17 +41,24 @@ export function SecurityScreen() {
   useEffect(() => {
     if (!hydratedRef.current) return;
     const timer = setTimeout(() => {
-      void saveSecurityConfig({ requireApproval, highRiskActions, incomingCallHooks, includeCallerNumber });
+      void saveSecurityConfig({
+        requireApproval,
+        highRiskActions,
+        incomingCallHooks,
+        includeCallerNumber,
+        directExecution,
+        preferStandardWebTool,
+      });
       void addActivity({
         kind: "action",
         source: "security",
         title: "Security policy updated",
-        detail: `approval=${requireApproval}, high_risk=${highRiskActions}, call_hooks=${incomingCallHooks}, caller_number=${includeCallerNumber}`,
+        detail: `approval=${requireApproval}, high_risk=${highRiskActions}, call_hooks=${incomingCallHooks}, caller_number=${includeCallerNumber}, direct_exec=${directExecution}, web_tool=${preferStandardWebTool}`,
       });
       setSaveStatus("Saved locally");
     }, 300);
     return () => clearTimeout(timer);
-  }, [requireApproval, highRiskActions, incomingCallHooks, includeCallerNumber]);
+  }, [requireApproval, highRiskActions, incomingCallHooks, includeCallerNumber, directExecution, preferStandardWebTool]);
 
   return (
     <Screen>
@@ -85,6 +96,14 @@ export function SecurityScreen() {
           <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
             <Text variant="bodyMedium">Share caller number with agent</Text>
             <Switch value={includeCallerNumber} onValueChange={setIncludeCallerNumber} />
+          </View>
+          <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
+            <Text variant="bodyMedium">Direct execute calls/SMS/camera</Text>
+            <Switch value={directExecution} onValueChange={setDirectExecution} />
+          </View>
+          <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
+            <Text variant="bodyMedium">Use standard web read tool</Text>
+            <Switch value={preferStandardWebTool} onValueChange={setPreferStandardWebTool} />
           </View>
         </View>
 

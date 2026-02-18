@@ -37,6 +37,8 @@ export type SecurityConfig = {
   highRiskActions: boolean;
   incomingCallHooks: boolean;
   includeCallerNumber: boolean;
+  directExecution: boolean;
+  preferStandardWebTool: boolean;
 };
 
 export type MobileToolCapability = {
@@ -85,6 +87,8 @@ export const DEFAULT_SECURITY: SecurityConfig = {
   highRiskActions: true,
   incomingCallHooks: true,
   includeCallerNumber: true,
+  directExecution: true,
+  preferStandardWebTool: true,
 };
 
 export const DEFAULT_DEVICE_TOOLS: MobileToolCapability[] = [
