@@ -99,7 +99,6 @@ impl Tool for PushoverTool {
                 },
                 "priority": {
                     "type": "integer",
-                    "enum": [-2, -1, 0, 1, 2],
                     "description": "Message priority: -2 (lowest/silent), -1 (low/no sound), 0 (normal), 1 (high), 2 (emergency/repeating)"
                 },
                 "sound": {
