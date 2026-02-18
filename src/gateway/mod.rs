@@ -248,6 +248,14 @@ fn client_key_from_request(
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+fn normalize_max_keys(configured: usize, fallback: usize) -> usize {
+    if configured == 0 {
+        fallback.max(1)
+    } else {
+        configured
+    }
+}
+
 /// Shared state for all axum handlers
 #[derive(Clone)]
 pub struct AppState {
@@ -378,20 +386,22 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         config.gateway.require_pairing,
         &config.gateway.paired_tokens,
     ));
+    let rate_limit_max_keys = normalize_max_keys(
+        config.gateway.rate_limit_max_keys,
+        RATE_LIMIT_MAX_KEYS_DEFAULT,
+    );
     let rate_limiter = Arc::new(GatewayRateLimiter::new(
         config.gateway.pair_rate_limit_per_minute,
         config.gateway.webhook_rate_limit_per_minute,
-        config
-            .gateway
-            .rate_limit_max_keys
-            .max(RATE_LIMIT_MAX_KEYS_DEFAULT),
+        rate_limit_max_keys,
     ));
+    let idempotency_max_keys = normalize_max_keys(
+        config.gateway.idempotency_max_keys,
+        IDEMPOTENCY_MAX_KEYS_DEFAULT,
+    );
     let idempotency_store = Arc::new(IdempotencyStore::new(
         Duration::from_secs(config.gateway.idempotency_ttl_secs.max(1)),
-        config
-            .gateway
-            .idempotency_max_keys
-            .max(IDEMPOTENCY_MAX_KEYS_DEFAULT),
+        idempotency_max_keys,
     ));
 
     // ── Tunnel ────────────────────────────────────────────────
@@ -1018,6 +1028,18 @@ mod tests {
 
         let key = client_key_from_request(Some(peer), &headers, true);
         assert_eq!(key, "10.0.0.5");
+    }
+
+    #[test]
+    fn normalize_max_keys_uses_fallback_for_zero() {
+        assert_eq!(normalize_max_keys(0, 10_000), 10_000);
+        assert_eq!(normalize_max_keys(0, 0), 1);
+    }
+
+    #[test]
+    fn normalize_max_keys_preserves_nonzero_values() {
+        assert_eq!(normalize_max_keys(2_048, 10_000), 2_048);
+        assert_eq!(normalize_max_keys(1, 10_000), 1);
     }
 
     #[test]
