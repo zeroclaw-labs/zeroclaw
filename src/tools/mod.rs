@@ -238,11 +238,14 @@ pub fn all_tools_with_runtime(
     }
 
     // Add node management tools when enabled
+    // Use the global NodeServer instance if available, otherwise create one
     if config.nodes.enabled {
-        let node_server = Arc::new(crate::nodes::NodeServer::new(config.nodes.clone()));
-        tools.push(Box::new(NodesListTool::new(node_server.clone())));
-        tools.push(Box::new(NodesRunTool::new(node_server.clone())));
-        tools.push(Box::new(NodesStatusTool::new(node_server)));
+        if let Some(node_server) = crate::nodes::get_node_server() {
+            tools.push(Box::new(NodesListTool::new(node_server.clone())));
+            tools.push(Box::new(NodesRunTool::new(node_server.clone())));
+            tools.push(Box::new(NodesStatusTool::new(node_server)));
+        }
+        // If no global instance, tools will be unavailable until daemon starts
     }
 
     tools

@@ -753,7 +753,11 @@ async fn handle_node_command(command: NodeCommands, config: &Config) -> Result<(
                 anyhow::bail!("Nodes are not enabled. Set [nodes] enabled = true in config.toml");
             }
 
-            let server = crate::nodes::NodeServer::new(config.nodes.clone());
+            // Try to get the global NodeServer instance (from daemon)
+            let server = crate::nodes::get_node_server()
+                .ok_or_else(|| anyhow::anyhow!(
+                    "Node server not running. Please start the daemon first with 'zeroclaw service start'"
+                ))?;
             let code = server.generate_pairing_code();
 
             println!("✅ Pairing code generated: {}", code);
@@ -804,7 +808,11 @@ async fn handle_node_command(command: NodeCommands, config: &Config) -> Result<(
                 anyhow::bail!("Nodes are not enabled. Set [nodes] enabled = true in config.toml");
             }
 
-            let server = crate::nodes::NodeServer::new(config.nodes.clone());
+            // Try to get the global NodeServer instance (from daemon)
+            let server = crate::nodes::get_node_server()
+                .ok_or_else(|| anyhow::anyhow!(
+                    "Node server not running. Please start the daemon first with 'zeroclaw service start'"
+                ))?;
             let nodes = server.list_nodes();
 
             if nodes.is_empty() {

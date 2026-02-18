@@ -72,6 +72,8 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     }
 
     if config.nodes.enabled {
+        // Initialize global NodeServer instance
+        let server = crate::nodes::init_node_server(config.nodes.clone());
         let nodes_cfg = config.clone();
         handles.push(spawn_component_supervisor(
             "nodes",
@@ -79,9 +81,10 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
             max_backoff,
             move || {
                 let cfg = nodes_cfg.clone();
+                let srv = server.clone();
                 async move {
-                    let server = crate::nodes::NodeServer::new(cfg.nodes);
-                    server.start().await
+                    // Use the pre-initialized server instance
+                    srv.start().await
                 }
             },
         ));
