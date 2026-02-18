@@ -1697,7 +1697,6 @@ mod tests {
             "moonshot-intl",
             "kimi-code",
             "moonshot-cn",
-            "kimi-code",
             "synthetic",
             "opencode",
             "zai",
