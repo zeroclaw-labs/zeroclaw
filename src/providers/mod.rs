@@ -322,11 +322,21 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         }
     }
 
-    for env_var in ["ZEROCLAW_API_KEY", "API_KEY"] {
-        if let Ok(value) = std::env::var(env_var) {
-            let value = value.trim();
-            if !value.is_empty() {
-                return Some(value.to_string());
+    // OAuth-authenticated providers use dedicated token flows; generic
+    // API keys (ZEROCLAW_API_KEY / API_KEY) are never valid for them and
+    // would mask configuration errors.
+    let skip_generic_fallback = matches!(
+        name,
+        "antigravity" | "google-antigravity" | "codex" | "openai-codex"
+    );
+
+    if !skip_generic_fallback {
+        for env_var in ["ZEROCLAW_API_KEY", "API_KEY"] {
+            if let Ok(value) = std::env::var(env_var) {
+                let value = value.trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
             }
         }
     }
