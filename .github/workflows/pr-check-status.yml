@@ -2,7 +2,7 @@ name: PR Check Status
 
 on:
   schedule:
-    - cron: "15 */12 * * *"
+    - cron: "15 8 * * *" # Once daily at 8:15am UTC
   workflow_dispatch:
 
 permissions: {}
@@ -13,12 +13,7 @@ concurrency:
 
 jobs:
   nudge-stale-prs:
-    runs-on: blacksmith-2vcpu-ubuntu-2404
-    permissions:
-      contents: read
-      pull-requests: write
-      issues: write
-    env:
+    runs-on: ubuntu-latest
       STALE_HOURS: "48"
     steps:
       - name: Checkout repository

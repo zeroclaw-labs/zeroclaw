@@ -12,9 +12,7 @@ jobs:
         permissions:
             issues: write
             pull-requests: write
-        runs-on: blacksmith-2vcpu-ubuntu-2404
-        steps:
-            - name: Mark stale issues and pull requests
+        runs-on: ubuntu-latest
               uses: actions/stale@b5d41d4e1d5dceea10e7104786b73624c18a190f # v10.2.0
               with:
                   repo-token: ${{ secrets.GITHUB_TOKEN }}

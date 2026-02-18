@@ -21,13 +21,8 @@ on:
         paths:
             - "Dockerfile"
             - ".dockerignore"
-            - "Cargo.toml"
-            - "Cargo.lock"
+            - "docker-compose.yml"
             - "rust-toolchain.toml"
-            - "src/**"
-            - "crates/**"
-            - "benches/**"
-            - "firmware/**"
             - "dev/config.template.toml"
             - ".github/workflows/pub-docker-img.yml"
     workflow_dispatch:
