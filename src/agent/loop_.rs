@@ -941,9 +941,22 @@ pub(crate) async fn run_tool_call_loop(
 
         if tool_calls.is_empty() {
             // No tool calls — this is the final response.
-            // If a streaming sender is provided, send the final text through it.
+            // If a streaming sender is provided, relay the text in small chunks
+            // so the channel can progressively update the draft message.
             if let Some(ref tx) = on_delta {
-                let _ = tx.send(display_text.clone()).await;
+                // Split on whitespace boundaries, accumulating ~80-char chunks.
+                let mut chunk = String::new();
+                for word in display_text.split_inclusive(char::is_whitespace) {
+                    chunk.push_str(word);
+                    if chunk.len() >= 80 {
+                        if tx.send(std::mem::take(&mut chunk)).await.is_err() {
+                            break; // receiver dropped
+                        }
+                    }
+                }
+                if !chunk.is_empty() {
+                    let _ = tx.send(chunk).await;
+                }
             }
             history.push(ChatMessage::assistant(response_text.clone()));
             return Ok(display_text);
