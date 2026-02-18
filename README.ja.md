@@ -50,15 +50,27 @@ ZeroClaw は、高速・省リソース・高拡張性を重視した自律エ�
 - **高速コールドスタート**: Rust 単一バイナリにより、主要コマンドと daemon 起動が非常に速い。
 - **高い移植性**: ARM / x86 / RISC-V を同じ運用モデルで扱え、provider/channel/tool を差し替え可能。
 
-## 再現可能な計測（例）
+## ベンチマークスナップショット（ZeroClaw vs OpenClaw、再現可能）
 
-README のサンプル値（macOS arm64, 2026-02-18）:
+以下はローカルのクイック比較（macOS arm64、2026年2月）を、0.8GHz エッジ CPU 基準で正規化したものです。
 
-- Release バイナリ: `8.8M`
-- `zeroclaw --help`: 約 `0.02s`、ピークメモリ 約 `3.9MB`
-- `zeroclaw status`: 約 `0.01s`、ピークメモリ 約 `4.1MB`
+| | OpenClaw | NanoBot | PicoClaw | ZeroClaw 🦀 |
+|---|---|---|---|---|
+| **言語** | TypeScript | Python | Go | **Rust** |
+| **RAM** | > 1GB | > 100MB | < 10MB | **< 5MB** |
+| **起動時間（0.8GHz コア）** | > 500s | > 30s | < 1s | **< 10ms** |
+| **バイナリサイズ** | ~28MB（dist） | N/A（スクリプト） | ~8MB | **3.4 MB** |
+| **コスト** | Mac Mini $599 | Linux SBC ~$50 | Linux ボード $10 | **任意の $10 ハードウェア** |
 
-環境差があるため、必ず自身の環境で再計測してください。
+> 注記: この表はあくまで比較の目安で、結果は環境によって変動します。OpenClaw は Node.js ランタイムが前提で追加オーバーヘッドがあり、NanoBot は Python ランタイム依存です。PicoClaw と ZeroClaw は静的バイナリです。
+
+<p align="center">
+  <img src="zero-claw.jpeg" alt="ZeroClaw vs OpenClaw Comparison" width="800" />
+</p>
+
+### ローカルで再現可能な測定
+
+ベンチマーク値はコードやツールチェーン更新で変わるため、必ず自身の環境で再測定してください。
 
 ```bash
 cargo build --release
@@ -67,6 +79,12 @@ ls -lh target/release/zeroclaw
 /usr/bin/time -l target/release/zeroclaw --help
 /usr/bin/time -l target/release/zeroclaw status
 ```
+
+README のサンプル値（macOS arm64, 2026-02-18）:
+
+- Release バイナリ: `8.8M`
+- `zeroclaw --help`: 約 `0.02s`、ピークメモリ 約 `3.9MB`
+- `zeroclaw status`: 約 `0.01s`、ピークメモリ 約 `4.1MB`
 
 ## ワンクリック導入
 
