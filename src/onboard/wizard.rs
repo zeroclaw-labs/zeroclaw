@@ -56,6 +56,27 @@ const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_TTL_SECS: u64 = 12 * 60 * 60;
 const CUSTOM_MODEL_SENTINEL: &str = "__custom_model__";
 
+fn confirm_save_progress(config: &Config, auto_save: &mut bool) -> Result<()> {
+    if *auto_save {
+        config.save()?;
+        // Minimal feedback for auto-save
+        // println!("  {} Saved", style("✓").dim()); 
+        return Ok(());
+    }
+
+    // Ask user to enable auto-save for the session
+    if Confirm::new()
+        .with_prompt("  Save progress? (Enable auto-save for remaining steps)")
+        .default(true)
+        .interact()?
+    {
+        *auto_save = true;
+        config.save()?;
+        println!("  {} Progress saved (auto-save enabled).", style("✓").green());
+    }
+    Ok(())
+}
+
 // ── Main wizard entry point ──────────────────────────────────────
 
 pub fn run_wizard() -> Result<Config> {
@@ -73,73 +94,75 @@ pub fn run_wizard() -> Result<Config> {
     );
     println!();
 
+    // Initialize config: try to load existing, else use defaults
+    let mut config = Config::load_or_init().unwrap_or_else(|_| Config::default());
+    let mut auto_save_enabled = false;
+
+    // 1. Workspace
     print_step(1, 9, "Workspace Setup");
-    let (workspace_dir, config_path) = setup_workspace()?;
+    let (workspace_dir, config_path) = setup_workspace(Some(&config))?;
+    config.workspace_dir = workspace_dir;
+    config.config_path = config_path;
+    confirm_save_progress(&config, &mut auto_save_enabled)?;
 
+    // 2. Provider
     print_step(2, 9, "AI Provider & API Key");
-    let (provider, api_key, model, provider_api_url) = setup_provider(&workspace_dir)?;
+    let (provider, api_key, model, provider_api_url) = setup_provider(&config.workspace_dir, Some(&config))?;
+    config.default_provider = Some(provider);
+    config.api_key = if api_key.is_empty() { None } else { Some(api_key) };
+    config.default_model = Some(model);
+    config.api_url = provider_api_url;
+    confirm_save_progress(&config, &mut auto_save_enabled)?;
 
+    // 3. Channels
     print_step(3, 9, "Channels (How You Talk to ZeroClaw)");
-    let channels_config = setup_channels()?;
+    config.channels_config = setup_channels(Some(&config))?;
+    confirm_save_progress(&config, &mut auto_save_enabled)?;
 
+    // 4. Tunnel
     print_step(4, 9, "Tunnel (Expose to Internet)");
-    let tunnel_config = setup_tunnel()?;
+    config.tunnel = setup_tunnel(Some(&config))?;
+    confirm_save_progress(&config, &mut auto_save_enabled)?;
 
+    // 5. Tool Mode
     print_step(5, 9, "Tool Mode & Security");
-    let (composio_config, secrets_config) = setup_tool_mode()?;
+    let (composio_config, secrets_config) = setup_tool_mode(Some(&config))?;
+    config.composio = composio_config;
+    config.secrets = secrets_config;
+    confirm_save_progress(&config, &mut auto_save_enabled)?;
 
+    // 6. Hardware
     print_step(6, 9, "Hardware (Physical World)");
-    let hardware_config = setup_hardware()?;
+    config.hardware = setup_hardware(Some(&config))?;
+    confirm_save_progress(&config, &mut auto_save_enabled)?;
 
+    // 7. Memory
     print_step(7, 9, "Memory Configuration");
-    let memory_config = setup_memory()?;
+    config.memory = setup_memory(Some(&config))?;
+    confirm_save_progress(&config, &mut auto_save_enabled)?;
 
+    // 8. Project Context
     print_step(8, 9, "Project Context (Personalize Your Agent)");
     let project_ctx = setup_project_context()?;
+    // Context is stored in MD files, but we can store it in config identity for reference if we want
+    // Config struct likely has IdentityConfig. Let's check if we can populate it.
+    // ProjectContext { user_name, timezone, agent_name, communication_style }
+    // IdentityConfig { user_name, agent_name, ... }
+    // config.identity currently does not support user/agent name fields directly.
+    // config.identity.user_name = Some(project_ctx.user_name.clone());
+    // config.identity.agent_name = Some(project_ctx.agent_name.clone());
+    confirm_save_progress(&config, &mut auto_save_enabled)?;
 
+    // 9. Scaffold
     print_step(9, 9, "Workspace Files");
-    scaffold_workspace(&workspace_dir, &project_ctx)?;
+    scaffold_workspace(&config.workspace_dir, &project_ctx)?;
+    // No need to save here as scaffold writes files. But we can save strict config.
+    confirm_save_progress(&config, &mut auto_save_enabled)?;
 
-    // ── Build config ──
-    // Defaults: SQLite memory, supervised autonomy, workspace-scoped, native runtime
-    let config = Config {
-        workspace_dir: workspace_dir.clone(),
-        config_path: config_path.clone(),
-        api_key: if api_key.is_empty() {
-            None
-        } else {
-            Some(api_key)
-        },
-        api_url: provider_api_url,
-        default_provider: Some(provider),
-        default_model: Some(model),
-        default_temperature: 0.7,
-        observability: ObservabilityConfig::default(),
-        autonomy: AutonomyConfig::default(),
-        runtime: RuntimeConfig::default(),
-        reliability: crate::config::ReliabilityConfig::default(),
-        scheduler: crate::config::schema::SchedulerConfig::default(),
-        agent: crate::config::schema::AgentConfig::default(),
-        model_routes: Vec::new(),
-        heartbeat: HeartbeatConfig::default(),
-        cron: crate::config::CronConfig::default(),
-        channels_config,
-        memory: memory_config, // User-selected memory backend
-        storage: StorageConfig::default(),
-        tunnel: tunnel_config,
-        gateway: crate::config::GatewayConfig::default(),
-        composio: composio_config,
-        secrets: secrets_config,
-        browser: BrowserConfig::default(),
-        http_request: crate::config::HttpRequestConfig::default(),
-        web_search: crate::config::WebSearchConfig::default(),
-        identity: crate::config::IdentityConfig::default(),
-        cost: crate::config::CostConfig::default(),
-        peripherals: crate::config::PeripheralsConfig::default(),
-        agents: std::collections::HashMap::new(),
-        hardware: hardware_config,
-        query_classification: crate::config::QueryClassificationConfig::default(),
-    };
+    // ── Build complete config ──
+    // Some defaults might need forcing if not set above
+    config.default_temperature = 0.7;
+    // ... other defaults are handled by Config::default()
 
     println!(
         "  {} Security: {} | workspace-scoped",
@@ -208,7 +231,7 @@ pub fn run_channels_repair_wizard() -> Result<Config> {
     let mut config = Config::load_or_init()?;
 
     print_step(1, 1, "Channels (How You Talk to ZeroClaw)");
-    config.channels_config = setup_channels()?;
+    config.channels_config = setup_channels(Some(&config))?;
     config.save()?;
     persist_workspace_selection(&config.config_path)?;
 
@@ -1327,20 +1350,41 @@ fn persist_workspace_selection(config_path: &Path) -> Result<()> {
 
 // ── Step 1: Workspace ────────────────────────────────────────────
 
-fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
+fn setup_workspace(existing: Option<&Config>) -> Result<(PathBuf, PathBuf)> {
     let home = directories::UserDirs::new()
         .map(|u| u.home_dir().to_path_buf())
         .context("Could not find home directory")?;
     let default_dir = home.join(".zeroclaw");
+
+    let mut current_default = default_dir.clone();
+    let mut use_default = true;
+
+    if let Some(cfg) = existing {
+        // If we have an existing workspace that isn't the default, default to "No" for "Use default workspace?"
+        // and pre-fill the custom path.
+        let workspaces_match = cfg.workspace_dir.parent() == Some(&default_dir) 
+             || cfg.workspace_dir == default_dir.join("workspace");
+             
+        if !workspaces_match {
+             use_default = false;
+             if let Some(parent) = cfg.workspace_dir.parent() {
+                 current_default = parent.to_path_buf();
+             }
+        }
+    }
 
     print_bullet(&format!(
         "Default location: {}",
         style(default_dir.display()).green()
     ));
 
+    if let Some(cfg) = existing {
+         println!("  {} Found existing workspace: {}", style("ℹ").blue(), style(cfg.workspace_dir.display()).dim());
+    }
+
     let use_default = Confirm::new()
         .with_prompt("  Use default workspace location?")
-        .default(true)
+        .default(use_default)
         .interact()?;
 
     let zeroclaw_dir = if use_default {
@@ -1348,6 +1392,7 @@ fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
     } else {
         let custom: String = Input::new()
             .with_prompt("  Enter workspace path")
+            .default(current_default.to_string_lossy().to_string())
             .interact_text()?;
         let expanded = shellexpand::tilde(&custom).to_string();
         PathBuf::from(expanded)
@@ -1370,7 +1415,33 @@ fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
 // ── Step 2: Provider & API Key ───────────────────────────────────
 
 #[allow(clippy::too_many_lines)]
-fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Option<String>)> {
+fn setup_provider(workspace_dir: &Path, existing: Option<&Config>) -> Result<(String, String, String, Option<String>)> {
+    // ── Shortcut for existing provider ──
+    if let Some(cfg) = existing {
+        if let Some(provider) = &cfg.default_provider {
+            let model = cfg.default_model.as_deref().unwrap_or("default");
+            println!();
+            println!(
+                "  {} Found existing provider: {} (model: {})",
+                style("ℹ").blue(),
+                style(provider).green(),
+                style(model).dim()
+            );
+            if Confirm::new()
+                .with_prompt("  Keep this provider configuration?")
+                .default(true)
+                .interact()?
+            {
+                return Ok((
+                    provider.clone(),
+                    cfg.api_key.clone().unwrap_or_default(),
+                    model.to_string(),
+                    cfg.api_url.clone(),
+                ));
+            }
+        }
+    }
+
     // ── Tier selection ──
     let tiers = vec![
         "⭐ Recommended (OpenRouter, Venice, Anthropic, OpenAI, Gemini)",
@@ -2044,7 +2115,7 @@ fn provider_env_var(name: &str) -> &'static str {
 
 // ── Step 5: Tool Mode & Security ────────────────────────────────
 
-fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
+fn setup_tool_mode(existing: Option<&Config>) -> Result<(ComposioConfig, SecretsConfig)> {
     print_bullet("Choose how ZeroClaw connects to external apps.");
     print_bullet("You can always change this later in config.toml.");
     println!();
@@ -2054,10 +2125,16 @@ fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
         "Composio (managed OAuth) — 1000+ apps via OAuth, no raw keys shared",
     ];
 
+    let default_wb = if let Some(cfg) = existing {
+        if cfg.composio.enabled { 1 } else { 0 }
+    } else {
+        0
+    };
+
     let choice = Select::new()
         .with_prompt("  Select tool mode")
         .items(&options)
-        .default(0)
+        .default(default_wb)
         .interact()?;
 
     let composio_config = if choice == 1 {
@@ -2071,9 +2148,16 @@ fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
         print_bullet("ZeroClaw uses Composio as a tool — your core agent stays local.");
         println!();
 
+        let default_key = if let Some(cfg) = existing {
+            cfg.composio.api_key.clone().unwrap_or_default()
+        } else {
+            String::new()
+        };
+
         let api_key: String = Input::new()
             .with_prompt("  Composio API key (or Enter to skip)")
             .allow_empty(true)
+            .default(default_key)
             .interact_text()?;
 
         if api_key.trim().is_empty() {
@@ -2108,9 +2192,15 @@ fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
     print_bullet("ZeroClaw can encrypt API keys stored in config.toml.");
     print_bullet("A local key file protects against plaintext exposure and accidental leaks.");
 
+    let default_encrypt = if let Some(cfg) = existing {
+        cfg.secrets.encrypt
+    } else {
+        true
+    };
+
     let encrypt = Confirm::new()
         .with_prompt("  Enable encrypted secret storage?")
-        .default(true)
+        .default(default_encrypt)
         .interact()?;
 
     let secrets_config = SecretsConfig { encrypt };
@@ -2134,7 +2224,7 @@ fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
 
 // ── Step 6: Hardware (Physical World) ───────────────────────────
 
-fn setup_hardware() -> Result<HardwareConfig> {
+fn setup_hardware(existing: Option<&Config>) -> Result<HardwareConfig> {
     print_bullet("ZeroClaw can talk to physical hardware (LEDs, sensors, motors).");
     print_bullet("Scanning for connected devices...");
     println!();
@@ -2189,7 +2279,17 @@ fn setup_hardware() -> Result<HardwareConfig> {
         "☁️  Software Only — no hardware access (default)",
     ];
 
-    let recommended = hardware::recommended_wizard_default(&devices);
+    let mut recommended = hardware::recommended_wizard_default(&devices);
+    
+    // Override recommendation with existing config if present
+    if let Some(cfg) = existing {
+        recommended = match cfg.hardware.transport_mode() {
+            hardware::HardwareTransport::Native => 0,
+            hardware::HardwareTransport::Serial => 1,
+            hardware::HardwareTransport::Probe => 2,
+            hardware::HardwareTransport::None => 3,
+        };
+    }
 
     let choice = Select::new()
         .with_prompt("  How should ZeroClaw interact with the physical world?")
@@ -2205,6 +2305,16 @@ fn setup_hardware() -> Result<HardwareConfig> {
             .iter()
             .filter(|d| d.transport == hardware::HardwareTransport::Serial)
             .collect();
+            
+        // Attempt to find index of existing serial port
+        let mut default_port_idx = 0;
+        if let Some(cfg) = existing {
+            if let Some(existing_port) = &cfg.hardware.serial_port {
+                if let Some(idx) = serial_devices.iter().position(|d| d.device_path.as_deref() == Some(existing_port)) {
+                    default_port_idx = idx;
+                }
+            }
+        }
 
         if serial_devices.len() > 1 {
             let port_labels: Vec<String> = serial_devices
@@ -2221,15 +2331,20 @@ fn setup_hardware() -> Result<HardwareConfig> {
             let port_idx = Select::new()
                 .with_prompt("  Multiple serial devices found — select one")
                 .items(&port_labels)
-                .default(0)
+                .default(default_port_idx)
                 .interact()?;
 
             hw_config.serial_port = serial_devices[port_idx].device_path.clone();
         } else if serial_devices.is_empty() {
+             let default_manual = if let Some(cfg) = existing {
+                 cfg.hardware.serial_port.clone().unwrap_or_else(|| "/dev/ttyUSB0".into())
+             } else {
+                 "/dev/ttyUSB0".into()
+             };
             // User chose serial but no device discovered — ask for manual path
             let manual_port: String = Input::new()
                 .with_prompt("  Serial port path (e.g. /dev/ttyUSB0)")
-                .default("/dev/ttyUSB0".into())
+                .default(default_manual)
                 .interact_text()?;
             hw_config.serial_port = Some(manual_port);
         }
@@ -2242,10 +2357,23 @@ fn setup_hardware() -> Result<HardwareConfig> {
             "230400",
             "Custom",
         ];
+        
+        // Find existing baud rate index
+        let mut default_baud_idx = 0;
+        if let Some(cfg) = existing {
+            default_baud_idx = match cfg.hardware.baud_rate {
+                115_200 => 0,
+                9600 => 1,
+                57600 => 2,
+                230_400 => 3,
+                _ => 4, // Custom
+            };
+        }
+        
         let baud_idx = Select::new()
             .with_prompt("  Serial baud rate")
             .items(&baud_options)
-            .default(0)
+            .default(default_baud_idx)
             .interact()?;
 
         hw_config.baud_rate = match baud_idx {
@@ -2253,9 +2381,14 @@ fn setup_hardware() -> Result<HardwareConfig> {
             2 => 57600,
             3 => 230_400,
             4 => {
+                 let default_custom = if let Some(cfg) = existing {
+                     cfg.hardware.baud_rate
+                 } else {
+                     115_200
+                 };
                 let custom: String = Input::new()
                     .with_prompt("  Custom baud rate")
-                    .default("115200".into())
+                    .default(default_custom.to_string())
                     .interact_text()?;
                 custom.parse::<u32>().unwrap_or(115_200)
             }
@@ -2267,18 +2400,28 @@ fn setup_hardware() -> Result<HardwareConfig> {
     if hw_config.transport_mode() == hardware::HardwareTransport::Probe
         && hw_config.probe_target.is_none()
     {
+        let default_target = if let Some(cfg) = existing {
+             cfg.hardware.probe_target.clone().unwrap_or_else(|| "STM32F411CEUx".into())
+        } else {
+             "STM32F411CEUx".into()
+        };
         let target: String = Input::new()
             .with_prompt("  Target MCU chip (e.g. STM32F411CEUx, nRF52840_xxAA)")
-            .default("STM32F411CEUx".into())
+            .default(default_target)
             .interact_text()?;
         hw_config.probe_target = Some(target);
     }
 
     // ── Datasheet RAG ──
     if hw_config.enabled {
+        let default_datasheets = if let Some(cfg) = existing {
+             cfg.hardware.workspace_datasheets
+        } else {
+             true
+        };
         let datasheets = Confirm::new()
             .with_prompt("  Enable datasheet RAG? (index PDF schematics for AI pin lookups)")
-            .default(true)
+            .default(default_datasheets)
             .interact()?;
         hw_config.workspace_datasheets = datasheets;
     }
@@ -2420,7 +2563,7 @@ fn setup_project_context() -> Result<ProjectContext> {
 
 // ── Step 6: Memory Configuration ───────────────────────────────
 
-fn setup_memory() -> Result<MemoryConfig> {
+fn setup_memory(existing: Option<&Config>) -> Result<MemoryConfig> {
     print_bullet("Choose how ZeroClaw stores and searches memories.");
     print_bullet("You can always change this later in config.toml.");
     println!();
@@ -2430,19 +2573,32 @@ fn setup_memory() -> Result<MemoryConfig> {
         .map(|backend| backend.label)
         .collect();
 
+    let mut default_idx = 0;
+    if let Some(cfg) = existing {
+         if let Some(idx) = selectable_memory_backends().iter().position(|b| b.key == cfg.memory.backend) {
+             default_idx = idx;
+         }
+    }
+
     let choice = Select::new()
         .with_prompt("  Select memory backend")
         .items(&options)
-        .default(0)
+        .default(default_idx)
         .interact()?;
 
     let backend = backend_key_from_choice(choice);
     let profile = memory_backend_profile(backend);
+    
+    let default_autosave = if let Some(cfg) = existing {
+        cfg.memory.auto_save
+    } else {
+        true
+    };
 
     let auto_save = profile.auto_save_default
         && Confirm::new()
             .with_prompt("  Auto-save conversations to memory?")
-            .default(true)
+            .default(default_autosave)
             .interact()?;
 
     println!(
@@ -2460,27 +2616,31 @@ fn setup_memory() -> Result<MemoryConfig> {
 // ── Step 3: Channels ────────────────────────────────────────────
 
 #[allow(clippy::too_many_lines)]
-fn setup_channels() -> Result<ChannelsConfig> {
+fn setup_channels(existing: Option<&Config>) -> Result<ChannelsConfig> {
     print_bullet("Channels let you talk to ZeroClaw from anywhere.");
     print_bullet("CLI is always available. Connect more channels now.");
     println!();
 
-    let mut config = ChannelsConfig {
-        cli: true,
-        telegram: None,
-        discord: None,
-        slack: None,
-        mattermost: None,
-        webhook: None,
-        imessage: None,
-        matrix: None,
-        signal: None,
-        whatsapp: None,
-        email: None,
-        irc: None,
-        lark: None,
-        dingtalk: None,
-        qq: None,
+    let mut config = if let Some(existing_config) = existing {
+        existing_config.channels_config.clone()
+    } else {
+        ChannelsConfig {
+            cli: true,
+            telegram: None,
+            discord: None,
+            slack: None,
+            mattermost: None,
+            webhook: None,
+            imessage: None,
+            matrix: None,
+            signal: None,
+            whatsapp: None,
+            email: None,
+            irc: None,
+            lark: None,
+            dingtalk: None,
+            qq: None,
+        }
     };
 
     loop {
@@ -3485,7 +3645,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
 // ── Step 4: Tunnel ──────────────────────────────────────────────
 
 #[allow(clippy::too_many_lines)]
-fn setup_tunnel() -> Result<crate::config::TunnelConfig> {
+fn setup_tunnel(existing: Option<&Config>) -> Result<crate::config::TunnelConfig> {
     use crate::config::schema::{
         CloudflareTunnelConfig, CustomTunnelConfig, NgrokTunnelConfig, TailscaleTunnelConfig,
         TunnelConfig,
@@ -3503,10 +3663,22 @@ fn setup_tunnel() -> Result<crate::config::TunnelConfig> {
         "Custom — bring your own (bore, frp, ssh, etc.)",
     ];
 
+    let default_idx = if let Some(existing_config) = existing {
+        match existing_config.tunnel.provider.as_str() {
+            "cloudflare" => 1,
+            "tailscale" => 2,
+            "ngrok" => 3,
+            "custom" => 4,
+            _ => 0,
+        }
+    } else {
+        0
+    };
+
     let choice = Select::new()
         .with_prompt("  Select tunnel provider")
         .items(&options)
-        .default(0)
+        .default(default_idx)
         .interact()?;
 
     let config = match choice {
