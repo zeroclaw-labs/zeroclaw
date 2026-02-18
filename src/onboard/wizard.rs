@@ -1315,6 +1315,36 @@ fn persist_workspace_selection(config_path: &Path) -> Result<()> {
     })
 }
 
+fn antigravity_project_id_path(workspace_dir: &Path) -> Option<PathBuf> {
+    workspace_dir
+        .parent()
+        .map(|config_dir| config_dir.join("google_antigravity_project_id"))
+}
+
+fn persist_antigravity_project_id(workspace_dir: &Path, project_id: &str) -> Result<()> {
+    let trimmed = project_id.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+
+    let path = antigravity_project_id_path(workspace_dir)
+        .context("Workspace path must have a parent config directory")?;
+    fs::write(&path, format!("{trimmed}\n")).with_context(|| {
+        format!(
+            "Failed to persist Antigravity project ID to {}",
+            path.display()
+        )
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    }
+
+    Ok(())
+}
+
 // ── Step 1: Workspace ────────────────────────────────────────────
 
 fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
@@ -1636,6 +1666,9 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
         print_bullet("Google Antigravity uses Google OAuth login — no API key needed.");
         print_bullet("You will authenticate via your browser.");
         print_bullet("Or set GOOGLE_ANTIGRAVITY_ACCESS_TOKEN env var if you already have a token.");
+        print_bullet(
+            "Optional: set GOOGLE_ANTIGRAVITY_PROJECT_ID to pin a licensed Google Cloud project.",
+        );
         println!();
 
         let env_token = std::env::var("GOOGLE_ANTIGRAVITY_ACCESS_TOKEN")
@@ -1648,6 +1681,17 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
                 "{} GOOGLE_ANTIGRAVITY_ACCESS_TOKEN detected!",
                 style("✓").green().bold()
             ));
+            if let Ok(project_id) = std::env::var("GOOGLE_ANTIGRAVITY_PROJECT_ID") {
+                let project_id = project_id.trim();
+                if !project_id.is_empty() {
+                    if let Err(error) = persist_antigravity_project_id(workspace_dir, project_id) {
+                        print_bullet(&format!(
+                            "{} Failed to persist GOOGLE_ANTIGRAVITY_PROJECT_ID: {error}",
+                            style("!").yellow().bold()
+                        ));
+                    }
+                }
+            }
             token
         } else {
             let login_now = Confirm::new()
@@ -1680,6 +1724,14 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
                     style("✓").green().bold(),
                     style(&credential.project_id).cyan()
                 ));
+                if let Err(error) =
+                    persist_antigravity_project_id(workspace_dir, &credential.project_id)
+                {
+                    print_bullet(&format!(
+                        "{} Failed to persist Antigravity project ID: {error}",
+                        style("!").yellow().bold()
+                    ));
+                }
 
                 credential.access_token
             } else {
@@ -4902,6 +4954,27 @@ mod tests {
         assert!(err
             .to_string()
             .contains("does not support live model discovery"));
+    }
+
+    #[test]
+    fn antigravity_project_id_path_uses_config_dir_parent() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let path = antigravity_project_id_path(&workspace).unwrap();
+        assert_eq!(path, tmp.path().join("google_antigravity_project_id"));
+    }
+
+    #[test]
+    fn persist_antigravity_project_id_writes_file() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        persist_antigravity_project_id(&workspace, "project-123").unwrap();
+
+        let path = tmp.path().join("google_antigravity_project_id");
+        let content = std::fs::read_to_string(path).unwrap();
+        assert_eq!(content.trim(), "project-123");
     }
 
     // ── provider_env_var ────────────────────────────────────────
