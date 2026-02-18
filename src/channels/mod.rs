@@ -5,6 +5,7 @@ pub mod email_channel;
 pub mod imessage;
 pub mod irc;
 pub mod lark;
+pub mod linq;
 pub mod matrix;
 pub mod mattermost;
 pub mod qq;
@@ -21,6 +22,7 @@ pub use email_channel::EmailChannel;
 pub use imessage::IMessageChannel;
 pub use irc::IrcChannel;
 pub use lark::LarkChannel;
+pub use linq::LinqChannel;
 pub use matrix::MatrixChannel;
 pub use mattermost::MattermostChannel;
 pub use qq::QQChannel;
@@ -1255,6 +1257,7 @@ pub fn handle_command(command: crate::ChannelCommands, config: &Config) -> Resul
                 ("Matrix", config.channels_config.matrix.is_some()),
                 ("Signal", config.channels_config.signal.is_some()),
                 ("WhatsApp", config.channels_config.whatsapp.is_some()),
+                ("Linq", config.channels_config.linq.is_some()),
                 ("Email", config.channels_config.email.is_some()),
                 ("IRC", config.channels_config.irc.is_some()),
                 ("Lark", config.channels_config.lark.is_some()),
@@ -1387,6 +1390,17 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 wa.phone_number_id.clone(),
                 wa.verify_token.clone(),
                 wa.allowed_numbers.clone(),
+            )),
+        ));
+    }
+
+    if let Some(ref lq) = config.channels_config.linq {
+        channels.push((
+            "Linq",
+            Arc::new(LinqChannel::new(
+                lq.api_token.clone(),
+                lq.from_phone.clone(),
+                lq.allowed_senders.clone(),
             )),
         ));
     }
@@ -1708,6 +1722,14 @@ pub async fn start_channels(config: Config) -> Result<()> {
             wa.phone_number_id.clone(),
             wa.verify_token.clone(),
             wa.allowed_numbers.clone(),
+        )));
+    }
+
+    if let Some(ref lq) = config.channels_config.linq {
+        channels.push(Arc::new(LinqChannel::new(
+            lq.api_token.clone(),
+            lq.from_phone.clone(),
+            lq.allowed_senders.clone(),
         )));
     }
 

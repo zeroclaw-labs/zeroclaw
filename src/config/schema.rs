@@ -1974,6 +1974,7 @@ pub struct ChannelsConfig {
     pub matrix: Option<MatrixConfig>,
     pub signal: Option<SignalConfig>,
     pub whatsapp: Option<WhatsAppConfig>,
+    pub linq: Option<LinqConfig>,
     pub email: Option<crate::channels::email_channel::EmailConfig>,
     pub irc: Option<IrcConfig>,
     pub lark: Option<LarkConfig>,
@@ -2002,6 +2003,7 @@ impl Default for ChannelsConfig {
             matrix: None,
             signal: None,
             whatsapp: None,
+            linq: None,
             email: None,
             irc: None,
             lark: None,
@@ -2146,6 +2148,20 @@ pub struct WhatsAppConfig {
     /// Allowed phone numbers (E.164 format: +1234567890) or "*" for all
     #[serde(default)]
     pub allowed_numbers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinqConfig {
+    /// Linq Partner API token (Bearer auth)
+    pub api_token: String,
+    /// Phone number to send from (E.164 format)
+    pub from_phone: String,
+    /// Webhook signing secret for signature verification
+    #[serde(default)]
+    pub signing_secret: Option<String>,
+    /// Allowed sender handles (phone numbers) or "*" for all
+    #[serde(default)]
+    pub allowed_senders: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3246,6 +3262,7 @@ default_temperature = 0.7
                 matrix: None,
                 signal: None,
                 whatsapp: None,
+                linq: None,
                 email: None,
                 irc: None,
                 lark: None,
@@ -3751,6 +3768,7 @@ allowed_users = ["@ops:matrix.org"]
             }),
             signal: None,
             whatsapp: None,
+            linq: None,
             email: None,
             irc: None,
             lark: None,
@@ -3915,6 +3933,7 @@ channel_id = "C123"
                 app_secret: None,
                 allowed_numbers: vec!["+1".into()],
             }),
+            linq: None,
             email: None,
             irc: None,
             lark: None,
