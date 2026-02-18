@@ -36,6 +36,7 @@ export type SecurityConfig = {
   requireApproval: boolean;
   highRiskActions: boolean;
   incomingCallHooks: boolean;
+  incomingSmsHooks: boolean;
   includeCallerNumber: boolean;
   directExecution: boolean;
   preferStandardWebTool: boolean;
@@ -86,6 +87,7 @@ export const DEFAULT_SECURITY: SecurityConfig = {
   requireApproval: false,
   highRiskActions: true,
   incomingCallHooks: true,
+  incomingSmsHooks: true,
   includeCallerNumber: true,
   directExecution: true,
   preferStandardWebTool: true,

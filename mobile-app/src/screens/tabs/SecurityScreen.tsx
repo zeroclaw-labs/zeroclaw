@@ -13,6 +13,7 @@ export function SecurityScreen() {
   const [requireApproval, setRequireApproval] = useState(DEFAULT_SECURITY.requireApproval);
   const [highRiskActions, setHighRiskActions] = useState(DEFAULT_SECURITY.highRiskActions);
   const [incomingCallHooks, setIncomingCallHooks] = useState(DEFAULT_SECURITY.incomingCallHooks);
+  const [incomingSmsHooks, setIncomingSmsHooks] = useState(DEFAULT_SECURITY.incomingSmsHooks);
   const [includeCallerNumber, setIncludeCallerNumber] = useState(DEFAULT_SECURITY.includeCallerNumber);
   const [directExecution, setDirectExecution] = useState(DEFAULT_SECURITY.directExecution);
   const [preferStandardWebTool, setPreferStandardWebTool] = useState(DEFAULT_SECURITY.preferStandardWebTool);
@@ -27,6 +28,7 @@ export function SecurityScreen() {
       setRequireApproval(loaded.requireApproval);
       setHighRiskActions(loaded.highRiskActions);
       setIncomingCallHooks(loaded.incomingCallHooks);
+      setIncomingSmsHooks(loaded.incomingSmsHooks);
       setIncludeCallerNumber(loaded.includeCallerNumber);
       setDirectExecution(loaded.directExecution);
       setPreferStandardWebTool(loaded.preferStandardWebTool);
@@ -45,6 +47,7 @@ export function SecurityScreen() {
         requireApproval,
         highRiskActions,
         incomingCallHooks,
+        incomingSmsHooks,
         includeCallerNumber,
         directExecution,
         preferStandardWebTool,
@@ -53,12 +56,12 @@ export function SecurityScreen() {
         kind: "action",
         source: "security",
         title: "Security policy updated",
-        detail: `approval=${requireApproval}, high_risk=${highRiskActions}, call_hooks=${incomingCallHooks}, caller_number=${includeCallerNumber}, direct_exec=${directExecution}, web_tool=${preferStandardWebTool}`,
+        detail: `approval=${requireApproval}, high_risk=${highRiskActions}, call_hooks=${incomingCallHooks}, sms_hooks=${incomingSmsHooks}, caller_number=${includeCallerNumber}, direct_exec=${directExecution}, web_tool=${preferStandardWebTool}`,
       });
       setSaveStatus("Saved locally");
     }, 300);
     return () => clearTimeout(timer);
-  }, [requireApproval, highRiskActions, incomingCallHooks, includeCallerNumber, directExecution, preferStandardWebTool]);
+  }, [requireApproval, highRiskActions, incomingCallHooks, incomingSmsHooks, includeCallerNumber, directExecution, preferStandardWebTool]);
 
   return (
     <Screen>
@@ -92,6 +95,10 @@ export function SecurityScreen() {
           <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
             <Text variant="bodyMedium">Enable incoming call hooks</Text>
             <Switch value={incomingCallHooks} onValueChange={setIncomingCallHooks} />
+          </View>
+          <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
+            <Text variant="bodyMedium">Enable incoming SMS hooks</Text>
+            <Switch value={incomingSmsHooks} onValueChange={setIncomingSmsHooks} />
           </View>
           <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
             <Text variant="bodyMedium">Share caller number with agent</Text>

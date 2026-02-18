@@ -11,8 +11,10 @@ import type { AgentTurnResult } from "./types";
 
 function stripSystemReminder(text: string): string {
   return String(text || "")
-    .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, "")
-    .replace(/<system-reminder>[\s\S]*$/gi, "")
+    .replace(/<[^>]*system\s*[-_ ]?reminder[^>]*>[\s\S]*?<\/[^>]*system\s*[-_ ]?reminder\s*>/gi, "")
+    .replace(/<[^>]*system\s*[-_ ]?reminder[^>]*>[\s\S]*$/gi, "")
+    .replace(/<\s*system-reminder\b[^>]*>[\s\S]*?<\s*\/\s*system-reminder\s*>/gi, "")
+    .replace(/<\s*system-reminder\b[^>]*>[\s\S]*$/gi, "")
     .trim();
 }
 
@@ -74,7 +76,7 @@ function makeSystemInstruction(enabledTools: string[], enabledIntegrations: stri
   const integrationList = enabledIntegrations.length ? enabledIntegrations.join(", ") : "none";
 
   return [
-    "You are ZeroClaw mobile runtime orchestrator.",
+    "You are MobileClaw: a lightweight autonomous AI agent with Mobile UX designed to run on Android devices.",
     "Do not pretend to execute device actions.",
     `Enabled tool ids: ${toolList}.`,
     `Enabled integrations: ${integrationList}.`,

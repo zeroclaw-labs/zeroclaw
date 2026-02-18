@@ -6,17 +6,21 @@ import { Screen } from "../../../ui/primitives/Screen";
 import { Text } from "../../../ui/primitives/Text";
 import { useActivity } from "../../state/activity";
 import { theme } from "../../../ui/theme";
+import { getRuntimeSupervisorState, type RuntimeSupervisorState } from "../../runtime/supervisor";
 
 export function ActivityScreen() {
   const { items, refresh } = useActivity();
+  const [runtimeState, setRuntimeState] = React.useState<RuntimeSupervisorState | null>(null);
 
   useEffect(() => {
     refresh();
+    void getRuntimeSupervisorState().then(setRuntimeState);
   }, [refresh]);
 
   useFocusEffect(
     React.useCallback(() => {
       void refresh();
+      void getRuntimeSupervisorState().then(setRuntimeState);
     }, [refresh])
   );
 
@@ -29,6 +33,37 @@ export function ActivityScreen() {
         </Text>
 
         <View style={{ marginTop: theme.spacing.lg, gap: theme.spacing.sm }}>
+          <View
+            style={{
+              padding: theme.spacing.md,
+              borderRadius: theme.radii.lg,
+              backgroundColor: theme.colors.surface.raised,
+              borderWidth: 1,
+              borderColor: theme.colors.stroke.subtle,
+            }}
+          >
+            <Text variant="bodyMedium">ZeroClaw Runtime</Text>
+            <Text variant="mono" style={{ marginTop: 6, color: theme.colors.base.textMuted }}>
+              {runtimeState
+                ? `status=${runtimeState.status} | restarts=${runtimeState.restartCount}`
+                : "status=unknown"}
+            </Text>
+            {runtimeState?.components?.length ? (
+              <Text variant="muted" style={{ marginTop: 4 }}>
+                {runtimeState.components.join(", ")}
+              </Text>
+            ) : (
+              <Text variant="muted" style={{ marginTop: 4 }}>
+                No runtime components active.
+              </Text>
+            )}
+            {runtimeState?.missingConfig?.length ? (
+              <Text variant="muted" style={{ marginTop: 4 }}>
+                Missing config: {runtimeState.missingConfig.join(", ")}
+              </Text>
+            ) : null}
+          </View>
+
           {items.length === 0 ? (
             <View style={{ padding: theme.spacing.lg, borderRadius: theme.radii.lg, backgroundColor: theme.colors.surface.raised }}>
               <Text variant="body">No activity yet.</Text>
