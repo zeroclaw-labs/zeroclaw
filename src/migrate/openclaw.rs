@@ -773,29 +773,43 @@ fn collect_telegram_channel_warnings(
     }
 }
 
-// ── Atomic config write ─────────────────────────────────────────
+// ── Atomic file write (fsync + rename + dir-fsync) ──────────────
 
-fn write_config_atomic(path: &Path, content: &str) -> Result<()> {
+/// Write bytes atomically: temp file -> fsync -> rename -> dir-fsync.
+/// Used for both config.toml (0600) and manifest JSON.
+fn write_file_atomic(path: &Path, content: &[u8]) -> Result<()> {
+    write_file_atomic_inner(path, content, None)
+}
+
+/// Write bytes atomically with explicit Unix permissions.
+fn write_file_atomic_mode(path: &Path, content: &[u8], mode: u32) -> Result<()> {
+    write_file_atomic_inner(path, content, Some(mode))
+}
+
+fn write_file_atomic_inner(path: &Path, content: &[u8], _mode: Option<u32>) -> Result<()> {
     use std::io::Write;
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
 
-    let dir = path.parent().context("Config path has no parent")?;
-    let temp = dir.join(format!(".config-tmp-{}", uuid::Uuid::new_v4()));
+    let dir = path.parent().context("File path has no parent")?;
+    let temp = dir.join(format!(".tmp-{}", uuid::Uuid::new_v4()));
 
     #[cfg(unix)]
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&temp)?;
+    let mut f = {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        if let Some(m) = _mode {
+            opts.mode(m);
+        }
+        opts.open(&temp)?
+    };
     #[cfg(not(unix))]
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temp)?;
 
-    f.write_all(content.as_bytes())?;
+    f.write_all(content)?;
     f.sync_all()?;
 
     std::fs::rename(&temp, path)?;
@@ -834,7 +848,7 @@ fn write_manifest(
         instance_ids: staged.iter().map(|s| s.id.clone()).collect(),
     };
     let json = serde_json::to_string_pretty(&manifest)?;
-    std::fs::write(path, json)?;
+    write_file_atomic(path, json.as_bytes())?;
     Ok(())
 }
 
@@ -854,7 +868,7 @@ fn commit_one(s: &StagedInstance, registry: &Registry, run_id: &str) -> Result<(
 
     // Write config.toml atomically with 0600 perms
     let config_path = s.instance_dir.join("config.toml");
-    write_config_atomic(&config_path, &s.config_toml)?;
+    write_file_atomic_mode(&config_path, s.config_toml.as_bytes(), 0o600)?;
 
     // Register in DB
     registry.create_instance(

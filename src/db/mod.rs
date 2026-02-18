@@ -29,23 +29,7 @@ impl Registry {
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
             .context("Failed to set SQLite pragmas")?;
 
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS instances (
-                id TEXT PRIMARY KEY NOT NULL,
-                name TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'stopped',
-                port INTEGER NOT NULL,
-                config_path TEXT NOT NULL,
-                workspace_dir TEXT,
-                archived_at TEXT,
-                migration_run_id TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_instances_name ON instances(name);
-            CREATE INDEX IF NOT EXISTS idx_instances_migration_run_id ON instances(migration_run_id);",
-        )
-        .context("Failed to initialize registry schema")?;
-
+        Self::init_schema(&conn)?;
         Ok(Self { conn })
     }
 
@@ -54,6 +38,11 @@ impl Registry {
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        Self::init_schema(&conn)?;
+        Ok(Self { conn })
+    }
+
+    fn init_schema(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS instances (
                 id TEXT PRIMARY KEY NOT NULL,
@@ -63,13 +52,28 @@ impl Registry {
                 config_path TEXT NOT NULL,
                 workspace_dir TEXT,
                 archived_at TEXT,
-                migration_run_id TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
-            CREATE INDEX IF NOT EXISTS idx_instances_name ON instances(name);
-            CREATE INDEX IF NOT EXISTS idx_instances_migration_run_id ON instances(migration_run_id);",
+            CREATE INDEX IF NOT EXISTS idx_instances_name ON instances(name);",
+        )
+        .context("Failed to initialize registry schema")?;
+
+        // Migration: add migration_run_id column if missing (pre-phase5 DBs lack it).
+        let has_column = conn
+            .prepare("PRAGMA table_info(instances)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .any(|col| col == "migration_run_id");
+
+        if !has_column {
+            conn.execute_batch("ALTER TABLE instances ADD COLUMN migration_run_id TEXT;")?;
+        }
+
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_instances_migration_run_id ON instances(migration_run_id);",
         )?;
-        Ok(Self { conn })
+
+        Ok(())
     }
 
     /// Create a new instance in the registry.
@@ -305,6 +309,51 @@ mod tests {
             .allocate_port_with_excludes(18801, 18802, &[])
             .unwrap();
         assert!(port.is_none());
+    }
+
+    #[test]
+    fn schema_migration_adds_migration_run_id_column() {
+        // Simulate a pre-phase5 DB: create table WITHOUT migration_run_id,
+        // then open via Registry which should ALTER TABLE to add it.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE instances (
+                id TEXT PRIMARY KEY NOT NULL,
+                name TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'stopped',
+                port INTEGER NOT NULL,
+                config_path TEXT NOT NULL,
+                workspace_dir TEXT,
+                archived_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        )
+        .unwrap();
+
+        // Insert a row without migration_run_id (old schema)
+        conn.execute(
+            "INSERT INTO instances (id, name, status, port, config_path)
+             VALUES ('old-1', 'legacy-agent', 'running', 18801, '/old/config.toml')",
+            [],
+        )
+        .unwrap();
+
+        // Now run init_schema which should add the column
+        Registry::init_schema(&conn).unwrap();
+
+        // Verify: column exists and old row is readable with NULL migration_run_id
+        let reg = Registry { conn };
+        let inst = reg.get_instance("old-1").unwrap().unwrap();
+        assert_eq!(inst.name, "legacy-agent");
+        assert_eq!(inst.status, "running");
+        assert!(inst.migration_run_id.is_none());
+
+        // Verify: new instances with migration_run_id work
+        reg.create_instance("new-1", "new-agent", 18802, "/new/config.toml", None, Some("run-123"))
+            .unwrap();
+        let new_inst = reg.get_instance("new-1").unwrap().unwrap();
+        assert_eq!(new_inst.migration_run_id.as_deref(), Some("run-123"));
     }
 
     #[test]
