@@ -52,7 +52,6 @@ jobs:
                   fetch-depth: 0
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
-                  toolchain: 1.92.0
                   components: rustfmt, clippy
             - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
             - name: Run rust quality gate
@@ -70,7 +69,6 @@ jobs:
                   fetch-depth: 0
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
-                  toolchain: 1.92.0
                   components: clippy
             - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
             - name: Run strict lint delta gate
@@ -87,8 +85,6 @@ jobs:
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
-              with:
-                  toolchain: 1.92.0
             - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
             - name: Run tests
               run: cargo test --locked --verbose
@@ -103,8 +99,6 @@ jobs:
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
-              with:
-                  toolchain: 1.92.0
             - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
             - name: Build release binary
               run: cargo build --release --locked --verbose
