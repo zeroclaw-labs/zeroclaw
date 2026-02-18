@@ -320,13 +320,9 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
         None
     };
 
-    let typing_cancellation = target_channel.as_ref().map(|_| {
-        let token = CancellationToken::new();
-        let guard = token.clone().drop_guard();
-        (token, guard)
-    });
-    let _typing_task = match (target_channel.as_ref(), typing_cancellation.as_ref()) {
-        (Some(channel), Some((token, _guard))) => Some(spawn_scoped_typing_task(
+    let typing_cancellation = target_channel.as_ref().map(|_| CancellationToken::new());
+    let typing_task = match (target_channel.as_ref(), typing_cancellation.as_ref()) {
+        (Some(channel), Some(token)) => Some(spawn_scoped_typing_task(
             Arc::clone(channel),
             msg.reply_target.clone(),
             token.clone(),
@@ -356,6 +352,13 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
     // Wait for draft updater to finish
     if let Some(handle) = draft_updater {
         let _ = handle.await;
+    }
+
+    if let Some(token) = typing_cancellation.as_ref() {
+        token.cancel();
+    }
+    if let Some(handle) = typing_task {
+        log_worker_join_result(handle.await);
     }
 
     match llm_result {
@@ -1919,6 +1922,7 @@ mod tests {
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
