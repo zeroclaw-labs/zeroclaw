@@ -47,6 +47,10 @@ pub struct Config {
     #[serde(default)]
     pub model_routes: Vec<ModelRouteConfig>,
 
+    /// Automatic query classification — maps user messages to model hints.
+    #[serde(default)]
+    pub query_classification: QueryClassificationConfig,
+
     #[serde(default)]
     pub heartbeat: HeartbeatConfig,
 
@@ -1205,6 +1209,40 @@ pub struct ModelRouteConfig {
     pub api_key: Option<String>,
 }
 
+// ── Query Classification ─────────────────────────────────────────
+
+/// Automatic query classification — classifies user messages by keyword/pattern
+/// and routes to the appropriate model hint. Disabled by default.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct QueryClassificationConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub rules: Vec<ClassificationRule>,
+}
+
+/// A single classification rule mapping message patterns to a model hint.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ClassificationRule {
+    /// Must match a `[[model_routes]]` hint value.
+    pub hint: String,
+    /// Case-insensitive substring matches.
+    #[serde(default)]
+    pub keywords: Vec<String>,
+    /// Case-sensitive literal matches (for "```", "fn ", etc.).
+    #[serde(default)]
+    pub patterns: Vec<String>,
+    /// Only match if message length >= N chars.
+    #[serde(default)]
+    pub min_length: Option<usize>,
+    /// Only match if message length <= N chars.
+    #[serde(default)]
+    pub max_length: Option<usize>,
+    /// Higher priority rules are checked first.
+    #[serde(default)]
+    pub priority: i32,
+}
+
 // ── Heartbeat ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1740,6 +1778,7 @@ impl Default for Config {
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            query_classification: QueryClassificationConfig::default(),
         }
     }
 }

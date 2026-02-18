@@ -136,6 +136,7 @@ pub fn run_wizard() -> Result<Config> {
         peripherals: crate::config::PeripheralsConfig::default(),
         agents: std::collections::HashMap::new(),
         hardware: hardware_config,
+        query_classification: crate::config::QueryClassificationConfig::default(),
     };
 
     println!(
@@ -356,6 +357,7 @@ pub fn run_quick_setup(
         peripherals: crate::config::PeripheralsConfig::default(),
         agents: std::collections::HashMap::new(),
         hardware: crate::config::HardwareConfig::default(),
+        query_classification: crate::config::QueryClassificationConfig::default(),
     };
 
     config.save()?;
