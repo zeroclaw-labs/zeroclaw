@@ -16,11 +16,11 @@ services:
     restart: unless-stopped
 
     environment:
-      # Provider: moonshot (Kimi models)
+      # Provider: deepseek
       # NOTE: Coolify injects these from its Environment Variables UI
-      - MOONSHOT_API_KEY
-      - PROVIDER=moonshot
-      - ZEROCLAW_MODEL=kimi-k2.5
+      - DEEPSEEK_API_KEY
+      - PROVIDER=deepseek
+      - ZEROCLAW_MODEL=deepseek-chat
 
       # Allow public bind inside Docker (required for container networking)
       - ZEROCLAW_ALLOW_PUBLIC_BIND=true
