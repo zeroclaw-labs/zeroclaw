@@ -13,6 +13,21 @@ zeroclaw channel doctor
 zeroclaw channel bind-telegram <IDENTITY>
 ```
 
+## In-Chat Runtime Model Switching (Telegram / Discord)
+
+When running `zeroclaw channel start` (or daemon mode), Telegram and Discord now support sender-scoped runtime switching:
+
+- `/models` — show available providers and current selection
+- `/models <provider>` — switch provider for the current sender session
+- `/model` — show current model and cached model IDs (if available)
+- `/model <model-id>` — switch model for the current sender session
+
+Notes:
+
+- Switching clears only that sender's in-memory conversation history to avoid cross-model context contamination.
+- Model cache previews come from `zeroclaw models refresh --provider <ID>`.
+- These are runtime chat commands, not CLI subcommands.
+
 ## Channel Matrix
 
 | Channel | Config section | Access control field | Setup path |
