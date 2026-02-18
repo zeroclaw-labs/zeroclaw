@@ -359,7 +359,13 @@ fn uninstall_linux(config: &Config, init_system: InitSystem) -> Result<()> {
         InitSystem::Openrc => {
             let init_script = Path::new("/etc/init.d/zeroclaw");
             if init_script.exists() {
-                run_checked(Command::new("rc-update").args(["del", "zeroclaw", "default"]))?;
+                if let Err(err) =
+                    run_checked(Command::new("rc-update").args(["del", "zeroclaw", "default"]))
+                {
+                    eprintln!(
+                        "⚠️  Warning: Could not remove zeroclaw from OpenRC default runlevel: {err}"
+                    );
+                }
                 fs::remove_file(init_script)
                     .with_context(|| format!("Failed to remove {}", init_script.display()))?;
             }

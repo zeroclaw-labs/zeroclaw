@@ -1919,24 +1919,21 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
         // OpenRC (system-wide) takes precedence over systemd (user-level)
         let openrc_init_script = PathBuf::from("/etc/init.d/zeroclaw");
         if openrc_init_script.exists() {
-            let status_output = Command::new("rc-service")
-                .args(OPENRC_STATUS_ARGS)
-                .output()
-                .context("Failed to query OpenRC service state")?;
-
-            // rc-service exits 0 if running, non-zero otherwise
-            if status_output.status.success() {
-                let restart_output = Command::new("rc-service")
-                    .args(OPENRC_RESTART_ARGS)
-                    .output()
-                    .context("Failed to restart OpenRC daemon service")?;
-                if !restart_output.status.success() {
-                    let stderr = String::from_utf8_lossy(&restart_output.stderr);
-                    anyhow::bail!("rc-service restart failed: {}", stderr.trim());
+            if let Ok(status_output) = Command::new("rc-service").args(OPENRC_STATUS_ARGS).output()
+            {
+                // rc-service exits 0 if running, non-zero otherwise
+                if status_output.status.success() {
+                    let restart_output = Command::new("rc-service")
+                        .args(OPENRC_RESTART_ARGS)
+                        .output()
+                        .context("Failed to restart OpenRC daemon service")?;
+                    if !restart_output.status.success() {
+                        let stderr = String::from_utf8_lossy(&restart_output.stderr);
+                        anyhow::bail!("rc-service restart failed: {}", stderr.trim());
+                    }
+                    return Ok(true);
                 }
-                return Ok(true);
             }
-            return Ok(false);
         }
 
         // Systemd (user-level)
