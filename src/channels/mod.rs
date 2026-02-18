@@ -488,14 +488,7 @@ fn load_openclaw_bootstrap_files(
         "The following workspace files define your identity, behavior, and context. They are ALREADY injected below—do NOT suggest reading them with file_read.\n\n",
     );
 
-    let bootstrap_files = [
-        "AGENTS.md",
-        "SOUL.md",
-        "TOOLS.md",
-        "IDENTITY.md",
-        "USER.md",
-        "HEARTBEAT.md",
-    ];
+    let bootstrap_files = ["AGENTS.md", "SOUL.md", "TOOLS.md", "IDENTITY.md", "USER.md"];
 
     for filename in &bootstrap_files {
         inject_workspace_file(prompt, workspace_dir, filename, max_chars_per_file);
@@ -518,7 +511,7 @@ fn load_openclaw_bootstrap_files(
 /// 2. Safety — guardrail reminder
 /// 3. Skills — compact list with paths (loaded on-demand)
 /// 4. Workspace — working directory
-/// 5. Bootstrap files — AGENTS, SOUL, TOOLS, IDENTITY, USER, HEARTBEAT, BOOTSTRAP, MEMORY
+/// 5. Bootstrap files — AGENTS, SOUL, TOOLS, IDENTITY, USER, BOOTSTRAP, MEMORY
 /// 6. Date & Time — timezone for cache stability
 /// 7. Runtime — host, OS, model
 ///
@@ -2004,7 +1997,13 @@ mod tests {
         assert!(prompt.contains("### USER.md"), "missing USER.md");
         assert!(prompt.contains("### AGENTS.md"), "missing AGENTS.md");
         assert!(prompt.contains("### TOOLS.md"), "missing TOOLS.md");
-        assert!(prompt.contains("### HEARTBEAT.md"), "missing HEARTBEAT.md");
+        // HEARTBEAT.md is intentionally excluded from channel prompts — it's only
+        // relevant to the heartbeat worker and causes LLMs to emit spurious
+        // "HEARTBEAT_OK" acknowledgments in channel conversations.
+        assert!(
+            !prompt.contains("### HEARTBEAT.md"),
+            "HEARTBEAT.md should not be in channel prompt"
+        );
         assert!(prompt.contains("### MEMORY.md"), "missing MEMORY.md");
         assert!(prompt.contains("User likes Rust"), "missing MEMORY content");
     }
