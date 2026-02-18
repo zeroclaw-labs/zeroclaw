@@ -472,6 +472,7 @@ fn canonical_provider_name(provider_name: &str) -> &str {
         "together" => "together-ai",
         "google" | "google-gemini" => "gemini",
         "kimi_coding" | "kimi_for_coding" => "kimi-code",
+        "nvidia-nim" | "build.nvidia.com" => "nvidia",
         _ => provider_name,
     }
 }
@@ -479,13 +480,7 @@ fn canonical_provider_name(provider_name: &str) -> &str {
 fn allows_unauthenticated_model_fetch(provider_name: &str) -> bool {
     matches!(
         canonical_provider_name(provider_name),
-        "openrouter"
-            | "ollama"
-            | "venice"
-            | "astrai"
-            | "nvidia"
-            | "nvidia-nim"
-            | "build.nvidia.com"
+        "openrouter" | "ollama" | "venice" | "astrai" | "nvidia"
     )
 }
 
@@ -520,7 +515,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "ollama" => "llama3.2".into(),
         "gemini" => "gemini-2.5-pro".into(),
         "kimi-code" => "kimi-for-coding".into(),
-        "nvidia" | "nvidia-nim" | "build.nvidia.com" => "meta/llama-3.3-70b-instruct".into(),
+        "nvidia" => "meta/llama-3.3-70b-instruct".into(),
         "astrai" => "anthropic/claude-sonnet-4.6".into(),
         _ => "anthropic/claude-sonnet-4.6".into(),
     }
@@ -792,22 +787,22 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "Qwen Turbo (fast and cost-efficient)".to_string(),
             ),
         ],
-        "nvidia" | "nvidia-nim" | "build.nvidia.com" => vec![
+        "nvidia" => vec![
             (
                 "meta/llama-3.3-70b-instruct".to_string(),
                 "Llama 3.3 70B Instruct (balanced default)".to_string(),
             ),
             (
                 "deepseek-ai/deepseek-v3.2".to_string(),
-                "DeepSeek V3.2 (reasoning + coding)".to_string(),
+                "DeepSeek V3.2 (advanced reasoning + coding)".to_string(),
             ),
             (
-                "google/gemma-3-27b-it".to_string(),
-                "Gemma 3 27B IT (cost-efficient)".to_string(),
+                "nvidia/llama-3.3-nemotron-super-49b-v1.5".to_string(),
+                "Llama 3.3 Nemotron Super 49B v1.5 (NVIDIA-tuned)".to_string(),
             ),
             (
-                "meta/llama-3.1-405b-instruct".to_string(),
-                "Llama 3.1 405B Instruct (max quality)".to_string(),
+                "nvidia/llama-3.1-nemotron-ultra-253b-v1".to_string(),
+                "Llama 3.1 Nemotron Ultra 253B v1 (max quality)".to_string(),
             ),
         ],
         "astrai" => vec![
@@ -881,8 +876,6 @@ fn supports_live_model_fetch(provider_name: &str) -> bool {
             | "zai"
             | "qwen"
             | "nvidia"
-            | "nvidia-nim"
-            | "build.nvidia.com"
     )
 }
 
@@ -907,9 +900,7 @@ fn models_endpoint_for_provider(provider_name: &str) -> Option<&'static str> {
             "glm" => Some("https://api.z.ai/api/paas/v4/models"),
             "zai" => Some("https://api.z.ai/api/coding/paas/v4/models"),
             "qwen" => Some("https://dashscope.aliyuncs.com/compatible-mode/v1/models"),
-            "nvidia" | "nvidia-nim" | "build.nvidia.com" => {
-                Some("https://integrate.api.nvidia.com/v1/models")
-            }
+            "nvidia" => Some("https://integrate.api.nvidia.com/v1/models"),
             "astrai" => Some("https://as-trai.com/v1/models"),
             _ => None,
         },
@@ -4642,6 +4633,10 @@ mod tests {
         assert_eq!(default_model_for_provider("venice"), "zai-org-glm-5");
         assert_eq!(default_model_for_provider("moonshot"), "kimi-k2.5");
         assert_eq!(
+            default_model_for_provider("nvidia"),
+            "meta/llama-3.3-70b-instruct"
+        );
+        assert_eq!(
             default_model_for_provider("nvidia-nim"),
             "meta/llama-3.3-70b-instruct"
         );
@@ -4664,6 +4659,8 @@ mod tests {
         assert_eq!(canonical_provider_name("minimax-cn"), "minimax");
         assert_eq!(canonical_provider_name("zai-cn"), "zai");
         assert_eq!(canonical_provider_name("z.ai-global"), "zai");
+        assert_eq!(canonical_provider_name("nvidia-nim"), "nvidia");
+        assert_eq!(canonical_provider_name("build.nvidia.com"), "nvidia");
     }
 
     #[test]
@@ -4757,6 +4754,9 @@ mod tests {
         assert!(supports_live_model_fetch("google"));
         assert!(supports_live_model_fetch("grok"));
         assert!(supports_live_model_fetch("together"));
+        assert!(supports_live_model_fetch("nvidia"));
+        assert!(supports_live_model_fetch("nvidia-nim"));
+        assert!(supports_live_model_fetch("build.nvidia.com"));
         assert!(supports_live_model_fetch("ollama"));
         assert!(supports_live_model_fetch("astrai"));
         assert!(supports_live_model_fetch("venice"));
@@ -4800,6 +4800,26 @@ mod tests {
             curated_models_for_provider("zai"),
             curated_models_for_provider("zai-cn")
         );
+        assert_eq!(
+            curated_models_for_provider("nvidia"),
+            curated_models_for_provider("nvidia-nim")
+        );
+        assert_eq!(
+            curated_models_for_provider("nvidia"),
+            curated_models_for_provider("build.nvidia.com")
+        );
+    }
+
+    #[test]
+    fn curated_models_for_nvidia_include_nim_catalog_entries() {
+        let ids: Vec<String> = curated_models_for_provider("nvidia")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+
+        assert!(ids.contains(&"meta/llama-3.3-70b-instruct".to_string()));
+        assert!(ids.contains(&"deepseek-ai/deepseek-v3.2".to_string()));
+        assert!(ids.contains(&"nvidia/llama-3.3-nemotron-super-49b-v1.5".to_string()));
     }
 
     #[test]
