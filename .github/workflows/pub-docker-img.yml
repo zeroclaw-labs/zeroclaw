@@ -2,14 +2,33 @@ name: Pub Docker Img
 
 on:
     push:
+        branches: [main]
         tags: ["v*"]
+        paths:
+            - "Dockerfile"
+            - ".dockerignore"
+            - "Cargo.toml"
+            - "Cargo.lock"
+            - "rust-toolchain.toml"
+            - "src/**"
+            - "crates/**"
+            - "benches/**"
+            - "firmware/**"
+            - "dev/config.template.toml"
+            - ".github/workflows/pub-docker-img.yml"
     pull_request:
         branches: [main]
         paths:
             - "Dockerfile"
-            - "docker-compose.yml"
-            - "dev/docker-compose.yml"
-            - "dev/sandbox/**"
+            - ".dockerignore"
+            - "Cargo.toml"
+            - "Cargo.lock"
+            - "rust-toolchain.toml"
+            - "src/**"
+            - "crates/**"
+            - "benches/**"
+            - "firmware/**"
+            - "dev/config.template.toml"
             - ".github/workflows/pub-docker-img.yml"
     workflow_dispatch:
 
@@ -61,7 +80,7 @@ jobs:
 
     publish:
         name: Build and Push Docker Image
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         runs-on: blacksmith-2vcpu-ubuntu-2404
         timeout-minutes: 25
         permissions:

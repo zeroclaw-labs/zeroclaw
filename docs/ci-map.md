@@ -24,7 +24,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 ### Non-Blocking but Important
 
 - `.github/workflows/pub-docker-img.yml` (`Docker`)
-    - Purpose: PR Docker smoke check and publish images on tag pushes (`v*`)
+    - Purpose: PR Docker smoke check and publish images on `main` pushes (build-input paths), tag pushes (`v*`), and manual dispatch
 - `.github/workflows/sec-audit.yml` (`Security Audit`)
     - Purpose: dependency advisories (`rustsec/audit-check`, pinned SHA) and policy/license checks (`cargo deny`)
 - `.github/workflows/sec-codeql.yml` (`CodeQL Analysis`)
@@ -66,7 +66,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 ## Trigger Map
 
 - `CI`: push to `main`, PRs to `main`
-- `Docker`: tag push (`v*`), PRs touching docker/workflow files, manual dispatch
+- `Docker`: push to `main` when Docker build inputs change, tag push (`v*`), matching PRs, manual dispatch
 - `Release`: tag push (`v*`)
 - `Security Audit`: push to `main`, PRs to `main`, weekly schedule
 - `Workflow Sanity`: PR/push when `.github/workflows/**`, `.github/*.yml`, or `.github/*.yaml` change
