@@ -1,3 +1,21 @@
+//! Provider subsystem for model inference backends.
+//!
+//! This module implements the factory pattern for AI model providers. Each provider
+//! implements the [`Provider`] trait defined in [`traits`], and is registered in the
+//! factory function [`create_provider`] by its canonical string key (e.g., `"openai"`,
+//! `"anthropic"`, `"ollama"`, `"gemini"`). Provider aliases are resolved internally
+//! so that user-facing keys remain stable.
+//!
+//! The subsystem supports resilient multi-provider configurations through the
+//! [`ReliableProvider`](reliable::ReliableProvider) wrapper, which handles fallback
+//! chains and automatic retry. Model routing across providers is available via
+//! [`create_routed_provider`].
+//!
+//! # Extension
+//!
+//! To add a new provider, implement [`Provider`] in a new submodule and register it
+//! in [`create_provider_with_url`]. See `AGENTS.md` §7.1 for the full change playbook.
+
 pub mod anthropic;
 pub mod bedrock;
 pub mod compatible;

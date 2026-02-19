@@ -1,3 +1,20 @@
+//! Tool subsystem for agent-callable capabilities.
+//!
+//! This module implements the tool execution surface exposed to the LLM during
+//! agentic loops. Each tool implements the [`Tool`] trait defined in [`traits`],
+//! which requires a name, description, JSON parameter schema, and an async
+//! `execute` method returning a structured [`ToolResult`].
+//!
+//! Tools are assembled into registries by [`default_tools`] (shell, file read/write)
+//! and [`all_tools`] (full set including memory, browser, cron, HTTP, delegation,
+//! and optional integrations). Security policy enforcement is injected via
+//! [`SecurityPolicy`](crate::security::SecurityPolicy) at construction time.
+//!
+//! # Extension
+//!
+//! To add a new tool, implement [`Tool`] in a new submodule and register it in
+//! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
+
 pub mod browser;
 pub mod browser_open;
 pub mod composio;

@@ -1,3 +1,19 @@
+//! Channel subsystem for messaging platform integrations.
+//!
+//! This module provides the multi-channel messaging infrastructure that connects
+//! ZeroClaw to external platforms. Each channel implements the [`Channel`] trait
+//! defined in [`traits`], which provides a uniform interface for sending messages,
+//! listening for incoming messages, health checking, and typing indicators.
+//!
+//! Channels are instantiated by [`start_channels`] based on the runtime configuration.
+//! The subsystem manages per-sender conversation history, concurrent message processing
+//! with configurable parallelism, and exponential-backoff reconnection for resilience.
+//!
+//! # Extension
+//!
+//! To add a new channel, implement [`Channel`] in a new submodule and wire it into
+//! [`start_channels`]. See `AGENTS.md` §7.2 for the full change playbook.
+
 pub mod cli;
 pub mod dingtalk;
 pub mod discord;
