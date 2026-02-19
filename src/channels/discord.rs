@@ -857,7 +857,10 @@ mod tests {
         msg.push_str(&"x".repeat(1990));
         msg.push_str("\n```\nMore text after code block");
         let parts = split_message_for_discord(&msg);
-        assert!(parts.len() >= 2, "code block spanning boundary should split");
+        assert!(
+            parts.len() >= 2,
+            "code block spanning boundary should split"
+        );
         for part in &parts {
             assert!(
                 part.len() <= DISCORD_MAX_MESSAGE_LENGTH,

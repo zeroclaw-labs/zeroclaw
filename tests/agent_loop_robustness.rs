@@ -128,7 +128,12 @@ struct CountingTool {
 impl CountingTool {
     fn new() -> (Self, Arc<Mutex<usize>>) {
         let count = Arc::new(Mutex::new(0));
-        (Self { count: count.clone() }, count)
+        (
+            Self {
+                count: count.clone(),
+            },
+            count,
+        )
     }
 }
 
@@ -295,10 +300,7 @@ async fn agent_handles_mixed_tool_success_and_failure() {
         text_response("Mixed results processed"),
     ]));
 
-    let mut agent = build_agent(
-        provider,
-        vec![Box::new(EchoTool), Box::new(FailingTool)],
-    );
+    let mut agent = build_agent(provider, vec![Box::new(EchoTool), Box::new(FailingTool)]);
     let response = agent.turn("mixed tools").await.unwrap();
     assert!(!response.is_empty());
 }

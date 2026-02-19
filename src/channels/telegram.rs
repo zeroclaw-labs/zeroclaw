@@ -45,10 +45,7 @@ fn split_message_for_telegram(message: &str) -> Vec<String> {
                     pos + 1
                 } else {
                     // Try space as fallback
-                    search_area
-                        .rfind(' ')
-                        .unwrap_or(hard_split)
-                        + 1
+                    search_area.rfind(' ').unwrap_or(hard_split) + 1
                 }
             } else if let Some(pos) = search_area.rfind(' ') {
                 pos + 1
@@ -1632,6 +1629,37 @@ impl Channel for TelegramChannel {
             .await
     }
 
+    async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
+        let (chat_id, _) = Self::parse_reply_target(recipient);
+        self.last_draft_edit.lock().remove(&chat_id);
+
+        let message_id = match message_id.parse::<i64>() {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::debug!("Invalid Telegram draft message_id '{message_id}': {e}");
+                return Ok(());
+            }
+        };
+
+        let response = self
+            .client
+            .post(self.api_url("deleteMessage"))
+            .json(&serde_json::json!({
+                "chat_id": chat_id,
+                "message_id": message_id,
+            }))
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            tracing::debug!("Telegram deleteMessage failed ({status}): {body}");
+        }
+
+        Ok(())
+    }
+
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         // Strip tool_call tags before processing to prevent Markdown parsing failures
         let content = strip_tool_call_tags(&message.content);
@@ -2844,7 +2872,10 @@ mod tests {
         msg.push_str(&"x".repeat(4085));
         msg.push_str("\n```\nMore text after code block");
         let parts = split_message_for_telegram(&msg);
-        assert!(parts.len() >= 2, "code block spanning boundary should split");
+        assert!(
+            parts.len() >= 2,
+            "code block spanning boundary should split"
+        );
         for part in &parts {
             assert!(
                 part.len() <= TELEGRAM_MAX_MESSAGE_LENGTH,

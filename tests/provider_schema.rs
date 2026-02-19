@@ -80,7 +80,10 @@ fn tool_call_has_required_fields() {
 
     let json = serde_json::to_value(&tc).unwrap();
     assert!(json.get("id").is_some(), "ToolCall must have 'id' field");
-    assert!(json.get("name").is_some(), "ToolCall must have 'name' field");
+    assert!(
+        json.get("name").is_some(),
+        "ToolCall must have 'name' field"
+    );
     assert!(
         json.get("arguments").is_some(),
         "ToolCall must have 'arguments' field"
@@ -98,7 +101,10 @@ fn tool_call_id_preserved_in_serialization() {
     let json_str = serde_json::to_string(&tc).unwrap();
     let parsed: ToolCall = serde_json::from_str(&json_str).unwrap();
 
-    assert_eq!(parsed.id, "call_deepseek_42", "tool_call_id must survive roundtrip");
+    assert_eq!(
+        parsed.id, "call_deepseek_42",
+        "tool_call_id must survive roundtrip"
+    );
     assert_eq!(parsed.name, "shell");
 }
 
@@ -111,8 +117,8 @@ fn tool_call_arguments_contain_valid_json() {
     };
 
     // Arguments should parse as valid JSON
-    let args: serde_json::Value = serde_json::from_str(&tc.arguments)
-        .expect("tool call arguments should be valid JSON");
+    let args: serde_json::Value =
+        serde_json::from_str(&tc.arguments).expect("tool call arguments should be valid JSON");
     assert!(args.get("path").is_some());
     assert!(args.get("content").is_some());
 }
@@ -125,9 +131,8 @@ fn tool_call_arguments_contain_valid_json() {
 fn tool_response_message_can_embed_tool_call_id() {
     // DeepSeek requires tool_call_id in tool response messages.
     // The tool message content can embed the tool_call_id as JSON.
-    let tool_response = ChatMessage::tool(
-        r#"{"tool_call_id": "call_abc123", "content": "search results here"}"#,
-    );
+    let tool_response =
+        ChatMessage::tool(r#"{"tool_call_id": "call_abc123", "content": "search results here"}"#);
 
     let parsed: serde_json::Value = serde_json::from_str(&tool_response.content)
         .expect("tool response content should be valid JSON");
@@ -245,21 +250,32 @@ fn provider_construction_with_different_names() {
         Some("test-key"),
         AuthStyle::Bearer,
     );
-    let _p2 = OpenAiCompatibleProvider::new(
-        "deepseek",
-        "https://api.test.com",
-        None,
-        AuthStyle::Bearer,
-    );
+    let _p2 =
+        OpenAiCompatibleProvider::new("deepseek", "https://api.test.com", None, AuthStyle::Bearer);
 }
 
 #[test]
 fn provider_construction_with_different_auth_styles() {
     use zeroclaw::providers::compatible::OpenAiCompatibleProvider;
 
-    let _bearer = OpenAiCompatibleProvider::new("Test", "https://api.test.com", Some("key"), AuthStyle::Bearer);
-    let _xapi = OpenAiCompatibleProvider::new("Test", "https://api.test.com", Some("key"), AuthStyle::XApiKey);
-    let _custom = OpenAiCompatibleProvider::new("Test", "https://api.test.com", Some("key"), AuthStyle::Custom("X-My-Auth".into()));
+    let _bearer = OpenAiCompatibleProvider::new(
+        "Test",
+        "https://api.test.com",
+        Some("key"),
+        AuthStyle::Bearer,
+    );
+    let _xapi = OpenAiCompatibleProvider::new(
+        "Test",
+        "https://api.test.com",
+        Some("key"),
+        AuthStyle::XApiKey,
+    );
+    let _custom = OpenAiCompatibleProvider::new(
+        "Test",
+        "https://api.test.com",
+        Some("key"),
+        AuthStyle::Custom("X-My-Auth".into()),
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -24,6 +24,7 @@ fn channel_message_sender_field_holds_platform_user_id() {
         content: "test message".into(),
         channel: "telegram".into(),
         timestamp: 1700000000,
+        thread_ts: None,
     };
 
     assert_eq!(msg.sender, "123456789");
@@ -40,11 +41,12 @@ fn channel_message_reply_target_distinct_from_sender() {
     // Simulates Discord: reply_target should be channel_id, not sender user_id
     let msg = ChannelMessage {
         id: "msg_1".into(),
-        sender: "user_987654".into(),    // Discord user ID
+        sender: "user_987654".into(),       // Discord user ID
         reply_target: "channel_123".into(), // Discord channel ID for replies
         content: "test message".into(),
         channel: "discord".into(),
         timestamp: 1700000000,
+        thread_ts: None,
     };
 
     assert_ne!(
@@ -64,9 +66,13 @@ fn channel_message_fields_not_swapped() {
         content: "payload".into(),
         channel: "test".into(),
         timestamp: 1700000000,
+        thread_ts: None,
     };
 
-    assert_eq!(msg.sender, "sender_value", "sender field should not be swapped");
+    assert_eq!(
+        msg.sender, "sender_value",
+        "sender field should not be swapped"
+    );
     assert_eq!(
         msg.reply_target, "target_value",
         "reply_target field should not be swapped"
@@ -86,6 +92,7 @@ fn channel_message_preserves_all_fields_on_clone() {
         content: "cloned content".into(),
         channel: "test_channel".into(),
         timestamp: 1700000001,
+        thread_ts: None,
     };
 
     let cloned = original.clone();
@@ -170,10 +177,7 @@ impl Channel for CapturingChannel {
         Ok(())
     }
 
-    async fn listen(
-        &self,
-        tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-    ) -> anyhow::Result<()> {
+    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         tx.send(ChannelMessage {
             id: "listen_1".into(),
             sender: "test_sender".into(),
@@ -181,6 +185,7 @@ impl Channel for CapturingChannel {
             content: "incoming".into(),
             channel: "capturing".into(),
             timestamp: 1700000000,
+            thread_ts: None,
         })
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -266,7 +271,10 @@ async fn channel_draft_defaults() {
         .send_draft(&SendMessage::new("draft", "target"))
         .await
         .unwrap();
-    assert!(draft_result.is_none(), "default send_draft should return None");
+    assert!(
+        draft_result.is_none(),
+        "default send_draft should return None"
+    );
 
     assert!(channel
         .update_draft("target", "msg_1", "updated")
