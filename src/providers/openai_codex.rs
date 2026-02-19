@@ -123,6 +123,44 @@ fn normalize_model_id(model: &str) -> &str {
     model.rsplit('/').next().unwrap_or(model)
 }
 
+fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<ResponsesInput>) {
+    let mut system_parts: Vec<&str> = Vec::new();
+    let mut input: Vec<ResponsesInput> = Vec::new();
+
+    for msg in messages {
+        match msg.role.as_str() {
+            "system" => system_parts.push(&msg.content),
+            "user" => {
+                input.push(ResponsesInput {
+                    role: "user".to_string(),
+                    content: vec![ResponsesInputContent {
+                        kind: "input_text".to_string(),
+                        text: msg.content.clone(),
+                    }],
+                });
+            }
+            "assistant" => {
+                input.push(ResponsesInput {
+                    role: "assistant".to_string(),
+                    content: vec![ResponsesInputContent {
+                        kind: "output_text".to_string(),
+                        text: msg.content.clone(),
+                    }],
+                });
+            }
+            _ => {}
+        }
+    }
+
+    let instructions = if system_parts.is_empty() {
+        DEFAULT_CODEX_INSTRUCTIONS.to_string()
+    } else {
+        system_parts.join("\n\n")
+    };
+
+    (instructions, input)
+}
+
 fn clamp_reasoning_effort(model: &str, effort: &str) -> String {
     let id = normalize_model_id(model);
     if (id.starts_with("gpt-5.2") || id.starts_with("gpt-5.3")) && effort == "minimal" {
@@ -429,33 +467,7 @@ impl Provider for OpenAiCodexProvider {
         model: &str,
         _temperature: f64,
     ) -> anyhow::Result<String> {
-        let mut system_parts: Vec<&str> = Vec::new();
-        let mut input: Vec<ResponsesInput> = Vec::new();
-
-        for msg in messages {
-            match msg.role.as_str() {
-                "system" => {
-                    system_parts.push(&msg.content);
-                }
-                "user" | "assistant" => {
-                    input.push(ResponsesInput {
-                        role: msg.role.clone(),
-                        content: vec![ResponsesInputContent {
-                            kind: "input_text".to_string(),
-                            text: msg.content.clone(),
-                        }],
-                    });
-                }
-                _ => {}
-            }
-        }
-
-        let instructions = if system_parts.is_empty() {
-            DEFAULT_CODEX_INSTRUCTIONS.to_string()
-        } else {
-            system_parts.join("\n\n")
-        };
-
+        let (instructions, input) = build_responses_input(messages);
         self.send_responses_request(input, instructions, model)
             .await
     }
@@ -565,5 +577,71 @@ data: [DONE]
 "#;
 
         assert_eq!(parse_sse_text(payload).unwrap().as_deref(), Some("Done"));
+    }
+
+    #[test]
+    fn build_responses_input_maps_content_types_by_role() {
+        let messages = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: "You are helpful.".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "Hi".into(),
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: "Hello!".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "Thanks".into(),
+            },
+        ];
+        let (instructions, input) = build_responses_input(&messages);
+        assert_eq!(instructions, "You are helpful.");
+        assert_eq!(input.len(), 3);
+
+        let json: Vec<Value> = input
+            .iter()
+            .map(|item| serde_json::to_value(item).unwrap())
+            .collect();
+        assert_eq!(json[0]["role"], "user");
+        assert_eq!(json[0]["content"][0]["type"], "input_text");
+        assert_eq!(json[1]["role"], "assistant");
+        assert_eq!(json[1]["content"][0]["type"], "output_text");
+        assert_eq!(json[2]["role"], "user");
+        assert_eq!(json[2]["content"][0]["type"], "input_text");
+    }
+
+    #[test]
+    fn build_responses_input_uses_default_instructions_without_system() {
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "Hello".into(),
+        }];
+        let (instructions, input) = build_responses_input(&messages);
+        assert_eq!(instructions, DEFAULT_CODEX_INSTRUCTIONS);
+        assert_eq!(input.len(), 1);
+    }
+
+    #[test]
+    fn build_responses_input_ignores_unknown_roles() {
+        let messages = vec![
+            ChatMessage {
+                role: "tool".into(),
+                content: "result".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "Go".into(),
+            },
+        ];
+        let (instructions, input) = build_responses_input(&messages);
+        assert_eq!(instructions, DEFAULT_CODEX_INSTRUCTIONS);
+        assert_eq!(input.len(), 1);
+        let json = serde_json::to_value(&input[0]).unwrap();
+        assert_eq!(json["role"], "user");
     }
 }
