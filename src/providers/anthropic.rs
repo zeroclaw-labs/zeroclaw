@@ -42,7 +42,7 @@ struct ContentBlock {
 }
 
 #[derive(Debug, Serialize)]
-struct NativeChatRequest {
+struct NativeChatRequest<'a> {
     model: String,
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -50,7 +50,7 @@ struct NativeChatRequest {
     messages: Vec<NativeMessage>,
     temperature: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<NativeToolSpec>>,
+    tools: Option<Vec<NativeToolSpec<'a>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -86,10 +86,10 @@ enum NativeContentOut {
 }
 
 #[derive(Debug, Serialize)]
-struct NativeToolSpec {
-    name: String,
-    description: String,
-    input_schema: serde_json::Value,
+struct NativeToolSpec<'a> {
+    name: &'a str,
+    description: &'a str,
+    input_schema: &'a serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_control: Option<CacheControl>,
 }
@@ -206,17 +206,17 @@ impl AnthropicProvider {
         }
     }
 
-    fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
+    fn convert_tools<'a>(tools: Option<&'a [ToolSpec]>) -> Option<Vec<NativeToolSpec<'a>>> {
         let items = tools?;
         if items.is_empty() {
             return None;
         }
-        let mut native_tools: Vec<NativeToolSpec> = items
+        let mut native_tools: Vec<NativeToolSpec<'a>> = items
             .iter()
             .map(|tool| NativeToolSpec {
-                name: tool.name.clone(),
-                description: tool.description.clone(),
-                input_schema: tool.parameters.clone(),
+                name: &tool.name,
+                description: &tool.description,
+                input_schema: &tool.parameters,
                 cache_control: None,
             })
             .collect();
@@ -828,10 +828,11 @@ mod tests {
 
     #[test]
     fn native_tool_spec_without_cache_control() {
+        let schema = serde_json::json!({"type": "object"});
         let tool = NativeToolSpec {
-            name: "get_weather".to_string(),
-            description: "Get weather info".to_string(),
-            input_schema: serde_json::json!({"type": "object"}),
+            name: "get_weather",
+            description: "Get weather info",
+            input_schema: &schema,
             cache_control: None,
         };
         let json = serde_json::to_string(&tool).unwrap();
@@ -841,10 +842,11 @@ mod tests {
 
     #[test]
     fn native_tool_spec_with_cache_control() {
+        let schema = serde_json::json!({"type": "object"});
         let tool = NativeToolSpec {
-            name: "get_weather".to_string(),
-            description: "Get weather info".to_string(),
-            input_schema: serde_json::json!({"type": "object"}),
+            name: "get_weather",
+            description: "Get weather info",
+            input_schema: &schema,
             cache_control: Some(CacheControl::ephemeral()),
         };
         let json = serde_json::to_string(&tool).unwrap();

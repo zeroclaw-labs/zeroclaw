@@ -3,12 +3,14 @@
 // Splits on markdown headings and paragraph boundaries, respecting
 // a max token limit per chunk. Preserves heading context.
 
+use std::rc::Rc;
+
 /// A single chunk of text with metadata.
 #[derive(Debug, Clone)]
 pub struct Chunk {
     pub index: usize,
     pub content: String,
-    pub heading: Option<String>,
+    pub heading: Option<Rc<str>>,
 }
 
 /// Split markdown text into chunks, each under `max_tokens` approximate tokens.
@@ -26,9 +28,10 @@ pub fn chunk_markdown(text: &str, max_tokens: usize) -> Vec<Chunk> {
 
     let max_chars = max_tokens * 4;
     let sections = split_on_headings(text);
-    let mut chunks = Vec::new();
+    let mut chunks = Vec::with_capacity(sections.len());
 
     for (heading, body) in sections {
+        let heading: Option<Rc<str>> = heading.map(Rc::from);
         let full = if let Some(ref h) = heading {
             format!("{h}\n{body}")
         } else {
@@ -45,7 +48,7 @@ pub fn chunk_markdown(text: &str, max_tokens: usize) -> Vec<Chunk> {
             // Split on paragraphs (blank lines)
             let paragraphs = split_on_blank_lines(&body);
             let mut current = heading
-                .as_ref()
+                .as_deref()
                 .map_or_else(String::new, |h| format!("{h}\n"));
 
             for para in paragraphs {
@@ -56,7 +59,7 @@ pub fn chunk_markdown(text: &str, max_tokens: usize) -> Vec<Chunk> {
                         heading: heading.clone(),
                     });
                     current = heading
-                        .as_ref()
+                        .as_deref()
                         .map_or_else(String::new, |h| format!("{h}\n"));
                 }
 
@@ -69,7 +72,7 @@ pub fn chunk_markdown(text: &str, max_tokens: usize) -> Vec<Chunk> {
                             heading: heading.clone(),
                         });
                         current = heading
-                            .as_ref()
+                            .as_deref()
                             .map_or_else(String::new, |h| format!("{h}\n"));
                     }
                     for line_chunk in split_on_lines(&para, max_chars) {
@@ -115,8 +118,7 @@ fn split_on_headings(text: &str) -> Vec<(Option<String>, String)> {
     for line in text.lines() {
         if line.starts_with("# ") || line.starts_with("## ") || line.starts_with("### ") {
             if !current_body.trim().is_empty() || current_heading.is_some() {
-                sections.push((current_heading.take(), current_body.clone()));
-                current_body.clear();
+                sections.push((current_heading.take(), std::mem::take(&mut current_body)));
             }
             current_heading = Some(line.to_string());
         } else {
@@ -140,8 +142,7 @@ fn split_on_blank_lines(text: &str) -> Vec<String> {
     for line in text.lines() {
         if line.trim().is_empty() {
             if !current.trim().is_empty() {
-                paragraphs.push(current.clone());
-                current.clear();
+                paragraphs.push(std::mem::take(&mut current));
             }
         } else {
             current.push_str(line);
@@ -158,13 +159,12 @@ fn split_on_blank_lines(text: &str) -> Vec<String> {
 
 /// Split text on line boundaries to fit within `max_chars`
 fn split_on_lines(text: &str, max_chars: usize) -> Vec<String> {
-    let mut chunks = Vec::new();
+    let mut chunks = Vec::with_capacity(text.len() / max_chars.max(1) + 1);
     let mut current = String::new();
 
     for line in text.lines() {
         if current.len() + line.len() + 1 > max_chars && !current.is_empty() {
-            chunks.push(current.clone());
-            current.clear();
+            chunks.push(std::mem::take(&mut current));
         }
         current.push_str(line);
         current.push('\n');
