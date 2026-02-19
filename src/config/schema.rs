@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
-use tokio::fs::{self, File, OpenOptions};
+use tokio::fs::{self, OpenOptions};
+#[cfg(unix)]
+use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 
 const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
@@ -3373,14 +3375,16 @@ async fn sync_directory(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> Result<()> {
+async fn sync_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs::Permissions, os::unix::fs::PermissionsExt, path::PathBuf};
+    #[cfg(unix)]
+    use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+    use std::path::PathBuf;
     use tokio::sync::{Mutex, MutexGuard};
     use tokio::test;
     use tokio_stream::wrappers::ReadDirStream;
