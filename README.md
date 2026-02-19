@@ -792,6 +792,9 @@ For a task-oriented command guide, see [`docs/commands-reference.md`](docs/comma
 ## Development
 
 ```bash
+# First-time setup (configures git hooks, verifies toolchain, runs build check)
+./dev/setup.sh
+
 cargo build              # Dev build
 cargo build --release    # Release build (codegen-units=1, works on all devices including Raspberry Pi)
 cargo build --profile release-fast    # Faster build (codegen-units=8, requires 16GB+ RAM)

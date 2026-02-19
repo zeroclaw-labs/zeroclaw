@@ -9,6 +9,10 @@ Thanks for your interest in contributing to ZeroClaw! This guide will help you g
 git clone https://github.com/zeroclaw-labs/zeroclaw.git
 cd zeroclaw
 
+# Automated setup (configures git hooks, verifies toolchain, runs build check)
+./dev/setup.sh
+
+# Or manually:
 # Enable the pre-push hook (runs fmt, clippy, tests before every push)
 git config core.hooksPath .githooks
 
