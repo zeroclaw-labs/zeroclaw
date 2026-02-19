@@ -1225,9 +1225,9 @@ mod native_backend {
                     });
 
                     if let Some(path_str) = path {
-                        tokio::fs::write(&path_str, &png).await.with_context(|| {
-                            format!("Failed to write screenshot to {path_str}")
-                        })?;
+                        tokio::fs::write(&path_str, &png)
+                            .await
+                            .with_context(|| format!("Failed to write screenshot to {path_str}"))?;
                         payload["path"] = Value::String(path_str);
                     } else {
                         payload["png_base64"] =
