@@ -3105,6 +3105,38 @@ mod tests {
     }
 
     #[test]
+    fn config_schema_export_contains_expected_contract_shape() {
+        let schema = schemars::schema_for!(Config);
+        let schema_json = serde_json::to_value(&schema).expect("schema should serialize to json");
+
+        assert_eq!(
+            schema_json
+                .get("$schema")
+                .and_then(serde_json::Value::as_str),
+            Some("https://json-schema.org/draft/2020-12/schema")
+        );
+
+        let properties = schema_json
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("schema should expose top-level properties");
+
+        assert!(properties.contains_key("default_provider"));
+        assert!(properties.contains_key("gateway"));
+        assert!(properties.contains_key("channels_config"));
+        assert!(!properties.contains_key("workspace_dir"));
+        assert!(!properties.contains_key("config_path"));
+
+        assert!(
+            schema_json
+                .get("$defs")
+                .and_then(serde_json::Value::as_object)
+                .is_some(),
+            "schema should include reusable type definitions"
+        );
+    }
+
+    #[test]
     fn observability_config_default() {
         let o = ObservabilityConfig::default();
         assert_eq!(o.backend, "none");

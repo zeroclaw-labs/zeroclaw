@@ -2,11 +2,15 @@
 
 This is a high-signal reference for common config sections and defaults.
 
-Last verified: **February 18, 2026**.
+Last verified: **February 19, 2026**.
 
 Config file path:
 
 - `~/.zeroclaw/config.toml`
+
+Schema export command:
+
+- `zeroclaw config schema` (prints JSON Schema draft 2020-12 to stdout)
 
 ## Core Keys
 
