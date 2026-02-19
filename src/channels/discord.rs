@@ -108,6 +108,23 @@ fn split_message_for_discord(message: &str) -> Vec<String> {
     chunks
 }
 
+/// URL-encode a Unicode emoji for use in Discord reaction API paths.
+///
+/// Discord's reaction endpoints accept raw Unicode emoji in the URL path,
+/// but they must be percent-encoded per RFC 3986. Custom guild emojis use
+/// the `name:id` format and are passed through unencoded.
+fn encode_emoji_for_discord(emoji: &str) -> String {
+    if emoji.contains(':') {
+        return emoji.to_string();
+    }
+
+    let mut encoded = String::new();
+    for byte in emoji.as_bytes() {
+        encoded.push_str(&format!("%{byte:02X}"));
+    }
+    encoded
+}
+
 fn mention_tags(bot_user_id: &str) -> [String; 2] {
     [format!("<@{bot_user_id}>"), format!("<@!{bot_user_id}>")]
 }
@@ -471,6 +488,69 @@ impl Channel for DiscordChannel {
         }
         Ok(())
     }
+
+    async fn add_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        let raw_id = message_id.strip_prefix("discord_").unwrap_or(message_id);
+        let encoded_emoji = encode_emoji_for_discord(emoji);
+        let url = format!(
+            "https://discord.com/api/v10/channels/{channel_id}/messages/{raw_id}/reactions/{encoded_emoji}/@me"
+        );
+
+        let resp = self
+            .http_client()
+            .put(&url)
+            .header("Authorization", format!("Bot {}", self.bot_token))
+            .header("Content-Length", "0")
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+            anyhow::bail!("Discord add reaction failed ({status}): {err}");
+        }
+
+        Ok(())
+    }
+
+    async fn remove_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        let raw_id = message_id.strip_prefix("discord_").unwrap_or(message_id);
+        let encoded_emoji = encode_emoji_for_discord(emoji);
+        let url = format!(
+            "https://discord.com/api/v10/channels/{channel_id}/messages/{raw_id}/reactions/{encoded_emoji}/@me"
+        );
+
+        let resp = self
+            .http_client()
+            .delete(&url)
+            .header("Authorization", format!("Bot {}", self.bot_token))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+            anyhow::bail!("Discord remove reaction failed ({status}): {err}");
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -801,6 +881,32 @@ mod tests {
         let guard = ch.typing_handles.lock();
         assert_eq!(guard.len(), 1);
         assert!(guard.contains_key("222"));
+    }
+
+    // ── Emoji encoding for reactions ──────────────────────────────
+
+    #[test]
+    fn encode_emoji_unicode_percent_encodes() {
+        let encoded = encode_emoji_for_discord("\u{1F440}");
+        assert_eq!(encoded, "%F0%9F%91%80");
+    }
+
+    #[test]
+    fn encode_emoji_checkmark() {
+        let encoded = encode_emoji_for_discord("\u{2705}");
+        assert_eq!(encoded, "%E2%9C%85");
+    }
+
+    #[test]
+    fn encode_emoji_custom_guild_emoji_passthrough() {
+        let encoded = encode_emoji_for_discord("custom_emoji:123456789");
+        assert_eq!(encoded, "custom_emoji:123456789");
+    }
+
+    #[test]
+    fn encode_emoji_simple_ascii_char() {
+        let encoded = encode_emoji_for_discord("A");
+        assert_eq!(encoded, "%41");
     }
 
     // ── Message ID edge cases ─────────────────────────────────────
