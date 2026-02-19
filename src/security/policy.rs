@@ -144,6 +144,12 @@ impl Default for SecurityPolicy {
     }
 }
 
+// ── Shell Command Parsing Utilities ───────────────────────────────────────
+// These helpers implement a minimal quote-aware shell lexer. They exist
+// because security validation must reason about the *structure* of a
+// command (separators, operators, quoting) rather than treating it as a
+// flat string — otherwise an attacker could hide dangerous sub-commands
+// inside quoted arguments or chained operators.
 /// Skip leading environment variable assignments (e.g. `FOO=bar cmd args`).
 /// Returns the remainder starting at the first non-assignment word.
 fn skip_env_assignments(s: &str) -> &str {
@@ -376,6 +382,11 @@ fn contains_unquoted_char(command: &str, target: char) -> bool {
 }
 
 impl SecurityPolicy {
+    // ── Risk Classification ──────────────────────────────────────────────
+    // Risk is assessed per-segment (split on shell operators), and the
+    // highest risk across all segments wins. This prevents bypasses like
+    // `ls && rm -rf /` from being classified as Low just because `ls` is safe.
+
     /// Classify command risk. Any high-risk segment marks the whole command high.
     pub fn command_risk_level(&self, command: &str) -> CommandRiskLevel {
         let mut saw_medium = false;
@@ -483,6 +494,15 @@ impl SecurityPolicy {
         }
     }
 
+    // ── Command Execution Policy Gate ──────────────────────────────────────
+    // Validation follows a strict precedence order:
+    //   1. Allowlist check (is the base command permitted at all?)
+    //   2. Risk classification (high / medium / low)
+    //   3. Policy flags (block_high_risk_commands, require_approval_for_medium_risk)
+    //   4. Autonomy level × approval status (supervised requires explicit approval)
+    // This ordering ensures deny-by-default: unknown commands are rejected
+    // before any risk or autonomy logic runs.
+
     /// Validate full command execution policy (allowlist + risk gate).
     pub fn validate_command_execution(
         &self,
@@ -519,6 +539,11 @@ impl SecurityPolicy {
 
         Ok(risk)
     }
+
+    // ── Layered Command Allowlist ──────────────────────────────────────────
+    // Defence-in-depth: five independent gates run in order before the
+    // per-segment allowlist check. Each gate targets a specific bypass
+    // technique. If any gate rejects, the whole command is blocked.
 
     /// Check if a shell command is allowed.
     ///
@@ -627,6 +652,12 @@ impl SecurityPolicy {
         }
     }
 
+    // ── Path Validation ────────────────────────────────────────────────
+    // Layered checks: null-byte injection → component-level traversal →
+    // URL-encoded traversal → tilde expansion → absolute-path block →
+    // forbidden-prefix match. Each layer addresses a distinct escape
+    // technique; together they enforce workspace confinement.
+
     /// Check if a file path is allowed (no path traversal, within workspace)
     pub fn is_path_allowed(&self, path: &str) -> bool {
         // Block null bytes (can truncate paths in C-backed syscalls)
@@ -702,6 +733,11 @@ impl SecurityPolicy {
     pub fn can_act(&self) -> bool {
         self.autonomy != AutonomyLevel::ReadOnly
     }
+
+    // ── Tool Operation Gating ──────────────────────────────────────────────
+    // Read operations bypass autonomy and rate checks because they have
+    // no side effects. Act operations must pass both the autonomy gate
+    // (not read-only) and the sliding-window rate limiter.
 
     /// Enforce policy for a tool operation.
     ///

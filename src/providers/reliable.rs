@@ -6,18 +6,28 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+// ── Error Classification ─────────────────────────────────────────────────
+// Errors are split into retryable (transient server/network failures) and
+// non-retryable (permanent client errors). This distinction drives whether
+// the retry loop continues, falls back to the next provider, or aborts
+// immediately — avoiding wasted latency on errors that cannot self-heal.
+
 /// Check if an error is non-retryable (client errors that won't resolve with retries).
 fn is_non_retryable(err: &anyhow::Error) -> bool {
     if is_context_window_exceeded(err) {
         return true;
     }
 
+    // 4xx errors are generally non-retryable (bad request, auth failure, etc.),
+    // except 429 (rate-limit — transient) and 408 (timeout — worth retrying).
     if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>() {
         if let Some(status) = reqwest_err.status() {
             let code = status.as_u16();
             return status.is_client_error() && code != 429 && code != 408;
         }
     }
+    // Fallback: parse status codes from stringified errors (some providers
+    // embed codes in error messages rather than returning typed HTTP errors).
     let msg = err.to_string();
     for word in msg.split(|c: char| !c.is_ascii_digit()) {
         if let Ok(code) = word.parse::<u16>() {
@@ -27,6 +37,8 @@ fn is_non_retryable(err: &anyhow::Error) -> bool {
         }
     }
 
+    // Heuristic: detect auth/model failures by keyword when no HTTP status
+    // is available (e.g. gRPC or custom transport errors).
     let msg_lower = msg.to_lowercase();
     let auth_failure_hints = [
         "invalid api key",
@@ -197,6 +209,16 @@ fn push_failure(
     ));
 }
 
+// ── Resilient Provider Wrapper ────────────────────────────────────────────
+// Three-level failover strategy: model chain → provider chain → retry loop.
+//   Outer loop:  iterate model fallback chain (original model first, then
+//                configured alternatives).
+//   Middle loop: iterate registered providers in priority order.
+//   Inner loop:  retry the same (provider, model) pair with exponential
+//                backoff, rotating API keys on rate-limit errors.
+// Loop invariant: `failures` accumulates every failed attempt so the final
+// error message gives operators a complete diagnostic trail.
+
 /// Provider wrapper with retry, fallback, auth rotation, and model failover.
 pub struct ReliableProvider {
     providers: Vec<(String, Box<dyn Provider>)>,
@@ -288,6 +310,10 @@ impl Provider for ReliableProvider {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
+        // Outer: model fallback chain. Middle: provider priority. Inner: retries.
+        // Each iteration: attempt one (provider, model) call. On success, return
+        // immediately. On non-retryable error, break to next provider. On
+        // retryable error, sleep with exponential backoff and retry.
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
                 let mut backoff_ms = self.base_backoff_ms;
@@ -326,7 +352,8 @@ impl Provider for ReliableProvider {
                                 &error_detail,
                             );
 
-                            // On rate-limit, try rotating API key
+                            // Rate-limit with rotatable keys: cycle to the next API key
+                            // so the retry hits a different quota bucket.
                             if rate_limited && !non_retryable_rate_limit {
                                 if let Some(new_key) = self.rotate_key() {
                                     tracing::info!(
