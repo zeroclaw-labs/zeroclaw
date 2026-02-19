@@ -2767,11 +2767,21 @@ impl Config {
             }
         }
 
-        // Provider: ZEROCLAW_PROVIDER or PROVIDER
-        if let Ok(provider) =
-            std::env::var("ZEROCLAW_PROVIDER").or_else(|_| std::env::var("PROVIDER"))
-        {
+        // Provider override precedence:
+        // 1) ZEROCLAW_PROVIDER always wins when set.
+        // 2) Legacy PROVIDER is only honored when config still uses the
+        //    default provider (openrouter) or provider is unset. This prevents
+        //    container defaults from overriding explicit custom providers.
+        if let Ok(provider) = std::env::var("ZEROCLAW_PROVIDER") {
             if !provider.is_empty() {
+                self.default_provider = Some(provider);
+            }
+        } else if let Ok(provider) = std::env::var("PROVIDER") {
+            let should_apply_legacy_provider = self.default_provider.as_deref().map_or(
+                true,
+                |configured| configured.trim().eq_ignore_ascii_case("openrouter"),
+            );
+            if should_apply_legacy_provider && !provider.is_empty() {
                 self.default_provider = Some(provider);
             }
         }
@@ -4350,6 +4360,42 @@ default_temperature = 0.7
         config.apply_env_overrides();
         assert_eq!(config.default_provider.as_deref(), Some("openai"));
 
+        std::env::remove_var("PROVIDER");
+    }
+
+    #[test]
+    fn env_override_provider_fallback_does_not_replace_non_default_provider() {
+        let _env_guard = env_override_test_guard();
+        let mut config = Config {
+            default_provider: Some("custom:https://proxy.example.com/v1".to_string()),
+            ..Config::default()
+        };
+
+        std::env::remove_var("ZEROCLAW_PROVIDER");
+        std::env::set_var("PROVIDER", "openrouter");
+        config.apply_env_overrides();
+        assert_eq!(
+            config.default_provider.as_deref(),
+            Some("custom:https://proxy.example.com/v1")
+        );
+
+        std::env::remove_var("PROVIDER");
+    }
+
+    #[test]
+    fn env_override_zero_claw_provider_overrides_non_default_provider() {
+        let _env_guard = env_override_test_guard();
+        let mut config = Config {
+            default_provider: Some("custom:https://proxy.example.com/v1".to_string()),
+            ..Config::default()
+        };
+
+        std::env::set_var("ZEROCLAW_PROVIDER", "openrouter");
+        std::env::set_var("PROVIDER", "anthropic");
+        config.apply_env_overrides();
+        assert_eq!(config.default_provider.as_deref(), Some("openrouter"));
+
+        std::env::remove_var("ZEROCLAW_PROVIDER");
         std::env::remove_var("PROVIDER");
     }
 
