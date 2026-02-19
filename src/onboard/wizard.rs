@@ -337,7 +337,11 @@ pub fn run_quick_setup(
     let config = Config {
         workspace_dir: workspace_dir.clone(),
         config_path: config_path.clone(),
-        api_key: credential_override.map(String::from),
+        api_key: credential_override.map(|c| {
+            let mut s = String::with_capacity(c.len());
+            s.push_str(c);
+            s
+        }),
         api_url: None,
         default_provider: Some(provider_name.clone()),
         default_model: Some(model.clone()),
@@ -3726,10 +3730,10 @@ fn setup_tunnel() -> Result<crate::config::TunnelConfig> {
         1 => {
             println!();
             print_bullet("Get your tunnel token from the Cloudflare Zero Trust dashboard.");
-            let token: String = Input::new()
+            let tunnel_value: String = Input::new()
                 .with_prompt("  Cloudflare tunnel token")
                 .interact_text()?;
-            if token.trim().is_empty() {
+            if tunnel_value.trim().is_empty() {
                 println!("  {} Skipped", style("→").dim());
                 TunnelConfig::default()
             } else {
@@ -3740,7 +3744,9 @@ fn setup_tunnel() -> Result<crate::config::TunnelConfig> {
                 );
                 TunnelConfig {
                     provider: "cloudflare".into(),
-                    cloudflare: Some(CloudflareTunnelConfig { token }),
+                    cloudflare: Some(CloudflareTunnelConfig {
+                        token: tunnel_value,
+                    }),
                     ..TunnelConfig::default()
                 }
             }

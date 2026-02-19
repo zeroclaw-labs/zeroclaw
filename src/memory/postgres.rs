@@ -157,7 +157,7 @@ impl Memory for PostgresMemory {
         let key = key.to_string();
         let content = content.to_string();
         let category = Self::category_to_str(&category);
-        let session_id = session_id.map(str::to_string);
+        let sid = session_id.map(str::to_string);
 
         tokio::task::spawn_blocking(move || -> Result<()> {
             let now = Utc::now();
@@ -177,10 +177,7 @@ impl Memory for PostgresMemory {
             );
 
             let id = Uuid::new_v4().to_string();
-            client.execute(
-                &stmt,
-                &[&id, &key, &content, &category, &now, &now, &session_id],
-            )?;
+            client.execute(&stmt, &[&id, &key, &content, &category, &now, &now, &sid])?;
             Ok(())
         })
         .await?
@@ -195,7 +192,7 @@ impl Memory for PostgresMemory {
         let client = self.client.clone();
         let qualified_table = self.qualified_table.clone();
         let query = query.trim().to_string();
-        let session_id = session_id.map(str::to_string);
+        let sid = session_id.map(str::to_string);
 
         tokio::task::spawn_blocking(move || -> Result<Vec<MemoryEntry>> {
             let mut client = client.lock();
@@ -217,7 +214,7 @@ impl Memory for PostgresMemory {
             #[allow(clippy::cast_possible_wrap)]
             let limit_i64 = limit as i64;
 
-            let rows = client.query(&stmt, &[&query, &session_id, &limit_i64])?;
+            let rows = client.query(&stmt, &[&query, &sid, &limit_i64])?;
             rows.iter()
                 .map(Self::row_to_entry)
                 .collect::<Result<Vec<MemoryEntry>>>()
@@ -255,7 +252,7 @@ impl Memory for PostgresMemory {
         let client = self.client.clone();
         let qualified_table = self.qualified_table.clone();
         let category = category.map(Self::category_to_str);
-        let session_id = session_id.map(str::to_string);
+        let sid = session_id.map(str::to_string);
 
         tokio::task::spawn_blocking(move || -> Result<Vec<MemoryEntry>> {
             let mut client = client.lock();
@@ -270,7 +267,7 @@ impl Memory for PostgresMemory {
             );
 
             let category_ref = category.as_deref();
-            let session_ref = session_id.as_deref();
+            let session_ref = sid.as_deref();
             let rows = client.query(&stmt, &[&category_ref, &session_ref])?;
             rows.iter()
                 .map(Self::row_to_entry)
