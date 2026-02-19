@@ -26,7 +26,7 @@ pub fn run_wizard() -> Result<Config> {
         security: SecurityConfig::autodetect(),  // Silent!
     };
 
-    config.save()?;
+    config.save().await?;
     Ok(config)
 }
 ```

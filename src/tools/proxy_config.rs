@@ -3,6 +3,7 @@ use crate::config::{
     runtime_proxy_config, set_runtime_proxy_config, Config, ProxyConfig, ProxyScope,
 };
 use crate::security::SecurityPolicy;
+use crate::util::MaybeSet;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::fs;
@@ -93,16 +94,13 @@ impl ProxyConfigTool {
         anyhow::bail!("'{field}' must be a string or string[]")
     }
 
-    fn parse_optional_string_update(
-        args: &Value,
-        field: &str,
-    ) -> anyhow::Result<Option<Option<String>>> {
+    fn parse_optional_string_update(args: &Value, field: &str) -> anyhow::Result<MaybeSet<String>> {
         let Some(raw) = args.get(field) else {
-            return Ok(None);
+            return Ok(MaybeSet::Unset);
         };
 
         if raw.is_null() {
-            return Ok(Some(None));
+            return Ok(MaybeSet::Null);
         }
 
         let value = raw
@@ -110,7 +108,13 @@ impl ProxyConfigTool {
             .ok_or_else(|| anyhow::anyhow!("'{field}' must be a string or null"))?
             .trim()
             .to_string();
-        Ok(Some((!value.is_empty()).then_some(value)))
+
+        let output = if value.is_empty() {
+            MaybeSet::Null
+        } else {
+            MaybeSet::Set(value)
+        };
+        Ok(output)
     }
 
     fn env_snapshot() -> Value {
@@ -164,7 +168,7 @@ impl ProxyConfigTool {
         })
     }
 
-    fn handle_set(&self, args: &Value) -> anyhow::Result<ToolResult> {
+    async fn handle_set(&self, args: &Value) -> anyhow::Result<ToolResult> {
         let mut cfg = self.load_config_without_env()?;
         let previous_scope = cfg.proxy.scope;
         let mut proxy = cfg.proxy.clone();
@@ -185,23 +189,24 @@ impl ProxyConfigTool {
             })?;
         }
 
-        if let Some(update) = Self::parse_optional_string_update(args, "http_proxy")? {
-            proxy.http_proxy = update;
+        if let MaybeSet::Set(update) = Self::parse_optional_string_update(args, "http_proxy")? {
+            proxy.http_proxy = Some(update);
             touched_proxy_url = true;
         }
 
-        if let Some(update) = Self::parse_optional_string_update(args, "https_proxy")? {
-            proxy.https_proxy = update;
+        if let MaybeSet::Set(update) = Self::parse_optional_string_update(args, "https_proxy")? {
+            proxy.https_proxy = Some(update);
             touched_proxy_url = true;
         }
 
-        if let Some(update) = Self::parse_optional_string_update(args, "all_proxy")? {
-            proxy.all_proxy = update;
+        if let MaybeSet::Set(update) = Self::parse_optional_string_update(args, "all_proxy")? {
+            proxy.all_proxy = Some(update);
             touched_proxy_url = true;
         }
 
         if let Some(no_proxy_raw) = args.get("no_proxy") {
             proxy.no_proxy = Self::parse_string_list(no_proxy_raw, "no_proxy")?;
+            touched_proxy_url = true;
         }
 
         if let Some(services_raw) = args.get("services") {
@@ -217,7 +222,7 @@ impl ProxyConfigTool {
         proxy.validate()?;
 
         cfg.proxy = proxy.clone();
-        cfg.save()?;
+        cfg.save().await?;
         set_runtime_proxy_config(proxy.clone());
 
         if proxy.enabled && proxy.scope == ProxyScope::Environment {
@@ -237,11 +242,11 @@ impl ProxyConfigTool {
         })
     }
 
-    fn handle_disable(&self, args: &Value) -> anyhow::Result<ToolResult> {
+    async fn handle_disable(&self, args: &Value) -> anyhow::Result<ToolResult> {
         let mut cfg = self.load_config_without_env()?;
         let clear_env_default = cfg.proxy.scope == ProxyScope::Environment;
         cfg.proxy.enabled = false;
-        cfg.save()?;
+        cfg.save().await?;
 
         set_runtime_proxy_config(cfg.proxy.clone());
 
@@ -384,8 +389,8 @@ impl Tool for ProxyConfigTool {
                 }
 
                 match action.as_str() {
-                    "set" => self.handle_set(&args),
-                    "disable" => self.handle_disable(&args),
+                    "set" => self.handle_set(&args).await,
+                    "disable" => self.handle_disable(&args).await,
                     "apply_env" => self.handle_apply_env(),
                     "clear_env" => self.handle_clear_env(),
                     _ => unreachable!("handled above"),
@@ -421,20 +426,20 @@ mod tests {
         })
     }
 
-    fn test_config(tmp: &TempDir) -> Arc<Config> {
+    async fn test_config(tmp: &TempDir) -> Arc<Config> {
         let config = Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        config.save().unwrap();
+        config.save().await.unwrap();
         Arc::new(config)
     }
 
     #[tokio::test]
     async fn list_services_action_returns_known_keys() {
         let tmp = TempDir::new().unwrap();
-        let tool = ProxyConfigTool::new(test_config(&tmp), test_security());
+        let tool = ProxyConfigTool::new(test_config(&tmp).await, test_security());
 
         let result = tool
             .execute(json!({"action": "list_services"}))
@@ -448,7 +453,7 @@ mod tests {
     #[tokio::test]
     async fn set_scope_services_requires_services_entries() {
         let tmp = TempDir::new().unwrap();
-        let tool = ProxyConfigTool::new(test_config(&tmp), test_security());
+        let tool = ProxyConfigTool::new(test_config(&tmp).await, test_security());
 
         let result = tool
             .execute(json!({
@@ -471,7 +476,7 @@ mod tests {
     #[tokio::test]
     async fn set_and_get_round_trip_proxy_scope() {
         let tmp = TempDir::new().unwrap();
-        let tool = ProxyConfigTool::new(test_config(&tmp), test_security());
+        let tool = ProxyConfigTool::new(test_config(&tmp).await, test_security());
 
         let set_result = tool
             .execute(json!({

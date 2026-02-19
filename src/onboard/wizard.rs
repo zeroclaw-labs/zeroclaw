@@ -95,7 +95,7 @@ fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
 
 // ── Main wizard entry point ──────────────────────────────────────
 
-pub fn run_wizard() -> Result<Config> {
+pub async fn run_wizard() -> Result<Config> {
     println!("{}", style(BANNER).cyan().bold());
 
     println!(
@@ -191,8 +191,8 @@ pub fn run_wizard() -> Result<Config> {
         if config.memory.auto_save { "on" } else { "off" }
     );
 
-    config.save()?;
-    persist_workspace_selection(&config.config_path)?;
+    config.save().await?;
+    persist_workspace_selection(&config.config_path).await?;
 
     // ── Final summary ────────────────────────────────────────────
     print_summary(&config);
@@ -226,7 +226,7 @@ pub fn run_wizard() -> Result<Config> {
 }
 
 /// Interactive repair flow: rerun channel setup only without redoing full onboarding.
-pub fn run_channels_repair_wizard() -> Result<Config> {
+pub async fn run_channels_repair_wizard() -> Result<Config> {
     println!("{}", style(BANNER).cyan().bold());
     println!(
         "  {}",
@@ -236,12 +236,12 @@ pub fn run_channels_repair_wizard() -> Result<Config> {
     );
     println!();
 
-    let mut config = Config::load_or_init()?;
+    let mut config = Config::load_or_init().await?;
 
     print_step(1, 1, "Channels (How You Talk to ZeroClaw)");
     config.channels_config = setup_channels()?;
-    config.save()?;
-    persist_workspace_selection(&config.config_path)?;
+    config.save().await?;
+    persist_workspace_selection(&config.config_path).await?;
 
     println!();
     println!(
@@ -321,7 +321,7 @@ fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
 }
 
 #[allow(clippy::too_many_lines)]
-pub fn run_quick_setup(
+pub async fn run_quick_setup(
     credential_override: Option<&str>,
     provider: Option<&str>,
     model_override: Option<&str>,
@@ -396,8 +396,8 @@ pub fn run_quick_setup(
         query_classification: crate::config::QueryClassificationConfig::default(),
     };
 
-    config.save()?;
-    persist_workspace_selection(&config.config_path)?;
+    config.save().await?;
+    persist_workspace_selection(&config.config_path).await?;
 
     // Scaffold minimal workspace files
     let default_ctx = ProjectContext {
@@ -1459,16 +1459,18 @@ fn print_bullet(text: &str) {
     println!("  {} {}", style("›").cyan(), text);
 }
 
-fn persist_workspace_selection(config_path: &Path) -> Result<()> {
+async fn persist_workspace_selection(config_path: &Path) -> Result<()> {
     let config_dir = config_path
         .parent()
         .context("Config path must have a parent directory")?;
-    crate::config::schema::persist_active_workspace_config_dir(config_dir).with_context(|| {
-        format!(
-            "Failed to persist active workspace selection for {}",
-            config_dir.display()
-        )
-    })
+    crate::config::schema::persist_active_workspace_config_dir(config_dir)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to persist active workspace selection for {}",
+                config_dir.display()
+            )
+        })
 }
 
 // ── Step 1: Workspace ────────────────────────────────────────────

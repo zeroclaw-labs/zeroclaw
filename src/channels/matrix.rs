@@ -726,7 +726,7 @@ mod tests {
             "!r:m".to_string(),
             vec![],
             Some("   ".to_string()),
-            Some("".to_string()),
+            Some(String::new()),
         );
 
         assert!(ch.session_owner_hint.is_none());

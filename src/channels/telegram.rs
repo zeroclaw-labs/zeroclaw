@@ -6,10 +6,10 @@ use async_trait::async_trait;
 use directories::UserDirs;
 use parking_lot::Mutex;
 use reqwest::multipart::{Form, Part};
-use std::fs;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use tokio::fs;
 
 /// Telegram's maximum message length for text messages
 const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
@@ -373,7 +373,7 @@ impl TelegramChannel {
             .collect()
     }
 
-    fn load_config_without_env() -> anyhow::Result<Config> {
+    async fn load_config_without_env() -> anyhow::Result<Config> {
         let home = UserDirs::new()
             .map(|u| u.home_dir().to_path_buf())
             .context("Could not find home directory")?;
@@ -381,6 +381,7 @@ impl TelegramChannel {
         let config_path = zeroclaw_dir.join("config.toml");
 
         let contents = fs::read_to_string(&config_path)
+            .await
             .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
         let mut config: Config = toml::from_str(&contents)
             .context("Failed to parse config file for Telegram binding")?;
@@ -389,8 +390,8 @@ impl TelegramChannel {
         Ok(config)
     }
 
-    fn persist_allowed_identity_blocking(identity: &str) -> anyhow::Result<()> {
-        let mut config = Self::load_config_without_env()?;
+    async fn persist_allowed_identity(&self, identity: &str) -> anyhow::Result<()> {
+        let mut config = Self::load_config_without_env().await?;
         let Some(telegram) = config.channels_config.telegram.as_mut() else {
             anyhow::bail!("Telegram channel config is missing in config.toml");
         };
@@ -404,17 +405,10 @@ impl TelegramChannel {
             telegram.allowed_users.push(normalized);
             config
                 .save()
+                .await
                 .context("Failed to persist Telegram allowlist to config.toml")?;
         }
 
-        Ok(())
-    }
-
-    async fn persist_allowed_identity(&self, identity: &str) -> anyhow::Result<()> {
-        let identity = identity.to_string();
-        tokio::task::spawn_blocking(move || Self::persist_allowed_identity_blocking(&identity))
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to join Telegram bind save task: {e}"))??;
         Ok(())
     }
 
@@ -629,7 +623,7 @@ impl TelegramChannel {
 
         if let Some(code) = Self::extract_bind_code(text) {
             if let Some(pairing) = self.pairing.as_ref() {
-                match pairing.try_pair(code) {
+                match pairing.try_pair(code).await {
                     Ok(Some(_token)) => {
                         let bind_identity = normalized_sender_id.clone().or_else(|| {
                             if normalized_username.is_empty() || normalized_username == "unknown" {
