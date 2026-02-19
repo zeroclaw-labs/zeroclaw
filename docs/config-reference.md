@@ -75,6 +75,7 @@ Notes:
 - Backward compatibility: legacy `enable = true` is accepted as an alias for `enabled = true`.
 - If `enabled = false` or `api_key` is missing, the `composio` tool is not registered.
 - Typical flow: call `connect`, complete browser OAuth, then run `execute` for the desired tool action.
+- If Composio returns a missing connected-account reference error, call `list_accounts` (optionally with `app`) and pass the returned `connected_account_id` to `execute`.
 
 ## `[multimodal]`
 
