@@ -2659,6 +2659,60 @@ fn resolve_config_dir_for_workspace(workspace_dir: &Path) -> (PathBuf, PathBuf) 
     )
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConfigResolutionSource {
+    EnvWorkspace,
+    ActiveWorkspaceMarker,
+    DefaultConfigDir,
+}
+
+impl ConfigResolutionSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::EnvWorkspace => "ZEROCLAW_WORKSPACE",
+            Self::ActiveWorkspaceMarker => "active_workspace.toml",
+            Self::DefaultConfigDir => "default",
+        }
+    }
+}
+
+async fn resolve_runtime_config_dirs(
+    default_zeroclaw_dir: &Path,
+    default_workspace_dir: &Path,
+) -> Result<(PathBuf, PathBuf, ConfigResolutionSource)> {
+    // Resolution priority:
+    // 1. ZEROCLAW_WORKSPACE env override
+    // 2. Persisted active workspace marker from onboarding/custom profile
+    // 3. Default ~/.zeroclaw layout
+    if let Ok(custom_workspace) = std::env::var("ZEROCLAW_WORKSPACE") {
+        if !custom_workspace.is_empty() {
+            let (zeroclaw_dir, workspace_dir) =
+                resolve_config_dir_for_workspace(&PathBuf::from(custom_workspace));
+            return Ok((
+                zeroclaw_dir,
+                workspace_dir,
+                ConfigResolutionSource::EnvWorkspace,
+            ));
+        }
+    }
+
+    if let Some((zeroclaw_dir, workspace_dir)) =
+        load_persisted_workspace_dirs(default_zeroclaw_dir).await?
+    {
+        return Ok((
+            zeroclaw_dir,
+            workspace_dir,
+            ConfigResolutionSource::ActiveWorkspaceMarker,
+        ));
+    }
+
+    Ok((
+        default_zeroclaw_dir.to_path_buf(),
+        default_workspace_dir.to_path_buf(),
+        ConfigResolutionSource::DefaultConfigDir,
+    ))
+}
+
 fn decrypt_optional_secret(
     store: &crate::security::SecretStore,
     value: &mut Option<String>,
@@ -2697,18 +2751,8 @@ impl Config {
     pub async fn load_or_init() -> Result<Self> {
         let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
 
-        // Resolution priority:
-        // 1. ZEROCLAW_WORKSPACE env override
-        // 2. Persisted active workspace marker from onboarding/custom profile
-        // 3. Default ~/.zeroclaw layout
-        let (zeroclaw_dir, workspace_dir) = match std::env::var("ZEROCLAW_WORKSPACE") {
-            Ok(custom_workspace) if !custom_workspace.is_empty() => {
-                resolve_config_dir_for_workspace(&PathBuf::from(custom_workspace))
-            }
-            _ => load_persisted_workspace_dirs(&default_zeroclaw_dir)
-                .await?
-                .unwrap_or((default_zeroclaw_dir, default_workspace_dir)),
-        };
+        let (zeroclaw_dir, workspace_dir, resolution_source) =
+            resolve_runtime_config_dirs(&default_zeroclaw_dir, &default_workspace_dir).await?;
 
         let config_path = zeroclaw_dir.join("config.toml");
 
@@ -2775,6 +2819,13 @@ impl Config {
                 decrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
             }
             config.apply_env_overrides();
+            tracing::info!(
+                path = %config.config_path.display(),
+                workspace = %config.workspace_dir.display(),
+                source = resolution_source.as_str(),
+                initialized = false,
+                "Config loaded"
+            );
             Ok(config)
         } else {
             let mut config = Config::default();
@@ -2790,6 +2841,13 @@ impl Config {
             }
 
             config.apply_env_overrides();
+            tracing::info!(
+                path = %config.config_path.display(),
+                workspace = %config.workspace_dir.display(),
+                source = resolution_source.as_str(),
+                initialized = true,
+                "Config loaded"
+            );
             Ok(config)
         }
     }
@@ -4543,6 +4601,75 @@ default_temperature = 0.7
         assert_eq!(config.workspace_dir, PathBuf::from("/custom/workspace"));
 
         std::env::remove_var("ZEROCLAW_WORKSPACE");
+    }
+
+    #[test]
+    async fn resolve_runtime_config_dirs_uses_env_workspace_first() {
+        let _env_guard = env_override_lock().await;
+        let default_config_dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let default_workspace_dir = default_config_dir.join("workspace");
+        let workspace_dir = default_config_dir.join("profile-a");
+
+        std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir);
+        let (config_dir, resolved_workspace_dir, source) =
+            resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
+                .await
+                .unwrap();
+
+        assert_eq!(source, ConfigResolutionSource::EnvWorkspace);
+        assert_eq!(config_dir, workspace_dir);
+        assert_eq!(resolved_workspace_dir, workspace_dir.join("workspace"));
+
+        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        let _ = fs::remove_dir_all(default_config_dir).await;
+    }
+
+    #[test]
+    async fn resolve_runtime_config_dirs_uses_active_workspace_marker() {
+        let _env_guard = env_override_lock().await;
+        let default_config_dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let default_workspace_dir = default_config_dir.join("workspace");
+        let marker_config_dir = default_config_dir.join("profiles").join("alpha");
+        let state_path = default_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
+
+        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        fs::create_dir_all(&default_config_dir).await.unwrap();
+        let state = ActiveWorkspaceState {
+            config_dir: marker_config_dir.to_string_lossy().into_owned(),
+        };
+        fs::write(&state_path, toml::to_string(&state).unwrap())
+            .await
+            .unwrap();
+
+        let (config_dir, resolved_workspace_dir, source) =
+            resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
+                .await
+                .unwrap();
+
+        assert_eq!(source, ConfigResolutionSource::ActiveWorkspaceMarker);
+        assert_eq!(config_dir, marker_config_dir);
+        assert_eq!(resolved_workspace_dir, marker_config_dir.join("workspace"));
+
+        let _ = fs::remove_dir_all(default_config_dir).await;
+    }
+
+    #[test]
+    async fn resolve_runtime_config_dirs_falls_back_to_default_layout() {
+        let _env_guard = env_override_lock().await;
+        let default_config_dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let default_workspace_dir = default_config_dir.join("workspace");
+
+        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        let (config_dir, resolved_workspace_dir, source) =
+            resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
+                .await
+                .unwrap();
+
+        assert_eq!(source, ConfigResolutionSource::DefaultConfigDir);
+        assert_eq!(config_dir, default_config_dir);
+        assert_eq!(resolved_workspace_dir, default_workspace_dir);
+
+        let _ = fs::remove_dir_all(default_config_dir).await;
     }
 
     #[test]

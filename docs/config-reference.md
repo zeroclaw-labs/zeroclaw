@@ -4,9 +4,15 @@ This is a high-signal reference for common config sections and defaults.
 
 Last verified: **February 19, 2026**.
 
-Config file path:
+Config path resolution at startup:
 
-- `~/.zeroclaw/config.toml`
+1. `ZEROCLAW_WORKSPACE` override (if set)
+2. persisted `~/.zeroclaw/active_workspace.toml` marker (if present)
+3. default `~/.zeroclaw/config.toml`
+
+ZeroClaw logs the resolved config on startup at `INFO` level:
+
+- `Config loaded` with fields: `path`, `workspace`, `source`, `initialized`
 
 Schema export command:
 
