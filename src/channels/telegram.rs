@@ -387,7 +387,7 @@ impl TelegramChannel {
             .await
             .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
         let mut config: Config = toml::from_str(&contents)
-            .context("Failed to parse config file for Telegram binding")?;
+            .context("Failed to parse config.toml — check [channels.telegram] section for syntax errors")?;
         config.config_path = config_path;
         config.workspace_dir = zeroclaw_dir.join("workspace");
         Ok(config)
@@ -396,7 +396,11 @@ impl TelegramChannel {
     async fn persist_allowed_identity(&self, identity: &str) -> anyhow::Result<()> {
         let mut config = Self::load_config_without_env().await?;
         let Some(telegram) = config.channels_config.telegram.as_mut() else {
-            anyhow::bail!("Telegram channel config is missing in config.toml");
+            anyhow::bail!(
+                "Missing [channels.telegram] section in config.toml. \
+                Add bot_token and allowed_users under [channels.telegram], \
+                or run `zeroclaw onboard --channels-only` to configure interactively"
+            );
         };
 
         let normalized = Self::normalize_identity(identity);
@@ -691,7 +695,7 @@ impl TelegramChannel {
             } else {
                 let _ = self
                     .send(&SendMessage::new(
-                        "ℹ️ Telegram pairing is not active. Ask operator to update allowlist in config.toml.",
+                        "ℹ️ Telegram pairing is not active. Ask operator to add your user ID to channels.telegram.allowed_users in config.toml.",
                         &chat_id,
                     ))
                     .await;

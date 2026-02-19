@@ -125,7 +125,8 @@ impl LinqChannel {
         if !self.is_sender_allowed(&normalized_from) {
             tracing::warn!(
                 "Linq: ignoring message from unauthorized sender: {normalized_from}. \
-                Add to allowed_senders in config.toml."
+                Add to channels.linq.allowed_senders in config.toml, \
+                or run `zeroclaw onboard --channels-only` to configure interactively."
             );
             return messages;
         }

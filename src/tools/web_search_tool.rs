@@ -219,7 +219,10 @@ impl Tool for WebSearchTool {
         let result = match self.provider.as_str() {
             "duckduckgo" | "ddg" => self.search_duckduckgo(query).await?,
             "brave" => self.search_brave(query).await?,
-            _ => anyhow::bail!("Unknown search provider: {}", self.provider),
+            _ => anyhow::bail!(
+                "Unknown search provider: '{}'. Set tools.web_search.provider to 'duckduckgo' or 'brave' in config.toml",
+                self.provider
+            ),
         };
 
         Ok(ToolResult {
