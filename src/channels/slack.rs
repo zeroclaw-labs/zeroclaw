@@ -54,10 +54,14 @@ impl Channel for SlackChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "channel": message.recipient,
             "text": message.content
         });
+
+        if let Some(ref ts) = message.thread_ts {
+            body["thread_ts"] = serde_json::json!(ts);
+        }
 
         let resp = self
             .http_client()
@@ -170,6 +174,7 @@ impl Channel for SlackChannel {
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs(),
+                        thread_ts: Some(ts.to_string()),
                     };
 
                     if tx.send(channel_msg).await.is_err() {

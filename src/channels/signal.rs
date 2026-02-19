@@ -265,6 +265,7 @@ impl SignalChannel {
             content: text.to_string(),
             channel: "signal".to_string(),
             timestamp: timestamp / 1000, // millis → secs
+            thread_ts: None,
         })
     }
 }

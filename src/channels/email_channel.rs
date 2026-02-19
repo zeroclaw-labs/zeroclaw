@@ -443,6 +443,7 @@ impl EmailChannel {
                 content: email.content,
                 channel: "email".to_string(),
                 timestamp: email.timestamp,
+                thread_ts: None,
             };
 
             if tx.send(msg).await.is_err() {

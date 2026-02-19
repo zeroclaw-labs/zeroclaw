@@ -377,6 +377,7 @@ impl Channel for QQChannel {
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
                                     .as_secs(),
+                                thread_ts: None,
                             };
 
                             if tx.send(channel_msg).await.is_err() {
@@ -415,6 +416,7 @@ impl Channel for QQChannel {
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
                                     .as_secs(),
+                                thread_ts: None,
                             };
 
                             if tx.send(channel_msg).await.is_err() {

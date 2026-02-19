@@ -442,7 +442,7 @@ async fn handle_runtime_command_if_needed(
     };
 
     if let Err(err) = channel
-        .send(&SendMessage::new(response, &msg.reply_target))
+        .send(&SendMessage::new(response, &msg.reply_target).in_thread(msg.thread_ts.clone()))
         .await
     {
         tracing::warn!(
@@ -592,7 +592,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             );
             if let Some(channel) = target_channel.as_ref() {
                 let _ = channel
-                    .send(&SendMessage::new(message, &msg.reply_target))
+                    .send(&SendMessage::new(message, &msg.reply_target).in_thread(msg.thread_ts.clone()))
                     .await;
             }
             return;
@@ -658,7 +658,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
     let draft_message_id = if use_streaming {
         if let Some(channel) = target_channel.as_ref() {
             match channel
-                .send_draft(&SendMessage::new("...", &msg.reply_target))
+                .send_draft(&SendMessage::new("...", &msg.reply_target).in_thread(msg.thread_ts.clone()))
                 .await
             {
                 Ok(id) => id,
@@ -769,11 +769,11 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                     {
                         tracing::warn!("Failed to finalize draft: {e}; sending as new message");
                         let _ = channel
-                            .send(&SendMessage::new(&response, &msg.reply_target))
+                            .send(&SendMessage::new(&response, &msg.reply_target).in_thread(msg.thread_ts.clone()))
                             .await;
                     }
                 } else if let Err(e) = channel
-                    .send(&SendMessage::new(response, &msg.reply_target))
+                    .send(&SendMessage::new(response, &msg.reply_target).in_thread(msg.thread_ts.clone()))
                     .await
                 {
                     eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
@@ -795,7 +795,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                         .send(&SendMessage::new(
                             format!("⚠️ Error: {e}"),
                             &msg.reply_target,
-                        ))
+                        ).in_thread(msg.thread_ts.clone()))
                         .await;
                 }
             }
@@ -816,7 +816,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                         .await;
                 } else {
                     let _ = channel
-                        .send(&SendMessage::new(error_text, &msg.reply_target))
+                        .send(&SendMessage::new(error_text, &msg.reply_target).in_thread(msg.thread_ts.clone()))
                         .await;
                 }
             }
@@ -2350,6 +2350,7 @@ mod tests {
                 content: "What is the BTC price now?".to_string(),
                 channel: "test-channel".to_string(),
                 timestamp: 1,
+                thread_ts: None,
             },
         )
         .await;
@@ -2403,6 +2404,7 @@ mod tests {
                 content: "What is the BTC price now?".to_string(),
                 channel: "test-channel".to_string(),
                 timestamp: 2,
+                thread_ts: None,
             },
         )
         .await;
@@ -2465,6 +2467,7 @@ mod tests {
                 content: "/models openrouter".to_string(),
                 channel: "telegram".to_string(),
                 timestamp: 1,
+                thread_ts: None,
             },
         )
         .await;
@@ -2548,6 +2551,7 @@ mod tests {
                 content: "hello routed provider".to_string(),
                 channel: "telegram".to_string(),
                 timestamp: 2,
+                thread_ts: None,
             },
         )
         .await;
@@ -2607,6 +2611,7 @@ mod tests {
                 content: "Loop until done".to_string(),
                 channel: "test-channel".to_string(),
                 timestamp: 1,
+                thread_ts: None,
             },
         )
         .await;
@@ -2661,6 +2666,7 @@ mod tests {
                 content: "Loop forever".to_string(),
                 channel: "test-channel".to_string(),
                 timestamp: 2,
+                thread_ts: None,
             },
         )
         .await;
@@ -2765,6 +2771,7 @@ mod tests {
             content: "hello".to_string(),
             channel: "test-channel".to_string(),
             timestamp: 1,
+            thread_ts: None,
         })
         .await
         .unwrap();
@@ -2775,6 +2782,7 @@ mod tests {
             content: "world".to_string(),
             channel: "test-channel".to_string(),
             timestamp: 2,
+            thread_ts: None,
         })
         .await
         .unwrap();
@@ -2837,6 +2845,7 @@ mod tests {
                 content: "hello".to_string(),
                 channel: "test-channel".to_string(),
                 timestamp: 1,
+                thread_ts: None,
             },
         )
         .await;
@@ -3097,6 +3106,7 @@ mod tests {
             content: "hello".into(),
             channel: "slack".into(),
             timestamp: 1,
+            thread_ts: None,
         };
 
         assert_eq!(conversation_memory_key(&msg), "slack_U123_msg_abc123");
@@ -3111,6 +3121,7 @@ mod tests {
             content: "first".into(),
             channel: "slack".into(),
             timestamp: 1,
+            thread_ts: None,
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -3119,6 +3130,7 @@ mod tests {
             content: "second".into(),
             channel: "slack".into(),
             timestamp: 2,
+            thread_ts: None,
         };
 
         assert_ne!(
@@ -3139,6 +3151,7 @@ mod tests {
             content: "I'm Paul".into(),
             channel: "slack".into(),
             timestamp: 1,
+            thread_ts: None,
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -3147,6 +3160,7 @@ mod tests {
             content: "I'm 45".into(),
             channel: "slack".into(),
             timestamp: 2,
+            thread_ts: None,
         };
 
         mem.store(
@@ -3228,6 +3242,7 @@ mod tests {
                 content: "hello".to_string(),
                 channel: "test-channel".to_string(),
                 timestamp: 1,
+                thread_ts: None,
             },
         )
         .await;
@@ -3241,6 +3256,7 @@ mod tests {
                 content: "follow up".to_string(),
                 channel: "test-channel".to_string(),
                 timestamp: 2,
+                thread_ts: None,
             },
         )
         .await;

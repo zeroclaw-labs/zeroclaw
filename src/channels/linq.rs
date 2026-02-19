@@ -178,6 +178,7 @@ impl LinqChannel {
             content,
             channel: "linq".to_string(),
             timestamp,
+            thread_ts: None,
         });
 
         messages
