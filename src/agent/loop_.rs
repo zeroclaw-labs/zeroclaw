@@ -1314,6 +1314,12 @@ pub(crate) async fn run_tool_call_loop(
             observer.record_event(&ObserverEvent::ToolCallStart {
                 tool: call.name.clone(),
             });
+
+            // Notify channel about tool execution start
+            if let Some(ref tx) = on_delta {
+                let _ = tx.send(format!("🔧 Executing: {}...", call.name)).await;
+            }
+
             let start = Instant::now();
             let result = if let Some(tool) = find_tool(tools_registry, &call.name) {
                 let tool_future = tool.execute(call.arguments.clone());
@@ -1333,11 +1339,27 @@ pub(crate) async fn run_tool_call_loop(
                             duration: start.elapsed(),
                             success: r.success,
                         });
-                        if r.success {
-                            scrub_credentials(&r.output)
+
+                        // Prepare result output and truncate for notification
+                        let (result_output, notification_msg) = if r.success {
+                            let truncated: String = r.output.chars().take(200).collect();
+                            let msg = format!("✅ {} completed: {}", call.name, truncated);
+                            (scrub_credentials(&r.output), Some(msg))
                         } else {
-                            format!("Error: {}", r.error.unwrap_or_else(|| r.output))
+                            let err_msg = r.error.unwrap_or_else(|| r.output.clone());
+                            let truncated: String = err_msg.chars().take(100).collect();
+                            let msg = format!("❌ {} failed: {}", call.name, truncated);
+                            (format!("Error: {}", err_msg), Some(msg))
+                        };
+
+                        // Notify channel about tool result
+                        if let Some(ref tx) = on_delta {
+                            if let Some(msg) = notification_msg {
+                                let _ = tx.send(msg).await;
+                            }
                         }
+
+                        result_output
                     }
                     Err(e) => {
                         observer.record_event(&ObserverEvent::ToolCall {
@@ -1345,6 +1367,12 @@ pub(crate) async fn run_tool_call_loop(
                             duration: start.elapsed(),
                             success: false,
                         });
+
+                        // Notify channel about tool error
+                        if let Some(ref tx) = on_delta {
+                            let _ = tx.send(format!("❌ {} error: {}", call.name, e)).await;
+                        }
+
                         format!("Error executing {}: {e}", call.name)
                     }
                 }
