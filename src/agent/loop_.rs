@@ -227,9 +227,16 @@ async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f6
         if !relevant.is_empty() {
             context.push_str("[Memory context]\n");
             for entry in &relevant {
+                if memory::is_assistant_autosave_key(&entry.key) {
+                    continue;
+                }
                 let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
             }
-            context.push('\n');
+            if context != "[Memory context]\n" {
+                context.push('\n');
+            } else {
+                context.clear();
+            }
         }
     }
 
@@ -1640,15 +1647,6 @@ pub async fn run(
         final_output = response.clone();
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
-
-        // Auto-save assistant response to daily log
-        if config.memory.auto_save {
-            let summary = truncate_with_ellipsis(&response, 100);
-            let response_key = autosave_memory_key("assistant_resp");
-            let _ = mem
-                .store(&response_key, &summary, MemoryCategory::Daily, None)
-                .await;
-        }
     } else {
         println!("🦀 ZeroClaw Interactive Mode");
         println!("Type /help for commands.\n");
@@ -1799,14 +1797,6 @@ pub async fn run(
 
             // Hard cap as a safety net.
             trim_history(&mut history, config.agent.max_history_messages);
-
-            if config.memory.auto_save {
-                let summary = truncate_with_ellipsis(&response, 100);
-                let response_key = autosave_memory_key("assistant_resp");
-                let _ = mem
-                    .store(&response_key, &summary, MemoryCategory::Daily, None)
-                    .await;
-            }
         }
     }
 
@@ -2650,6 +2640,33 @@ Done."#;
 
         let recalled = mem.recall("45", 5, None).await.unwrap();
         assert!(recalled.iter().any(|entry| entry.content.contains("45")));
+    }
+
+    #[tokio::test]
+    async fn build_context_ignores_legacy_assistant_autosave_entries() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        mem.store(
+            "assistant_resp_poisoned",
+            "User suffered a fabricated event",
+            MemoryCategory::Daily,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "user_msg_real",
+            "User asked for concise status updates",
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let context = build_context(&mem, "status updates", 0.0).await;
+        assert!(context.contains("user_msg_real"));
+        assert!(!context.contains("assistant_resp_poisoned"));
+        assert!(!context.contains("fabricated event"));
     }
 
     // ═══════════════════════════════════════════════════════════════════════

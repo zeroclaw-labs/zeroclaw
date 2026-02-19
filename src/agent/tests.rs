@@ -624,7 +624,7 @@ async fn history_trims_after_max_messages() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn auto_save_stores_messages_in_memory() {
+async fn auto_save_stores_only_user_messages_in_memory() {
     let (mem, _tmp) = make_sqlite_memory();
     let provider = Box::new(ScriptedProvider::new(vec![text_response(
         "I remember everything",
@@ -639,11 +639,25 @@ async fn auto_save_stores_messages_in_memory() {
 
     let _ = agent.turn("Remember this fact").await.unwrap();
 
-    // Both user message and assistant response should be saved
+    // Auto-save only persists user-stated input, never assistant-generated summaries.
     let count = mem.count().await.unwrap();
+    assert_eq!(
+        count, 1,
+        "Expected exactly 1 user memory entry, got {count}"
+    );
+
+    let stored = mem.get("user_msg").await.unwrap();
+    assert!(stored.is_some(), "Expected user_msg key to be present");
+    assert_eq!(
+        stored.unwrap().content,
+        "Remember this fact",
+        "Stored memory should match the original user message"
+    );
+
+    let assistant = mem.get("assistant_resp").await.unwrap();
     assert!(
-        count >= 2,
-        "Expected at least 2 memory entries, got {count}"
+        assistant.is_none(),
+        "assistant_resp should not be auto-saved anymore"
     );
 }
 

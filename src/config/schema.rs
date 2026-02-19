@@ -1387,7 +1387,7 @@ pub struct MemoryConfig {
     ///
     /// `postgres` requires `[storage.provider.config]` with `db_url` (`dbURL` alias supported).
     pub backend: String,
-    /// Auto-save conversation context to memory
+    /// Auto-save user-stated conversation input to memory (assistant output is excluded)
     pub auto_save: bool,
     /// Run memory/session hygiene (archiving + retention cleanup)
     #[serde(default = "default_hygiene_enabled")]
