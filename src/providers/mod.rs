@@ -1700,7 +1700,7 @@ mod tests {
         };
 
         // Primary uses a ZAI key; fallbacks (lmstudio, ollama) should NOT
-        // receive this key — they resolve their own credentials independently.
+        // receive this key; they resolve their own credentials independently.
         let provider = create_resilient_provider("zai", Some("zai-test-key"), None, &reliability);
         assert!(provider.is_ok());
     }
