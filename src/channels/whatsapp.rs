@@ -203,6 +203,11 @@ impl Channel for WhatsAppChannel {
         // Check if we can reach the WhatsApp API
         let url = format!("https://graph.facebook.com/v18.0/{}", self.endpoint_id);
 
+        if !url.starts_with("https://") {
+            tracing::error!("WhatsApp API health check URL must use HTTPS");
+            return false;
+        }
+
         self.http_client()
             .get(&url)
             .bearer_auth(&self.access_token)
