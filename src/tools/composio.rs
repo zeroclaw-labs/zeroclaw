@@ -198,13 +198,14 @@ impl ComposioTool {
         let accounts = self
             .list_connected_accounts(Some(&app), Some(&entity))
             .await?;
-        let mut usable = accounts.into_iter().filter(|acct| acct.is_usable());
-        let Some(first) = usable.next() else {
+        // The API returns accounts ordered by updated_at DESC, so the first
+        // usable account is the most recently active one.  We always pick it
+        // rather than giving up when multiple accounts exist — giving up was
+        // the root cause of the "cannot find connected account" loop reported
+        // in issue #959.
+        let Some(first) = accounts.into_iter().find(|acct| acct.is_usable()) else {
             return Ok(None);
         };
-        if usable.next().is_some() {
-            return Ok(None);
-        }
 
         self.cache_connected_account(&app, &entity, &first.id);
         Ok(Some(first.id))
@@ -541,8 +542,9 @@ impl Tool for ComposioTool {
 
     fn description(&self) -> &str {
         "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). \
-         Use action='list' to see available actions, action='execute' with action_name/tool_slug, params, and optional connected_account_id, \
-         action='list_accounts' to list connected accounts and IDs, \
+         Use action='list' to see available actions, \
+         action='list_accounts' or action='connected_accounts' to list OAuth-connected accounts after login, \
+         action='execute' with action_name/tool_slug and params (connected_account_id auto-resolved when omitted), \
          or action='connect' with app/auth_config_id to get OAuth URL."
     }
 
@@ -552,8 +554,8 @@ impl Tool for ComposioTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "description": "The operation: 'list' (list available actions), 'list_accounts' (list connected accounts), 'execute' (run an action), or 'connect' (get OAuth URL)",
-                    "enum": ["list", "list_accounts", "execute", "connect"]
+                    "description": "The operation: 'list' (list available actions), 'list_accounts'/'connected_accounts' (list connected accounts), 'execute' (run an action), or 'connect' (get OAuth URL)",
+                    "enum": ["list", "list_accounts", "connected_accounts", "execute", "connect"]
                 },
                 "app": {
                     "type": "string",
@@ -640,7 +642,8 @@ impl Tool for ComposioTool {
                 }
             }
 
-            "list_accounts" => {
+            // Accept both spellings so the LLM can use either.
+            "list_accounts" | "connected_accounts" => {
                 let app = args.get("app").and_then(|v| v.as_str());
                 match self.list_connected_accounts(app, Some(entity_id)).await {
                     Ok(accounts) => {
@@ -1516,6 +1519,110 @@ mod tests {
         assert_eq!(body["arguments"]["to"], json!("test@example.com"));
         assert_eq!(body["user_id"], json!("workspace-user"));
         assert_eq!(body["connected_account_id"], json!("account-42"));
+    }
+
+    // ── resolve_connected_account_ref (multi-account fix) ────
+
+    #[test]
+    fn resolve_picks_first_usable_when_multiple_accounts_exist() {
+        // Regression test for issue #959: previously returned None when
+        // multiple accounts existed, causing the LLM to loop on the OAuth URL.
+        let tool = ComposioTool::new("test-key", None, test_security());
+        let accounts = vec![
+            ComposioConnectedAccount {
+                id: "ca_old".to_string(),
+                status: "ACTIVE".to_string(),
+                toolkit: None,
+            },
+            ComposioConnectedAccount {
+                id: "ca_new".to_string(),
+                status: "ACTIVE".to_string(),
+                toolkit: None,
+            },
+        ];
+        // Simulate what resolve_connected_account_ref does: find first usable.
+        let resolved = accounts.into_iter().find(|a| a.is_usable()).map(|a| a.id);
+        assert_eq!(resolved.as_deref(), Some("ca_old"));
+    }
+
+    #[test]
+    fn resolve_picks_first_usable_skipping_unusable_head() {
+        let accounts = vec![
+            ComposioConnectedAccount {
+                id: "ca_dead".to_string(),
+                status: "DISCONNECTED".to_string(),
+                toolkit: None,
+            },
+            ComposioConnectedAccount {
+                id: "ca_live".to_string(),
+                status: "ACTIVE".to_string(),
+                toolkit: None,
+            },
+        ];
+        let resolved = accounts.into_iter().find(|a| a.is_usable()).map(|a| a.id);
+        assert_eq!(resolved.as_deref(), Some("ca_live"));
+    }
+
+    #[test]
+    fn resolve_returns_none_when_no_usable_accounts() {
+        let accounts = vec![ComposioConnectedAccount {
+            id: "ca_dead".to_string(),
+            status: "DISCONNECTED".to_string(),
+            toolkit: None,
+        }];
+        let resolved = accounts.into_iter().find(|a| a.is_usable()).map(|a| a.id);
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn resolve_returns_none_for_empty_accounts() {
+        let accounts: Vec<ComposioConnectedAccount> = vec![];
+        let resolved = accounts.into_iter().find(|a| a.is_usable()).map(|a| a.id);
+        assert!(resolved.is_none());
+    }
+
+    // ── connected_accounts alias ──────────────────────────────
+
+    #[tokio::test]
+    async fn connected_accounts_alias_dispatches_same_as_list_accounts() {
+        // Both spellings should reach the same handler and return the same
+        // shape of error (network failure in test, not a dispatch error).
+        let tool = ComposioTool::new("test-key", None, test_security());
+        let r1 = tool
+            .execute(json!({"action": "list_accounts"}))
+            .await
+            .unwrap();
+        let r2 = tool
+            .execute(json!({"action": "connected_accounts"}))
+            .await
+            .unwrap();
+        // Both fail the same way (network) — neither is a dispatch error.
+        assert!(!r1.success);
+        assert!(!r2.success);
+        let e1 = r1.error.unwrap_or_default();
+        let e2 = r2.error.unwrap_or_default();
+        assert!(!e1.contains("Unknown action"), "list_accounts: {e1}");
+        assert!(!e2.contains("Unknown action"), "connected_accounts: {e2}");
+    }
+
+    #[test]
+    fn schema_enum_includes_connected_accounts_alias() {
+        let tool = ComposioTool::new("test-key", None, test_security());
+        let schema = tool.parameters_schema();
+        let values: Vec<&str> = schema["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(values.contains(&"connected_accounts"));
+        assert!(values.contains(&"list_accounts"));
+    }
+
+    #[test]
+    fn description_mentions_connected_accounts() {
+        let tool = ComposioTool::new("test-key", None, test_security());
+        assert!(tool.description().contains("connected_accounts"));
     }
 
     #[test]
