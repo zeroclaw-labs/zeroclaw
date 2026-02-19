@@ -147,7 +147,11 @@ fn doctor_model_targets(provider_override: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-pub fn run_models(config: &Config, provider_override: Option<&str>, use_cache: bool) -> Result<()> {
+pub async fn run_models(
+    config: &Config,
+    provider_override: Option<&str>,
+    use_cache: bool,
+) -> Result<()> {
     let targets = doctor_model_targets(provider_override);
 
     if targets.is_empty() {
@@ -174,7 +178,7 @@ pub fn run_models(config: &Config, provider_override: Option<&str>, use_cache: b
     for provider_name in &targets {
         println!("  [{}]", provider_name);
 
-        match crate::onboard::run_models_refresh(config, Some(provider_name), !use_cache) {
+        match crate::onboard::run_models_refresh(config, Some(provider_name), !use_cache).await {
             Ok(()) => {
                 ok_count += 1;
                 println!("    ✅ model catalog check passed");

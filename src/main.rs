@@ -781,12 +781,7 @@ async fn main() -> Result<()> {
 
         Commands::Models { model_command } => match model_command {
             ModelCommands::Refresh { provider, force } => {
-                let config_for_refresh = config.clone();
-                tokio::task::spawn_blocking(move || {
-                    onboard::run_models_refresh(&config_for_refresh, provider.as_deref(), force)
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("models refresh task failed: {e}"))?
+                onboard::run_models_refresh(&config, provider.as_deref(), force).await
             }
         },
 
@@ -835,14 +830,7 @@ async fn main() -> Result<()> {
             Some(DoctorCommands::Models {
                 provider,
                 use_cache,
-            }) => {
-                let config_for_models = config.clone();
-                tokio::task::spawn_blocking(move || {
-                    doctor::run_models(&config_for_models, provider.as_deref(), use_cache)
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("doctor models task failed: {e}"))?
-            }
+            }) => doctor::run_models(&config, provider.as_deref(), use_cache).await,
             None => doctor::run(&config),
         },
 
