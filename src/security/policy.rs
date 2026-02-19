@@ -111,6 +111,7 @@ impl Default for SecurityPolicy {
                 "wc".into(),
                 "head".into(),
                 "tail".into(),
+                "date".into(),
             ],
             forbidden_paths: vec![
                 // System directories (blocked even when workspace_only=false)
