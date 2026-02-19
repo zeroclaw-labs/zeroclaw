@@ -3,6 +3,7 @@ firmware/*/target
 *.db
 *.db-journal
 .DS_Store
+._*
 .wt-pr37/
 __pycache__/
 *.pyc
