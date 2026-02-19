@@ -163,12 +163,17 @@ fn split_message(message: &str, max_bytes: usize) -> Vec<String> {
 
     // Guard against max_bytes == 0 to prevent infinite loop
     if max_bytes == 0 {
-        let full: String = message
+        let mut full = String::new();
+        for l in message
             .lines()
             .map(|l| l.trim_end_matches('\r'))
             .filter(|l| !l.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
+        {
+            if !full.is_empty() {
+                full.push(' ');
+            }
+            full.push_str(l);
+        }
         if full.is_empty() {
             chunks.push(String::new());
         } else {
