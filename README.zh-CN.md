@@ -69,7 +69,7 @@ ZeroClaw 是一个高性能、低资源占用、可组合的自主智能体运�
 | **语言** | TypeScript | Python | Go | **Rust** |
 | **RAM** | > 1GB | > 100MB | < 10MB | **< 5MB** |
 | **启动时间（0.8GHz 核）** | > 500s | > 30s | < 1s | **< 10ms** |
-| **二进制体积** | ~28MB（dist） | N/A（脚本） | ~8MB | **3.4 MB** |
+| **二进制体积** | ~28MB（dist） | N/A（脚本） | ~8MB | **~8.8 MB** |
 | **成本** | Mac Mini $599 | Linux SBC ~$50 | Linux 板卡 $10 | **任意 $10 硬件** |
 
 > 说明：ZeroClaw 的数据来自 release 构建，并通过 `/usr/bin/time -l` 测得。OpenClaw 需要 Node.js 运行时环境，仅该运行时通常就会带来约 390MB 的额外内存占用；NanoBot 需要 Python 运行时环境。PicoClaw 与 ZeroClaw 为静态二进制。

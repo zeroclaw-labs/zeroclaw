@@ -33,7 +33,7 @@ cargo test --locked
 # Optional docs links gate (checks only links added on changed lines)
 ./scripts/ci/docs_links_gate.sh
 
-# Release build (~3.4MB)
+# Release build
 cargo build --release --locked
 ```
 
