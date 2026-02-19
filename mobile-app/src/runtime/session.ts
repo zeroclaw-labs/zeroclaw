@@ -1,21 +1,18 @@
 import { runAgentChat, type ChatCompletionMessage } from "../api/mobileclaw";
 import { addActivity } from "../state/activity";
+import { sanitizeAssistantArtifacts } from "../state/chat";
 import {
   loadAgentConfig,
   loadDeviceToolsConfig,
   loadIntegrationsConfig,
   loadSecurityConfig,
 } from "../state/mobileclaw";
+import { getRuntimeSupervisorState } from "./supervisor";
 import { executeToolDirective, parseToolDirective } from "./tooling";
 import type { AgentTurnResult } from "./types";
 
 function stripSystemReminder(text: string): string {
-  return String(text || "")
-    .replace(/<[^>]*system\s*[-_ ]?reminder[^>]*>[\s\S]*?<\/[^>]*system\s*[-_ ]?reminder\s*>/gi, "")
-    .replace(/<[^>]*system\s*[-_ ]?reminder[^>]*>[\s\S]*$/gi, "")
-    .replace(/<\s*system-reminder\b[^>]*>[\s\S]*?<\s*\/\s*system-reminder\s*>/gi, "")
-    .replace(/<\s*system-reminder\b[^>]*>[\s\S]*$/gi, "")
-    .trim();
+  return sanitizeAssistantArtifacts(text);
 }
 
 function extractFirstUrl(text: string): string | null {
@@ -93,6 +90,44 @@ function makeSystemInstruction(enabledTools: string[], enabledIntegrations: stri
   ].join(" ");
 }
 
+function makeIntegrationHints(config: Awaited<ReturnType<typeof loadIntegrationsConfig>>): string {
+  const hints: string[] = [];
+
+  if (config.telegramEnabled && config.telegramBotToken.trim() && config.telegramChatId.trim()) {
+    hints.push(
+      "Telegram integration is configured with bot token and chat ID.",
+      "When user asks to send/write Telegram message, call integration.telegram.send_message with arguments containing only message text.",
+      "Never ask user for Telegram chat ID.",
+    );
+  } else if (config.telegramEnabled) {
+    hints.push(
+      "Telegram integration is enabled but incomplete.",
+      "If user asks for Telegram sending, ask them to detect chat ID in Integrations screen first.",
+    );
+  }
+
+  if (config.discordEnabled) {
+    hints.push("Discord integration requires backend runtime channel path for inbound/outbound automation.");
+  }
+  if (config.slackEnabled) {
+    hints.push("Slack integration requires backend runtime channel path for inbound/outbound automation.");
+  }
+  if (config.whatsappEnabled) {
+    hints.push("WhatsApp integration requires backend runtime channel path for inbound/outbound automation.");
+  }
+  if (config.composioEnabled) {
+    hints.push("Composio integration actions are executed by backend runtime when available.");
+  }
+
+  return hints.join(" ");
+}
+
+function isInboundIntegrationIntent(prompt: string): boolean {
+  const text = prompt.toLowerCase();
+  return /(incoming|new message|listen|watch|monitor|reply).*(telegram|discord|slack|whatsapp)/.test(text) ||
+    /(telegram|discord|slack|whatsapp).*(incoming|new message|listen|watch|monitor|reply)/.test(text);
+}
+
 function extractPhoneNumber(text: string): string | null {
   const match = text.match(/(\+?\d[\d\s\-()]{5,}\d)/);
   if (!match?.[1]) return null;
@@ -107,6 +142,17 @@ function extractSmsTargetAndBody(text: string): { to: string; body: string } | n
   const body = match[2].trim();
   if (!to || !body) return null;
   return { to, body };
+}
+
+function extractTelegramMessageBody(text: string): string {
+  const trimmed = text.trim();
+  const withSeparator = trimmed.match(/telegram[^:]*[:\-]\s*(.+)$/i);
+  if (withSeparator?.[1]) return withSeparator[1].trim();
+
+  const quoted = trimmed.match(/telegram[^"']*["']([\s\S]+)["']/i);
+  if (quoted?.[1]) return quoted[1].trim();
+
+  return "";
 }
 
 function normalizeDirectiveForPrompt(
@@ -136,9 +182,18 @@ function normalizeDirectiveForPrompt(
 function inferDirectiveFromPrompt(
   userPrompt: string,
   enabledToolIds: string[],
+  integrations: Awaited<ReturnType<typeof loadIntegrationsConfig>>,
 ): { tool: string; arguments: Record<string, unknown> } | null {
   const text = userPrompt.toLowerCase();
   const hasTool = (id: string) => enabledToolIds.includes(id);
+
+  const asksTelegramMessage = /\b(telegram)\b/.test(text) && /\b(send|write|message|reply|text)\b/.test(text);
+  if (asksTelegramMessage && integrations.telegramEnabled && integrations.telegramBotToken.trim() && integrations.telegramChatId.trim()) {
+    const body = extractTelegramMessageBody(userPrompt);
+    if (body) {
+      return { tool: "integration.telegram.send_message", arguments: { text: body } };
+    }
+  }
 
   const sms = extractSmsTargetAndBody(userPrompt);
   if (sms && hasTool("android_device.sms.send")) {
@@ -197,19 +252,39 @@ function integrationToolIds(integrations: string[]): string[] {
 }
 
 export async function runAgentTurn(userPrompt: string): Promise<AgentTurnResult> {
-  const [runtime, tools, integrations, security] = await Promise.all([
+  const [runtime, tools, integrations, security, supervisor] = await Promise.all([
     loadAgentConfig(),
     loadDeviceToolsConfig(),
     loadIntegrationsConfig(),
     loadSecurityConfig(),
+    getRuntimeSupervisorState(),
   ]);
+
+  if (supervisor.status === "degraded" && isInboundIntegrationIntent(userPrompt)) {
+    return {
+      assistantText:
+        "ZeroClaw runtime is degraded, so inbound channel events may not reach the agent right now. Check Activity status, ensure backend is reachable, then retry.",
+      toolEvents: [],
+    };
+  }
+
+  const lowerPrompt = userPrompt.toLowerCase();
+  const asksTelegramMessage = /\btelegram\b/.test(lowerPrompt) && /\b(send|write|message|reply|text)\b/.test(lowerPrompt);
+  const telegramConfigured = integrations.telegramEnabled && integrations.telegramBotToken.trim() && integrations.telegramChatId.trim();
+  if (asksTelegramMessage && telegramConfigured && !extractTelegramMessageBody(userPrompt)) {
+    return {
+      assistantText: "Sure. What exact text should I send to your Telegram chat?",
+      toolEvents: [],
+    };
+  }
 
   const enabledTools = tools.filter((tool) => tool.enabled).map((tool) => tool.id);
   const enabledIntegrations = integrationList(integrations);
-  const system = makeSystemInstruction(
+  const systemBase = makeSystemInstruction(
     [...enabledTools, ...integrationToolIds(enabledIntegrations)],
     enabledIntegrations,
   );
+  const system = [systemBase, makeIntegrationHints(integrations)].filter(Boolean).join(" ");
 
   const firstMessages: ChatCompletionMessage[] = [
     { role: "system", content: system },
@@ -264,9 +339,9 @@ export async function runAgentTurn(userPrompt: string): Promise<AgentTurnResult>
     }
   }
 
-  const deterministicDirective = inferDirectiveFromPrompt(userPrompt, enabledTools);
+  const deterministicDirective = inferDirectiveFromPrompt(userPrompt, enabledTools, integrations);
   if (deterministicDirective) {
-    const toolEvent = await executeToolDirective(deterministicDirective, { tools, security });
+    const toolEvent = await executeToolDirective(deterministicDirective, { tools, integrations, security });
     await addActivity({
       kind: "action",
       source: "chat",
@@ -308,7 +383,7 @@ export async function runAgentTurn(userPrompt: string): Promise<AgentTurnResult>
     };
   }
   const parsedDirective = parseToolDirective(firstReply);
-  const directive = parsedDirective || inferDirectiveFromPrompt(userPrompt, enabledTools);
+  const directive = parsedDirective || inferDirectiveFromPrompt(userPrompt, enabledTools, integrations);
   if (!directive) {
     return {
       assistantText: stripSystemReminder(firstReply) || "(empty response)",
@@ -317,7 +392,7 @@ export async function runAgentTurn(userPrompt: string): Promise<AgentTurnResult>
   }
 
   const normalizedDirective = normalizeDirectiveForPrompt(userPrompt, directive);
-  const toolEvent = await executeToolDirective(normalizedDirective, { tools, security });
+  const toolEvent = await executeToolDirective(normalizedDirective, { tools, integrations, security });
   await addActivity({
     kind: "action",
     source: "chat",
@@ -352,7 +427,11 @@ export async function runAgentTurn(userPrompt: string): Promise<AgentTurnResult>
 }
 
 export async function runToolExecutionProbe(rawAssistantReply: string): Promise<AgentTurnResult> {
-  const [tools, security] = await Promise.all([loadDeviceToolsConfig(), loadSecurityConfig()]);
+  const [tools, integrations, security] = await Promise.all([
+    loadDeviceToolsConfig(),
+    loadIntegrationsConfig(),
+    loadSecurityConfig(),
+  ]);
   const directive = parseToolDirective(rawAssistantReply);
 
   if (!directive) {
@@ -362,7 +441,7 @@ export async function runToolExecutionProbe(rawAssistantReply: string): Promise<
     };
   }
 
-  const toolEvent = await executeToolDirective(directive, { tools, security });
+  const toolEvent = await executeToolDirective(directive, { tools, integrations, security });
   return {
     assistantText:
       toolEvent.status === "executed"

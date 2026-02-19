@@ -1,0 +1,13 @@
+appId: com.mobileclaw.app
+---
+- launchApp
+- extendedWaitUntil:
+    visible:
+      id: "screen-chat"
+    timeout: 30000
+- tapOn:
+    id: "chat-input"
+- inputText: "keyboard check"
+- assertVisible: "keyboard check"
+- assertVisible:
+    id: "chat-send-or-voice"

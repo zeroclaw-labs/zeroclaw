@@ -3,6 +3,54 @@ use crate::tools::{Tool, ToolSpec};
 use serde_json::Value;
 use std::fmt::Write;
 
+fn canonicalize_tool_name(raw_name: &str) -> String {
+    let normalized = raw_name.trim().to_lowercase().replace(['-', '.'], "_");
+    match normalized.as_str() {
+        "androiddevice" => "android_device".to_string(),
+        _ => normalized,
+    }
+}
+
+fn canonicalize_android_action(raw_action: &str) -> String {
+    let normalized = raw_action.trim().to_lowercase().replace(['-', '.'], "_");
+    match normalized.as_str() {
+        "readcalllog" => "read_call_log".to_string(),
+        "readsms" => "read_sms".to_string(),
+        "sendsms" => "send_sms".to_string(),
+        "placecall" => "place_call".to_string(),
+        "readcontacts" => "read_contacts".to_string(),
+        "readcalendar" => "read_calendar".to_string(),
+        "getbattery" => "get_battery".to_string(),
+        "getnetwork" => "get_network".to_string(),
+        "openurl" => "open_url".to_string(),
+        "listapps" => "list_apps".to_string(),
+        "openapp" => "launch_app".to_string(),
+        "getandroidversion" => "get_android_version".to_string(),
+        "getdeviceinfo" => "get_device_info".to_string(),
+        _ => normalized,
+    }
+}
+
+fn canonicalize_tool_call(name: String, mut arguments: Value) -> ParsedToolCall {
+    let canonical_name = canonicalize_tool_name(&name);
+    if canonical_name == "android_device" {
+        if let Some(obj) = arguments.as_object_mut() {
+            if let Some(action) = obj.get("action").and_then(Value::as_str) {
+                obj.insert(
+                    "action".to_string(),
+                    Value::String(canonicalize_android_action(action)),
+                );
+            }
+        }
+    }
+
+    ParsedToolCall {
+        name: canonical_name,
+        arguments,
+        tool_call_id: None,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ParsedToolCall {
     pub name: String,
@@ -58,11 +106,7 @@ impl XmlToolDispatcher {
                             .get("arguments")
                             .cloned()
                             .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
-                        calls.push(ParsedToolCall {
-                            name,
-                            arguments,
-                            tool_call_id: None,
-                        });
+                        calls.push(canonicalize_tool_call(name, arguments));
                     }
                     Err(e) => {
                         tracing::warn!("Malformed <tool_call> JSON: {e}");
@@ -164,11 +208,14 @@ impl ToolDispatcher for NativeToolDispatcher {
         let calls = response
             .tool_calls
             .iter()
-            .map(|tc| ParsedToolCall {
-                name: tc.name.clone(),
-                arguments: serde_json::from_str(&tc.arguments)
-                    .unwrap_or_else(|_| Value::Object(serde_json::Map::new())),
-                tool_call_id: Some(tc.id.clone()),
+            .map(|tc| {
+                let mut call = canonicalize_tool_call(
+                    tc.name.clone(),
+                    serde_json::from_str(&tc.arguments)
+                        .unwrap_or_else(|_| Value::Object(serde_json::Map::new())),
+                );
+                call.tool_call_id = Some(tc.id.clone());
+                call
             })
             .collect();
         (text, calls)
@@ -242,6 +289,25 @@ mod tests {
         let (_, calls) = dispatcher.parse_response(&response);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
+    }
+
+    #[test]
+    fn xml_dispatcher_normalizes_android_aliases() {
+        let response = ChatResponse {
+            text: Some(
+                "<tool_call>{\"name\":\"androiddevice\",\"arguments\":{\"action\":\"readcalllog\",\"limit\":20}}</tool_call>"
+                    .into(),
+            ),
+            tool_calls: vec![],
+        };
+        let dispatcher = XmlToolDispatcher;
+        let (_, calls) = dispatcher.parse_response(&response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "android_device");
+        assert_eq!(
+            calls[0].arguments.get("action").and_then(Value::as_str),
+            Some("read_call_log")
+        );
     }
 
     #[test]

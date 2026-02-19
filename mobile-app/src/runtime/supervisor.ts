@@ -1,11 +1,20 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import { Platform } from "react-native";
 
-import { config } from "../config";
+import { configureAndroidRuntimeBridge, getAndroidRuntimeBridgeStatus } from "../native/androidAgentBridge";
 import { addActivity } from "../state/activity";
-import { loadIntegrationsConfig, loadSecurityConfig, type IntegrationsConfig, type SecurityConfig } from "../state/mobileclaw";
+import {
+  loadAgentConfig,
+  loadDeviceToolsConfig,
+  loadIntegrationsConfig,
+  loadSecurityConfig,
+  type IntegrationsConfig,
+  type SecurityConfig,
+} from "../state/mobileclaw";
 
 export type RuntimeSupervisorState = {
   status: "stopped" | "starting" | "healthy" | "degraded";
+  degradeReason: "none" | "missing_config" | "platform_unreachable" | "mixed";
   startedAtMs: number | null;
   lastTransitionMs: number;
   restartCount: number;
@@ -19,6 +28,7 @@ const KEY = "mobileclaw:runtime-supervisor:v1";
 
 const DEFAULT_STATE: RuntimeSupervisorState = {
   status: "stopped",
+  degradeReason: "none",
   startedAtMs: null,
   lastTransitionMs: Date.now(),
   restartCount: 0,
@@ -57,7 +67,6 @@ function deriveComponents(integrations: IntegrationsConfig, security: SecurityCo
   if (integrations.telegramEnabled) {
     components.push("channel:telegram");
     if (!integrations.telegramBotToken.trim()) missing.push("telegram.bot_token");
-    if (!integrations.telegramChatId.trim()) missing.push("telegram.chat_id");
   }
   if (integrations.discordEnabled) {
     components.push("channel:discord");
@@ -101,20 +110,12 @@ async function writeState(state: RuntimeSupervisorState): Promise<void> {
 }
 
 async function fetchHealthSnapshot(): Promise<{ ok: boolean; detail?: string }> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 4000);
-  try {
-    const res = await fetch(`${config.platformUrl}/health`, { signal: controller.signal });
-    if (!res.ok) return { ok: false, detail: `health HTTP ${res.status}` };
-    return { ok: true };
-  } catch (error) {
-    return {
-      ok: false,
-      detail: error instanceof Error ? error.message : "health request failed",
-    };
-  } finally {
-    clearTimeout(timer);
-  }
+  if (Platform.OS !== "android") return { ok: false, detail: "android_only" };
+  const bridge = await getAndroidRuntimeBridgeStatus();
+  if (!bridge) return { ok: false, detail: "native_runtime_bridge_unavailable" };
+  if (!bridge.runtimeReady) return { ok: false, detail: "runtime_not_configured" };
+  if (!bridge.daemonUp) return { ok: false, detail: "daemon_down" };
+  return { ok: true };
 }
 
 export async function getRuntimeSupervisorState(): Promise<RuntimeSupervisorState> {
@@ -146,7 +147,9 @@ export async function startRuntimeSupervisor(reason: string): Promise<RuntimeSup
 }
 
 export async function applyRuntimeSupervisorConfig(reason: string): Promise<RuntimeSupervisorState> {
-  const [integrations, security, previous] = await Promise.all([
+  const [runtime, deviceTools, integrations, security, previous] = await Promise.all([
+    loadAgentConfig(),
+    loadDeviceToolsConfig(),
     loadIntegrationsConfig(),
     loadSecurityConfig(),
     readState(),
@@ -154,14 +157,38 @@ export async function applyRuntimeSupervisorConfig(reason: string): Promise<Runt
 
   const { components, missing } = deriveComponents(integrations, security);
   const hash = signature(integrations, security);
+
+  await configureAndroidRuntimeBridge({
+    telegramEnabled: integrations.telegramEnabled,
+    telegramBotToken: integrations.telegramBotToken,
+    alwaysOnMode: security.alwaysOnRuntime,
+    incomingCallHooks: security.incomingCallHooks,
+    incomingSmsHooks: security.incomingSmsHooks,
+    enabledToolIds: deviceTools.filter((tool) => tool.enabled).map((tool) => tool.id),
+    runtimeProvider: runtime.provider,
+    runtimeModel: runtime.model,
+    runtimeApiUrl: runtime.apiUrl,
+    runtimeApiKey: runtime.authMode === "oauth_token" ? runtime.oauthAccessToken : runtime.apiKey,
+    runtimeTemperature: runtime.temperature,
+  });
+
   const health = await fetchHealthSnapshot();
 
   const status: RuntimeSupervisorState["status"] =
     missing.length > 0 || !health.ok ? "degraded" : "healthy";
+  const degradeReason: RuntimeSupervisorState["degradeReason"] =
+    missing.length > 0 && !health.ok
+      ? "mixed"
+      : missing.length > 0
+        ? "missing_config"
+        : !health.ok
+          ? "platform_unreachable"
+          : "none";
 
   const next: RuntimeSupervisorState = {
     ...previous,
     status,
+    degradeReason,
     components,
     missingConfig: missing,
     lastError: health.ok ? null : health.detail || "health check failed",
@@ -177,6 +204,7 @@ export async function applyRuntimeSupervisorConfig(reason: string): Promise<Runt
     const detailParts = [
       `reason=${reason}`,
       `status=${status}`,
+      `degrade_reason=${degradeReason}`,
       `components=${components.join(", ") || "none"}`,
     ];
     if (missing.length) detailParts.push(`missing=${missing.join(", ")}`);
@@ -199,6 +227,7 @@ export async function stopRuntimeSupervisor(reason: string): Promise<RuntimeSupe
   const next: RuntimeSupervisorState = {
     ...previous,
     status: "stopped",
+    degradeReason: "none",
     components: [],
     missingConfig: [],
     lastError: null,
@@ -218,7 +247,7 @@ export async function reportRuntimeHookEvent(kind: "incoming_call" | "incoming_s
   await addActivity({
     kind: "action",
     source: "runtime",
-    title: `Hook event: ${kind}`,
-    detail,
+    title: `Hook queued: ${kind}`,
+    detail: `${detail} | native_runtime_bridge=true`,
   });
 }

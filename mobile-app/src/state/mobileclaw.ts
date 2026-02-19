@@ -40,6 +40,7 @@ export type SecurityConfig = {
   includeCallerNumber: boolean;
   directExecution: boolean;
   preferStandardWebTool: boolean;
+  alwaysOnRuntime: boolean;
 };
 
 export type MobileToolCapability = {
@@ -91,6 +92,7 @@ export const DEFAULT_SECURITY: SecurityConfig = {
   includeCallerNumber: true,
   directExecution: true,
   preferStandardWebTool: true,
+  alwaysOnRuntime: false,
 };
 
 export const DEFAULT_DEVICE_TOOLS: MobileToolCapability[] = [

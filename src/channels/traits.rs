@@ -22,6 +22,19 @@ pub trait Channel: Send + Sync {
     /// Send a message through this channel
     async fn send(&self, message: &str, recipient: &str) -> anyhow::Result<()>;
 
+    /// Send a photo through this channel if supported.
+    async fn send_photo(
+        &self,
+        file_path: &str,
+        caption: Option<&str>,
+        recipient: &str,
+    ) -> anyhow::Result<()> {
+        let fallback = caption
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("Photo captured: `{file_path}`"));
+        self.send(&fallback, recipient).await
+    }
+
     /// Start listening for incoming messages (long-running)
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()>;
 

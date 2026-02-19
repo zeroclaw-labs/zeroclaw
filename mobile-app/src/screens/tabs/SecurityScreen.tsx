@@ -17,6 +17,7 @@ export function SecurityScreen() {
   const [includeCallerNumber, setIncludeCallerNumber] = useState(DEFAULT_SECURITY.includeCallerNumber);
   const [directExecution, setDirectExecution] = useState(DEFAULT_SECURITY.directExecution);
   const [preferStandardWebTool, setPreferStandardWebTool] = useState(DEFAULT_SECURITY.preferStandardWebTool);
+  const [alwaysOnRuntime, setAlwaysOnRuntime] = useState(DEFAULT_SECURITY.alwaysOnRuntime);
   const [saveStatus, setSaveStatus] = useState("Loading...");
   const hydratedRef = useRef(false);
 
@@ -32,6 +33,7 @@ export function SecurityScreen() {
       setIncludeCallerNumber(loaded.includeCallerNumber);
       setDirectExecution(loaded.directExecution);
       setPreferStandardWebTool(loaded.preferStandardWebTool);
+      setAlwaysOnRuntime(loaded.alwaysOnRuntime);
       hydratedRef.current = true;
       setSaveStatus("Autosave enabled");
     })();
@@ -51,17 +53,18 @@ export function SecurityScreen() {
         includeCallerNumber,
         directExecution,
         preferStandardWebTool,
+        alwaysOnRuntime,
       });
       void addActivity({
         kind: "action",
         source: "security",
         title: "Security policy updated",
-        detail: `approval=${requireApproval}, high_risk=${highRiskActions}, call_hooks=${incomingCallHooks}, sms_hooks=${incomingSmsHooks}, caller_number=${includeCallerNumber}, direct_exec=${directExecution}, web_tool=${preferStandardWebTool}`,
+        detail: `approval=${requireApproval}, high_risk=${highRiskActions}, call_hooks=${incomingCallHooks}, sms_hooks=${incomingSmsHooks}, caller_number=${includeCallerNumber}, direct_exec=${directExecution}, web_tool=${preferStandardWebTool}, always_on=${alwaysOnRuntime}`,
       });
       setSaveStatus("Saved locally");
     }, 300);
     return () => clearTimeout(timer);
-  }, [requireApproval, highRiskActions, incomingCallHooks, incomingSmsHooks, includeCallerNumber, directExecution, preferStandardWebTool]);
+  }, [requireApproval, highRiskActions, incomingCallHooks, incomingSmsHooks, includeCallerNumber, directExecution, preferStandardWebTool, alwaysOnRuntime]);
 
   return (
     <Screen>
@@ -112,6 +115,11 @@ export function SecurityScreen() {
             <Text variant="bodyMedium">Use standard web read tool</Text>
             <Switch value={preferStandardWebTool} onValueChange={setPreferStandardWebTool} />
           </View>
+          <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
+            <Text variant="bodyMedium">Always-on runtime mode</Text>
+            <Switch value={alwaysOnRuntime} onValueChange={setAlwaysOnRuntime} />
+          </View>
+          <Text variant="muted">Always-on keeps a persistent Android notification and improves delivery when app is in background.</Text>
         </View>
 
       </ScrollView>

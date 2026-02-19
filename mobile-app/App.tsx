@@ -1,6 +1,6 @@
 import "react-native-gesture-handler";
 
-import React, { useEffect } from "react";
+import React, { useEffect, useRef } from "react";
 import { Platform } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { NavigationContainer } from "@react-navigation/native";
@@ -21,9 +21,13 @@ import { ErrorBoundary } from "./src/state/ErrorBoundary";
 import { addActivity } from "./src/state/activity";
 import { loadSecurityConfig } from "./src/state/mobileclaw";
 import { subscribeIncomingDeviceEvents } from "./src/native/incomingCalls";
+import { getAndroidRuntimeBridgeStatus } from "./src/native/androidAgentBridge";
 import { applyRuntimeSupervisorConfig, reportRuntimeHookEvent, startRuntimeSupervisor } from "./src/runtime/supervisor";
 
 export default function App() {
+  const lastTelegramSeenRef = useRef(0);
+  const lastWebhookSuccessRef = useRef(0);
+  const lastWebhookFailRef = useRef(0);
   const [fontsLoaded] = Font.useFonts({
     Inter_400Regular,
     Inter_500Medium,
@@ -34,6 +38,49 @@ export default function App() {
   useEffect(() => {
     if (!fontsLoaded) return;
     log("info", "app started", { platform: Platform.OS });
+  }, [fontsLoaded]);
+
+  useEffect(() => {
+    if (!fontsLoaded) return;
+
+    const timer = setInterval(() => {
+      void (async () => {
+        const status = await getAndroidRuntimeBridgeStatus();
+        if (!status) return;
+
+        if (status.telegramSeenCount > lastTelegramSeenRef.current) {
+          lastTelegramSeenRef.current = status.telegramSeenCount;
+          await addActivity({
+            kind: "message",
+            source: "runtime",
+            title: "Telegram inbound received",
+            detail: status.lastEventNote || "Telegram message queued in native bridge",
+          });
+        }
+
+        if (status.webhookSuccessCount > lastWebhookSuccessRef.current) {
+          lastWebhookSuccessRef.current = status.webhookSuccessCount;
+          await addActivity({
+            kind: "action",
+            source: "runtime",
+            title: "Bridge forwarded event",
+            detail: status.lastEventNote || "Webhook delivery succeeded",
+          });
+        }
+
+        if (status.webhookFailCount > lastWebhookFailRef.current) {
+          lastWebhookFailRef.current = status.webhookFailCount;
+          await addActivity({
+            kind: "action",
+            source: "runtime",
+            title: "Bridge forward retry",
+            detail: status.lastEventNote || "Webhook delivery failed and will retry",
+          });
+        }
+      })();
+    }, 5000);
+
+    return () => clearInterval(timer);
   }, [fontsLoaded]);
 
   useEffect(() => {

@@ -1,0 +1,43 @@
+appId: com.mobileclaw.app
+---
+- launchApp
+- tapOn:
+    text: "Dismiss"
+    optional: true
+- tapOn:
+    text: "Close"
+    optional: true
+- tapOn:
+    text: "OK"
+    optional: true
+- tapOn:
+    text: "Allow"
+    optional: true
+- tapOn:
+    text: "While using the app"
+    optional: true
+- tapOn:
+    text: "Only this time"
+    optional: true
+- tapOn:
+    text: "Allow"
+    optional: true
+- tapOn:
+    text: "Allow"
+    optional: true
+- extendedWaitUntil:
+    visible:
+      id: "screen-chat"
+    timeout: 30000
+- assertVisible:
+    id: "dock-tab-activity"
+- tapOn:
+    id: "dock-tab-activity"
+- assertVisible: "ZeroClaw Runtime"
+- assertVisible: "status="
+- tapOn:
+    id: "dock-tab-integrations"
+- assertVisible:
+    id: "screen-integrations"
+- assertVisible: "Telegram"
+- assertNotVisible: "Chat ID"

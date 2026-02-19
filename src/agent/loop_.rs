@@ -479,6 +479,10 @@ pub(crate) async fn run_tool_call_loop(
         Vec::new()
     };
 
+    let mut pending_media: Vec<serde_json::Value> = Vec::new();
+    let mut last_signature: Option<String> = None;
+    let mut repeated_signature_count: usize = 0;
+
     for _iteration in 0..MAX_TOOL_ITERATIONS {
         observer.record_event(&ObserverEvent::LlmRequest {
             provider: provider_name.to_string(),
@@ -581,7 +585,39 @@ pub(crate) async fn run_tool_call_loop(
         if tool_calls.is_empty() {
             // No tool calls — this is the final response
             history.push(ChatMessage::assistant(response_text.clone()));
-            return Ok(display_text);
+            let mut final_text = display_text;
+            for media in &pending_media {
+                let serialized = serde_json::to_string(media).unwrap_or_else(|_| "{}".to_string());
+                final_text.push_str("\n\n<media_result>");
+                final_text.push_str(&serialized);
+                final_text.push_str("</media_result>");
+            }
+            return Ok(final_text);
+        }
+
+        let call_signature = serde_json::to_string(
+            &tool_calls
+                .iter()
+                .map(|call| {
+                    serde_json::json!({
+                        "name": call.name.clone(),
+                        "arguments": call.arguments.clone(),
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or_else(|_| String::new());
+        if last_signature.as_deref() == Some(call_signature.as_str()) {
+            repeated_signature_count += 1;
+        } else {
+            repeated_signature_count = 0;
+        }
+        last_signature = Some(call_signature);
+        if repeated_signature_count >= 2 {
+            return Ok(
+                "I stopped because the same tool call kept repeating and would exceed iteration limits. Please rephrase the request or adjust permissions/capabilities."
+                    .to_string(),
+            );
         }
 
         // Print any text the LLM produced alongside tool calls (unless silent)
@@ -606,6 +642,16 @@ pub(crate) async fn run_tool_call_loop(
                             success: r.success,
                         });
                         if r.success {
+                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&r.output)
+                            {
+                                if let Some(media) = parsed.get("media") {
+                                    if media.get("type").and_then(serde_json::Value::as_str)
+                                        == Some("photo")
+                                    {
+                                        pending_media.push(media.clone());
+                                    }
+                                }
+                            }
                             r.output
                         } else {
                             format!("Error: {}", r.error.unwrap_or_else(|| r.output))

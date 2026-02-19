@@ -495,6 +495,15 @@ impl Channel for TelegramChannel {
         Ok(())
     }
 
+    async fn send_photo(
+        &self,
+        file_path: &str,
+        caption: Option<&str>,
+        recipient: &str,
+    ) -> anyhow::Result<()> {
+        TelegramChannel::send_photo(self, recipient, Path::new(file_path), caption).await
+    }
+
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         let mut offset: i64 = 0;
 

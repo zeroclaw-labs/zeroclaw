@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { View, ScrollView, TextInput, Pressable, Linking } from "react-native";
+import { View, ScrollView, TextInput, Pressable, Linking, KeyboardAvoidingView, Keyboard, Platform } from "react-native";
 import Animated, { FadeIn, SlideInLeft, SlideInRight } from "react-native-reanimated";
 import { useFocusEffect } from "@react-navigation/native";
 import Markdown from "react-native-markdown-display";
@@ -12,7 +12,7 @@ import { VoiceRecordButton } from "../../../ui/voice/VoiceRecordButton";
 import { TranscriptOverlay } from "../../../ui/voice/TranscriptOverlay";
 import { useVoiceRecording } from "../../hooks/useVoiceRecording";
 import { useToast } from "../../state/toast";
-import { appendChat, loadChat, type ChatMessage } from "../../state/chat";
+import { appendChat, loadChat, sanitizeAssistantArtifacts, type ChatMessage } from "../../state/chat";
 import { addActivity } from "../../state/activity";
 import { loadAgentConfig } from "../../state/mobileclaw";
 import { runAgentTurn } from "../../runtime/session";
@@ -29,6 +29,7 @@ export function ChatScreen() {
   const [thinkingDots, setThinkingDots] = useState(".");
   const [loadedIds, setLoadedIds] = useState<Set<string>>(new Set());
   const [deepgramApiKey, setDeepgramApiKey] = useState("");
+  const [keyboardVisible, setKeyboardVisible] = useState(false);
   const voice = useVoiceRecording(deepgramApiKey);
   const scrollRef = useRef<ScrollView | null>(null);
   const runNonceRef = useRef(0);
@@ -73,6 +74,15 @@ export function ChatScreen() {
     return () => clearInterval(id);
   }, [busy]);
 
+  useEffect(() => {
+    const showSub = Keyboard.addListener("keyboardDidShow", () => setKeyboardVisible(true));
+    const hideSub = Keyboard.addListener("keyboardDidHide", () => setKeyboardVisible(false));
+    return () => {
+      showSub.remove();
+      hideSub.remove();
+    };
+  }, []);
+
   const markdownStyles = useMemo(
     () => ({
       body: { color: theme.colors.base.text, fontFamily: theme.typography.body, fontSize: 15, lineHeight: 22 },
@@ -96,7 +106,7 @@ export function ChatScreen() {
         backgroundColor: theme.colors.surface.panel,
       },
       strong: { fontFamily: theme.typography.bodyMedium },
-      em: { fontStyle: "italic" },
+      em: { fontStyle: "italic" as const },
       code_inline: {
         fontFamily: theme.typography.mono,
         backgroundColor: theme.colors.surface.panel,
@@ -170,7 +180,7 @@ export function ChatScreen() {
     const assistantMsg: ChatMessage = {
       id: `a_restart_${Date.now()}`,
       role: "assistant",
-      text: "Agent runtime restarted. Please retry your request.",
+      text: sanitizeAssistantArtifacts("Agent runtime restarted. Please retry your request."),
       ts: Date.now(),
     };
     setMessages((prev) => [...prev, assistantMsg]);
@@ -205,7 +215,7 @@ export function ChatScreen() {
         const assistantMsg: ChatMessage = {
           id: `a_${Date.now()}_${Math.random()}`,
           role: "assistant",
-          text: result.assistantText || "(empty response)",
+          text: sanitizeAssistantArtifacts(result.assistantText || "(empty response)"),
           ts: Date.now(),
         };
         setMessages((prev) => [...prev, assistantMsg]);
@@ -227,7 +237,7 @@ export function ChatScreen() {
         const assistantMsg: ChatMessage = {
           id: `a_err_${Date.now()}_${Math.random()}`,
           role: "assistant",
-          text: `Agent error: ${detail}. You can tap Restart Agent and try again.`,
+          text: sanitizeAssistantArtifacts(`Agent error: ${detail}. You can tap Restart Agent and try again.`),
           ts: Date.now(),
         };
         setMessages((prev) => [...prev, assistantMsg]);
@@ -247,7 +257,12 @@ export function ChatScreen() {
 
   return (
     <Screen>
-      <View style={{ flex: 1, paddingHorizontal: theme.spacing.lg, paddingTop: theme.spacing.xl, paddingBottom: 92 }}>
+      <KeyboardAvoidingView
+        style={{ flex: 1 }}
+        behavior={Platform.OS === "ios" ? "padding" : "height"}
+        keyboardVerticalOffset={Platform.OS === "ios" ? 14 : 0}
+      >
+      <View style={{ flex: 1, paddingHorizontal: theme.spacing.lg, paddingTop: theme.spacing.xl, paddingBottom: keyboardVisible ? 12 : 92 }}>
         <Text testID="screen-chat" variant="display">Chat</Text>
         <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginTop: theme.spacing.xs }}>
           <Text variant="muted">MobileClaw agent chat with voice mode.</Text>
@@ -275,6 +290,7 @@ export function ChatScreen() {
           style={{ flex: 1 }}
           contentContainerStyle={{ paddingBottom: 18, gap: theme.spacing.sm }}
           showsVerticalScrollIndicator={false}
+          keyboardShouldPersistTaps="handled"
           onContentSizeChange={() => scrollRef.current?.scrollToEnd({ animated: true })}
         >
           {messages.map((m) => {
@@ -360,6 +376,7 @@ export function ChatScreen() {
           />
         </View>
       </View>
+      </KeyboardAvoidingView>
     </Screen>
   );
 }

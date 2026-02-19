@@ -28,7 +28,9 @@ const optionalEnv = (key: string) => {
 
 const normalizeDevHost = (url: string) => {
   // Android emulator cannot reach host services via localhost.
+  // Real devices must use LAN/tunnel URL and should not be rewritten.
   if (Platform.OS !== "android") return url;
+  if (Constants.isDevice) return url;
   return url
     .replace("http://localhost", "http://10.0.2.2")
     .replace("http://127.0.0.1", "http://10.0.2.2")

@@ -6,7 +6,7 @@ const requireEnv = (key) => {
     EXPO_APP_SLUG: "mobileclaw",
     EXPO_APP_SCHEME: "mobileclaw",
     EXPO_APP_VERSION: "0.1.0",
-    EXPO_PUBLIC_PLATFORM_URL: "http://10.0.2.2:11434",
+    EXPO_PUBLIC_PLATFORM_URL: "http://10.0.2.2:8080",
     EXPO_PUBLIC_LOG_LEVEL: "info",
     EXPO_PUBLIC_THEME_PRIMARY: "#D4F49C",
     EXPO_PUBLIC_THEME_SECONDARY: "#5CC8FF",
