@@ -19,6 +19,13 @@ use std::sync::Arc;
 const COMPOSIO_API_BASE_V2: &str = "https://backend.composio.dev/api/v2";
 const COMPOSIO_API_BASE_V3: &str = "https://backend.composio.dev/api/v3";
 
+fn ensure_https(url: &str) -> anyhow::Result<()> {
+    if !url.starts_with("https://") {
+        anyhow::bail!("Refusing to transmit sensitive data over non-HTTPS URL: URL scheme must be https");
+    }
+    Ok(())
+}
+
 /// A tool that proxies actions to the Composio managed tool platform.
 pub struct ComposioTool {
     api_key: String,
@@ -176,6 +183,8 @@ impl ComposioTool {
             entity_id,
             connected_account_ref,
         );
+
+        ensure_https(&url)?;
 
         let resp = self
             .client()
@@ -508,11 +517,10 @@ impl Tool for ComposioTool {
                     })?;
 
                 let params = args.get("params").cloned().unwrap_or(json!({}));
-                let connected_account_ref =
-                    args.get("connected_account_id").and_then(|v| v.as_str());
+                let acct_ref = args.get("connected_account_id").and_then(|v| v.as_str());
 
                 match self
-                    .execute_action(action_name, params, Some(entity_id), connected_account_ref)
+                    .execute_action(action_name, params, Some(entity_id), acct_ref)
                     .await
                 {
                     Ok(result) => {

@@ -1979,6 +1979,14 @@ pub struct ChannelsConfig {
     pub lark: Option<LarkConfig>,
     pub dingtalk: Option<DingTalkConfig>,
     pub qq: Option<QQConfig>,
+    /// Timeout in seconds for processing a single channel message (LLM + tools).
+    /// Default: 300s for on-device LLMs (Ollama) which are slower than cloud APIs.
+    #[serde(default = "default_channel_message_timeout_secs")]
+    pub message_timeout_secs: u64,
+}
+
+fn default_channel_message_timeout_secs() -> u64 {
+    300
 }
 
 impl Default for ChannelsConfig {
@@ -1999,6 +2007,7 @@ impl Default for ChannelsConfig {
             lark: None,
             dingtalk: None,
             qq: None,
+            message_timeout_secs: default_channel_message_timeout_secs(),
         }
     }
 }
@@ -3242,6 +3251,7 @@ default_temperature = 0.7
                 lark: None,
                 dingtalk: None,
                 qq: None,
+                message_timeout_secs: 300,
             },
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -3746,6 +3756,7 @@ allowed_users = ["@ops:matrix.org"]
             lark: None,
             dingtalk: None,
             qq: None,
+            message_timeout_secs: 300,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -3909,6 +3920,7 @@ channel_id = "C123"
             lark: None,
             dingtalk: None,
             qq: None,
+            message_timeout_secs: 300,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();

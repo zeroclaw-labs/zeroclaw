@@ -232,6 +232,19 @@ receive_mode = "websocket"          # or "webhook"
 port = 8081                          # required for webhook mode
 ```
 
+Interactive onboarding support:
+
+```bash
+zeroclaw onboard --interactive
+```
+
+The wizard now includes a dedicated **Lark/Feishu** step with:
+
+- region selection (`Feishu (CN)` vs `Lark (International)`)
+- credential verification against official Open Platform auth endpoint
+- receive mode selection (`websocket` or `webhook`)
+- optional webhook verification token prompt (recommended for stronger callback authenticity checks)
+
 ### 4.12 DingTalk
 
 ```toml

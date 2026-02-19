@@ -19,7 +19,7 @@ use tokio::process::Command;
 use tracing::debug;
 
 /// Computer-use sidecar settings.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ComputerUseConfig {
     pub endpoint: String,
     pub api_key: Option<String>,
@@ -28,6 +28,20 @@ pub struct ComputerUseConfig {
     pub window_allowlist: Vec<String>,
     pub max_coordinate_x: Option<i64>,
     pub max_coordinate_y: Option<i64>,
+}
+
+impl std::fmt::Debug for ComputerUseConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ComputerUseConfig")
+            .field("endpoint", &self.endpoint)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("timeout_ms", &self.timeout_ms)
+            .field("allow_remote_endpoint", &self.allow_remote_endpoint)
+            .field("window_allowlist", &self.window_allowlist)
+            .field("max_coordinate_x", &self.max_coordinate_x)
+            .field("max_coordinate_y", &self.max_coordinate_y)
+            .finish()
+    }
 }
 
 impl Default for ComputerUseConfig {

@@ -33,7 +33,16 @@
 >
 > コマンド名、設定キー、API パス、Trait 名などの技術識別子は英語のまま維持しています。
 >
-> 最終同期日: **2026-02-18**。
+> 最終同期日: **2026-02-19**。
+
+## 📢 お知らせボード
+
+重要なお知らせ（互換性破壊変更、セキュリティ告知、メンテナンス時間、リリース阻害事項など）をここに掲載します。
+
+| 日付 (UTC) | レベル | お知らせ | 対応 |
+|---|---|---|---|
+| 2026-02-19 | _重要_ | 公式サイトは**まだ公開しておらず**、なりすましの試みを確認しています。ZeroClaw 名義の投資・資金調達などの活動には参加しないでください。 | 情報は本リポジトリを最優先で確認し、[X（@zeroclawlabs）](https://x.com/zeroclawlabs?s=21) と [小紅書アカウント](https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search) で公式更新を確認してください。 |
+| 2026-02-19 | _重要_ | Anthropic は 2026-02-19 に Authentication and Credential Use を更新しました。条文では、OAuth authentication（Free/Pro/Max）は Claude Code と Claude.ai 専用であり、Claude Free/Pro/Max で取得した OAuth トークンを他の製品・ツール・サービス（Agent SDK を含む）で使用することは許可されず、Consumer Terms of Service 違反に該当すると明記されています。 | 損失回避のため、当面は Claude Code OAuth 連携を試さないでください。原文: [Authentication and Credential Use](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use)。 |
 
 ## 概要
 
