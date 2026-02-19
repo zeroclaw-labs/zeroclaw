@@ -109,7 +109,7 @@ impl AndroidDeviceTool {
                     );
                 }
             }
-            "place_call" => {
+            "place_call" | "read_call_log" => {
                 if !self.config.capabilities.calls {
                     anyhow::bail!("android capability calls is disabled");
                 }
@@ -135,7 +135,7 @@ impl AndroidDeviceTool {
                 }
             }
             other => anyhow::bail!(
-                "Unknown android action '{other}'. Supported: launch_app, list_apps, open_url, open_settings, sensor_read, vibrate, get_location, take_photo, record_audio, set_clipboard, read_clipboard, post_notification, get_network, get_battery, read_contacts, read_calendar, send_sms, read_sms, place_call"
+                "Unknown android action '{other}'. Supported: launch_app, list_apps, open_url, open_settings, sensor_read, vibrate, get_location, take_photo, record_audio, set_clipboard, read_clipboard, post_notification, get_network, get_battery, read_contacts, read_calendar, send_sms, read_sms, place_call, read_call_log"
             ),
         }
 
@@ -270,7 +270,7 @@ impl Tool for AndroidDeviceTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "description": "Action to perform: launch_app, list_apps, open_url, open_settings, sensor_read, vibrate, get_location, take_photo, record_audio, set_clipboard, read_clipboard, post_notification, get_network, get_battery, read_contacts, read_calendar, send_sms, read_sms, place_call"
+                    "description": "Action to perform: launch_app, list_apps, open_url, open_settings, sensor_read, vibrate, get_location, take_photo, record_audio, set_clipboard, read_clipboard, post_notification, get_network, get_battery, read_contacts, read_calendar, send_sms, read_sms, place_call, read_call_log"
                 },
                 "package": {
                     "type": "string",
@@ -307,7 +307,7 @@ impl Tool for AndroidDeviceTool {
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Optional read_sms result limit",
+                    "description": "Optional read_sms/read_call_log result limit",
                     "default": 10
                 },
                 "approved": {
@@ -517,6 +517,14 @@ impl Tool for AndroidDeviceTool {
                     .and_then(serde_json::Value::as_u64)
                     .map_or(10, |v| v.clamp(1, 100));
                 self.execute_bridge_call("read_sms", json!({ "limit": limit }))
+                    .await
+            }
+            "read_call_log" => {
+                let limit = args
+                    .get("limit")
+                    .and_then(serde_json::Value::as_u64)
+                    .map_or(10, |v| v.clamp(1, 100));
+                self.execute_bridge_call("read_call_log", json!({ "limit": limit }))
                     .await
             }
             "place_call" => {
