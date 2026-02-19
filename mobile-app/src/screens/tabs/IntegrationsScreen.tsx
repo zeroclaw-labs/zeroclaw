@@ -90,6 +90,8 @@ function SecretField(props: { label: string; value: string; onChangeText: (value
 export function IntegrationsScreen() {
   const [form, setForm] = useState<IntegrationsConfig>(DEFAULT_INTEGRATIONS);
   const [saveStatus, setSaveStatus] = useState("Loading...");
+  const [telegramLookupStatus, setTelegramLookupStatus] = useState("");
+  const [telegramLookupBusy, setTelegramLookupBusy] = useState(false);
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const hydratedRef = useRef(false);
 
@@ -105,35 +107,90 @@ export function IntegrationsScreen() {
 
   const guides: Record<string, string[]> = {
     telegram: [
-      "Create bot in Telegram via @BotFather and copy bot token.",
-      "Start a chat with the bot and send /start.",
-      "Read chat id from updates and paste it in Chat ID field.",
-      "MobileClaw orchestrator auto-applies runtime config after save.",
+      "Create a bot via @BotFather, then paste your bot token below.",
+      "Open Telegram chat with your bot and send any message (for example: /start).",
+      "Tap Detect chat from Telegram updates to auto-fill Chat ID.",
+      "Keep Telegram toggle ON. MobileClaw saves and applies runtime config automatically.",
     ],
     discord: [
-      "Create Discord application and bot in Developer Portal.",
-      "Enable message content intent and invite bot to your server.",
-      "Paste bot token and enable integration toggle.",
-      "Restrict allowed users/channels in server policy.",
+      "Create a Discord app and bot in the Developer Portal.",
+      "Enable Message Content intent and invite the bot to your server.",
+      "Paste Bot token here and keep Discord toggle ON.",
+      "Send a test message to verify the integration is working.",
     ],
     slack: [
-      "Create Slack app and add bot token scopes.",
-      "Install app to workspace and copy Bot User OAuth token.",
-      "Paste token and enable Slack integration toggle.",
-      "Invite bot to target channels and test a message.",
+      "Create a Slack app and add Bot token scopes.",
+      "Install the app to workspace and copy Bot User OAuth token.",
+      "Paste token here and keep Slack toggle ON.",
+      "Invite the bot to a channel and send a quick test message.",
     ],
     whatsapp: [
-      "Create Meta app and WhatsApp Business integration.",
+      "Create a Meta app with WhatsApp Business integration.",
       "Set webhook endpoint to your ZeroClaw gateway URL.",
-      "Add verify token/secret and paste access token in app.",
-      "Confirm inbound webhook delivery from Meta dashboard.",
+      "Paste access token here and keep WhatsApp toggle ON.",
+      "Use Meta dashboard webhook test to confirm delivery.",
     ],
     composio: [
-      "Create account at app.composio.dev and generate API key.",
-      "Paste key and enable Composio integration toggle.",
+      "Create an account at app.composio.dev and generate API key.",
+      "Paste key here and keep Composio toggle ON.",
       "Connect target SaaS tools in Composio dashboard.",
-      "MobileClaw orchestrator auto-reloads runtime tools.",
+      "MobileClaw auto-saves and reloads runtime tool configuration.",
     ],
+  };
+
+  const detectTelegramChatId = async () => {
+    const token = form.telegramBotToken.trim();
+    if (!token) {
+      setTelegramLookupStatus("Paste Bot token first.");
+      return;
+    }
+
+    setTelegramLookupBusy(true);
+    setTelegramLookupStatus("Checking latest Telegram updates...");
+
+    try {
+      const response = await fetch(`https://api.telegram.org/bot${token}/getUpdates`);
+      const payload = (await response.json()) as {
+        ok?: boolean;
+        description?: string;
+        result?: Array<{
+          message?: { chat?: { id?: number | string } };
+          edited_message?: { chat?: { id?: number | string } };
+          channel_post?: { chat?: { id?: number | string } };
+        }>;
+      };
+
+      if (!response.ok || !payload.ok) {
+        const detail = payload.description ? `: ${payload.description}` : "";
+        setTelegramLookupStatus(`Telegram API request failed${detail}`);
+        return;
+      }
+
+      const updates = Array.isArray(payload.result) ? payload.result : [];
+      const match = [...updates]
+        .reverse()
+        .map((update) => update.message?.chat?.id ?? update.edited_message?.chat?.id ?? update.channel_post?.chat?.id)
+        .find((chatId) => chatId !== undefined && chatId !== null);
+
+      if (match === undefined) {
+        setTelegramLookupStatus("No chat found yet. Send any message to your bot and try again.");
+        return;
+      }
+
+      const detectedChatId = String(match);
+      setForm((prev) => ({ ...prev, telegramChatId: detectedChatId }));
+      setTelegramLookupStatus(`Detected chat ID: ${detectedChatId}`);
+      await addActivity({
+        kind: "action",
+        source: "integrations",
+        title: "Telegram chat ID detected",
+        detail: `chat_id=${detectedChatId}`,
+      });
+    } catch (error) {
+      setTelegramLookupStatus(error instanceof Error ? `Failed to detect chat ID: ${error.message}` : "Failed to detect chat ID.");
+    } finally {
+      setTelegramLookupBusy(false);
+    }
   };
 
   useEffect(() => {
@@ -192,7 +249,27 @@ export function IntegrationsScreen() {
           instructions={guides.telegram}
         >
           <SecretField label="Bot token" value={form.telegramBotToken} onChangeText={(value) => setForm((prev) => ({ ...prev, telegramBotToken: value }))} />
-          <SecretField label="Chat ID" value={form.telegramChatId} onChangeText={(value) => setForm((prev) => ({ ...prev, telegramChatId: value }))} />
+          <Pressable
+            onPress={() => {
+              void detectTelegramChatId();
+            }}
+            disabled={telegramLookupBusy}
+            style={{
+              paddingVertical: 10,
+              borderRadius: theme.radii.lg,
+              alignItems: "center",
+              borderWidth: 1,
+              borderColor: theme.colors.stroke.subtle,
+              backgroundColor: telegramLookupBusy ? theme.colors.surface.panel : theme.colors.surface.raised,
+            }}
+          >
+            <Text variant="bodyMedium">{telegramLookupBusy ? "Detecting chat..." : "Detect chat from Telegram updates"}</Text>
+          </Pressable>
+          {telegramLookupStatus ? (
+            <Text variant="muted" style={{ marginTop: 2 }}>
+              {telegramLookupStatus}
+            </Text>
+          ) : null}
         </IntegrationCard>
 
         <IntegrationCard

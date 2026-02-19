@@ -12,7 +12,7 @@ jobs:
     android-release:
         name: Build Android APK and publish release
         runs-on: ubuntu-latest
-        timeout-minutes: 45
+        timeout-minutes: 90
         defaults:
             run:
                 working-directory: mobile-app
@@ -31,6 +31,7 @@ jobs:
               with:
                   distribution: temurin
                   java-version: "17"
+                  cache: gradle
 
             - name: Install mobile app dependencies
               run: npm ci
@@ -39,6 +40,16 @@ jobs:
               env:
                   CI: "1"
               run: npx expo prebuild --platform android
+
+            - name: Tune Android Gradle config for CI
+              run: |
+                  set -euo pipefail
+                  {
+                    echo "org.gradle.parallel=false"
+                    echo "org.gradle.workers.max=2"
+                    echo "org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1536m -Dkotlin.daemon.jvm.options=-Xmx2048m,XX:MaxMetaspaceSize=1024m -Dfile.encoding=UTF-8"
+                    echo "kotlin.daemon.jvmargs=-Xmx2048m -XX:MaxMetaspaceSize=1024m"
+                  } >> android/gradle.properties
 
             - name: Validate signing secrets
               run: |
@@ -55,8 +66,13 @@ jobs:
                   printf '%s' "${{ secrets.ANDROID_RELEASE_KEYSTORE_B64 }}" | base64 --decode > android/app/release.keystore
 
             - name: Build release APK
+              env:
+                  JAVA_TOOL_OPTIONS: -XX:MaxMetaspaceSize=1536m
+                  GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1536m -Dkotlin.daemon.jvm.options=-Xmx2048m,XX:MaxMetaspaceSize=1024m -Dfile.encoding=UTF-8"
               run: |
-                  ./gradlew :app:assembleRelease --no-daemon \
+                  ./gradlew :app:assembleRelease --no-daemon --max-workers=2 -Dkotlin.compiler.execution.strategy=in-process \
+                    -PnewArchEnabled=false \
+                    -PreactNativeArchitectures=arm64-v8a \
                     -Pandroid.injected.signing.store.file=app/release.keystore \
                     -Pandroid.injected.signing.store.password="${{ secrets.ANDROID_RELEASE_STORE_PASSWORD }}" \
                     -Pandroid.injected.signing.key.alias="${{ secrets.ANDROID_RELEASE_KEY_ALIAS }}" \
