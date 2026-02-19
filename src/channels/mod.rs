@@ -1252,6 +1252,7 @@ pub fn handle_command(command: crate::ChannelCommands, config: &Config) -> Resul
                 ("Telegram", config.channels_config.telegram.is_some()),
                 ("Discord", config.channels_config.discord.is_some()),
                 ("Slack", config.channels_config.slack.is_some()),
+                ("Mattermost", config.channels_config.mattermost.is_some()),
                 ("Webhook", config.channels_config.webhook.is_some()),
                 ("iMessage", config.channels_config.imessage.is_some()),
                 ("Matrix", config.channels_config.matrix.is_some()),

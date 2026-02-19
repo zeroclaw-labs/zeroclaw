@@ -58,6 +58,40 @@ const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_TTL_SECS: u64 = 12 * 60 * 60;
 const CUSTOM_MODEL_SENTINEL: &str = "__custom_model__";
 
+fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
+    let ChannelsConfig {
+        cli: _,     // `cli` is always available and does not require channel server startup
+        webhook: _, // webhook traffic is handled by gateway, not `zeroclaw channel start`
+        telegram,
+        discord,
+        slack,
+        mattermost,
+        imessage,
+        matrix,
+        signal,
+        whatsapp,
+        email,
+        irc,
+        lark,
+        dingtalk,
+        qq,
+    } = channels;
+
+    telegram.is_some()
+        || discord.is_some()
+        || slack.is_some()
+        || mattermost.is_some()
+        || imessage.is_some()
+        || matrix.is_some()
+        || signal.is_some()
+        || whatsapp.is_some()
+        || email.is_some()
+        || irc.is_some()
+        || lark.is_some()
+        || dingtalk.is_some()
+        || qq.is_some()
+}
+
 // ── Main wizard entry point ──────────────────────────────────────
 
 pub fn run_wizard() -> Result<Config> {
@@ -163,15 +197,7 @@ pub fn run_wizard() -> Result<Config> {
     print_summary(&config);
 
     // ── Offer to launch channels immediately ─────────────────────
-    let has_channels = config.channels_config.telegram.is_some()
-        || config.channels_config.discord.is_some()
-        || config.channels_config.slack.is_some()
-        || config.channels_config.imessage.is_some()
-        || config.channels_config.matrix.is_some()
-        || config.channels_config.email.is_some()
-        || config.channels_config.dingtalk.is_some()
-        || config.channels_config.qq.is_some()
-        || config.channels_config.lark.is_some();
+    let has_channels = has_launchable_channels(&config.channels_config);
 
     if has_channels && config.api_key.is_some() {
         let launch: bool = Confirm::new()
@@ -223,15 +249,7 @@ pub fn run_channels_repair_wizard() -> Result<Config> {
         style(config.config_path.display()).green()
     );
 
-    let has_channels = config.channels_config.telegram.is_some()
-        || config.channels_config.discord.is_some()
-        || config.channels_config.slack.is_some()
-        || config.channels_config.imessage.is_some()
-        || config.channels_config.matrix.is_some()
-        || config.channels_config.email.is_some()
-        || config.channels_config.dingtalk.is_some()
-        || config.channels_config.qq.is_some()
-        || config.channels_config.lark.is_some();
+    let has_channels = has_launchable_channels(&config.channels_config);
 
     if has_channels && config.api_key.is_some() {
         let launch: bool = Confirm::new()
@@ -4223,15 +4241,7 @@ fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> 
 
 #[allow(clippy::too_many_lines)]
 fn print_summary(config: &Config) {
-    let has_channels = config.channels_config.telegram.is_some()
-        || config.channels_config.discord.is_some()
-        || config.channels_config.slack.is_some()
-        || config.channels_config.imessage.is_some()
-        || config.channels_config.matrix.is_some()
-        || config.channels_config.email.is_some()
-        || config.channels_config.dingtalk.is_some()
-        || config.channels_config.qq.is_some()
-        || config.channels_config.lark.is_some();
+    let has_channels = has_launchable_channels(&config.channels_config);
 
     println!();
     println!(
@@ -5441,5 +5451,29 @@ mod tests {
         assert_eq!(config.archive_after_days, 0);
         assert_eq!(config.purge_after_days, 0);
         assert_eq!(config.embedding_cache_size, 0);
+    }
+
+    #[test]
+    fn launchable_channels_include_mattermost_and_qq() {
+        let mut channels = ChannelsConfig::default();
+        assert!(!has_launchable_channels(&channels));
+
+        channels.mattermost = Some(crate::config::schema::MattermostConfig {
+            url: "https://mattermost.example.com".into(),
+            bot_token: "token".into(),
+            channel_id: Some("channel".into()),
+            allowed_users: vec!["*".into()],
+            thread_replies: Some(true),
+            mention_only: Some(false),
+        });
+        assert!(has_launchable_channels(&channels));
+
+        channels.mattermost = None;
+        channels.qq = Some(crate::config::schema::QQConfig {
+            app_id: "app-id".into(),
+            app_secret: "app-secret".into(),
+            allowed_users: vec!["*".into()],
+        });
+        assert!(has_launchable_channels(&channels));
     }
 }

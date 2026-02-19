@@ -333,4 +333,29 @@ mod tests {
         });
         assert!(has_supervised_channels(&config));
     }
+
+    #[test]
+    fn detects_mattermost_as_supervised_channel() {
+        let mut config = Config::default();
+        config.channels_config.mattermost = Some(crate::config::schema::MattermostConfig {
+            url: "https://mattermost.example.com".into(),
+            bot_token: "token".into(),
+            channel_id: Some("channel-id".into()),
+            allowed_users: vec!["*".into()],
+            thread_replies: Some(true),
+            mention_only: Some(false),
+        });
+        assert!(has_supervised_channels(&config));
+    }
+
+    #[test]
+    fn detects_qq_as_supervised_channel() {
+        let mut config = Config::default();
+        config.channels_config.qq = Some(crate::config::schema::QQConfig {
+            app_id: "app-id".into(),
+            app_secret: "app-secret".into(),
+            allowed_users: vec!["*".into()],
+        });
+        assert!(has_supervised_channels(&config));
+    }
 }
