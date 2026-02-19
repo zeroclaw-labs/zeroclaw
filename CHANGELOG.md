@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `enc:` prefix for encrypted secrets — Use `enc2:` (ChaCha20-Poly1305) instead.
   Legacy values are still decrypted for backward compatibility but should be migrated.
 
+### Fixed
+- **Onboarding channel menu dispatch** now uses an enum-backed selector instead of hard-coded
+  numeric match arms, preventing duplicated pattern arms and related `unreachable pattern`
+  compiler warnings in `src/onboard/wizard.rs`.
+- **OpenAI native tool spec parsing** now uses owned serializable/deserializable structs,
+  fixing a compile-time type mismatch when validating tool schemas before API calls.
+
 ## [0.1.0] - 2026-02-13
 
 ### Added
