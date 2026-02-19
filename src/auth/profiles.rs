@@ -3,11 +3,12 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::thread;
 use std::time::Duration;
+use tokio::fs::{self, OpenOptions};
+use tokio::io::AsyncWriteExt;
+use tokio::time::sleep;
 
 const CURRENT_SCHEMA_VERSION: u32 = 1;
 const PROFILES_FILENAME: &str = "auth-profiles.json";
@@ -147,14 +148,14 @@ impl AuthProfilesStore {
         &self.path
     }
 
-    pub fn load(&self) -> Result<AuthProfilesData> {
-        let _lock = self.acquire_lock()?;
-        self.load_locked()
+    pub async fn load(&self) -> Result<AuthProfilesData> {
+        let _lock = self.acquire_lock().await?;
+        self.load_locked().await
     }
 
-    pub fn upsert_profile(&self, mut profile: AuthProfile, set_active: bool) -> Result<()> {
-        let _lock = self.acquire_lock()?;
-        let mut data = self.load_locked()?;
+    pub async fn upsert_profile(&self, mut profile: AuthProfile, set_active: bool) -> Result<()> {
+        let _lock = self.acquire_lock().await?;
+        let mut data = self.load_locked().await?;
 
         profile.updated_at = Utc::now();
         if let Some(existing) = data.profiles.get(&profile.id) {
@@ -169,12 +170,12 @@ impl AuthProfilesStore {
         data.profiles.insert(profile.id.clone(), profile);
         data.updated_at = Utc::now();
 
-        self.save_locked(&data)
+        self.save_locked(&data).await
     }
 
-    pub fn remove_profile(&self, profile_id: &str) -> Result<bool> {
-        let _lock = self.acquire_lock()?;
-        let mut data = self.load_locked()?;
+    pub async fn remove_profile(&self, profile_id: &str) -> Result<bool> {
+        let _lock = self.acquire_lock().await?;
+        let mut data = self.load_locked().await?;
 
         let removed = data.profiles.remove(profile_id).is_some();
         if !removed {
@@ -184,13 +185,13 @@ impl AuthProfilesStore {
         data.active_profiles
             .retain(|_, active| active != profile_id);
         data.updated_at = Utc::now();
-        self.save_locked(&data)?;
+        self.save_locked(&data).await?;
         Ok(true)
     }
 
-    pub fn set_active_profile(&self, provider: &str, profile_id: &str) -> Result<()> {
-        let _lock = self.acquire_lock()?;
-        let mut data = self.load_locked()?;
+    pub async fn set_active_profile(&self, provider: &str, profile_id: &str) -> Result<()> {
+        let _lock = self.acquire_lock().await?;
+        let mut data = self.load_locked().await?;
 
         if !data.profiles.contains_key(profile_id) {
             anyhow::bail!("Auth profile not found: {profile_id}");
@@ -199,23 +200,23 @@ impl AuthProfilesStore {
         data.active_profiles
             .insert(provider.to_string(), profile_id.to_string());
         data.updated_at = Utc::now();
-        self.save_locked(&data)
+        self.save_locked(&data).await
     }
 
-    pub fn clear_active_profile(&self, provider: &str) -> Result<()> {
-        let _lock = self.acquire_lock()?;
-        let mut data = self.load_locked()?;
+    pub async fn clear_active_profile(&self, provider: &str) -> Result<()> {
+        let _lock = self.acquire_lock().await?;
+        let mut data = self.load_locked().await?;
         data.active_profiles.remove(provider);
         data.updated_at = Utc::now();
-        self.save_locked(&data)
+        self.save_locked(&data).await
     }
 
-    pub fn update_profile<F>(&self, profile_id: &str, mut updater: F) -> Result<AuthProfile>
+    pub async fn update_profile<F>(&self, profile_id: &str, mut updater: F) -> Result<AuthProfile>
     where
         F: FnMut(&mut AuthProfile) -> Result<()>,
     {
-        let _lock = self.acquire_lock()?;
-        let mut data = self.load_locked()?;
+        let _lock = self.acquire_lock().await?;
+        let mut data = self.load_locked().await?;
 
         let profile = data
             .profiles
@@ -226,12 +227,12 @@ impl AuthProfilesStore {
         profile.updated_at = Utc::now();
         let updated_profile = profile.clone();
         data.updated_at = Utc::now();
-        self.save_locked(&data)?;
+        self.save_locked(&data).await?;
         Ok(updated_profile)
     }
 
-    fn load_locked(&self) -> Result<AuthProfilesData> {
-        let mut persisted = self.read_persisted_locked()?;
+    async fn load_locked(&self) -> Result<AuthProfilesData> {
+        let mut persisted = self.read_persisted_locked().await?;
         let mut migrated = false;
 
         let mut profiles = BTreeMap::new();
@@ -297,7 +298,7 @@ impl AuthProfilesStore {
         }
 
         if migrated {
-            self.write_persisted_locked(&persisted)?;
+            self.write_persisted_locked(&persisted).await?;
         }
 
         Ok(AuthProfilesData {
@@ -308,7 +309,7 @@ impl AuthProfilesStore {
         })
     }
 
-    fn save_locked(&self, data: &AuthProfilesData) -> Result<()> {
+    async fn save_locked(&self, data: &AuthProfilesData) -> Result<()> {
         let mut persisted = PersistedAuthProfiles {
             schema_version: CURRENT_SCHEMA_VERSION,
             updated_at: data.updated_at.to_rfc3339(),
@@ -354,15 +355,15 @@ impl AuthProfilesStore {
             );
         }
 
-        self.write_persisted_locked(&persisted)
+        self.write_persisted_locked(&persisted).await
     }
 
-    fn read_persisted_locked(&self) -> Result<PersistedAuthProfiles> {
+    async fn read_persisted_locked(&self) -> Result<PersistedAuthProfiles> {
         if !self.path.exists() {
             return Ok(PersistedAuthProfiles::default());
         }
 
-        let bytes = fs::read(&self.path).with_context(|| {
+        let bytes = fs::read(&self.path).await.with_context(|| {
             format!(
                 "Failed to read auth profile store at {}",
                 self.path.display()
@@ -396,9 +397,9 @@ impl AuthProfilesStore {
         Ok(persisted)
     }
 
-    fn write_persisted_locked(&self, persisted: &PersistedAuthProfiles) -> Result<()> {
+    async fn write_persisted_locked(&self, persisted: &PersistedAuthProfiles) -> Result<()> {
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
+            fs::create_dir_all(parent).await.with_context(|| {
                 format!(
                     "Failed to create auth profile directory at {}",
                     parent.display()
@@ -416,14 +417,14 @@ impl AuthProfilesStore {
         );
         let tmp_path = self.path.with_file_name(tmp_name);
 
-        fs::write(&tmp_path, &json).with_context(|| {
+        fs::write(&tmp_path, &json).await.with_context(|| {
             format!(
                 "Failed to write temporary auth profile file at {}",
                 tmp_path.display()
             )
         })?;
 
-        fs::rename(&tmp_path, &self.path).with_context(|| {
+        fs::rename(&tmp_path, &self.path).await.with_context(|| {
             format!(
                 "Failed to replace auth profile store at {}",
                 self.path.display()
@@ -450,9 +451,9 @@ impl AuthProfilesStore {
         }
     }
 
-    fn acquire_lock(&self) -> Result<AuthProfileLockGuard> {
+    async fn acquire_lock(&self) -> Result<AuthProfileLockGuard> {
         if let Some(parent) = self.lock_path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
+            fs::create_dir_all(parent).await.with_context(|| {
                 format!("Failed to create lock directory at {}", parent.display())
             })?;
         }
@@ -463,9 +464,25 @@ impl AuthProfilesStore {
                 .create_new(true)
                 .write(true)
                 .open(&self.lock_path)
+                .await
             {
                 Ok(mut file) => {
-                    let _ = writeln!(file, "pid={}", std::process::id());
+                    let mut buffer = Vec::new();
+                    writeln!(&mut buffer, "pid={}", std::process::id())?;
+                    if let Err(e) = file.write_all(&buffer).await {
+                        fs::remove_file(&self.lock_path)
+                            .await
+                            .inspect(|e| {
+                                tracing::error!("Failed to remove auth profile lock file: {e:?}");
+                            })
+                            .ok();
+                        return Err(e).with_context(|| {
+                            format!(
+                                "Failed to write auth profile lock at {}",
+                                self.lock_path.display()
+                            )
+                        });
+                    }
                     return Ok(AuthProfileLockGuard {
                         lock_path: self.lock_path.clone(),
                     });
@@ -477,7 +494,7 @@ impl AuthProfilesStore {
                             self.lock_path.display()
                         );
                     }
-                    thread::sleep(Duration::from_millis(LOCK_WAIT_MS));
+                    sleep(Duration::from_millis(LOCK_WAIT_MS)).await;
                     waited = waited.saturating_add(LOCK_WAIT_MS);
                 }
                 Err(e) => {
@@ -499,7 +516,7 @@ struct AuthProfileLockGuard {
 
 impl Drop for AuthProfileLockGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.lock_path);
+        let _ = std::fs::remove_file(&self.lock_path);
     }
 }
 
@@ -645,9 +662,9 @@ mod tests {
         );
         profile.account_id = Some("acct_123".into());
 
-        store.upsert_profile(profile.clone(), true).unwrap();
+        store.upsert_profile(profile.clone(), true).await.unwrap();
 
-        let data = store.load().unwrap();
+        let data = store.load().await.unwrap();
         let loaded = data.profiles.get(&profile.id).unwrap();
 
         assert_eq!(loaded.provider, "openai-codex");
@@ -673,7 +690,7 @@ mod tests {
         let store = AuthProfilesStore::new(tmp.path(), false);
 
         let profile = AuthProfile::new_token("anthropic", "default", "token-abc".into());
-        store.upsert_profile(profile, true).unwrap();
+        store.upsert_profile(profile, true).await.unwrap();
 
         let path = store.path().to_path_buf();
         assert!(path.exists());

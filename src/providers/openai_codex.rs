@@ -382,7 +382,8 @@ impl OpenAiCodexProvider {
     ) -> anyhow::Result<String> {
         let profile = self
             .auth
-            .get_profile("openai-codex", self.auth_profile_override.as_deref())?;
+            .get_profile("openai-codex", self.auth_profile_override.as_deref())
+            .await?;
         let access_token = self
             .auth
             .get_valid_openai_access_token(self.auth_profile_override.as_deref())

@@ -982,7 +982,9 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                         let account_id =
                             extract_openai_account_id_for_profile(&token_set.access_token);
 
-                        auth_service.store_openai_tokens(&profile, token_set, account_id, true)?;
+                        auth_service
+                            .store_openai_tokens(&profile, token_set, account_id, true)
+                            .await?;
                         clear_pending_openai_login(config);
 
                         println!("Saved profile {profile}");
@@ -1032,7 +1034,9 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 auth::openai_oauth::exchange_code_for_tokens(&client, &code, &pkce).await?;
             let account_id = extract_openai_account_id_for_profile(&token_set.access_token);
 
-            auth_service.store_openai_tokens(&profile, token_set, account_id, true)?;
+            auth_service
+                .store_openai_tokens(&profile, token_set, account_id, true)
+                .await?;
             clear_pending_openai_login(config);
 
             println!("Saved profile {profile}");
@@ -1085,7 +1089,9 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 auth::openai_oauth::exchange_code_for_tokens(&client, &code, &pkce).await?;
             let account_id = extract_openai_account_id_for_profile(&token_set.access_token);
 
-            auth_service.store_openai_tokens(&profile, token_set, account_id, true)?;
+            auth_service
+                .store_openai_tokens(&profile, token_set, account_id, true)
+                .await?;
             clear_pending_openai_login(config);
 
             println!("Saved profile {profile}");
@@ -1115,7 +1121,9 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 kind.as_metadata_value().to_string(),
             );
 
-            auth_service.store_provider_token(&provider, &profile, &token, metadata, true)?;
+            auth_service
+                .store_provider_token(&provider, &profile, &token, metadata, true)
+                .await?;
             println!("Saved profile {profile}");
             println!("Active profile for {provider}: {profile}");
             Ok(())
@@ -1135,7 +1143,9 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 kind.as_metadata_value().to_string(),
             );
 
-            auth_service.store_provider_token(&provider, &profile, &token, metadata, true)?;
+            auth_service
+                .store_provider_token(&provider, &profile, &token, metadata, true)
+                .await?;
             println!("Saved profile {profile}");
             println!("Active profile for {provider}: {profile}");
             Ok(())
@@ -1165,7 +1175,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 
         AuthCommands::Logout { provider, profile } => {
             let provider = auth::normalize_provider(&provider)?;
-            let removed = auth_service.remove_profile(&provider, &profile)?;
+            let removed = auth_service.remove_profile(&provider, &profile).await?;
             if removed {
                 println!("Removed auth profile {provider}:{profile}");
             } else {
@@ -1176,13 +1186,13 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 
         AuthCommands::Use { provider, profile } => {
             let provider = auth::normalize_provider(&provider)?;
-            auth_service.set_active_profile(&provider, &profile)?;
+            auth_service.set_active_profile(&provider, &profile).await?;
             println!("Active profile for {provider}: {profile}");
             Ok(())
         }
 
         AuthCommands::List => {
-            let data = auth_service.load_profiles()?;
+            let data = auth_service.load_profiles().await?;
             if data.profiles.is_empty() {
                 println!("No auth profiles configured.");
                 return Ok(());
@@ -1201,7 +1211,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
         }
 
         AuthCommands::Status => {
-            let data = auth_service.load_profiles()?;
+            let data = auth_service.load_profiles().await?;
             if data.profiles.is_empty() {
                 println!("No auth profiles configured.");
                 return Ok(());
