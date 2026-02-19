@@ -166,7 +166,19 @@ func handleZeroClawForward(ws *websocket.Conn, f Frame) {
 
     j, _ := json.Marshal(body)
 
-    resp, err := http.Post(zeroclawURL, "application/json", bytes.NewReader(j))
+    req, err := http.NewRequest("POST", zeroclawURL, bytes.NewReader(j))
+    if err != nil {
+        sendError(ws, f.ID, err.Error())
+        return
+    }
+    req.Header.Set("Content-Type", "application/json")
+
+    token := os.Getenv("ZEROCLAW_BEARER_TOKEN")
+    if token != "" {
+        req.Header.Set("Authorization", "Bearer "+token)
+    }
+
+    resp, err := http.DefaultClient.Do(req)
     if err != nil {
         sendError(ws, f.ID, err.Error())
         return

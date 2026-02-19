@@ -66,6 +66,7 @@ services:
     restart: unless-stopped
     environment:
       - ZEROCLAW_URL=http://zeroclaw:3000/webhook
+      - ZEROCLAW_BEARER_TOKEN
     depends_on:
       - zeroclaw
     labels:
