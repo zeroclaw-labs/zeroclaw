@@ -158,6 +158,12 @@ impl Provider for RouterProvider {
             .unwrap_or(false)
     }
 
+    fn supports_vision(&self) -> bool {
+        self.providers
+            .iter()
+            .any(|(_, provider)| provider.supports_vision())
+    }
+
     async fn warmup(&self) -> anyhow::Result<()> {
         for (name, provider) in &self.providers {
             tracing::info!(provider = name, "Warming up routed provider");

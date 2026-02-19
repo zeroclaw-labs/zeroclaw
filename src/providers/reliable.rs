@@ -511,6 +511,12 @@ impl Provider for ReliableProvider {
             .unwrap_or(false)
     }
 
+    fn supports_vision(&self) -> bool {
+        self.providers
+            .iter()
+            .any(|(_, provider)| provider.supports_vision())
+    }
+
     async fn chat_with_tools(
         &self,
         messages: &[ChatMessage],

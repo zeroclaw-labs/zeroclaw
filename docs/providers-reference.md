@@ -56,6 +56,13 @@ credential is not reused for fallback providers.
 | `lmstudio` | `lm-studio` | Yes | (optional; local by default) |
 | `nvidia` | `nvidia-nim`, `build.nvidia.com` | No | `NVIDIA_API_KEY` |
 
+### Ollama Vision Notes
+
+- Provider ID: `ollama`
+- Vision input is supported through user message image markers: ``[IMAGE:<source>]``.
+- After multimodal normalization, ZeroClaw sends image payloads through Ollama's native `messages[].images` field.
+- If a non-vision provider is selected, ZeroClaw returns a structured capability error instead of silently ignoring images.
+
 ### Bedrock Notes
 
 - Provider ID: `bedrock` (alias: `aws-bedrock`)

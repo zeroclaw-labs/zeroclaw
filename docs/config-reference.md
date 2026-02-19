@@ -62,6 +62,24 @@ Notes:
 - `reasoning_enabled = true` explicitly requests reasoning for supported providers (`think: true` on `ollama`).
 - Unset keeps provider defaults.
 
+## `[multimodal]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `max_images` | `4` | Maximum image markers accepted per request |
+| `max_image_size_mb` | `5` | Per-image size limit before base64 encoding |
+| `allow_remote_fetch` | `false` | Allow fetching `http(s)` image URLs from markers |
+
+Notes:
+
+- Runtime accepts image markers in user messages with syntax: ``[IMAGE:<source>]``.
+- Supported sources:
+  - Local file path (for example ``[IMAGE:/tmp/screenshot.png]``)
+- Data URI (for example ``[IMAGE:data:image/png;base64,...]``)
+- Remote URL only when `allow_remote_fetch = true`
+- Allowed MIME types: `image/png`, `image/jpeg`, `image/webp`, `image/gif`, `image/bmp`.
+- When the active provider does not support vision, requests fail with a structured capability error (`capability=vision`) instead of silently dropping images.
+
 ## `[gateway]`
 
 | Key | Default | Purpose |

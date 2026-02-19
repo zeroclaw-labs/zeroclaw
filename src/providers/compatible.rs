@@ -857,6 +857,7 @@ impl Provider for OpenAiCompatibleProvider {
     fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
         crate::providers::traits::ProviderCapabilities {
             native_tool_calling: true,
+            vision: false,
         }
     }
 
