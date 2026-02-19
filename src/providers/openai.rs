@@ -371,8 +371,10 @@ impl Provider for OpenAiProvider {
             Some(
                 tools
                     .iter()
-                    .filter_map(|t| serde_json::from_value(t.clone()).ok())
-                    .collect(),
+                    .cloned()
+                    .map(serde_json::from_value::<NativeToolSpec>)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| anyhow::anyhow!("Invalid OpenAI tool specification: {e}"))?,
             )
         };
 
@@ -385,7 +387,7 @@ impl Provider for OpenAiProvider {
         };
 
         let response = self
-            .client
+            .http_client()
             .post(format!("{}/chat/completions", self.base_url))
             .header("Authorization", format!("Bearer {credential}"))
             .json(&native_request)
@@ -611,6 +613,32 @@ mod tests {
         let result = p.chat_with_tools(&messages, &tools, "gpt-4o", 0.7).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("API key not set"));
+    }
+
+    #[tokio::test]
+    async fn chat_with_tools_rejects_invalid_tool_shape() {
+        let p = OpenAiProvider::new(Some("openai-test-credential"));
+        let messages = vec![ChatMessage::user("hello".to_string())];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "shell",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string" }
+                    },
+                    "required": ["command"]
+                }
+            }
+        })];
+
+        let result = p.chat_with_tools(&messages, &tools, "gpt-4o", 0.7).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid OpenAI tool specification"));
     }
 
     #[test]
