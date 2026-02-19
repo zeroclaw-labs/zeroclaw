@@ -14,7 +14,8 @@ pub mod traits;
 #[allow(unused_imports)]
 pub use traits::{
     ChatMessage, ChatRequest, ChatResponse, ConversationMessage, Provider, ProviderCapabilityError,
-    ToolCall, ToolResultMessage,
+    StreamChunk, StreamError, StreamOptions, StreamResult, ToolCall, ToolResultMessage,
+    ToolsPayload,
 };
 
 use compatible::{AuthStyle, OpenAiCompatibleProvider};
@@ -2121,6 +2122,7 @@ mod tests {
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
             scheduler_retries: 2,
+            streaming_enabled: false,
         };
 
         let provider = create_resilient_provider(
@@ -2160,6 +2162,7 @@ mod tests {
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
             scheduler_retries: 2,
+            streaming_enabled: false,
         };
 
         // Primary uses a ZAI key; fallbacks (lmstudio, ollama) should NOT
@@ -2182,6 +2185,7 @@ mod tests {
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
             scheduler_retries: 2,
+            streaming_enabled: false,
         };
 
         let provider =
@@ -2208,6 +2212,7 @@ mod tests {
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
             scheduler_retries: 2,
+            streaming_enabled: false,
         };
 
         let provider = create_resilient_provider("zai", Some("zai-test-key"), None, &reliability);

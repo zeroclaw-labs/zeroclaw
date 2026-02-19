@@ -263,7 +263,7 @@ struct ApiChatRequest {
     tool_choice: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct Message {
     role: String,
     content: String,
@@ -1390,6 +1390,173 @@ impl Provider for OpenAiCompatibleProvider {
             stream: Some(options.enabled),
             tools: None,
             tool_choice: None,
+        };
+
+        let url = self.chat_completions_url();
+        let client = self.http_client();
+        let auth_header = self.auth_header.clone();
+
+        // Use a channel to bridge the async HTTP response to the stream
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
+
+        tokio::spawn(async move {
+            // Build request with auth
+            let mut req_builder = client.post(&url).json(&request);
+
+            // Apply auth header
+            req_builder = match &auth_header {
+                AuthStyle::Bearer => {
+                    req_builder.header("Authorization", format!("Bearer {}", credential))
+                }
+                AuthStyle::XApiKey => req_builder.header("x-api-key", &credential),
+                AuthStyle::Custom(header) => req_builder.header(header, &credential),
+            };
+
+            // Set accept header for streaming
+            req_builder = req_builder.header("Accept", "text/event-stream");
+
+            // Send request
+            let response = match req_builder.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Err(StreamError::Http(e))).await;
+                    return;
+                }
+            };
+
+            // Check status
+            if !response.status().is_success() {
+                let status = response.status();
+                let error = match response.text().await {
+                    Ok(e) => e,
+                    Err(_) => format!("HTTP error: {}", status),
+                };
+                let _ = tx
+                    .send(Err(StreamError::Provider(format!("{}: {}", status, error))))
+                    .await;
+                return;
+            }
+
+            // Convert to chunk stream and forward to channel
+            let mut chunk_stream = sse_bytes_to_chunks(response, options.count_tokens);
+            while let Some(chunk) = chunk_stream.next().await {
+                if tx.send(chunk).await.is_err() {
+                    break; // Receiver dropped
+                }
+            }
+        });
+
+        // Convert channel receiver to stream
+        stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|chunk| (chunk, rx))
+        })
+        .boxed()
+    }
+
+    fn stream_chat(
+        &self,
+        request: crate::providers::ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+        options: crate::providers::StreamOptions,
+    ) -> stream::BoxStream<'static, crate::providers::StreamResult<crate::providers::StreamChunk>>
+    {
+        use crate::providers::{StreamChunk, StreamError, StreamResult};
+        use futures_util::{stream, StreamExt};
+
+        let credential = match self.credential.as_ref() {
+            Some(value) => value.clone(),
+            None => {
+                let provider_name = self.name.clone();
+                return stream::once(async move {
+                    Err(StreamError::Provider(format!(
+                        "{} API key not set",
+                        provider_name
+                    )))
+                })
+                .boxed();
+            }
+        };
+
+        // Convert messages to API format
+        let effective_messages = if self.merge_system_into_user {
+            Self::flatten_system_messages(request.messages)
+        } else {
+            request.messages.to_vec()
+        };
+
+        let api_messages: Vec<Message> = effective_messages
+            .iter()
+            .map(|m| Message {
+                role: m.role.clone(),
+                content: m.content.clone(),
+            })
+            .collect();
+
+        // Handle tools - inject instructions if needed for non-native mode
+        let (messages_with_tools, tools_payload) = if let Some(tools) = request.tools {
+            if !tools.is_empty() && !self.supports_native_tools() {
+                // For prompt-guided tool calling, inject instructions
+                let tool_instructions = match self.convert_tools(tools) {
+                    crate::providers::ToolsPayload::PromptGuided { instructions } => instructions,
+                    _ => {
+                        // Cannot use streaming with non-prompt-guided tools
+                        return stream::once(async move {
+                            Err(StreamError::Provider(
+                                "Streaming not supported with native tools payload".to_string(),
+                            ))
+                        })
+                        .boxed();
+                    }
+                };
+                let mut modified_messages = api_messages.clone();
+                if let Some(system_msg) = modified_messages.iter_mut().find(|m| m.role == "system")
+                {
+                    if !system_msg.content.is_empty() {
+                        system_msg.content.push_str("\n\n");
+                    }
+                    system_msg.content.push_str(&tool_instructions);
+                } else {
+                    modified_messages.insert(
+                        0,
+                        Message {
+                            role: "system".to_string(),
+                            content: tool_instructions,
+                        },
+                    );
+                }
+                (modified_messages, None)
+            } else if !tools.is_empty() {
+                // Native tools - convert to JSON
+                let json_tools: Vec<serde_json::Value> = tools
+                    .iter()
+                    .map(|tool| {
+                        serde_json::json!({
+                            "type": "function",
+                            "function": {
+                                "name": tool.name,
+                                "description": tool.description,
+                                "parameters": tool.parameters
+                            }
+                        })
+                    })
+                    .collect();
+                (api_messages, Some(json_tools))
+            } else {
+                (api_messages, None)
+            }
+        } else {
+            (api_messages, None)
+        };
+
+        let tool_choice = tools_payload.as_ref().map(|_| "auto".to_string());
+        let request = ApiChatRequest {
+            model: model.to_string(),
+            messages: messages_with_tools,
+            temperature,
+            stream: Some(options.enabled),
+            tools: tools_payload,
+            tool_choice,
         };
 
         let url = self.chat_completions_url();

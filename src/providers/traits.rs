@@ -428,6 +428,33 @@ pub trait Provider: Send + Sync {
         let chunk = StreamChunk::error(format!("{} does not support streaming", provider_name));
         stream::once(async move { Ok(chunk) }).boxed()
     }
+
+    /// Streaming chat with structured request (supports tools and full message history).
+    /// Returns an async stream of text chunks.
+    /// Default implementation falls back to non-streaming chat and yields single chunk.
+    fn stream_chat(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        // Extract system prompt and last user message for fallback
+        let system = request
+            .messages
+            .iter()
+            .find(|m| m.role == "system")
+            .map(|m| m.content.clone());
+        let last_user = request
+            .messages
+            .iter()
+            .rfind(|m| m.role == "user")
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+
+        // Default: use stream_chat_with_system which falls back to non-streaming
+        self.stream_chat_with_system(system.as_deref(), &last_user, model, temperature, options)
+    }
 }
 
 /// Build tool instructions text for prompt-guided tool calling.

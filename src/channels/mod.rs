@@ -816,6 +816,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             &ctx.multimodal,
             ctx.max_tool_iterations,
             delta_tx,
+            ctx.reliability.streaming_enabled,
         ),
     )
     .await;

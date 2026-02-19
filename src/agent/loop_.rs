@@ -4,13 +4,14 @@ use crate::memory::{self, Memory, MemoryCategory};
 use crate::multimodal;
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::providers::{
-    self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall,
+    self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, StreamOptions, ToolCall,
 };
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
+use futures_util::StreamExt;
 use regex::{Regex, RegexSet};
 use std::fmt::Write;
 use std::io::Write as _;
@@ -582,6 +583,167 @@ fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value, Opt
     calls
 }
 
+/// Attempt to parse incomplete tool calls from a buffer during streaming.
+/// Returns Some((text_before_tool_calls, parsed_calls)) if complete tool calls are found.
+/// Returns None if no complete tool calls detected yet.
+fn try_parse_incomplete_tool_calls(buffer: &str) -> Option<(String, Vec<ParsedToolCall>)> {
+    use regex::Regex;
+    use std::sync::LazyLock;
+
+    // Check if we have a complete <tool_call>...</tool_call> pair
+    static TOOL_CALL_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"<tool[_-]?call>\s*(\{.*?\})\s*</tool[_-]?call>").unwrap());
+
+    // Find all complete tool calls in the buffer
+    let mut calls = Vec::new();
+    let mut last_end = 0;
+
+    for cap in TOOL_CALL_RE.captures_iter(buffer) {
+        if let Some(json_match) = cap.get(1) {
+            let json_str = json_match.as_str();
+            if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(json_str) {
+                let parsed = parse_tool_calls_from_json_value(&json_value);
+                if !parsed.is_empty() {
+                    calls.extend(parsed);
+                    last_end = cap.get(0).unwrap().end();
+                }
+            }
+        }
+    }
+
+    if calls.is_empty() {
+        // Check if we have incomplete tool call start but not complete
+        if buffer.contains("<tool_call>") && !buffer.contains("</tool_call>") {
+            // Incomplete - don't return anything yet
+            return None;
+        }
+        return None;
+    }
+
+    // Extract text before the first tool call
+    let first_tool_start = TOOL_CALL_RE
+        .captures(buffer)
+        .and_then(|cap| cap.get(0))
+        .map(|m| m.start())
+        .unwrap_or(buffer.len());
+
+    let text_before = buffer[..first_tool_start].trim().to_string();
+
+    // Check if there are more tool calls after last_end
+    let remaining = &buffer[last_end..];
+    let text_after = if remaining.contains("<tool_call>") {
+        // More tool calls coming, wait for them
+        return None;
+    } else {
+        remaining.trim().to_string()
+    };
+
+    let full_text = if text_before.is_empty() {
+        text_after
+    } else if text_after.is_empty() {
+        text_before
+    } else {
+        format!("{}\n{}", text_before, text_after)
+    };
+
+    Some((full_text, calls))
+}
+
+/// Try streaming response from provider and accumulate chunks.
+/// Returns Some(result) if streaming succeeded, None if should fallback to non-streaming.
+async fn try_streaming_response(
+    provider: &dyn Provider,
+    request: ChatRequest<'_>,
+    model: &str,
+    temperature: f64,
+    on_delta: Option<&tokio::sync::mpsc::Sender<String>>,
+    use_native_tools: bool,
+) -> Option<
+    Result<
+        (
+            String,              // response_text
+            String,              // parsed_text
+            Vec<ParsedToolCall>, // tool_calls
+            String,              // assistant_history_content
+            Vec<ToolCall>,       // native_tool_calls
+        ),
+        anyhow::Error,
+    >,
+> {
+    // Only try streaming if provider supports it and we have on_delta
+    if !provider.supports_streaming() || on_delta.is_none() {
+        return None;
+    }
+
+    // For now, skip streaming if using native tools (tool calls in streaming are complex)
+    // We can enhance this later to support streaming tool calls
+    if use_native_tools && request.tools.is_some() {
+        // Check if tools are actually provided
+        if let Some(tools) = request.tools {
+            if !tools.is_empty() {
+                return None;
+            }
+        }
+    }
+
+    let options = StreamOptions::new(true);
+    let mut stream = provider.stream_chat(request, model, temperature, options);
+
+    let mut buffer = String::new();
+    let tx = on_delta.unwrap();
+
+    while let Some(chunk_result) = stream.next().await {
+        match chunk_result {
+            Ok(chunk) => {
+                if chunk.is_final {
+                    break;
+                }
+
+                buffer.push_str(&chunk.delta);
+
+                // Try to detect tool calls in the accumulated buffer
+                if let Some((text_part, calls)) = try_parse_incomplete_tool_calls(&buffer) {
+                    // Tool calls detected - stop streaming to user
+                    // Return the complete result
+                    let response_text = buffer.clone();
+                    let assistant_history_content = response_text.clone();
+
+                    return Some(Ok((
+                        response_text,
+                        text_part,
+                        calls,
+                        assistant_history_content,
+                        Vec::new(), // native_tool_calls - empty for streaming path currently
+                    )));
+                }
+
+                // No tool calls yet - stream to user
+                if !chunk.delta.is_empty() {
+                    let _ = tx.send(chunk.delta).await;
+                }
+            }
+            Err(e) => {
+                // Streaming error - fallback to non-streaming
+                tracing::warn!("Streaming error, falling back to non-streaming: {}", e);
+                return None;
+            }
+        }
+    }
+
+    // Stream completed without tool calls
+    // Parse any tool calls from complete buffer
+    let (parsed_text, calls) = parse_tool_calls(&buffer);
+    let assistant_history_content = buffer.clone();
+
+    Some(Ok((
+        buffer,
+        parsed_text,
+        calls,
+        assistant_history_content,
+        Vec::new(),
+    )))
+}
+
 /// Parse tool calls from an LLM response that uses XML-style function calling.
 ///
 /// Expected format (common with system-prompt-guided tool use):
@@ -846,6 +1008,7 @@ pub(crate) async fn agent_turn(
         multimodal_config,
         max_tool_iterations,
         None,
+        false, // streaming disabled by default for agent_turn
     )
     .await
 }
@@ -867,6 +1030,7 @@ pub(crate) async fn run_tool_call_loop(
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
+    streaming_enabled: bool,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -910,19 +1074,29 @@ pub(crate) async fn run_tool_call_loop(
             None
         };
 
+        // Try streaming first if enabled, provider supports it, and we have on_delta
+        let chat_request = ChatRequest {
+            messages: &prepared_messages.messages,
+            tools: request_tools,
+        };
+
+        let streaming_result = if streaming_enabled {
+            try_streaming_response(
+                provider,
+                chat_request,
+                model,
+                temperature,
+                on_delta.as_ref(),
+                use_native_tools,
+            )
+            .await
+        } else {
+            None
+        };
+
         let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
-            match provider
-                .chat(
-                    ChatRequest {
-                        messages: &prepared_messages.messages,
-                        tools: request_tools,
-                    },
-                    model,
-                    temperature,
-                )
-                .await
-            {
-                Ok(resp) => {
+            match streaming_result {
+                Some(Ok(result)) => {
                     observer.record_event(&ObserverEvent::LlmResponse {
                         provider: provider_name.to_string(),
                         model: model.to_string(),
@@ -930,37 +1104,9 @@ pub(crate) async fn run_tool_call_loop(
                         success: true,
                         error_message: None,
                     });
-
-                    let response_text = resp.text_or_empty().to_string();
-                    let mut calls = parse_structured_tool_calls(&resp.tool_calls);
-                    let mut parsed_text = String::new();
-
-                    if calls.is_empty() {
-                        let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
-                        if !fallback_text.is_empty() {
-                            parsed_text = fallback_text;
-                        }
-                        calls = fallback_calls;
-                    }
-
-                    // Preserve native tool call IDs in assistant history so role=tool
-                    // follow-up messages can reference the exact call id.
-                    let assistant_history_content = if resp.tool_calls.is_empty() {
-                        response_text.clone()
-                    } else {
-                        build_native_assistant_history(&response_text, &resp.tool_calls)
-                    };
-
-                    let native_calls = resp.tool_calls;
-                    (
-                        response_text,
-                        parsed_text,
-                        calls,
-                        assistant_history_content,
-                        native_calls,
-                    )
+                    result
                 }
-                Err(e) => {
+                Some(Err(e)) => {
                     observer.record_event(&ObserverEvent::LlmResponse {
                         provider: provider_name.to_string(),
                         model: model.to_string(),
@@ -969,6 +1115,62 @@ pub(crate) async fn run_tool_call_loop(
                         error_message: Some(crate::providers::sanitize_api_error(&e.to_string())),
                     });
                     return Err(e);
+                }
+                None => {
+                    // Fallback to non-streaming
+                    match provider.chat(chat_request, model, temperature).await {
+                        Ok(resp) => {
+                            observer.record_event(&ObserverEvent::LlmResponse {
+                                provider: provider_name.to_string(),
+                                model: model.to_string(),
+                                duration: llm_started_at.elapsed(),
+                                success: true,
+                                error_message: None,
+                            });
+
+                            let response_text = resp.text_or_empty().to_string();
+                            let mut calls = parse_structured_tool_calls(&resp.tool_calls);
+                            let mut parsed_text = String::new();
+
+                            if calls.is_empty() {
+                                let (fallback_text, fallback_calls) =
+                                    parse_tool_calls(&response_text);
+                                if !fallback_text.is_empty() {
+                                    parsed_text = fallback_text;
+                                }
+                                calls = fallback_calls;
+                            }
+
+                            // Preserve native tool call IDs in assistant history so role=tool
+                            // follow-up messages can reference the exact call id.
+                            let assistant_history_content = if resp.tool_calls.is_empty() {
+                                response_text.clone()
+                            } else {
+                                build_native_assistant_history(&response_text, &resp.tool_calls)
+                            };
+
+                            let native_calls = resp.tool_calls;
+                            (
+                                response_text,
+                                parsed_text,
+                                calls,
+                                assistant_history_content,
+                                native_calls,
+                            )
+                        }
+                        Err(e) => {
+                            observer.record_event(&ObserverEvent::LlmResponse {
+                                provider: provider_name.to_string(),
+                                model: model.to_string(),
+                                duration: llm_started_at.elapsed(),
+                                success: false,
+                                error_message: Some(crate::providers::sanitize_api_error(
+                                    &e.to_string(),
+                                )),
+                            });
+                            return Err(e);
+                        }
+                    }
                 }
             };
 
@@ -1428,6 +1630,7 @@ pub async fn run(
             &config.multimodal,
             config.agent.max_tool_iterations,
             None,
+            config.reliability.streaming_enabled,
         )
         .await?;
         final_output = response.clone();
@@ -1555,6 +1758,7 @@ pub async fn run(
                 &config.multimodal,
                 config.agent.max_tool_iterations,
                 None,
+                config.reliability.streaming_enabled,
             )
             .await
             {
@@ -1910,6 +2114,7 @@ mod tests {
             &crate::config::MultimodalConfig::default(),
             3,
             None,
+            false,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -1953,6 +2158,7 @@ mod tests {
             &multimodal,
             3,
             None,
+            false,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -1990,6 +2196,7 @@ mod tests {
             &crate::config::MultimodalConfig::default(),
             3,
             None,
+            false,
         )
         .await
         .expect("valid multimodal payload should pass");
