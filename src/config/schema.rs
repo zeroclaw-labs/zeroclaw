@@ -3581,7 +3581,7 @@ connect_timeout_secs = 12
     }
 
     #[test]
-    fn runtime_reasoning_enabled_deserializes() {
+    async fn runtime_reasoning_enabled_deserializes() {
         let raw = r#"
 default_temperature = 0.7
 
