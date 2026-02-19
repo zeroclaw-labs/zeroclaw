@@ -674,6 +674,61 @@ mod tests {
     }
 
     #[test]
+    fn job_type_from_sql_reads_valid_value() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let now = Utc::now();
+
+        with_connection(&config, |conn| {
+            conn.execute(
+                "INSERT INTO cron_jobs (id, expression, command, schedule, job_type, created_at, next_run)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    "job-type-valid",
+                    "*/5 * * * *",
+                    "echo ok",
+                    Option::<String>::None,
+                    "agent",
+                    now.to_rfc3339(),
+                    (now + ChronoDuration::minutes(5)).to_rfc3339(),
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let job = get_job(&config, "job-type-valid").unwrap();
+        assert_eq!(job.job_type, JobType::Agent);
+    }
+
+    #[test]
+    fn job_type_from_sql_rejects_invalid_value() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let now = Utc::now();
+
+        with_connection(&config, |conn| {
+            conn.execute(
+                "INSERT INTO cron_jobs (id, expression, command, schedule, job_type, created_at, next_run)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    "job-type-invalid",
+                    "*/5 * * * *",
+                    "echo ok",
+                    Option::<String>::None,
+                    "unknown",
+                    now.to_rfc3339(),
+                    (now + ChronoDuration::minutes(5)).to_rfc3339(),
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(get_job(&config, "job-type-invalid").is_err());
+    }
+
+    #[test]
     fn migration_falls_back_to_legacy_expression() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
