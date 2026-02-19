@@ -681,6 +681,56 @@ async fn build_memory_context(
     context
 }
 
+/// Extract a compact summary of tool interactions from history messages added
+/// during `run_tool_call_loop`. Scans assistant messages for `<tool_call>` tags
+/// or native tool-call JSON to collect tool names used.
+/// Returns an empty string when no tools were invoked.
+fn extract_tool_context_summary(history: &[ChatMessage], start_index: usize) -> String {
+    let mut tool_names: Vec<String> = Vec::new();
+
+    for msg in history.iter().skip(start_index) {
+        if msg.role != "assistant" {
+            continue;
+        }
+        // Extract tool names from XML-style <tool_call> blocks
+        for segment in msg.content.split("<tool_call>") {
+            if let Some(json_end) = segment.find("</tool_call>") {
+                let json_str = segment[..json_end].trim();
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
+                    if let Some(name) = val.get("name").and_then(|n| n.as_str()) {
+                        if !tool_names.contains(&name.to_string()) {
+                            tool_names.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        // Extract tool names from native tool-call JSON (tool_calls array in content)
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&msg.content) {
+            if let Some(calls) = val.get("tool_calls").and_then(|c| c.as_array()) {
+                for call in calls {
+                    let name = call
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|n| n.as_str())
+                        .or_else(|| call.get("name").and_then(|n| n.as_str()));
+                    if let Some(n) = name {
+                        if !tool_names.contains(&n.to_string()) {
+                            tool_names.push(n.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if tool_names.is_empty() {
+        return String::new();
+    }
+
+    format!("[Used tools: {}]", tool_names.join(", "))
+}
+
 fn spawn_supervised_listener(
     ch: Arc<dyn Channel>,
     tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
@@ -923,6 +973,9 @@ async fn process_channel_message(
         _ => None,
     };
 
+    // Record history length before tool loop so we can extract tool context after.
+    let history_len_before_tools = history.len();
+
     enum LlmExecutionResult {
         Completed(Result<Result<String, anyhow::Error>, tokio::time::error::Elapsed>),
         Cancelled,
@@ -978,10 +1031,20 @@ async fn process_channel_message(
             }
         }
         LlmExecutionResult::Completed(Ok(Ok(response))) => {
+            // Extract condensed tool-use context from the history messages
+            // added during run_tool_call_loop, so the LLM retains awareness
+            // of what it did on subsequent turns.
+            let tool_summary = extract_tool_context_summary(&history, history_len_before_tools);
+            let history_response = if tool_summary.is_empty() {
+                response.clone()
+            } else {
+                format!("{tool_summary}\n{response}")
+            };
+
             append_sender_turn(
                 ctx.as_ref(),
                 &history_key,
-                ChatMessage::assistant(&response),
+                ChatMessage::assistant(&history_response),
             );
             println!(
                 "  🤖 Reply ({}ms): {}",
