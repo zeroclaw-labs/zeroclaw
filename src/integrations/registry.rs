@@ -14,7 +14,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Bot API — long-polling",
             category: IntegrationCategory::Chat,
             status_fn: |c| {
-                if c.channels_config.telegram.is_some() {
+                if c.channels_config.launchable.telegram.is_some() {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -26,7 +26,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Servers, channels & DMs",
             category: IntegrationCategory::Chat,
             status_fn: |c| {
-                if c.channels_config.discord.is_some() {
+                if c.channels_config.launchable.discord.is_some() {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -38,7 +38,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Workspace apps via Web API",
             category: IntegrationCategory::Chat,
             status_fn: |c| {
-                if c.channels_config.slack.is_some() {
+                if c.channels_config.launchable.slack.is_some() {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -62,7 +62,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Meta Cloud API via webhook",
             category: IntegrationCategory::Chat,
             status_fn: |c| {
-                if c.channels_config.whatsapp.is_some() {
+                if c.channels_config.launchable.whatsapp.is_some() {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -74,7 +74,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Privacy-focused via signal-cli",
             category: IntegrationCategory::Chat,
             status_fn: |c| {
-                if c.channels_config.signal.is_some() {
+                if c.channels_config.launchable.signal.is_some() {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -86,7 +86,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "macOS AppleScript bridge",
             category: IntegrationCategory::Chat,
             status_fn: |c| {
-                if c.channels_config.imessage.is_some() {
+                if c.channels_config.launchable.imessage.is_some() {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -104,7 +104,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Matrix protocol (Element)",
             category: IntegrationCategory::Chat,
             status_fn: |c| {
-                if c.channels_config.matrix.is_some() {
+                if c.channels_config.launchable.matrix.is_some() {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -140,7 +140,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "DingTalk Stream Mode",
             category: IntegrationCategory::Chat,
             status_fn: |c| {
-                if c.channels_config.dingtalk.is_some() {
+                if c.channels_config.launchable.dingtalk.is_some() {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -152,7 +152,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Tencent QQ Bot SDK",
             category: IntegrationCategory::Chat,
             status_fn: |c| {
-                if c.channels_config.qq.is_some() {
+                if c.channels_config.launchable.qq.is_some() {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -669,7 +669,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "IMAP/SMTP email channel",
             category: IntegrationCategory::Social,
             status_fn: |c| {
-                if c.channels_config.email.is_some() {
+                if c.channels_config.launchable.email.is_some() {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -785,7 +785,7 @@ mod tests {
     #[test]
     fn telegram_active_when_configured() {
         let mut config = Config::default();
-        config.channels_config.telegram = Some(TelegramConfig {
+        config.channels_config.launchable.telegram = Some(TelegramConfig {
             bot_token: "123:ABC".into(),
             allowed_users: vec!["user".into()],
             stream_mode: StreamMode::default(),
@@ -811,7 +811,7 @@ mod tests {
     #[test]
     fn imessage_active_when_configured() {
         let mut config = Config::default();
-        config.channels_config.imessage = Some(IMessageConfig {
+        config.channels_config.launchable.imessage = Some(IMessageConfig {
             allowed_contacts: vec!["*".into()],
         });
         let entries = all_integrations();
@@ -833,7 +833,7 @@ mod tests {
     #[test]
     fn matrix_active_when_configured() {
         let mut config = Config::default();
-        config.channels_config.matrix = Some(MatrixConfig {
+        config.channels_config.launchable.matrix = Some(MatrixConfig {
             homeserver: "https://m.org".into(),
             access_token: "tok".into(),
             user_id: None,

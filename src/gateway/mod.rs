@@ -368,7 +368,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     // WhatsApp channel (if configured)
     let whatsapp_channel: Option<Arc<WhatsAppChannel>> =
-        config.channels_config.whatsapp.as_ref().map(|wa| {
+        config.channels_config.launchable.whatsapp.as_ref().map(|wa| {
             Arc::new(WhatsAppChannel::new(
                 wa.access_token.clone(),
                 wa.phone_number_id.clone(),
@@ -386,7 +386,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             (!secret.is_empty()).then(|| secret.to_owned())
         })
         .or_else(|| {
-            config.channels_config.whatsapp.as_ref().and_then(|wa| {
+            config.channels_config.launchable.whatsapp.as_ref().and_then(|wa| {
                 wa.app_secret
                     .as_deref()
                     .map(str::trim)
@@ -397,7 +397,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .map(Arc::from);
 
     // Linq channel (if configured)
-    let linq_channel: Option<Arc<LinqChannel>> = config.channels_config.linq.as_ref().map(|lq| {
+    let linq_channel: Option<Arc<LinqChannel>> = config.channels_config.launchable.linq.as_ref().map(|lq| {
         Arc::new(LinqChannel::new(
             lq.api_token.clone(),
             lq.from_phone.clone(),
@@ -414,7 +414,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             (!secret.is_empty()).then(|| secret.to_owned())
         })
         .or_else(|| {
-            config.channels_config.linq.as_ref().and_then(|lq| {
+            config.channels_config.launchable.linq.as_ref().and_then(|lq| {
                 lq.signing_secret
                     .as_deref()
                     .map(str::trim)
@@ -1194,6 +1194,8 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
         };
 
@@ -1235,6 +1237,8 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
             observer,
         };
 
