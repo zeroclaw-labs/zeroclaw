@@ -1,25 +1,62 @@
-//! Sandbox trait for pluggable OS-level isolation
+//! Sandbox trait for pluggable OS-level isolation.
+//!
+//! This module defines the [`Sandbox`] trait, which abstracts OS-level process
+//! isolation backends. Implementations wrap shell commands with platform-specific
+//! sandboxing (e.g., seccomp, AppArmor, namespaces) to limit the blast radius
+//! of tool execution. The agent runtime selects and applies a sandbox backend
+//! before executing any shell command.
 
 use async_trait::async_trait;
 use std::process::Command;
 
-/// Sandbox backend for OS-level isolation
+/// Sandbox backend for OS-level process isolation.
+///
+/// Implement this trait to add a new sandboxing strategy. The runtime queries
+/// [`is_available`](Sandbox::is_available) at startup to select the best
+/// backend for the current platform, then calls
+/// [`wrap_command`](Sandbox::wrap_command) before every shell execution.
+///
+/// Implementations must be `Send + Sync` because the sandbox may be shared
+/// across concurrent tool executions on the Tokio runtime.
 #[async_trait]
 pub trait Sandbox: Send + Sync {
-    /// Wrap a command with sandbox protection
+    /// Wrap a command with sandbox protection.
+    ///
+    /// Mutates `cmd` in place to apply isolation constraints (e.g., prepending
+    /// a wrapper binary, setting environment variables, adding seccomp filters).
+    ///
+    /// # Errors
+    ///
+    /// Returns `std::io::Error` if the sandbox configuration cannot be applied
+    /// (e.g., missing wrapper binary, invalid policy file).
     fn wrap_command(&self, cmd: &mut Command) -> std::io::Result<()>;
 
-    /// Check if this sandbox backend is available on the current platform
+    /// Check if this sandbox backend is available on the current platform.
+    ///
+    /// Returns `true` when all required kernel features, binaries, and
+    /// permissions are present. The runtime calls this at startup to select
+    /// the most capable available backend.
     fn is_available(&self) -> bool;
 
-    /// Human-readable name of this sandbox backend
+    /// Return the human-readable name of this sandbox backend.
+    ///
+    /// Used in logs and diagnostics to identify which isolation strategy is
+    /// active (e.g., `"firejail"`, `"bubblewrap"`, `"none"`).
     fn name(&self) -> &str;
 
-    /// Description of what this sandbox provides
+    /// Return a brief description of the isolation guarantees this sandbox provides.
+    ///
+    /// Displayed in status output and health checks so operators can verify
+    /// the active security posture.
     fn description(&self) -> &str;
 }
 
-/// No-op sandbox (always available, provides no additional isolation)
+/// No-op sandbox that provides no additional OS-level isolation.
+///
+/// Always reports itself as available. Use this as the fallback when no
+/// platform-specific sandbox backend is detected, or in development
+/// environments where isolation is not required. Security in this mode
+/// relies entirely on application-layer controls.
 #[derive(Debug, Clone, Default)]
 pub struct NoopSandbox;
 
