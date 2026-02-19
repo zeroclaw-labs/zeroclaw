@@ -60,5 +60,16 @@ services:
       - coolify.managed=true
       - autoheal=true
 
+  zc-bridge:
+    build: ./zc-bridge
+    container_name: zc-bridge
+    restart: unless-stopped
+    environment:
+      - ZEROCLAW_URL=http://zeroclaw:3000/webhook
+    depends_on:
+      - zeroclaw
+    labels:
+      - coolify.managed=true
+
 volumes:
   zeroclaw-data:
