@@ -1,10 +1,47 @@
 #!/usr/bin/env python3
-"""Fetch GitHub Actions workflow runs for a given date and summarize costs."""
+"""Fetch GitHub Actions workflow runs for a given date and summarize costs.
 
+Usage:
+    python fetch_actions_data.py [OPTIONS]
+
+Options:
+    --date YYYY-MM-DD   Date to query (default: yesterday)
+    --mode brief|full   Output mode (default: full)
+                        brief: billable minutes/hours table only
+                        full:  detailed breakdown with per-run list
+    --repo OWNER/NAME   Repository (default: zeroclaw-labs/zeroclaw)
+    -h, --help          Show this help message
+"""
+
+import argparse
 import json
 import subprocess
-import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+
+
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Fetch GitHub Actions workflow runs and summarize costs.",
+    )
+    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+    parser.add_argument(
+        "--date",
+        default=yesterday,
+        help="Date to query in YYYY-MM-DD format (default: yesterday)",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["brief", "full"],
+        default="full",
+        help="Output mode: 'brief' for billable hours only, 'full' for detailed breakdown (default: full)",
+    )
+    parser.add_argument(
+        "--repo",
+        default="zeroclaw-labs/zeroclaw",
+        help="Repository in OWNER/NAME format (default: zeroclaw-labs/zeroclaw)",
+    )
+    return parser.parse_args()
 
 
 def fetch_runs(repo, date_str, page=1, per_page=100):
@@ -43,8 +80,10 @@ def parse_duration(started, completed):
 
 
 def main():
-    repo = "zeroclaw-labs/zeroclaw"
-    date_str = "2026-02-17"
+    args = parse_args()
+    repo = args.repo
+    date_str = args.date
+    brief = args.mode == "brief"
 
     print(f"Fetching workflow runs for {repo} on {date_str}...")
     print("=" * 100)
@@ -117,39 +156,53 @@ def main():
         reverse=True
     )
 
-    print("=" * 100)
-    print(f"{'Workflow':<40} {'Runs':>5} {'SampledJobs':>12} {'SampledMins':>12} {'Est.TotalMins':>14} {'Events'}")
-    print("-" * 100)
+    if brief:
+        # Brief mode: compact billable hours table
+        print(f"{'Workflow':<40} {'Runs':>5} {'Est.Mins':>9} {'Est.Hours':>10}")
+        print("-" * 68)
+        grand_total_minutes = 0
+        for name, stats in sorted_workflows:
+            est_mins = stats["estimated_total_seconds"] / 60
+            grand_total_minutes += est_mins
+            print(f"{name:<40} {stats['count']:>5} {est_mins:>9.1f} {est_mins/60:>10.2f}")
+        print("-" * 68)
+        print(f"{'TOTAL':<40} {len(all_runs):>5} {grand_total_minutes:>9.0f} {grand_total_minutes/60:>10.1f}")
+        print(f"\nProjected monthly: ~{grand_total_minutes/60*30:.0f} hours")
+    else:
+        # Full mode: detailed breakdown with per-run list
+        print("=" * 100)
+        print(f"{'Workflow':<40} {'Runs':>5} {'SampledJobs':>12} {'SampledMins':>12} {'Est.TotalMins':>14} {'Events'}")
+        print("-" * 100)
 
-    grand_total_minutes = 0
-    for name, stats in sorted_workflows:
-        sampled_mins = stats["total_job_seconds"] / 60
-        est_total_mins = stats["estimated_total_seconds"] / 60
-        grand_total_minutes += est_total_mins
-        events_str = ", ".join(f"{k}={v}" for k, v in stats["events"].items())
-        conclusions_str = ", ".join(f"{k}={v}" for k, v in stats["conclusions"].items())
-        print(
-            f"{name:<40} {stats['count']:>5} {stats['total_jobs']:>12} "
-            f"{sampled_mins:>12.1f} {est_total_mins:>14.1f}   {events_str}"
-        )
-        print(f"{'':>40} {'':>5} {'':>12} {'':>12} {'':>14}   outcomes: {conclusions_str}")
+        grand_total_minutes = 0
+        for name, stats in sorted_workflows:
+            sampled_mins = stats["total_job_seconds"] / 60
+            est_total_mins = stats["estimated_total_seconds"] / 60
+            grand_total_minutes += est_total_mins
+            events_str = ", ".join(f"{k}={v}" for k, v in stats["events"].items())
+            conclusions_str = ", ".join(f"{k}={v}" for k, v in stats["conclusions"].items())
+            print(
+                f"{name:<40} {stats['count']:>5} {stats['total_jobs']:>12} "
+                f"{sampled_mins:>12.1f} {est_total_mins:>14.1f}   {events_str}"
+            )
+            print(f"{'':>40} {'':>5} {'':>12} {'':>12} {'':>14}   outcomes: {conclusions_str}")
 
-    print("-" * 100)
-    print(f"{'GRAND TOTAL':>40} {len(all_runs):>5} {'':>12} {'':>12} {grand_total_minutes:>14.1f}")
-    print(f"\nEstimated total billable minutes on {date_str}: {grand_total_minutes:.0f} min ({grand_total_minutes/60:.1f} hours)")
-    print()
+        print("-" * 100)
+        print(f"{'GRAND TOTAL':>40} {len(all_runs):>5} {'':>12} {'':>12} {grand_total_minutes:>14.1f}")
+        print(f"\nEstimated total billable minutes on {date_str}: {grand_total_minutes:.0f} min ({grand_total_minutes/60:.1f} hours)")
+        print()
 
-    # Also show raw run list
-    print("\n" + "=" * 100)
-    print("DETAILED RUN LIST")
-    print("=" * 100)
-    for run in all_runs:
-        name = run.get("name", "Unknown")
-        event = run.get("event", "unknown")
-        conclusion = run.get("conclusion", "unknown")
-        run_id = run.get("id")
-        started = run.get("run_started_at", "?")
-        print(f"  [{run_id}] {name:<40} conclusion={conclusion:<12} event={event:<20} started={started}")
+        # Also show raw run list
+        print("\n" + "=" * 100)
+        print("DETAILED RUN LIST")
+        print("=" * 100)
+        for run in all_runs:
+            name = run.get("name", "Unknown")
+            event = run.get("event", "unknown")
+            conclusion = run.get("conclusion", "unknown")
+            run_id = run.get("id")
+            started = run.get("run_started_at", "?")
+            print(f"  [{run_id}] {name:<40} conclusion={conclusion:<12} event={event:<20} started={started}")
 
 
 if __name__ == "__main__":
