@@ -227,10 +227,19 @@ pub fn all_tools_with_runtime(
             let trimmed_value = value.trim();
             (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
         });
-        tools.push(Box::new(DelegateTool::new(
+        tools.push(Box::new(DelegateTool::new_with_options(
             delegate_agents,
             delegate_fallback_credential,
             security.clone(),
+            crate::providers::ProviderRuntimeOptions {
+                auth_profile_override: None,
+                zeroclaw_dir: root_config
+                    .config_path
+                    .parent()
+                    .map(std::path::PathBuf::from),
+                secrets_encrypt: root_config.secrets.encrypt,
+                reasoning_enabled: root_config.runtime.reasoning_enabled,
+            },
         )));
     }
 

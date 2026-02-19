@@ -21,6 +21,8 @@ pub struct DelegateTool {
     security: Arc<SecurityPolicy>,
     /// Global credential fallback (from config.api_key)
     fallback_credential: Option<String>,
+    /// Provider runtime options inherited from root config.
+    provider_runtime_options: providers::ProviderRuntimeOptions,
     /// Depth at which this tool instance lives in the delegation chain.
     depth: u32,
 }
@@ -31,10 +33,25 @@ impl DelegateTool {
         fallback_credential: Option<String>,
         security: Arc<SecurityPolicy>,
     ) -> Self {
+        Self::new_with_options(
+            agents,
+            fallback_credential,
+            security,
+            providers::ProviderRuntimeOptions::default(),
+        )
+    }
+
+    pub fn new_with_options(
+        agents: HashMap<String, DelegateAgentConfig>,
+        fallback_credential: Option<String>,
+        security: Arc<SecurityPolicy>,
+        provider_runtime_options: providers::ProviderRuntimeOptions,
+    ) -> Self {
         Self {
             agents: Arc::new(agents),
             security,
             fallback_credential,
+            provider_runtime_options,
             depth: 0,
         }
     }
@@ -48,10 +65,27 @@ impl DelegateTool {
         security: Arc<SecurityPolicy>,
         depth: u32,
     ) -> Self {
+        Self::with_depth_and_options(
+            agents,
+            fallback_credential,
+            security,
+            depth,
+            providers::ProviderRuntimeOptions::default(),
+        )
+    }
+
+    pub fn with_depth_and_options(
+        agents: HashMap<String, DelegateAgentConfig>,
+        fallback_credential: Option<String>,
+        security: Arc<SecurityPolicy>,
+        depth: u32,
+        provider_runtime_options: providers::ProviderRuntimeOptions,
+    ) -> Self {
         Self {
             agents: Arc::new(agents),
             security,
             fallback_credential,
+            provider_runtime_options,
             depth,
         }
     }
@@ -190,20 +224,23 @@ impl Tool for DelegateTool {
         #[allow(clippy::option_as_ref_deref)]
         let provider_credential = provider_credential_owned.as_ref().map(String::as_str);
 
-        let provider: Box<dyn Provider> =
-            match providers::create_provider(&agent_config.provider, provider_credential) {
-                Ok(p) => p,
-                Err(e) => {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!(
-                            "Failed to create provider '{}' for agent '{agent_name}': {e}",
-                            agent_config.provider
-                        )),
-                    });
-                }
-            };
+        let provider: Box<dyn Provider> = match providers::create_provider_with_options(
+            &agent_config.provider,
+            provider_credential,
+            &self.provider_runtime_options,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Failed to create provider '{}' for agent '{agent_name}': {e}",
+                        agent_config.provider
+                    )),
+                });
+            }
+        };
 
         // Build the message
         let full_prompt = if context.is_empty() {
