@@ -1761,7 +1761,7 @@ impl Default for ObservabilityConfig {
 
 // ── Hooks ────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HooksConfig {
     /// Enable lifecycle hook execution.
     ///
@@ -1781,7 +1781,7 @@ impl Default for HooksConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct BuiltinHooksConfig {
     /// Enable the command-logger hook (logs tool calls for auditing).
     pub command_logger: bool,

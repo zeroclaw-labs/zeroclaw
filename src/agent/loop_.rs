@@ -1300,6 +1300,7 @@ pub(crate) async fn agent_turn(
         max_tool_iterations,
         None,
         None,
+        None,
     )
     .await
 }
@@ -2126,6 +2127,7 @@ pub async fn run(
             config.agent.max_tool_iterations,
             None,
             None,
+            None,
         )
         .await?;
         final_output = response.clone();
@@ -2243,6 +2245,7 @@ pub async fn run(
                 "cli",
                 &config.multimodal,
                 config.agent.max_tool_iterations,
+                None,
                 None,
                 None,
             )

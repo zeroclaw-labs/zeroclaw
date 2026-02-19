@@ -409,6 +409,7 @@ impl DelegateTool {
                 agent_config.max_iterations,
                 None,
                 None,
+                None,
             ),
         )
         .await;
