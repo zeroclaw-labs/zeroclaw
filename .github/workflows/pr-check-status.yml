@@ -13,13 +13,13 @@ concurrency:
 
 jobs:
   nudge-stale-prs:
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: write
       issues: write
     env:
-      STALE_HOURS: "4"
+      STALE_HOURS: "48"
     steps:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
