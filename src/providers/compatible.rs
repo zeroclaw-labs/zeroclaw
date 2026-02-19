@@ -322,19 +322,32 @@ impl ResponseMessage {
     /// Strips `<think>...</think>` blocks that some models (e.g. MiniMax) embed
     /// inline in `content` instead of using a separate field.
     fn effective_content(&self) -> String {
-        let raw = match &self.content {
-            Some(c) if !c.is_empty() => c.clone(),
-            _ => self.reasoning_content.clone().unwrap_or_default(),
-        };
-        strip_think_tags(&raw)
+        if let Some(content) = self.content.as_ref().filter(|c| !c.is_empty()) {
+            let stripped = strip_think_tags(content);
+            if !stripped.is_empty() {
+                return stripped;
+            }
+        }
+
+        self.reasoning_content
+            .as_ref()
+            .map(|c| strip_think_tags(c))
+            .filter(|c| !c.is_empty())
+            .unwrap_or_default()
     }
 
     fn effective_content_optional(&self) -> Option<String> {
-        let raw = match &self.content {
-            Some(c) if !c.is_empty() => Some(c.clone()),
-            _ => self.reasoning_content.clone().filter(|c| !c.is_empty()),
-        };
-        raw.map(|s| strip_think_tags(&s)).filter(|s| !s.is_empty())
+        if let Some(content) = self.content.as_ref().filter(|c| !c.is_empty()) {
+            let stripped = strip_think_tags(content);
+            if !stripped.is_empty() {
+                return Some(stripped);
+            }
+        }
+
+        self.reasoning_content
+            .as_ref()
+            .map(|c| strip_think_tags(c))
+            .filter(|c| !c.is_empty())
     }
 }
 
@@ -2069,6 +2082,56 @@ mod tests {
         assert!(msg.tool_calls.is_none());
     }
 
+    #[test]
+    fn flatten_system_messages_merges_into_first_user_and_removes_system_roles() {
+        let messages = vec![
+            ChatMessage::system("System A"),
+            ChatMessage::assistant("Earlier assistant turn"),
+            ChatMessage::system("System B"),
+            ChatMessage::user("User turn"),
+            ChatMessage::tool(r#"{"ok":true}"#),
+        ];
+
+        let flattened = OpenAiCompatibleProvider::flatten_system_messages(&messages);
+        assert_eq!(flattened.len(), 3);
+        assert_eq!(flattened[0].role, "assistant");
+        assert_eq!(
+            flattened[1].content,
+            "System A\n\nSystem B\n\nUser turn".to_string()
+        );
+        assert_eq!(flattened[1].role, "user");
+        assert_eq!(flattened[2].role, "tool");
+        assert!(!flattened.iter().any(|m| m.role == "system"));
+    }
+
+    #[test]
+    fn flatten_system_messages_inserts_synthetic_user_when_no_user_exists() {
+        let messages = vec![
+            ChatMessage::assistant("Assistant only"),
+            ChatMessage::system("Synthetic system"),
+        ];
+
+        let flattened = OpenAiCompatibleProvider::flatten_system_messages(&messages);
+        assert_eq!(flattened.len(), 2);
+        assert_eq!(flattened[0].role, "user");
+        assert_eq!(flattened[0].content, "Synthetic system");
+        assert_eq!(flattened[1].role, "assistant");
+    }
+
+    #[test]
+    fn strip_think_tags_removes_multiple_blocks() {
+        let input = "Answer A <think>hidden 1</think> and B <think>hidden 2</think> done";
+        let output = strip_think_tags(input);
+        assert_eq!(output, "Answer A  and B  done");
+    }
+
+    #[test]
+    fn strip_think_tags_drops_tail_for_unclosed_block() {
+        let input = "Visible<think>hidden tail";
+        let output = strip_think_tags(input);
+        assert_eq!(output, "Visible");
+    }
+
     // ----------------------------------------------------------
     // Reasoning model fallback tests (reasoning_content)
     // ----------------------------------------------------------
@@ -2108,6 +2171,18 @@ mod tests {
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
         assert_eq!(msg.effective_content(), "Normal response");
+    }
+
+    #[test]
+    fn reasoning_content_used_when_content_only_think_tags() {
+        let json = r#"{"choices":[{"message":{"content":"<think>secret</think>","reasoning_content":"Fallback text"}}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let msg = &resp.choices[0].message;
+        assert_eq!(msg.effective_content(), "Fallback text");
+        assert_eq!(
+            msg.effective_content_optional().as_deref(),
+            Some("Fallback text")
+        );
     }
 
     #[test]
