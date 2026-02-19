@@ -2181,6 +2181,7 @@ mod tests {
             api_key: None,
             api_url: None,
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            multimodal: crate::config::MultimodalConfig::default(),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
@@ -2196,9 +2197,12 @@ mod tests {
             .get(&sender)
             .expect("sender history should remain");
         assert_eq!(kept.len(), CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
-        assert!(kept
-            .iter()
-            .all(|turn| turn.content.chars().count() <= CHANNEL_HISTORY_COMPACT_CONTENT_CHARS));
+        assert!(kept.iter().all(|turn| {
+            let len = turn.content.chars().count();
+            len <= CHANNEL_HISTORY_COMPACT_CONTENT_CHARS
+                || (len <= CHANNEL_HISTORY_COMPACT_CONTENT_CHARS + 3
+                    && turn.content.ends_with("..."))
+        }));
     }
 
     struct DummyProvider;
