@@ -109,7 +109,31 @@ fn parse_media_markers(message: &str) -> (String, Vec<OutboundMedia>) {
     }
 
     clean.push_str(&message[cursor..]);
-    (clean.trim().to_string(), media)
+    (strip_system_reminders(clean.trim()), media)
+}
+
+fn strip_system_reminders(input: &str) -> String {
+    let mut output = String::new();
+    let mut cursor = 0usize;
+    let open = "<system-reminder>";
+    let close = "</system-reminder>";
+
+    while let Some(start_rel) = input[cursor..].find(open) {
+        let start = cursor + start_rel;
+        output.push_str(&input[cursor..start]);
+        let body_start = start + open.len();
+        if let Some(end_rel) = input[body_start..].find(close) {
+            cursor = body_start + end_rel + close.len();
+        } else {
+            cursor = input.len();
+            break;
+        }
+    }
+    if cursor < input.len() {
+        output.push_str(&input[cursor..]);
+    }
+
+    output.trim().to_string()
 }
 
 fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {

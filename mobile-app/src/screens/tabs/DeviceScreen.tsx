@@ -77,9 +77,11 @@ export function DeviceScreen() {
   useEffect(() => {
     if (!hydratedRef.current) return;
     const timer = setTimeout(() => {
-      void saveDeviceToolsConfig(tools);
-      void applyRuntimeSupervisorConfig("device_tools_changed");
-      setSaveStatus("Saved locally");
+      void (async () => {
+        await saveDeviceToolsConfig(tools);
+        await applyRuntimeSupervisorConfig("device_tools_changed");
+        setSaveStatus("Saved locally");
+      })();
     }, 300);
     return () => clearTimeout(timer);
   }, [tools]);
