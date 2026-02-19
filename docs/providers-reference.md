@@ -144,6 +144,11 @@ Optional:
 - `MINIMAX_OAUTH_REGION=global` or `cn` (defaults by provider alias)
 - `MINIMAX_OAUTH_CLIENT_ID` to override the default OAuth client id
 
+Channel compatibility note:
+
+- For MiniMax-backed channel conversations, runtime history is normalized to keep valid `user`/`assistant` turn order.
+- Channel-specific delivery guidance (for example Telegram attachment markers) is merged into the leading system prompt instead of being appended as a trailing `system` turn.
+
 ## Qwen Code OAuth Setup (config.toml)
 
 Set Qwen Code OAuth mode in config:
