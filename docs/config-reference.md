@@ -65,6 +65,7 @@ Notes:
 
 - Default `300s` is optimized for on-device LLMs (Ollama) which are slower than cloud APIs.
 - If using cloud APIs (OpenAI, Anthropic, etc.), you can reduce this to `60` or lower.
+- Values below `30` are clamped to `30` to avoid immediate timeout churn.
 - When a timeout occurs, users receive: `⚠️ Request timed out while waiting for the model. Please try again.`
 
 See detailed channel matrix and allowlist behavior in [channels-reference.md](channels-reference.md).

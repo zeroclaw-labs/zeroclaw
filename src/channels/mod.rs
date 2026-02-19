@@ -60,6 +60,7 @@ const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 
 const DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS: u64 = 2;
 const DEFAULT_CHANNEL_MAX_BACKOFF_SECS: u64 = 60;
+const MIN_CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 30;
 /// Default timeout for processing a single channel message (LLM + tools).
 /// Used as fallback when not configured in channels_config.message_timeout_secs.
 const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 300;
@@ -72,6 +73,10 @@ const MODEL_CACHE_PREVIEW_LIMIT: usize = 10;
 
 type ProviderCacheMap = Arc<Mutex<HashMap<String, Arc<dyn Provider>>>>;
 type RouteSelectionMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
+
+fn effective_channel_message_timeout_secs(configured: u64) -> u64 {
+    configured.max(MIN_CHANNEL_MESSAGE_TIMEOUT_SECS)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ChannelRouteSelection {
@@ -1811,6 +1816,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
     provider_cache_seed.insert(provider_name.clone(), Arc::clone(&provider));
+    let message_timeout_secs =
+        effective_channel_message_timeout_secs(config.channels_config.message_timeout_secs);
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
@@ -1833,7 +1840,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         reliability: Arc::new(config.reliability.clone()),
         provider_runtime_options,
         workspace_dir: Arc::new(config.workspace_dir.clone()),
-        message_timeout_secs: config.channels_config.message_timeout_secs,
+        message_timeout_secs,
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -1877,6 +1884,19 @@ mod tests {
         .unwrap();
         std::fs::write(tmp.path().join("MEMORY.md"), "# Memory\nUser likes Rust.").unwrap();
         tmp
+    }
+
+    #[test]
+    fn effective_channel_message_timeout_secs_clamps_to_minimum() {
+        assert_eq!(
+            effective_channel_message_timeout_secs(0),
+            MIN_CHANNEL_MESSAGE_TIMEOUT_SECS
+        );
+        assert_eq!(
+            effective_channel_message_timeout_secs(15),
+            MIN_CHANNEL_MESSAGE_TIMEOUT_SECS
+        );
+        assert_eq!(effective_channel_message_timeout_secs(300), 300);
     }
 
     #[derive(Default)]
