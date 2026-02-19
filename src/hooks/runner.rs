@@ -1,7 +1,8 @@
 use std::time::Duration;
 
-use futures::future::join_all;
+use futures::{future::join_all, FutureExt};
 use serde_json::Value;
+use std::panic::AssertUnwindSafe;
 use tracing::info;
 
 use crate::channels::traits::ChannelMessage;
@@ -124,17 +125,27 @@ impl HookRunner {
         mut model: String,
     ) -> HookResult<(String, String)> {
         for h in &self.handlers {
-            match h.before_model_resolve(provider, model).await {
-                HookResult::Continue((p, m)) => {
+            let hook_name = h.name();
+            match AssertUnwindSafe(h.before_model_resolve(provider.clone(), model.clone()))
+                .catch_unwind()
+                .await
+            {
+                Ok(HookResult::Continue((p, m))) => {
                     provider = p;
                     model = m;
                 }
-                HookResult::Cancel(reason) => {
+                Ok(HookResult::Cancel(reason)) => {
                     info!(
-                        hook = h.name(),
+                        hook = hook_name,
                         reason, "before_model_resolve cancelled by hook"
                     );
                     return HookResult::Cancel(reason);
+                }
+                Err(_) => {
+                    tracing::error!(
+                        hook = hook_name,
+                        "before_model_resolve hook panicked; continuing with previous values"
+                    );
                 }
             }
         }
@@ -143,14 +154,24 @@ impl HookRunner {
 
     pub async fn run_before_prompt_build(&self, mut prompt: String) -> HookResult<String> {
         for h in &self.handlers {
-            match h.before_prompt_build(prompt).await {
-                HookResult::Continue(p) => prompt = p,
-                HookResult::Cancel(reason) => {
+            let hook_name = h.name();
+            match AssertUnwindSafe(h.before_prompt_build(prompt.clone()))
+                .catch_unwind()
+                .await
+            {
+                Ok(HookResult::Continue(p)) => prompt = p,
+                Ok(HookResult::Cancel(reason)) => {
                     info!(
-                        hook = h.name(),
+                        hook = hook_name,
                         reason, "before_prompt_build cancelled by hook"
                     );
                     return HookResult::Cancel(reason);
+                }
+                Err(_) => {
+                    tracing::error!(
+                        hook = hook_name,
+                        "before_prompt_build hook panicked; continuing with previous value"
+                    );
                 }
             }
         }
@@ -163,14 +184,24 @@ impl HookRunner {
         mut model: String,
     ) -> HookResult<(Vec<ChatMessage>, String)> {
         for h in &self.handlers {
-            match h.before_llm_call(messages, model).await {
-                HookResult::Continue((m, mdl)) => {
+            let hook_name = h.name();
+            match AssertUnwindSafe(h.before_llm_call(messages.clone(), model.clone()))
+                .catch_unwind()
+                .await
+            {
+                Ok(HookResult::Continue((m, mdl))) => {
                     messages = m;
                     model = mdl;
                 }
-                HookResult::Cancel(reason) => {
-                    info!(hook = h.name(), reason, "before_llm_call cancelled by hook");
+                Ok(HookResult::Cancel(reason)) => {
+                    info!(hook = hook_name, reason, "before_llm_call cancelled by hook");
                     return HookResult::Cancel(reason);
+                }
+                Err(_) => {
+                    tracing::error!(
+                        hook = hook_name,
+                        "before_llm_call hook panicked; continuing with previous values"
+                    );
                 }
             }
         }
@@ -183,17 +214,27 @@ impl HookRunner {
         mut args: Value,
     ) -> HookResult<(String, Value)> {
         for h in &self.handlers {
-            match h.before_tool_call(name, args).await {
-                HookResult::Continue((n, a)) => {
+            let hook_name = h.name();
+            match AssertUnwindSafe(h.before_tool_call(name.clone(), args.clone()))
+                .catch_unwind()
+                .await
+            {
+                Ok(HookResult::Continue((n, a))) => {
                     name = n;
                     args = a;
                 }
-                HookResult::Cancel(reason) => {
+                Ok(HookResult::Cancel(reason)) => {
                     info!(
-                        hook = h.name(),
+                        hook = hook_name,
                         reason, "before_tool_call cancelled by hook"
                     );
                     return HookResult::Cancel(reason);
+                }
+                Err(_) => {
+                    tracing::error!(
+                        hook = hook_name,
+                        "before_tool_call hook panicked; continuing with previous values"
+                    );
                 }
             }
         }
@@ -205,14 +246,24 @@ impl HookRunner {
         mut message: ChannelMessage,
     ) -> HookResult<ChannelMessage> {
         for h in &self.handlers {
-            match h.on_message_received(message).await {
-                HookResult::Continue(m) => message = m,
-                HookResult::Cancel(reason) => {
+            let hook_name = h.name();
+            match AssertUnwindSafe(h.on_message_received(message.clone()))
+                .catch_unwind()
+                .await
+            {
+                Ok(HookResult::Continue(m)) => message = m,
+                Ok(HookResult::Cancel(reason)) => {
                     info!(
-                        hook = h.name(),
+                        hook = hook_name,
                         reason, "on_message_received cancelled by hook"
                     );
                     return HookResult::Cancel(reason);
+                }
+                Err(_) => {
+                    tracing::error!(
+                        hook = hook_name,
+                        "on_message_received hook panicked; continuing with previous message"
+                    );
                 }
             }
         }
@@ -226,18 +277,30 @@ impl HookRunner {
         mut content: String,
     ) -> HookResult<(String, String, String)> {
         for h in &self.handlers {
-            match h.on_message_sending(channel, recipient, content).await {
-                HookResult::Continue((c, r, ct)) => {
+            let hook_name = h.name();
+            match AssertUnwindSafe(
+                h.on_message_sending(channel.clone(), recipient.clone(), content.clone()),
+            )
+            .catch_unwind()
+            .await
+            {
+                Ok(HookResult::Continue((c, r, ct))) => {
                     channel = c;
                     recipient = r;
                     content = ct;
                 }
-                HookResult::Cancel(reason) => {
+                Ok(HookResult::Cancel(reason)) => {
                     info!(
-                        hook = h.name(),
+                        hook = hook_name,
                         reason, "on_message_sending cancelled by hook"
                     );
                     return HookResult::Cancel(reason);
+                }
+                Err(_) => {
+                    tracing::error!(
+                        hook = hook_name,
+                        "on_message_sending hook panicked; continuing with previous message"
+                    );
                 }
             }
         }

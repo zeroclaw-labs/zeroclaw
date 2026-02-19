@@ -306,6 +306,13 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     }
     let config_state = Arc::new(Mutex::new(config.clone()));
 
+    // ── Hooks ──────────────────────────────────────────────────────
+    let hooks: Option<std::sync::Arc<crate::hooks::HookRunner>> = if config.hooks.enabled {
+        Some(std::sync::Arc::new(crate::hooks::HookRunner::new()))
+    } else {
+        None
+    };
+
     let addr: SocketAddr = format!("{host}:{port}").parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let actual_port = listener.local_addr()?.port();
@@ -544,6 +551,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     println!("  Press Ctrl+C to stop.\n");
 
     crate::health::mark_component_ok("gateway");
+
+    // Fire gateway start hook
+    if let Some(ref hooks) = hooks {
+        hooks.fire_gateway_start(host, actual_port).await;
+    }
 
     // Build shared state
     let observer: Arc<dyn crate::observability::Observer> =
