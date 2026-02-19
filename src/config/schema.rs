@@ -3275,7 +3275,7 @@ mod tests {
     }
 
     #[test]
-    fn config_schema_export_contains_expected_contract_shape() {
+    async fn config_schema_export_contains_expected_contract_shape() {
         let schema = schemars::schema_for!(Config);
         let schema_json = serde_json::to_value(&schema).expect("schema should serialize to json");
 
