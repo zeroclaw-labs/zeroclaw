@@ -39,6 +39,14 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
+fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
+    let t: f64 = s.parse().map_err(|e| format!("{e}"))?;
+    if !(0.0..=2.0).contains(&t) {
+        return Err("temperature must be between 0.0 and 2.0".to_string());
+    }
+    Ok(t)
+}
+
 mod agent;
 mod approval;
 mod auth;
@@ -144,7 +152,7 @@ enum Commands {
         model: Option<String>,
 
         /// Temperature (0.0 - 2.0)
-        #[arg(short, long, default_value = "0.7")]
+        #[arg(short, long, default_value = "0.7", value_parser = parse_temperature)]
         temperature: f64,
 
         /// Attach a peripheral (board:path, e.g. nucleo-f401re:/dev/ttyACM0)
