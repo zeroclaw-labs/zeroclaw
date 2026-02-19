@@ -37,10 +37,17 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "tool.pushover",
     "memory.embeddings",
     "tunnel.custom",
+    "transcription.groq",
 ];
 
-const SUPPORTED_PROXY_SERVICE_SELECTORS: &[&str] =
-    &["provider.*", "channel.*", "tool.*", "memory.*", "tunnel.*"];
+const SUPPORTED_PROXY_SERVICE_SELECTORS: &[&str] = &[
+    "provider.*",
+    "channel.*",
+    "tool.*",
+    "memory.*",
+    "tunnel.*",
+    "transcription.*",
+];
 
 static RUNTIME_PROXY_CONFIG: OnceLock<RwLock<ProxyConfig>> = OnceLock::new();
 static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Client>>> =
@@ -185,6 +192,10 @@ pub struct Config {
     /// Hardware configuration (wizard-driven physical world setup).
     #[serde(default)]
     pub hardware: HardwareConfig,
+
+    /// Voice transcription configuration (Whisper API via Groq).
+    #[serde(default)]
+    pub transcription: TranscriptionConfig,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -293,6 +304,52 @@ impl Default for HardwareConfig {
             baud_rate: default_baud_rate(),
             probe_target: None,
             workspace_datasheets: false,
+        }
+    }
+}
+
+// ── Transcription ────────────────────────────────────────────────
+
+fn default_transcription_api_url() -> String {
+    "https://api.groq.com/openai/v1/audio/transcriptions".into()
+}
+
+fn default_transcription_model() -> String {
+    "whisper-large-v3-turbo".into()
+}
+
+fn default_transcription_max_duration_secs() -> u64 {
+    120
+}
+
+/// Voice transcription configuration (Whisper API via Groq).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TranscriptionConfig {
+    /// Enable voice transcription for channels that support it.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Whisper API endpoint URL.
+    #[serde(default = "default_transcription_api_url")]
+    pub api_url: String,
+    /// Whisper model name.
+    #[serde(default = "default_transcription_model")]
+    pub model: String,
+    /// Optional language hint (ISO-639-1, e.g. "en", "ru").
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Maximum voice duration in seconds (messages longer than this are skipped).
+    #[serde(default = "default_transcription_max_duration_secs")]
+    pub max_duration_secs: u64,
+}
+
+impl Default for TranscriptionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_url: default_transcription_api_url(),
+            model: default_transcription_model(),
+            language: None,
+            max_duration_secs: default_transcription_max_duration_secs(),
         }
     }
 }
@@ -2804,6 +2861,7 @@ impl Default for Config {
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
+            transcription: TranscriptionConfig::default(),
         }
     }
 }
@@ -3860,6 +3918,7 @@ default_temperature = 0.7
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            transcription: TranscriptionConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -4029,6 +4088,7 @@ tool_dispatcher = "xml"
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            transcription: TranscriptionConfig::default(),
         };
 
         config.save().await.unwrap();
@@ -5884,5 +5944,41 @@ default_model = "legacy-model"
             mode & 0o004 != 0,
             "Test setup: file should be world-readable (mode {mode:o})"
         );
+    }
+
+    #[test]
+    async fn transcription_config_defaults() {
+        let tc = TranscriptionConfig::default();
+        assert!(!tc.enabled);
+        assert!(tc.api_url.contains("groq.com"));
+        assert_eq!(tc.model, "whisper-large-v3-turbo");
+        assert!(tc.language.is_none());
+        assert_eq!(tc.max_duration_secs, 120);
+    }
+
+    #[test]
+    async fn config_roundtrip_with_transcription() {
+        let mut config = Config::default();
+        config.transcription.enabled = true;
+        config.transcription.language = Some("en".into());
+
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&toml_str).unwrap();
+
+        assert!(parsed.transcription.enabled);
+        assert_eq!(parsed.transcription.language.as_deref(), Some("en"));
+        assert_eq!(parsed.transcription.model, "whisper-large-v3-turbo");
+    }
+
+    #[test]
+    async fn config_without_transcription_uses_defaults() {
+        let toml_str = r#"
+            default_provider = "openrouter"
+            default_model = "test-model"
+            default_temperature = 0.7
+        "#;
+        let parsed: Config = toml::from_str(toml_str).unwrap();
+        assert!(!parsed.transcription.enabled);
+        assert_eq!(parsed.transcription.max_duration_secs, 120);
     }
 }

@@ -310,6 +310,7 @@ pub struct TelegramChannel {
     last_draft_edit: Mutex<std::collections::HashMap<String, std::time::Instant>>,
     mention_only: bool,
     bot_username: Mutex<Option<String>>,
+    transcription: Option<crate::config::TranscriptionConfig>,
 }
 
 impl TelegramChannel {
@@ -337,6 +338,7 @@ impl TelegramChannel {
             typing_handle: Mutex::new(None),
             mention_only,
             bot_username: Mutex::new(None),
+            transcription: None,
         }
     }
 
@@ -348,6 +350,14 @@ impl TelegramChannel {
     ) -> Self {
         self.stream_mode = stream_mode;
         self.draft_update_interval_ms = draft_update_interval_ms;
+        self
+    }
+
+    /// Configure voice transcription.
+    pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
+        if config.enabled {
+            self.transcription = Some(config);
+        }
         self
     }
 
@@ -738,6 +748,176 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 ))
                 .await;
         }
+    }
+
+    /// Get the file path for a Telegram file ID via the Bot API.
+    async fn get_file_path(&self, file_id: &str) -> anyhow::Result<String> {
+        let url = self.api_url("getFile");
+        let resp = self
+            .http_client()
+            .get(&url)
+            .query(&[("file_id", file_id)])
+            .send()
+            .await
+            .context("Failed to call Telegram getFile")?;
+
+        let data: serde_json::Value = resp.json().await?;
+        data.get("result")
+            .and_then(|r| r.get("file_path"))
+            .and_then(serde_json::Value::as_str)
+            .map(String::from)
+            .context("Telegram getFile: missing file_path in response")
+    }
+
+    /// Download a file from the Telegram CDN.
+    async fn download_file(&self, file_path: &str) -> anyhow::Result<Vec<u8>> {
+        let url = format!(
+            "https://api.telegram.org/file/bot{}/{file_path}",
+            self.bot_token
+        );
+        let resp = self
+            .http_client()
+            .get(&url)
+            .send()
+            .await
+            .context("Failed to download Telegram file")?;
+
+        if !resp.status().is_success() {
+            anyhow::bail!("Telegram file download failed: {}", resp.status());
+        }
+
+        Ok(resp.bytes().await?.to_vec())
+    }
+
+    /// Extract (file_id, duration) from a voice or audio message.
+    fn parse_voice_metadata(message: &serde_json::Value) -> Option<(String, u64)> {
+        let voice = message.get("voice").or_else(|| message.get("audio"))?;
+        let file_id = voice.get("file_id")?.as_str()?.to_string();
+        let duration = voice
+            .get("duration")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        Some((file_id, duration))
+    }
+
+    /// Attempt to parse a Telegram update as a voice message and transcribe it.
+    ///
+    /// Returns `None` if the message is not a voice message, transcription is disabled,
+    /// or the message exceeds duration limits.
+    async fn try_parse_voice_message(&self, update: &serde_json::Value) -> Option<ChannelMessage> {
+        let config = self.transcription.as_ref()?;
+        let message = update.get("message")?;
+
+        let (file_id, duration) = Self::parse_voice_metadata(message)?;
+
+        if duration > config.max_duration_secs {
+            tracing::info!(
+                "Skipping voice message: duration {duration}s exceeds limit {}s",
+                config.max_duration_secs
+            );
+            return None;
+        }
+
+        // Extract sender info (same logic as parse_update_message)
+        let username = message
+            .get("from")
+            .and_then(|from| from.get("username"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+
+        let sender_id = message
+            .get("from")
+            .and_then(|from| from.get("id"))
+            .and_then(serde_json::Value::as_i64)
+            .map(|id| id.to_string());
+
+        let sender_identity = if username == "unknown" {
+            sender_id.clone().unwrap_or_else(|| "unknown".to_string())
+        } else {
+            username.clone()
+        };
+
+        let mut identities = vec![username.as_str()];
+        if let Some(id) = sender_id.as_deref() {
+            identities.push(id);
+        }
+
+        if !self.is_any_user_allowed(identities.iter().copied()) {
+            return None;
+        }
+
+        let chat_id = message
+            .get("chat")
+            .and_then(|chat| chat.get("id"))
+            .and_then(serde_json::Value::as_i64)
+            .map(|id| id.to_string())?;
+
+        let message_id = message
+            .get("message_id")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+
+        let thread_id = message
+            .get("message_thread_id")
+            .and_then(serde_json::Value::as_i64)
+            .map(|id| id.to_string());
+
+        let reply_target = if let Some(tid) = thread_id {
+            format!("{}:{}", chat_id, tid)
+        } else {
+            chat_id.clone()
+        };
+
+        // Download and transcribe
+        let file_path = match self.get_file_path(&file_id).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("Failed to get voice file path: {e}");
+                return None;
+            }
+        };
+
+        let file_name = file_path
+            .rsplit('/')
+            .next()
+            .unwrap_or("voice.ogg")
+            .to_string();
+
+        let audio_data = match self.download_file(&file_path).await {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("Failed to download voice file: {e}");
+                return None;
+            }
+        };
+
+        let text =
+            match super::transcription::transcribe_audio(audio_data, &file_name, config).await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!("Voice transcription failed: {e}");
+                    return None;
+                }
+            };
+
+        if text.trim().is_empty() {
+            tracing::info!("Voice transcription returned empty text, skipping");
+            return None;
+        }
+
+        Some(ChannelMessage {
+            id: format!("telegram_{chat_id}_{message_id}"),
+            sender: sender_identity,
+            reply_target,
+            content: format!("[Voice] {text}"),
+            channel: "telegram".to_string(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            thread_ts: None,
+        })
     }
 
     fn parse_update_message(&self, update: &serde_json::Value) -> Option<ChannelMessage> {
@@ -1778,7 +1958,11 @@ Ensure only one `zeroclaw` process is using this bot token."
                         offset = uid + 1;
                     }
 
-                    let Some(msg) = self.parse_update_message(update) else {
+                    let msg = if let Some(m) = self.parse_update_message(update) {
+                        m
+                    } else if let Some(m) = self.try_parse_voice_message(update).await {
+                        m
+                    } else {
                         self.handle_unauthorized_message(update).await;
                         continue;
                     };
@@ -2962,5 +3146,68 @@ mod tests {
         for part in &parts {
             assert!(part.len() <= TELEGRAM_MAX_MESSAGE_LENGTH);
         }
+    }
+
+    #[test]
+    fn parse_voice_metadata_extracts_voice() {
+        let msg = serde_json::json!({
+            "voice": {
+                "file_id": "abc123",
+                "duration": 5
+            }
+        });
+        let (file_id, dur) = TelegramChannel::parse_voice_metadata(&msg).unwrap();
+        assert_eq!(file_id, "abc123");
+        assert_eq!(dur, 5);
+    }
+
+    #[test]
+    fn parse_voice_metadata_extracts_audio() {
+        let msg = serde_json::json!({
+            "audio": {
+                "file_id": "audio456",
+                "duration": 30
+            }
+        });
+        let (file_id, dur) = TelegramChannel::parse_voice_metadata(&msg).unwrap();
+        assert_eq!(file_id, "audio456");
+        assert_eq!(dur, 30);
+    }
+
+    #[test]
+    fn parse_voice_metadata_returns_none_for_text() {
+        let msg = serde_json::json!({
+            "text": "hello"
+        });
+        assert!(TelegramChannel::parse_voice_metadata(&msg).is_none());
+    }
+
+    #[test]
+    fn parse_voice_metadata_defaults_duration_to_zero() {
+        let msg = serde_json::json!({
+            "voice": {
+                "file_id": "no_dur"
+            }
+        });
+        let (_, dur) = TelegramChannel::parse_voice_metadata(&msg).unwrap();
+        assert_eq!(dur, 0);
+    }
+
+    #[test]
+    fn with_transcription_sets_config_when_enabled() {
+        let mut tc = crate::config::TranscriptionConfig::default();
+        tc.enabled = true;
+
+        let ch =
+            TelegramChannel::new("token".into(), vec!["*".into()], false).with_transcription(tc);
+        assert!(ch.transcription.is_some());
+    }
+
+    #[test]
+    fn with_transcription_skips_when_disabled() {
+        let tc = crate::config::TranscriptionConfig::default(); // enabled = false
+        let ch =
+            TelegramChannel::new("token".into(), vec!["*".into()], false).with_transcription(tc);
+        assert!(ch.transcription.is_none());
     }
 }

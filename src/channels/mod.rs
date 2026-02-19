@@ -30,6 +30,7 @@ pub mod signal;
 pub mod slack;
 pub mod telegram;
 pub mod traits;
+pub mod transcription;
 pub mod whatsapp;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_storage;
@@ -2037,7 +2038,8 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                     tg.allowed_users.clone(),
                     tg.mention_only,
                 )
-                .with_streaming(tg.stream_mode, tg.draft_update_interval_ms),
+                .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
+                .with_transcription(config.transcription.clone()),
             ),
         ));
     }
@@ -2436,7 +2438,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 tg.allowed_users.clone(),
                 tg.mention_only,
             )
-            .with_streaming(tg.stream_mode, tg.draft_update_interval_ms),
+            .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
+            .with_transcription(config.transcription.clone()),
         ));
     }
 
