@@ -1,4 +1,10 @@
 //! USB device discovery — enumerate devices and enrich with board registry.
+//!
+//! USB enumeration via `nusb` is only supported on Linux, macOS, and Windows.
+//! On Android (Termux) and other unsupported platforms this module is excluded
+//! from compilation; callers in `hardware/mod.rs` fall back to an empty result.
+
+#![cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 
 use super::registry;
 use anyhow::Result;

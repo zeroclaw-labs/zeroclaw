@@ -130,11 +130,13 @@ opentelemetry = { version = "0.31", default-features = false, features = ["trace
 opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "metrics"] }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-client", "reqwest-rustls-webpki-roots"] }
 
-# USB device enumeration (hardware discovery)
-nusb = { version = "0.2", default-features = false, optional = true }
-
 # Serial port for peripheral communication (STM32, etc.)
 tokio-serial = { version = "5", default-features = false, optional = true }
+
+# USB device enumeration (hardware discovery) — only on platforms nusb supports
+# (Linux, macOS, Windows). Android/Termux uses target_os="android" and is excluded.
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
+nusb = { version = "0.2", default-features = false, optional = true }
 
 # probe-rs for STM32/Nucleo memory read (Phase B)
 probe-rs = { version = "0.30", optional = true }
