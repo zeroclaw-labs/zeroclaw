@@ -263,7 +263,9 @@ impl Channel for QQChannel {
                 }
             }
         });
-        write.send(Message::Text(identify.to_string())).await?;
+        write
+            .send(Message::Text(identify.to_string().into()))
+            .await?;
 
         tracing::info!("QQ: connected and identified");
 
@@ -287,7 +289,11 @@ impl Channel for QQChannel {
                 _ = hb_rx.recv() => {
                     let d = if sequence >= 0 { json!(sequence) } else { json!(null) };
                     let hb = json!({"op": 1, "d": d});
-                    if write.send(Message::Text(hb.to_string())).await.is_err() {
+                    if write
+                        .send(Message::Text(hb.to_string().into()))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -298,7 +304,7 @@ impl Channel for QQChannel {
                         _ => continue,
                     };
 
-                    let event: serde_json::Value = match serde_json::from_str(&msg) {
+                    let event: serde_json::Value = match serde_json::from_str(msg.as_ref()) {
                         Ok(e) => e,
                         Err(_) => continue,
                     };
@@ -315,7 +321,11 @@ impl Channel for QQChannel {
                         1 => {
                             let d = if sequence >= 0 { json!(sequence) } else { json!(null) };
                             let hb = json!({"op": 1, "d": d});
-                            if write.send(Message::Text(hb.to_string())).await.is_err() {
+                            if write
+                                .send(Message::Text(hb.to_string().into()))
+                                .await
+                                .is_err()
+                            {
                                 break;
                             }
                             continue;

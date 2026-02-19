@@ -26,7 +26,7 @@ tokio-util = { version = "0.7", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "multipart", "stream", "socks"] }
 
 # Matrix client + E2EE decryption
-matrix-sdk = { version = "0.16", default-features = false, features = ["e2e-encryption", "rustls-tls", "markdown"] }
+matrix-sdk = { version = "0.16", optional = true, default-features = false, features = ["e2e-encryption", "rustls-tls", "markdown"] }
 
 # Serialization
 serde = { version = "1.0", default-features = false, features = ["derive"] }
@@ -103,8 +103,8 @@ console = "0.16"
 # Hardware discovery (device path globbing)
 glob = "0.3"
 
-# Discord WebSocket gateway
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+# WebSocket client channels (Discord/Lark/DingTalk)
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 futures = "0.3"
 regex = "1.10"
@@ -158,8 +158,9 @@ rppal = { version = "0.22", optional = true }
 landlock = { version = "0.4", optional = true }
 
 [features]
-default = ["hardware"]
+default = ["hardware", "channel-matrix"]
 hardware = ["nusb", "tokio-serial"]
+channel-matrix = ["dep:matrix-sdk"]
 peripheral-rpi = ["rppal"]
 # Browser backend feature alias used by cfg(feature = "browser-native")
 browser-native = ["dep:fantoccini"]

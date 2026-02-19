@@ -69,6 +69,25 @@ Operational notes:
 
 ## Channel Matrix
 
+### Build Feature Toggle (`channel-matrix`)
+
+Matrix support is controlled at compile time by the `channel-matrix` Cargo feature.
+
+- Default builds include Matrix support (`default = ["hardware", "channel-matrix"]`).
+- For faster local iteration when Matrix is not needed:
+
+```bash
+cargo check --no-default-features --features hardware
+```
+
+- To explicitly enable Matrix support in custom feature sets:
+
+```bash
+cargo check --no-default-features --features hardware,channel-matrix
+```
+
+If `[channels_config.matrix]` is present but the binary was built without `channel-matrix`, `zeroclaw channel list`, `zeroclaw channel doctor`, and `zeroclaw channel start` will log that Matrix is intentionally skipped for this build.
+
 ---
 
 ## 2. Delivery Modes at a Glance

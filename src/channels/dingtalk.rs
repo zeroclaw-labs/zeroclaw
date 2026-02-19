@@ -169,7 +169,7 @@ impl Channel for DingTalkChannel {
                 _ => continue,
             };
 
-            let frame: serde_json::Value = match serde_json::from_str(&msg) {
+            let frame: serde_json::Value = match serde_json::from_str(msg.as_ref()) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
@@ -195,7 +195,7 @@ impl Channel for DingTalkChannel {
                         "data": "",
                     });
 
-                    if let Err(e) = write.send(Message::Text(pong.to_string())).await {
+                    if let Err(e) = write.send(Message::Text(pong.to_string().into())).await {
                         tracing::warn!("DingTalk: failed to send pong: {e}");
                         break;
                     }
@@ -262,7 +262,7 @@ impl Channel for DingTalkChannel {
                         "message": "OK",
                         "data": "",
                     });
-                    let _ = write.send(Message::Text(ack.to_string())).await;
+                    let _ = write.send(Message::Text(ack.to_string().into())).await;
 
                     let channel_msg = ChannelMessage {
                         id: Uuid::new_v4().to_string(),
