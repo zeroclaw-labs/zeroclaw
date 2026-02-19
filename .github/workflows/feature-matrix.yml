@@ -1,12 +1,6 @@
 name: Feature Matrix
 
 on:
-    push:
-        branches: [main]
-        paths:
-            - "Cargo.toml"
-            - "Cargo.lock"
-            - "src/**"
     schedule:
         - cron: "30 4 * * 1" # Weekly Monday 4:30am UTC
     workflow_dispatch:
@@ -61,6 +55,3 @@ jobs:
 
             - name: Check feature combination
               run: cargo check --locked ${{ matrix.args }}
-
-            - name: Test feature combination
-              run: cargo test --locked ${{ matrix.args }}

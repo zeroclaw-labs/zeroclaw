@@ -25,8 +25,7 @@ permissions:
 
 jobs:
     label:
-        runs-on: blacksmith-2vcpu-ubuntu-2404
-        timeout-minutes: 10
+        runs-on: ubuntu-latest
         steps:
             - name: Checkout repository
               uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4

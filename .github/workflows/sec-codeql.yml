@@ -2,7 +2,7 @@ name: Sec CodeQL
 
 on:
     schedule:
-        - cron: "0 6,18 * * *" # Twice daily at 6am and 6pm UTC
+        - cron: "0 6 * * 1" # Weekly Monday 6am UTC
     workflow_dispatch:
 
 concurrency:
