@@ -3683,7 +3683,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     allowed_users,
                 });
             }
-            10 => {
+            11 => {
                 // ── Lark/Feishu ──
                 println!();
                 println!(
