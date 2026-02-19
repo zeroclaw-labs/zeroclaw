@@ -269,10 +269,13 @@ pub async fn api_error(provider: &str, response: reqwest::Response) -> anyhow::E
 /// Resolution order:
 /// 1. Explicitly provided `api_key` parameter (trimmed, filtered if empty)
 /// 2. Provider-specific environment variable (e.g., `ANTHROPIC_OAUTH_TOKEN`, `OPENROUTER_API_KEY`)
-/// 3. Generic fallback variables (`ZEROCLAW_API_KEY`, `API_KEY`)
+/// 3. Generic fallback variables (`ZEROCLAW_API_KEY`, `API_KEY`) for non-OAuth providers
 ///
 /// For Anthropic, the provider-specific env var is `ANTHROPIC_OAUTH_TOKEN` (for setup-tokens)
 /// followed by `ANTHROPIC_API_KEY` (for regular API keys).
+///
+/// OAuth providers (`codex`/`openai-codex`, `antigravity`/`google-antigravity`)
+/// intentionally skip the generic fallback to avoid masking missing credentials.
 fn resolve_provider_credential(name: &str, credential_override: Option<&str>) -> Option<String> {
     if let Some(raw_override) = credential_override {
         let trimmed_override = raw_override.trim();
