@@ -1220,6 +1220,19 @@ mod tests {
     }
 
     #[test]
+    fn resolve_provider_credential_bedrock_uses_internal_credential_path() {
+        let _generic_guard = EnvGuard::set("API_KEY", Some("generic-key"));
+        let _override_guard = EnvGuard::set("OPENROUTER_API_KEY", Some("openrouter-key"));
+
+        assert_eq!(
+            resolve_provider_credential("bedrock", Some("explicit")),
+            Some("explicit".to_string())
+        );
+        assert!(resolve_provider_credential("bedrock", None).is_none());
+        assert!(resolve_provider_credential("aws-bedrock", None).is_none());
+    }
+
+    #[test]
     fn regional_alias_predicates_cover_expected_variants() {
         assert!(is_moonshot_alias("moonshot"));
         assert!(is_moonshot_alias("kimi-global"));

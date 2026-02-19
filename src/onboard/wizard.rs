@@ -505,6 +505,7 @@ fn canonical_provider_name(provider_name: &str) -> &str {
         "google" | "google-gemini" => "gemini",
         "kimi_coding" | "kimi_for_coding" => "kimi-code",
         "nvidia-nim" | "build.nvidia.com" => "nvidia",
+        "aws-bedrock" => "bedrock",
         _ => provider_name,
     }
 }
@@ -547,7 +548,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "ollama" => "llama3.2".into(),
         "gemini" => "gemini-2.5-pro".into(),
         "kimi-code" => "kimi-for-coding".into(),
-        "bedrock" | "aws-bedrock" => "anthropic.claude-sonnet-4-5-20250929-v1:0".into(),
+        "bedrock" => "anthropic.claude-sonnet-4-5-20250929-v1:0".into(),
         "nvidia" => "meta/llama-3.3-70b-instruct".into(),
         "astrai" => "anthropic/claude-sonnet-4.6".into(),
         _ => "anthropic/claude-sonnet-4.6".into(),
@@ -5048,6 +5049,10 @@ mod tests {
         assert_eq!(default_model_for_provider("google"), "gemini-2.5-pro");
         assert_eq!(default_model_for_provider("kimi-code"), "kimi-for-coding");
         assert_eq!(
+            default_model_for_provider("bedrock"),
+            "anthropic.claude-sonnet-4-5-20250929-v1:0"
+        );
+        assert_eq!(
             default_model_for_provider("google-gemini"),
             "gemini-2.5-pro"
         );
@@ -5081,6 +5086,7 @@ mod tests {
         assert_eq!(canonical_provider_name("zai-cn"), "zai");
         assert_eq!(canonical_provider_name("z.ai-global"), "zai");
         assert_eq!(canonical_provider_name("nvidia-nim"), "nvidia");
+        assert_eq!(canonical_provider_name("aws-bedrock"), "bedrock");
         assert_eq!(canonical_provider_name("build.nvidia.com"), "nvidia");
     }
 
@@ -5128,6 +5134,19 @@ mod tests {
             .collect();
 
         assert!(ids.contains(&"anthropic/claude-sonnet-4.6".to_string()));
+    }
+
+    #[test]
+    fn curated_models_for_bedrock_include_verified_model_ids() {
+        let ids: Vec<String> = curated_models_for_provider("bedrock")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+
+        assert!(ids.contains(&"anthropic.claude-sonnet-4-6".to_string()));
+        assert!(ids.contains(&"anthropic.claude-opus-4-6-v1".to_string()));
+        assert!(ids.contains(&"anthropic.claude-haiku-4-5-20251001-v1:0".to_string()));
+        assert!(ids.contains(&"anthropic.claude-sonnet-4-5-20250929-v1:0".to_string()));
     }
 
     #[test]
@@ -5228,6 +5247,10 @@ mod tests {
         assert_eq!(
             curated_models_for_provider("nvidia"),
             curated_models_for_provider("build.nvidia.com")
+        );
+        assert_eq!(
+            curated_models_for_provider("bedrock"),
+            curated_models_for_provider("aws-bedrock")
         );
     }
 
