@@ -583,13 +583,19 @@ fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value, Opt
     calls
 }
 
+/// Result of a streaming LLM response before final processing.
+struct StreamingResponse {
+    response_text: String,
+    parsed_text: String,
+    tool_calls: Vec<ParsedToolCall>,
+    assistant_history_content: String,
+    native_tool_calls: Vec<ToolCall>,
+}
+
 /// Attempt to parse incomplete tool calls from a buffer during streaming.
 /// Returns Some((text_before_tool_calls, parsed_calls)) if complete tool calls are found.
 /// Returns None if no complete tool calls detected yet.
 fn try_parse_incomplete_tool_calls(buffer: &str) -> Option<(String, Vec<ParsedToolCall>)> {
-    use regex::Regex;
-    use std::sync::LazyLock;
-
     // Check if we have a complete <tool_call>...</tool_call> pair
     static TOOL_CALL_RE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"<tool[_-]?call>\s*(\{.*?\})\s*</tool[_-]?call>").unwrap());
@@ -658,18 +664,7 @@ async fn try_streaming_response(
     temperature: f64,
     on_delta: Option<&tokio::sync::mpsc::Sender<String>>,
     use_native_tools: bool,
-) -> Option<
-    Result<
-        (
-            String,              // response_text
-            String,              // parsed_text
-            Vec<ParsedToolCall>, // tool_calls
-            String,              // assistant_history_content
-            Vec<ToolCall>,       // native_tool_calls
-        ),
-        anyhow::Error,
-    >,
-> {
+) -> Option<Result<StreamingResponse, anyhow::Error>> {
     // Only try streaming if provider supports it and we have on_delta
     if !provider.supports_streaming() || on_delta.is_none() {
         return None;
@@ -678,7 +673,6 @@ async fn try_streaming_response(
     // For now, skip streaming if using native tools (tool calls in streaming are complex)
     // We can enhance this later to support streaming tool calls
     if use_native_tools && request.tools.is_some() {
-        // Check if tools are actually provided
         if let Some(tools) = request.tools {
             if !tools.is_empty() {
                 return None;
@@ -695,7 +689,12 @@ async fn try_streaming_response(
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
             Ok(chunk) => {
+                // Final chunk may have remaining delta content
                 if chunk.is_final {
+                    if !chunk.delta.is_empty() {
+                        buffer.push_str(&chunk.delta);
+                        let _ = tx.send(chunk.delta).await;
+                    }
                     break;
                 }
 
@@ -703,27 +702,27 @@ async fn try_streaming_response(
 
                 // Try to detect tool calls in the accumulated buffer
                 if let Some((text_part, calls)) = try_parse_incomplete_tool_calls(&buffer) {
-                    // Tool calls detected - stop streaming to user
-                    // Return the complete result
                     let response_text = buffer.clone();
                     let assistant_history_content = response_text.clone();
 
-                    return Some(Ok((
+                    return Some(Ok(StreamingResponse {
                         response_text,
-                        text_part,
-                        calls,
+                        parsed_text: text_part,
+                        tool_calls: calls,
                         assistant_history_content,
-                        Vec::new(), // native_tool_calls - empty for streaming path currently
-                    )));
+                        native_tool_calls: Vec::new(),
+                    }));
                 }
 
                 // No tool calls yet - stream to user
                 if !chunk.delta.is_empty() {
-                    let _ = tx.send(chunk.delta).await;
+                    if tx.send(chunk.delta).await.is_err() {
+                        // Receiver dropped - stop streaming to save tokens
+                        break;
+                    }
                 }
             }
             Err(e) => {
-                // Streaming error - fallback to non-streaming
                 tracing::warn!("Streaming error, falling back to non-streaming: {}", e);
                 return None;
             }
@@ -731,17 +730,16 @@ async fn try_streaming_response(
     }
 
     // Stream completed without tool calls
-    // Parse any tool calls from complete buffer
     let (parsed_text, calls) = parse_tool_calls(&buffer);
     let assistant_history_content = buffer.clone();
 
-    Some(Ok((
-        buffer,
+    Some(Ok(StreamingResponse {
+        response_text: buffer,
         parsed_text,
-        calls,
+        tool_calls: calls,
         assistant_history_content,
-        Vec::new(),
-    )))
+        native_tool_calls: Vec::new(),
+    }))
 }
 
 /// Parse tool calls from an LLM response that uses XML-style function calling.
@@ -1104,7 +1102,13 @@ pub(crate) async fn run_tool_call_loop(
                         success: true,
                         error_message: None,
                     });
-                    result
+                    (
+                        result.response_text,
+                        result.parsed_text,
+                        result.tool_calls,
+                        result.assistant_history_content,
+                        result.native_tool_calls,
+                    )
                 }
                 Some(Err(e)) => {
                     observer.record_event(&ObserverEvent::LlmResponse {

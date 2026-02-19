@@ -1461,9 +1461,6 @@ impl Provider for OpenAiCompatibleProvider {
         options: crate::providers::StreamOptions,
     ) -> stream::BoxStream<'static, crate::providers::StreamResult<crate::providers::StreamChunk>>
     {
-        use crate::providers::{StreamChunk, StreamError, StreamResult};
-        use futures_util::{stream, StreamExt};
-
         let credential = match self.credential.as_ref() {
             Some(value) => value.clone(),
             None => {

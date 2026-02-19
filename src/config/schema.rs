@@ -1769,12 +1769,8 @@ pub struct ReliabilityConfig {
     pub scheduler_retries: u32,
     /// Enable real-time streaming from LLM providers for faster response delivery.
     /// When enabled, compatible providers will stream response chunks as they arrive.
-    #[serde(default = "default_streaming_enabled")]
+    #[serde(default)]
     pub streaming_enabled: bool,
-}
-
-fn default_streaming_enabled() -> bool {
-    false
 }
 
 fn default_provider_retries() -> u32 {
@@ -1813,7 +1809,7 @@ impl Default for ReliabilityConfig {
             channel_max_backoff_secs: default_channel_backoff_max_secs(),
             scheduler_poll_secs: default_scheduler_poll_secs(),
             scheduler_retries: default_scheduler_retries(),
-            streaming_enabled: default_streaming_enabled(),
+            streaming_enabled: false,
         }
     }
 }
