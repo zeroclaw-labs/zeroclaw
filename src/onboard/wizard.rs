@@ -547,6 +547,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "ollama" => "llama3.2".into(),
         "gemini" => "gemini-2.5-pro".into(),
         "kimi-code" => "kimi-for-coding".into(),
+        "bedrock" | "aws-bedrock" => "anthropic.claude-sonnet-4-5-20250929-v1:0".into(),
         "nvidia" => "meta/llama-3.3-70b-instruct".into(),
         "astrai" => "anthropic/claude-sonnet-4.6".into(),
         _ => "anthropic/claude-sonnet-4.6".into(),
@@ -863,6 +864,24 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
             ("mistral".to_string(), "Mistral 7B".to_string()),
             ("codellama".to_string(), "Code Llama".to_string()),
             ("phi3".to_string(), "Phi-3 (small, fast)".to_string()),
+        ],
+        "bedrock" => vec![
+            (
+                "anthropic.claude-sonnet-4-6".to_string(),
+                "Claude Sonnet 4.6 (latest, recommended)".to_string(),
+            ),
+            (
+                "anthropic.claude-opus-4-6-v1".to_string(),
+                "Claude Opus 4.6 (strongest)".to_string(),
+            ),
+            (
+                "anthropic.claude-haiku-4-5-20251001-v1:0".to_string(),
+                "Claude Haiku 4.5 (fastest, cheapest)".to_string(),
+            ),
+            (
+                "anthropic.claude-sonnet-4-5-20250929-v1:0".to_string(),
+                "Claude Sonnet 4.5".to_string(),
+            ),
         ],
         "gemini" => vec![
             (
@@ -1826,29 +1845,51 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
         };
 
         println!();
-        if !key_url.is_empty() {
+        if matches!(provider_name, "bedrock" | "aws-bedrock") {
+            // Bedrock uses AWS AKSK, not a single API key.
+            print_bullet("Bedrock uses AWS credentials (not a single API key).");
             print_bullet(&format!(
-                "Get your API key at: {}",
-                style(key_url).cyan().underlined()
+                "Set {} and {} environment variables.",
+                style("AWS_ACCESS_KEY_ID").yellow(),
+                style("AWS_SECRET_ACCESS_KEY").yellow(),
             ));
-        }
-        print_bullet("You can also set it later via env var or config file.");
-        println!();
-
-        let key: String = Input::new()
-            .with_prompt("  Paste your API key (or press Enter to skip)")
-            .allow_empty(true)
-            .interact_text()?;
-
-        if key.is_empty() {
-            let env_var = provider_env_var(provider_name);
             print_bullet(&format!(
-                "Skipped. Set {} or edit config.toml later.",
-                style(env_var).yellow()
+                "Optionally set {} for the region (default: us-east-1).",
+                style("AWS_REGION").yellow(),
             ));
-        }
+            if !key_url.is_empty() {
+                print_bullet(&format!(
+                    "Manage IAM credentials at: {}",
+                    style(key_url).cyan().underlined()
+                ));
+            }
+            println!();
+            String::new()
+        } else {
+            if !key_url.is_empty() {
+                print_bullet(&format!(
+                    "Get your API key at: {}",
+                    style(key_url).cyan().underlined()
+                ));
+            }
+            print_bullet("You can also set it later via env var or config file.");
+            println!();
 
-        key
+            let key: String = Input::new()
+                .with_prompt("  Paste your API key (or press Enter to skip)")
+                .allow_empty(true)
+                .interact_text()?;
+
+            if key.is_empty() {
+                let env_var = provider_env_var(provider_name);
+                print_bullet(&format!(
+                    "Skipped. Set {} or edit config.toml later.",
+                    style(env_var).yellow()
+                ));
+            }
+
+            key
+        }
     };
 
     // ── Model selection ──
