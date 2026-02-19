@@ -347,10 +347,17 @@ pub fn verify_linq_signature(secret: &str, body: &str, timestamp: &str, signatur
         return false;
     };
     mac.update(message.as_bytes());
-    let expected = hex::encode(mac.finalize().into_bytes());
+    let signature_hex = signature
+        .trim()
+        .strip_prefix("sha256=")
+        .unwrap_or(signature);
+    let Ok(provided) = hex::decode(signature_hex.trim()) else {
+        tracing::warn!("Linq: invalid webhook signature format");
+        return false;
+    };
 
-    // Constant-time comparison
-    crate::security::pairing::constant_time_eq(&expected, signature)
+    // Constant-time comparison via HMAC verify.
+    mac.verify_slice(&provided).is_ok()
 }
 
 #[cfg(test)]
@@ -585,6 +592,38 @@ mod tests {
             !verify_linq_signature(secret, body, &stale_ts, &signature),
             "Stale timestamps (>300s) should be rejected"
         );
+    }
+
+    #[test]
+    fn linq_signature_verification_accepts_sha256_prefix() {
+        let secret = "test_webhook_secret";
+        let body = r#"{"event_type":"message.received"}"#;
+        let now = chrono::Utc::now().timestamp().to_string();
+
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let message = format!("{now}.{body}");
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(message.as_bytes());
+        let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+
+        assert!(verify_linq_signature(secret, body, &now, &signature));
+    }
+
+    #[test]
+    fn linq_signature_verification_accepts_uppercase_hex() {
+        let secret = "test_webhook_secret";
+        let body = r#"{"event_type":"message.received"}"#;
+        let now = chrono::Utc::now().timestamp().to_string();
+
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let message = format!("{now}.{body}");
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(message.as_bytes());
+        let signature = hex::encode(mac.finalize().into_bytes()).to_ascii_uppercase();
+
+        assert!(verify_linq_signature(secret, body, &now, &signature));
     }
 
     #[test]
