@@ -3012,7 +3012,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     if config.nostr.is_some() {
                         "✅ connected"
                     } else {
-                        "— Nostr DMs"
+                        "     — Nostr DMs"
                     }
                 ),
                 ChannelMenuChoice::Done => "Done — finish setup".to_string(),
