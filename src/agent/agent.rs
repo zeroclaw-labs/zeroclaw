@@ -678,7 +678,8 @@ mod tests {
             ..crate::config::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None).unwrap(),
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
         );
 
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -690,7 +691,7 @@ mod tests {
             .tool_dispatcher(Box::new(XmlToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
             .build()
-            .unwrap();
+            .expect("agent builder should succeed with valid config");
 
         let response = agent.turn("hi").await.unwrap();
         assert_eq!(response, "hello");
@@ -720,7 +721,8 @@ mod tests {
             ..crate::config::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None).unwrap(),
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
         );
 
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -732,7 +734,7 @@ mod tests {
             .tool_dispatcher(Box::new(NativeToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
             .build()
-            .unwrap();
+            .expect("agent builder should succeed with valid config");
 
         let response = agent.turn("hi").await.unwrap();
         assert_eq!(response, "done");
