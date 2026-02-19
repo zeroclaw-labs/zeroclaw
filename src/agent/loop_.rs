@@ -1001,11 +1001,13 @@ pub(crate) async fn run_tool_call_loop(
                         arguments: call.arguments.clone(),
                     };
 
-                    // Only prompt interactively on CLI; auto-approve on other channels.
+                    // On CLI, prompt interactively. On other channels where
+                    // interactive approval is not possible, deny the call to
+                    // respect the supervised autonomy setting.
                     let decision = if channel_name == "cli" {
                         mgr.prompt_cli(&request)
                     } else {
-                        ApprovalResponse::Yes
+                        ApprovalResponse::No
                     };
 
                     mgr.record_decision(&call.name, &call.arguments, decision, channel_name);
