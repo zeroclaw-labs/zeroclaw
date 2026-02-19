@@ -18,6 +18,10 @@ Runtime resolution order is:
 2. Provider-specific env var(s)
 3. Generic fallback env vars: `ZEROCLAW_API_KEY` then `API_KEY`
 
+For resilient fallback chains (`reliability.fallback_providers`), each fallback
+provider resolves credentials independently. The primary provider's explicit
+credential is not reused for fallback providers.
+
 ## Provider Catalog
 
 | Canonical ID | Aliases | Local | Provider-specific env var(s) |
