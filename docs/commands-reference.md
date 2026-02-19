@@ -52,6 +52,7 @@ Last verified: **February 19, 2026**.
 - `zeroclaw service install`
 - `zeroclaw service start`
 - `zeroclaw service stop`
+- `zeroclaw service restart`
 - `zeroclaw service status`
 - `zeroclaw service uninstall`
 
@@ -89,6 +90,13 @@ Runtime in-chat commands (Telegram/Discord while channel server is running):
 - `/models <provider>`
 - `/model`
 - `/model <model-id>`
+
+Channel runtime also watches `config.toml` and hot-applies updates to:
+- `default_provider`
+- `default_model`
+- `default_temperature`
+- `api_key` / `api_url` (for the default provider)
+- `reliability.*` provider retry settings
 
 `add/remove` currently route you back to managed setup/manual config paths (not full declarative mutators yet).
 

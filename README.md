@@ -269,6 +269,7 @@ zeroclaw integrations info Telegram
 # Manage background service
 zeroclaw service install
 zeroclaw service status
+zeroclaw service restart
 
 # Migrate memory from OpenClaw (safe preview first)
 zeroclaw migrate openclaw --dry-run
@@ -517,6 +518,10 @@ WhatsApp uses Meta's Cloud API with webhooks (push-based, not polling):
 ## Configuration
 
 Config: `~/.zeroclaw/config.toml` (created by `onboard`)
+
+When `zeroclaw channel start` is already running, changes to `default_provider`,
+`default_model`, `default_temperature`, `api_key`, `api_url`, and `reliability.*`
+are hot-applied on the next inbound channel message.
 
 ```toml
 api_key = "sk-..."
