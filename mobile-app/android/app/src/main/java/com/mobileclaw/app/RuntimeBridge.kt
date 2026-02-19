@@ -46,6 +46,7 @@ object RuntimeBridge {
     private const val RUNTIME_API_URL = "runtime_api_url"
     private const val RUNTIME_API_KEY = "runtime_api_key"
     private const val RUNTIME_TEMPERATURE = "runtime_temperature"
+    private const val RUNTIME_CONFIG_HASH = "runtime_config_hash"
     private const val CAP_SMS = "cap_sms"
     private const val CAP_CALLS = "cap_calls"
     private const val CAP_APP_LAUNCH = "cap_app_launch"
@@ -135,7 +136,33 @@ object RuntimeBridge {
             .putBoolean(CAP_CALENDAR, enabledToolIds.any { it == "android_device.calendar.read_write" })
             .apply()
 
+        val configHash = buildString {
+            append(telegramEnabled)
+            append('|')
+            append(telegramBotToken)
+            append('|')
+            append(runtimeProvider)
+            append('|')
+            append(runtimeModel)
+            append('|')
+            append(runtimeApiUrl)
+            append('|')
+            append(runtimeApiKey)
+            append('|')
+            append(runtimeTemperature)
+            append('|')
+            append(enabledToolIds.sorted().joinToString(","))
+        }
+        val previousHash = prefs.getString(RUNTIME_CONFIG_HASH, "") ?: ""
+        val configChanged = previousHash != configHash
+        if (configChanged) {
+            prefs.edit().putString(RUNTIME_CONFIG_HASH, configHash).apply()
+        }
+
         writeRuntimeConfig(context)
+        if (configChanged) {
+            stopLocalDaemon()
+        }
         ensureAndroidActionBridge(context)
         ensureDaemonRunning(context)
         resetPendingSchedule(context)
@@ -405,6 +432,18 @@ object RuntimeBridge {
         } catch (error: Throwable) {
             val detail = (error.message ?: error::class.java.simpleName).take(120)
             prefs.edit().putString(LAST_EVENT_NOTE, "Failed to start local daemon: $detail").apply()
+        }
+    }
+
+    private fun stopLocalDaemon() {
+        try {
+            ProcessBuilder(
+                "sh",
+                "-c",
+                "pkill -f 'libzeroclaw.so daemon --host 127.0.0.1 --port 8080' || true",
+            ).start().waitFor(2, TimeUnit.SECONDS)
+        } catch (_: Throwable) {
+            // best effort
         }
     }
 
