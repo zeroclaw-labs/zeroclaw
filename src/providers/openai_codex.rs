@@ -1,6 +1,6 @@
 use crate::auth::openai_oauth::extract_account_id_from_jwt;
 use crate::auth::AuthService;
-use crate::providers::traits::Provider;
+use crate::providers::traits::{ChatMessage, Provider};
 use crate::providers::ProviderRuntimeOptions;
 use async_trait::async_trait;
 use reqwest::Client;
@@ -335,14 +335,12 @@ async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<St
     extract_responses_text(&parsed).ok_or_else(|| anyhow::anyhow!("No response from OpenAI Codex"))
 }
 
-#[async_trait]
-impl Provider for OpenAiCodexProvider {
-    async fn chat_with_system(
+impl OpenAiCodexProvider {
+    async fn send_responses_request(
         &self,
-        system_prompt: Option<&str>,
-        message: &str,
+        input: Vec<ResponsesInput>,
+        instructions: String,
         model: &str,
-        _temperature: f64,
     ) -> anyhow::Result<String> {
         let profile = self
             .auth
@@ -368,14 +366,8 @@ impl Provider for OpenAiCodexProvider {
 
         let request = ResponsesRequest {
             model: normalized_model.to_string(),
-            input: vec![ResponsesInput {
-                role: "user".to_string(),
-                content: vec![ResponsesInputContent {
-                    kind: "input_text".to_string(),
-                    text: message.to_string(),
-                }],
-            }],
-            instructions: resolve_instructions(system_prompt),
+            input,
+            instructions,
             store: false,
             stream: true,
             text: ResponsesTextOptions {
@@ -408,6 +400,64 @@ impl Provider for OpenAiCodexProvider {
         }
 
         decode_responses_body(response).await
+    }
+}
+
+#[async_trait]
+impl Provider for OpenAiCodexProvider {
+    async fn chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        let input = vec![ResponsesInput {
+            role: "user".to_string(),
+            content: vec![ResponsesInputContent {
+                kind: "input_text".to_string(),
+                text: message.to_string(),
+            }],
+        }];
+        self.send_responses_request(input, resolve_instructions(system_prompt), model)
+            .await
+    }
+
+    async fn chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        let mut system_parts: Vec<&str> = Vec::new();
+        let mut input: Vec<ResponsesInput> = Vec::new();
+
+        for msg in messages {
+            match msg.role.as_str() {
+                "system" => {
+                    system_parts.push(&msg.content);
+                }
+                "user" | "assistant" => {
+                    input.push(ResponsesInput {
+                        role: msg.role.clone(),
+                        content: vec![ResponsesInputContent {
+                            kind: "input_text".to_string(),
+                            text: msg.content.clone(),
+                        }],
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        let instructions = if system_parts.is_empty() {
+            DEFAULT_CODEX_INSTRUCTIONS.to_string()
+        } else {
+            system_parts.join("\n\n")
+        };
+
+        self.send_responses_request(input, instructions, model)
+            .await
     }
 }
 
