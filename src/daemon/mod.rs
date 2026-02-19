@@ -225,6 +225,7 @@ fn has_supervised_channels(config: &Config) -> bool {
         lark,
         dingtalk,
         qq,
+        ..
     } = &config.channels_config;
 
     telegram.is_some()

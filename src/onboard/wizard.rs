@@ -75,6 +75,7 @@ fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
         lark,
         dingtalk,
         qq,
+        ..
     } = channels;
 
     telegram.is_some()
