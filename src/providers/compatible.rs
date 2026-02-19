@@ -26,6 +26,10 @@ pub struct OpenAiCompatibleProvider {
     /// GLM/Zhipu does not support the responses API.
     supports_responses_fallback: bool,
     user_agent: Option<String>,
+    /// When true, collect all `system` messages and prepend their content
+    /// to the first `user` message, then drop the system messages.
+    /// Required for providers that reject `role: system` (e.g. MiniMax).
+    merge_system_into_user: bool,
 }
 
 /// How the provider expects the API key to be sent.
@@ -46,7 +50,7 @@ impl OpenAiCompatibleProvider {
         credential: Option<&str>,
         auth_style: AuthStyle,
     ) -> Self {
-        Self::new_with_options(name, base_url, credential, auth_style, true, None)
+        Self::new_with_options(name, base_url, credential, auth_style, true, None, false)
     }
 
     /// Same as `new` but skips the /v1/responses fallback on 404.
@@ -57,7 +61,7 @@ impl OpenAiCompatibleProvider {
         credential: Option<&str>,
         auth_style: AuthStyle,
     ) -> Self {
-        Self::new_with_options(name, base_url, credential, auth_style, false, None)
+        Self::new_with_options(name, base_url, credential, auth_style, false, None, false)
     }
 
     /// Create a provider with a custom User-Agent header.
@@ -78,7 +82,19 @@ impl OpenAiCompatibleProvider {
             auth_style,
             true,
             Some(user_agent),
+            false,
         )
+    }
+
+    /// For providers that do not support `role: system` (e.g. MiniMax).
+    /// System prompt content is prepended to the first user message instead.
+    pub fn new_merge_system_into_user(
+        name: &str,
+        base_url: &str,
+        credential: Option<&str>,
+        auth_style: AuthStyle,
+    ) -> Self {
+        Self::new_with_options(name, base_url, credential, auth_style, false, None, true)
     }
 
     fn new_with_options(
@@ -88,6 +104,7 @@ impl OpenAiCompatibleProvider {
         auth_style: AuthStyle,
         supports_responses_fallback: bool,
         user_agent: Option<&str>,
+        merge_system_into_user: bool,
     ) -> Self {
         Self {
             name: name.to_string(),
@@ -96,7 +113,39 @@ impl OpenAiCompatibleProvider {
             auth_header: auth_style,
             supports_responses_fallback,
             user_agent: user_agent.map(ToString::to_string),
+            merge_system_into_user,
         }
+    }
+
+    /// Collect all `system` role messages, concatenate their content,
+    /// and prepend to the first `user` message. Drop all system messages.
+    /// Used for providers (e.g. MiniMax) that reject `role: system`.
+    fn flatten_system_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+        let system_content: String = messages
+            .iter()
+            .filter(|m| m.role == "system")
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        if system_content.is_empty() {
+            return messages.to_vec();
+        }
+
+        let mut result: Vec<ChatMessage> = messages
+            .iter()
+            .filter(|m| m.role != "system")
+            .cloned()
+            .collect();
+
+        if let Some(first_user) = result.iter_mut().find(|m| m.role == "user") {
+            first_user.content = format!("{system_content}\n\n{}", first_user.content);
+        } else {
+            // No user message found: insert a synthetic user message with system content
+            result.insert(0, ChatMessage::user(&system_content));
+        }
+
+        result
     }
 
     fn http_client(&self) -> Client {
@@ -230,6 +279,30 @@ struct Choice {
     message: ResponseMessage,
 }
 
+/// Remove `<think>...</think>` blocks from model output.
+/// Some reasoning models (e.g. MiniMax) embed their chain-of-thought inline
+/// in the `content` field rather than a separate `reasoning_content` field.
+/// The resulting `<think>` tags must be stripped before returning to the user.
+fn strip_think_tags(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut rest = s;
+    loop {
+        if let Some(start) = rest.find("<think>") {
+            result.push_str(&rest[..start]);
+            if let Some(end) = rest[start..].find("</think>") {
+                rest = &rest[start + end + "</think>".len()..];
+            } else {
+                // Unclosed tag: drop the rest to avoid leaking partial reasoning.
+                break;
+            }
+        } else {
+            result.push_str(rest);
+            break;
+        }
+    }
+    result.trim().to_string()
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct ResponseMessage {
     #[serde(default)]
@@ -246,18 +319,22 @@ impl ResponseMessage {
     /// Extract text content, falling back to `reasoning_content` when `content`
     /// is missing or empty. Reasoning/thinking models (Qwen3, GLM-4, etc.)
     /// often return their output solely in `reasoning_content`.
+    /// Strips `<think>...</think>` blocks that some models (e.g. MiniMax) embed
+    /// inline in `content` instead of using a separate field.
     fn effective_content(&self) -> String {
-        match &self.content {
+        let raw = match &self.content {
             Some(c) if !c.is_empty() => c.clone(),
             _ => self.reasoning_content.clone().unwrap_or_default(),
-        }
+        };
+        strip_think_tags(&raw)
     }
 
     fn effective_content_optional(&self) -> Option<String> {
-        match &self.content {
+        let raw = match &self.content {
             Some(c) if !c.is_empty() => Some(c.clone()),
             _ => self.reasoning_content.clone().filter(|c| !c.is_empty()),
-        }
+        };
+        raw.map(|s| strip_think_tags(&s)).filter(|s| !s.is_empty())
     }
 }
 
@@ -786,17 +863,27 @@ impl Provider for OpenAiCompatibleProvider {
 
         let mut messages = Vec::new();
 
-        if let Some(sys) = system_prompt {
+        if self.merge_system_into_user {
+            let content = match system_prompt {
+                Some(sys) => format!("{sys}\n\n{message}"),
+                None => message.to_string(),
+            };
             messages.push(Message {
-                role: "system".to_string(),
-                content: sys.to_string(),
+                role: "user".to_string(),
+                content,
+            });
+        } else {
+            if let Some(sys) = system_prompt {
+                messages.push(Message {
+                    role: "system".to_string(),
+                    content: sys.to_string(),
+                });
+            }
+            messages.push(Message {
+                role: "user".to_string(),
+                content: message.to_string(),
             });
         }
-
-        messages.push(Message {
-            role: "user".to_string(),
-            content: message.to_string(),
-        });
 
         let request = ApiChatRequest {
             model: model.to_string(),
@@ -892,7 +979,12 @@ impl Provider for OpenAiCompatibleProvider {
             )
         })?;
 
-        let api_messages: Vec<Message> = messages
+        let effective_messages = if self.merge_system_into_user {
+            Self::flatten_system_messages(messages)
+        } else {
+            messages.to_vec()
+        };
+        let api_messages: Vec<Message> = effective_messages
             .iter()
             .map(|m| Message {
                 role: m.role.clone(),
@@ -1104,9 +1196,14 @@ impl Provider for OpenAiCompatibleProvider {
         })?;
 
         let tools = Self::convert_tool_specs(request.tools);
+        let effective_messages = if self.merge_system_into_user {
+            Self::flatten_system_messages(request.messages)
+        } else {
+            request.messages.to_vec()
+        };
         let native_request = NativeChatRequest {
             model: model.to_string(),
-            messages: Self::convert_messages_for_native(request.messages),
+            messages: Self::convert_messages_for_native(&effective_messages),
             temperature,
             stream: Some(false),
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
