@@ -31,7 +31,8 @@ impl HookRunner {
     /// Register a handler and re-sort by descending priority.
     pub fn register(&mut self, handler: Box<dyn HookHandler>) {
         self.handlers.push(handler);
-        self.handlers.sort_by(|a, b| b.priority().cmp(&a.priority()));
+        self.handlers
+            .sort_by_key(|h| std::cmp::Reverse(h.priority()));
     }
 
     // ---------------------------------------------------------------

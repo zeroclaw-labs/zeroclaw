@@ -1754,7 +1754,9 @@ pub(crate) async fn run_tool_call_loop(
                     output: result.clone(),
                     error: None,
                 };
-                hooks.fire_after_tool_call(&tool_name, &tool_result_obj, start.elapsed()).await;
+                hooks
+                    .fire_after_tool_call(&tool_name, &tool_result_obj, start.elapsed())
+                    .await;
             }
 
             individual_results.push(result.clone());
