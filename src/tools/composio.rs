@@ -73,6 +73,38 @@ impl ComposioTool {
         }
     }
 
+    /// List connected accounts for the current entity/user.
+    /// Uses v3 endpoint.
+    pub async fn list_connected_accounts(
+        &self,
+        entity_id: Option<&str>,
+        toolkit_slug: Option<&str>,
+    ) -> anyhow::Result<Vec<ComposioConnectedAccount>> {
+        let entity_id = entity_id.unwrap_or(&self.default_entity_id);
+        let url = format!("{COMPOSIO_API_BASE_V3}/connected_accounts");
+
+        let mut req = self.client().get(&url).header("x-api-key", &self.api_key);
+
+        req = req.query(&[("user_ids", entity_id)]);
+
+        if let Some(toolkit) = toolkit_slug {
+            req = req.query(&[("toolkit_slugs", toolkit)]);
+        }
+
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            let err = response_error(resp).await;
+            anyhow::bail!("Composio connected accounts API error: {err}");
+        }
+
+        let body: ComposioConnectedAccountsResponse = resp
+            .json()
+            .await
+            .context("Failed to decode Composio connected accounts response")?;
+
+        Ok(body.items)
+    }
+
     async fn list_actions_v3(&self, app_name: Option<&str>) -> anyhow::Result<Vec<ComposioAction>> {
         let url = format!("{COMPOSIO_API_BASE_V3}/tools");
         let mut req = self.client().get(&url).header("x-api-key", &self.api_key);
@@ -418,7 +450,7 @@ impl Tool for ComposioTool {
     fn description(&self) -> &str {
         "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). \
          Use action='list' to see available actions, action='execute' with action_name/tool_slug, params, and optional connected_account_id, \
-         or action='connect' with app/auth_config_id to get OAuth URL."
+         action='connect' with app/auth_config_id to get OAuth URL, or action='connected_accounts' to list OAuth connections."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -599,11 +631,46 @@ impl Tool for ComposioTool {
                 }
             }
 
+            "connected_accounts" => {
+                if let Err(error) = self
+                    .security
+                    .enforce_tool_operation(ToolOperation::Act, "composio.connect")
+                {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(error),
+                    });
+                }
+
+                let toolkit = args.get("toolkit").and_then(|v| v.as_str());
+
+                match self
+                    .list_connected_accounts(Some(entity_id), toolkit)
+                    .await
+                {
+                    Ok(accounts) => {
+                        let output = serde_json::to_string_pretty(&accounts)
+                            .unwrap_or_else(|_| format!("{accounts:?}"));
+                        Ok(ToolResult {
+                            success: true,
+                            output,
+                            error: None,
+                        })
+                    }
+                    Err(e) => Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("Failed to list connected accounts: {e}")),
+                    }),
+                }
+            }
+
             _ => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Unknown action '{action}'. Use 'list', 'execute', or 'connect'."
+                    "Unknown action '{action}'. Use 'list', 'execute', 'connect', or 'connected_accounts'."
                 )),
             }),
         }
@@ -748,7 +815,7 @@ struct ComposioV3Tool {
     toolkit: Option<ComposioToolkitRef>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ComposioToolkitRef {
     #[serde(default)]
     slug: Option<String>,
@@ -779,6 +846,27 @@ impl ComposioAuthConfig {
                 .as_deref()
                 .is_some_and(|v| v.eq_ignore_ascii_case("enabled"))
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct ComposioConnectedAccountsResponse {
+    #[serde(default)]
+    pub(crate) items: Vec<ComposioConnectedAccount>,
+    #[serde(default)]
+    total_items: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ComposioConnectedAccount {
+    id: String,
+    #[serde(default)]
+    auth_config_id: Option<String>,
+    #[serde(rename = "userId", default)]
+    user_id: Option<String>,
+    #[serde(default)]
+    toolkit: Option<ComposioToolkitRef>,
+    #[serde(default)]
+    status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
