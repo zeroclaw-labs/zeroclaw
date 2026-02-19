@@ -153,28 +153,10 @@ impl PromptSection for SkillsSection {
     }
 
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
-        if ctx.skills.is_empty() {
-            return Ok(String::new());
-        }
-
-        let mut prompt = String::from("## Available Skills\n\n<available_skills>\n");
-        for skill in ctx.skills {
-            let location = skill.location.clone().unwrap_or_else(|| {
-                ctx.workspace_dir
-                    .join("skills")
-                    .join(&skill.name)
-                    .join("SKILL.md")
-            });
-            let _ = writeln!(
-                prompt,
-                "  <skill>\n    <name>{}</name>\n    <description>{}</description>\n    <location>{}</location>\n  </skill>",
-                skill.name,
-                skill.description,
-                location.display()
-            );
-        }
-        prompt.push_str("</available_skills>");
-        Ok(prompt)
+        Ok(crate::skills::skills_to_prompt(
+            ctx.skills,
+            ctx.workspace_dir,
+        ))
     }
 }
 
@@ -350,6 +332,43 @@ mod tests {
     }
 
     #[test]
+    fn skills_section_includes_instructions_and_tools() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let skills = vec![crate::skills::Skill {
+            name: "deploy".into(),
+            description: "Release safely".into(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: vec![],
+            tools: vec![crate::skills::SkillTool {
+                name: "release_checklist".into(),
+                description: "Validate release readiness".into(),
+                kind: "shell".into(),
+                command: "echo ok".into(),
+                args: std::collections::HashMap::new(),
+            }],
+            prompts: vec!["Run smoke tests before deploy.".into()],
+            location: None,
+        }];
+
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &skills,
+            identity_config: None,
+            dispatcher_instructions: "",
+        };
+
+        let output = SkillsSection.build(&ctx).unwrap();
+        assert!(output.contains("<available_skills>"));
+        assert!(output.contains("<name>deploy</name>"));
+        assert!(output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
+        assert!(output.contains("<name>release_checklist</name>"));
+        assert!(output.contains("<kind>shell</kind>"));
+    }
+
+    #[test]
     fn datetime_section_includes_timestamp_and_timezone() {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let ctx = PromptContext {
@@ -368,5 +387,48 @@ mod tests {
         assert!(payload.chars().any(|c| c.is_ascii_digit()));
         assert!(payload.contains(" ("));
         assert!(payload.ends_with(')'));
+    }
+
+    #[test]
+    fn prompt_builder_inlines_and_escapes_skills() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let skills = vec![crate::skills::Skill {
+            name: "code<review>&".into(),
+            description: "Review \"unsafe\" and 'risky' bits".into(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: vec![],
+            tools: vec![crate::skills::SkillTool {
+                name: "run\"linter\"".into(),
+                description: "Run <lint> & report".into(),
+                kind: "shell&exec".into(),
+                command: "cargo clippy".into(),
+                args: std::collections::HashMap::new(),
+            }],
+            prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
+            location: None,
+        }];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp/workspace"),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &skills,
+            identity_config: None,
+            dispatcher_instructions: "",
+        };
+
+        let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
+
+        assert!(prompt.contains("<available_skills>"));
+        assert!(prompt.contains("<name>code&lt;review&gt;&amp;</name>"));
+        assert!(prompt.contains(
+            "<description>Review &quot;unsafe&quot; and &apos;risky&apos; bits</description>"
+        ));
+        assert!(prompt.contains("<name>run&quot;linter&quot;</name>"));
+        assert!(prompt.contains("<description>Run &lt;lint&gt; &amp; report</description>"));
+        assert!(prompt.contains("<kind>shell&amp;exec</kind>"));
+        assert!(prompt.contains(
+            "<instruction>Use &lt;tool_call&gt; and &amp; keep output &quot;safe&quot;</instruction>"
+        ));
     }
 }

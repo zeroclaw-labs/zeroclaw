@@ -10,7 +10,6 @@ use crate::providers::{self, ChatMessage, ChatRequest, ConversationMessage, Prov
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool, ToolSpec};
-use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use std::io::Write as IoWrite;
 use std::sync::Arc;
@@ -229,8 +228,9 @@ impl Agent {
             &config.workspace_dir,
         ));
 
-        let memory: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
+        let memory: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes(
             &config.memory,
+            &config.embedding_routes,
             Some(&config.storage.provider.config),
             &config.workspace_dir,
             config.api_key.as_deref(),
@@ -485,14 +485,6 @@ impl Agent {
                         final_text.clone(),
                     )));
                 self.trim_history();
-
-                if self.auto_save {
-                    let summary = truncate_with_ellipsis(&final_text, 100);
-                    let _ = self
-                        .memory
-                        .store("assistant_resp", &summary, MemoryCategory::Daily, None)
-                        .await;
-                }
 
                 return Ok(final_text);
             }

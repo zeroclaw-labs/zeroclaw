@@ -4,13 +4,13 @@ updates:
   - package-ecosystem: cargo
     directory: "/"
     schedule:
-      interval: weekly
+      interval: monthly
     target-branch: main
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 3
     labels:
       - "dependencies"
     groups:
-      rust-minor-patch:
+      rust-all:
         patterns:
           - "*"
         update-types:
@@ -20,14 +20,31 @@ updates:
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
-      interval: weekly
+      interval: monthly
     target-branch: main
-    open-pull-requests-limit: 3
+    open-pull-requests-limit: 1
     labels:
       - "ci"
       - "dependencies"
     groups:
-      actions-minor-patch:
+      actions-all:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: monthly
+    target-branch: main
+    open-pull-requests-limit: 1
+    labels:
+      - "ci"
+      - "dependencies"
+    groups:
+      docker-all:
         patterns:
           - "*"
         update-types:

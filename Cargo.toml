@@ -26,7 +26,7 @@ tokio-util = { version = "0.7", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "multipart", "stream", "socks"] }
 
 # Matrix client + E2EE decryption
-matrix-sdk = { version = "0.16", default-features = false, features = ["e2e-encryption", "rustls-tls", "markdown"] }
+matrix-sdk = { version = "0.16", optional = true, default-features = false, features = ["e2e-encryption", "rustls-tls", "markdown"] }
 
 # Serialization
 serde = { version = "1.0", default-features = false, features = ["derive"] }
@@ -103,8 +103,8 @@ console = "0.16"
 # Hardware discovery (device path globbing)
 glob = "0.3"
 
-# Discord WebSocket gateway
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+# WebSocket client channels (Discord/Lark/DingTalk)
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 futures = "0.3"
 regex = "1.10"
@@ -130,11 +130,13 @@ opentelemetry = { version = "0.31", default-features = false, features = ["trace
 opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "metrics"] }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-client", "reqwest-rustls-webpki-roots"] }
 
-# USB device enumeration (hardware discovery)
-nusb = { version = "0.2", default-features = false, optional = true }
-
 # Serial port for peripheral communication (STM32, etc.)
 tokio-serial = { version = "5", default-features = false, optional = true }
+
+# USB device enumeration (hardware discovery) — only on platforms nusb supports
+# (Linux, macOS, Windows). Android/Termux uses target_os="android" and is excluded.
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
+nusb = { version = "0.2", default-features = false, optional = true }
 
 # probe-rs for STM32/Nucleo memory read (Phase B)
 probe-rs = { version = "0.30", optional = true }
@@ -158,8 +160,9 @@ rppal = { version = "0.22", optional = true }
 landlock = { version = "0.4", optional = true }
 
 [features]
-default = ["hardware"]
+default = ["hardware", "channel-matrix"]
 hardware = ["nusb", "tokio-serial"]
+channel-matrix = ["dep:matrix-sdk"]
 peripheral-rpi = ["rppal"]
 # Browser backend feature alias used by cfg(feature = "browser-native")
 browser-native = ["dep:fantoccini"]

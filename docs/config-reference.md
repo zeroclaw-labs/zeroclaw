@@ -50,6 +50,51 @@ Notes:
 - Setting `max_tool_iterations = 0` falls back to safe default `10`.
 - If a channel message exceeds this value, the runtime returns: `Agent exceeded maximum tool iterations (<value>)`.
 
+## `[runtime]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `reasoning_enabled` | unset (`None`) | Global reasoning/thinking override for providers that support explicit controls |
+
+Notes:
+
+- `reasoning_enabled = false` explicitly disables provider-side reasoning for supported providers (currently `ollama`, via request field `think: false`).
+- `reasoning_enabled = true` explicitly requests reasoning for supported providers (`think: true` on `ollama`).
+- Unset keeps provider defaults.
+
+## `[composio]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable Composio managed OAuth tools |
+| `api_key` | unset | Composio API key used by the `composio` tool |
+| `entity_id` | `default` | Default `user_id` sent on connect/execute calls |
+
+Notes:
+
+- Backward compatibility: legacy `enable = true` is accepted as an alias for `enabled = true`.
+- If `enabled = false` or `api_key` is missing, the `composio` tool is not registered.
+- Typical flow: call `connect`, complete browser OAuth, then run `execute` for the desired tool action.
+- If Composio returns a missing connected-account reference error, call `list_accounts` (optionally with `app`) and pass the returned `connected_account_id` to `execute`.
+
+## `[multimodal]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `max_images` | `4` | Maximum image markers accepted per request |
+| `max_image_size_mb` | `5` | Per-image size limit before base64 encoding |
+| `allow_remote_fetch` | `false` | Allow fetching `http(s)` image URLs from markers |
+
+Notes:
+
+- Runtime accepts image markers in user messages with syntax: ``[IMAGE:<source>]``.
+- Supported sources:
+  - Local file path (for example ``[IMAGE:/tmp/screenshot.png]``)
+- Data URI (for example ``[IMAGE:data:image/png;base64,...]``)
+- Remote URL only when `allow_remote_fetch = true`
+- Allowed MIME types: `image/png`, `image/jpeg`, `image/webp`, `image/gif`, `image/bmp`.
+- When the active provider does not support vision, requests fail with a structured capability error (`capability=vision`) instead of silently dropping images.
+
 ## `[gateway]`
 
 | Key | Default | Purpose |
@@ -85,10 +130,42 @@ Notes:
 | Key | Default | Purpose |
 |---|---|---|
 | `backend` | `sqlite` | `sqlite`, `lucid`, `markdown`, `none` |
-| `auto_save` | `true` | automatic persistence |
+| `auto_save` | `true` | persist user-stated inputs only (assistant outputs are excluded) |
 | `embedding_provider` | `none` | `none`, `openai`, or custom endpoint |
+| `embedding_model` | `text-embedding-3-small` | embedding model ID, or `hint:<name>` route |
+| `embedding_dimensions` | `1536` | expected vector size for selected embedding model |
 | `vector_weight` | `0.7` | hybrid ranking vector weight |
 | `keyword_weight` | `0.3` | hybrid ranking keyword weight |
+
+Notes:
+
+- Memory context injection ignores legacy `assistant_resp*` auto-save keys to prevent old model-authored summaries from being treated as facts.
+
+## `[[model_routes]]` and `[[embedding_routes]]`
+
+Use route hints so integrations can keep stable names while model IDs evolve.
+
+```toml
+[memory]
+embedding_model = "hint:semantic"
+
+[[model_routes]]
+hint = "reasoning"
+provider = "openrouter"
+model = "provider/model-id"
+
+[[embedding_routes]]
+hint = "semantic"
+provider = "openai"
+model = "text-embedding-3-small"
+dimensions = 1536
+```
+
+Upgrade strategy:
+
+1. Keep hints stable (`hint:reasoning`, `hint:semantic`).
+2. Update only `model = "...new-version..."` in the route entries.
+3. Validate with `zeroclaw doctor` before restart/rollout.
 
 ## `[channels_config]`
 
@@ -111,6 +188,8 @@ Notes:
 - If using cloud APIs (OpenAI, Anthropic, etc.), you can reduce this to `60` or lower.
 - Values below `30` are clamped to `30` to avoid immediate timeout churn.
 - When a timeout occurs, users receive: `⚠️ Request timed out while waiting for the model. Please try again.`
+- Telegram-only interruption behavior is controlled with `channels_config.telegram.interrupt_on_new_message` (default `false`).
+  When enabled, a newer message from the same sender in the same chat cancels the in-flight request and preserves interrupted user context.
 
 See detailed channel matrix and allowlist behavior in [channels-reference.md](channels-reference.md).
 

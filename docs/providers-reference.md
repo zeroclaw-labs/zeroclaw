@@ -43,7 +43,7 @@ credential is not reused for fallback providers.
 | `minimax` | `minimax-intl`, `minimax-io`, `minimax-global`, `minimax-cn`, `minimaxi`, `minimax-oauth`, `minimax-oauth-cn`, `minimax-portal`, `minimax-portal-cn` | No | `MINIMAX_OAUTH_TOKEN`, `MINIMAX_API_KEY` |
 | `bedrock` | `aws-bedrock` | No | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (optional: `AWS_REGION`) |
 | `qianfan` | `baidu` | No | `QIANFAN_API_KEY` |
-| `qwen` | `dashscope`, `qwen-intl`, `dashscope-intl`, `qwen-us`, `dashscope-us` | No | `DASHSCOPE_API_KEY` |
+| `qwen` | `dashscope`, `qwen-intl`, `dashscope-intl`, `qwen-us`, `dashscope-us`, `qwen-code`, `qwen-oauth`, `qwen_oauth` | No | `QWEN_OAUTH_TOKEN`, `DASHSCOPE_API_KEY` |
 | `groq` | — | No | `GROQ_API_KEY` |
 | `mistral` | — | No | `MISTRAL_API_KEY` |
 | `xai` | `grok` | No | `XAI_API_KEY` |
@@ -56,6 +56,13 @@ credential is not reused for fallback providers.
 | `lmstudio` | `lm-studio` | Yes | (optional; local by default) |
 | `nvidia` | `nvidia-nim`, `build.nvidia.com` | No | `NVIDIA_API_KEY` |
 
+### Ollama Vision Notes
+
+- Provider ID: `ollama`
+- Vision input is supported through user message image markers: ``[IMAGE:<source>]``.
+- After multimodal normalization, ZeroClaw sends image payloads through Ollama's native `messages[].images` field.
+- If a non-vision provider is selected, ZeroClaw returns a structured capability error instead of silently ignoring images.
+
 ### Bedrock Notes
 
 - Provider ID: `bedrock` (alias: `aws-bedrock`)
@@ -66,6 +73,21 @@ credential is not reused for fallback providers.
 - Supports native tool calling and prompt caching (`cachePoint`).
 - Cross-region inference profiles supported (e.g., `us.anthropic.claude-*`).
 - Model IDs use Bedrock format: `anthropic.claude-sonnet-4-6`, `anthropic.claude-opus-4-6-v1`, etc.
+
+### Ollama Reasoning Toggle
+
+You can control Ollama reasoning/thinking behavior from `config.toml`:
+
+```toml
+[runtime]
+reasoning_enabled = false
+```
+
+Behavior:
+
+- `false`: sends `think: false` to Ollama `/api/chat` requests.
+- `true`: sends `think: true`.
+- Unset: omits `think` and keeps Ollama/model defaults.
 
 ### Kimi Code Notes
 
@@ -122,6 +144,33 @@ Optional:
 - `MINIMAX_OAUTH_REGION=global` or `cn` (defaults by provider alias)
 - `MINIMAX_OAUTH_CLIENT_ID` to override the default OAuth client id
 
+Channel compatibility note:
+
+- For MiniMax-backed channel conversations, runtime history is normalized to keep valid `user`/`assistant` turn order.
+- Channel-specific delivery guidance (for example Telegram attachment markers) is merged into the leading system prompt instead of being appended as a trailing `system` turn.
+
+## Qwen Code OAuth Setup (config.toml)
+
+Set Qwen Code OAuth mode in config:
+
+```toml
+default_provider = "qwen-code"
+api_key = "qwen-oauth"
+```
+
+Credential resolution for `qwen-code`:
+
+1. Explicit `api_key` value (if not the placeholder `qwen-oauth`)
+2. `QWEN_OAUTH_TOKEN`
+3. `~/.qwen/oauth_creds.json` (reuses Qwen Code cached OAuth credentials)
+4. Optional refresh via `QWEN_OAUTH_REFRESH_TOKEN` (or cached refresh token)
+5. If no OAuth placeholder is used, `DASHSCOPE_API_KEY` can still be used as fallback
+
+Optional endpoint override:
+
+- `QWEN_OAUTH_RESOURCE_URL` (normalized to `https://.../v1` if needed)
+- If unset, `resource_url` from cached OAuth credentials is used when available
+
 ## Model Routing (`hint:<name>`)
 
 You can route model calls by hint using `[[model_routes]]`:
@@ -143,3 +192,56 @@ Then call with a hint model name (for example from tool or integration paths):
 ```text
 hint:reasoning
 ```
+
+## Embedding Routing (`hint:<name>`)
+
+You can route embedding calls with the same hint pattern using `[[embedding_routes]]`.
+Set `[memory].embedding_model` to a `hint:<name>` value to activate routing.
+
+```toml
+[memory]
+embedding_model = "hint:semantic"
+
+[[embedding_routes]]
+hint = "semantic"
+provider = "openai"
+model = "text-embedding-3-small"
+dimensions = 1536
+
+[[embedding_routes]]
+hint = "archive"
+provider = "custom:https://embed.example.com/v1"
+model = "your-embedding-model-id"
+dimensions = 1024
+```
+
+Supported embedding providers:
+
+- `none`
+- `openai`
+- `custom:<url>` (OpenAI-compatible embeddings endpoint)
+
+Optional per-route key override:
+
+```toml
+[[embedding_routes]]
+hint = "semantic"
+provider = "openai"
+model = "text-embedding-3-small"
+api_key = "sk-route-specific"
+```
+
+## Upgrading Models Safely
+
+Use stable hints and update only route targets when providers deprecate model IDs.
+
+Recommended workflow:
+
+1. Keep call sites stable (`hint:reasoning`, `hint:semantic`).
+2. Change only the target model under `[[model_routes]]` or `[[embedding_routes]]`.
+3. Run:
+   - `zeroclaw doctor`
+   - `zeroclaw status`
+4. Smoke test one representative flow (chat + memory retrieval) before rollout.
+
+This minimizes breakage because integrations and prompts do not need to change when model IDs are upgraded.

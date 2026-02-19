@@ -154,7 +154,14 @@ impl EmailChannel {
                 _ => {}
             }
         }
-        result.split_whitespace().collect::<Vec<_>>().join(" ")
+        let mut normalized = String::with_capacity(result.len());
+        for word in result.split_whitespace() {
+            if !normalized.is_empty() {
+                normalized.push(' ');
+            }
+            normalized.push_str(word);
+        }
+        normalized
     }
 
     /// Extract the sender address from a parsed email

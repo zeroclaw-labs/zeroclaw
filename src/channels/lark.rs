@@ -288,7 +288,7 @@ impl LarkChannel {
             payload: None,
         };
         if write
-            .send(WsMsg::Binary(initial_ping.encode_to_vec()))
+            .send(WsMsg::Binary(initial_ping.encode_to_vec().into()))
             .await
             .is_err()
         {
@@ -309,7 +309,7 @@ impl LarkChannel {
                         headers: vec![PbHeader { key: "type".into(), value: "ping".into() }],
                         payload: None,
                     };
-                    if write.send(WsMsg::Binary(ping.encode_to_vec())).await.is_err() {
+                    if write.send(WsMsg::Binary(ping.encode_to_vec().into())).await.is_err() {
                         tracing::warn!("Lark: ping failed, reconnecting");
                         break;
                     }
@@ -378,7 +378,7 @@ impl LarkChannel {
                         let mut ack = frame.clone();
                         ack.payload = Some(br#"{"code":200,"headers":{},"data":[]}"#.to_vec());
                         ack.headers.push(PbHeader { key: "biz_rt".into(), value: "0".into() });
-                        let _ = write.send(WsMsg::Binary(ack.encode_to_vec())).await;
+                        let _ = write.send(WsMsg::Binary(ack.encode_to_vec().into())).await;
                     }
 
                     // Fragment reassembly
@@ -917,9 +917,11 @@ mod tests {
 
     #[test]
     fn lark_ws_activity_refreshes_heartbeat_watchdog() {
-        assert!(should_refresh_last_recv(&WsMsg::Binary(vec![1, 2, 3])));
-        assert!(should_refresh_last_recv(&WsMsg::Ping(vec![9, 9])));
-        assert!(should_refresh_last_recv(&WsMsg::Pong(vec![8, 8])));
+        assert!(should_refresh_last_recv(&WsMsg::Binary(
+            vec![1, 2, 3].into()
+        )));
+        assert!(should_refresh_last_recv(&WsMsg::Ping(vec![9, 9].into())));
+        assert!(should_refresh_last_recv(&WsMsg::Pong(vec![8, 8].into())));
     }
 
     #[test]

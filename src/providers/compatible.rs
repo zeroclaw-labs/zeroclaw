@@ -585,6 +585,43 @@ fn first_nonempty(text: Option<&str>) -> Option<String> {
     })
 }
 
+fn normalize_responses_role(role: &str) -> &'static str {
+    match role {
+        "assistant" => "assistant",
+        "tool" => "assistant",
+        _ => "user",
+    }
+}
+
+fn build_responses_prompt(messages: &[ChatMessage]) -> (Option<String>, Vec<ResponsesInput>) {
+    let mut instructions_parts = Vec::new();
+    let mut input = Vec::new();
+
+    for message in messages {
+        if message.content.trim().is_empty() {
+            continue;
+        }
+
+        if message.role == "system" {
+            instructions_parts.push(message.content.clone());
+            continue;
+        }
+
+        input.push(ResponsesInput {
+            role: normalize_responses_role(&message.role).to_string(),
+            content: message.content.clone(),
+        });
+    }
+
+    let instructions = if instructions_parts.is_empty() {
+        None
+    } else {
+        Some(instructions_parts.join("\n\n"))
+    };
+
+    (instructions, input)
+}
+
 fn extract_responses_text(response: ResponsesResponse) -> Option<String> {
     if let Some(text) = first_nonempty(response.output_text.as_deref()) {
         return Some(text);
@@ -655,17 +692,21 @@ impl OpenAiCompatibleProvider {
     async fn chat_via_responses(
         &self,
         credential: &str,
-        system_prompt: Option<&str>,
-        message: &str,
+        messages: &[ChatMessage],
         model: &str,
     ) -> anyhow::Result<String> {
+        let (instructions, input) = build_responses_prompt(messages);
+        if input.is_empty() {
+            anyhow::bail!(
+                "{} Responses API fallback requires at least one non-system message",
+                self.name
+            );
+        }
+
         let request = ResponsesRequest {
             model: model.to_string(),
-            input: vec![ResponsesInput {
-                role: "user".to_string(),
-                content: message.to_string(),
-            }],
-            instructions: system_prompt.map(str::to_string),
+            input,
+            instructions,
             stream: Some(false),
         };
 
@@ -857,6 +898,7 @@ impl Provider for OpenAiCompatibleProvider {
     fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
         crate::providers::traits::ProviderCapabilities {
             native_tool_calling: true,
+            vision: false,
         }
     }
 
@@ -909,6 +951,17 @@ impl Provider for OpenAiCompatibleProvider {
 
         let url = self.chat_completions_url();
 
+        let mut fallback_messages = Vec::new();
+        if let Some(system_prompt) = system_prompt {
+            fallback_messages.push(ChatMessage::system(system_prompt));
+        }
+        fallback_messages.push(ChatMessage::user(message));
+        let fallback_messages = if self.merge_system_into_user {
+            Self::flatten_system_messages(&fallback_messages)
+        } else {
+            fallback_messages
+        };
+
         let response = match self
             .apply_auth_header(self.http_client().post(&url).json(&request), credential)
             .send()
@@ -919,7 +972,7 @@ impl Provider for OpenAiCompatibleProvider {
                 if self.supports_responses_fallback {
                     let sanitized = super::sanitize_api_error(&chat_error.to_string());
                     return self
-                        .chat_via_responses(credential, system_prompt, message, model)
+                        .chat_via_responses(credential, &fallback_messages, model)
                         .await
                         .map_err(|responses_err| {
                             anyhow::anyhow!(
@@ -940,7 +993,7 @@ impl Provider for OpenAiCompatibleProvider {
 
             if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
                 return self
-                    .chat_via_responses(credential, system_prompt, message, model)
+                    .chat_via_responses(credential, &fallback_messages, model)
                     .await
                     .map_err(|responses_err| {
                         anyhow::anyhow!(
@@ -1023,25 +1076,16 @@ impl Provider for OpenAiCompatibleProvider {
             Ok(response) => response,
             Err(chat_error) => {
                 if self.supports_responses_fallback {
-                    let system = messages.iter().find(|m| m.role == "system");
-                    let last_user = messages.iter().rfind(|m| m.role == "user");
-                    if let Some(user_msg) = last_user {
-                        let sanitized = super::sanitize_api_error(&chat_error.to_string());
-                        return self
-                            .chat_via_responses(
-                                credential,
-                                system.map(|m| m.content.as_str()),
-                                &user_msg.content,
-                                model,
+                    let sanitized = super::sanitize_api_error(&chat_error.to_string());
+                    return self
+                        .chat_via_responses(credential, &effective_messages, model)
+                        .await
+                        .map_err(|responses_err| {
+                            anyhow::anyhow!(
+                                "{} chat completions transport error: {sanitized} (responses fallback failed: {responses_err})",
+                                self.name
                             )
-                            .await
-                            .map_err(|responses_err| {
-                                anyhow::anyhow!(
-                                    "{} chat completions transport error: {sanitized} (responses fallback failed: {responses_err})",
-                                    self.name
-                                )
-                            });
-                    }
+                        });
                 }
 
                 return Err(chat_error.into());
@@ -1053,25 +1097,15 @@ impl Provider for OpenAiCompatibleProvider {
 
             // Mirror chat_with_system: 404 may mean this provider uses the Responses API
             if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
-                // Extract system prompt and last user message for responses fallback
-                let system = messages.iter().find(|m| m.role == "system");
-                let last_user = messages.iter().rfind(|m| m.role == "user");
-                if let Some(user_msg) = last_user {
-                    return self
-                        .chat_via_responses(
-                            credential,
-                            system.map(|m| m.content.as_str()),
-                            &user_msg.content,
-                            model,
+                return self
+                    .chat_via_responses(credential, &effective_messages, model)
+                    .await
+                    .map_err(|responses_err| {
+                        anyhow::anyhow!(
+                            "{} API error (chat completions unavailable; responses fallback failed: {responses_err})",
+                            self.name
                         )
-                        .await
-                        .map_err(|responses_err| {
-                            anyhow::anyhow!(
-                                "{} API error (chat completions unavailable; responses fallback failed: {responses_err})",
-                                self.name
-                            )
-                        });
-                }
+                    });
             }
 
             return Err(super::api_error(&self.name, response).await);
@@ -1240,29 +1274,20 @@ impl Provider for OpenAiCompatibleProvider {
             Ok(response) => response,
             Err(chat_error) => {
                 if self.supports_responses_fallback {
-                    let system = request.messages.iter().find(|m| m.role == "system");
-                    let last_user = request.messages.iter().rfind(|m| m.role == "user");
-                    if let Some(user_msg) = last_user {
-                        let sanitized = super::sanitize_api_error(&chat_error.to_string());
-                        return self
-                            .chat_via_responses(
-                                credential,
-                                system.map(|m| m.content.as_str()),
-                                &user_msg.content,
-                                model,
+                    let sanitized = super::sanitize_api_error(&chat_error.to_string());
+                    return self
+                        .chat_via_responses(credential, &effective_messages, model)
+                        .await
+                        .map(|text| ProviderChatResponse {
+                            text: Some(text),
+                            tool_calls: vec![],
+                        })
+                        .map_err(|responses_err| {
+                            anyhow::anyhow!(
+                                "{} native chat transport error: {sanitized} (responses fallback failed: {responses_err})",
+                                self.name
                             )
-                            .await
-                            .map(|text| ProviderChatResponse {
-                                text: Some(text),
-                                tool_calls: vec![],
-                            })
-                            .map_err(|responses_err| {
-                                anyhow::anyhow!(
-                                    "{} native chat transport error: {sanitized} (responses fallback failed: {responses_err})",
-                                    self.name
-                                )
-                            });
-                    }
+                        });
                 }
 
                 return Err(chat_error.into());
@@ -1287,28 +1312,19 @@ impl Provider for OpenAiCompatibleProvider {
             }
 
             if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
-                let system = request.messages.iter().find(|m| m.role == "system");
-                let last_user = request.messages.iter().rfind(|m| m.role == "user");
-                if let Some(user_msg) = last_user {
-                    return self
-                        .chat_via_responses(
-                            credential,
-                            system.map(|m| m.content.as_str()),
-                            &user_msg.content,
-                            model,
+                return self
+                    .chat_via_responses(credential, &effective_messages, model)
+                    .await
+                    .map(|text| ProviderChatResponse {
+                        text: Some(text),
+                        tool_calls: vec![],
+                    })
+                    .map_err(|responses_err| {
+                        anyhow::anyhow!(
+                            "{} API error ({status}): {sanitized} (chat completions unavailable; responses fallback failed: {responses_err})",
+                            self.name
                         )
-                        .await
-                        .map(|text| ProviderChatResponse {
-                            text: Some(text),
-                            tool_calls: vec![],
-                        })
-                        .map_err(|responses_err| {
-                            anyhow::anyhow!(
-                                "{} API error ({status}): {sanitized} (chat completions unavailable; responses fallback failed: {responses_err})",
-                                self.name
-                            )
-                        });
-                }
+                    });
             }
 
             anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
@@ -1641,6 +1657,43 @@ mod tests {
             extract_responses_text(response).as_deref(),
             Some("Fallback text")
         );
+    }
+
+    #[test]
+    fn build_responses_prompt_preserves_multi_turn_history() {
+        let messages = vec![
+            ChatMessage::system("policy"),
+            ChatMessage::user("step 1"),
+            ChatMessage::assistant("ack 1"),
+            ChatMessage::tool("{\"result\":\"ok\"}"),
+            ChatMessage::user("step 2"),
+        ];
+
+        let (instructions, input) = build_responses_prompt(&messages);
+
+        assert_eq!(instructions.as_deref(), Some("policy"));
+        assert_eq!(input.len(), 4);
+        assert_eq!(input[0].role, "user");
+        assert_eq!(input[0].content, "step 1");
+        assert_eq!(input[1].role, "assistant");
+        assert_eq!(input[1].content, "ack 1");
+        assert_eq!(input[2].role, "assistant");
+        assert_eq!(input[2].content, "{\"result\":\"ok\"}");
+        assert_eq!(input[3].role, "user");
+        assert_eq!(input[3].content, "step 2");
+    }
+
+    #[tokio::test]
+    async fn chat_via_responses_requires_non_system_message() {
+        let provider = make_provider("custom", "https://api.example.com", Some("test-key"));
+        let err = provider
+            .chat_via_responses("test-key", &[ChatMessage::system("policy")], "gpt-test")
+            .await
+            .expect_err("system-only fallback payload should fail");
+
+        assert!(err
+            .to_string()
+            .contains("requires at least one non-system message"));
     }
 
     // ----------------------------------------------------------

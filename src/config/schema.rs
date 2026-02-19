@@ -83,6 +83,10 @@ pub struct Config {
     #[serde(default)]
     pub model_routes: Vec<ModelRouteConfig>,
 
+    /// Embedding routing rules — route `hint:<name>` to specific provider+model combos.
+    #[serde(default)]
+    pub embedding_routes: Vec<EmbeddingRouteConfig>,
+
     /// Automatic query classification — maps user messages to model hints.
     #[serde(default)]
     pub query_classification: QueryClassificationConfig,
@@ -119,6 +123,9 @@ pub struct Config {
 
     #[serde(default)]
     pub http_request: HttpRequestConfig,
+
+    #[serde(default)]
+    pub multimodal: MultimodalConfig,
 
     #[serde(default)]
     pub web_search: WebSearchConfig,
@@ -276,6 +283,46 @@ impl Default for AgentConfig {
             max_history_messages: default_agent_max_history_messages(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MultimodalConfig {
+    /// Maximum number of image attachments accepted per request.
+    #[serde(default = "default_multimodal_max_images")]
+    pub max_images: usize,
+    /// Maximum image payload size in MiB before base64 encoding.
+    #[serde(default = "default_multimodal_max_image_size_mb")]
+    pub max_image_size_mb: usize,
+    /// Allow fetching remote image URLs (http/https). Disabled by default.
+    #[serde(default)]
+    pub allow_remote_fetch: bool,
+}
+
+fn default_multimodal_max_images() -> usize {
+    4
+}
+
+fn default_multimodal_max_image_size_mb() -> usize {
+    5
+}
+
+impl MultimodalConfig {
+    /// Clamp configured values to safe runtime bounds.
+    pub fn effective_limits(&self) -> (usize, usize) {
+        let max_images = self.max_images.clamp(1, 16);
+        let max_image_size_mb = self.max_image_size_mb.clamp(1, 20);
+        (max_images, max_image_size_mb)
+    }
+}
+
+impl Default for MultimodalConfig {
+    fn default() -> Self {
+        Self {
+            max_images: default_multimodal_max_images(),
+            max_image_size_mb: default_multimodal_max_image_size_mb(),
+            allow_remote_fetch: false,
         }
     }
 }
@@ -601,7 +648,7 @@ impl Default for GatewayConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ComposioConfig {
     /// Enable Composio integration for 1000+ OAuth tools
-    #[serde(default)]
+    #[serde(default, alias = "enable")]
     pub enabled: bool,
     /// Composio API key (stored encrypted when secrets.encrypt = true)
     #[serde(default)]
@@ -1340,7 +1387,7 @@ pub struct MemoryConfig {
     ///
     /// `postgres` requires `[storage.provider.config]` with `db_url` (`dbURL` alias supported).
     pub backend: String,
-    /// Auto-save conversation context to memory
+    /// Auto-save user-stated conversation input to memory (assistant output is excluded)
     pub auto_save: bool,
     /// Run memory/session hygiene (archiving + retention cleanup)
     #[serde(default = "default_hygiene_enabled")]
@@ -1603,6 +1650,13 @@ pub struct RuntimeConfig {
     /// Docker runtime settings (used when `kind = "docker"`).
     #[serde(default)]
     pub docker: DockerRuntimeConfig,
+
+    /// Global reasoning override for providers that expose explicit controls.
+    /// - `None`: provider default behavior
+    /// - `Some(true)`: request reasoning/thinking when supported
+    /// - `Some(false)`: disable reasoning/thinking when supported
+    #[serde(default)]
+    pub reasoning_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1675,6 +1729,7 @@ impl Default for RuntimeConfig {
         Self {
             kind: default_runtime_kind(),
             docker: DockerRuntimeConfig::default(),
+            reasoning_enabled: None,
         }
     }
 }
@@ -1816,6 +1871,36 @@ pub struct ModelRouteConfig {
     pub provider: String,
     /// Model to use with that provider
     pub model: String,
+    /// Optional API key override for this route's provider
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
+// ── Embedding routing ───────────────────────────────────────────
+
+/// Route an embedding hint to a specific provider + model.
+///
+/// ```toml
+/// [[embedding_routes]]
+/// hint = "semantic"
+/// provider = "openai"
+/// model = "text-embedding-3-small"
+/// dimensions = 1536
+///
+/// [memory]
+/// embedding_model = "hint:semantic"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct EmbeddingRouteConfig {
+    /// Route hint name (e.g. "semantic", "archive", "faq")
+    pub hint: String,
+    /// Embedding provider (`none`, `openai`, or `custom:<url>`)
+    pub provider: String,
+    /// Embedding model to use with that provider
+    pub model: String,
+    /// Optional embedding dimension override for this route
+    #[serde(default)]
+    pub dimensions: Option<usize>,
     /// Optional API key override for this route's provider
     #[serde(default)]
     pub api_key: Option<String>,
@@ -2040,6 +2125,10 @@ pub struct TelegramConfig {
     /// Minimum interval (ms) between draft message edits to avoid rate limits.
     #[serde(default = "default_draft_update_interval_ms")]
     pub draft_update_interval_ms: u64,
+    /// When true, a newer Telegram message from the same sender in the same chat
+    /// cancels the in-flight request and starts a fresh response with preserved history.
+    #[serde(default)]
+    pub interrupt_on_new_message: bool,
     /// When true, only respond to messages that @-mention the bot in groups.
     /// Direct messages are always processed.
     #[serde(default)]
@@ -2480,6 +2569,7 @@ impl Default for Config {
             scheduler: SchedulerConfig::default(),
             agent: AgentConfig::default(),
             model_routes: Vec::new(),
+            embedding_routes: Vec::new(),
             heartbeat: HeartbeatConfig::default(),
             cron: CronConfig::default(),
             channels_config: ChannelsConfig::default(),
@@ -2491,6 +2581,7 @@ impl Default for Config {
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             http_request: HttpRequestConfig::default(),
+            multimodal: MultimodalConfig::default(),
             web_search: WebSearchConfig::default(),
             proxy: ProxyConfig::default(),
             identity: IdentityConfig::default(),
@@ -2944,6 +3035,18 @@ impl Config {
             }
         }
 
+        // Reasoning override: ZEROCLAW_REASONING_ENABLED or REASONING_ENABLED
+        if let Ok(flag) = std::env::var("ZEROCLAW_REASONING_ENABLED")
+            .or_else(|_| std::env::var("REASONING_ENABLED"))
+        {
+            let normalized = flag.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "1" | "true" | "yes" | "on" => self.runtime.reasoning_enabled = Some(true),
+                "0" | "false" | "no" | "off" => self.runtime.reasoning_enabled = Some(false),
+                _ => {}
+            }
+        }
+
         // Web search enabled: ZEROCLAW_WEB_SEARCH_ENABLED or WEB_SEARCH_ENABLED
         if let Ok(enabled) = std::env::var("ZEROCLAW_WEB_SEARCH_ENABLED")
             .or_else(|_| std::env::var("WEB_SEARCH_ENABLED"))
@@ -3240,7 +3343,7 @@ mod tests {
     }
 
     #[test]
-    fn config_schema_export_contains_expected_contract_shape() {
+    async fn config_schema_export_contains_expected_contract_shape() {
         let schema = schemars::schema_for!(Config);
         let schema_json = serde_json::to_value(&schema).expect("schema should serialize to json");
 
@@ -3407,6 +3510,7 @@ default_temperature = 0.7
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
             model_routes: Vec::new(),
+            embedding_routes: Vec::new(),
             query_classification: QueryClassificationConfig::default(),
             heartbeat: HeartbeatConfig {
                 enabled: true,
@@ -3420,6 +3524,7 @@ default_temperature = 0.7
                     allowed_users: vec!["user1".into()],
                     stream_mode: StreamMode::default(),
                     draft_update_interval_ms: default_draft_update_interval_ms(),
+                    interrupt_on_new_message: false,
                     mention_only: false,
                 }),
                 discord: None,
@@ -3446,6 +3551,7 @@ default_temperature = 0.7
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             http_request: HttpRequestConfig::default(),
+            multimodal: MultimodalConfig::default(),
             web_search: WebSearchConfig::default(),
             proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
@@ -3525,6 +3631,19 @@ connect_timeout_secs = 12
     }
 
     #[test]
+    async fn runtime_reasoning_enabled_deserializes() {
+        let raw = r#"
+default_temperature = 0.7
+
+[runtime]
+reasoning_enabled = false
+"#;
+
+        let parsed: Config = toml::from_str(raw).unwrap();
+        assert_eq!(parsed.runtime.reasoning_enabled, Some(false));
+    }
+
+    #[test]
     async fn agent_config_defaults() {
         let cfg = AgentConfig::default();
         assert!(!cfg.compact_context);
@@ -3574,6 +3693,7 @@ tool_dispatcher = "xml"
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
             model_routes: Vec::new(),
+            embedding_routes: Vec::new(),
             query_classification: QueryClassificationConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             cron: CronConfig::default(),
@@ -3586,6 +3706,7 @@ tool_dispatcher = "xml"
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             http_request: HttpRequestConfig::default(),
+            multimodal: MultimodalConfig::default(),
             web_search: WebSearchConfig::default(),
             proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
@@ -3736,6 +3857,7 @@ tool_dispatcher = "xml"
             allowed_users: vec!["alice".into(), "bob".into()],
             stream_mode: StreamMode::Partial,
             draft_update_interval_ms: 500,
+            interrupt_on_new_message: true,
             mention_only: false,
         };
         let json = serde_json::to_string(&tc).unwrap();
@@ -3744,6 +3866,7 @@ tool_dispatcher = "xml"
         assert_eq!(parsed.allowed_users.len(), 2);
         assert_eq!(parsed.stream_mode, StreamMode::Partial);
         assert_eq!(parsed.draft_update_interval_ms, 500);
+        assert!(parsed.interrupt_on_new_message);
     }
 
     #[test]
@@ -3752,6 +3875,7 @@ tool_dispatcher = "xml"
         let parsed: TelegramConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.stream_mode, StreamMode::Off);
         assert_eq!(parsed.draft_update_interval_ms, 1000);
+        assert!(!parsed.interrupt_on_new_message);
     }
 
     #[test]
@@ -4295,6 +4419,17 @@ default_temperature = 0.7
     async fn composio_config_partial_toml() {
         let toml_str = r"
 enabled = true
+";
+        let parsed: ComposioConfig = toml::from_str(toml_str).unwrap();
+        assert!(parsed.enabled);
+        assert!(parsed.api_key.is_none());
+        assert_eq!(parsed.entity_id, "default");
+    }
+
+    #[test]
+    async fn composio_config_enable_alias_supported() {
+        let toml_str = r"
+enable = true
 ";
         let parsed: ComposioConfig = toml::from_str(toml_str).unwrap();
         assert!(parsed.enabled);
@@ -4962,6 +5097,36 @@ default_model = "legacy-model"
         );
 
         std::env::remove_var("ZEROCLAW_TEMPERATURE");
+    }
+
+    #[test]
+    async fn env_override_reasoning_enabled() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        assert_eq!(config.runtime.reasoning_enabled, None);
+
+        std::env::set_var("ZEROCLAW_REASONING_ENABLED", "false");
+        config.apply_env_overrides();
+        assert_eq!(config.runtime.reasoning_enabled, Some(false));
+
+        std::env::set_var("ZEROCLAW_REASONING_ENABLED", "true");
+        config.apply_env_overrides();
+        assert_eq!(config.runtime.reasoning_enabled, Some(true));
+
+        std::env::remove_var("ZEROCLAW_REASONING_ENABLED");
+    }
+
+    #[test]
+    async fn env_override_reasoning_invalid_value_ignored() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        config.runtime.reasoning_enabled = Some(false);
+
+        std::env::set_var("ZEROCLAW_REASONING_ENABLED", "maybe");
+        config.apply_env_overrides();
+        assert_eq!(config.runtime.reasoning_enabled, Some(false));
+
+        std::env::remove_var("ZEROCLAW_REASONING_ENABLED");
     }
 
     #[test]

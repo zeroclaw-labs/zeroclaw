@@ -2,7 +2,7 @@
 
 This guide focuses on common setup/runtime failures and fast resolution paths.
 
-Last verified: **February 18, 2026**.
+Last verified: **February 19, 2026**.
 
 ## Installation / Bootstrap
 
@@ -31,6 +31,51 @@ Fix:
 ```bash
 ./bootstrap.sh --install-system-deps
 ```
+
+### Build is very slow or appears stuck
+
+Symptoms:
+
+- `cargo check` / `cargo build` appears stuck at `Checking zeroclaw` for a long time
+- repeated `Blocking waiting for file lock on package cache` or `build directory`
+
+Why this happens in ZeroClaw:
+
+- Matrix E2EE stack (`matrix-sdk`, `ruma`, `vodozemac`) is large and expensive to type-check.
+- TLS + crypto native build scripts (`aws-lc-sys`, `ring`) add noticeable compile time.
+- `rusqlite` with bundled SQLite compiles C code locally.
+- Running multiple cargo jobs/worktrees in parallel causes lock contention.
+
+Fast checks:
+
+```bash
+cargo check --timings
+cargo tree -d
+```
+
+The timing report is written to `target/cargo-timings/cargo-timing.html`.
+
+Faster local iteration (when Matrix channel is not needed):
+
+```bash
+cargo check --no-default-features --features hardware
+```
+
+This skips `channel-matrix` and can significantly reduce compile time.
+
+To build with Matrix support explicitly enabled:
+
+```bash
+cargo check --no-default-features --features hardware,channel-matrix
+```
+
+Lock-contention mitigation:
+
+```bash
+pgrep -af "cargo (check|build|test)|cargo check|cargo build|cargo test"
+```
+
+Stop unrelated cargo jobs before running your own build.
 
 ### `zeroclaw` command not found after install
 

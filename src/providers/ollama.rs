@@ -1,4 +1,7 @@
-use crate::providers::traits::{ChatMessage, ChatResponse, Provider, ToolCall};
+use crate::multimodal;
+use crate::providers::traits::{
+    ChatMessage, ChatResponse, Provider, ProviderCapabilities, ToolCall,
+};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -7,6 +10,7 @@ use std::collections::HashMap;
 pub struct OllamaProvider {
     base_url: String,
     api_key: Option<String>,
+    reasoning_enabled: Option<bool>,
 }
 
 // ─── Request Structures ───────────────────────────────────────────────────────
@@ -18,6 +22,8 @@ struct ChatRequest {
     stream: bool,
     options: Options,
     #[serde(skip_serializing_if = "Option::is_none")]
+    think: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<serde_json::Value>>,
 }
 
@@ -26,6 +32,8 @@ struct Message {
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    images: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<OutgoingToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -85,6 +93,14 @@ struct OllamaFunction {
 
 impl OllamaProvider {
     pub fn new(base_url: Option<&str>, api_key: Option<&str>) -> Self {
+        Self::new_with_reasoning(base_url, api_key, None)
+    }
+
+    pub fn new_with_reasoning(
+        base_url: Option<&str>,
+        api_key: Option<&str>,
+        reasoning_enabled: Option<bool>,
+    ) -> Self {
         let api_key = api_key.and_then(|value| {
             let trimmed = value.trim();
             (!trimmed.is_empty()).then(|| trimmed.to_string())
@@ -96,6 +112,7 @@ impl OllamaProvider {
                 .trim_end_matches('/')
                 .to_string(),
             api_key,
+            reasoning_enabled,
         }
     }
 
@@ -137,6 +154,48 @@ impl OllamaProvider {
         serde_json::from_str(arguments).unwrap_or_else(|_| serde_json::json!({}))
     }
 
+    fn build_chat_request(
+        &self,
+        messages: Vec<Message>,
+        model: &str,
+        temperature: f64,
+        tools: Option<&[serde_json::Value]>,
+    ) -> ChatRequest {
+        ChatRequest {
+            model: model.to_string(),
+            messages,
+            stream: false,
+            options: Options { temperature },
+            think: self.reasoning_enabled,
+            tools: tools.map(|t| t.to_vec()),
+        }
+    }
+
+    fn convert_user_message_content(&self, content: &str) -> (Option<String>, Option<Vec<String>>) {
+        let (cleaned, image_refs) = multimodal::parse_image_markers(content);
+        if image_refs.is_empty() {
+            return (Some(content.to_string()), None);
+        }
+
+        let images: Vec<String> = image_refs
+            .iter()
+            .filter_map(|reference| multimodal::extract_ollama_image_payload(reference))
+            .collect();
+
+        if images.is_empty() {
+            return (Some(content.to_string()), None);
+        }
+
+        let cleaned = cleaned.trim();
+        let content = if cleaned.is_empty() {
+            None
+        } else {
+            Some(cleaned.to_string())
+        };
+
+        (content, Some(images))
+    }
+
     /// Convert internal chat history format to Ollama's native tool-call message schema.
     ///
     /// `run_tool_call_loop` stores native assistant/tool entries as JSON strings in
@@ -176,6 +235,7 @@ impl OllamaProvider {
                                 return Message {
                                     role: "assistant".to_string(),
                                     content,
+                                    images: None,
                                     tool_calls: Some(outgoing_calls),
                                     tool_name: None,
                                 };
@@ -209,15 +269,28 @@ impl OllamaProvider {
                         return Message {
                             role: "tool".to_string(),
                             content,
+                            images: None,
                             tool_calls: None,
                             tool_name,
                         };
                     }
                 }
 
+                if message.role == "user" {
+                    let (content, images) = self.convert_user_message_content(&message.content);
+                    return Message {
+                        role: "user".to_string(),
+                        content,
+                        images,
+                        tool_calls: None,
+                        tool_name: None,
+                    };
+                }
+
                 Message {
                     role: message.role.clone(),
                     content: Some(message.content.clone()),
+                    images: None,
                     tool_calls: None,
                     tool_name: None,
                 }
@@ -235,22 +308,17 @@ impl OllamaProvider {
         should_auth: bool,
         tools: Option<&[serde_json::Value]>,
     ) -> anyhow::Result<ApiChatResponse> {
-        let request = ChatRequest {
-            model: model.to_string(),
-            messages,
-            stream: false,
-            options: Options { temperature },
-            tools: tools.map(|t| t.to_vec()),
-        };
+        let request = self.build_chat_request(messages, model, temperature, tools);
 
         let url = format!("{}/api/chat", self.base_url);
 
         tracing::debug!(
-            "Ollama request: url={} model={} message_count={} temperature={} tool_count={}",
+            "Ollama request: url={} model={} message_count={} temperature={} think={:?} tool_count={}",
             url,
             model,
             request.messages.len(),
             temperature,
+            request.think,
             request.tools.as_ref().map_or(0, |t| t.len()),
         );
 
@@ -374,6 +442,13 @@ impl OllamaProvider {
 
 #[async_trait]
 impl Provider for OllamaProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calling: true,
+            vision: true,
+        }
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -389,14 +464,17 @@ impl Provider for OllamaProvider {
             messages.push(Message {
                 role: "system".to_string(),
                 content: Some(sys.to_string()),
+                images: None,
                 tool_calls: None,
                 tool_name: None,
             });
         }
 
+        let (user_content, user_images) = self.convert_user_message_content(message);
         messages.push(Message {
             role: "user".to_string(),
-            content: Some(message.to_string()),
+            content: user_content,
+            images: user_images,
             tool_calls: None,
             tool_name: None,
         });
@@ -646,6 +724,46 @@ mod tests {
     }
 
     #[test]
+    fn request_omits_think_when_reasoning_not_configured() {
+        let provider = OllamaProvider::new(None, None);
+        let request = provider.build_chat_request(
+            vec![Message {
+                role: "user".to_string(),
+                content: Some("hello".to_string()),
+                images: None,
+                tool_calls: None,
+                tool_name: None,
+            }],
+            "llama3",
+            0.7,
+            None,
+        );
+
+        let json = serde_json::to_value(request).unwrap();
+        assert!(json.get("think").is_none());
+    }
+
+    #[test]
+    fn request_includes_think_when_reasoning_configured() {
+        let provider = OllamaProvider::new_with_reasoning(None, None, Some(false));
+        let request = provider.build_chat_request(
+            vec![Message {
+                role: "user".to_string(),
+                content: Some("hello".to_string()),
+                images: None,
+                tool_calls: None,
+                tool_name: None,
+            }],
+            "llama3",
+            0.7,
+            None,
+        );
+
+        let json = serde_json::to_value(request).unwrap();
+        assert_eq!(json.get("think"), Some(&serde_json::json!(false)));
+    }
+
+    #[test]
     fn response_deserializes() {
         let json = r#"{"message":{"role":"assistant","content":"Hello from Ollama!"}}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
@@ -799,5 +917,35 @@ mod tests {
         assert_eq!(converted[1].tool_name.as_deref(), Some("file_read"));
         assert_eq!(converted[1].content.as_deref(), Some("ok"));
         assert!(converted[1].tool_calls.is_none());
+    }
+
+    #[test]
+    fn convert_messages_extracts_images_from_user_marker() {
+        let provider = OllamaProvider::new(None, None);
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "Inspect this screenshot [IMAGE:data:image/png;base64,abcd==]".into(),
+        }];
+
+        let converted = provider.convert_messages(&messages);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, "user");
+        assert_eq!(
+            converted[0].content.as_deref(),
+            Some("Inspect this screenshot")
+        );
+        let images = converted[0]
+            .images
+            .as_ref()
+            .expect("images should be present");
+        assert_eq!(images, &vec!["abcd==".to_string()]);
+    }
+
+    #[test]
+    fn capabilities_include_native_tools_and_vision() {
+        let provider = OllamaProvider::new(None, None);
+        let caps = <OllamaProvider as Provider>::capabilities(&provider);
+        assert!(caps.native_tool_calling);
+        assert!(caps.vision);
     }
 }

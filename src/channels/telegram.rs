@@ -18,7 +18,7 @@ const TELEGRAM_BIND_COMMAND: &str = "/bind";
 /// Split a message into chunks that respect Telegram's 4096 character limit.
 /// Tries to split at word boundaries when possible, and handles continuation.
 fn split_message_for_telegram(message: &str) -> Vec<String> {
-    if message.len() <= TELEGRAM_MAX_MESSAGE_LENGTH {
+    if message.chars().count() <= TELEGRAM_MAX_MESSAGE_LENGTH {
         return vec![message.to_string()];
     }
 
@@ -26,29 +26,32 @@ fn split_message_for_telegram(message: &str) -> Vec<String> {
     let mut remaining = message;
 
     while !remaining.is_empty() {
-        let chunk_end = if remaining.len() <= TELEGRAM_MAX_MESSAGE_LENGTH {
-            remaining.len()
+        // Find the byte offset for the Nth character boundary.
+        let hard_split = remaining
+            .char_indices()
+            .nth(TELEGRAM_MAX_MESSAGE_LENGTH)
+            .map_or(remaining.len(), |(idx, _)| idx);
+
+        let chunk_end = if hard_split == remaining.len() {
+            hard_split
         } else {
             // Try to find a good break point (newline, then space)
-            let search_area = &remaining[..TELEGRAM_MAX_MESSAGE_LENGTH];
+            let search_area = &remaining[..hard_split];
 
             // Prefer splitting at newline
             if let Some(pos) = search_area.rfind('\n') {
                 // Don't split if the newline is too close to the start
-                if pos >= TELEGRAM_MAX_MESSAGE_LENGTH / 2 {
+                if search_area[..pos].chars().count() >= TELEGRAM_MAX_MESSAGE_LENGTH / 2 {
                     pos + 1
                 } else {
                     // Try space as fallback
-                    search_area
-                        .rfind(' ')
-                        .unwrap_or(TELEGRAM_MAX_MESSAGE_LENGTH)
-                        + 1
+                    search_area.rfind(' ').unwrap_or(hard_split) + 1
                 }
             } else if let Some(pos) = search_area.rfind(' ') {
                 pos + 1
             } else {
-                // Hard split at the limit
-                TELEGRAM_MAX_MESSAGE_LENGTH
+                // Hard split at character boundary
+                hard_split
             }
         };
 
@@ -623,7 +626,7 @@ impl TelegramChannel {
 
         if let Some(code) = Self::extract_bind_code(text) {
             if let Some(pairing) = self.pairing.as_ref() {
-                match pairing.try_pair(code).await {
+                match pairing.try_pair(code, &chat_id).await {
                     Ok(Some(_token)) => {
                         let bind_identity = normalized_sender_id.clone().or_else(|| {
                             if normalized_username.is_empty() || normalized_username == "unknown" {
@@ -1624,6 +1627,37 @@ impl Channel for TelegramChannel {
         tracing::warn!("Telegram finalize_draft edit failed; falling back to sendMessage");
         self.send_text_chunks(text, &chat_id, thread_id.as_deref())
             .await
+    }
+
+    async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
+        let (chat_id, _) = Self::parse_reply_target(recipient);
+        self.last_draft_edit.lock().remove(&chat_id);
+
+        let message_id = match message_id.parse::<i64>() {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::debug!("Invalid Telegram draft message_id '{message_id}': {e}");
+                return Ok(());
+            }
+        };
+
+        let response = self
+            .client
+            .post(self.api_url("deleteMessage"))
+            .json(&serde_json::json!({
+                "chat_id": chat_id,
+                "message_id": message_id,
+            }))
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            tracing::debug!("Telegram deleteMessage failed ({status}): {body}");
+        }
+
+        Ok(())
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
@@ -2824,5 +2858,104 @@ mod tests {
 
         let ch_disabled = TelegramChannel::new("token".into(), vec!["*".into()], false);
         assert!(!ch_disabled.mention_only);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // TG6: Channel platform limit edge cases for Telegram (4096 char limit)
+    // Prevents: Pattern 6 — issues #574, #499
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn telegram_split_code_block_at_boundary() {
+        let mut msg = String::new();
+        msg.push_str("```python\n");
+        msg.push_str(&"x".repeat(4085));
+        msg.push_str("\n```\nMore text after code block");
+        let parts = split_message_for_telegram(&msg);
+        assert!(
+            parts.len() >= 2,
+            "code block spanning boundary should split"
+        );
+        for part in &parts {
+            assert!(
+                part.len() <= TELEGRAM_MAX_MESSAGE_LENGTH,
+                "each part must be <= {TELEGRAM_MAX_MESSAGE_LENGTH}, got {}",
+                part.len()
+            );
+        }
+    }
+
+    #[test]
+    fn telegram_split_single_long_word() {
+        let long_word = "a".repeat(5000);
+        let parts = split_message_for_telegram(&long_word);
+        assert!(parts.len() >= 2, "word exceeding limit must be split");
+        for part in &parts {
+            assert!(
+                part.len() <= TELEGRAM_MAX_MESSAGE_LENGTH,
+                "hard-split part must be <= {TELEGRAM_MAX_MESSAGE_LENGTH}, got {}",
+                part.len()
+            );
+        }
+        let reassembled: String = parts.join("");
+        assert_eq!(reassembled, long_word);
+    }
+
+    #[test]
+    fn telegram_split_exactly_at_limit_no_split() {
+        let msg = "a".repeat(TELEGRAM_MAX_MESSAGE_LENGTH);
+        let parts = split_message_for_telegram(&msg);
+        assert_eq!(parts.len(), 1, "message exactly at limit should not split");
+    }
+
+    #[test]
+    fn telegram_split_one_over_limit() {
+        let msg = "a".repeat(TELEGRAM_MAX_MESSAGE_LENGTH + 1);
+        let parts = split_message_for_telegram(&msg);
+        assert!(parts.len() >= 2, "message 1 char over limit must split");
+    }
+
+    #[test]
+    fn telegram_split_many_short_lines() {
+        let msg: String = (0..1000).map(|i| format!("line {i}\n")).collect();
+        let parts = split_message_for_telegram(&msg);
+        for part in &parts {
+            assert!(
+                part.len() <= TELEGRAM_MAX_MESSAGE_LENGTH,
+                "short-line batch must be <= limit"
+            );
+        }
+    }
+
+    #[test]
+    fn telegram_split_only_whitespace() {
+        let msg = "   \n\n\t  ";
+        let parts = split_message_for_telegram(msg);
+        assert!(parts.len() <= 1);
+    }
+
+    #[test]
+    fn telegram_split_emoji_at_boundary() {
+        let mut msg = "a".repeat(4094);
+        msg.push_str("🎉🎊"); // 4096 chars total
+        let parts = split_message_for_telegram(&msg);
+        for part in &parts {
+            // The function splits on character count, not byte count
+            assert!(
+                part.chars().count() <= TELEGRAM_MAX_MESSAGE_LENGTH,
+                "emoji boundary split must respect limit"
+            );
+        }
+    }
+
+    #[test]
+    fn telegram_split_consecutive_newlines() {
+        let mut msg = "a".repeat(4090);
+        msg.push_str("\n\n\n\n\n\n");
+        msg.push_str(&"b".repeat(100));
+        let parts = split_message_for_telegram(&msg);
+        for part in &parts {
+            assert!(part.len() <= TELEGRAM_MAX_MESSAGE_LENGTH);
+        }
     }
 }

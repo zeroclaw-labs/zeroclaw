@@ -22,7 +22,34 @@ SOFTWARE.
 
 ================================================================================
 
+TRADEMARK NOTICE
+
+This license does not grant permission to use the trade names, trademarks,
+service marks, or product names of ZeroClaw Labs, including "ZeroClaw",
+"zeroclaw-labs", or associated logos, except as required for reasonable and
+customary use in describing the origin of the Software.
+
+Unauthorized use of the ZeroClaw name or branding to imply endorsement,
+affiliation, or origin is strictly prohibited. See TRADEMARK.md for details.
+
+================================================================================
+
+DUAL LICENSE NOTICE
+
+This software is available under a dual-license model:
+
+  1. MIT License (this file) — for open-source, research, academic, and
+     personal use. See LICENSE (this file).
+
+  2. Apache License 2.0 — for contributors and deployments requiring explicit
+     patent grants and stronger IP protection. See LICENSE-APACHE.
+
+You may choose either license for your use. Contributors submitting patches
+grant rights under both licenses. See CLA.md for the contributor agreement.
+
+================================================================================
+
 This product includes software developed by ZeroClaw Labs and contributors:
 https://github.com/zeroclaw-labs/zeroclaw/graphs/contributors
 
-See NOTICE file for full contributor attribution.
+See NOTICE for full contributor attribution.

@@ -51,7 +51,42 @@ Notes:
 - Model cache previews come from `zeroclaw models refresh --provider <ID>`.
 - These are runtime chat commands, not CLI subcommands.
 
+## Inbound Image Marker Protocol
+
+ZeroClaw supports multimodal input through inline message markers:
+
+- Syntax: ``[IMAGE:<source>]``
+- `<source>` can be:
+  - Local file path
+  - Data URI (`data:image/...;base64,...`)
+  - Remote URL only when `[multimodal].allow_remote_fetch = true`
+
+Operational notes:
+
+- Marker parsing applies to user-role messages before provider calls.
+- Provider capability is enforced at runtime: if the selected provider does not support vision, the request fails with a structured capability error (`capability=vision`).
+- Linq webhook `media` parts with `image/*` MIME type are automatically converted to this marker format.
+
 ## Channel Matrix
+
+### Build Feature Toggle (`channel-matrix`)
+
+Matrix support is controlled at compile time by the `channel-matrix` Cargo feature.
+
+- Default builds include Matrix support (`default = ["hardware", "channel-matrix"]`).
+- For faster local iteration when Matrix is not needed:
+
+```bash
+cargo check --no-default-features --features hardware
+```
+
+- To explicitly enable Matrix support in custom feature sets:
+
+```bash
+cargo check --no-default-features --features hardware,channel-matrix
+```
+
+If `[channels_config.matrix]` is present but the binary was built without `channel-matrix`, `zeroclaw channel list`, `zeroclaw channel doctor`, and `zeroclaw channel start` will log that Matrix is intentionally skipped for this build.
 
 ---
 
@@ -103,7 +138,16 @@ Field names differ by channel:
 [channels_config.telegram]
 bot_token = "123456:telegram-token"
 allowed_users = ["*"]
+stream_mode = "off"               # optional: off | partial
+draft_update_interval_ms = 1000   # optional: edit throttle for partial streaming
+mention_only = false              # optional: require @mention in groups
+interrupt_on_new_message = false  # optional: cancel in-flight same-sender same-chat request
 ```
+
+Telegram notes:
+
+- `interrupt_on_new_message = true` preserves interrupted user turns in conversation history, then restarts generation on the newest message.
+- Interruption scope is strict: same sender in the same chat. Messages from different chats are processed independently.
 
 ### 4.2 Discord
 
@@ -349,4 +393,3 @@ If a specific channel task crashes or exits, the channel supervisor in `channels
 - `Channel message worker crashed:`
 
 These messages indicate automatic restart behavior is active, and you should inspect preceding logs for root cause.
-

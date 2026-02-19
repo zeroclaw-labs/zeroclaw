@@ -113,6 +113,11 @@ pub trait Channel: Send + Sync {
     ) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// Cancel and remove a previously sent draft message if the channel supports it.
+    async fn cancel_draft(&self, _recipient: &str, _message_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -198,6 +203,7 @@ mod tests {
             .finalize_draft("bob", "msg_1", "final text")
             .await
             .is_ok());
+        assert!(channel.cancel_draft("bob", "msg_1").await.is_ok());
     }
 
     #[tokio::test]

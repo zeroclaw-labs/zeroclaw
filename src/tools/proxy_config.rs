@@ -235,7 +235,9 @@ impl ProxyConfigTool {
         }
 
         if args.get("enabled").is_none() && touched_proxy_url {
-            proxy.enabled = true;
+            // Keep auto-enable behavior when users provide a proxy URL, but
+            // auto-disable when all proxy URLs are cleared in the same update.
+            proxy.enabled = proxy.has_any_proxy_url();
         }
 
         proxy.no_proxy = proxy.normalized_no_proxy();

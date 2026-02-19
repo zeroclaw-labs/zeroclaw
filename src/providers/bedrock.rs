@@ -639,6 +639,7 @@ impl Provider for BedrockProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             native_tool_calling: true,
+            vision: false,
         }
     }
 

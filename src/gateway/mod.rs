@@ -10,7 +10,7 @@
 use crate::channels::{Channel, LinqChannel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
-use crate::providers::{self, Provider};
+use crate::providers::{self, ChatMessage, Provider, ProviderCapabilityError};
 use crate::runtime;
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::security::SecurityPolicy;
@@ -313,6 +313,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             auth_profile_override: None,
             zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
             secrets_encrypt: config.secrets.encrypt,
+            reasoning_enabled: config.runtime.reasoning_enabled,
         },
     )?);
     let model = config
@@ -609,7 +610,7 @@ async fn handle_pair(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    match state.pairing.try_pair(code).await {
+    match state.pairing.try_pair(code, &rate_key).await {
         Ok(Some(token)) => {
             tracing::info!("🔐 New client paired successfully");
             if let Err(err) = persist_pairing_tokens(state.config.clone(), &state.pairing).await {
@@ -663,6 +664,52 @@ async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGua
     // Keep shared runtime config in sync with persisted tokens.
     *config.lock() = updated_cfg;
     Ok(())
+}
+
+async fn run_gateway_chat_with_multimodal(
+    state: &AppState,
+    provider_label: &str,
+    message: &str,
+) -> anyhow::Result<String> {
+    let user_messages = vec![ChatMessage::user(message)];
+    let image_marker_count = crate::multimodal::count_image_markers(&user_messages);
+    if image_marker_count > 0 && !state.provider.supports_vision() {
+        return Err(ProviderCapabilityError {
+            provider: provider_label.to_string(),
+            capability: "vision".to_string(),
+            message: format!(
+                "received {image_marker_count} image marker(s), but this provider does not support vision input"
+            ),
+        }
+        .into());
+    }
+
+    // Keep webhook/gateway prompts aligned with channel behavior by injecting
+    // workspace-aware system context before model invocation.
+    let system_prompt = {
+        let config_guard = state.config.lock();
+        crate::channels::build_system_prompt(
+            &config_guard.workspace_dir,
+            &state.model,
+            &[], // tools - empty for simple chat
+            &[], // skills
+            Some(&config_guard.identity),
+            None, // bootstrap_max_chars - use default
+        )
+    };
+
+    let mut messages = Vec::with_capacity(1 + user_messages.len());
+    messages.push(ChatMessage::system(system_prompt));
+    messages.extend(user_messages);
+
+    let multimodal_config = state.config.lock().multimodal.clone();
+    let prepared =
+        crate::multimodal::prepare_messages_for_provider(&messages, &multimodal_config).await?;
+
+    state
+        .provider
+        .chat_with_history(&prepared.messages, &state.model, state.temperature)
+        .await
 }
 
 /// Webhook request body
@@ -786,30 +833,7 @@ async fn handle_webhook(
             messages_count: 1,
         });
 
-    // Build system prompt with workspace context (IDENTITY.md, AGENTS.md, etc.)
-    let system_prompt = {
-        let config_guard = state.config.lock();
-        crate::channels::build_system_prompt(
-            &config_guard.workspace_dir,
-            &state.model,
-            &[], // tools - empty for simple chat
-            &[], // skills
-            Some(&config_guard.identity),
-            None, // bootstrap_max_chars - use default
-        )
-    };
-
-    // Call the LLM with separate system prompt
-    match state
-        .provider
-        .chat_with_system(
-            Some(&system_prompt),
-            message,
-            &state.model,
-            state.temperature,
-        )
-        .await
-    {
+    match run_gateway_chat_with_multimodal(&state, &provider_label, message).await {
         Ok(response) => {
             let duration = started_at.elapsed();
             state
@@ -993,6 +1017,12 @@ async fn handle_whatsapp_message(
     }
 
     // Process each message
+    let provider_label = state
+        .config
+        .lock()
+        .default_provider
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
     for msg in &messages {
         tracing::info!(
             "WhatsApp message from {}: {}",
@@ -1009,30 +1039,7 @@ async fn handle_whatsapp_message(
                 .await;
         }
 
-        // Build system prompt with workspace context (IDENTITY.md, AGENTS.md, etc.)
-        let system_prompt = {
-            let config_guard = state.config.lock();
-            crate::channels::build_system_prompt(
-                &config_guard.workspace_dir,
-                &state.model,
-                &[], // tools - empty for simple chat
-                &[], // skills
-                Some(&config_guard.identity),
-                None, // bootstrap_max_chars - use default
-            )
-        };
-
-        // Call the LLM with separate system prompt
-        match state
-            .provider
-            .chat_with_system(
-                Some(&system_prompt),
-                &msg.content,
-                &state.model,
-                state.temperature,
-            )
-            .await
-        {
+        match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content).await {
             Ok(response) => {
                 // Send reply via WhatsApp
                 if let Err(e) = wa
@@ -1123,6 +1130,12 @@ async fn handle_linq_webhook(
     }
 
     // Process each message
+    let provider_label = state
+        .config
+        .lock()
+        .default_provider
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
     for msg in &messages {
         tracing::info!(
             "Linq message from {}: {}",
@@ -1140,11 +1153,7 @@ async fn handle_linq_webhook(
         }
 
         // Call the LLM
-        match state
-            .provider
-            .simple_chat(&msg.content, &state.model, state.temperature)
-            .await
-        {
+        match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content).await {
             Ok(response) => {
                 // Send reply via Linq
                 if let Err(e) = linq
@@ -1448,7 +1457,7 @@ mod tests {
 
         let guard = PairingGuard::new(true, &[]);
         let code = guard.pairing_code().unwrap();
-        let token = guard.try_pair(&code).await.unwrap().unwrap();
+        let token = guard.try_pair(&code, "test_client").await.unwrap().unwrap();
         assert!(guard.is_authenticated(&token));
 
         let shared_config = Arc::new(Mutex::new(config));
