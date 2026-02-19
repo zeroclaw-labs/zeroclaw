@@ -47,9 +47,10 @@ jobs:
                   set -euo pipefail
                   {
                     echo "org.gradle.parallel=false"
-                    echo "org.gradle.workers.max=2"
-                    echo "org.gradle.jvmargs=-Xmx5120m -XX:MaxMetaspaceSize=2048m -Dkotlin.daemon.jvm.options=-Xmx3072m,XX:MaxMetaspaceSize=1536m -Dfile.encoding=UTF-8"
-                    echo "kotlin.daemon.jvmargs=-Xmx3072m -XX:MaxMetaspaceSize=1536m"
+                    echo "org.gradle.workers.max=1"
+                    echo "org.gradle.jvmargs=-Xmx3072m -XX:MaxMetaspaceSize=1024m -Dfile.encoding=UTF-8"
+                    echo "kotlin.compiler.execution.strategy=in-process"
+                    echo "kotlin.daemon.jvmargs=-Xmx1536m -XX:MaxMetaspaceSize=512m"
                     echo "newArchEnabled=true"
                     echo "reactNativeArchitectures=arm64-v8a"
                   } >> android/gradle.properties
@@ -70,10 +71,9 @@ jobs:
 
             - name: Build release APK
               env:
-                  JAVA_TOOL_OPTIONS: -XX:MaxMetaspaceSize=2048m
-                  GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx5120m -XX:MaxMetaspaceSize=2048m -Dkotlin.daemon.jvm.options=-Xmx3072m,XX:MaxMetaspaceSize=1536m -Dfile.encoding=UTF-8"
+                  GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx3072m -XX:MaxMetaspaceSize=1024m -Dfile.encoding=UTF-8"
               run: |
-                  ./gradlew :app:assembleRelease --no-daemon --max-workers=2 -Dkotlin.compiler.execution.strategy=in-process \
+                  ./gradlew :app:assembleRelease --no-daemon --max-workers=1 -Dkotlin.compiler.execution.strategy=in-process \
                     -PreactNativeArchitectures=arm64-v8a \
                     -Pandroid.injected.signing.store.file="$RELEASE_KEYSTORE_PATH" \
                     -Pandroid.injected.signing.store.password="${{ secrets.ANDROID_RELEASE_STORE_PASSWORD }}" \
