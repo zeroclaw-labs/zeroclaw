@@ -224,6 +224,7 @@ fn has_supervised_channels(config: &Config) -> bool {
         irc,
         lark,
         dingtalk,
+        linq,
         qq,
         ..
     } = &config.channels_config;
@@ -240,6 +241,7 @@ fn has_supervised_channels(config: &Config) -> bool {
         || irc.is_some()
         || lark.is_some()
         || dingtalk.is_some()
+        || linq.is_some()
         || qq.is_some()
 }
 

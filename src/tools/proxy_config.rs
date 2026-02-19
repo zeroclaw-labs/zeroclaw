@@ -189,19 +189,40 @@ impl ProxyConfigTool {
             })?;
         }
 
-        if let MaybeSet::Set(update) = Self::parse_optional_string_update(args, "http_proxy")? {
-            proxy.http_proxy = Some(update);
-            touched_proxy_url = true;
+        match Self::parse_optional_string_update(args, "http_proxy")? {
+            MaybeSet::Set(update) => {
+                proxy.http_proxy = Some(update);
+                touched_proxy_url = true;
+            }
+            MaybeSet::Null => {
+                proxy.http_proxy = None;
+                touched_proxy_url = true;
+            }
+            MaybeSet::Unset => {}
         }
 
-        if let MaybeSet::Set(update) = Self::parse_optional_string_update(args, "https_proxy")? {
-            proxy.https_proxy = Some(update);
-            touched_proxy_url = true;
+        match Self::parse_optional_string_update(args, "https_proxy")? {
+            MaybeSet::Set(update) => {
+                proxy.https_proxy = Some(update);
+                touched_proxy_url = true;
+            }
+            MaybeSet::Null => {
+                proxy.https_proxy = None;
+                touched_proxy_url = true;
+            }
+            MaybeSet::Unset => {}
         }
 
-        if let MaybeSet::Set(update) = Self::parse_optional_string_update(args, "all_proxy")? {
-            proxy.all_proxy = Some(update);
-            touched_proxy_url = true;
+        match Self::parse_optional_string_update(args, "all_proxy")? {
+            MaybeSet::Set(update) => {
+                proxy.all_proxy = Some(update);
+                touched_proxy_url = true;
+            }
+            MaybeSet::Null => {
+                proxy.all_proxy = None;
+                touched_proxy_url = true;
+            }
+            MaybeSet::Unset => {}
         }
 
         if let Some(no_proxy_raw) = args.get("no_proxy") {
@@ -493,5 +514,35 @@ mod tests {
         assert!(get_result.success);
         assert!(get_result.output.contains("provider.openai"));
         assert!(get_result.output.contains("services"));
+    }
+
+    #[tokio::test]
+    async fn set_null_proxy_url_clears_existing_value() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ProxyConfigTool::new(test_config(&tmp).await, test_security());
+
+        let set_result = tool
+            .execute(json!({
+                "action": "set",
+                "http_proxy": "http://127.0.0.1:7890"
+            }))
+            .await
+            .unwrap();
+        assert!(set_result.success, "{:?}", set_result.error);
+
+        let clear_result = tool
+            .execute(json!({
+                "action": "set",
+                "http_proxy": null
+            }))
+            .await
+            .unwrap();
+        assert!(clear_result.success, "{:?}", clear_result.error);
+
+        let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
+        assert!(get_result.success);
+        let parsed: Value = serde_json::from_str(&get_result.output).unwrap();
+        assert!(parsed["proxy"]["http_proxy"].is_null());
+        assert!(parsed["runtime_proxy"]["http_proxy"].is_null());
     }
 }
