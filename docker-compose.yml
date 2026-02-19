@@ -1,0 +1,13 @@
+services:
+  clawsuite:
+    build: .
+    ports:
+      - '3000:3000'
+    environment:
+      - CLAWDBOT_GATEWAY_URL=${CLAWDBOT_GATEWAY_URL:-ws://host.docker.internal:18789}
+      - CLAWDBOT_GATEWAY_TOKEN=${CLAWDBOT_GATEWAY_TOKEN:-}
+      - CLAWSUITE_ALLOWED_HOSTS=${CLAWSUITE_ALLOWED_HOSTS:-}
+      - CLAWSUITE_PASSWORD=${CLAWSUITE_PASSWORD:-}
+    restart: unless-stopped
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'

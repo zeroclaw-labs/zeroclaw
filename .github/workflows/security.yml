@@ -1,0 +1,62 @@
+# Phase 2.5-001: Secrets scanning CI
+# Scans for leaked secrets on PR and push to main
+
+name: Security Scan
+
+on:
+  push:
+    branches: [main, production]
+  pull_request:
+    branches: [main, production]
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  secrets-scan:
+    name: Scan for Secrets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # No additional secrets required - uses built-in GITHUB_TOKEN
+
+      - name: Grep for common patterns (fallback)
+        if: always()
+        run: |
+          echo "🔍 Scanning for common secret patterns..."
+
+          # Patterns that indicate secrets
+          PATTERNS=(
+            "sk-[a-zA-Z0-9]{20,}"
+            "sk-ant-"
+            "ghp_[a-zA-Z0-9]{36}"
+            "github_pat_"
+            "gho_[a-zA-Z0-9]{36}"
+            "PRIVATE KEY"
+            "-----BEGIN RSA"
+            "-----BEGIN OPENSSH"
+          )
+
+          FOUND=0
+          for pattern in "${PATTERNS[@]}"; do
+            if grep -rE "$pattern" --include="*.ts" --include="*.tsx" --include="*.js" --include="*.json" --include="*.env*" . 2>/dev/null | grep -v node_modules | grep -v ".lock" | grep -v dist; then
+              echo "⚠️ Potential secret found matching: $pattern"
+              FOUND=1
+            fi
+          done
+
+          if [ $FOUND -eq 1 ]; then
+            echo "❌ Potential secrets detected! Please review and remove."
+            exit 1
+          fi
+
+          echo "✅ No obvious secret patterns found"

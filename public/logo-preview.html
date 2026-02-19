@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ClawSuite Logo Preview</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        background: #0f172a;
+        color: #e2e8f0;
+        padding: 3rem;
+      }
+      h1 {
+        text-align: center;
+        margin-bottom: 3rem;
+        font-size: 2.5rem;
+        background: linear-gradient(135deg, #0891b2, #06b6d4);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+        gap: 2rem;
+        max-width: 1400px;
+        margin: 0 auto;
+      }
+      .card {
+        background: #1e293b;
+        border-radius: 1rem;
+        padding: 2rem;
+        border: 1px solid #334155;
+      }
+      .card h2 {
+        text-align: center;
+        margin-bottom: 1.5rem;
+        font-size: 1.25rem;
+        color: #06b6d4;
+      }
+      .preview-row {
+        display: flex;
+        gap: 1rem;
+        margin-bottom: 1rem;
+      }
+      .preview-box {
+        flex: 1;
+        aspect-ratio: 1;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 0.5rem;
+        position: relative;
+        overflow: hidden;
+      }
+      .preview-box.dark {
+        background: #0f172a;
+      }
+      .preview-box.light {
+        background: #f8fafc;
+      }
+      .preview-box.gradient {
+        background: linear-gradient(135deg, #1e293b, #334155);
+      }
+      .preview-box img {
+        width: 80%;
+        height: 80%;
+        object-fit: contain;
+      }
+      .label {
+        position: absolute;
+        bottom: 0.5rem;
+        left: 50%;
+        transform: translateX(-50%);
+        font-size: 0.75rem;
+        opacity: 0.6;
+        background: rgba(0, 0, 0, 0.5);
+        padding: 0.25rem 0.5rem;
+        border-radius: 0.25rem;
+      }
+      .sizes {
+        display: flex;
+        gap: 1rem;
+        margin-top: 1rem;
+        justify-content: center;
+      }
+      .size-box {
+        background: #0f172a;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 0.5rem;
+      }
+      .size-label {
+        font-size: 0.875rem;
+        opacity: 0.7;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>ClawSuite Logo Concepts</h1>
+
+    <div class="grid">
+      <!-- Logo 1: Terminal -->
+      <div class="card">
+        <h2>Terminal Window</h2>
+        <div class="preview-row">
+          <div class="preview-box dark">
+            <img src="/logo.svg" alt="Logo on dark" />
+            <div class="label">Dark BG</div>
+          </div>
+          <div class="preview-box light">
+            <img src="/logo.svg" alt="Logo on light" />
+            <div class="label">Light BG</div>
+          </div>
+        </div>
+        <div class="preview-box gradient">
+          <img src="/logo.svg" alt="Logo on gradient" />
+          <div class="label">Gradient BG</div>
+        </div>
+        <div class="sizes">
+          <div class="size-box">
+            <img src="/logo.svg" style="width: 64px; height: 64px" />
+            <div class="size-label">64px</div>
+          </div>
+          <div class="size-box">
+            <img src="/logo.svg" style="width: 32px; height: 32px" />
+            <div class="size-label">32px</div>
+          </div>
+          <div class="size-box">
+            <img src="/logo.svg" style="width: 16px; height: 16px" />
+            <div class="size-label">16px</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Logo 2: Badge -->
+      <div class="card">
+        <h2>Hexagon Badge</h2>
+        <div class="preview-row">
+          <div class="preview-box dark">
+            <img src="/logo-badge.svg" alt="Badge on dark" />
+            <div class="label">Dark BG</div>
+          </div>
+          <div class="preview-box light">
+            <img src="/logo-badge.svg" alt="Badge on light" />
+            <div class="label">Light BG</div>
+          </div>
+        </div>
+        <div class="preview-box gradient">
+          <img src="/logo-badge.svg" alt="Badge on gradient" />
+          <div class="label">Gradient BG</div>
+        </div>
+        <div class="sizes">
+          <div class="size-box">
+            <img src="/logo-badge.svg" style="width: 64px; height: 64px" />
+            <div class="size-label">64px</div>
+          </div>
+          <div class="size-box">
+            <img src="/logo-badge.svg" style="width: 32px; height: 32px" />
+            <div class="size-label">32px</div>
+          </div>
+          <div class="size-box">
+            <img src="/logo-badge.svg" style="width: 16px; height: 16px" />
+            <div class="size-label">16px</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Logo 3: Minimal -->
+      <div class="card">
+        <h2>Abstract Minimal</h2>
+        <div class="preview-row">
+          <div class="preview-box dark">
+            <img src="/logo-minimal.svg" alt="Minimal on dark" />
+            <div class="label">Dark BG</div>
+          </div>
+          <div class="preview-box light">
+            <img src="/logo-minimal.svg" alt="Minimal on light" />
+            <div class="label">Light BG</div>
+          </div>
+        </div>
+        <div class="preview-box gradient">
+          <img src="/logo-minimal.svg" alt="Minimal on gradient" />
+          <div class="label">Gradient BG</div>
+        </div>
+        <div class="sizes">
+          <div class="size-box">
+            <img src="/logo-minimal.svg" style="width: 64px; height: 64px" />
+            <div class="size-label">64px</div>
+          </div>
+          <div class="size-box">
+            <img src="/logo-minimal.svg" style="width: 32px; height: 32px" />
+            <div class="size-label">32px</div>
+          </div>
+          <div class="size-box">
+            <img src="/logo-minimal.svg" style="width: 16px; height: 16px" />
+            <div class="size-label">16px</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

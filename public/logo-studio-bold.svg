@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" fill="none">
+  <defs>
+    <linearGradient id="orangeBoldGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#ea580c;stop-opacity:1" />
+      <stop offset="50%" style="stop-color:#f97316;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#fb923c;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="bgGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1e293b;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#334155;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  
+  <!-- Background rounded square -->
+  <rect x="5" y="5" width="90" height="90" rx="12" fill="url(#bgGradient)"/>
+  
+  <!-- Terminal window frame - thicker -->
+  <rect x="20" y="25" width="60" height="50" rx="4" stroke="url(#orangeBoldGradient)" stroke-width="3.5" fill="none"/>
+  
+  <!-- Terminal header dots - larger -->
+  <circle cx="28" cy="32" r="2.5" fill="url(#orangeBoldGradient)"/>
+  <circle cx="37" cy="32" r="2.5" fill="url(#orangeBoldGradient)"/>
+  <circle cx="46" cy="32" r="2.5" fill="url(#orangeBoldGradient)"/>
+  
+  <!-- Left claw bracket - thicker -->
+  <path d="M 37 45 L 31 50 L 37 55" stroke="url(#orangeBoldGradient)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  <!-- Pincer details - bolder -->
+  <path d="M 31 47.5 L 27 47.5" stroke="url(#orangeBoldGradient)" stroke-width="2.5" stroke-linecap="round" fill="none"/>
+  <path d="M 31 52.5 L 27 52.5" stroke="url(#orangeBoldGradient)" stroke-width="2.5" stroke-linecap="round" fill="none"/>
+  
+  <!-- Right claw bracket - thicker -->
+  <path d="M 63 45 L 69 50 L 63 55" stroke="url(#orangeBoldGradient)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  <!-- Pincer details - bolder -->
+  <path d="M 69 47.5 L 73 47.5" stroke="url(#orangeBoldGradient)" stroke-width="2.5" stroke-linecap="round" fill="none"/>
+  <path d="M 69 52.5 L 73 52.5" stroke="url(#orangeBoldGradient)" stroke-width="2.5" stroke-linecap="round" fill="none"/>
+  
+  <!-- Cursor - thicker -->
+  <rect x="46.5" y="47" width="3.5" height="10" rx="1.5" fill="url(#orangeBoldGradient)">
+    <animate attributeName="opacity" values="1;0.4;1" dur="1.5s" repeatCount="indefinite"/>
+  </rect>
+</svg>

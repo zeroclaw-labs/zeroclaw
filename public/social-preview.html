@@ -1,0 +1,185 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+
+      body {
+        width: 1280px;
+        height: 640px;
+        background: linear-gradient(
+          135deg,
+          #ea580c 0%,
+          #f97316 50%,
+          #fb923c 100%
+        );
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-family:
+          -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      }
+
+      .card {
+        background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
+        border-radius: 24px;
+        padding: 48px 56px;
+        display: flex;
+        align-items: center;
+        gap: 48px;
+        box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.4);
+      }
+
+      .icon-box {
+        width: 170px;
+        height: 170px;
+        background: linear-gradient(
+          135deg,
+          #ea580c 0%,
+          #f97316 50%,
+          #fb923c 100%
+        );
+        border-radius: 24px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-shrink: 0;
+      }
+
+      .icon-box svg {
+        width: 130px;
+        height: 130px;
+      }
+
+      .content {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+
+      .title {
+        font-size: 52px;
+        font-weight: 700;
+        color: #ffffff;
+        letter-spacing: -1px;
+        position: relative;
+        display: inline-block;
+      }
+
+      .title::after {
+        content: '';
+        position: absolute;
+        bottom: -6px;
+        left: 0;
+        width: 100%;
+        height: 3px;
+        background: linear-gradient(
+          90deg,
+          #f97316 0%,
+          #f97316 40%,
+          transparent 100%
+        );
+        border-radius: 2px;
+      }
+
+      .tagline {
+        font-size: 22px;
+        color: #94a3b8;
+        margin-bottom: 8px;
+      }
+
+      .features {
+        font-size: 16px;
+        color: #64748b;
+        letter-spacing: 0.5px;
+      }
+
+      .tags {
+        display: flex;
+        gap: 8px;
+        margin-top: 8px;
+      }
+
+      .tag {
+        font-size: 14px;
+        color: #f97316;
+        font-weight: 500;
+      }
+
+      .tag-sep {
+        color: #475569;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <div class="icon-box">
+        <svg
+          viewBox="0 0 100 100"
+          fill="none"
+          xmlns="http://www.w3.org/2000/svg"
+        >
+          <!-- Terminal window frame - dark outline, no fill -->
+          <rect
+            x="20"
+            y="25"
+            width="60"
+            height="50"
+            rx="4"
+            stroke="#1e293b"
+            stroke-width="3"
+            fill="none"
+          />
+
+          <!-- Terminal header dots - dark fill -->
+          <circle cx="28" cy="32" r="2.5" fill="#1e293b" />
+          <circle cx="37" cy="32" r="2.5" fill="#1e293b" />
+          <circle cx="46" cy="32" r="2.5" fill="#1e293b" />
+
+          <!-- Left claw bracket - dark -->
+          <path
+            d="M 38 45 L 32 50 L 38 55"
+            stroke="#1e293b"
+            stroke-width="4"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            fill="none"
+          />
+
+          <!-- Right claw bracket - dark -->
+          <path
+            d="M 62 45 L 68 50 L 62 55"
+            stroke="#1e293b"
+            stroke-width="4"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            fill="none"
+          />
+
+          <!-- Center cursor bar - dark fill -->
+          <rect x="47" y="46" width="4" height="10" rx="2" fill="#1e293b" />
+        </svg>
+      </div>
+
+      <div class="content">
+        <div class="title">ClawSuite</div>
+        <div class="tagline">All-in-one command center for OpenClaw</div>
+        <div class="features">
+          Chat • Terminal • Files • Skills • Cron • Dashboard
+        </div>
+        <div class="tags">
+          <span class="tag">Local-first</span>
+          <span class="tag-sep">•</span>
+          <span class="tag">Gateway-native</span>
+          <span class="tag-sep">•</span>
+          <span class="tag">Builder-focused</span>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

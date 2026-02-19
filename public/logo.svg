@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" fill="none">
+  <defs>
+    <linearGradient id="clawGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#0891b2;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#06b6d4;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  
+  <!-- Terminal window frame -->
+  <rect x="20" y="25" width="60" height="50" rx="4" stroke="url(#clawGradient)" stroke-width="2.5" fill="none"/>
+  
+  <!-- Terminal header dots -->
+  <circle cx="27" cy="32" r="2" fill="url(#clawGradient)"/>
+  <circle cx="35" cy="32" r="2" fill="url(#clawGradient)"/>
+  <circle cx="43" cy="32" r="2" fill="url(#clawGradient)"/>
+  
+  <!-- Stylized claw brackets (< >) -->
+  <path d="M 35 45 L 30 50 L 35 55" stroke="url(#clawGradient)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  <path d="M 65 45 L 70 50 L 65 55" stroke="url(#clawGradient)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  
+  <!-- Cursor/claw accent -->
+  <rect x="46" y="48" width="2.5" height="8" rx="1" fill="url(#clawGradient)">
+    <animate attributeName="opacity" values="1;0.3;1" dur="1.5s" repeatCount="indefinite"/>
+  </rect>
+</svg>

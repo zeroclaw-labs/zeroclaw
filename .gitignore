@@ -1,0 +1,136 @@
+# Dependencies
+node_modules
+.pnp
+.pnp.js
+
+# Build outputs
+dist
+dist-ssr
+build
+.output
+.vinxi
+.nitro
+.tanstack
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor directories
+.vscode/*
+!.vscode/extensions.json
+.idea
+*.swp
+*.swo
+*~
+
+# Testing
+coverage
+.nyc_output
+
+# Temporary files
+*.tmp
+*.temp
+.cache
+.parcel-cache
+
+# Tauri
+src-tauri/target
+src-tauri/WixTools
+
+# Local state
+count.txt
+todos.json
+releases/
+
+# Wrangler (Cloudflare Workers)
+.wrangler
+
+# Internal documentation (not for public repo)
+SHIP-REPORT.md
+CURRENT-STATUS.md
+BUG-REPORT.md
+LINT-FIX-TASK.md
+docs/OVERNIGHT-SHIP-REPORT.md
+docs/RELEASE-SETUP.md
+docs/PHASE-3-ACTION-PLAN.md
+docs/TAURI-PACKAGING-PLAN.md
+**/INTERNAL-*.md
+
+# Local development files
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Diagnostic exports
+diagnostics-*.json
+debug-export-*.txt
+
+# Terminal session state
+.terminal-sessions
+
+# Keep these files
+!.github/workflows
+tmp/
+
+# Task data (local persistence)
+data/
+dist/
+research/
+BROWSER-RESEARCH.md
+CHAT-TEST-REPORT.md
+DEVELOPMENT-STATUS.md
+FEATURE-AUDIT.md
+PHASE_5_REVIEW.md
+PR_SUMMARY_4.3.md
+RELEASE_NOTES_v2.1.2.md
+COMPETITOR-ANALYSIS.md
+SECURITY-AUDIT.md
+docs/PHASE-*
+docs/DASHBOARD_FINALIZATION_PLAN.md
+docs/MODEL_SWITCHER_AUDIT.md
+docs/MODEL_SWITCHER_TESTPLAN.md
+docs/OVERNIGHT-SHIP-REPORT.md
+docs/QA/
+docs/security/
+AGENTS.md
+SIDEBAR-SPEC.md
+SPEC-*.md
+docs/BETA_*.md
+docs/DEBUG_CONSOLE.md
+docs/EMBEDDINGS-*.md
+docs/MODEL_SWITCHER_ROOT_CAUSE.md
+docs/POST-MERGE-PROTOCOL.md
+docs/TESTER_INSTRUCTIONS.md
+docs/RELEASE_CHECKLIST.md
+docs/DASHBOARD_QA.md
+docs/ACTIVITY_LOGS.md
+docs/BROWSER-STRATEGY.md
+docs/CHAT-OPTIMIZATION.md
+docs/DASHBOARD_*.md
+docs/GATEWAY_CONSOLE_PARITY.md
+docs/NAVIGATION_ARCHITECTURE.md
+docs/ONBOARDING-SPEC.md
+docs/USAGE_AND_COST.md
+docs/WIDGET_ADD_REMOVE.md
+docs/MODEL_SWITCHER_SPEC.md
+docs/PROVIDER_WIZARD.md
+docs/0*
+docs/1*
+docs/INDEX.md
+docs/PHASE_*
+docs/specs/
+docs/CLAWSUITE-ROADMAP.md
