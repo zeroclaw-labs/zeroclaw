@@ -2830,10 +2830,10 @@ impl Config {
                 self.default_provider = Some(provider);
             }
         } else if let Ok(provider) = std::env::var("PROVIDER") {
-            let should_apply_legacy_provider = self.default_provider.as_deref().map_or(
-                true,
-                |configured| configured.trim().eq_ignore_ascii_case("openrouter"),
-            );
+            let should_apply_legacy_provider =
+                self.default_provider.as_deref().map_or(true, |configured| {
+                    configured.trim().eq_ignore_ascii_case("openrouter")
+                });
             if should_apply_legacy_provider && !provider.is_empty() {
                 self.default_provider = Some(provider);
             }
