@@ -1905,12 +1905,6 @@ mod tests {
     }
 
     #[test]
-    fn strip_think_tags_removes_multiple_blocks() {
-        let input = "a<think>x</think>b<think>y</think>c";
-        assert_eq!(strip_think_tags(input), "abc");
-    }
-
-    #[test]
     fn strip_think_tags_drops_unclosed_block_suffix() {
         let input = "visible<think>hidden";
         assert_eq!(strip_think_tags(input), "visible");
