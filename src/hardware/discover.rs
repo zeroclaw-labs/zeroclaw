@@ -1,8 +1,12 @@
 //! USB device discovery — enumerate devices and enrich with board registry.
+//!
+//! On Android (Termux) `nusb` does not expose `list_devices()` — it is gated
+//! behind `#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]`
+//! inside the `nusb` crate.  We guard our call site the same way and return an
+//! empty list on Android so the crate compiles cleanly in Termux.
 
 use super::registry;
 use anyhow::Result;
-use nusb::MaybeFuture;
 
 /// Information about a discovered USB device.
 #[derive(Debug, Clone)]
@@ -17,29 +21,45 @@ pub struct UsbDeviceInfo {
 }
 
 /// Enumerate all connected USB devices and enrich with board registry lookup.
+///
+/// Returns an empty `Vec` on Android/Termux where `nusb` does not support
+/// USB device enumeration.  All other platforms (Linux, macOS, Windows)
+/// perform a real scan.
 #[cfg(feature = "hardware")]
 pub fn list_usb_devices() -> Result<Vec<UsbDeviceInfo>> {
-    let mut devices = Vec::new();
+    #[cfg(not(target_os = "android"))]
+    {
+        use nusb::MaybeFuture;
 
-    let iter = nusb::list_devices()
-        .wait()
-        .map_err(|e| anyhow::anyhow!("USB enumeration failed: {e}"))?;
+        let mut devices = Vec::new();
 
-    for dev in iter {
-        let vid = dev.vendor_id();
-        let pid = dev.product_id();
-        let board = registry::lookup_board(vid, pid);
+        let iter = nusb::list_devices()
+            .wait()
+            .map_err(|e| anyhow::anyhow!("USB enumeration failed: {e}"))?;
 
-        devices.push(UsbDeviceInfo {
-            bus_id: dev.bus_id().to_string(),
-            device_address: dev.device_address(),
-            vid,
-            pid,
-            product_string: dev.product_string().map(String::from),
-            board_name: board.map(|b| b.name.to_string()),
-            architecture: board.and_then(|b| b.architecture.map(String::from)),
-        });
+        for dev in iter {
+            let vid: u16 = dev.vendor_id();
+            let pid: u16 = dev.product_id();
+            let board = registry::lookup_board(vid, pid);
+
+            devices.push(UsbDeviceInfo {
+                bus_id: dev.bus_id().to_string(),
+                device_address: dev.device_address(),
+                vid,
+                pid,
+                product_string: dev.product_string().map(String::from),
+                board_name: board.map(|b| b.name.to_string()),
+                architecture: board.and_then(|b| b.architecture.map(String::from)),
+            });
+        }
+
+        Ok(devices)
     }
 
-    Ok(devices)
+    // Android/Termux: nusb does not support USB enumeration on this platform.
+    #[cfg(target_os = "android")]
+    {
+        Ok(Vec::new())
+    }
 }
+
