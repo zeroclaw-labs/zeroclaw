@@ -879,13 +879,42 @@ A heartfelt thank you to the communities and institutions that inspire and fuel 
 
 We're building in the open because the best ideas come from everywhere. If you're reading this, you're part of it. Welcome. 🦀❤️
 
+## ⚠️ Official Repository & Impersonation Warning
+
+**This is the only official ZeroClaw repository:**
+> https://github.com/zeroclaw-labs/zeroclaw
+
+Any other repository, organization, domain, or package claiming to be "ZeroClaw" or implying affiliation with ZeroClaw Labs is **unauthorized and not affiliated with this project**. Known unauthorized forks will be listed in [TRADEMARK.md](TRADEMARK.md).
+
+If you encounter impersonation or trademark misuse, please [open an issue](https://github.com/zeroclaw-labs/zeroclaw/issues).
+
+---
+
 ## License
 
-MIT — see [LICENSE](LICENSE) for license terms and attribution baseline
+ZeroClaw is dual-licensed for maximum openness and contributor protection:
+
+| License | Use case |
+|---|---|
+| [MIT](LICENSE) | Open-source, research, academic, personal use |
+| [Apache 2.0](LICENSE-APACHE) | Patent protection, institutional, commercial deployment |
+
+You may choose either license. **Contributors automatically grant rights under both** — see [CLA.md](CLA.md) for the full contributor agreement.
+
+### Trademark
+
+The **ZeroClaw** name and logo are trademarks of ZeroClaw Labs. This license does not grant permission to use them to imply endorsement or affiliation. See [TRADEMARK.md](TRADEMARK.md) for permitted and prohibited uses.
+
+### Contributor Protections
+
+- You **retain copyright** of your contributions
+- **Patent grant** (Apache 2.0) shields you from patent claims by other contributors
+- Your contributions are **permanently attributed** in commit history and [NOTICE](NOTICE)
+- No trademark rights are transferred by contributing
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Implement a trait, submit a PR:
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [CLA.md](CLA.md). Implement a trait, submit a PR:
 - CI workflow guide: [docs/ci-map.md](docs/ci-map.md)
 - New `Provider` → `src/providers/`
 - New `Channel` → `src/channels/`
