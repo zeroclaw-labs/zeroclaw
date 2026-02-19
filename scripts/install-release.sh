@@ -21,10 +21,10 @@ echo "🦀 [2/4] Checking Rust installation..."
 if ! command -v rustc &> /dev/null; then
     echo "   Rust not found. Installing Rust (via rustup)..."
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-    
+
     # Source the environment for the current session
     source "$HOME/.cargo/env"
-    
+
     echo "   ✅ Rust installed successfully."
 else
     echo "   ✅ Rust is already installed."

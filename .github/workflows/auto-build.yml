@@ -36,7 +36,7 @@ jobs:
           LOCAL_HEAD=$(git rev-parse HEAD)
           echo "Upstream: $UPSTREAM_HEAD"
           echo "Local: $LOCAL_HEAD"
-          
+
           if [ "$UPSTREAM_HEAD" != "$LOCAL_HEAD" ] || [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
             echo "updates_available=true" >> $GITHUB_OUTPUT
             echo "Updates found or manual trigger. Proceeding."
@@ -63,7 +63,7 @@ jobs:
         run: |
           TAG_NAME="v-auto-$(date +'%Y%m%d-%H%M')"
           TITLE="Auto-Build Release $(date +'%Y-%m-%d %H:%M')"
-          
+
           # Create Release
           gh release create "$TAG_NAME" \
             "target/release/zeroclaw" \
