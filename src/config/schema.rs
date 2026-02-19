@@ -83,6 +83,10 @@ pub struct Config {
     #[serde(default)]
     pub model_routes: Vec<ModelRouteConfig>,
 
+    /// Embedding routing rules — route `hint:<name>` to specific provider+model combos.
+    #[serde(default)]
+    pub embedding_routes: Vec<EmbeddingRouteConfig>,
+
     /// Automatic query classification — maps user messages to model hints.
     #[serde(default)]
     pub query_classification: QueryClassificationConfig,
@@ -1821,6 +1825,36 @@ pub struct ModelRouteConfig {
     pub api_key: Option<String>,
 }
 
+// ── Embedding routing ───────────────────────────────────────────
+
+/// Route an embedding hint to a specific provider + model.
+///
+/// ```toml
+/// [[embedding_routes]]
+/// hint = "semantic"
+/// provider = "openai"
+/// model = "text-embedding-3-small"
+/// dimensions = 1536
+///
+/// [memory]
+/// embedding_model = "hint:semantic"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingRouteConfig {
+    /// Route hint name (e.g. "semantic", "archive", "faq")
+    pub hint: String,
+    /// Embedding provider (`none`, `openai`, or `custom:<url>`)
+    pub provider: String,
+    /// Embedding model to use with that provider
+    pub model: String,
+    /// Optional embedding dimension override for this route
+    #[serde(default)]
+    pub dimensions: Option<usize>,
+    /// Optional API key override for this route's provider
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
 // ── Query Classification ─────────────────────────────────────────
 
 /// Automatic query classification — classifies user messages by keyword/pattern
@@ -2480,6 +2514,7 @@ impl Default for Config {
             scheduler: SchedulerConfig::default(),
             agent: AgentConfig::default(),
             model_routes: Vec::new(),
+            embedding_routes: Vec::new(),
             heartbeat: HeartbeatConfig::default(),
             cron: CronConfig::default(),
             channels_config: ChannelsConfig::default(),
@@ -3407,6 +3442,7 @@ default_temperature = 0.7
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
             model_routes: Vec::new(),
+            embedding_routes: Vec::new(),
             query_classification: QueryClassificationConfig::default(),
             heartbeat: HeartbeatConfig {
                 enabled: true,
@@ -3574,6 +3610,7 @@ tool_dispatcher = "xml"
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
             model_routes: Vec::new(),
+            embedding_routes: Vec::new(),
             query_classification: QueryClassificationConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             cron: CronConfig::default(),

@@ -87,8 +87,36 @@ Notes:
 | `backend` | `sqlite` | `sqlite`, `lucid`, `markdown`, `none` |
 | `auto_save` | `true` | automatic persistence |
 | `embedding_provider` | `none` | `none`, `openai`, or custom endpoint |
+| `embedding_model` | `text-embedding-3-small` | embedding model ID, or `hint:<name>` route |
+| `embedding_dimensions` | `1536` | expected vector size for selected embedding model |
 | `vector_weight` | `0.7` | hybrid ranking vector weight |
 | `keyword_weight` | `0.3` | hybrid ranking keyword weight |
+
+## `[[model_routes]]` and `[[embedding_routes]]`
+
+Use route hints so integrations can keep stable names while model IDs evolve.
+
+```toml
+[memory]
+embedding_model = "hint:semantic"
+
+[[model_routes]]
+hint = "reasoning"
+provider = "openrouter"
+model = "provider/model-id"
+
+[[embedding_routes]]
+hint = "semantic"
+provider = "openai"
+model = "text-embedding-3-small"
+dimensions = 1536
+```
+
+Upgrade strategy:
+
+1. Keep hints stable (`hint:reasoning`, `hint:semantic`).
+2. Update only `model = "...new-version..."` in the route entries.
+3. Validate with `zeroclaw doctor` before restart/rollout.
 
 ## `[channels_config]`
 

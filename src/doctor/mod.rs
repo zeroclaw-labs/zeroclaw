@@ -344,6 +344,58 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         }
     }
 
+    // Embedding routes validation
+    for route in &config.embedding_routes {
+        if route.hint.trim().is_empty() {
+            items.push(DiagItem::warn(cat, "embedding route with empty hint"));
+        }
+        if let Some(reason) = embedding_provider_validation_error(&route.provider) {
+            items.push(DiagItem::warn(
+                cat,
+                format!(
+                    "embedding route \"{}\" uses invalid provider \"{}\": {}",
+                    route.hint, route.provider, reason
+                ),
+            ));
+        }
+        if route.model.trim().is_empty() {
+            items.push(DiagItem::warn(
+                cat,
+                format!("embedding route \"{}\" has empty model", route.hint),
+            ));
+        }
+        if route.dimensions.is_some_and(|value| value == 0) {
+            items.push(DiagItem::warn(
+                cat,
+                format!(
+                    "embedding route \"{}\" has invalid dimensions=0",
+                    route.hint
+                ),
+            ));
+        }
+    }
+
+    if let Some(hint) = config
+        .memory
+        .embedding_model
+        .strip_prefix("hint:")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if !config
+            .embedding_routes
+            .iter()
+            .any(|route| route.hint.trim() == hint)
+        {
+            items.push(DiagItem::warn(
+                cat,
+                format!(
+                    "memory.embedding_model uses hint \"{hint}\" but no matching [[embedding_routes]] entry exists"
+                ),
+            ));
+        }
+    }
+
     // Channel: at least one configured
     let cc = &config.channels_config;
     let has_channel = cc.telegram.is_some()
@@ -393,6 +445,31 @@ fn provider_validation_error(name: &str) -> Option<String> {
                 .unwrap_or("invalid provider")
                 .into(),
         ),
+    }
+}
+
+fn embedding_provider_validation_error(name: &str) -> Option<String> {
+    let normalized = name.trim();
+    if normalized.eq_ignore_ascii_case("none") || normalized.eq_ignore_ascii_case("openai") {
+        return None;
+    }
+
+    let Some(url) = normalized.strip_prefix("custom:") else {
+        return Some("supported values: none, openai, custom:<url>".into());
+    };
+
+    let url = url.trim();
+    if url.is_empty() {
+        return Some("custom provider requires a non-empty URL after 'custom:'".into());
+    }
+
+    match reqwest::Url::parse(url) {
+        Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => None,
+        Ok(parsed) => Some(format!(
+            "custom provider URL must use http/https, got '{}'",
+            parsed.scheme()
+        )),
+        Err(err) => Some(format!("invalid custom provider URL: {err}")),
     }
 }
 
@@ -892,6 +969,62 @@ mod tests {
     }
 
     #[test]
+    fn config_validation_warns_empty_embedding_route_model() {
+        let mut config = Config::default();
+        config.embedding_routes = vec![crate::config::EmbeddingRouteConfig {
+            hint: "semantic".into(),
+            provider: "openai".into(),
+            model: String::new(),
+            dimensions: Some(1536),
+            api_key: None,
+        }];
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        let route_item = items.iter().find(|item| {
+            item.message
+                .contains("embedding route \"semantic\" has empty model")
+        });
+        assert!(route_item.is_some());
+        assert_eq!(route_item.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn config_validation_warns_invalid_embedding_route_provider() {
+        let mut config = Config::default();
+        config.embedding_routes = vec![crate::config::EmbeddingRouteConfig {
+            hint: "semantic".into(),
+            provider: "groq".into(),
+            model: "text-embedding-3-small".into(),
+            dimensions: None,
+            api_key: None,
+        }];
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        let route_item = items
+            .iter()
+            .find(|item| item.message.contains("uses invalid provider \"groq\""));
+        assert!(route_item.is_some());
+        assert_eq!(route_item.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn config_validation_warns_missing_embedding_hint_target() {
+        let mut config = Config::default();
+        config.memory.embedding_model = "hint:semantic".into();
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        let route_item = items.iter().find(|item| {
+            item.message
+                .contains("no matching [[embedding_routes]] entry exists")
+        });
+        assert!(route_item.is_some());
+        assert_eq!(route_item.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
     fn environment_check_finds_git() {
         let mut items = Vec::new();
         check_environment(&mut items);
@@ -910,8 +1043,8 @@ mod tests {
 
     #[test]
     fn truncate_for_display_preserves_utf8_boundaries() {
-        let preview = truncate_for_display("版本号-alpha-build", 3);
-        assert_eq!(preview, "版本号…");
+        let preview = truncate_for_display("🙂example-alpha-build", 3);
+        assert_eq!(preview, "🙂ex…");
     }
 
     #[test]
