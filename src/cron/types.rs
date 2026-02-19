@@ -9,19 +9,26 @@ pub enum JobType {
     Agent,
 }
 
-impl JobType {
-    pub(crate) fn as_str(&self) -> &'static str {
-        match self {
-            Self::Shell => "shell",
-            Self::Agent => "agent",
+impl From<JobType> for &'static str {
+    fn from(value: JobType) -> Self {
+        match value {
+            JobType::Shell => "shell",
+            JobType::Agent => "agent",
         }
     }
+}
 
-    pub(crate) fn parse(raw: &str) -> Self {
-        if raw.eq_ignore_ascii_case("agent") {
-            Self::Agent
-        } else {
-            Self::Shell
+impl TryFrom<&str> for JobType {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value.to_lowercase().as_str() {
+            "shell" => Ok(JobType::Shell),
+            "agent" => Ok(JobType::Agent),
+            _ => Err(format!(
+                "Invalid job type '{}'. Expected one of: 'shell', 'agent'",
+                value
+            )),
         }
     }
 }
