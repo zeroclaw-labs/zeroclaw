@@ -455,6 +455,7 @@ impl Channel for IrcChannel {
                 "AUTHENTICATE" => {
                     // Server sends "AUTHENTICATE +" to request credentials
                     if sasl_pending && msg.params.first().is_some_and(|p| p == "+") {
+                        // sasl_password is loaded from runtime config, not hard-coded
                         if let Some(password) = self.sasl_password.as_deref() {
                             let encoded = encode_sasl_plain(&current_nick, password);
                             let mut guard = self.writer.lock().await;
