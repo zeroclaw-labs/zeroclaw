@@ -143,3 +143,56 @@ Then call with a hint model name (for example from tool or integration paths):
 ```text
 hint:reasoning
 ```
+
+## Embedding Routing (`hint:<name>`)
+
+You can route embedding calls with the same hint pattern using `[[embedding_routes]]`.
+Set `[memory].embedding_model` to a `hint:<name>` value to activate routing.
+
+```toml
+[memory]
+embedding_model = "hint:semantic"
+
+[[embedding_routes]]
+hint = "semantic"
+provider = "openai"
+model = "text-embedding-3-small"
+dimensions = 1536
+
+[[embedding_routes]]
+hint = "archive"
+provider = "custom:https://embed.example.com/v1"
+model = "your-embedding-model-id"
+dimensions = 1024
+```
+
+Supported embedding providers:
+
+- `none`
+- `openai`
+- `custom:<url>` (OpenAI-compatible embeddings endpoint)
+
+Optional per-route key override:
+
+```toml
+[[embedding_routes]]
+hint = "semantic"
+provider = "openai"
+model = "text-embedding-3-small"
+api_key = "sk-route-specific"
+```
+
+## Upgrading Models Safely
+
+Use stable hints and update only route targets when providers deprecate model IDs.
+
+Recommended workflow:
+
+1. Keep call sites stable (`hint:reasoning`, `hint:semantic`).
+2. Change only the target model under `[[model_routes]]` or `[[embedding_routes]]`.
+3. Run:
+   - `zeroclaw doctor`
+   - `zeroclaw status`
+4. Smoke test one representative flow (chat + memory retrieval) before rollout.
+
+This minimizes breakage because integrations and prompts do not need to change when model IDs are upgraded.
