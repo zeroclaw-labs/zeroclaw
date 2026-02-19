@@ -28,7 +28,7 @@
 
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use super::whatsapp_storage::RusqliteStore;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -60,6 +60,8 @@ pub struct WhatsAppWebChannel {
     allowed_numbers: Vec<String>,
     /// Bot handle for shutdown
     bot_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Client handle for sending messages and typing indicators
+    client: Arc<Mutex<Option<Arc<wa_rs::Client>>>>,
     /// Message sender channel
     tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ChannelMessage>>>>,
 }
@@ -86,6 +88,7 @@ impl WhatsAppWebChannel {
             pair_code,
             allowed_numbers,
             bot_handle: Arc::new(Mutex::new(None)),
+            client: Arc::new(Mutex::new(None)),
             tx: Arc::new(Mutex::new(None)),
         }
     }
@@ -100,11 +103,43 @@ impl WhatsAppWebChannel {
     /// Normalize phone number to E.164 format
     #[cfg(feature = "whatsapp-web")]
     fn normalize_phone(&self, phone: &str) -> String {
-        if phone.starts_with('+') {
-            phone.to_string()
+        let trimmed = phone.trim();
+        let user_part = trimmed
+            .split_once('@')
+            .map(|(user, _)| user)
+            .unwrap_or(trimmed);
+        let normalized_user = user_part.trim_start_matches('+');
+        if user_part.starts_with('+') {
+            format!("+{normalized_user}")
         } else {
-            format!("+{phone}")
+            format!("+{normalized_user}")
         }
+    }
+
+    /// Convert a recipient to a wa-rs JID.
+    ///
+    /// Supports:
+    /// - Full JIDs (e.g. "12345@s.whatsapp.net")
+    /// - E.164-like numbers (e.g. "+1234567890")
+    #[cfg(feature = "whatsapp-web")]
+    fn recipient_to_jid(&self, recipient: &str) -> Result<wa_rs_binary::jid::Jid> {
+        let trimmed = recipient.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("Recipient cannot be empty");
+        }
+
+        if trimmed.contains('@') {
+            return trimmed
+                .parse::<wa_rs_binary::jid::Jid>()
+                .map_err(|e| anyhow!("Invalid WhatsApp JID `{trimmed}`: {e}"));
+        }
+
+        let digits: String = trimmed.chars().filter(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            anyhow::bail!("Recipient `{trimmed}` does not contain a valid phone number");
+        }
+
+        Ok(wa_rs_binary::jid::Jid::pn(digits))
     }
 }
 
@@ -116,23 +151,33 @@ impl Channel for WhatsAppWebChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
-        // Check if bot is running
-        let bot_handle_guard = self.bot_handle.lock();
-        if bot_handle_guard.is_none() {
+        let client = self.client.lock().clone();
+        let Some(client) = client else {
             anyhow::bail!("WhatsApp Web client not connected. Initialize the bot first.");
-        }
-        drop(bot_handle_guard);
+        };
 
         // Validate recipient is allowed
         let normalized = self.normalize_phone(&message.recipient);
         if !self.is_number_allowed(&normalized) {
-            tracing::warn!("WhatsApp Web: recipient {} not in allowed list", message.recipient);
+            tracing::warn!(
+                "WhatsApp Web: recipient {} not in allowed list",
+                message.recipient
+            );
             return Ok(());
         }
 
-        // TODO: Implement sending via wa-rs client
-        // This requires getting the client from the bot and using its send_message API
-        tracing::debug!("WhatsApp Web: sending message to {}: {}", message.recipient, message.content);
+        let to = self.recipient_to_jid(&message.recipient)?;
+        let outgoing = wa_rs_proto::whatsapp::Message {
+            conversation: Some(message.content.clone()),
+            ..Default::default()
+        };
+
+        let message_id = client.send_message(to, outgoing).await?;
+        tracing::debug!(
+            "WhatsApp Web: sent message to {} (id: {})",
+            message.recipient,
+            message_id
+        );
         Ok(())
     }
 
@@ -141,11 +186,13 @@ impl Channel for WhatsAppWebChannel {
         *self.tx.lock() = Some(tx.clone());
 
         use wa_rs::bot::Bot;
+        use wa_rs::pair_code::PairCodeOptions;
         use wa_rs::store::{Device, DeviceStore};
-        use wa_rs_core::types::events::Event;
-        use wa_rs_ureq_http::UreqHttpClient;
-        use wa_rs_tokio_transport::TokioWebSocketTransportFactory;
+        use wa_rs_binary::jid::JidExt as _;
         use wa_rs_core::proto_helpers::MessageExt;
+        use wa_rs_core::types::events::Event;
+        use wa_rs_tokio_transport::TokioWebSocketTransportFactory;
+        use wa_rs_ureq_http::UreqHttpClient;
 
         tracing::info!(
             "WhatsApp Web channel starting (session: {})",
@@ -166,7 +213,9 @@ impl Channel for WhatsAppWebChannel {
                 anyhow::bail!("Device exists but failed to load");
             }
         } else {
-            tracing::info!("WhatsApp Web: no existing session, new device will be created during pairing");
+            tracing::info!(
+                "WhatsApp Web: no existing session, new device will be created during pairing"
+            );
         };
 
         // Create transport factory
@@ -182,7 +231,7 @@ impl Channel for WhatsAppWebChannel {
         let tx_clone = tx.clone();
         let allowed_numbers = self.allowed_numbers.clone();
 
-        let mut bot = Bot::builder()
+        let mut builder = Bot::builder()
             .with_backend(backend)
             .with_transport_factory(transport_factory)
             .with_http_client(http_client)
@@ -194,7 +243,7 @@ impl Channel for WhatsAppWebChannel {
                         Event::Message(msg, info) => {
                             // Extract message content
                             let text = msg.text_content().unwrap_or("");
-                            let sender = info.source.sender.to_string();
+                            let sender = info.source.sender.user().to_string();
                             let chat = info.source.chat.to_string();
 
                             tracing::info!("📨 WhatsApp message from {} in {}: {}", sender, chat, text);
@@ -209,14 +258,17 @@ impl Channel for WhatsAppWebChannel {
                             if allowed_numbers.is_empty()
                                 || allowed_numbers.iter().any(|n| n == "*" || n == &normalized)
                             {
-                                if let Err(e) = tx_inner.send(ChannelMessage {
-                                    id: uuid::Uuid::new_v4().to_string(),
-                                    channel: "whatsapp".to_string(),
-                                    sender: normalized.clone(),
-                                    reply_target: normalized.clone(),
-                                    content: text.to_string(),
-                                    timestamp: chrono::Utc::now().timestamp_millis() as u64,
-                                }).await {
+                                if let Err(e) = tx_inner
+                                    .send(ChannelMessage {
+                                        id: uuid::Uuid::new_v4().to_string(),
+                                        channel: "whatsapp".to_string(),
+                                        sender: normalized.clone(),
+                                        reply_target: normalized.clone(),
+                                        content: text.to_string(),
+                                        timestamp: chrono::Utc::now().timestamp_millis() as u64,
+                                    })
+                                    .await
+                                {
                                     tracing::error!("Failed to send message to channel: {}", e);
                                 }
                             } else {
@@ -244,16 +296,24 @@ impl Channel for WhatsAppWebChannel {
                     }
                 }
             })
-            .build()
-            .await?;
+            ;
 
-        // Configure pair code options if pair_phone is set
+        // Configure pair-code flow when a phone number is provided.
         if let Some(ref phone) = self.pair_phone {
-            // Set the phone number for pair code linking
-            // The exact API depends on wa-rs version
-            tracing::info!("Requesting pair code for phone: {}", phone);
-            // bot.request_pair_code(phone).await?;
+            tracing::info!("WhatsApp Web: pair-code flow enabled for configured phone number");
+            builder = builder.with_pair_code(PairCodeOptions {
+                phone_number: phone.clone(),
+                custom_code: self.pair_code.clone(),
+                ..Default::default()
+            });
+        } else if self.pair_code.is_some() {
+            tracing::warn!(
+                "WhatsApp Web: pair_code is set but pair_phone is missing; pair code config is ignored"
+            );
         }
+
+        let mut bot = builder.build().await?;
+        *self.client.lock() = Some(bot.client());
 
         // Run the bot
         let bot_handle = bot.run().await?;
@@ -273,6 +333,11 @@ impl Channel for WhatsAppWebChannel {
             }
         }
 
+        *self.client.lock() = None;
+        if let Some(handle) = self.bot_handle.lock().take() {
+            handle.abort();
+        }
+
         Ok(())
     }
 
@@ -282,14 +347,54 @@ impl Channel for WhatsAppWebChannel {
     }
 
     async fn start_typing(&self, recipient: &str) -> Result<()> {
+        let client = self.client.lock().clone();
+        let Some(client) = client else {
+            anyhow::bail!("WhatsApp Web client not connected. Initialize the bot first.");
+        };
+
+        let normalized = self.normalize_phone(recipient);
+        if !self.is_number_allowed(&normalized) {
+            tracing::warn!(
+                "WhatsApp Web: typing target {} not in allowed list",
+                recipient
+            );
+            return Ok(());
+        }
+
+        let to = self.recipient_to_jid(recipient)?;
+        client
+            .chatstate()
+            .send_composing(&to)
+            .await
+            .map_err(|e| anyhow!("Failed to send typing state (composing): {e}"))?;
+
         tracing::debug!("WhatsApp Web: start typing for {}", recipient);
-        // TODO: Implement typing indicator via wa-rs client
         Ok(())
     }
 
     async fn stop_typing(&self, recipient: &str) -> Result<()> {
+        let client = self.client.lock().clone();
+        let Some(client) = client else {
+            anyhow::bail!("WhatsApp Web client not connected. Initialize the bot first.");
+        };
+
+        let normalized = self.normalize_phone(recipient);
+        if !self.is_number_allowed(&normalized) {
+            tracing::warn!(
+                "WhatsApp Web: typing target {} not in allowed list",
+                recipient
+            );
+            return Ok(());
+        }
+
+        let to = self.recipient_to_jid(recipient)?;
+        client
+            .chatstate()
+            .send_paused(&to)
+            .await
+            .map_err(|e| anyhow!("Failed to send typing state (paused): {e}"))?;
+
         tracing::debug!("WhatsApp Web: stop typing for {}", recipient);
-        // TODO: Implement typing indicator via wa-rs client
         Ok(())
     }
 }
@@ -308,10 +413,7 @@ impl WhatsAppWebChannel {
         _pair_code: Option<String>,
         _allowed_numbers: Vec<String>,
     ) -> Self {
-        panic!(
-            "WhatsApp Web channel requires the 'whatsapp-web' feature. \
-            Enable with: cargo build --features whatsapp-web"
-        );
+        Self { _private: () }
     }
 }
 
@@ -323,11 +425,17 @@ impl Channel for WhatsAppWebChannel {
     }
 
     async fn send(&self, _message: &SendMessage) -> Result<()> {
-        unreachable!()
+        anyhow::bail!(
+            "WhatsApp Web channel requires the 'whatsapp-web' feature. \
+            Enable with: cargo build --features whatsapp-web"
+        );
     }
 
     async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
-        unreachable!()
+        anyhow::bail!(
+            "WhatsApp Web channel requires the 'whatsapp-web' feature. \
+            Enable with: cargo build --features whatsapp-web"
+        );
     }
 
     async fn health_check(&self) -> bool {
@@ -335,11 +443,17 @@ impl Channel for WhatsAppWebChannel {
     }
 
     async fn start_typing(&self, _recipient: &str) -> Result<()> {
-        unreachable!()
+        anyhow::bail!(
+            "WhatsApp Web channel requires the 'whatsapp-web' feature. \
+            Enable with: cargo build --features whatsapp-web"
+        );
     }
 
     async fn stop_typing(&self, _recipient: &str) -> Result<()> {
-        unreachable!()
+        anyhow::bail!(
+            "WhatsApp Web channel requires the 'whatsapp-web' feature. \
+            Enable with: cargo build --features whatsapp-web"
+        );
     }
 }
 
