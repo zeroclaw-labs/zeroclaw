@@ -653,11 +653,16 @@ async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGua
     let paired_tokens = pairing.tokens();
     // This is needed because parking_lot's guard is not Send so we clone the inner
     // this should be removed once async mutexes are used everywhere
-    let mut cfg = { config.lock().clone() };
-    cfg.gateway.paired_tokens = paired_tokens;
-    cfg.save()
+    let mut updated_cfg = { config.lock().clone() };
+    updated_cfg.gateway.paired_tokens = paired_tokens;
+    updated_cfg
+        .save()
         .await
-        .context("Failed to persist paired tokens to config.toml")
+        .context("Failed to persist paired tokens to config.toml")?;
+
+    // Keep shared runtime config in sync with persisted tokens.
+    *config.lock() = updated_cfg;
+    Ok(())
 }
 
 /// Webhook request body
@@ -1410,7 +1415,9 @@ mod tests {
         assert!(guard.is_authenticated(&token));
 
         let shared_config = Arc::new(Mutex::new(config));
-        persist_pairing_tokens(shared_config, &guard).await.unwrap();
+        persist_pairing_tokens(shared_config.clone(), &guard)
+            .await
+            .unwrap();
 
         let saved = tokio::fs::read_to_string(config_path).await.unwrap();
         let parsed: Config = toml::from_str(&saved).unwrap();
@@ -1418,6 +1425,10 @@ mod tests {
         let persisted = &parsed.gateway.paired_tokens[0];
         assert_eq!(persisted.len(), 64);
         assert!(persisted.chars().all(|c| c.is_ascii_hexdigit()));
+
+        let in_memory = shared_config.lock();
+        assert_eq!(in_memory.gateway.paired_tokens.len(), 1);
+        assert_eq!(&in_memory.gateway.paired_tokens[0], persisted);
     }
 
     #[test]

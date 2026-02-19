@@ -74,6 +74,7 @@ fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
         irc,
         lark,
         dingtalk,
+        linq,
         qq,
         ..
     } = channels;
@@ -90,6 +91,7 @@ fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
         || irc.is_some()
         || lark.is_some()
         || dingtalk.is_some()
+        || linq.is_some()
         || qq.is_some()
 }
 
