@@ -1,4 +1,5 @@
 pub mod anthropic;
+pub mod bedrock;
 pub mod compatible;
 pub mod copilot;
 pub mod gemini;
@@ -502,6 +503,9 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         }
         name if is_glm_alias(name) => vec!["GLM_API_KEY"],
         name if is_minimax_alias(name) => vec![MINIMAX_OAUTH_TOKEN_ENV, MINIMAX_API_KEY_ENV],
+        // Bedrock uses AWS AKSK from env vars (AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY),
+        // not a single API key. Credential resolution happens inside BedrockProvider.
+        "bedrock" | "aws-bedrock" => return None,
         name if is_qianfan_alias(name) => vec!["QIANFAN_API_KEY"],
         name if is_qwen_alias(name) => vec!["DASHSCOPE_API_KEY"],
         name if is_zai_alias(name) => vec!["ZAI_API_KEY"],
@@ -669,12 +673,7 @@ pub fn create_provider_with_url(
                 AuthStyle::Bearer,
             )
         )),
-        "bedrock" | "aws-bedrock" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Amazon Bedrock",
-            "https://bedrock-runtime.us-east-1.amazonaws.com",
-            key,
-            AuthStyle::Bearer,
-        ))),
+        "bedrock" | "aws-bedrock" => Ok(Box::new(bedrock::BedrockProvider::new())),
         name if is_qianfan_alias(name) => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Qianfan", "https://aip.baidubce.com", key, AuthStyle::Bearer,
         ))),
@@ -1417,8 +1416,11 @@ mod tests {
 
     #[test]
     fn factory_bedrock() {
-        assert!(create_provider("bedrock", Some("key")).is_ok());
-        assert!(create_provider("aws-bedrock", Some("key")).is_ok());
+        // Bedrock uses AWS env vars for credentials, not API key.
+        assert!(create_provider("bedrock", None).is_ok());
+        assert!(create_provider("aws-bedrock", None).is_ok());
+        // Passing an api_key is harmless (ignored).
+        assert!(create_provider("bedrock", Some("ignored")).is_ok());
     }
 
     #[test]
