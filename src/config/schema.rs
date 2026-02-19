@@ -648,7 +648,7 @@ impl Default for GatewayConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ComposioConfig {
     /// Enable Composio integration for 1000+ OAuth tools
-    #[serde(default)]
+    #[serde(default, alias = "enable")]
     pub enabled: bool,
     /// Composio API key (stored encrypted when secrets.encrypt = true)
     #[serde(default)]
@@ -4411,6 +4411,17 @@ default_temperature = 0.7
     async fn composio_config_partial_toml() {
         let toml_str = r"
 enabled = true
+";
+        let parsed: ComposioConfig = toml::from_str(toml_str).unwrap();
+        assert!(parsed.enabled);
+        assert!(parsed.api_key.is_none());
+        assert_eq!(parsed.entity_id, "default");
+    }
+
+    #[test]
+    async fn composio_config_enable_alias_supported() {
+        let toml_str = r"
+enable = true
 ";
         let parsed: ComposioConfig = toml::from_str(toml_str).unwrap();
         assert!(parsed.enabled);
