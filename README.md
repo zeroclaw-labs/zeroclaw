@@ -182,6 +182,12 @@ curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/scripts
 
 ## Quick Start
 
+### Homebrew (macOS/Linuxbrew)
+
+```bash
+brew install zeroclaw
+```
+
 ### One-click bootstrap
 
 ```bash

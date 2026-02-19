@@ -117,6 +117,12 @@ cd zeroclaw
 
 ## Быстрый старт
 
+### Homebrew (macOS/Linuxbrew)
+
+```bash
+brew install zeroclaw
+```
+
 ```bash
 git clone https://github.com/zeroclaw-labs/zeroclaw.git
 cd zeroclaw
