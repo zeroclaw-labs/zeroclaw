@@ -177,6 +177,11 @@ impl ComposioTool {
             connected_account_ref,
         );
 
+        anyhow::ensure!(
+            url.starts_with("https://"),
+            "Composio API requests must use HTTPS"
+        );
+
         let resp = self
             .client()
             .post(&url)
