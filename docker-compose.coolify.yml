@@ -72,5 +72,19 @@ services:
     labels:
       - coolify.managed=true
 
+  clawsuite:
+    build: ./clawsuite
+    container_name: clawsuite
+    restart: unless-stopped
+    environment:
+      - CLAWDBOT_GATEWAY_URL=ws://zc-bridge:18789
+      - CLAWDBOT_GATEWAY_TOKEN=${ZEROCLAW_BEARER_TOKEN}
+      - CLAWSUITE_ALLOWED_HOSTS
+      - CLAWSUITE_PASSWORD
+    depends_on:
+      - zc-bridge
+    labels:
+      - coolify.managed=true
+
 volumes:
   zeroclaw-data:
