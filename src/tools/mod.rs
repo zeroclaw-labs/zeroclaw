@@ -36,6 +36,7 @@ pub mod image_info;
 pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
+pub mod pdf_read;
 pub mod proxy_config;
 pub mod pushover;
 pub mod schedule;
@@ -66,6 +67,7 @@ pub use image_info::ImageInfoTool;
 pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
+pub use pdf_read::PdfReadTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
 pub use schedule::ScheduleTool;
@@ -254,6 +256,9 @@ pub fn all_tools_with_runtime(
             root_config.web_search.timeout_secs,
         )));
     }
+
+    // PDF extraction (feature-gated at compile time via rag-pdf)
+    tools.push(Box::new(PdfReadTool::new(security.clone())));
 
     // Vision tools are always available
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
