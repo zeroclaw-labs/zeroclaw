@@ -99,7 +99,8 @@ impl WhatsAppChannel {
                     if !self.is_number_allowed(&normalized_from) {
                         tracing::warn!(
                             "WhatsApp: ignoring message from unauthorized number: {normalized_from}. \
-                            Add to allowed_numbers in config.toml, then run `zeroclaw onboard --channels-only`."
+                            Add to channels.whatsapp.allowed_numbers in config.toml, \
+                            or run `zeroclaw onboard --channels-only` to configure interactively."
                         );
                         continue;
                     }
