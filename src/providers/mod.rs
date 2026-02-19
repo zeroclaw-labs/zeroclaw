@@ -604,7 +604,7 @@ fn moonshot_base_url(name: &str) -> Option<&'static str> {
 }
 
 fn qwen_base_url(name: &str) -> Option<&'static str> {
-    if is_qwen_cn_alias(name) {
+    if is_qwen_cn_alias(name) || is_qwen_oauth_alias(name) {
         Some(QWEN_CN_BASE_URL)
     } else if is_qwen_intl_alias(name) {
         Some(QWEN_INTL_BASE_URL)
