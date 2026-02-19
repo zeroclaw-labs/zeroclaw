@@ -17,6 +17,10 @@ pub mod slack;
 pub mod telegram;
 pub mod traits;
 pub mod whatsapp;
+#[cfg(feature = "whatsapp-web")]
+pub mod whatsapp_storage;
+#[cfg(feature = "whatsapp-web")]
+pub mod whatsapp_web;
 
 pub use cli::CliChannel;
 pub use dingtalk::DingTalkChannel;
@@ -34,6 +38,8 @@ pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
 pub use traits::{Channel, SendMessage};
 pub use whatsapp::WhatsAppChannel;
+#[cfg(feature = "whatsapp-web")]
+pub use whatsapp_web::WhatsAppWebChannel;
 
 use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
 use crate::config::{Config, LaunchableChannelsConfig};
@@ -75,6 +81,11 @@ const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
 const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_PREVIEW_LIMIT: usize = 10;
+const MEMORY_CONTEXT_MAX_ENTRIES: usize = 4;
+const MEMORY_CONTEXT_ENTRY_MAX_CHARS: usize = 800;
+const MEMORY_CONTEXT_MAX_CHARS: usize = 4_000;
+const CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES: usize = 12;
+const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 600;
 
 type ProviderCacheMap = Arc<Mutex<HashMap<String, Arc<dyn Provider>>>>;
 type RouteSelectionMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
@@ -249,6 +260,60 @@ fn clear_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(sender_key);
+}
+
+fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool {
+    let mut histories = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let Some(turns) = histories.get_mut(sender_key) else {
+        return false;
+    };
+
+    if turns.is_empty() {
+        return false;
+    }
+
+    let keep_from = turns
+        .len()
+        .saturating_sub(CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
+    let mut compacted = turns[keep_from..].to_vec();
+
+    for turn in &mut compacted {
+        if turn.content.chars().count() > CHANNEL_HISTORY_COMPACT_CONTENT_CHARS {
+            turn.content =
+                truncate_with_ellipsis(&turn.content, CHANNEL_HISTORY_COMPACT_CONTENT_CHARS);
+        }
+    }
+
+    *turns = compacted;
+    true
+}
+
+fn should_skip_memory_context_entry(key: &str, content: &str) -> bool {
+    if key.trim().to_ascii_lowercase().ends_with("_history") {
+        return true;
+    }
+
+    content.chars().count() > MEMORY_CONTEXT_MAX_CHARS
+}
+
+fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
+    let lower = err.to_string().to_lowercase();
+    [
+        "exceeds the context window",
+        "context window of this model",
+        "maximum context length",
+        "context length exceeded",
+        "too many tokens",
+        "token limit exceeded",
+        "prompt is too long",
+        "input is too long",
+    ]
+    .iter()
+    .any(|hint| lower.contains(hint))
 }
 
 fn load_cached_model_preview(workspace_dir: &Path, provider_name: &str) -> Vec<String> {
@@ -439,7 +504,7 @@ async fn handle_runtime_command_if_needed(
     };
 
     if let Err(err) = channel
-        .send(&SendMessage::new(response, &msg.reply_target))
+        .send(&SendMessage::new(response, &msg.reply_target).in_thread(msg.thread_ts.clone()))
         .await
     {
         tracing::warn!(
@@ -459,19 +524,43 @@ async fn build_memory_context(
     let mut context = String::new();
 
     if let Ok(entries) = mem.recall(user_msg, 5, None).await {
-        let relevant: Vec<_> = entries
-            .iter()
-            .filter(|e| match e.score {
-                Some(score) => score >= min_relevance_score,
-                None => true, // keep entries without a score (e.g. non-vector backends)
-            })
-            .collect();
+        let mut included = 0usize;
+        let mut used_chars = 0usize;
 
-        if !relevant.is_empty() {
-            context.push_str("[Memory context]\n");
-            for entry in &relevant {
-                let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
+        for entry in entries.iter().filter(|e| match e.score {
+            Some(score) => score >= min_relevance_score,
+            None => true, // keep entries without a score (e.g. non-vector backends)
+        }) {
+            if included >= MEMORY_CONTEXT_MAX_ENTRIES {
+                break;
             }
+
+            if should_skip_memory_context_entry(&entry.key, &entry.content) {
+                continue;
+            }
+
+            let content = if entry.content.chars().count() > MEMORY_CONTEXT_ENTRY_MAX_CHARS {
+                truncate_with_ellipsis(&entry.content, MEMORY_CONTEXT_ENTRY_MAX_CHARS)
+            } else {
+                entry.content.clone()
+            };
+
+            let line = format!("- {}: {}\n", entry.key, content);
+            let line_chars = line.chars().count();
+            if used_chars + line_chars > MEMORY_CONTEXT_MAX_CHARS {
+                break;
+            }
+
+            if included == 0 {
+                context.push_str("[Memory context]\n");
+            }
+
+            context.push_str(&line);
+            used_chars += line_chars;
+            included += 1;
+        }
+
+        if included > 0 {
             context.push('\n');
         }
     }
@@ -589,7 +678,10 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             );
             if let Some(channel) = target_channel.as_ref() {
                 let _ = channel
-                    .send(&SendMessage::new(message, &msg.reply_target))
+                    .send(
+                        &SendMessage::new(message, &msg.reply_target)
+                            .in_thread(msg.thread_ts.clone()),
+                    )
                     .await;
             }
             return;
@@ -655,7 +747,9 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
     let draft_message_id = if use_streaming {
         if let Some(channel) = target_channel.as_ref() {
             match channel
-                .send_draft(&SendMessage::new("...", &msg.reply_target))
+                .send_draft(
+                    &SendMessage::new("...", &msg.reply_target).in_thread(msg.thread_ts.clone()),
+                )
                 .await
             {
                 Ok(id) => id,
@@ -766,11 +860,17 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                     {
                         tracing::warn!("Failed to finalize draft: {e}; sending as new message");
                         let _ = channel
-                            .send(&SendMessage::new(&response, &msg.reply_target))
+                            .send(
+                                &SendMessage::new(&response, &msg.reply_target)
+                                    .in_thread(msg.thread_ts.clone()),
+                            )
                             .await;
                     }
                 } else if let Err(e) = channel
-                    .send(&SendMessage::new(response, &msg.reply_target))
+                    .send(
+                        &SendMessage::new(response, &msg.reply_target)
+                            .in_thread(msg.thread_ts.clone()),
+                    )
                     .await
                 {
                     eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
@@ -778,6 +878,35 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             }
         }
         Ok(Err(e)) => {
+            if is_context_window_overflow_error(&e) {
+                let compacted = compact_sender_history(ctx.as_ref(), &history_key);
+                let error_text = if compacted {
+                    "⚠️ Context window exceeded for this conversation. I compacted recent history and kept the latest context. Please resend your last message."
+                } else {
+                    "⚠️ Context window exceeded for this conversation. Please resend your last message."
+                };
+                eprintln!(
+                    "  ⚠️ Context window exceeded after {}ms; sender history compacted={}",
+                    started_at.elapsed().as_millis(),
+                    compacted
+                );
+                if let Some(channel) = target_channel.as_ref() {
+                    if let Some(ref draft_id) = draft_message_id {
+                        let _ = channel
+                            .finalize_draft(&msg.reply_target, draft_id, error_text)
+                            .await;
+                    } else {
+                        let _ = channel
+                            .send(
+                                &SendMessage::new(error_text, &msg.reply_target)
+                                    .in_thread(msg.thread_ts.clone()),
+                            )
+                            .await;
+                    }
+                }
+                return;
+            }
+
             eprintln!(
                 "  ❌ LLM error after {}ms: {e}",
                 started_at.elapsed().as_millis()
@@ -789,10 +918,10 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                         .await;
                 } else {
                     let _ = channel
-                        .send(&SendMessage::new(
-                            format!("⚠️ Error: {e}"),
-                            &msg.reply_target,
-                        ))
+                        .send(
+                            &SendMessage::new(format!("⚠️ Error: {e}"), &msg.reply_target)
+                                .in_thread(msg.thread_ts.clone()),
+                        )
                         .await;
                 }
             }
@@ -813,7 +942,10 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                         .await;
                 } else {
                     let _ = channel
-                        .send(&SendMessage::new(error_text, &msg.reply_target))
+                        .send(
+                            &SendMessage::new(error_text, &msg.reply_target)
+                                .in_thread(msg.thread_ts.clone()),
+                        )
                         .await;
                 }
             }
@@ -1114,7 +1246,7 @@ fn normalize_telegram_identity(value: &str) -> String {
     value.trim().trim_start_matches('@').to_string()
 }
 
-fn bind_telegram_identity(config: &Config, identity: &str) -> Result<()> {
+async fn bind_telegram_identity(config: &Config, identity: &str) -> Result<()> {
     let normalized = normalize_telegram_identity(identity);
     if normalized.is_empty() {
         anyhow::bail!("Telegram identity cannot be empty");
@@ -1144,7 +1276,7 @@ fn bind_telegram_identity(config: &Config, identity: &str) -> Result<()> {
     }
 
     telegram.allowed_users.push(normalized.clone());
-    updated.save()?;
+    updated.save().await?;
     println!("✅ Bound Telegram identity: {normalized}");
     println!("   Saved to {}", updated.config_path.display());
     match maybe_restart_managed_daemon_service() {
@@ -1240,7 +1372,7 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
     Ok(false)
 }
 
-pub fn handle_command(command: crate::ChannelCommands, config: &Config) -> Result<()> {
+pub async fn handle_command(command: crate::ChannelCommands, config: &Config) -> Result<()> {
     match command {
         crate::ChannelCommands::Start => {
             anyhow::bail!("Start must be handled in main.rs (requires async runtime)")
@@ -1271,7 +1403,7 @@ pub fn handle_command(command: crate::ChannelCommands, config: &Config) -> Resul
             anyhow::bail!("Remove channel '{name}' — edit ~/.zeroclaw/config.toml directly");
         }
         crate::ChannelCommands::BindTelegram { identity } => {
-            bind_telegram_identity(config, &identity)
+            bind_telegram_identity(config, &identity).await
         }
     }
 }
@@ -1389,15 +1521,49 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     }
 
     if let Some(ref wa) = whatsapp {
-        channels.push((
-            "WhatsApp",
-            Arc::new(WhatsAppChannel::new(
-                wa.access_token.clone(),
-                wa.phone_number_id.clone(),
-                wa.verify_token.clone(),
-                wa.allowed_numbers.clone(),
-            )),
-        ));
+        // Runtime negotiation: detect backend type from config
+        match wa.backend_type() {
+            "cloud" => {
+                // Cloud API mode: requires phone_number_id, access_token, verify_token
+                if wa.is_cloud_config() {
+                    channels.push((
+                        "WhatsApp",
+                        Arc::new(WhatsAppChannel::new(
+                            wa.access_token.clone().unwrap_or_default(),
+                            wa.phone_number_id.clone().unwrap_or_default(),
+                            wa.verify_token.clone().unwrap_or_default(),
+                            wa.allowed_numbers.clone(),
+                        )),
+                    ));
+                } else {
+                    tracing::warn!("WhatsApp Cloud API configured but missing required fields (phone_number_id, access_token, verify_token)");
+                }
+            }
+            "web" => {
+                // Web mode: requires session_path
+                #[cfg(feature = "whatsapp-web")]
+                if wa.is_web_config() {
+                    channels.push((
+                        "WhatsApp",
+                        Arc::new(WhatsAppWebChannel::new(
+                            wa.session_path.clone().unwrap_or_default(),
+                            wa.pair_phone.clone(),
+                            wa.pair_code.clone(),
+                            wa.allowed_numbers.clone(),
+                        )),
+                    ));
+                } else {
+                    tracing::warn!("WhatsApp Web configured but session_path not set");
+                }
+                #[cfg(not(feature = "whatsapp-web"))]
+                {
+                    tracing::warn!("WhatsApp Web backend requires 'whatsapp-web' feature. Enable with: cargo build --features whatsapp-web");
+                }
+            }
+            _ => {
+                tracing::warn!("WhatsApp config invalid: neither phone_number_id (Cloud API) nor session_path (Web) is set");
+            }
+        }
     }
 
     if let Some(ref lq) = linq {
@@ -1740,12 +1906,43 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
 
     if let Some(ref wa) = whatsapp {
-        channels.push(Arc::new(WhatsAppChannel::new(
-            wa.access_token.clone(),
-            wa.phone_number_id.clone(),
-            wa.verify_token.clone(),
-            wa.allowed_numbers.clone(),
-        )));
+        // Runtime negotiation: detect backend type from config
+        match wa.backend_type() {
+            "cloud" => {
+                // Cloud API mode: requires phone_number_id, access_token, verify_token
+                if wa.is_cloud_config() {
+                    channels.push(Arc::new(WhatsAppChannel::new(
+                        wa.access_token.clone().unwrap_or_default(),
+                        wa.phone_number_id.clone().unwrap_or_default(),
+                        wa.verify_token.clone().unwrap_or_default(),
+                        wa.allowed_numbers.clone(),
+                    )));
+                } else {
+                    tracing::warn!("WhatsApp Cloud API configured but missing required fields (phone_number_id, access_token, verify_token)");
+                }
+            }
+            "web" => {
+                // Web mode: requires session_path
+                #[cfg(feature = "whatsapp-web")]
+                if wa.is_web_config() {
+                    channels.push(Arc::new(WhatsAppWebChannel::new(
+                        wa.session_path.clone().unwrap_or_default(),
+                        wa.pair_phone.clone(),
+                        wa.pair_code.clone(),
+                        wa.allowed_numbers.clone(),
+                    )));
+                } else {
+                    tracing::warn!("WhatsApp Web configured but session_path not set");
+                }
+                #[cfg(not(feature = "whatsapp-web"))]
+                {
+                    tracing::warn!("WhatsApp Web backend requires 'whatsapp-web' feature. Enable with: cargo build --features whatsapp-web");
+                }
+            }
+            _ => {
+                tracing::warn!("WhatsApp config invalid: neither phone_number_id (Cloud API) nor session_path (Web) is set");
+            }
+        }
     }
 
     if let Some(ref lq) = linq {
@@ -1942,6 +2139,99 @@ mod tests {
             MIN_CHANNEL_MESSAGE_TIMEOUT_SECS
         );
         assert_eq!(effective_channel_message_timeout_secs(300), 300);
+    }
+
+    #[test]
+    fn context_window_overflow_error_detector_matches_known_messages() {
+        let overflow_err = anyhow::anyhow!(
+            "OpenAI Codex stream error: Your input exceeds the context window of this model."
+        );
+        assert!(is_context_window_overflow_error(&overflow_err));
+
+        let other_err =
+            anyhow::anyhow!("OpenAI Codex API error (502 Bad Gateway): error code: 502");
+        assert!(!is_context_window_overflow_error(&other_err));
+    }
+
+    #[test]
+    fn memory_context_skip_rules_exclude_history_blobs() {
+        assert!(should_skip_memory_context_entry(
+            "telegram_123_history",
+            r#"[{"role":"user"}]"#
+        ));
+        assert!(!should_skip_memory_context_entry("telegram_123_45", "hi"));
+    }
+
+    #[test]
+    fn compact_sender_history_keeps_recent_truncated_messages() {
+        let mut histories = HashMap::new();
+        let sender = "telegram_u1".to_string();
+        histories.insert(
+            sender.clone(),
+            (0..20)
+                .map(|idx| {
+                    let content = format!("msg-{idx}-{}", "x".repeat(700));
+                    if idx % 2 == 0 {
+                        ChatMessage::user(content)
+                    } else {
+                        ChatMessage::assistant(content)
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        let ctx = ChannelRuntimeContext {
+            channels_by_name: Arc::new(HashMap::new()),
+            provider: Arc::new(DummyProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("system".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(histories)),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+        };
+
+        assert!(compact_sender_history(&ctx, &sender));
+
+        let histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let kept = histories
+            .get(&sender)
+            .expect("sender history should remain");
+        assert_eq!(kept.len(), CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
+        assert!(kept
+            .iter()
+            .all(|turn| turn.content.chars().count() <= CHANNEL_HISTORY_COMPACT_CONTENT_CHARS));
+    }
+
+    struct DummyProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for DummyProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
     }
 
     #[derive(Default)]
@@ -2301,6 +2591,7 @@ mod tests {
                 content: "What is the BTC price now?".to_string(),
                 channel: "test-channel".to_string(),
                 timestamp: 1,
+                thread_ts: None,
             },
         )
         .await;
@@ -2354,6 +2645,7 @@ mod tests {
                 content: "What is the BTC price now?".to_string(),
                 channel: "test-channel".to_string(),
                 timestamp: 2,
+                thread_ts: None,
             },
         )
         .await;
@@ -2416,6 +2708,7 @@ mod tests {
                 content: "/models openrouter".to_string(),
                 channel: "telegram".to_string(),
                 timestamp: 1,
+                thread_ts: None,
             },
         )
         .await;
@@ -2499,6 +2792,7 @@ mod tests {
                 content: "hello routed provider".to_string(),
                 channel: "telegram".to_string(),
                 timestamp: 2,
+                thread_ts: None,
             },
         )
         .await;
@@ -2558,6 +2852,7 @@ mod tests {
                 content: "Loop until done".to_string(),
                 channel: "test-channel".to_string(),
                 timestamp: 1,
+                thread_ts: None,
             },
         )
         .await;
@@ -2612,6 +2907,7 @@ mod tests {
                 content: "Loop forever".to_string(),
                 channel: "test-channel".to_string(),
                 timestamp: 2,
+                thread_ts: None,
             },
         )
         .await;
@@ -2716,6 +3012,7 @@ mod tests {
             content: "hello".to_string(),
             channel: "test-channel".to_string(),
             timestamp: 1,
+            thread_ts: None,
         })
         .await
         .unwrap();
@@ -2726,6 +3023,7 @@ mod tests {
             content: "world".to_string(),
             channel: "test-channel".to_string(),
             timestamp: 2,
+            thread_ts: None,
         })
         .await
         .unwrap();
@@ -2788,6 +3086,7 @@ mod tests {
                 content: "hello".to_string(),
                 channel: "test-channel".to_string(),
                 timestamp: 1,
+                thread_ts: None,
             },
         )
         .await;
@@ -3048,6 +3347,7 @@ mod tests {
             content: "hello".into(),
             channel: "slack".into(),
             timestamp: 1,
+            thread_ts: None,
         };
 
         assert_eq!(conversation_memory_key(&msg), "slack_U123_msg_abc123");
@@ -3062,6 +3362,7 @@ mod tests {
             content: "first".into(),
             channel: "slack".into(),
             timestamp: 1,
+            thread_ts: None,
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -3070,6 +3371,7 @@ mod tests {
             content: "second".into(),
             channel: "slack".into(),
             timestamp: 2,
+            thread_ts: None,
         };
 
         assert_ne!(
@@ -3090,6 +3392,7 @@ mod tests {
             content: "I'm Paul".into(),
             channel: "slack".into(),
             timestamp: 1,
+            thread_ts: None,
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -3098,6 +3401,7 @@ mod tests {
             content: "I'm 45".into(),
             channel: "slack".into(),
             timestamp: 2,
+            thread_ts: None,
         };
 
         mem.store(
@@ -3179,6 +3483,7 @@ mod tests {
                 content: "hello".to_string(),
                 channel: "test-channel".to_string(),
                 timestamp: 1,
+                thread_ts: None,
             },
         )
         .await;
@@ -3192,6 +3497,7 @@ mod tests {
                 content: "follow up".to_string(),
                 channel: "test-channel".to_string(),
                 timestamp: 2,
+                thread_ts: None,
             },
         )
         .await;

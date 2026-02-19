@@ -13,7 +13,9 @@ const QQ_AUTH_URL: &str = "https://bots.qq.com/app/getAppAccessToken";
 
 fn ensure_https(url: &str) -> anyhow::Result<()> {
     if !url.starts_with("https://") {
-        anyhow::bail!("Refusing to transmit sensitive data over non-HTTPS URL: URL scheme must be https");
+        anyhow::bail!(
+            "Refusing to transmit sensitive data over non-HTTPS URL: URL scheme must be https"
+        );
     }
     Ok(())
 }
@@ -375,6 +377,7 @@ impl Channel for QQChannel {
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
                                     .as_secs(),
+                                thread_ts: None,
                             };
 
                             if tx.send(channel_msg).await.is_err() {
@@ -413,6 +416,7 @@ impl Channel for QQChannel {
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
                                     .as_secs(),
+                                thread_ts: None,
                             };
 
                             if tx.send(channel_msg).await.is_err() {

@@ -10,11 +10,18 @@ use uuid::Uuid;
 /// happens in the gateway when Meta sends webhook events.
 fn ensure_https(url: &str) -> anyhow::Result<()> {
     if !url.starts_with("https://") {
-        anyhow::bail!("Refusing to transmit sensitive data over non-HTTPS URL: URL scheme must be https");
+        anyhow::bail!(
+            "Refusing to transmit sensitive data over non-HTTPS URL: URL scheme must be https"
+        );
     }
     Ok(())
 }
 
+///
+/// # Runtime Negotiation
+///
+/// This Cloud API channel is automatically selected when `phone_number_id` is set in the config.
+/// Use `WhatsAppWebChannel` (with `session_path`) for native Web mode.
 pub struct WhatsAppChannel {
     access_token: String,
     endpoint_id: String,
@@ -133,6 +140,7 @@ impl WhatsAppChannel {
                         content,
                         channel: "whatsapp".to_string(),
                         timestamp,
+                        thread_ts: None,
                     });
                 }
             }

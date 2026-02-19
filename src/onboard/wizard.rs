@@ -66,7 +66,7 @@ fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
 
 // ── Main wizard entry point ──────────────────────────────────────
 
-pub fn run_wizard() -> Result<Config> {
+pub async fn run_wizard() -> Result<Config> {
     println!("{}", style(BANNER).cyan().bold());
 
     println!(
@@ -162,8 +162,8 @@ pub fn run_wizard() -> Result<Config> {
         if config.memory.auto_save { "on" } else { "off" }
     );
 
-    config.save()?;
-    persist_workspace_selection(&config.config_path)?;
+    config.save().await?;
+    persist_workspace_selection(&config.config_path).await?;
 
     // ── Final summary ────────────────────────────────────────────
     print_summary(&config);
@@ -197,7 +197,7 @@ pub fn run_wizard() -> Result<Config> {
 }
 
 /// Interactive repair flow: rerun channel setup only without redoing full onboarding.
-pub fn run_channels_repair_wizard() -> Result<Config> {
+pub async fn run_channels_repair_wizard() -> Result<Config> {
     println!("{}", style(BANNER).cyan().bold());
     println!(
         "  {}",
@@ -207,12 +207,12 @@ pub fn run_channels_repair_wizard() -> Result<Config> {
     );
     println!();
 
-    let mut config = Config::load_or_init()?;
+    let mut config = Config::load_or_init().await?;
 
     print_step(1, 1, "Channels (How You Talk to ZeroClaw)");
     config.channels_config = setup_channels()?;
-    config.save()?;
-    persist_workspace_selection(&config.config_path)?;
+    config.save().await?;
+    persist_workspace_selection(&config.config_path).await?;
 
     println!();
     println!(
@@ -292,9 +292,10 @@ fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
 }
 
 #[allow(clippy::too_many_lines)]
-pub fn run_quick_setup(
+pub async fn run_quick_setup(
     credential_override: Option<&str>,
     provider: Option<&str>,
+    model_override: Option<&str>,
     memory_backend: Option<&str>,
 ) -> Result<Config> {
     println!("{}", style(BANNER).cyan().bold());
@@ -316,7 +317,9 @@ pub fn run_quick_setup(
     fs::create_dir_all(&workspace_dir).context("Failed to create workspace directory")?;
 
     let provider_name = provider.unwrap_or("openrouter").to_string();
-    let model = default_model_for_provider(&provider_name);
+    let model = model_override
+        .map(str::to_string)
+        .unwrap_or_else(|| default_model_for_provider(&provider_name));
     let memory_backend_name = memory_backend
         .unwrap_or(default_memory_backend_key())
         .to_string();
@@ -364,8 +367,8 @@ pub fn run_quick_setup(
         query_classification: crate::config::QueryClassificationConfig::default(),
     };
 
-    config.save()?;
-    persist_workspace_selection(&config.config_path)?;
+    config.save().await?;
+    persist_workspace_selection(&config.config_path).await?;
 
     // Scaffold minimal workspace files
     let default_ctx = ProjectContext {
@@ -471,6 +474,7 @@ fn canonical_provider_name(provider_name: &str) -> &str {
         "google" | "google-gemini" => "gemini",
         "kimi_coding" | "kimi_for_coding" => "kimi-code",
         "nvidia-nim" | "build.nvidia.com" => "nvidia",
+        "aws-bedrock" => "bedrock",
         _ => provider_name,
     }
 }
@@ -513,6 +517,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "ollama" => "llama3.2".into(),
         "gemini" => "gemini-2.5-pro".into(),
         "kimi-code" => "kimi-for-coding".into(),
+        "bedrock" => "anthropic.claude-sonnet-4-5-20250929-v1:0".into(),
         "nvidia" => "meta/llama-3.3-70b-instruct".into(),
         "astrai" => "anthropic/claude-sonnet-4.6".into(),
         _ => "anthropic/claude-sonnet-4.6".into(),
@@ -829,6 +834,24 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
             ("mistral".to_string(), "Mistral 7B".to_string()),
             ("codellama".to_string(), "Code Llama".to_string()),
             ("phi3".to_string(), "Phi-3 (small, fast)".to_string()),
+        ],
+        "bedrock" => vec![
+            (
+                "anthropic.claude-sonnet-4-6".to_string(),
+                "Claude Sonnet 4.6 (latest, recommended)".to_string(),
+            ),
+            (
+                "anthropic.claude-opus-4-6-v1".to_string(),
+                "Claude Opus 4.6 (strongest)".to_string(),
+            ),
+            (
+                "anthropic.claude-haiku-4-5-20251001-v1:0".to_string(),
+                "Claude Haiku 4.5 (fastest, cheapest)".to_string(),
+            ),
+            (
+                "anthropic.claude-sonnet-4-5-20250929-v1:0".to_string(),
+                "Claude Sonnet 4.5".to_string(),
+            ),
         ],
         "gemini" => vec![
             (
@@ -1427,16 +1450,18 @@ fn print_bullet(text: &str) {
     println!("  {} {}", style("›").cyan(), text);
 }
 
-fn persist_workspace_selection(config_path: &Path) -> Result<()> {
+async fn persist_workspace_selection(config_path: &Path) -> Result<()> {
     let config_dir = config_path
         .parent()
         .context("Config path must have a parent directory")?;
-    crate::config::schema::persist_active_workspace_config_dir(config_dir).with_context(|| {
-        format!(
-            "Failed to persist active workspace selection for {}",
-            config_dir.display()
-        )
-    })
+    crate::config::schema::persist_active_workspace_config_dir(config_dir)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to persist active workspace selection for {}",
+                config_dir.display()
+            )
+        })
 }
 
 // ── Step 1: Workspace ────────────────────────────────────────────
@@ -1790,29 +1815,51 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
         };
 
         println!();
-        if !key_url.is_empty() {
+        if matches!(provider_name, "bedrock" | "aws-bedrock") {
+            // Bedrock uses AWS AKSK, not a single API key.
+            print_bullet("Bedrock uses AWS credentials (not a single API key).");
             print_bullet(&format!(
-                "Get your API key at: {}",
-                style(key_url).cyan().underlined()
+                "Set {} and {} environment variables.",
+                style("AWS_ACCESS_KEY_ID").yellow(),
+                style("AWS_SECRET_ACCESS_KEY").yellow(),
             ));
-        }
-        print_bullet("You can also set it later via env var or config file.");
-        println!();
-
-        let key: String = Input::new()
-            .with_prompt("  Paste your API key (or press Enter to skip)")
-            .allow_empty(true)
-            .interact_text()?;
-
-        if key.is_empty() {
-            let env_var = provider_env_var(provider_name);
             print_bullet(&format!(
-                "Skipped. Set {} or edit config.toml later.",
-                style(env_var).yellow()
+                "Optionally set {} for the region (default: us-east-1).",
+                style("AWS_REGION").yellow(),
             ));
-        }
+            if !key_url.is_empty() {
+                print_bullet(&format!(
+                    "Manage IAM credentials at: {}",
+                    style(key_url).cyan().underlined()
+                ));
+            }
+            println!();
+            String::new()
+        } else {
+            if !key_url.is_empty() {
+                print_bullet(&format!(
+                    "Get your API key at: {}",
+                    style(key_url).cyan().underlined()
+                ));
+            }
+            print_bullet("You can also set it later via env var or config file.");
+            println!();
 
-        key
+            let key: String = Input::new()
+                .with_prompt("  Paste your API key (or press Enter to skip)")
+                .allow_empty(true)
+                .interact_text()?;
+
+            if key.is_empty() {
+                let env_var = provider_env_var(provider_name);
+                print_bullet(&format!(
+                    "Skipped. Set {} or edit config.toml later.",
+                    style(env_var).yellow()
+                ));
+            }
+
+            key
+        }
     };
 
     // ── Model selection ──
@@ -3019,6 +3066,11 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 return Ok(());
             }
 
+            if access_token.trim().is_empty() {
+                println!("  {} Skipped", style("→").dim());
+                return Ok(());
+            }
+
             let phone_number_id: String = Input::new()
                 .with_prompt("  Phone number ID (from WhatsApp app settings)")
                 .interact_text()?;
@@ -3081,10 +3133,76 @@ fn setup_channels() -> Result<ChannelsConfig> {
             };
 
             config.launchable.whatsapp = Some(WhatsAppConfig {
-                access_token: access_token.trim().to_string(),
-                phone_number_id: phone_number_id.trim().to_string(),
-                verify_token: verify_token.trim().to_string(),
+                access_token: Some(access_token.trim().to_string()),
+                phone_number_id: Some(phone_number_id.trim().to_string()),
+                verify_token: Some(verify_token.trim().to_string()),
                 app_secret: None, // Can be set via ZEROCLAW_WHATSAPP_APP_SECRET env var
+                session_path: None,
+                pair_phone: None,
+                pair_code: None,
+                allowed_numbers,
+            });
+
+            let verify_token: String = Input::new()
+                .with_prompt("  Webhook verify token (create your own)")
+                .default("zeroclaw-whatsapp-verify".into())
+                .interact_text()?;
+
+            // Test connection (run entirely in separate thread — Response must be used/dropped there)
+            print!("  {} Testing connection... ", style("⏳").dim());
+            let phone_number_id_clone = phone_number_id.clone();
+            let access_token_clone = access_token.clone();
+            let thread_result = std::thread::spawn(move || {
+                let client = reqwest::blocking::Client::new();
+                let url = format!(
+                    "https://graph.facebook.com/v18.0/{}",
+                    phone_number_id_clone.trim()
+                );
+                let resp = client
+                    .get(&url)
+                    .header(
+                        "Authorization",
+                        format!("Bearer {}", access_token_clone.trim()),
+                    )
+                    .send()?;
+                Ok::<_, reqwest::Error>(resp.status().is_success())
+            })
+            .join();
+            match thread_result {
+                Ok(Ok(true)) => {
+                    println!(
+                        "\r  {} Connected to WhatsApp API        ",
+                        style("✅").green().bold()
+                    );
+                }
+                _ => {
+                    println!(
+                        "\r  {} Connection failed — check access token and phone number ID",
+                        style("❌").red().bold()
+                    );
+                    return Ok(());
+                }
+            }
+
+            let users_str: String = Input::new()
+                .with_prompt("  Allowed phone numbers (comma-separated +1234567890, or * for all)")
+                .default("*".into())
+                .interact_text()?;
+
+            let allowed_numbers = if users_str.trim() == "*" {
+                vec!["*".into()]
+            } else {
+                users_str.split(',').map(|s| s.trim().to_string()).collect()
+            };
+
+            config.launchable.whatsapp = Some(WhatsAppConfig {
+                access_token: Some(access_token.trim().to_string()),
+                phone_number_id: Some(phone_number_id.trim().to_string()),
+                verify_token: Some(verify_token.trim().to_string()),
+                app_secret: None, // Can be set via ZEROCLAW_WHATSAPP_APP_SECRET env var
+                session_path: None,
+                pair_phone: None,
+                pair_code: None,
                 allowed_numbers,
             });
             Ok(())
@@ -4885,6 +5003,10 @@ mod tests {
         assert_eq!(default_model_for_provider("google"), "gemini-2.5-pro");
         assert_eq!(default_model_for_provider("kimi-code"), "kimi-for-coding");
         assert_eq!(
+            default_model_for_provider("bedrock"),
+            "anthropic.claude-sonnet-4-5-20250929-v1:0"
+        );
+        assert_eq!(
             default_model_for_provider("google-gemini"),
             "gemini-2.5-pro"
         );
@@ -4918,6 +5040,7 @@ mod tests {
         assert_eq!(canonical_provider_name("zai-cn"), "zai");
         assert_eq!(canonical_provider_name("z.ai-global"), "zai");
         assert_eq!(canonical_provider_name("nvidia-nim"), "nvidia");
+        assert_eq!(canonical_provider_name("aws-bedrock"), "bedrock");
         assert_eq!(canonical_provider_name("build.nvidia.com"), "nvidia");
     }
 
@@ -4965,6 +5088,19 @@ mod tests {
             .collect();
 
         assert!(ids.contains(&"anthropic/claude-sonnet-4.6".to_string()));
+    }
+
+    #[test]
+    fn curated_models_for_bedrock_include_verified_model_ids() {
+        let ids: Vec<String> = curated_models_for_provider("bedrock")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+
+        assert!(ids.contains(&"anthropic.claude-sonnet-4-6".to_string()));
+        assert!(ids.contains(&"anthropic.claude-opus-4-6-v1".to_string()));
+        assert!(ids.contains(&"anthropic.claude-haiku-4-5-20251001-v1:0".to_string()));
+        assert!(ids.contains(&"anthropic.claude-sonnet-4-5-20250929-v1:0".to_string()));
     }
 
     #[test]
@@ -5065,6 +5201,10 @@ mod tests {
         assert_eq!(
             curated_models_for_provider("nvidia"),
             curated_models_for_provider("build.nvidia.com")
+        );
+        assert_eq!(
+            curated_models_for_provider("bedrock"),
+            curated_models_for_provider("aws-bedrock")
         );
     }
 
@@ -5242,7 +5382,8 @@ mod tests {
 
         let config = Config {
             workspace_dir: tmp.path().to_path_buf(),
-            default_provider: Some("venice".to_string()),
+            // Use a non-provider channel key to keep this test deterministic and offline.
+            default_provider: Some("imessage".to_string()),
             ..Config::default()
         };
 

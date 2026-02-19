@@ -1,5 +1,6 @@
 use crate::config::Config;
-use anyhow::Result;
+use crate::security::SecurityPolicy;
+use anyhow::{bail, Result};
 
 mod schedule;
 mod store;
@@ -96,6 +97,58 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             println!("  Cmd : {}", job.command);
             Ok(())
         }
+        crate::CronCommands::Update {
+            id,
+            expression,
+            tz,
+            command,
+            name,
+        } => {
+            if expression.is_none() && tz.is_none() && command.is_none() && name.is_none() {
+                bail!("At least one of --expression, --tz, --command, or --name must be provided");
+            }
+
+            // Merge expression/tz with the existing schedule so that
+            // --tz alone updates the timezone and --expression alone
+            // preserves the existing timezone.
+            let schedule = if expression.is_some() || tz.is_some() {
+                let existing = get_job(config, &id)?;
+                let (existing_expr, existing_tz) = match existing.schedule {
+                    Schedule::Cron {
+                        expr,
+                        tz: existing_tz,
+                    } => (expr, existing_tz),
+                    _ => bail!("Cannot update expression/tz on a non-cron schedule"),
+                };
+                Some(Schedule::Cron {
+                    expr: expression.unwrap_or(existing_expr),
+                    tz: tz.or(existing_tz),
+                })
+            } else {
+                None
+            };
+
+            if let Some(ref cmd) = command {
+                let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+                if !security.is_command_allowed(cmd) {
+                    bail!("Command blocked by security policy: {cmd}");
+                }
+            }
+
+            let patch = CronJobPatch {
+                schedule,
+                command,
+                name,
+                ..CronJobPatch::default()
+            };
+
+            let job = update_job(config, &id, patch)?;
+            println!("\u{2705} Updated cron job {}", job.id);
+            println!("  Expr: {}", job.expression);
+            println!("  Next: {}", job.next_run.to_rfc3339());
+            println!("  Cmd : {}", job.command);
+            Ok(())
+        }
         crate::CronCommands::Remove { id } => remove_job(config, &id),
         crate::CronCommands::Pause { id } => {
             pause_job(config, &id)?;
@@ -166,4 +219,198 @@ fn parse_delay(input: &str) -> Result<chrono::Duration> {
         _ => anyhow::bail!("unsupported delay unit '{unit}', use s/m/h/d"),
     };
     Ok(duration)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn test_config(tmp: &TempDir) -> Config {
+        let config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        config
+    }
+
+    fn make_job(config: &Config, expr: &str, tz: Option<&str>, cmd: &str) -> CronJob {
+        add_shell_job(
+            config,
+            None,
+            Schedule::Cron {
+                expr: expr.into(),
+                tz: tz.map(Into::into),
+            },
+            cmd,
+        )
+        .unwrap()
+    }
+
+    fn run_update(
+        config: &Config,
+        id: &str,
+        expression: Option<&str>,
+        tz: Option<&str>,
+        command: Option<&str>,
+        name: Option<&str>,
+    ) -> Result<()> {
+        handle_command(
+            crate::CronCommands::Update {
+                id: id.into(),
+                expression: expression.map(Into::into),
+                tz: tz.map(Into::into),
+                command: command.map(Into::into),
+                name: name.map(Into::into),
+            },
+            config,
+        )
+    }
+
+    #[test]
+    fn update_changes_command_via_handler() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = make_job(&config, "*/5 * * * *", None, "echo original");
+
+        run_update(&config, &job.id, None, None, Some("echo updated"), None).unwrap();
+
+        let updated = get_job(&config, &job.id).unwrap();
+        assert_eq!(updated.command, "echo updated");
+        assert_eq!(updated.id, job.id);
+    }
+
+    #[test]
+    fn update_changes_expression_via_handler() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = make_job(&config, "*/5 * * * *", None, "echo test");
+
+        run_update(&config, &job.id, Some("0 9 * * *"), None, None, None).unwrap();
+
+        let updated = get_job(&config, &job.id).unwrap();
+        assert_eq!(updated.expression, "0 9 * * *");
+    }
+
+    #[test]
+    fn update_changes_name_via_handler() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = make_job(&config, "*/5 * * * *", None, "echo test");
+
+        run_update(&config, &job.id, None, None, None, Some("new-name")).unwrap();
+
+        let updated = get_job(&config, &job.id).unwrap();
+        assert_eq!(updated.name.as_deref(), Some("new-name"));
+    }
+
+    #[test]
+    fn update_tz_alone_sets_timezone() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = make_job(&config, "*/5 * * * *", None, "echo test");
+
+        run_update(
+            &config,
+            &job.id,
+            None,
+            Some("America/Los_Angeles"),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let updated = get_job(&config, &job.id).unwrap();
+        assert_eq!(
+            updated.schedule,
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: Some("America/Los_Angeles".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn update_expression_preserves_existing_tz() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = make_job(
+            &config,
+            "*/5 * * * *",
+            Some("America/Los_Angeles"),
+            "echo test",
+        );
+
+        run_update(&config, &job.id, Some("0 9 * * *"), None, None, None).unwrap();
+
+        let updated = get_job(&config, &job.id).unwrap();
+        assert_eq!(
+            updated.schedule,
+            Schedule::Cron {
+                expr: "0 9 * * *".into(),
+                tz: Some("America/Los_Angeles".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn update_preserves_unchanged_fields() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_shell_job(
+            &config,
+            Some("original-name".into()),
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo original",
+        )
+        .unwrap();
+
+        run_update(&config, &job.id, None, None, Some("echo changed"), None).unwrap();
+
+        let updated = get_job(&config, &job.id).unwrap();
+        assert_eq!(updated.command, "echo changed");
+        assert_eq!(updated.name.as_deref(), Some("original-name"));
+        assert_eq!(updated.expression, "*/5 * * * *");
+    }
+
+    #[test]
+    fn update_no_flags_fails() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = make_job(&config, "*/5 * * * *", None, "echo test");
+
+        let result = run_update(&config, &job.id, None, None, None, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("At least one of"));
+    }
+
+    #[test]
+    fn update_nonexistent_job_fails() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let result = run_update(
+            &config,
+            "nonexistent-id",
+            None,
+            None,
+            Some("echo test"),
+            None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn update_security_allows_safe_command() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+        assert!(security.is_command_allowed("echo safe"));
+    }
 }

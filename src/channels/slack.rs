@@ -45,6 +45,15 @@ impl SlackChannel {
             .and_then(|u| u.as_str())
             .map(String::from)
     }
+
+    /// Resolve the thread identifier for inbound Slack messages.
+    /// Replies carry `thread_ts` (root thread id); top-level messages only have `ts`.
+    fn inbound_thread_ts(msg: &serde_json::Value, ts: &str) -> Option<String> {
+        msg.get("thread_ts")
+            .and_then(|t| t.as_str())
+            .or(if ts.is_empty() { None } else { Some(ts) })
+            .map(str::to_string)
+    }
 }
 
 #[async_trait]
@@ -54,10 +63,14 @@ impl Channel for SlackChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "channel": message.recipient,
             "text": message.content
         });
+
+        if let Some(ref ts) = message.thread_ts {
+            body["thread_ts"] = serde_json::json!(ts);
+        }
 
         let resp = self
             .http_client()
@@ -170,6 +183,7 @@ impl Channel for SlackChannel {
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs(),
+                        thread_ts: Self::inbound_thread_ts(msg, ts),
                     };
 
                     if tx.send(channel_msg).await.is_err() {
@@ -302,5 +316,34 @@ mod tests {
         let id = format!("slack_{channel_id}_{ts}");
         assert!(!id.contains('-')); // No UUID dashes
         assert!(id.starts_with("slack_"));
+    }
+
+    #[test]
+    fn inbound_thread_ts_prefers_explicit_thread_ts() {
+        let msg = serde_json::json!({
+            "ts": "123.002",
+            "thread_ts": "123.001"
+        });
+
+        let thread_ts = SlackChannel::inbound_thread_ts(&msg, "123.002");
+        assert_eq!(thread_ts.as_deref(), Some("123.001"));
+    }
+
+    #[test]
+    fn inbound_thread_ts_falls_back_to_ts() {
+        let msg = serde_json::json!({
+            "ts": "123.001"
+        });
+
+        let thread_ts = SlackChannel::inbound_thread_ts(&msg, "123.001");
+        assert_eq!(thread_ts.as_deref(), Some("123.001"));
+    }
+
+    #[test]
+    fn inbound_thread_ts_none_when_ts_missing() {
+        let msg = serde_json::json!({});
+
+        let thread_ts = SlackChannel::inbound_thread_ts(&msg, "");
+        assert_eq!(thread_ts, None);
     }
 }

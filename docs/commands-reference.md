@@ -2,7 +2,7 @@
 
 This reference is derived from the current CLI surface (`zeroclaw --help`).
 
-Last verified: **February 18, 2026**.
+Last verified: **February 19, 2026**.
 
 ## Top-Level Commands
 
@@ -22,6 +22,7 @@ Last verified: **February 18, 2026**.
 | `integrations` | Inspect integration details |
 | `skills` | List/install/remove skills |
 | `migrate` | Import from external runtimes (currently OpenClaw) |
+| `config` | Export machine-readable config schema |
 | `hardware` | Discover and introspect USB hardware |
 | `peripheral` | Configure and flash peripherals |
 
@@ -104,6 +105,12 @@ Runtime in-chat commands (Telegram/Discord while channel server is running):
 ### `migrate`
 
 - `zeroclaw migrate openclaw [--source <path>] [--dry-run]`
+
+### `config`
+
+- `zeroclaw config schema`
+
+`config schema` prints a JSON Schema (draft 2020-12) for the full `config.toml` contract to stdout.
 
 ### `hardware`
 

@@ -1,4 +1,5 @@
 pub mod anthropic;
+pub mod bedrock;
 pub mod compatible;
 pub mod copilot;
 pub mod gemini;
@@ -502,6 +503,9 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         }
         name if is_glm_alias(name) => vec!["GLM_API_KEY"],
         name if is_minimax_alias(name) => vec![MINIMAX_OAUTH_TOKEN_ENV, MINIMAX_API_KEY_ENV],
+        // Bedrock uses AWS AKSK from env vars (AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY),
+        // not a single API key. Credential resolution happens inside BedrockProvider.
+        "bedrock" | "aws-bedrock" => return None,
         name if is_qianfan_alias(name) => vec!["QIANFAN_API_KEY"],
         name if is_qwen_alias(name) => vec!["DASHSCOPE_API_KEY"],
         name if is_zai_alias(name) => vec!["ZAI_API_KEY"],
@@ -661,18 +665,15 @@ pub fn create_provider_with_url(
                 AuthStyle::Bearer,
             )))
         }
-        name if minimax_base_url(name).is_some() => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "MiniMax",
-            minimax_base_url(name).expect("checked in guard"),
-            key,
-            AuthStyle::Bearer,
-        ))),
-        "bedrock" | "aws-bedrock" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Amazon Bedrock",
-            "https://bedrock-runtime.us-east-1.amazonaws.com",
-            key,
-            AuthStyle::Bearer,
-        ))),
+        name if minimax_base_url(name).is_some() => Ok(Box::new(
+            OpenAiCompatibleProvider::new_merge_system_into_user(
+                "MiniMax",
+                minimax_base_url(name).expect("checked in guard"),
+                key,
+                AuthStyle::Bearer,
+            )
+        )),
+        "bedrock" | "aws-bedrock" => Ok(Box::new(bedrock::BedrockProvider::new())),
         name if is_qianfan_alias(name) => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Qianfan", "https://aip.baidubce.com", key, AuthStyle::Bearer,
         ))),
@@ -818,8 +819,16 @@ pub fn create_resilient_provider_with_options(
             continue;
         }
 
-        // Fallback providers don't use the custom api_url (it's specific to primary).
-        match create_provider_with_options(fallback, api_key, options) {
+        // Each fallback provider resolves its own credential via provider-
+        // specific env vars (e.g. DEEPSEEK_API_KEY for "deepseek") instead
+        // of inheriting the primary provider's key. Passing `None` lets
+        // `resolve_provider_credential` check the correct env var for the
+        // fallback provider name.
+        //
+        // Keep using `create_provider_with_options` so fallback entries that
+        // require runtime options (for example Codex auth profile overrides)
+        // continue to work.
+        match create_provider_with_options(fallback, None, options) {
             Ok(provider) => providers.push((fallback.clone(), provider)),
             Err(_error) => {
                 tracing::warn!(
@@ -1211,6 +1220,19 @@ mod tests {
     }
 
     #[test]
+    fn resolve_provider_credential_bedrock_uses_internal_credential_path() {
+        let _generic_guard = EnvGuard::set("API_KEY", Some("generic-key"));
+        let _override_guard = EnvGuard::set("OPENROUTER_API_KEY", Some("openrouter-key"));
+
+        assert_eq!(
+            resolve_provider_credential("bedrock", Some("explicit")),
+            Some("explicit".to_string())
+        );
+        assert!(resolve_provider_credential("bedrock", None).is_none());
+        assert!(resolve_provider_credential("aws-bedrock", None).is_none());
+    }
+
+    #[test]
     fn regional_alias_predicates_cover_expected_variants() {
         assert!(is_moonshot_alias("moonshot"));
         assert!(is_moonshot_alias("kimi-global"));
@@ -1407,8 +1429,11 @@ mod tests {
 
     #[test]
     fn factory_bedrock() {
-        assert!(create_provider("bedrock", Some("key")).is_ok());
-        assert!(create_provider("aws-bedrock", Some("key")).is_ok());
+        // Bedrock uses AWS env vars for credentials, not API key.
+        assert!(create_provider("bedrock", None).is_ok());
+        assert!(create_provider("aws-bedrock", None).is_ok());
+        // Passing an api_key is harmless (ignored).
+        assert!(create_provider("bedrock", Some("ignored")).is_ok());
     }
 
     #[test]
@@ -1669,6 +1694,76 @@ mod tests {
             &reliability,
         );
         assert!(provider.is_err());
+    }
+
+    /// Fallback providers resolve their own credentials via provider-specific
+    /// env vars rather than inheriting the primary provider's key.  A provider
+    /// that requires no key (e.g. lmstudio, ollama) must initialize
+    /// successfully even when the primary uses a completely different key.
+    #[test]
+    fn resilient_fallback_resolves_own_credential() {
+        let reliability = crate::config::ReliabilityConfig {
+            provider_retries: 1,
+            provider_backoff_ms: 100,
+            fallback_providers: vec!["lmstudio".into(), "ollama".into()],
+            api_keys: Vec::new(),
+            model_fallbacks: std::collections::HashMap::new(),
+            channel_initial_backoff_secs: 2,
+            channel_max_backoff_secs: 60,
+            scheduler_poll_secs: 15,
+            scheduler_retries: 2,
+        };
+
+        // Primary uses a ZAI key; fallbacks (lmstudio, ollama) should NOT
+        // receive this key; they resolve their own credentials independently.
+        let provider = create_resilient_provider("zai", Some("zai-test-key"), None, &reliability);
+        assert!(provider.is_ok());
+    }
+
+    /// `custom:` URL entries work as fallback providers, enabling arbitrary
+    /// OpenAI-compatible endpoints (e.g. local LM Studio on a Docker host).
+    #[test]
+    fn resilient_fallback_supports_custom_url() {
+        let reliability = crate::config::ReliabilityConfig {
+            provider_retries: 1,
+            provider_backoff_ms: 100,
+            fallback_providers: vec!["custom:http://host.docker.internal:1234/v1".into()],
+            api_keys: Vec::new(),
+            model_fallbacks: std::collections::HashMap::new(),
+            channel_initial_backoff_secs: 2,
+            channel_max_backoff_secs: 60,
+            scheduler_poll_secs: 15,
+            scheduler_retries: 2,
+        };
+
+        let provider =
+            create_resilient_provider("openai", Some("openai-test-key"), None, &reliability);
+        assert!(provider.is_ok());
+    }
+
+    /// Mixed fallback chain: named providers, custom URLs, and invalid entries
+    /// all coexist.  Invalid entries are silently ignored; valid ones initialize.
+    #[test]
+    fn resilient_fallback_mixed_chain() {
+        let reliability = crate::config::ReliabilityConfig {
+            provider_retries: 1,
+            provider_backoff_ms: 100,
+            fallback_providers: vec![
+                "deepseek".into(),
+                "custom:http://localhost:8080/v1".into(),
+                "nonexistent-provider".into(),
+                "lmstudio".into(),
+            ],
+            api_keys: Vec::new(),
+            model_fallbacks: std::collections::HashMap::new(),
+            channel_initial_backoff_secs: 2,
+            channel_max_backoff_secs: 60,
+            scheduler_poll_secs: 15,
+            scheduler_retries: 2,
+        };
+
+        let provider = create_resilient_provider("zai", Some("zai-test-key"), None, &reliability);
+        assert!(provider.is_ok());
     }
 
     #[test]

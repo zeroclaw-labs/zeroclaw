@@ -2,11 +2,21 @@
 
 This is a high-signal reference for common config sections and defaults.
 
-Last verified: **February 18, 2026**.
+Last verified: **February 19, 2026**.
 
-Config file path:
+Config path resolution at startup:
 
-- `~/.zeroclaw/config.toml`
+1. `ZEROCLAW_WORKSPACE` override (if set)
+2. persisted `~/.zeroclaw/active_workspace.toml` marker (if present)
+3. default `~/.zeroclaw/config.toml`
+
+ZeroClaw logs the resolved config on startup at `INFO` level:
+
+- `Config loaded` with fields: `path`, `workspace`, `source`, `initialized`
+
+Schema export command:
+
+- `zeroclaw config schema` (prints JSON Schema draft 2020-12 to stdout)
 
 ## Core Keys
 
@@ -15,6 +25,19 @@ Config file path:
 | `default_provider` | `openrouter` | provider ID or alias |
 | `default_model` | `anthropic/claude-sonnet-4-6` | model routed through selected provider |
 | `default_temperature` | `0.7` | model temperature |
+
+## Environment Provider Overrides
+
+Provider selection can also be controlled by environment variables. Precedence is:
+
+1. `ZEROCLAW_PROVIDER` (explicit override, always wins when non-empty)
+2. `PROVIDER` (legacy fallback, only applied when config provider is unset or still `openrouter`)
+3. `default_provider` in `config.toml`
+
+Operational note for container users:
+
+- If your `config.toml` sets an explicit custom provider like `custom:https://.../v1`, a default `PROVIDER=openrouter` from Docker/container env will no longer replace it.
+- Use `ZEROCLAW_PROVIDER` when you intentionally want runtime env to override a non-default configured provider.
 
 ## `[agent]`
 
@@ -35,6 +58,27 @@ Notes:
 | `port` | `3000` | gateway listen port |
 | `require_pairing` | `true` | require pairing before bearer auth |
 | `allow_public_bind` | `false` | block accidental public exposure |
+
+## `[autonomy]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `level` | `supervised` | `read_only`, `supervised`, or `full` |
+| `workspace_only` | `true` | restrict writes/command paths to workspace scope |
+| `allowed_commands` | _required for shell execution_ | allowlist of executable names |
+| `forbidden_paths` | `[]` | explicit path denylist |
+| `max_actions_per_hour` | `100` | per-policy action budget |
+| `max_cost_per_day_cents` | `1000` | per-policy spend guardrail |
+| `require_approval_for_medium_risk` | `true` | approval gate for medium-risk commands |
+| `block_high_risk_commands` | `true` | hard block for high-risk commands |
+| `auto_approve` | `[]` | tool operations always auto-approved |
+| `always_ask` | `[]` | tool operations that always require approval |
+
+Notes:
+
+- `level = "full"` skips medium-risk approval gating for shell execution, while still enforcing configured guardrails.
+- Shell separator/operator parsing is quote-aware. Characters like `;` inside quoted arguments are treated as literals, not command separators.
+- Unquoted shell chaining/operators are still enforced by policy checks (`;`, `|`, `&&`, `||`, background chaining, and redirects).
 
 ## `[memory]`
 

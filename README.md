@@ -52,6 +52,7 @@ Use this board for important notices (breaking changes, security advisories, mai
 
 | Date (UTC) | Level | Notice | Action |
 |---|---|---|---|
+| 2026-02-19 | _Critical_ | We are **not affiliated** with `openagen/zeroclaw` or `zeroclaw.org`. The `zeroclaw.org` domain currently points to the `openagen/zeroclaw` fork, and that domain/repository are impersonating our official website/project. | Do not trust information, binaries, fundraising, or announcements from those sources. Use only this repository and our verified social accounts. |
 | 2026-02-19 | _Important_ | We have **not** launched an official website yet, and we are seeing impersonation attempts. Do **not** join any investment or fundraising activity claiming the ZeroClaw name. | Use this repository as the single source of truth. Follow [X (@zeroclawlabs)](https://x.com/zeroclawlabs?s=21) and [Xiaohongshu](https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search) for official updates. |
 | 2026-02-19 | _Important_ | Anthropic updated the Authentication and Credential Use terms on 2026-02-19. OAuth authentication (Free, Pro, Max) is intended exclusively for Claude Code and Claude.ai; using OAuth tokens from Claude Free/Pro/Max in any other product, tool, or service (including Agent SDK) is not permitted and may violate the Consumer Terms of Service. | Please temporarily avoid Claude Code OAuth integrations to prevent potential loss. Original clause: [Authentication and Credential Use](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use). |
 
@@ -189,7 +190,7 @@ cd zeroclaw
 ./bootstrap.sh --install-system-deps --install-rust
 
 # Optional: run onboarding in the same flow
-./bootstrap.sh --onboard --api-key "sk-..." --provider openrouter
+./bootstrap.sh --onboard --api-key "sk-..." --provider openrouter [--model "openrouter/auto"]
 ```
 
 Remote one-liner (review first in security-sensitive environments):
@@ -209,8 +210,8 @@ cargo install --path . --force --locked
 # Ensure ~/.cargo/bin is in your PATH
 export PATH="$HOME/.cargo/bin:$PATH"
 
-# Quick setup (no prompts)
-zeroclaw onboard --api-key sk-... --provider openrouter
+# Quick setup (no prompts, optional model specification)
+zeroclaw onboard --api-key sk-... --provider openrouter [--model "openrouter/auto"]
 
 # Or interactive wizard
 zeroclaw onboard --interactive
@@ -776,7 +777,7 @@ See [aieos.org](https://aieos.org) for the full schema and live examples.
 | `service` | Manage user-level background service |
 | `doctor` | Diagnose daemon/scheduler/channel freshness |
 | `status` | Show full system status |
-| `cron` | Manage scheduled tasks (`list/add/add-at/add-every/once/remove/pause/resume`) |
+| `cron` | Manage scheduled tasks (`list/add/add-at/add-every/once/remove/update/pause/resume`) |
 | `models` | Refresh provider model catalogs (`models refresh`) |
 | `providers` | List supported providers and aliases |
 | `channel` | List/start/doctor channels and bind Telegram identities |

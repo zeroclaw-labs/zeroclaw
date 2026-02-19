@@ -31,6 +31,7 @@ Options:
   --interactive-onboard      Run interactive onboarding (implies --onboard)
   --api-key <key>            API key for non-interactive onboarding
   --provider <id>            Provider for non-interactive onboarding (default: openrouter)
+  --model <id>               Model for non-interactive onboarding (optional)
   --skip-build               Skip `cargo build --release --locked`
   --skip-install             Skip `cargo install --path . --force --locked`
   -h, --help                 Show help
@@ -38,7 +39,7 @@ Options:
 Examples:
   ./bootstrap.sh
   ./bootstrap.sh --install-system-deps --install-rust
-  ./bootstrap.sh --onboard --api-key "sk-..." --provider openrouter
+  ./bootstrap.sh --onboard --api-key "sk-..." --provider openrouter [--model "openrouter/auto"]
   ./bootstrap.sh --interactive-onboard
 
   # Remote one-liner
@@ -47,6 +48,7 @@ Examples:
 Environment:
   ZEROCLAW_API_KEY           Used when --api-key is not provided
   ZEROCLAW_PROVIDER          Used when --provider is not provided (default: openrouter)
+  ZEROCLAW_MODEL             Used when --model is not provided
 USAGE
 }
 
@@ -139,6 +141,7 @@ SKIP_BUILD=false
 SKIP_INSTALL=false
 API_KEY="${ZEROCLAW_API_KEY:-}"
 PROVIDER="${ZEROCLAW_PROVIDER:-openrouter}"
+MODEL="${ZEROCLAW_MODEL:-}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -171,6 +174,14 @@ while [[ $# -gt 0 ]]; do
       PROVIDER="${2:-}"
       [[ -n "$PROVIDER" ]] || {
         error "--provider requires a value"
+        exit 1
+      }
+      shift 2
+      ;;
+    --model)
+      MODEL="${2:-}"
+      [[ -n "$MODEL" ]] || {
+        error "--model requires a value"
         exit 1
       }
       shift 2
@@ -298,8 +309,16 @@ or run interactive:
 MSG
       exit 1
     fi
-    info "Running quick onboarding (provider: $PROVIDER)"
-    "$ZEROCLAW_BIN" onboard --api-key "$API_KEY" --provider "$PROVIDER"
+    if [[ -n "$MODEL" ]]; then
+      info "Running quick onboarding (provider: $PROVIDER, model: $MODEL)"
+    else
+      info "Running quick onboarding (provider: $PROVIDER)"
+    fi
+    ONBOARD_CMD=("$ZEROCLAW_BIN" onboard --api-key "$API_KEY" --provider "$PROVIDER")
+    if [[ -n "$MODEL" ]]; then
+      ONBOARD_CMD+=(--model "$MODEL")
+    fi
+    "${ONBOARD_CMD[@]}"
   fi
 fi
 

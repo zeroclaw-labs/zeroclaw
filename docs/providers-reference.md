@@ -2,7 +2,7 @@
 
 This document maps provider IDs, aliases, and credential environment variables.
 
-Last verified: **February 18, 2026**.
+Last verified: **February 19, 2026**.
 
 ## How to List Providers
 
@@ -17,6 +17,10 @@ Runtime resolution order is:
 1. Explicit credential from config/CLI
 2. Provider-specific env var(s)
 3. Generic fallback env vars: `ZEROCLAW_API_KEY` then `API_KEY`
+
+For resilient fallback chains (`reliability.fallback_providers`), each fallback
+provider resolves credentials independently. The primary provider's explicit
+credential is not reused for fallback providers.
 
 ## Provider Catalog
 
@@ -37,7 +41,7 @@ Runtime resolution order is:
 | `zai` | `z.ai` | No | `ZAI_API_KEY` |
 | `glm` | `zhipu` | No | `GLM_API_KEY` |
 | `minimax` | `minimax-intl`, `minimax-io`, `minimax-global`, `minimax-cn`, `minimaxi`, `minimax-oauth`, `minimax-oauth-cn`, `minimax-portal`, `minimax-portal-cn` | No | `MINIMAX_OAUTH_TOKEN`, `MINIMAX_API_KEY` |
-| `bedrock` | `aws-bedrock` | No | (use config/`API_KEY` fallback) |
+| `bedrock` | `aws-bedrock` | No | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (optional: `AWS_REGION`) |
 | `qianfan` | `baidu` | No | `QIANFAN_API_KEY` |
 | `qwen` | `dashscope`, `qwen-intl`, `dashscope-intl`, `qwen-us`, `dashscope-us` | No | `DASHSCOPE_API_KEY` |
 | `groq` | — | No | `GROQ_API_KEY` |
@@ -51,6 +55,17 @@ Runtime resolution order is:
 | `copilot` | `github-copilot` | No | (use config/`API_KEY` fallback with GitHub token) |
 | `lmstudio` | `lm-studio` | Yes | (optional; local by default) |
 | `nvidia` | `nvidia-nim`, `build.nvidia.com` | No | `NVIDIA_API_KEY` |
+
+### Bedrock Notes
+
+- Provider ID: `bedrock` (alias: `aws-bedrock`)
+- API: [Converse API](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html)
+- Authentication: AWS AKSK (not a single API key). Set `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` environment variables.
+- Optional: `AWS_SESSION_TOKEN` for temporary/STS credentials, `AWS_REGION` or `AWS_DEFAULT_REGION` (default: `us-east-1`).
+- Default onboarding model: `anthropic.claude-sonnet-4-5-20250929-v1:0`
+- Supports native tool calling and prompt caching (`cachePoint`).
+- Cross-region inference profiles supported (e.g., `us.anthropic.claude-*`).
+- Model IDs use Bedrock format: `anthropic.claude-sonnet-4-6`, `anthropic.claude-opus-4-6-v1`, etc.
 
 ### Kimi Code Notes
 

@@ -9,6 +9,9 @@ pub struct ChannelMessage {
     pub content: String,
     pub channel: String,
     pub timestamp: u64,
+    /// Platform thread identifier (e.g. Slack `ts`, Discord thread ID).
+    /// When set, replies should be posted as threaded responses.
+    pub thread_ts: Option<String>,
 }
 
 /// Message to send through a channel
@@ -17,6 +20,8 @@ pub struct SendMessage {
     pub content: String,
     pub recipient: String,
     pub subject: Option<String>,
+    /// Platform thread identifier for threaded replies (e.g. Slack `thread_ts`).
+    pub thread_ts: Option<String>,
 }
 
 impl SendMessage {
@@ -26,6 +31,7 @@ impl SendMessage {
             content: content.into(),
             recipient: recipient.into(),
             subject: None,
+            thread_ts: None,
         }
     }
 
@@ -39,7 +45,14 @@ impl SendMessage {
             content: content.into(),
             recipient: recipient.into(),
             subject: Some(subject.into()),
+            thread_ts: None,
         }
+    }
+
+    /// Set the thread identifier for threaded replies.
+    pub fn in_thread(mut self, thread_ts: Option<String>) -> Self {
+        self.thread_ts = thread_ts;
+        self
     }
 }
 
@@ -129,6 +142,7 @@ mod tests {
                 content: "hello".into(),
                 channel: "dummy".into(),
                 timestamp: 123,
+                thread_ts: None,
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -144,6 +158,7 @@ mod tests {
             content: "ping".into(),
             channel: "dummy".into(),
             timestamp: 999,
+            thread_ts: None,
         };
 
         let cloned = message.clone();

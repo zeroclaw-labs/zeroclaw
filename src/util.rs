@@ -43,6 +43,13 @@ pub fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Utility enum for handling optional values.
+pub enum MaybeSet<T> {
+    Set(T),
+    Unset,
+    Null,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

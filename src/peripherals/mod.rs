@@ -42,7 +42,7 @@ pub fn list_configured_boards(config: &PeripheralsConfig) -> Vec<&PeripheralBoar
 
 /// Handle `zeroclaw peripheral` subcommands.
 #[allow(clippy::module_name_repetitions)]
-pub fn handle_command(cmd: crate::PeripheralCommands, config: &Config) -> Result<()> {
+pub async fn handle_command(cmd: crate::PeripheralCommands, config: &Config) -> Result<()> {
     match cmd {
         crate::PeripheralCommands::List => {
             let boards = list_configured_boards(&config.peripherals);
@@ -76,7 +76,7 @@ pub fn handle_command(cmd: crate::PeripheralCommands, config: &Config) -> Result
                 Some(path.clone())
             };
 
-            let mut cfg = crate::config::Config::load_or_init()?;
+            let mut cfg = crate::config::Config::load_or_init().await?;
             cfg.peripherals.enabled = true;
 
             if cfg
@@ -95,7 +95,7 @@ pub fn handle_command(cmd: crate::PeripheralCommands, config: &Config) -> Result
                 path: path_opt,
                 baud: 115_200,
             });
-            cfg.save()?;
+            cfg.save().await?;
             println!("Added {} at {}. Restart daemon to apply.", board, path);
         }
         #[cfg(feature = "hardware")]

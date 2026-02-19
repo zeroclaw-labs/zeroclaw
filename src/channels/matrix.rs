@@ -596,6 +596,7 @@ impl Channel for MatrixChannel {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs(),
+                    thread_ts: None,
                 };
 
                 let _ = tx.send(msg).await;
@@ -726,7 +727,7 @@ mod tests {
             "!r:m".to_string(),
             vec![],
             Some("   ".to_string()),
-            Some("".to_string()),
+            Some(String::new()),
         );
 
         assert!(ch.session_owner_hint.is_none());

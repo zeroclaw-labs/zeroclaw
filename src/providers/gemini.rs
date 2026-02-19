@@ -3,7 +3,7 @@
 //! - Gemini CLI OAuth tokens (reuse existing ~/.gemini/ authentication)
 //! - Google Cloud ADC (`GOOGLE_APPLICATION_CREDENTIALS`)
 
-use crate::providers::traits::Provider;
+use crate::providers::traits::{ChatMessage, Provider};
 use async_trait::async_trait;
 use directories::UserDirs;
 use reqwest::Client;
@@ -326,12 +326,11 @@ impl GeminiProvider {
     }
 }
 
-#[async_trait]
-impl Provider for GeminiProvider {
-    async fn chat_with_system(
+impl GeminiProvider {
+    async fn send_generate_content(
         &self,
-        system_prompt: Option<&str>,
-        message: &str,
+        contents: Vec<Content>,
+        system_instruction: Option<Content>,
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
@@ -345,21 +344,8 @@ impl Provider for GeminiProvider {
             )
         })?;
 
-        // Build request
-        let system_instruction = system_prompt.map(|sys| Content {
-            role: None,
-            parts: vec![Part {
-                text: sys.to_string(),
-            }],
-        });
-
         let request = GenerateContentRequest {
-            contents: vec![Content {
-                role: Some("user".to_string()),
-                parts: vec![Part {
-                    text: message.to_string(),
-                }],
-            }],
+            contents,
             system_instruction,
             generation_config: GenerationConfig {
                 temperature,
@@ -382,18 +368,94 @@ impl Provider for GeminiProvider {
 
         let result: GenerateContentResponse = response.json().await?;
 
-        // Check for API error in response body
         if let Some(err) = result.error {
             anyhow::bail!("Gemini API error: {}", err.message);
         }
 
-        // Extract text from response
         result
             .candidates
             .and_then(|c| c.into_iter().next())
             .and_then(|c| c.content.parts.into_iter().next())
             .and_then(|p| p.text)
             .ok_or_else(|| anyhow::anyhow!("No response from Gemini"))
+    }
+}
+
+#[async_trait]
+impl Provider for GeminiProvider {
+    async fn chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<String> {
+        let system_instruction = system_prompt.map(|sys| Content {
+            role: None,
+            parts: vec![Part {
+                text: sys.to_string(),
+            }],
+        });
+
+        let contents = vec![Content {
+            role: Some("user".to_string()),
+            parts: vec![Part {
+                text: message.to_string(),
+            }],
+        }];
+
+        self.send_generate_content(contents, system_instruction, model, temperature)
+            .await
+    }
+
+    async fn chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<String> {
+        let mut system_parts: Vec<&str> = Vec::new();
+        let mut contents: Vec<Content> = Vec::new();
+
+        for msg in messages {
+            match msg.role.as_str() {
+                "system" => {
+                    system_parts.push(&msg.content);
+                }
+                "user" => {
+                    contents.push(Content {
+                        role: Some("user".to_string()),
+                        parts: vec![Part {
+                            text: msg.content.clone(),
+                        }],
+                    });
+                }
+                "assistant" => {
+                    // Gemini API uses "model" role instead of "assistant"
+                    contents.push(Content {
+                        role: Some("model".to_string()),
+                        parts: vec![Part {
+                            text: msg.content.clone(),
+                        }],
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        let system_instruction = if system_parts.is_empty() {
+            None
+        } else {
+            Some(Content {
+                role: None,
+                parts: vec![Part {
+                    text: system_parts.join("\n\n"),
+                }],
+            })
+        };
+
+        self.send_generate_content(contents, system_instruction, model, temperature)
+            .await
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
