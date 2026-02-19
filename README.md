@@ -188,7 +188,7 @@ cd zeroclaw
 # Optional: bootstrap dependencies + Rust on fresh machines
 ./bootstrap.sh --install-system-deps --install-rust
 
-# Optional: run onboarding in the same flow 
+# Optional: run onboarding in the same flow
 ./bootstrap.sh --onboard --api-key "sk-..." --provider openrouter [--model "openrouter/auto"]
 ```
 
