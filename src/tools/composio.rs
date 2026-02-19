@@ -137,12 +137,29 @@ impl ComposioTool {
             .await
         {
             Ok(result) => Ok(result),
-            Err(v3_err) => match self.execute_action_v2(action_name, params, entity_id).await {
-                Ok(result) => Ok(result),
-                Err(v2_err) => anyhow::bail!(
-                    "Composio execute failed on v3 ({v3_err}) and v2 fallback ({v2_err})"
-                ),
-            },
+            Err(v3_err) => {
+                let mut v2_candidates = vec![action_name.trim().to_string()];
+                let legacy_action_name = normalize_legacy_action_name(action_name);
+                if !legacy_action_name.is_empty() && !v2_candidates.contains(&legacy_action_name) {
+                    v2_candidates.push(legacy_action_name);
+                }
+
+                let mut v2_errors = Vec::new();
+                for candidate in v2_candidates {
+                    match self
+                        .execute_action_v2(&candidate, params.clone(), entity_id)
+                        .await
+                    {
+                        Ok(result) => return Ok(result),
+                        Err(v2_err) => v2_errors.push(format!("{candidate}: {v2_err}")),
+                    }
+                }
+
+                anyhow::bail!(
+                    "Composio execute failed on v3 ({v3_err}) and v2 fallback attempts ({})",
+                    v2_errors.join(" | ")
+                );
+            }
         }
     }
 
@@ -152,7 +169,7 @@ impl ComposioTool {
         entity_id: Option<&str>,
         connected_account_ref: Option<&str>,
     ) -> (String, serde_json::Value) {
-        let url = format!("{COMPOSIO_API_BASE_V3}/tools/{tool_slug}/execute");
+        let url = format!("{COMPOSIO_API_BASE_V3}/tools/execute/{tool_slug}");
         let account_ref = connected_account_ref.and_then(|candidate| {
             let trimmed_candidate = candidate.trim();
             (!trimmed_candidate.is_empty()).then_some(trimmed_candidate)
@@ -606,6 +623,10 @@ fn normalize_tool_slug(action_name: &str) -> String {
     action_name.trim().replace('_', "-").to_ascii_lowercase()
 }
 
+fn normalize_legacy_action_name(action_name: &str) -> String {
+    action_name.trim().replace('-', "_").to_ascii_uppercase()
+}
+
 fn map_v3_tools_to_actions(items: Vec<ComposioV3Tool>) -> Vec<ComposioAction> {
     items
         .into_iter()
@@ -967,6 +988,18 @@ mod tests {
     }
 
     #[test]
+    fn normalize_legacy_action_name_supports_v3_slug_input() {
+        assert_eq!(
+            normalize_legacy_action_name("gmail-fetch-emails"),
+            "GMAIL_FETCH_EMAILS"
+        );
+        assert_eq!(
+            normalize_legacy_action_name(" GITHUB_LIST_REPOS "),
+            "GITHUB_LIST_REPOS"
+        );
+    }
+
+    #[test]
     fn extract_redirect_url_supports_v2_and_v3_shapes() {
         let v2 = json!({"redirectUrl": "https://app.composio.dev/connect-v2"});
         let v3 = json!({"redirect_url": "https://app.composio.dev/connect-v3"});
@@ -1041,10 +1074,10 @@ mod tests {
 
     #[test]
     fn composio_action_with_unicode() {
-        let json_str = r#"{"name": "SLACK_SEND_MESSAGE", "appName": "slack", "description": "Send message with emoji 🎉 and unicode 中文", "enabled": true}"#;
+        let json_str = r#"{"name": "SLACK_SEND_MESSAGE", "appName": "slack", "description": "Send message with emoji 🎉 and unicode Ω", "enabled": true}"#;
         let action: ComposioAction = serde_json::from_str(json_str).unwrap();
         assert!(action.description.as_ref().unwrap().contains("🎉"));
-        assert!(action.description.as_ref().unwrap().contains("中文"));
+        assert!(action.description.as_ref().unwrap().contains("Ω"));
     }
 
     #[test]
@@ -1093,7 +1126,7 @@ mod tests {
 
         assert_eq!(
             url,
-            "https://backend.composio.dev/api/v3/tools/gmail-send-email/execute"
+            "https://backend.composio.dev/api/v3/tools/execute/gmail-send-email"
         );
         assert_eq!(body["arguments"]["to"], json!("test@example.com"));
         assert_eq!(body["user_id"], json!("workspace-user"));
@@ -1111,7 +1144,7 @@ mod tests {
 
         assert_eq!(
             url,
-            "https://backend.composio.dev/api/v3/tools/github-list-repos/execute"
+            "https://backend.composio.dev/api/v3/tools/execute/github-list-repos"
         );
         assert_eq!(body["arguments"], json!({}));
         assert!(body.get("connected_account_id").is_none());

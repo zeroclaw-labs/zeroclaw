@@ -62,6 +62,20 @@ Notes:
 - `reasoning_enabled = true` explicitly requests reasoning for supported providers (`think: true` on `ollama`).
 - Unset keeps provider defaults.
 
+## `[composio]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable Composio managed OAuth tools |
+| `api_key` | unset | Composio API key used by the `composio` tool |
+| `entity_id` | `default` | Default `user_id` sent on connect/execute calls |
+
+Notes:
+
+- Backward compatibility: legacy `enable = true` is accepted as an alias for `enabled = true`.
+- If `enabled = false` or `api_key` is missing, the `composio` tool is not registered.
+- Typical flow: call `connect`, complete browser OAuth, then run `execute` for the desired tool action.
+
 ## `[multimodal]`
 
 | Key | Default | Purpose |
