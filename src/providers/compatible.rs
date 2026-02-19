@@ -1117,7 +1117,12 @@ impl Provider for OpenAiCompatibleProvider {
             )
         })?;
 
-        let api_messages: Vec<Message> = messages
+        let effective_messages = if self.merge_system_into_user {
+            Self::flatten_system_messages(messages)
+        } else {
+            messages.to_vec()
+        };
+        let api_messages: Vec<Message> = effective_messages
             .iter()
             .map(|m| Message {
                 role: m.role.clone(),
@@ -1861,6 +1866,54 @@ mod tests {
         assert_eq!(converted[0].role, "tool");
         assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_abc"));
         assert_eq!(converted[0].content.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn flatten_system_messages_merges_into_first_user() {
+        let input = vec![
+            ChatMessage::system("core policy"),
+            ChatMessage::assistant("ack"),
+            ChatMessage::system("delivery rules"),
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("post-user"),
+        ];
+
+        let output = OpenAiCompatibleProvider::flatten_system_messages(&input);
+        assert_eq!(output.len(), 3);
+        assert_eq!(output[0].role, "assistant");
+        assert_eq!(output[0].content, "ack");
+        assert_eq!(output[1].role, "user");
+        assert_eq!(output[1].content, "core policy\n\ndelivery rules\n\nhello");
+        assert_eq!(output[2].role, "assistant");
+        assert_eq!(output[2].content, "post-user");
+        assert!(output.iter().all(|m| m.role != "system"));
+    }
+
+    #[test]
+    fn flatten_system_messages_inserts_user_when_missing() {
+        let input = vec![
+            ChatMessage::system("core policy"),
+            ChatMessage::assistant("ack"),
+        ];
+
+        let output = OpenAiCompatibleProvider::flatten_system_messages(&input);
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0].role, "user");
+        assert_eq!(output[0].content, "core policy");
+        assert_eq!(output[1].role, "assistant");
+        assert_eq!(output[1].content, "ack");
+    }
+
+    #[test]
+    fn strip_think_tags_removes_multiple_blocks() {
+        let input = "a<think>x</think>b<think>y</think>c";
+        assert_eq!(strip_think_tags(input), "abc");
+    }
+
+    #[test]
+    fn strip_think_tags_drops_unclosed_block_suffix() {
+        let input = "visible<think>hidden";
+        assert_eq!(strip_think_tags(input), "visible");
     }
 
     #[test]

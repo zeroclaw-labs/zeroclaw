@@ -691,6 +691,7 @@ mod tests {
         assert!(p.is_command_allowed("cargo build --release"));
         assert!(p.is_command_allowed("cat file.txt"));
         assert!(p.is_command_allowed("grep -r pattern ."));
+        assert!(p.is_command_allowed("date"));
     }
 
     #[test]

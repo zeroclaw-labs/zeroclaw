@@ -348,4 +348,25 @@ mod tests {
         assert!(prompt.contains("test_tool"));
         assert!(prompt.contains("instr"));
     }
+
+    #[test]
+    fn datetime_section_includes_timestamp_and_timezone() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            identity_config: None,
+            dispatcher_instructions: "instr",
+        };
+
+        let rendered = DateTimeSection.build(&ctx).unwrap();
+        assert!(rendered.starts_with("## Current Date & Time\n\n"));
+
+        let payload = rendered.trim_start_matches("## Current Date & Time\n\n");
+        assert!(payload.chars().any(|c| c.is_ascii_digit()));
+        assert!(payload.contains(" ("));
+        assert!(payload.ends_with(')'));
+    }
 }
