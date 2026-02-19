@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
-use tokio::fs::{self, File, OpenOptions};
+use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 
 const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
@@ -2715,7 +2715,7 @@ pub(crate) async fn persist_active_workspace_config_dir(config_dir: &Path) -> Re
         );
     }
 
-    sync_directory(&default_config_dir).await?;
+    sync_directory(&default_config_dir)?;
     Ok(())
 }
 
@@ -3351,7 +3351,7 @@ impl Config {
             anyhow::bail!("Failed to atomically replace config file: {e}");
         }
 
-        sync_directory(parent_dir).await?;
+        sync_directory(parent_dir)?;
 
         if had_existing_config {
             let _ = fs::remove_file(&backup_path).await;
@@ -3362,7 +3362,7 @@ impl Config {
 }
 
 #[cfg(unix)]
-async fn sync_directory(path: &Path) -> Result<()> {
+fn sync_directory(path: &Path) -> Result<()> {
     let dir = File::open(path)
         .await
         .with_context(|| format!("Failed to open directory for fsync: {}", path.display()))?;
@@ -3380,7 +3380,7 @@ fn sync_directory(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs::Permissions, os::unix::fs::PermissionsExt, path::PathBuf};
+    use std::path::PathBuf;
     use tokio::sync::{Mutex, MutexGuard};
     use tokio::test;
     use tokio_stream::wrappers::ReadDirStream;
