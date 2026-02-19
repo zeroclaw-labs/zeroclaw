@@ -8,6 +8,10 @@ use std::time::Duration;
 
 /// Check if an error is non-retryable (client errors that won't resolve with retries).
 fn is_non_retryable(err: &anyhow::Error) -> bool {
+    if is_context_window_exceeded(err) {
+        return true;
+    }
+
     if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>() {
         if let Some(status) = reqwest_err.status() {
             let code = status.as_u16();
@@ -51,6 +55,22 @@ fn is_non_retryable(err: &anyhow::Error) -> bool {
             || msg_lower.contains("unsupported")
             || msg_lower.contains("does not exist")
             || msg_lower.contains("invalid"))
+}
+
+fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
+    let lower = err.to_string().to_lowercase();
+    let hints = [
+        "exceeds the context window",
+        "context window of this model",
+        "maximum context length",
+        "context length exceeded",
+        "too many tokens",
+        "token limit exceeded",
+        "prompt is too long",
+        "input is too long",
+    ];
+
+    hints.iter().any(|hint| lower.contains(hint))
 }
 
 /// Check if an error is a rate-limit (429) error.
@@ -325,6 +345,14 @@ impl Provider for ReliableProvider {
                                     error = %error_detail,
                                     "Non-retryable error, moving on"
                                 );
+
+                                if is_context_window_exceeded(&e) {
+                                    anyhow::bail!(
+                                        "Request exceeds model context window; retries and fallbacks were skipped. Attempts:\n{}",
+                                        failures.join("\n")
+                                    );
+                                }
+
                                 break;
                             }
 
@@ -433,6 +461,14 @@ impl Provider for ReliableProvider {
                                     error = %error_detail,
                                     "Non-retryable error, moving on"
                                 );
+
+                                if is_context_window_exceeded(&e) {
+                                    anyhow::bail!(
+                                        "Request exceeds model context window; retries and fallbacks were skipped. Attempts:\n{}",
+                                        failures.join("\n")
+                                    );
+                                }
+
                                 break;
                             }
 
@@ -541,6 +577,14 @@ impl Provider for ReliableProvider {
                                     error = %error_detail,
                                     "Non-retryable error, moving on"
                                 );
+
+                                if is_context_window_exceeded(&e) {
+                                    anyhow::bail!(
+                                        "Request exceeds model context window; retries and fallbacks were skipped. Attempts:\n{}",
+                                        failures.join("\n")
+                                    );
+                                }
+
                                 break;
                             }
 
@@ -867,6 +911,44 @@ mod tests {
         assert!(!is_non_retryable(&anyhow::anyhow!(
             "model overloaded, try again later"
         )));
+        assert!(is_non_retryable(&anyhow::anyhow!(
+            "OpenAI Codex stream error: Your input exceeds the context window of this model."
+        )));
+    }
+
+    #[tokio::test]
+    async fn context_window_error_aborts_retries_and_model_fallbacks() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut model_fallbacks = std::collections::HashMap::new();
+        model_fallbacks.insert(
+            "gpt-5.3-codex".to_string(),
+            vec!["gpt-5.2-codex".to_string()],
+        );
+
+        let provider = ReliableProvider::new(
+            vec![(
+                "openai-codex".into(),
+                Box::new(MockProvider {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: usize::MAX,
+                    response: "never",
+                    error: "OpenAI Codex stream error: Your input exceeds the context window of this model. Please adjust your input and try again.",
+                }),
+            )],
+            4,
+            1,
+        )
+        .with_model_fallbacks(model_fallbacks);
+
+        let err = provider
+            .simple_chat("hello", "gpt-5.3-codex", 0.0)
+            .await
+            .expect_err("context window overflow should fail fast");
+        let msg = err.to_string();
+
+        assert!(msg.contains("context window"));
+        assert!(msg.contains("skipped"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

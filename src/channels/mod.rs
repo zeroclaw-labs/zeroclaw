@@ -254,6 +254,22 @@ fn clear_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) {
         .remove(sender_key);
 }
 
+fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
+    let lower = err.to_string().to_lowercase();
+    [
+        "exceeds the context window",
+        "context window of this model",
+        "maximum context length",
+        "context length exceeded",
+        "too many tokens",
+        "token limit exceeded",
+        "prompt is too long",
+        "input is too long",
+    ]
+    .iter()
+    .any(|hint| lower.contains(hint))
+}
+
 fn load_cached_model_preview(workspace_dir: &Path, provider_name: &str) -> Vec<String> {
     let cache_path = workspace_dir.join("state").join(MODEL_CACHE_FILE);
     let Ok(raw) = std::fs::read_to_string(cache_path) else {
@@ -592,7 +608,10 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             );
             if let Some(channel) = target_channel.as_ref() {
                 let _ = channel
-                    .send(&SendMessage::new(message, &msg.reply_target).in_thread(msg.thread_ts.clone()))
+                    .send(
+                        &SendMessage::new(message, &msg.reply_target)
+                            .in_thread(msg.thread_ts.clone()),
+                    )
                     .await;
             }
             return;
@@ -658,7 +677,9 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
     let draft_message_id = if use_streaming {
         if let Some(channel) = target_channel.as_ref() {
             match channel
-                .send_draft(&SendMessage::new("...", &msg.reply_target).in_thread(msg.thread_ts.clone()))
+                .send_draft(
+                    &SendMessage::new("...", &msg.reply_target).in_thread(msg.thread_ts.clone()),
+                )
                 .await
             {
                 Ok(id) => id,
@@ -769,11 +790,17 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                     {
                         tracing::warn!("Failed to finalize draft: {e}; sending as new message");
                         let _ = channel
-                            .send(&SendMessage::new(&response, &msg.reply_target).in_thread(msg.thread_ts.clone()))
+                            .send(
+                                &SendMessage::new(&response, &msg.reply_target)
+                                    .in_thread(msg.thread_ts.clone()),
+                            )
                             .await;
                     }
                 } else if let Err(e) = channel
-                    .send(&SendMessage::new(response, &msg.reply_target).in_thread(msg.thread_ts.clone()))
+                    .send(
+                        &SendMessage::new(response, &msg.reply_target)
+                            .in_thread(msg.thread_ts.clone()),
+                    )
                     .await
                 {
                     eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
@@ -781,6 +808,30 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             }
         }
         Ok(Err(e)) => {
+            if is_context_window_overflow_error(&e) {
+                clear_sender_history(ctx.as_ref(), &history_key);
+                let error_text = "⚠️ Context window exceeded for this conversation. I cleared this sender history. Please resend your last message.";
+                eprintln!(
+                    "  ⚠️ Context window exceeded after {}ms; sender history cleared",
+                    started_at.elapsed().as_millis()
+                );
+                if let Some(channel) = target_channel.as_ref() {
+                    if let Some(ref draft_id) = draft_message_id {
+                        let _ = channel
+                            .finalize_draft(&msg.reply_target, draft_id, error_text)
+                            .await;
+                    } else {
+                        let _ = channel
+                            .send(
+                                &SendMessage::new(error_text, &msg.reply_target)
+                                    .in_thread(msg.thread_ts.clone()),
+                            )
+                            .await;
+                    }
+                }
+                return;
+            }
+
             eprintln!(
                 "  ❌ LLM error after {}ms: {e}",
                 started_at.elapsed().as_millis()
@@ -792,10 +843,10 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                         .await;
                 } else {
                     let _ = channel
-                        .send(&SendMessage::new(
-                            format!("⚠️ Error: {e}"),
-                            &msg.reply_target,
-                        ).in_thread(msg.thread_ts.clone()))
+                        .send(
+                            &SendMessage::new(format!("⚠️ Error: {e}"), &msg.reply_target)
+                                .in_thread(msg.thread_ts.clone()),
+                        )
                         .await;
                 }
             }
@@ -816,7 +867,10 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                         .await;
                 } else {
                     let _ = channel
-                        .send(&SendMessage::new(error_text, &msg.reply_target).in_thread(msg.thread_ts.clone()))
+                        .send(
+                            &SendMessage::new(error_text, &msg.reply_target)
+                                .in_thread(msg.thread_ts.clone()),
+                        )
                         .await;
                 }
             }
@@ -1991,6 +2045,18 @@ mod tests {
             MIN_CHANNEL_MESSAGE_TIMEOUT_SECS
         );
         assert_eq!(effective_channel_message_timeout_secs(300), 300);
+    }
+
+    #[test]
+    fn context_window_overflow_error_detector_matches_known_messages() {
+        let overflow_err = anyhow::anyhow!(
+            "OpenAI Codex stream error: Your input exceeds the context window of this model."
+        );
+        assert!(is_context_window_overflow_error(&overflow_err));
+
+        let other_err =
+            anyhow::anyhow!("OpenAI Codex API error (502 Bad Gateway): error code: 502");
+        assert!(!is_context_window_overflow_error(&other_err));
     }
 
     #[derive(Default)]
