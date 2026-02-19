@@ -188,8 +188,8 @@ cd zeroclaw
 # Optional: bootstrap dependencies + Rust on fresh machines
 ./bootstrap.sh --install-system-deps --install-rust
 
-# Optional: run onboarding in the same flow
-./bootstrap.sh --onboard --api-key "sk-..." --provider openrouter
+# Optional: run onboarding in the same flow 
+./bootstrap.sh --onboard --api-key "sk-..." --provider openrouter [--model "openrouter/auto"]
 ```
 
 Remote one-liner (review first in security-sensitive environments):
@@ -209,8 +209,8 @@ cargo install --path . --force --locked
 # Ensure ~/.cargo/bin is in your PATH
 export PATH="$HOME/.cargo/bin:$PATH"
 
-# Quick setup (no prompts)
-zeroclaw onboard --api-key sk-... --provider openrouter
+# Quick setup (no prompts, optional model specification)
+zeroclaw onboard --api-key sk-... --provider openrouter [--model "openrouter/auto"]
 
 # Or interactive wizard
 zeroclaw onboard --interactive

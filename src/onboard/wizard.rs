@@ -324,6 +324,7 @@ fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
 pub fn run_quick_setup(
     credential_override: Option<&str>,
     provider: Option<&str>,
+    model_override: Option<&str>,
     memory_backend: Option<&str>,
 ) -> Result<Config> {
     println!("{}", style(BANNER).cyan().bold());
@@ -345,7 +346,9 @@ pub fn run_quick_setup(
     fs::create_dir_all(&workspace_dir).context("Failed to create workspace directory")?;
 
     let provider_name = provider.unwrap_or("openrouter").to_string();
-    let model = default_model_for_provider(&provider_name);
+    let model = model_override
+        .map(str::to_string)
+        .unwrap_or_else(|| default_model_for_provider(&provider_name));
     let memory_backend_name = memory_backend
         .unwrap_or(default_memory_backend_key())
         .to_string();

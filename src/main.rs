@@ -120,7 +120,9 @@ enum Commands {
         /// Provider name (used in quick mode, default: openrouter)
         #[arg(long)]
         provider: Option<String>,
-
+        /// Model ID override (used in quick mode)
+        #[arg(long)]
+        model: Option<String>,
         /// Memory backend (sqlite, lucid, markdown, none) - used in quick mode, default: sqlite
         #[arg(long)]
         memory: Option<String>,
@@ -532,6 +534,7 @@ async fn main() -> Result<()> {
         channels_only,
         api_key,
         provider,
+        model,
         memory,
     } = &cli.command
     {
@@ -539,22 +542,29 @@ async fn main() -> Result<()> {
         let channels_only = *channels_only;
         let api_key = api_key.clone();
         let provider = provider.clone();
+        let model = model.clone();
         let memory = memory.clone();
 
         if interactive && channels_only {
             bail!("Use either --interactive or --channels-only, not both");
         }
-        if channels_only && (api_key.is_some() || provider.is_some() || memory.is_some()) {
-            bail!("--channels-only does not accept --api-key, --provider, or --memory");
+        if channels_only
+            && (api_key.is_some() || provider.is_some() || model.is_some() || memory.is_some())
+        {
+            bail!("--channels-only does not accept --api-key, --provider, --model, or --memory");
         }
-
         let config = tokio::task::spawn_blocking(move || {
             if channels_only {
                 onboard::run_channels_repair_wizard()
             } else if interactive {
                 onboard::run_wizard()
             } else {
-                onboard::run_quick_setup(api_key.as_deref(), provider.as_deref(), memory.as_deref())
+                onboard::run_quick_setup(
+                    api_key.as_deref(),
+                    provider.as_deref(),
+                    model.as_deref(),
+                    memory.as_deref(),
+                )
             }
         })
         .await??;
