@@ -1,7 +1,9 @@
-use crate::config::schema::{DingTalkConfig, IrcConfig, QQConfig, StreamMode, WhatsAppConfig};
+use crate::config::schema::{
+    DingTalkConfig, IrcConfig, LarkReceiveMode, QQConfig, StreamMode, WhatsAppConfig,
+};
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
-    HeartbeatConfig, IMessageConfig, MatrixConfig, MemoryConfig, ObservabilityConfig,
+    HeartbeatConfig, IMessageConfig, LarkConfig, MatrixConfig, MemoryConfig, ObservabilityConfig,
     RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig, TelegramConfig, WebhookConfig,
 };
 use crate::hardware::{self, HardwareConfig};
@@ -168,7 +170,8 @@ pub fn run_wizard() -> Result<Config> {
         || config.channels_config.matrix.is_some()
         || config.channels_config.email.is_some()
         || config.channels_config.dingtalk.is_some()
-        || config.channels_config.qq.is_some();
+        || config.channels_config.qq.is_some()
+        || config.channels_config.lark.is_some();
 
     if has_channels && config.api_key.is_some() {
         let launch: bool = Confirm::new()
@@ -227,7 +230,8 @@ pub fn run_channels_repair_wizard() -> Result<Config> {
         || config.channels_config.matrix.is_some()
         || config.channels_config.email.is_some()
         || config.channels_config.dingtalk.is_some()
-        || config.channels_config.qq.is_some();
+        || config.channels_config.qq.is_some()
+        || config.channels_config.lark.is_some();
 
     if has_channels && config.api_key.is_some() {
         let launch: bool = Confirm::new()
@@ -2544,13 +2548,21 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     "— Tencent QQ Bot"
                 }
             ),
+            format!(
+                "Lark/Feishu {}",
+                if config.lark.is_some() {
+                    "✅ connected"
+                } else {
+                    "— Lark/Feishu Bot"
+                }
+            ),
             "Done — finish setup".to_string(),
         ];
 
         let choice = Select::new()
             .with_prompt("  Connect a channel (or Done to continue)")
             .items(&options)
-            .default(10)
+            .default(11)
             .interact()?;
 
         match choice {
@@ -3443,6 +3455,193 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     allowed_users,
                 });
             }
+            10 => {
+                // ── Lark/Feishu ──
+                println!();
+                println!(
+                    "  {} {}",
+                    style("Lark/Feishu Setup").white().bold(),
+                    style("— talk to ZeroClaw from Lark or Feishu").dim()
+                );
+                print_bullet(
+                    "1. Go to Lark/Feishu Open Platform (open.larksuite.com / open.feishu.cn)",
+                );
+                print_bullet("2. Create an app and enable 'Bot' capability");
+                print_bullet("3. Copy the App ID and App Secret");
+                println!();
+
+                let app_id: String = Input::new().with_prompt("  App ID").interact_text()?;
+                let app_id = app_id.trim().to_string();
+
+                if app_id.trim().is_empty() {
+                    println!("  {} Skipped", style("→").dim());
+                    continue;
+                }
+
+                let app_secret: String =
+                    Input::new().with_prompt("  App Secret").interact_text()?;
+                let app_secret = app_secret.trim().to_string();
+
+                if app_secret.is_empty() {
+                    println!("  {} App Secret is required", style("❌").red().bold());
+                    continue;
+                }
+
+                let use_feishu = Select::new()
+                    .with_prompt("  Region")
+                    .items(["Feishu (CN)", "Lark (International)"])
+                    .default(0)
+                    .interact()?
+                    == 0;
+
+                // Test connection (run entirely in separate thread — Response must be used/dropped there)
+                print!("  {} Testing connection... ", style("⏳").dim());
+                let base_url = if use_feishu {
+                    "https://open.feishu.cn/open-apis"
+                } else {
+                    "https://open.larksuite.com/open-apis"
+                };
+                let app_id_clone = app_id.clone();
+                let app_secret_clone = app_secret.clone();
+                let endpoint = format!("{base_url}/auth/v3/tenant_access_token/internal");
+
+                let thread_result = std::thread::spawn(move || {
+                    let client = reqwest::blocking::Client::builder()
+                        .timeout(Duration::from_secs(8))
+                        .connect_timeout(Duration::from_secs(4))
+                        .build()
+                        .map_err(|err| format!("failed to build HTTP client: {err}"))?;
+                    let body = serde_json::json!({
+                        "app_id": app_id_clone,
+                        "app_secret": app_secret_clone,
+                    });
+
+                    let response = client
+                        .post(endpoint)
+                        .json(&body)
+                        .send()
+                        .map_err(|err| format!("request error: {err}"))?;
+
+                    let status = response.status();
+                    let payload: Value = response.json().unwrap_or_default();
+                    let has_token = payload
+                        .get("tenant_access_token")
+                        .and_then(Value::as_str)
+                        .is_some_and(|token| !token.trim().is_empty());
+
+                    if status.is_success() && has_token {
+                        return Ok::<(), String>(());
+                    }
+
+                    let detail = payload
+                        .get("msg")
+                        .or_else(|| payload.get("message"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown error");
+
+                    Err(format!("auth rejected ({status}): {detail}"))
+                })
+                .join();
+
+                match thread_result {
+                    Ok(Ok(())) => {
+                        println!(
+                            "\r  {} Lark/Feishu credentials verified        ",
+                            style("✅").green().bold()
+                        );
+                    }
+                    Ok(Err(reason)) => {
+                        println!(
+                            "\r  {} Connection failed — check your credentials",
+                            style("❌").red().bold()
+                        );
+                        println!("    {}", style(reason).dim());
+                        continue;
+                    }
+                    Err(_) => {
+                        println!(
+                            "\r  {} Connection failed — check your credentials",
+                            style("❌").red().bold()
+                        );
+                        continue;
+                    }
+                }
+
+                let receive_mode_choice = Select::new()
+                    .with_prompt("  Receive Mode")
+                    .items([
+                        "WebSocket (recommended, no public IP needed)",
+                        "Webhook (requires public HTTPS endpoint)",
+                    ])
+                    .default(0)
+                    .interact()?;
+
+                let receive_mode = if receive_mode_choice == 0 {
+                    LarkReceiveMode::Websocket
+                } else {
+                    LarkReceiveMode::Webhook
+                };
+
+                let verification_token = if receive_mode == LarkReceiveMode::Webhook {
+                    let token: String = Input::new()
+                        .with_prompt("  Verification Token (optional, for Webhook mode)")
+                        .allow_empty(true)
+                        .interact_text()?;
+                    if token.is_empty() {
+                        None
+                    } else {
+                        Some(token)
+                    }
+                } else {
+                    None
+                };
+
+                if receive_mode == LarkReceiveMode::Webhook && verification_token.is_none() {
+                    println!(
+                        "  {} Verification Token is empty — webhook authenticity checks are reduced.",
+                        style("⚠").yellow().bold()
+                    );
+                }
+
+                let port = if receive_mode == LarkReceiveMode::Webhook {
+                    let p: String = Input::new()
+                        .with_prompt("  Webhook Port")
+                        .default("8080".into())
+                        .interact_text()?;
+                    Some(p.parse().unwrap_or(8080))
+                } else {
+                    None
+                };
+
+                let users_str: String = Input::new()
+                    .with_prompt("  Allowed user Open IDs (comma-separated, '*' for all)")
+                    .allow_empty(true)
+                    .interact_text()?;
+
+                let allowed_users: Vec<String> = users_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+
+                if allowed_users.is_empty() {
+                    println!(
+                        "  {} No users allowlisted — Lark/Feishu inbound messages will be denied until you add Open IDs or '*'.",
+                        style("⚠").yellow().bold()
+                    );
+                }
+
+                config.lark = Some(LarkConfig {
+                    app_id,
+                    app_secret,
+                    verification_token,
+                    encrypt_key: None,
+                    allowed_users,
+                    use_feishu,
+                    receive_mode,
+                    port,
+                });
+            }
             _ => break, // Done
         }
         println!();
@@ -3482,6 +3681,9 @@ fn setup_channels() -> Result<ChannelsConfig> {
     }
     if config.qq.is_some() {
         active.push("QQ");
+    }
+    if config.lark.is_some() {
+        active.push("Lark");
     }
 
     println!(
@@ -3935,7 +4137,8 @@ fn print_summary(config: &Config) {
         || config.channels_config.matrix.is_some()
         || config.channels_config.email.is_some()
         || config.channels_config.dingtalk.is_some()
-        || config.channels_config.qq.is_some();
+        || config.channels_config.qq.is_some()
+        || config.channels_config.lark.is_some();
 
     println!();
     println!(
@@ -4002,6 +4205,9 @@ fn print_summary(config: &Config) {
     }
     if config.channels_config.webhook.is_some() {
         channels.push("Webhook");
+    }
+    if config.channels_config.lark.is_some() {
+        channels.push("Lark");
     }
     println!(
         "    {} Channels:      {}",
