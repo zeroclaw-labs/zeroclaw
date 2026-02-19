@@ -8,6 +8,13 @@ use uuid::Uuid;
 /// Messages are received via the gateway's `/whatsapp` webhook endpoint.
 /// The `listen` method here is a no-op placeholder; actual message handling
 /// happens in the gateway when Meta sends webhook events.
+fn ensure_https(url: &str) -> anyhow::Result<()> {
+    if !url.starts_with("https://") {
+        anyhow::bail!("Refusing to transmit sensitive data over non-HTTPS URL: URL scheme must be https");
+    }
+    Ok(())
+}
+
 pub struct WhatsAppChannel {
     access_token: String,
     endpoint_id: String,
@@ -165,6 +172,8 @@ impl Channel for WhatsAppChannel {
             }
         });
 
+        ensure_https(&url)?;
+
         let resp = self
             .http_client()
             .post(&url)
@@ -202,6 +211,10 @@ impl Channel for WhatsAppChannel {
     async fn health_check(&self) -> bool {
         // Check if we can reach the WhatsApp API
         let url = format!("https://graph.facebook.com/v18.0/{}", self.endpoint_id);
+
+        if ensure_https(&url).is_err() {
+            return false;
+        }
 
         self.http_client()
             .get(&url)

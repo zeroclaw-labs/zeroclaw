@@ -11,6 +11,13 @@ use uuid::Uuid;
 const QQ_API_BASE: &str = "https://api.sgroup.qq.com";
 const QQ_AUTH_URL: &str = "https://bots.qq.com/app/getAppAccessToken";
 
+fn ensure_https(url: &str) -> anyhow::Result<()> {
+    if !url.starts_with("https://") {
+        anyhow::bail!("Refusing to transmit sensitive data over non-HTTPS URL: URL scheme must be https");
+    }
+    Ok(())
+}
+
 /// Deduplication set capacity — evict half of entries when full.
 const DEDUP_CAPACITY: usize = 10_000;
 
@@ -195,6 +202,8 @@ impl Channel for QQChannel {
                 }),
             )
         };
+
+        ensure_https(&url)?;
 
         let resp = self
             .http_client()
