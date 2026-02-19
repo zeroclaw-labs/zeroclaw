@@ -10,7 +10,9 @@ use uuid::Uuid;
 /// happens in the gateway when Meta sends webhook events.
 fn ensure_https(url: &str) -> anyhow::Result<()> {
     if !url.starts_with("https://") {
-        anyhow::bail!("Refusing to transmit sensitive data over non-HTTPS URL: URL scheme must be https");
+        anyhow::bail!(
+            "Refusing to transmit sensitive data over non-HTTPS URL: URL scheme must be https"
+        );
     }
     Ok(())
 }

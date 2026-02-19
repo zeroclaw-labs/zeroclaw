@@ -1813,10 +1813,7 @@ mod tests {
         };
 
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "X-Webhook-Secret",
-            HeaderValue::from_str(&secret).unwrap(),
-        );
+        headers.insert("X-Webhook-Secret", HeaderValue::from_str(&secret).unwrap());
 
         let response = handle_webhook(
             State(state),
@@ -1988,7 +1985,11 @@ mod tests {
 
         // Correct prefix should pass
         let correct_prefix = format!("sha256={hex_sig}");
-        assert!(verify_whatsapp_signature(&app_secret, body, &correct_prefix));
+        assert!(verify_whatsapp_signature(
+            &app_secret,
+            body,
+            &correct_prefix
+        ));
     }
 
     #[test]
