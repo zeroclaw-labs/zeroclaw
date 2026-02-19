@@ -322,7 +322,8 @@ impl LarkChannel {
                 msg = read.next() => {
                     let raw = match msg {
                         Some(Ok(WsMsg::Binary(b))) => { last_recv = Instant::now(); b }
-                        Some(Ok(WsMsg::Ping(d))) => { let _ = write.send(WsMsg::Pong(d)).await; continue; }
+                        Some(Ok(WsMsg::Ping(d))) => { last_recv = Instant::now(); let _ = write.send(WsMsg::Pong(d)).await; continue; }
+                        Some(Ok(WsMsg::Pong(_))) => { last_recv = Instant::now(); continue; }
                         Some(Ok(WsMsg::Close(_))) | None => { tracing::info!("Lark: WS closed — reconnecting"); break; }
                         Some(Err(e)) => { tracing::error!("Lark: WS read error: {e}"); break; }
                         _ => continue,
