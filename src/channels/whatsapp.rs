@@ -148,6 +148,11 @@ impl Channel for WhatsAppChannel {
             self.endpoint_id
         );
 
+        anyhow::ensure!(
+            url.starts_with("https://"),
+            "WhatsApp API requests must use HTTPS"
+        );
+
         // Normalize recipient (remove leading + if present for API)
         let to = message
             .recipient
