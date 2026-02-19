@@ -55,6 +55,7 @@ pub mod identity;
 pub mod integrations;
 pub mod memory;
 pub mod migration;
+pub mod multimodal;
 pub mod observability;
 pub mod onboard;
 pub mod peripherals;

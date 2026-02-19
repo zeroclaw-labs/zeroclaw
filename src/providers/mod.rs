@@ -13,8 +13,8 @@ pub mod traits;
 
 #[allow(unused_imports)]
 pub use traits::{
-    ChatMessage, ChatRequest, ChatResponse, ConversationMessage, Provider, ToolCall,
-    ToolResultMessage,
+    ChatMessage, ChatRequest, ChatResponse, ConversationMessage, Provider, ProviderCapabilityError,
+    ToolCall, ToolResultMessage,
 };
 
 use compatible::{AuthStyle, OpenAiCompatibleProvider};

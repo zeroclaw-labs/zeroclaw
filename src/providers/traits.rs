@@ -192,6 +192,15 @@ pub enum StreamError {
     Io(#[from] std::io::Error),
 }
 
+/// Structured error returned when a requested capability is not supported.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("provider_capability_error provider={provider} capability={capability} message={message}")]
+pub struct ProviderCapabilityError {
+    pub provider: String,
+    pub capability: String,
+    pub message: String,
+}
+
 /// Provider capabilities declaration.
 ///
 /// Describes what features a provider supports, enabling intelligent
@@ -205,6 +214,8 @@ pub struct ProviderCapabilities {
     ///
     /// When `false`, tools must be injected via system prompt as text.
     pub native_tool_calling: bool,
+    /// Whether the provider supports vision / image inputs.
+    pub vision: bool,
 }
 
 /// Provider-specific tool payload formats.
@@ -351,6 +362,11 @@ pub trait Provider: Send + Sync {
         self.capabilities().native_tool_calling
     }
 
+    /// Whether provider supports multimodal vision input.
+    fn supports_vision(&self) -> bool {
+        self.capabilities().vision
+    }
+
     /// Warm up the HTTP connection pool (TLS handshake, DNS, HTTP/2 setup).
     /// Default implementation is a no-op; providers with HTTP clients should override.
     async fn warmup(&self) -> anyhow::Result<()> {
@@ -458,6 +474,7 @@ mod tests {
         fn capabilities(&self) -> ProviderCapabilities {
             ProviderCapabilities {
                 native_tool_calling: true,
+                vision: true,
             }
         }
 
@@ -539,18 +556,22 @@ mod tests {
     fn provider_capabilities_default() {
         let caps = ProviderCapabilities::default();
         assert!(!caps.native_tool_calling);
+        assert!(!caps.vision);
     }
 
     #[test]
     fn provider_capabilities_equality() {
         let caps1 = ProviderCapabilities {
             native_tool_calling: true,
+            vision: false,
         };
         let caps2 = ProviderCapabilities {
             native_tool_calling: true,
+            vision: false,
         };
         let caps3 = ProviderCapabilities {
             native_tool_calling: false,
+            vision: false,
         };
 
         assert_eq!(caps1, caps2);
@@ -561,6 +582,12 @@ mod tests {
     fn supports_native_tools_reflects_capabilities_default_mapping() {
         let provider = CapabilityMockProvider;
         assert!(provider.supports_native_tools());
+    }
+
+    #[test]
+    fn supports_vision_reflects_capabilities_default_mapping() {
+        let provider = CapabilityMockProvider;
+        assert!(provider.supports_vision());
     }
 
     #[test]

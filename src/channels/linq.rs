@@ -37,6 +37,28 @@ impl LinqChannel {
         &self.from_phone
     }
 
+    fn media_part_to_image_marker(part: &serde_json::Value) -> Option<String> {
+        let source = part
+            .get("url")
+            .or_else(|| part.get("value"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+
+        let mime_type = part
+            .get("mime_type")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+
+        if !mime_type.starts_with("image/") {
+            return None;
+        }
+
+        Some(format!("[IMAGE:{source}]"))
+    }
+
     /// Parse an incoming webhook payload from Linq and extract messages.
     ///
     /// Linq webhook envelope:
@@ -124,25 +146,36 @@ impl LinqChannel {
             return messages;
         };
 
-        let text_parts: Vec<&str> = parts
+        let content_parts: Vec<String> = parts
             .iter()
             .filter_map(|part| {
                 let part_type = part.get("type").and_then(|t| t.as_str())?;
-                if part_type == "text" {
-                    part.get("value").and_then(|v| v.as_str())
-                } else {
-                    // Skip media parts for now
-                    tracing::debug!("Linq: skipping {part_type} part");
-                    None
+                match part_type {
+                    "text" => part
+                        .get("value")
+                        .and_then(|v| v.as_str())
+                        .map(ToString::to_string),
+                    "media" | "image" => {
+                        if let Some(marker) = Self::media_part_to_image_marker(part) {
+                            Some(marker)
+                        } else {
+                            tracing::debug!("Linq: skipping unsupported {part_type} part");
+                            None
+                        }
+                    }
+                    _ => {
+                        tracing::debug!("Linq: skipping {part_type} part");
+                        None
+                    }
                 }
             })
             .collect();
 
-        if text_parts.is_empty() {
+        if content_parts.is_empty() {
             return messages;
         }
 
-        let content = text_parts.join("\n");
+        let content = content_parts.join("\n").trim().to_string();
 
         if content.is_empty() {
             return messages;
@@ -496,7 +529,7 @@ mod tests {
     }
 
     #[test]
-    fn linq_parse_media_only_skipped() {
+    fn linq_parse_media_only_translated_to_image_marker() {
         let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["*".into()]);
         let payload = serde_json::json!({
             "event_type": "message.received",
@@ -516,7 +549,32 @@ mod tests {
         });
 
         let msgs = ch.parse_webhook_payload(&payload);
-        assert!(msgs.is_empty(), "Media-only messages should be skipped");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "[IMAGE:https://example.com/image.jpg]");
+    }
+
+    #[test]
+    fn linq_parse_media_non_image_still_skipped() {
+        let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "event_type": "message.received",
+            "data": {
+                "chat_id": "chat-789",
+                "from": "+1234567890",
+                "is_from_me": false,
+                "message": {
+                    "id": "msg-abc",
+                    "parts": [{
+                        "type": "media",
+                        "url": "https://example.com/sound.mp3",
+                        "mime_type": "audio/mpeg"
+                    }]
+                }
+            }
+        });
+
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(msgs.is_empty(), "Non-image media should still be skipped");
     }
 
     #[test]

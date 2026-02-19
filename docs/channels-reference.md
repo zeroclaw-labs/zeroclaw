@@ -51,6 +51,22 @@ Notes:
 - Model cache previews come from `zeroclaw models refresh --provider <ID>`.
 - These are runtime chat commands, not CLI subcommands.
 
+## Inbound Image Marker Protocol
+
+ZeroClaw supports multimodal input through inline message markers:
+
+- Syntax: ``[IMAGE:<source>]``
+- `<source>` can be:
+  - Local file path
+  - Data URI (`data:image/...;base64,...`)
+  - Remote URL only when `[multimodal].allow_remote_fetch = true`
+
+Operational notes:
+
+- Marker parsing applies to user-role messages before provider calls.
+- Provider capability is enforced at runtime: if the selected provider does not support vision, the request fails with a structured capability error (`capability=vision`).
+- Linq webhook `media` parts with `image/*` MIME type are automatically converted to this marker format.
+
 ## Channel Matrix
 
 ---
@@ -349,4 +365,3 @@ If a specific channel task crashes or exits, the channel supervisor in `channels
 - `Channel message worker crashed:`
 
 These messages indicate automatic restart behavior is active, and you should inspect preceding logs for root cause.
-

@@ -1,4 +1,7 @@
-use crate::providers::traits::{ChatMessage, ChatResponse, Provider, ToolCall};
+use crate::multimodal;
+use crate::providers::traits::{
+    ChatMessage, ChatResponse, Provider, ProviderCapabilities, ToolCall,
+};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -29,6 +32,8 @@ struct Message {
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    images: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<OutgoingToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -166,6 +171,31 @@ impl OllamaProvider {
         }
     }
 
+    fn convert_user_message_content(&self, content: &str) -> (Option<String>, Option<Vec<String>>) {
+        let (cleaned, image_refs) = multimodal::parse_image_markers(content);
+        if image_refs.is_empty() {
+            return (Some(content.to_string()), None);
+        }
+
+        let images: Vec<String> = image_refs
+            .iter()
+            .filter_map(|reference| multimodal::extract_ollama_image_payload(reference))
+            .collect();
+
+        if images.is_empty() {
+            return (Some(content.to_string()), None);
+        }
+
+        let cleaned = cleaned.trim();
+        let content = if cleaned.is_empty() {
+            None
+        } else {
+            Some(cleaned.to_string())
+        };
+
+        (content, Some(images))
+    }
+
     /// Convert internal chat history format to Ollama's native tool-call message schema.
     ///
     /// `run_tool_call_loop` stores native assistant/tool entries as JSON strings in
@@ -205,6 +235,7 @@ impl OllamaProvider {
                                 return Message {
                                     role: "assistant".to_string(),
                                     content,
+                                    images: None,
                                     tool_calls: Some(outgoing_calls),
                                     tool_name: None,
                                 };
@@ -238,15 +269,28 @@ impl OllamaProvider {
                         return Message {
                             role: "tool".to_string(),
                             content,
+                            images: None,
                             tool_calls: None,
                             tool_name,
                         };
                     }
                 }
 
+                if message.role == "user" {
+                    let (content, images) = self.convert_user_message_content(&message.content);
+                    return Message {
+                        role: "user".to_string(),
+                        content,
+                        images,
+                        tool_calls: None,
+                        tool_name: None,
+                    };
+                }
+
                 Message {
                     role: message.role.clone(),
                     content: Some(message.content.clone()),
+                    images: None,
                     tool_calls: None,
                     tool_name: None,
                 }
@@ -398,6 +442,13 @@ impl OllamaProvider {
 
 #[async_trait]
 impl Provider for OllamaProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calling: true,
+            vision: true,
+        }
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -413,14 +464,17 @@ impl Provider for OllamaProvider {
             messages.push(Message {
                 role: "system".to_string(),
                 content: Some(sys.to_string()),
+                images: None,
                 tool_calls: None,
                 tool_name: None,
             });
         }
 
+        let (user_content, user_images) = self.convert_user_message_content(message);
         messages.push(Message {
             role: "user".to_string(),
-            content: Some(message.to_string()),
+            content: user_content,
+            images: user_images,
             tool_calls: None,
             tool_name: None,
         });
@@ -861,5 +915,35 @@ mod tests {
         assert_eq!(converted[1].tool_name.as_deref(), Some("file_read"));
         assert_eq!(converted[1].content.as_deref(), Some("ok"));
         assert!(converted[1].tool_calls.is_none());
+    }
+
+    #[test]
+    fn convert_messages_extracts_images_from_user_marker() {
+        let provider = OllamaProvider::new(None, None);
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "Inspect this screenshot [IMAGE:data:image/png;base64,abcd==]".into(),
+        }];
+
+        let converted = provider.convert_messages(&messages);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, "user");
+        assert_eq!(
+            converted[0].content.as_deref(),
+            Some("Inspect this screenshot")
+        );
+        let images = converted[0]
+            .images
+            .as_ref()
+            .expect("images should be present");
+        assert_eq!(images, &vec!["abcd==".to_string()]);
+    }
+
+    #[test]
+    fn capabilities_include_native_tools_and_vision() {
+        let provider = OllamaProvider::new(None, None);
+        let caps = <OllamaProvider as Provider>::capabilities(&provider);
+        assert!(caps.native_tool_calling);
+        assert!(caps.vision);
     }
 }
