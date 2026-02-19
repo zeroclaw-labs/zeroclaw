@@ -587,6 +587,7 @@ async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// POST /pair — exchange one-time code for bearer token
+#[axum::debug_handler]
 async fn handle_pair(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
@@ -608,10 +609,10 @@ async fn handle_pair(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    match state.pairing.try_pair(code) {
+    match state.pairing.try_pair(code).await {
         Ok(Some(token)) => {
             tracing::info!("🔐 New client paired successfully");
-            if let Err(err) = persist_pairing_tokens(&state.config, &state.pairing) {
+            if let Err(err) = persist_pairing_tokens(state.config.clone(), &state.pairing).await {
                 tracing::error!("🔐 Pairing succeeded but token persistence failed: {err:#}");
                 let body = serde_json::json!({
                     "paired": true,
@@ -648,11 +649,14 @@ async fn handle_pair(
     }
 }
 
-fn persist_pairing_tokens(config: &Arc<Mutex<Config>>, pairing: &PairingGuard) -> Result<()> {
+async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGuard) -> Result<()> {
     let paired_tokens = pairing.tokens();
-    let mut cfg = config.lock();
+    // This is needed because parking_lot's guard is not Send so we clone the inner
+    // this should be removed once async mutexes are used everywhere
+    let mut cfg = { config.lock().clone() };
     cfg.gateway.paired_tokens = paired_tokens;
     cfg.save()
+        .await
         .context("Failed to persist paired tokens to config.toml")
 }
 
@@ -1398,15 +1402,15 @@ mod tests {
         let mut config = Config::default();
         config.config_path = config_path.clone();
         config.workspace_dir = workspace_path;
-        config.save().unwrap();
+        config.save().await.unwrap();
 
         let guard = PairingGuard::new(true, &[]);
         let code = guard.pairing_code().unwrap();
-        let token = guard.try_pair(&code).unwrap().unwrap();
+        let token = guard.try_pair(&code).await.unwrap().unwrap();
         assert!(guard.is_authenticated(&token));
 
         let shared_config = Arc::new(Mutex::new(config));
-        persist_pairing_tokens(&shared_config, &guard).unwrap();
+        persist_pairing_tokens(shared_config, &guard).await.unwrap();
 
         let saved = tokio::fs::read_to_string(config_path).await.unwrap();
         let parsed: Config = toml::from_str(&saved).unwrap();
