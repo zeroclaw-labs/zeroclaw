@@ -1038,6 +1038,7 @@ pub(crate) async fn agent_turn(
         multimodal_config,
         max_tool_iterations,
         None,
+        None,  // on_delta
         false, // streaming disabled by default for agent_turn
     )
     .await
@@ -1112,7 +1113,6 @@ pub(crate) async fn run_tool_call_loop(
             None
         };
 
-<<<<<<< HEAD
         // Try streaming first if enabled, provider supports it, and we have on_delta
         let chat_request = ChatRequest {
             messages: &prepared_messages.messages,
@@ -1133,18 +1133,8 @@ pub(crate) async fn run_tool_call_loop(
             None
         };
 
-        let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
-            match streaming_result {
-                Some(Ok(result)) => {
-=======
-        let chat_future = provider.chat(
-            ChatRequest {
-                messages: &prepared_messages.messages,
-                tools: request_tools,
-            },
-            model,
-            temperature,
-        );
+        // Fallback to non-streaming with cancellation_token support
+        let chat_future = provider.chat(chat_request, model, temperature);
 
         let chat_result = if let Some(token) = cancellation_token.as_ref() {
             tokio::select! {
@@ -1156,9 +1146,8 @@ pub(crate) async fn run_tool_call_loop(
         };
 
         let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
-            match chat_result {
-                Ok(resp) => {
->>>>>>> ef82c7d (fix(channels): interrupt in-flight telegram requests on newer sender messages)
+            match streaming_result {
+                Some(Ok(result)) => {
                     observer.record_event(&ObserverEvent::LlmResponse {
                         provider: provider_name.to_string(),
                         model: model.to_string(),
@@ -1185,8 +1174,8 @@ pub(crate) async fn run_tool_call_loop(
                     return Err(e);
                 }
                 None => {
-                    // Fallback to non-streaming
-                    match provider.chat(chat_request, model, temperature).await {
+                    // Fallback to non-streaming with cancellation_token support
+                    match chat_result {
                         Ok(resp) => {
                             observer.record_event(&ObserverEvent::LlmResponse {
                                 provider: provider_name.to_string(),
@@ -1742,11 +1731,8 @@ pub async fn run(
             &config.multimodal,
             config.agent.max_tool_iterations,
             None,
-<<<<<<< HEAD
+            None, // on_delta - no streaming for CLI
             config.reliability.streaming_enabled,
-=======
-            None,
->>>>>>> ef82c7d (fix(channels): interrupt in-flight telegram requests on newer sender messages)
         )
         .await?;
         final_output = response.clone();
@@ -1865,11 +1851,8 @@ pub async fn run(
                 &config.multimodal,
                 config.agent.max_tool_iterations,
                 None,
-<<<<<<< HEAD
+                None, // on_delta - no streaming for CLI
                 config.reliability.streaming_enabled,
-=======
-                None,
->>>>>>> ef82c7d (fix(channels): interrupt in-flight telegram requests on newer sender messages)
             )
             .await
             {
@@ -2217,11 +2200,8 @@ mod tests {
             &crate::config::MultimodalConfig::default(),
             3,
             None,
-<<<<<<< HEAD
-            false,
-=======
             None,
->>>>>>> ef82c7d (fix(channels): interrupt in-flight telegram requests on newer sender messages)
+            false,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -2265,11 +2245,8 @@ mod tests {
             &multimodal,
             3,
             None,
-<<<<<<< HEAD
-            false,
-=======
             None,
->>>>>>> ef82c7d (fix(channels): interrupt in-flight telegram requests on newer sender messages)
+            false,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -2307,11 +2284,8 @@ mod tests {
             &crate::config::MultimodalConfig::default(),
             3,
             None,
-<<<<<<< HEAD
-            false,
-=======
             None,
->>>>>>> ef82c7d (fix(channels): interrupt in-flight telegram requests on newer sender messages)
+            false,
         )
         .await
         .expect("valid multimodal payload should pass");
