@@ -1462,6 +1462,16 @@ async fn process_channel_message(
         None
     };
 
+    // React with 👀 to acknowledge the incoming message
+    if let Some(channel) = target_channel.as_ref() {
+        if let Err(e) = channel
+            .add_reaction(&msg.reply_target, &msg.id, "\u{1F440}")
+            .await
+        {
+            tracing::debug!("Failed to add reaction: {e}");
+        }
+    }
+
     let typing_cancellation = target_channel.as_ref().map(|_| CancellationToken::new());
     let typing_task = match (target_channel.as_ref(), typing_cancellation.as_ref()) {
         (Some(channel), Some(token)) => Some(spawn_scoped_typing_task(
@@ -1515,6 +1525,11 @@ async fn process_channel_message(
     if let Some(handle) = typing_task {
         log_worker_join_result(handle.await);
     }
+
+    let reaction_done_emoji = match &llm_result {
+        Ok(Ok(_)) => "\u{2705}", // ✅
+        _ => "\u{26A0}\u{FE0F}", // ⚠️
+    };
 
     match llm_result {
         LlmExecutionResult::Cancelled => {
@@ -1679,6 +1694,16 @@ async fn process_channel_message(
                 }
             }
         }
+    }
+
+    // Swap 👀 → ✅ (or ⚠️ on error) to signal processing is complete
+    if let Some(channel) = target_channel.as_ref() {
+        let _ = channel
+            .remove_reaction(&msg.reply_target, &msg.id, "\u{1F440}")
+            .await;
+        let _ = channel
+            .add_reaction(&msg.reply_target, &msg.id, reaction_done_emoji)
+            .await;
     }
 }
 
@@ -3050,6 +3075,8 @@ mod tests {
         sent_messages: tokio::sync::Mutex<Vec<String>>,
         start_typing_calls: AtomicUsize,
         stop_typing_calls: AtomicUsize,
+        reactions_added: tokio::sync::Mutex<Vec<(String, String, String)>>,
+        reactions_removed: tokio::sync::Mutex<Vec<(String, String, String)>>,
     }
 
     #[derive(Default)]
@@ -3115,6 +3142,34 @@ mod tests {
 
         async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
             self.stop_typing_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn add_reaction(
+            &self,
+            channel_id: &str,
+            message_id: &str,
+            emoji: &str,
+        ) -> anyhow::Result<()> {
+            self.reactions_added.lock().await.push((
+                channel_id.to_string(),
+                message_id.to_string(),
+                emoji.to_string(),
+            ));
+            Ok(())
+        }
+
+        async fn remove_reaction(
+            &self,
+            channel_id: &str,
+            message_id: &str,
+            emoji: &str,
+        ) -> anyhow::Result<()> {
+            self.reactions_removed.lock().await.push((
+                channel_id.to_string(),
+                message_id.to_string(),
+                emoji.to_string(),
+            ));
             Ok(())
         }
     }
@@ -4434,6 +4489,73 @@ BTC is currently around $65,000 based on latest tool output."#
         let stops = channel_impl.stop_typing_calls.load(Ordering::SeqCst);
         assert_eq!(starts, 1, "start_typing should be called once");
         assert_eq!(stops, 1, "stop_typing should be called once");
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_adds_and_swaps_reactions() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(SlowProvider {
+                delay: Duration::from_millis(5),
+            }),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            multimodal: crate::config::MultimodalConfig::default(),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "react-msg".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-react".to_string(),
+                content: "hello".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+        )
+        .await;
+
+        let added = channel_impl.reactions_added.lock().await;
+        assert!(
+            added.len() >= 2,
+            "expected at least 2 reactions added (\u{1F440} then \u{2705}), got {}",
+            added.len()
+        );
+        assert_eq!(added[0].2, "\u{1F440}", "first reaction should be eyes");
+        assert_eq!(
+            added.last().unwrap().2,
+            "\u{2705}",
+            "last reaction should be checkmark"
+        );
+
+        let removed = channel_impl.reactions_removed.lock().await;
+        assert_eq!(removed.len(), 1, "eyes reaction should be removed once");
+        assert_eq!(removed[0].2, "\u{1F440}");
     }
 
     #[test]
