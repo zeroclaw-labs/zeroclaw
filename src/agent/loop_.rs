@@ -691,6 +691,7 @@ async fn try_streaming_response(
     let options = StreamOptions::new(true);
     let mut stream = provider.stream_chat(request, model, temperature, options);
 
+    const MAX_BUFFER_SIZE: usize = 1024 * 1024; // 1MB max buffer
     let mut buffer = String::new();
     let tx = on_delta.unwrap();
 
@@ -701,6 +702,14 @@ async fn try_streaming_response(
                 if chunk.is_final {
                     if !chunk.delta.is_empty() {
                         buffer.push_str(&chunk.delta);
+
+                        // Prevent buffer overflow - limit accumulated response size
+                        if buffer.len() > MAX_BUFFER_SIZE {
+                            tracing::warn!(
+                                "Streaming buffer exceeded limit, falling back to non-streaming"
+                            );
+                            return None;
+                        }
                         let _ = tx.send(chunk.delta).await;
                     }
                     break;
