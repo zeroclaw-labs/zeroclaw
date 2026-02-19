@@ -838,7 +838,7 @@ async fn process_channel_message(
     append_sender_turn(
         ctx.as_ref(),
         &history_key,
-        ChatMessage::user(&enriched_message),
+        ChatMessage::user(&msg.content),
     );
 
     // Build history from per-sender conversation cache.
