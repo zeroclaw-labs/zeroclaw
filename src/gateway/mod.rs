@@ -2089,4 +2089,52 @@ mod tests {
             &signature_header
         ));
     }
+
+    // ══════════════════════════════════════════════════════════
+    // IdempotencyStore Edge-Case Tests
+    // ══════════════════════════════════════════════════════════
+
+    #[test]
+    fn idempotency_store_allows_different_keys() {
+        let store = IdempotencyStore::new(Duration::from_secs(60), 100);
+        assert!(store.record_if_new("key-a"));
+        assert!(store.record_if_new("key-b"));
+        assert!(store.record_if_new("key-c"));
+        assert!(store.record_if_new("key-d"));
+    }
+
+    #[test]
+    fn idempotency_store_max_keys_clamped_to_one() {
+        let store = IdempotencyStore::new(Duration::from_secs(60), 0);
+        assert!(store.record_if_new("only-key"));
+        assert!(!store.record_if_new("only-key"));
+    }
+
+    #[test]
+    fn idempotency_store_rapid_duplicate_rejected() {
+        let store = IdempotencyStore::new(Duration::from_secs(300), 100);
+        assert!(store.record_if_new("rapid"));
+        assert!(!store.record_if_new("rapid"));
+    }
+
+    #[test]
+    fn idempotency_store_accepts_after_ttl_expires() {
+        let store = IdempotencyStore::new(Duration::from_millis(1), 100);
+        assert!(store.record_if_new("ttl-key"));
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(store.record_if_new("ttl-key"));
+    }
+
+    #[test]
+    fn idempotency_store_eviction_preserves_newest() {
+        let store = IdempotencyStore::new(Duration::from_secs(300), 1);
+        assert!(store.record_if_new("old-key"));
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(store.record_if_new("new-key"));
+
+        let keys = store.keys.lock();
+        assert_eq!(keys.len(), 1);
+        assert!(!keys.contains_key("old-key"));
+        assert!(keys.contains_key("new-key"));
+    }
 }

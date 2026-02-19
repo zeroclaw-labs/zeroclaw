@@ -3373,14 +3373,16 @@ async fn sync_directory(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> Result<()> {
+async fn sync_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs::Permissions, os::unix::fs::PermissionsExt, path::PathBuf};
+    #[cfg(unix)]
+    use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+    use std::path::PathBuf;
     use tokio::sync::{Mutex, MutexGuard};
     use tokio::test;
     use tokio_stream::wrappers::ReadDirStream;
