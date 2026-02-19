@@ -229,6 +229,7 @@ impl GeminiProvider {
         let auth = Self::normalize_non_empty(access_token).map(GeminiAuth::OAuthToken);
         Self {
             auth,
+            antigravity_project_id: None,
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
                 .connect_timeout(std::time::Duration::from_secs(10))
