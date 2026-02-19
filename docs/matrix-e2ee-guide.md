@@ -109,8 +109,16 @@ curl -sS -H "Authorization: Bearer $MATRIX_TOKEN" \
 - The bot device must receive room keys from trusted devices.
 - If keys are not shared to this device, encrypted events cannot be decrypted.
 - Verify device trust and key sharing in your Matrix client/admin workflow.
+- If logs show `matrix_sdk_crypto::backups: Trying to backup room keys but no backup key was found`, key backup recovery is not enabled on this device yet. This warning is usually non-fatal for live message flow, but you should still complete key backup/recovery setup.
+- If recipients see bot messages as "unverified", verify/sign the bot device from a trusted Matrix session and keep `channels_config.matrix.device_id` stable across restarts.
 
-### E. Fresh start test
+### E. Message formatting (Markdown)
+
+- ZeroClaw sends Matrix text replies as markdown-capable `m.room.message` text content.
+- Matrix clients that support `formatted_body` should render emphasis, lists, and code blocks.
+- If formatting appears as plain text, check client capability first, then confirm ZeroClaw is running a build that includes markdown-enabled Matrix output.
+
+### F. Fresh start test
 
 After updating config, restart daemon and send a new message (not just old timeline history).
 

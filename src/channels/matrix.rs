@@ -438,6 +438,40 @@ impl MatrixChannel {
         })
         .to_string()
     }
+
+    async fn log_e2ee_diagnostics(&self, client: &MatrixSdkClient) {
+        match client.encryption().get_own_device().await {
+            Ok(Some(device)) => {
+                if device.is_verified() {
+                    tracing::info!(
+                        "Matrix device '{}' is verified for E2EE.",
+                        device.device_id()
+                    );
+                } else {
+                    tracing::warn!(
+                        "Matrix device '{}' is not verified. Some clients may label bot messages as unverified until you sign/verify this device from a trusted session.",
+                        device.device_id()
+                    );
+                }
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    "Matrix own-device metadata is unavailable; verify/signing status cannot be determined."
+                );
+            }
+            Err(error) => {
+                tracing::warn!("Matrix own-device verification check failed: {error}");
+            }
+        }
+
+        if client.encryption().backups().are_enabled().await {
+            tracing::info!("Matrix room-key backup is enabled for this device.");
+        } else {
+            tracing::warn!(
+                "Matrix room-key backup is not enabled for this device; `matrix_sdk_crypto::backups` warnings about missing backup keys may appear until recovery is configured."
+            );
+        }
+    }
 }
 
 #[async_trait]
@@ -465,7 +499,7 @@ impl Channel for MatrixChannel {
             anyhow::bail!("Matrix room '{}' is not in joined state", target_room_id);
         }
 
-        room.send(RoomMessageEventContent::text_plain(&message.content))
+        room.send(RoomMessageEventContent::text_markdown(&message.content))
             .await?;
 
         Ok(())
@@ -490,6 +524,8 @@ impl Channel for MatrixChannel {
             }
         };
         let client = self.matrix_client().await?;
+
+        self.log_e2ee_diagnostics(&client).await;
 
         let _ = client.sync_once(SyncSettings::new()).await;
 
@@ -723,6 +759,20 @@ mod tests {
         assert!(MatrixChannel::has_non_empty_body("  hello  "));
         assert!(!MatrixChannel::has_non_empty_body(""));
         assert!(!MatrixChannel::has_non_empty_body("   \n\t  "));
+    }
+
+    #[test]
+    fn send_content_uses_markdown_formatting() {
+        let content = RoomMessageEventContent::text_markdown("**hello**");
+        let value = serde_json::to_value(content).unwrap();
+
+        assert_eq!(value["msgtype"], "m.text");
+        assert_eq!(value["body"], "**hello**");
+        assert_eq!(value["format"], "org.matrix.custom.html");
+        assert!(value["formatted_body"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("<strong>hello</strong>"));
     }
 
     #[test]

@@ -150,6 +150,10 @@ allowed_users = ["*"]
 
 See [Matrix E2EE Guide](./matrix-e2ee-guide.md) for encrypted-room troubleshooting.
 
+Notes:
+- Outbound Matrix replies are emitted as markdown-capable `m.room.message` text content so common clients can render lists, emphasis, and code blocks.
+- If you still see `matrix_sdk_crypto::backups` warnings, follow the backup/recovery section in the Matrix E2EE guide.
+
 ### 4.6 Signal
 
 ```toml
@@ -316,7 +320,7 @@ rg -n "Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|D
 | Discord | `Discord: connected and identified` | `Discord: ignoring message from unauthorized user:` | `Discord: received Reconnect (op 7)` / `Discord: received Invalid Session (op 9)` |
 | Slack | `Slack channel listening on #` | `Slack: ignoring message from unauthorized user:` | `Slack poll error:` / `Slack parse error:` |
 | Mattermost | `Mattermost channel listening on` | `Mattermost: ignoring message from unauthorized user:` | `Mattermost poll error:` / `Mattermost parse error:` |
-| Matrix | `Matrix channel listening on room` / `Matrix room ... is encrypted; E2EE decryption is enabled via matrix-sdk.` | `Matrix whoami failed; falling back to configured session hints for E2EE session restore:` / `Matrix whoami failed while resolving listener user_id; using configured user_id hint:` | `Matrix sync error: ... retrying...` |
+| Matrix | `Matrix channel listening on room` / `Matrix room ... is encrypted; E2EE decryption is enabled via matrix-sdk.` / `Matrix room-key backup is enabled for this device.` / `Matrix device '...' is verified for E2EE.` | `Matrix whoami failed; falling back to configured session hints for E2EE session restore:` / `Matrix whoami failed while resolving listener user_id; using configured user_id hint:` / `Matrix room-key backup is not enabled for this device...` / `Matrix device '...' is not verified...` | `Matrix sync error: ... retrying...` |
 | Signal | `Signal channel listening via SSE on` | (allowlist checks are enforced by `allowed_from`) | `Signal SSE returned ...` / `Signal SSE connect error:` |
 | WhatsApp (channel) | `WhatsApp channel active (webhook mode).` | `WhatsApp: ignoring message from unauthorized number:` | `WhatsApp send failed:` |
 | Webhook / WhatsApp (gateway) | `WhatsApp webhook verified successfully` | `Webhook: rejected — not paired / invalid bearer token` / `Webhook: rejected request — invalid or missing X-Webhook-Secret` / `WhatsApp webhook verification failed — token mismatch` | `Webhook JSON parse error:` |
@@ -336,4 +340,3 @@ If a specific channel task crashes or exits, the channel supervisor in `channels
 - `Channel message worker crashed:`
 
 These messages indicate automatic restart behavior is active, and you should inspect preceding logs for root cause.
-
