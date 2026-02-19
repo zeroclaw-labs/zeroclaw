@@ -412,7 +412,7 @@ impl TelegramChannel {
 
     async fn persist_allowed_identity(&self, identity: &str) -> anyhow::Result<()> {
         let mut config = Self::load_config_without_env().await?;
-        let Some(telegram) = config.channels_config.telegram.as_mut() else {
+        let Some(telegram) = config.channels_config.launchable.telegram.as_mut() else {
             anyhow::bail!(
                 "Missing [channels.telegram] section in config.toml. \
                 Add bot_token and allowed_users under [channels.telegram], \

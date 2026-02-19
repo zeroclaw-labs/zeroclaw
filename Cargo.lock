@@ -7107,7 +7107,7 @@ checksum = "24d643ce3fd3e5b54854602a080f34fb10ab75e0b813ee32d00ca2b44fa74762"
 dependencies = [
  "either",
  "env_home",
- "rustix 1.1.3",
+ "rustix",
  "winsafe",
 ]
 

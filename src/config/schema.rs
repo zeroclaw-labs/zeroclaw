@@ -1,3 +1,4 @@
+use crate::config::traits::ChannelConfig;
 use crate::providers::{is_glm_alias, is_zai_alias};
 use crate::security::AutonomyLevel;
 use anyhow::{Context, Result};
@@ -2231,6 +2232,36 @@ pub struct CustomTunnelConfig {
 pub struct ChannelsConfig {
     /// Enable the CLI interactive channel. Default: `true`.
     pub cli: bool,
+    /// Webhook channel configuration.
+    pub webhook: Option<WebhookConfig>,
+    #[serde(flatten)]
+    pub launchable: LaunchableChannelsConfig,
+    /// Base timeout in seconds for processing a single channel message (LLM + tools).
+    /// Runtime uses this as a per-turn budget that scales with tool-loop depth
+    /// (up to 4x, capped) so one slow/retried model call does not consume the
+    /// entire conversation budget.
+    /// Default: 300s for on-device LLMs (Ollama) which are slower than cloud APIs.
+    #[serde(default = "default_channel_message_timeout_secs")]
+    pub message_timeout_secs: u64,
+}
+
+fn default_channel_message_timeout_secs() -> u64 {
+    300
+}
+
+impl Default for ChannelsConfig {
+    fn default() -> Self {
+        Self {
+            cli: true,
+            webhook: None,
+            launchable: Default::default(),
+            message_timeout_secs: default_channel_message_timeout_secs(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LaunchableChannelsConfig {
     /// Telegram bot channel configuration.
     pub telegram: Option<TelegramConfig>,
     /// Discord bot channel configuration.
@@ -2239,8 +2270,6 @@ pub struct ChannelsConfig {
     pub slack: Option<SlackConfig>,
     /// Mattermost bot channel configuration.
     pub mattermost: Option<MattermostConfig>,
-    /// Webhook channel configuration.
-    pub webhook: Option<WebhookConfig>,
     /// iMessage channel configuration (macOS only).
     pub imessage: Option<IMessageConfig>,
     /// Matrix channel configuration.
@@ -2263,42 +2292,6 @@ pub struct ChannelsConfig {
     pub dingtalk: Option<DingTalkConfig>,
     /// QQ Official Bot channel configuration.
     pub qq: Option<QQConfig>,
-    /// Base timeout in seconds for processing a single channel message (LLM + tools).
-    /// Runtime uses this as a per-turn budget that scales with tool-loop depth
-    /// (up to 4x, capped) so one slow/retried model call does not consume the
-    /// entire conversation budget.
-    /// Default: 300s for on-device LLMs (Ollama) which are slower than cloud APIs.
-    #[serde(default = "default_channel_message_timeout_secs")]
-    pub message_timeout_secs: u64,
-}
-
-fn default_channel_message_timeout_secs() -> u64 {
-    300
-}
-
-impl Default for ChannelsConfig {
-    fn default() -> Self {
-        Self {
-            cli: true,
-            telegram: None,
-            discord: None,
-            slack: None,
-            mattermost: None,
-            webhook: None,
-            imessage: None,
-            matrix: None,
-            signal: None,
-            whatsapp: None,
-            linq: None,
-            nextcloud_talk: None,
-            email: None,
-            irc: None,
-            lark: None,
-            dingtalk: None,
-            qq: None,
-            message_timeout_secs: default_channel_message_timeout_secs(),
-        }
-    }
 }
 
 /// Streaming mode for channels that support progressive message updates.
@@ -2339,6 +2332,16 @@ pub struct TelegramConfig {
     pub mention_only: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+impl ChannelConfig for TelegramConfig {
+    fn name() -> &'static str {
+        "Telegram"
+    }
+    fn desc() -> &'static str {
+        "connect your bot"
+    }
+}
+
 /// Discord bot channel configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DiscordConfig {
@@ -2359,6 +2362,15 @@ pub struct DiscordConfig {
     pub mention_only: bool,
 }
 
+impl ChannelConfig for DiscordConfig {
+    fn name() -> &'static str {
+        "Discord"
+    }
+    fn desc() -> &'static str {
+        "connect your bot"
+    }
+}
+
 /// Slack bot channel configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SlackConfig {
@@ -2371,6 +2383,15 @@ pub struct SlackConfig {
     /// Allowed Slack user IDs. Empty = deny all.
     #[serde(default)]
     pub allowed_users: Vec<String>,
+}
+
+impl ChannelConfig for SlackConfig {
+    fn name() -> &'static str {
+        "Slack"
+    }
+    fn desc() -> &'static str {
+        "connect your bot"
+    }
 }
 
 /// Mattermost bot channel configuration.
@@ -2395,6 +2416,15 @@ pub struct MattermostConfig {
     pub mention_only: Option<bool>,
 }
 
+impl ChannelConfig for MattermostConfig {
+    fn name() -> &'static str {
+        "Mattermost"
+    }
+    fn desc() -> &'static str {
+        "connect to your bot"
+    }
+}
+
 /// Webhook channel configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WebhookConfig {
@@ -2404,11 +2434,29 @@ pub struct WebhookConfig {
     pub secret: Option<String>,
 }
 
+impl ChannelConfig for WebhookConfig {
+    fn name() -> &'static str {
+        "Webhook"
+    }
+    fn desc() -> &'static str {
+        "HTTP endpoint"
+    }
+}
+
 /// iMessage channel configuration (macOS only).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct IMessageConfig {
     /// Allowed iMessage contacts (phone numbers or email addresses). Empty = deny all.
     pub allowed_contacts: Vec<String>,
+}
+
+impl ChannelConfig for IMessageConfig {
+    fn name() -> &'static str {
+        "iMessage"
+    }
+    fn desc() -> &'static str {
+        "macOS only"
+    }
 }
 
 /// Matrix channel configuration.
@@ -2428,6 +2476,15 @@ pub struct MatrixConfig {
     pub room_id: String,
     /// Allowed Matrix user IDs. Empty = deny all.
     pub allowed_users: Vec<String>,
+}
+
+impl ChannelConfig for MatrixConfig {
+    fn name() -> &'static str {
+        "Matrix"
+    }
+    fn desc() -> &'static str {
+        "self-hosted chat"
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -2451,6 +2508,15 @@ pub struct SignalConfig {
     /// Skip incoming story messages.
     #[serde(default)]
     pub ignore_stories: bool,
+}
+
+impl ChannelConfig for SignalConfig {
+    fn name() -> &'static str {
+        "Signal"
+    }
+    fn desc() -> &'static str {
+        "An open-source, encrypted messaging service"
+    }
 }
 
 /// WhatsApp channel configuration (Cloud API or Web mode).
@@ -2491,6 +2557,15 @@ pub struct WhatsAppConfig {
     pub allowed_numbers: Vec<String>,
 }
 
+impl ChannelConfig for WhatsAppConfig {
+    fn name() -> &'static str {
+        "WhatsApp"
+    }
+    fn desc() -> &'static str {
+        "Business Cloud API"
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LinqConfig {
     /// Linq Partner API token (Bearer auth)
@@ -2503,6 +2578,15 @@ pub struct LinqConfig {
     /// Allowed sender handles (phone numbers) or "*" for all
     #[serde(default)]
     pub allowed_senders: Vec<String>,
+}
+
+impl ChannelConfig for LinqConfig {
+    fn name() -> &'static str {
+        "Linq"
+    }
+    fn desc() -> &'static str {
+        "iMessage/RCS/SMS via Linq API"
+    }
 }
 
 /// Nextcloud Talk bot configuration (webhook receive + OCS send API).
@@ -2555,7 +2639,7 @@ impl WhatsAppConfig {
 }
 
 /// IRC channel configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IrcConfig {
     /// IRC server hostname
     pub server: String,
@@ -2580,6 +2664,15 @@ pub struct IrcConfig {
     pub sasl_password: Option<String>,
     /// Verify TLS certificate (default: true)
     pub verify_tls: Option<bool>,
+}
+
+impl ChannelConfig for IrcConfig {
+    fn name() -> &'static str {
+        "IRC"
+    }
+    fn desc() -> &'static str {
+        "IRC over TLS"
+    }
 }
 
 fn default_irc_port() -> u16 {
@@ -2625,6 +2718,15 @@ pub struct LarkConfig {
     /// Not required (and ignored) for websocket mode.
     #[serde(default)]
     pub port: Option<u16>,
+}
+
+impl ChannelConfig for LarkConfig {
+    fn name() -> &'static str {
+        "Lark/Feishu"
+    }
+    fn desc() -> &'static str {
+        "Lark/Feishu Bot"
+    }
 }
 
 // ── Security Config ─────────────────────────────────────────────────
@@ -2792,6 +2894,15 @@ pub struct DingTalkConfig {
     pub allowed_users: Vec<String>,
 }
 
+impl ChannelConfig for DingTalkConfig {
+    fn name() -> &'static str {
+        "DingTalk"
+    }
+    fn desc() -> &'static str {
+        "DingTalk Stream Mode"
+    }
+}
+
 /// QQ Official Bot configuration (Tencent QQ Bot SDK)
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct QQConfig {
@@ -2802,6 +2913,15 @@ pub struct QQConfig {
     /// Allowed user IDs. Empty = deny all, "*" = allow all
     #[serde(default)]
     pub allowed_users: Vec<String>,
+}
+
+impl ChannelConfig for QQConfig {
+    fn name() -> &'static str {
+        "QQ Official"
+    }
+    fn desc() -> &'static str {
+        "Tencent QQ Bot"
+    }
 }
 
 // ── Config impl ──────────────────────────────────────────────────
@@ -3734,11 +3854,144 @@ async fn sync_directory(path: &Path) -> Result<()> {
             .with_context(|| format!("Failed to fsync directory metadata: {}", path.display()))?;
         return Ok(());
     }
-
     #[cfg(not(unix))]
     {
         let _ = path;
         Ok(())
+    }
+}
+
+fn push_channel_name_if<T: ChannelConfig>(vector: &mut Vec<&'static str>, v: &Option<T>) {
+    if v.is_some() {
+        vector.push(T::name());
+    }
+}
+
+fn channel_identifier<T: ChannelConfig>(v: &Option<T>) -> (&'static str, bool) {
+    (T::name(), v.is_some())
+}
+
+impl ChannelsConfig {
+    pub fn channel_identifiers(&self) -> [(&'static str, bool); 16] {
+        let mut ret = [channel_identifier(&self.webhook); _];
+        (&mut ret[1..]).copy_from_slice(&self.launchable.channel_identifiers());
+        ret
+    }
+}
+
+impl LaunchableChannelsConfig {
+    pub fn has_any(&self) -> bool {
+        let LaunchableChannelsConfig {
+            telegram,
+            discord,
+            slack,
+            mattermost,
+            imessage,
+            matrix,
+            signal,
+            whatsapp,
+            linq,
+            email,
+            irc,
+            lark,
+            dingtalk,
+            qq,
+            nextcloud_talk,
+        } = &self;
+
+        telegram.is_some()
+            || discord.is_some()
+            || slack.is_some()
+            || mattermost.is_some()
+            || imessage.is_some()
+            || matrix.is_some()
+            || signal.is_some()
+            || whatsapp.is_some()
+            || linq.is_some()
+            || email.is_some()
+            || irc.is_some()
+            || lark.is_some()
+            || dingtalk.is_some()
+            || qq.is_some()
+            || nextcloud_talk.is_some()
+    }
+
+    pub fn channels(&self) -> Vec<&'static str> {
+        let Self {
+            telegram,
+            discord,
+            slack,
+            mattermost,
+            imessage,
+            matrix,
+            signal,
+            whatsapp,
+            linq,
+            email,
+            irc,
+            lark,
+            dingtalk,
+            qq,
+            nextcloud_talk
+        } = &self;
+
+        let mut ret = Vec::new();
+
+        push_channel_name_if(&mut ret, telegram);
+        push_channel_name_if(&mut ret, discord);
+        push_channel_name_if(&mut ret, slack);
+        push_channel_name_if(&mut ret, mattermost);
+        push_channel_name_if(&mut ret, imessage);
+        push_channel_name_if(&mut ret, matrix);
+        push_channel_name_if(&mut ret, signal);
+        push_channel_name_if(&mut ret, whatsapp);
+        push_channel_name_if(&mut ret, linq);
+        push_channel_name_if(&mut ret, email);
+        push_channel_name_if(&mut ret, irc);
+        push_channel_name_if(&mut ret, lark);
+        push_channel_name_if(&mut ret, dingtalk);
+        push_channel_name_if(&mut ret, qq);
+        push_channel_name_if(&mut ret, nextcloud_talk);
+
+        ret
+    }
+
+    pub fn channel_identifiers(&self) -> [(&'static str, bool); 15] {
+        let Self {
+            telegram,
+            discord,
+            slack,
+            mattermost,
+            imessage,
+            matrix,
+            signal,
+            whatsapp,
+            linq,
+            email,
+            irc,
+            lark,
+            dingtalk,
+            qq,
+            nextcloud_talk
+        } = &self;
+
+        [
+            channel_identifier(telegram),
+            channel_identifier(discord),
+            channel_identifier(slack),
+            channel_identifier(mattermost),
+            channel_identifier(imessage),
+            channel_identifier(matrix),
+            channel_identifier(signal),
+            channel_identifier(whatsapp),
+            channel_identifier(linq),
+            channel_identifier(email),
+            channel_identifier(irc),
+            channel_identifier(lark),
+            channel_identifier(dingtalk),
+            channel_identifier(qq),
+            channel_identifier(nextcloud_talk),
+        ]
     }
 }
 
@@ -3909,8 +4162,8 @@ default_temperature = 0.7
     async fn channels_config_default() {
         let c = ChannelsConfig::default();
         assert!(c.cli);
-        assert!(c.telegram.is_none());
-        assert!(c.discord.is_none());
+        assert!(c.launchable.telegram.is_none());
+        assert!(c.launchable.discord.is_none());
     }
 
     // ── Serde round-trip ─────────────────────────────────────
@@ -3958,29 +4211,17 @@ default_temperature = 0.7
             cron: CronConfig::default(),
             channels_config: ChannelsConfig {
                 cli: true,
-                telegram: Some(TelegramConfig {
-                    bot_token: "123:ABC".into(),
-                    allowed_users: vec!["user1".into()],
-                    stream_mode: StreamMode::default(),
-                    draft_update_interval_ms: default_draft_update_interval_ms(),
-                    interrupt_on_new_message: false,
-                    mention_only: false,
-                }),
-                discord: None,
-                slack: None,
-                mattermost: None,
                 webhook: None,
-                imessage: None,
-                matrix: None,
-                signal: None,
-                whatsapp: None,
-                linq: None,
-                nextcloud_talk: None,
-                email: None,
-                irc: None,
-                lark: None,
-                dingtalk: None,
-                qq: None,
+                launchable: LaunchableChannelsConfig {
+                    telegram: Some(TelegramConfig {
+                        bot_token: "123:ABC".into(),
+                        allowed_users: vec!["user1".into()],
+                        stream_mode: StreamMode::default(),
+                        draft_update_interval_ms: default_draft_update_interval_ms(),
+                        mention_only: false,
+                    }),
+                    ..Default::default()
+                },
                 message_timeout_secs: 300,
             },
             memory: MemoryConfig::default(),
@@ -4015,9 +4256,14 @@ default_temperature = 0.7
         assert_eq!(parsed.runtime.kind, "docker");
         assert!(parsed.heartbeat.enabled);
         assert_eq!(parsed.heartbeat.interval_minutes, 15);
-        assert!(parsed.channels_config.telegram.is_some());
+        assert!(parsed.channels_config.launchable.telegram.is_some());
         assert_eq!(
-            parsed.channels_config.telegram.unwrap().bot_token,
+            parsed
+                .channels_config
+                .launchable
+                .telegram
+                .unwrap()
+                .bot_token,
             "123:ABC"
         );
     }
@@ -4500,46 +4746,42 @@ allowed_users = ["@ops:matrix.org"]
     async fn channels_config_with_imessage_and_matrix() {
         let c = ChannelsConfig {
             cli: true,
-            telegram: None,
-            discord: None,
-            slack: None,
-            mattermost: None,
             webhook: None,
-            imessage: Some(IMessageConfig {
-                allowed_contacts: vec!["+1".into()],
-            }),
-            matrix: Some(MatrixConfig {
-                homeserver: "https://m.org".into(),
-                access_token: "tok".into(),
-                user_id: None,
-                device_id: None,
-                room_id: "!r:m".into(),
-                allowed_users: vec!["@u:m".into()],
-            }),
-            signal: None,
-            whatsapp: None,
-            linq: None,
-            nextcloud_talk: None,
-            email: None,
-            irc: None,
-            lark: None,
-            dingtalk: None,
-            qq: None,
+            launchable: LaunchableChannelsConfig {
+                imessage: Some(IMessageConfig {
+                    allowed_contacts: vec!["+1".into()],
+                }),
+                matrix: Some(MatrixConfig {
+                    homeserver: "https://m.org".into(),
+                    access_token: "tok".into(),
+                    user_id: None,
+                    device_id: None,
+                    room_id: "!r:m".into(),
+                    allowed_users: vec!["@u:m".into()],
+                }),
+                ..Default::default()
+            },
             message_timeout_secs: 300,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
-        assert!(parsed.imessage.is_some());
-        assert!(parsed.matrix.is_some());
-        assert_eq!(parsed.imessage.unwrap().allowed_contacts, vec!["+1"]);
-        assert_eq!(parsed.matrix.unwrap().homeserver, "https://m.org");
+        assert!(parsed.launchable.imessage.is_some());
+        assert!(parsed.launchable.matrix.is_some());
+        assert_eq!(
+            parsed.launchable.imessage.unwrap().allowed_contacts,
+            vec!["+1"]
+        );
+        assert_eq!(
+            parsed.launchable.matrix.unwrap().homeserver,
+            "https://m.org"
+        );
     }
 
     #[test]
     async fn channels_config_default_has_no_imessage_matrix() {
         let c = ChannelsConfig::default();
-        assert!(c.imessage.is_none());
-        assert!(c.matrix.is_none());
+        assert!(c.launchable.imessage.is_none());
+        assert!(c.launchable.matrix.is_none());
     }
 
     // ── Edge cases: serde(default) for allowed_users ─────────
@@ -4710,45 +4952,31 @@ channel_id = "C123"
     async fn channels_config_with_whatsapp() {
         let c = ChannelsConfig {
             cli: true,
-            telegram: None,
-            discord: None,
-            slack: None,
-            mattermost: None,
             webhook: None,
-            imessage: None,
-            matrix: None,
-            signal: None,
-            whatsapp: Some(WhatsAppConfig {
-                access_token: Some("tok".into()),
-                phone_number_id: Some("123".into()),
-                verify_token: Some("ver".into()),
-                app_secret: None,
-                session_path: None,
-                pair_phone: None,
-                pair_code: None,
-                allowed_numbers: vec!["+1".into()],
-            }),
-            linq: None,
-            nextcloud_talk: None,
-            email: None,
-            irc: None,
-            lark: None,
-            dingtalk: None,
-            qq: None,
+            launchable: LaunchableChannelsConfig {
+                whatsapp: Some(WhatsAppConfig {
+                    access_token: "tok".into(),
+                    phone_number_id: "123".into(),
+                    verify_token: "ver".into(),
+                    app_secret: None,
+                    allowed_numbers: vec!["+1".into()],
+                }),
+                ..Default::default()
+            },
             message_timeout_secs: 300,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
-        assert!(parsed.whatsapp.is_some());
-        let wa = parsed.whatsapp.unwrap();
-        assert_eq!(wa.phone_number_id, Some("123".into()));
+        assert!(parsed.launchable.whatsapp.is_some());
+        let wa = parsed.launchable.whatsapp.unwrap();
+        assert_eq!(wa.phone_number_id, "123");
         assert_eq!(wa.allowed_numbers, vec!["+1"]);
     }
 
     #[test]
     async fn channels_config_default_has_no_whatsapp() {
         let c = ChannelsConfig::default();
-        assert!(c.whatsapp.is_none());
+        assert!(c.launchable.whatsapp.is_none());
     }
 
     #[test]

@@ -14,6 +14,9 @@
 //! To add a new channel, implement [`Channel`] in a new submodule and wire it into
 //! [`start_channels`]. See `AGENTS.md` §7.2 for the full change playbook.
 
+// (possibly) TODO: provide method to convert a XXXConfig into XXXChannel
+// to simplify new channels added while still avoiding emission
+
 pub mod cli;
 pub mod dingtalk;
 pub mod discord;
@@ -61,7 +64,7 @@ pub use whatsapp::WhatsAppChannel;
 pub use whatsapp_web::WhatsAppWebChannel;
 
 use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
-use crate::config::Config;
+use crate::config::{Config, LaunchableChannelsConfig};
 use crate::identity;
 use crate::memory::{self, Memory};
 use crate::observability::{self, Observer};
@@ -2038,7 +2041,7 @@ async fn bind_telegram_identity(config: &Config, identity: &str) -> Result<()> {
     }
 
     let mut updated = config.clone();
-    let Some(telegram) = updated.channels_config.telegram.as_mut() else {
+    let Some(telegram) = updated.channels_config.launchable.telegram.as_mut() else {
         anyhow::bail!(
             "Telegram channel is not configured. Run `zeroclaw onboard --channels-only` first"
         );
@@ -2189,33 +2192,7 @@ pub async fn handle_command(command: crate::ChannelCommands, config: &Config) ->
         crate::ChannelCommands::List => {
             println!("Channels:");
             println!("  ✅ CLI (always available)");
-            for (name, configured) in [
-                ("Telegram", config.channels_config.telegram.is_some()),
-                ("Discord", config.channels_config.discord.is_some()),
-                ("Slack", config.channels_config.slack.is_some()),
-                ("Mattermost", config.channels_config.mattermost.is_some()),
-                ("Webhook", config.channels_config.webhook.is_some()),
-                ("iMessage", config.channels_config.imessage.is_some()),
-                (
-                    "Matrix",
-                    cfg!(feature = "channel-matrix") && config.channels_config.matrix.is_some(),
-                ),
-                ("Signal", config.channels_config.signal.is_some()),
-                ("WhatsApp", config.channels_config.whatsapp.is_some()),
-                ("Linq", config.channels_config.linq.is_some()),
-                (
-                    "Nextcloud Talk",
-                    config.channels_config.nextcloud_talk.is_some(),
-                ),
-                ("Email", config.channels_config.email.is_some()),
-                ("IRC", config.channels_config.irc.is_some()),
-                (
-                    "Lark",
-                    cfg!(feature = "channel-lark") && config.channels_config.lark.is_some(),
-                ),
-                ("DingTalk", config.channels_config.dingtalk.is_some()),
-                ("QQ", config.channels_config.qq.is_some()),
-            ] {
+            for (name, configured) in config.channels_config.channel_identifiers() {
                 println!("  {} {name}", if configured { "✅" } else { "❌" });
             }
             if !cfg!(feature = "channel-matrix") {
@@ -2271,7 +2248,25 @@ fn classify_health_result(
 pub async fn doctor_channels(config: Config) -> Result<()> {
     let mut channels: Vec<(&'static str, Arc<dyn Channel>)> = Vec::new();
 
-    if let Some(ref tg) = config.channels_config.telegram {
+    // TODO: add doctor for mattermost
+    let LaunchableChannelsConfig {
+        telegram,
+        discord,
+        slack,
+        mattermost: _,
+        imessage,
+        matrix,
+        signal,
+        whatsapp,
+        linq,
+        email,
+        irc,
+        lark,
+        dingtalk,
+        qq,
+    } = &config.channels_config.launchable;
+
+    if let Some(ref tg) = telegram {
         channels.push((
             "Telegram",
             Arc::new(
@@ -2285,7 +2280,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         ));
     }
 
-    if let Some(ref dc) = config.channels_config.discord {
+    if let Some(ref dc) = discord {
         channels.push((
             "Discord",
             Arc::new(DiscordChannel::new(
@@ -2298,7 +2293,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         ));
     }
 
-    if let Some(ref sl) = config.channels_config.slack {
+    if let Some(ref sl) = slack {
         channels.push((
             "Slack",
             Arc::new(SlackChannel::new(
@@ -2309,7 +2304,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         ));
     }
 
-    if let Some(ref im) = config.channels_config.imessage {
+    if let Some(ref im) = imessage {
         channels.push((
             "iMessage",
             Arc::new(IMessageChannel::new(im.allowed_contacts.clone())),
@@ -2317,7 +2312,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     }
 
     #[cfg(feature = "channel-matrix")]
-    if let Some(ref mx) = config.channels_config.matrix {
+    if let Some(ref mx) = matrix {
         channels.push((
             "Matrix",
             Arc::new(MatrixChannel::new_with_session_hint(
@@ -2332,7 +2327,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     }
 
     #[cfg(not(feature = "channel-matrix"))]
-    if config.channels_config.matrix.is_some() {
+    if matrix.is_some() {
         tracing::warn!(
             "Matrix channel is configured but this build was compiled without `channel-matrix`; skipping Matrix health check."
         );
@@ -2352,7 +2347,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         ));
     }
 
-    if let Some(ref wa) = config.channels_config.whatsapp {
+    if let Some(ref wa) = whatsapp {
         if wa.is_ambiguous_config() {
             tracing::warn!(
                 "WhatsApp config has both phone_number_id and session_path set; preferring Cloud API mode. Remove one selector to avoid ambiguity."
@@ -2403,7 +2398,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         }
     }
 
-    if let Some(ref lq) = config.channels_config.linq {
+    if let Some(ref lq) = linq {
         channels.push((
             "Linq",
             Arc::new(LinqChannel::new(
@@ -2425,11 +2420,11 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         ));
     }
 
-    if let Some(ref email_cfg) = config.channels_config.email {
+    if let Some(ref email_cfg) = email {
         channels.push(("Email", Arc::new(EmailChannel::new(email_cfg.clone()))));
     }
 
-    if let Some(ref irc) = config.channels_config.irc {
+    if let Some(ref irc) = irc {
         channels.push((
             "IRC",
             Arc::new(IrcChannel::new(irc::IrcChannelConfig {
@@ -2448,18 +2443,18 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     }
 
     #[cfg(feature = "channel-lark")]
-    if let Some(ref lk) = config.channels_config.lark {
+    if let Some(ref lk) = lark {
         channels.push(("Lark", Arc::new(LarkChannel::from_config(lk))));
     }
 
     #[cfg(not(feature = "channel-lark"))]
-    if config.channels_config.lark.is_some() {
+    if lark.is_some() {
         tracing::warn!(
             "Lark channel is configured but this build was compiled without `channel-lark`; skipping Lark health check."
         );
     }
 
-    if let Some(ref dt) = config.channels_config.dingtalk {
+    if let Some(ref dt) = dingtalk {
         channels.push((
             "DingTalk",
             Arc::new(DingTalkChannel::new(
@@ -2470,7 +2465,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         ));
     }
 
-    if let Some(ref qq) = config.channels_config.qq {
+    if let Some(ref qq) = qq {
         channels.push((
             "QQ",
             Arc::new(QQChannel::new(
@@ -2695,7 +2690,24 @@ pub async fn start_channels(config: Config) -> Result<()> {
     // Collect active channels
     let mut channels: Vec<Arc<dyn Channel>> = Vec::new();
 
-    if let Some(ref tg) = config.channels_config.telegram {
+    let LaunchableChannelsConfig {
+        telegram,
+        discord,
+        slack,
+        mattermost,
+        imessage,
+        matrix,
+        signal,
+        whatsapp,
+        linq,
+        email,
+        irc,
+        lark,
+        dingtalk,
+        qq,
+    } = &config.channels_config.launchable;
+
+    if let Some(ref tg) = telegram {
         channels.push(Arc::new(
             TelegramChannel::new(
                 tg.bot_token.clone(),
@@ -2706,7 +2718,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         ));
     }
 
-    if let Some(ref dc) = config.channels_config.discord {
+    if let Some(ref dc) = discord {
         channels.push(Arc::new(DiscordChannel::new(
             dc.bot_token.clone(),
             dc.guild_id.clone(),
@@ -2716,7 +2728,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         )));
     }
 
-    if let Some(ref sl) = config.channels_config.slack {
+    if let Some(ref sl) = slack {
         channels.push(Arc::new(SlackChannel::new(
             sl.bot_token.clone(),
             sl.channel_id.clone(),
@@ -2724,7 +2736,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         )));
     }
 
-    if let Some(ref mm) = config.channels_config.mattermost {
+    if let Some(ref mm) = mattermost {
         channels.push(Arc::new(MattermostChannel::new(
             mm.url.clone(),
             mm.bot_token.clone(),
@@ -2735,12 +2747,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
         )));
     }
 
-    if let Some(ref im) = config.channels_config.imessage {
+    if let Some(ref im) = imessage {
         channels.push(Arc::new(IMessageChannel::new(im.allowed_contacts.clone())));
     }
 
     #[cfg(feature = "channel-matrix")]
-    if let Some(ref mx) = config.channels_config.matrix {
+    if let Some(ref mx) = matrix {
         channels.push(Arc::new(MatrixChannel::new_with_session_hint(
             mx.homeserver.clone(),
             mx.access_token.clone(),
@@ -2752,13 +2764,13 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
 
     #[cfg(not(feature = "channel-matrix"))]
-    if config.channels_config.matrix.is_some() {
+    if matrix.is_some() {
         tracing::warn!(
             "Matrix channel is configured but this build was compiled without `channel-matrix`; skipping Matrix runtime startup."
         );
     }
 
-    if let Some(ref sig) = config.channels_config.signal {
+    if let Some(ref sig) = signal {
         channels.push(Arc::new(SignalChannel::new(
             sig.http_url.clone(),
             sig.account.clone(),
@@ -2769,7 +2781,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         )));
     }
 
-    if let Some(ref wa) = config.channels_config.whatsapp {
+    if let Some(ref wa) = whatsapp {
         if wa.is_ambiguous_config() {
             tracing::warn!(
                 "WhatsApp config has both phone_number_id and session_path set; preferring Cloud API mode. Remove one selector to avoid ambiguity."
@@ -2814,7 +2826,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         }
     }
 
-    if let Some(ref lq) = config.channels_config.linq {
+    if let Some(ref lq) = linq {
         channels.push(Arc::new(LinqChannel::new(
             lq.api_token.clone(),
             lq.from_phone.clone(),
@@ -2822,7 +2834,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         )));
     }
 
-    if let Some(ref nc) = config.channels_config.nextcloud_talk {
+    if let Some(ref nc) = nextcloud_talk {
         channels.push(Arc::new(NextcloudTalkChannel::new(
             nc.base_url.clone(),
             nc.app_token.clone(),
@@ -2830,11 +2842,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
         )));
     }
 
-    if let Some(ref email_cfg) = config.channels_config.email {
+    if let Some(ref email_cfg) = email {
         channels.push(Arc::new(EmailChannel::new(email_cfg.clone())));
     }
 
-    if let Some(ref irc) = config.channels_config.irc {
+    if let Some(ref irc) = irc {
         channels.push(Arc::new(IrcChannel::new(irc::IrcChannelConfig {
             server: irc.server.clone(),
             port: irc.port,
@@ -2850,18 +2862,18 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
 
     #[cfg(feature = "channel-lark")]
-    if let Some(ref lk) = config.channels_config.lark {
+    if let Some(ref lk) = lark {
         channels.push(Arc::new(LarkChannel::from_config(lk)));
     }
 
     #[cfg(not(feature = "channel-lark"))]
-    if config.channels_config.lark.is_some() {
+    if lark.is_some() {
         tracing::warn!(
             "Lark channel is configured but this build was compiled without `channel-lark`; skipping Lark runtime startup."
         );
     }
 
-    if let Some(ref dt) = config.channels_config.dingtalk {
+    if let Some(ref dt) = dingtalk {
         channels.push(Arc::new(DingTalkChannel::new(
             dt.client_id.clone(),
             dt.client_secret.clone(),
@@ -2869,7 +2881,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         )));
     }
 
-    if let Some(ref qq) = config.channels_config.qq {
+    if let Some(ref qq) = qq {
         channels.push(Arc::new(QQChannel::new(
             qq.app_id.clone(),
             qq.app_secret.clone(),
