@@ -31,7 +31,6 @@ jobs:
               with:
                   distribution: temurin
                   java-version: "17"
-                  cache: gradle
 
             - name: Install mobile app dependencies
               run: npm ci
