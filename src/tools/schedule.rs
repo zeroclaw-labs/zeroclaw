@@ -368,14 +368,16 @@ mod tests {
     use crate::security::AutonomyLevel;
     use tempfile::TempDir;
 
-    fn test_setup() -> (TempDir, Config, Arc<SecurityPolicy>) {
+    async fn test_setup() -> (TempDir, Config, Arc<SecurityPolicy>) {
         let tmp = TempDir::new().unwrap();
         let config = Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        tokio::fs::create_dir_all(&config.workspace_dir)
+            .await
+            .unwrap();
         let security = Arc::new(SecurityPolicy::from_config(
             &config.autonomy,
             &config.workspace_dir,
@@ -383,9 +385,9 @@ mod tests {
         (tmp, config, security)
     }
 
-    #[test]
-    fn tool_name_and_schema() {
-        let (_tmp, config, security) = test_setup();
+    #[tokio::test]
+    async fn tool_name_and_schema() {
+        let (_tmp, config, security) = test_setup().await;
         let tool = ScheduleTool::new(security, config);
         assert_eq!(tool.name(), "schedule");
         let schema = tool.parameters_schema();
@@ -394,7 +396,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_empty() {
-        let (_tmp, config, security) = test_setup();
+        let (_tmp, config, security) = test_setup().await;
         let tool = ScheduleTool::new(security, config);
 
         let result = tool.execute(json!({"action": "list"})).await.unwrap();
@@ -404,7 +406,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_get_and_cancel_roundtrip() {
-        let (_tmp, config, security) = test_setup();
+        let (_tmp, config, security) = test_setup().await;
         let tool = ScheduleTool::new(security, config);
 
         let create = tool
@@ -440,7 +442,7 @@ mod tests {
 
     #[tokio::test]
     async fn once_and_pause_resume_aliases_work() {
-        let (_tmp, config, security) = test_setup();
+        let (_tmp, config, security) = test_setup().await;
         let tool = ScheduleTool::new(security, config);
 
         let once = tool
@@ -489,7 +491,9 @@ mod tests {
             },
             ..Config::default()
         };
-        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        tokio::fs::create_dir_all(&config.workspace_dir)
+            .await
+            .unwrap();
         let security = Arc::new(SecurityPolicy::from_config(
             &config.autonomy,
             &config.workspace_dir,
@@ -514,7 +518,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_action_returns_failure() {
-        let (_tmp, config, security) = test_setup();
+        let (_tmp, config, security) = test_setup().await;
         let tool = ScheduleTool::new(security, config);
 
         let result = tool.execute(json!({"action": "explode"})).await.unwrap();

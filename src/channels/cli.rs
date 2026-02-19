@@ -1,4 +1,4 @@
-use super::traits::{Channel, ChannelMessage};
+use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use tokio::io::{self, AsyncBufReadExt, BufReader};
 use uuid::Uuid;
@@ -18,8 +18,8 @@ impl Channel for CliChannel {
         "cli"
     }
 
-    async fn send(&self, message: &str, _recipient: &str) -> anyhow::Result<()> {
-        println!("{message}");
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        println!("{}", message.content);
         Ok(())
     }
 
@@ -47,6 +47,7 @@ impl Channel for CliChannel {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),
+                thread_ts: None,
             };
 
             if tx.send(msg).await.is_err() {
@@ -69,14 +70,28 @@ mod tests {
     #[tokio::test]
     async fn cli_channel_send_does_not_panic() {
         let ch = CliChannel::new();
-        let result = ch.send("hello", "user").await;
+        let result = ch
+            .send(&SendMessage {
+                content: "hello".into(),
+                recipient: "user".into(),
+                subject: None,
+                thread_ts: None,
+            })
+            .await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn cli_channel_send_empty_message() {
         let ch = CliChannel::new();
-        let result = ch.send("", "").await;
+        let result = ch
+            .send(&SendMessage {
+                content: String::new(),
+                recipient: String::new(),
+                subject: None,
+                thread_ts: None,
+            })
+            .await;
         assert!(result.is_ok());
     }
 
@@ -95,6 +110,7 @@ mod tests {
             content: "hello".into(),
             channel: "cli".into(),
             timestamp: 1_234_567_890,
+            thread_ts: None,
         };
         assert_eq!(msg.id, "test-id");
         assert_eq!(msg.sender, "user");
@@ -113,6 +129,7 @@ mod tests {
             content: "c".into(),
             channel: "ch".into(),
             timestamp: 0,
+            thread_ts: None,
         };
         let cloned = msg.clone();
         assert_eq!(cloned.id, msg.id);

@@ -1,4 +1,4 @@
-use super::traits::{Channel, ChannelMessage};
+use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
@@ -127,6 +127,12 @@ struct LarkMessage {
 /// If no binary frame (pong or event) is received within this window, reconnect.
 const WS_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Returns true when the WebSocket frame indicates live traffic that should
+/// refresh the heartbeat watchdog.
+fn should_refresh_last_recv(msg: &WsMsg) -> bool {
+    matches!(msg, WsMsg::Binary(_) | WsMsg::Ping(_) | WsMsg::Pong(_))
+}
+
 /// Lark/Feishu channel.
 ///
 /// Supports two receive modes (configured via `receive_mode` in config):
@@ -142,7 +148,6 @@ pub struct LarkChannel {
     use_feishu: bool,
     /// How to receive events: WebSocket long-connection or HTTP webhook.
     receive_mode: crate::config::schema::LarkReceiveMode,
-    client: reqwest::Client,
     /// Cached tenant access token
     tenant_token: Arc<RwLock<Option<String>>>,
     /// Dedup set: WS message_ids seen in last ~30 min to prevent double-dispatch
@@ -165,7 +170,6 @@ impl LarkChannel {
             allowed_users,
             use_feishu: true,
             receive_mode: crate::config::schema::LarkReceiveMode::default(),
-            client: reqwest::Client::new(),
             tenant_token: Arc::new(RwLock::new(None)),
             ws_seen_ids: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -183,6 +187,10 @@ impl LarkChannel {
         ch.use_feishu = config.use_feishu;
         ch.receive_mode = config.receive_mode.clone();
         ch
+    }
+
+    fn http_client(&self) -> reqwest::Client {
+        crate::config::build_runtime_proxy_client("channel.lark")
     }
 
     fn api_base(&self) -> &'static str {
@@ -212,7 +220,7 @@ impl LarkChannel {
     /// POST /callback/ws/endpoint → (wss_url, client_config)
     async fn get_ws_endpoint(&self) -> anyhow::Result<(String, WsClientConfig)> {
         let resp = self
-            .client
+            .http_client()
             .post(format!("{}/callback/ws/endpoint", self.ws_base()))
             .header("locale", if self.use_feishu { "zh" } else { "en" })
             .json(&serde_json::json!({
@@ -280,7 +288,7 @@ impl LarkChannel {
             payload: None,
         };
         if write
-            .send(WsMsg::Binary(initial_ping.encode_to_vec()))
+            .send(WsMsg::Binary(initial_ping.encode_to_vec().into()))
             .await
             .is_err()
         {
@@ -301,7 +309,7 @@ impl LarkChannel {
                         headers: vec![PbHeader { key: "type".into(), value: "ping".into() }],
                         payload: None,
                     };
-                    if write.send(WsMsg::Binary(ping.encode_to_vec())).await.is_err() {
+                    if write.send(WsMsg::Binary(ping.encode_to_vec().into())).await.is_err() {
                         tracing::warn!("Lark: ping failed, reconnecting");
                         break;
                     }
@@ -319,11 +327,20 @@ impl LarkChannel {
 
                 msg = read.next() => {
                     let raw = match msg {
-                        Some(Ok(WsMsg::Binary(b))) => { last_recv = Instant::now(); b }
-                        Some(Ok(WsMsg::Ping(d))) => { let _ = write.send(WsMsg::Pong(d)).await; continue; }
-                        Some(Ok(WsMsg::Close(_))) | None => { tracing::info!("Lark: WS closed — reconnecting"); break; }
+                        Some(Ok(ws_msg)) => {
+                            if should_refresh_last_recv(&ws_msg) {
+                                last_recv = Instant::now();
+                            }
+                            match ws_msg {
+                                WsMsg::Binary(b) => b,
+                                WsMsg::Ping(d) => { let _ = write.send(WsMsg::Pong(d)).await; continue; }
+                                WsMsg::Pong(_) => continue,
+                                WsMsg::Close(_) => { tracing::info!("Lark: WS closed — reconnecting"); break; }
+                                _ => continue,
+                            }
+                        }
+                        None => { tracing::info!("Lark: WS closed — reconnecting"); break; }
                         Some(Err(e)) => { tracing::error!("Lark: WS read error: {e}"); break; }
-                        _ => continue,
                     };
 
                     let frame = match PbFrame::decode(&raw[..]) {
@@ -361,7 +378,7 @@ impl LarkChannel {
                         let mut ack = frame.clone();
                         ack.payload = Some(br#"{"code":200,"headers":{},"data":[]}"#.to_vec());
                         ack.headers.push(PbHeader { key: "biz_rt".into(), value: "0".into() });
-                        let _ = write.send(WsMsg::Binary(ack.encode_to_vec())).await;
+                        let _ = write.send(WsMsg::Binary(ack.encode_to_vec().into())).await;
                     }
 
                     // Fragment reassembly
@@ -457,6 +474,7 @@ impl LarkChannel {
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs(),
+                        thread_ts: None,
                     };
 
                     tracing::debug!("Lark WS: message in {}", lark_msg.chat_id);
@@ -488,7 +506,7 @@ impl LarkChannel {
             "app_secret": self.app_secret,
         });
 
-        let resp = self.client.post(&url).json(&body).send().await?;
+        let resp = self.http_client().post(&url).json(&body).send().await?;
         let data: serde_json::Value = resp.json().await?;
 
         let code = data.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
@@ -618,6 +636,7 @@ impl LarkChannel {
             content: text,
             channel: "lark".to_string(),
             timestamp,
+            thread_ts: None,
         });
 
         messages
@@ -630,19 +649,19 @@ impl Channel for LarkChannel {
         "lark"
     }
 
-    async fn send(&self, message: &str, recipient: &str) -> anyhow::Result<()> {
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let token = self.get_tenant_access_token().await?;
         let url = self.send_message_url();
 
-        let content = serde_json::json!({ "text": message }).to_string();
+        let content = serde_json::json!({ "text": message.content }).to_string();
         let body = serde_json::json!({
-            "receive_id": recipient,
+            "receive_id": message.recipient,
             "msg_type": "text",
             "content": content,
         });
 
         let resp = self
-            .client
+            .http_client()
             .post(&url)
             .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json; charset=utf-8")
@@ -655,7 +674,7 @@ impl Channel for LarkChannel {
             self.invalidate_token().await;
             let new_token = self.get_tenant_access_token().await?;
             let retry_resp = self
-                .client
+                .http_client()
                 .post(&url)
                 .header("Authorization", format!("Bearer {new_token}"))
                 .header("Content-Type", "application/json; charset=utf-8")
@@ -897,6 +916,21 @@ mod tests {
     }
 
     #[test]
+    fn lark_ws_activity_refreshes_heartbeat_watchdog() {
+        assert!(should_refresh_last_recv(&WsMsg::Binary(
+            vec![1, 2, 3].into()
+        )));
+        assert!(should_refresh_last_recv(&WsMsg::Ping(vec![9, 9].into())));
+        assert!(should_refresh_last_recv(&WsMsg::Pong(vec![8, 8].into())));
+    }
+
+    #[test]
+    fn lark_ws_non_activity_frames_do_not_refresh_heartbeat_watchdog() {
+        assert!(!should_refresh_last_recv(&WsMsg::Text("hello".into())));
+        assert!(!should_refresh_last_recv(&WsMsg::Close(None)));
+    }
+
+    #[test]
     fn lark_user_allowed_exact() {
         let ch = make_channel();
         assert!(ch.is_user_allowed("ou_testuser123"));
@@ -1085,7 +1119,7 @@ mod tests {
                 "sender": { "sender_id": { "open_id": "ou_user" } },
                 "message": {
                     "message_type": "text",
-                    "content": "{\"text\":\"你好世界 🌍\"}",
+                    "content": "{\"text\":\"Hello world 🌍\"}",
                     "chat_id": "oc_chat",
                     "create_time": "1000"
                 }
@@ -1094,7 +1128,7 @@ mod tests {
 
         let msgs = ch.parse_event_payload(&payload);
         assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].content, "你好世界 🌍");
+        assert_eq!(msgs[0].content, "Hello world 🌍");
     }
 
     #[test]

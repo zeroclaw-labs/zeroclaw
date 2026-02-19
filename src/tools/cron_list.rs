@@ -63,20 +63,22 @@ mod tests {
     use crate::config::Config;
     use tempfile::TempDir;
 
-    fn test_config(tmp: &TempDir) -> Arc<Config> {
+    async fn test_config(tmp: &TempDir) -> Arc<Config> {
         let config = Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        tokio::fs::create_dir_all(&config.workspace_dir)
+            .await
+            .unwrap();
         Arc::new(config)
     }
 
     #[tokio::test]
     async fn returns_empty_list_when_no_jobs() {
         let tmp = TempDir::new().unwrap();
-        let cfg = test_config(&tmp);
+        let cfg = test_config(&tmp).await;
         let tool = CronListTool::new(cfg);
 
         let result = tool.execute(json!({})).await.unwrap();
@@ -87,7 +89,7 @@ mod tests {
     #[tokio::test]
     async fn errors_when_cron_disabled() {
         let tmp = TempDir::new().unwrap();
-        let mut cfg = (*test_config(&tmp)).clone();
+        let mut cfg = (*test_config(&tmp).await).clone();
         cfg.cron.enabled = false;
         let tool = CronListTool::new(Arc::new(cfg));
 

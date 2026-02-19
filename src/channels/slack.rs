@@ -1,4 +1,4 @@
-use super::traits::{Channel, ChannelMessage};
+use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 
 /// Slack channel — polls conversations.history via Web API
@@ -6,7 +6,6 @@ pub struct SlackChannel {
     bot_token: String,
     channel_id: Option<String>,
     allowed_users: Vec<String>,
-    client: reqwest::Client,
 }
 
 impl SlackChannel {
@@ -15,8 +14,11 @@ impl SlackChannel {
             bot_token,
             channel_id,
             allowed_users,
-            client: reqwest::Client::new(),
         }
+    }
+
+    fn http_client(&self) -> reqwest::Client {
+        crate::config::build_runtime_proxy_client("channel.slack")
     }
 
     /// Check if a Slack user ID is in the allowlist.
@@ -29,7 +31,7 @@ impl SlackChannel {
     /// Get the bot's own user ID so we can ignore our own messages
     async fn get_bot_user_id(&self) -> Option<String> {
         let resp: serde_json::Value = self
-            .client
+            .http_client()
             .get("https://slack.com/api/auth.test")
             .bearer_auth(&self.bot_token)
             .send()
@@ -43,6 +45,15 @@ impl SlackChannel {
             .and_then(|u| u.as_str())
             .map(String::from)
     }
+
+    /// Resolve the thread identifier for inbound Slack messages.
+    /// Replies carry `thread_ts` (root thread id); top-level messages only have `ts`.
+    fn inbound_thread_ts(msg: &serde_json::Value, ts: &str) -> Option<String> {
+        msg.get("thread_ts")
+            .and_then(|t| t.as_str())
+            .or(if ts.is_empty() { None } else { Some(ts) })
+            .map(str::to_string)
+    }
 }
 
 #[async_trait]
@@ -51,14 +62,18 @@ impl Channel for SlackChannel {
         "slack"
     }
 
-    async fn send(&self, message: &str, channel: &str) -> anyhow::Result<()> {
-        let body = serde_json::json!({
-            "channel": channel,
-            "text": message
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        let mut body = serde_json::json!({
+            "channel": message.recipient,
+            "text": message.content
         });
 
+        if let Some(ref ts) = message.thread_ts {
+            body["thread_ts"] = serde_json::json!(ts);
+        }
+
         let resp = self
-            .client
+            .http_client()
             .post("https://slack.com/api/chat.postMessage")
             .bearer_auth(&self.bot_token)
             .json(&body)
@@ -108,7 +123,7 @@ impl Channel for SlackChannel {
             }
 
             let resp = match self
-                .client
+                .http_client()
                 .get("https://slack.com/api/conversations.history")
                 .bearer_auth(&self.bot_token)
                 .query(&params)
@@ -168,6 +183,7 @@ impl Channel for SlackChannel {
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs(),
+                        thread_ts: Self::inbound_thread_ts(msg, ts),
                     };
 
                     if tx.send(channel_msg).await.is_err() {
@@ -179,7 +195,7 @@ impl Channel for SlackChannel {
     }
 
     async fn health_check(&self) -> bool {
-        self.client
+        self.http_client()
             .get("https://slack.com/api/auth.test")
             .bearer_auth(&self.bot_token)
             .send()
@@ -300,5 +316,34 @@ mod tests {
         let id = format!("slack_{channel_id}_{ts}");
         assert!(!id.contains('-')); // No UUID dashes
         assert!(id.starts_with("slack_"));
+    }
+
+    #[test]
+    fn inbound_thread_ts_prefers_explicit_thread_ts() {
+        let msg = serde_json::json!({
+            "ts": "123.002",
+            "thread_ts": "123.001"
+        });
+
+        let thread_ts = SlackChannel::inbound_thread_ts(&msg, "123.002");
+        assert_eq!(thread_ts.as_deref(), Some("123.001"));
+    }
+
+    #[test]
+    fn inbound_thread_ts_falls_back_to_ts() {
+        let msg = serde_json::json!({
+            "ts": "123.001"
+        });
+
+        let thread_ts = SlackChannel::inbound_thread_ts(&msg, "123.001");
+        assert_eq!(thread_ts.as_deref(), Some("123.001"));
+    }
+
+    #[test]
+    fn inbound_thread_ts_none_when_ts_missing() {
+        let msg = serde_json::json!({});
+
+        let thread_ts = SlackChannel::inbound_thread_ts(&msg, "");
+        assert_eq!(thread_ts, None);
     }
 }

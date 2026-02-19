@@ -39,6 +39,8 @@ use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 
 pub mod agent;
+pub mod approval;
+pub mod auth;
 pub mod channels;
 pub mod config;
 pub mod cost;
@@ -53,6 +55,7 @@ pub mod identity;
 pub mod integrations;
 pub mod memory;
 pub mod migration;
+pub mod multimodal;
 pub mod observability;
 pub mod onboard;
 pub mod peripherals;
@@ -103,6 +106,11 @@ pub enum ChannelCommands {
     Remove {
         /// Channel name to remove
         name: String,
+    },
+    /// Bind a Telegram identity (username or numeric user ID) into allowlist
+    BindTelegram {
+        /// Telegram identity to allow (username without '@' or numeric user ID)
+        identity: String,
     },
 }
 
@@ -178,6 +186,23 @@ pub enum CronCommands {
     Remove {
         /// Task ID
         id: String,
+    },
+    /// Update a scheduled task
+    Update {
+        /// Task ID
+        id: String,
+        /// New cron expression
+        #[arg(long)]
+        expression: Option<String>,
+        /// New IANA timezone
+        #[arg(long)]
+        tz: Option<String>,
+        /// New command to run
+        #[arg(long)]
+        command: Option<String>,
+        /// New job name
+        #[arg(long)]
+        name: Option<String>,
     },
     /// Pause a scheduled task
     Pause {

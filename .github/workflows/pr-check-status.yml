@@ -1,0 +1,32 @@
+name: PR Check Status
+
+on:
+  schedule:
+    - cron: "15 8 * * *" # Once daily at 8:15am UTC
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: pr-check-status
+  cancel-in-progress: true
+
+jobs:
+  nudge-stale-prs:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    env:
+      STALE_HOURS: "48"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Nudge PRs that need rebase or CI refresh
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            const script = require('./.github/workflows/scripts/pr_check_status_nudge.js');
+            await script({ github, context, core });

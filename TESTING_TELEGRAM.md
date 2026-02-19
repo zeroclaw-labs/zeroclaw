@@ -101,7 +101,22 @@ After running automated tests, perform these manual checks:
     - Verify: No "Too Many Requests" errors
     - Verify: Responses have delays
 
-5. **Error logging**
+5. **Mention-only mode (group chats)**
+
+    ```toml
+    # Edit ~/.zeroclaw/config.toml
+    [channels.telegram]
+    mention_only = true
+    ```
+
+    - Add bot to a group chat
+    - Send message without @botname mention
+    - Verify: Bot does not respond
+    - Send message with @botname mention
+    - Verify: Bot responds and mention is stripped
+    - DM/private chat should always work regardless of mention_only
+
+6. **Error logging**
 
     ```bash
     RUST_LOG=debug zeroclaw channel start
@@ -225,7 +240,7 @@ Expected values after all fixes:
 | Message split overhead | <50ms      | Check logs for timing            |
 | Memory usage           | <10MB      | `ps aux \| grep zeroclaw`        |
 | Binary size            | ~3-4MB     | `ls -lh target/release/zeroclaw` |
-| Unit test coverage     | 24/24 pass | `cargo test telegram --lib`      |
+| Unit test coverage     | 61/61 pass | `cargo test telegram --lib`      |
 
 ## 🐛 Debugging Failed Tests
 

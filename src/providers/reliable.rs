@@ -1,4 +1,4 @@
-use super::traits::{ChatMessage, StreamChunk, StreamOptions, StreamResult};
+use super::traits::{ChatMessage, ChatResponse, StreamChunk, StreamOptions, StreamResult};
 use super::Provider;
 use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
@@ -8,6 +8,10 @@ use std::time::Duration;
 
 /// Check if an error is non-retryable (client errors that won't resolve with retries).
 fn is_non_retryable(err: &anyhow::Error) -> bool {
+    if is_context_window_exceeded(err) {
+        return true;
+    }
+
     if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>() {
         if let Some(status) = reqwest_err.status() {
             let code = status.as_u16();
@@ -22,7 +26,51 @@ fn is_non_retryable(err: &anyhow::Error) -> bool {
             }
         }
     }
-    false
+
+    let msg_lower = msg.to_lowercase();
+    let auth_failure_hints = [
+        "invalid api key",
+        "incorrect api key",
+        "missing api key",
+        "api key not set",
+        "authentication failed",
+        "auth failed",
+        "unauthorized",
+        "forbidden",
+        "permission denied",
+        "access denied",
+        "invalid token",
+    ];
+
+    if auth_failure_hints
+        .iter()
+        .any(|hint| msg_lower.contains(hint))
+    {
+        return true;
+    }
+
+    msg_lower.contains("model")
+        && (msg_lower.contains("not found")
+            || msg_lower.contains("unknown")
+            || msg_lower.contains("unsupported")
+            || msg_lower.contains("does not exist")
+            || msg_lower.contains("invalid"))
+}
+
+fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
+    let lower = err.to_string().to_lowercase();
+    let hints = [
+        "exceeds the context window",
+        "context window of this model",
+        "maximum context length",
+        "context length exceeded",
+        "too many tokens",
+        "token limit exceeded",
+        "prompt is too long",
+        "input is too long",
+    ];
+
+    hints.iter().any(|hint| lower.contains(hint))
 }
 
 /// Check if an error is a rate-limit (429) error.
@@ -35,6 +83,52 @@ fn is_rate_limited(err: &anyhow::Error) -> bool {
     let msg = err.to_string();
     msg.contains("429")
         && (msg.contains("Too Many") || msg.contains("rate") || msg.contains("limit"))
+}
+
+/// Check if a 429 is a business/quota-plan error that retries cannot fix.
+///
+/// Examples:
+/// - plan does not include requested model
+/// - insufficient balance / package not active
+/// - known provider business codes (e.g. Z.AI: 1311, 1113)
+fn is_non_retryable_rate_limit(err: &anyhow::Error) -> bool {
+    if !is_rate_limited(err) {
+        return false;
+    }
+
+    let msg = err.to_string();
+    let lower = msg.to_lowercase();
+
+    let business_hints = [
+        "plan does not include",
+        "doesn't include",
+        "not include",
+        "insufficient balance",
+        "insufficient_balance",
+        "insufficient quota",
+        "insufficient_quota",
+        "quota exhausted",
+        "out of credits",
+        "no available package",
+        "package not active",
+        "purchase package",
+        "model not available for your plan",
+    ];
+
+    if business_hints.iter().any(|hint| lower.contains(hint)) {
+        return true;
+    }
+
+    // Known provider business codes observed for 429 where retry is futile.
+    for token in lower.split(|c: char| !c.is_ascii_digit()) {
+        if let Ok(code) = token.parse::<u16>() {
+            if matches!(code, 1113 | 1311) {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 /// Try to extract a Retry-After value (in milliseconds) from an error message.
@@ -68,6 +162,39 @@ fn parse_retry_after_ms(err: &anyhow::Error) -> Option<u64> {
         }
     }
     None
+}
+
+fn failure_reason(rate_limited: bool, non_retryable: bool) -> &'static str {
+    if rate_limited && non_retryable {
+        "rate_limited_non_retryable"
+    } else if rate_limited {
+        "rate_limited"
+    } else if non_retryable {
+        "non_retryable"
+    } else {
+        "retryable"
+    }
+}
+
+fn compact_error_detail(err: &anyhow::Error) -> String {
+    super::sanitize_api_error(&err.to_string())
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn push_failure(
+    failures: &mut Vec<String>,
+    provider_name: &str,
+    model: &str,
+    attempt: u32,
+    max_attempts: u32,
+    reason: &str,
+    error_detail: &str,
+) {
+    failures.push(format!(
+        "provider={provider_name} model={model} attempt {attempt}/{max_attempts}: {reason}; error={error_detail}"
+    ));
 }
 
 /// Provider wrapper with retry, fallback, auth rotation, and model failover.
@@ -183,27 +310,28 @@ impl Provider for ReliableProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
-                            let non_retryable = is_non_retryable(&e);
+                            let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
+                            let non_retryable = is_non_retryable(&e) || non_retryable_rate_limit;
                             let rate_limited = is_rate_limited(&e);
+                            let failure_reason = failure_reason(rate_limited, non_retryable);
+                            let error_detail = compact_error_detail(&e);
 
-                            let failure_reason = if rate_limited {
-                                "rate_limited"
-                            } else if non_retryable {
-                                "non_retryable"
-                            } else {
-                                "retryable"
-                            };
-                            failures.push(format!(
-                                "{provider_name}/{current_model} attempt {}/{}: {failure_reason}",
+                            push_failure(
+                                &mut failures,
+                                provider_name,
+                                current_model,
                                 attempt + 1,
-                                self.max_retries + 1
-                            ));
+                                self.max_retries + 1,
+                                failure_reason,
+                                &error_detail,
+                            );
 
                             // On rate-limit, try rotating API key
-                            if rate_limited {
+                            if rate_limited && !non_retryable_rate_limit {
                                 if let Some(new_key) = self.rotate_key() {
                                     tracing::info!(
                                         provider = provider_name,
+                                        error = %error_detail,
                                         "Rate limited, rotated API key (key ending ...{})",
                                         &new_key[new_key.len().saturating_sub(4)..]
                                     );
@@ -214,8 +342,17 @@ impl Provider for ReliableProvider {
                                 tracing::warn!(
                                     provider = provider_name,
                                     model = *current_model,
+                                    error = %error_detail,
                                     "Non-retryable error, moving on"
                                 );
+
+                                if is_context_window_exceeded(&e) {
+                                    anyhow::bail!(
+                                        "Request exceeds model context window; retries and fallbacks were skipped. Attempts:\n{}",
+                                        failures.join("\n")
+                                    );
+                                }
+
                                 break;
                             }
 
@@ -226,6 +363,8 @@ impl Provider for ReliableProvider {
                                     model = *current_model,
                                     attempt = attempt + 1,
                                     backoff_ms = wait,
+                                    reason = failure_reason,
+                                    error = %error_detail,
                                     "Provider call failed, retrying"
                                 );
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
@@ -288,26 +427,27 @@ impl Provider for ReliableProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
-                            let non_retryable = is_non_retryable(&e);
+                            let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
+                            let non_retryable = is_non_retryable(&e) || non_retryable_rate_limit;
                             let rate_limited = is_rate_limited(&e);
+                            let failure_reason = failure_reason(rate_limited, non_retryable);
+                            let error_detail = compact_error_detail(&e);
 
-                            let failure_reason = if rate_limited {
-                                "rate_limited"
-                            } else if non_retryable {
-                                "non_retryable"
-                            } else {
-                                "retryable"
-                            };
-                            failures.push(format!(
-                                "{provider_name}/{current_model} attempt {}/{}: {failure_reason}",
+                            push_failure(
+                                &mut failures,
+                                provider_name,
+                                current_model,
                                 attempt + 1,
-                                self.max_retries + 1
-                            ));
+                                self.max_retries + 1,
+                                failure_reason,
+                                &error_detail,
+                            );
 
-                            if rate_limited {
+                            if rate_limited && !non_retryable_rate_limit {
                                 if let Some(new_key) = self.rotate_key() {
                                     tracing::info!(
                                         provider = provider_name,
+                                        error = %error_detail,
                                         "Rate limited, rotated API key (key ending ...{})",
                                         &new_key[new_key.len().saturating_sub(4)..]
                                     );
@@ -318,8 +458,17 @@ impl Provider for ReliableProvider {
                                 tracing::warn!(
                                     provider = provider_name,
                                     model = *current_model,
+                                    error = %error_detail,
                                     "Non-retryable error, moving on"
                                 );
+
+                                if is_context_window_exceeded(&e) {
+                                    anyhow::bail!(
+                                        "Request exceeds model context window; retries and fallbacks were skipped. Attempts:\n{}",
+                                        failures.join("\n")
+                                    );
+                                }
+
                                 break;
                             }
 
@@ -330,6 +479,130 @@ impl Provider for ReliableProvider {
                                     model = *current_model,
                                     attempt = attempt + 1,
                                     backoff_ms = wait,
+                                    reason = failure_reason,
+                                    error = %error_detail,
+                                    "Provider call failed, retrying"
+                                );
+                                tokio::time::sleep(Duration::from_millis(wait)).await;
+                                backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+                            }
+                        }
+                    }
+                }
+
+                tracing::warn!(
+                    provider = provider_name,
+                    model = *current_model,
+                    "Exhausted retries, trying next provider/model"
+                );
+            }
+        }
+
+        anyhow::bail!(
+            "All providers/models failed. Attempts:\n{}",
+            failures.join("\n")
+        )
+    }
+
+    fn supports_native_tools(&self) -> bool {
+        self.providers
+            .first()
+            .map(|(_, p)| p.supports_native_tools())
+            .unwrap_or(false)
+    }
+
+    fn supports_vision(&self) -> bool {
+        self.providers
+            .iter()
+            .any(|(_, provider)| provider.supports_vision())
+    }
+
+    async fn chat_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ChatResponse> {
+        let models = self.model_chain(model);
+        let mut failures = Vec::new();
+
+        for current_model in &models {
+            for (provider_name, provider) in &self.providers {
+                let mut backoff_ms = self.base_backoff_ms;
+
+                for attempt in 0..=self.max_retries {
+                    match provider
+                        .chat_with_tools(messages, tools, current_model, temperature)
+                        .await
+                    {
+                        Ok(resp) => {
+                            if attempt > 0 || *current_model != model {
+                                tracing::info!(
+                                    provider = provider_name,
+                                    model = *current_model,
+                                    attempt,
+                                    original_model = model,
+                                    "Provider recovered (failover/retry)"
+                                );
+                            }
+                            return Ok(resp);
+                        }
+                        Err(e) => {
+                            let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
+                            let non_retryable = is_non_retryable(&e) || non_retryable_rate_limit;
+                            let rate_limited = is_rate_limited(&e);
+                            let failure_reason = failure_reason(rate_limited, non_retryable);
+                            let error_detail = compact_error_detail(&e);
+
+                            push_failure(
+                                &mut failures,
+                                provider_name,
+                                current_model,
+                                attempt + 1,
+                                self.max_retries + 1,
+                                failure_reason,
+                                &error_detail,
+                            );
+
+                            if rate_limited && !non_retryable_rate_limit {
+                                if let Some(new_key) = self.rotate_key() {
+                                    tracing::info!(
+                                        provider = provider_name,
+                                        error = %error_detail,
+                                        "Rate limited, rotated API key (key ending ...{})",
+                                        &new_key[new_key.len().saturating_sub(4)..]
+                                    );
+                                }
+                            }
+
+                            if non_retryable {
+                                tracing::warn!(
+                                    provider = provider_name,
+                                    model = *current_model,
+                                    error = %error_detail,
+                                    "Non-retryable error, moving on"
+                                );
+
+                                if is_context_window_exceeded(&e) {
+                                    anyhow::bail!(
+                                        "Request exceeds model context window; retries and fallbacks were skipped. Attempts:\n{}",
+                                        failures.join("\n")
+                                    );
+                                }
+
+                                break;
+                            }
+
+                            if attempt < self.max_retries {
+                                let wait = self.compute_backoff(backoff_ms, &e);
+                                tracing::warn!(
+                                    provider = provider_name,
+                                    model = *current_model,
+                                    attempt = attempt + 1,
+                                    backoff_ms = wait,
+                                    reason = failure_reason,
+                                    error = %error_detail,
                                     "Provider call failed, retrying"
                                 );
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
@@ -412,10 +685,7 @@ impl Provider for ReliableProvider {
 
             // Convert channel receiver to stream
             return stream::unfold(rx, |mut rx| async move {
-                match rx.recv().await {
-                    Some(chunk) => Some((chunk, rx)),
-                    None => None,
-                }
+                rx.recv().await.map(|chunk| (chunk, rx))
             })
             .boxed();
         }
@@ -475,7 +745,7 @@ mod tests {
     /// Mock that records which model was used for each call.
     struct ModelAwareMock {
         calls: Arc<AtomicUsize>,
-        models_seen: std::sync::Mutex<Vec<String>>,
+        models_seen: parking_lot::Mutex<Vec<String>>,
         fail_models: Vec<&'static str>,
         response: &'static str,
     }
@@ -490,7 +760,7 @@ mod tests {
             _temperature: f64,
         ) -> anyhow::Result<String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            self.models_seen.lock().unwrap().push(model.to_string());
+            self.models_seen.lock().push(model.to_string());
             if self.fail_models.contains(&model) {
                 anyhow::bail!("500 model {} unavailable", model);
             }
@@ -613,8 +883,11 @@ mod tests {
             .expect_err("all providers should fail");
         let msg = err.to_string();
         assert!(msg.contains("All providers/models failed"));
-        assert!(msg.contains("p1"));
-        assert!(msg.contains("p2"));
+        assert!(msg.contains("provider=p1 model=test"));
+        assert!(msg.contains("provider=p2 model=test"));
+        assert!(msg.contains("error=p1 error"));
+        assert!(msg.contains("error=p2 error"));
+        assert!(msg.contains("retryable"));
     }
 
     #[test]
@@ -623,6 +896,16 @@ mod tests {
         assert!(is_non_retryable(&anyhow::anyhow!("401 Unauthorized")));
         assert!(is_non_retryable(&anyhow::anyhow!("403 Forbidden")));
         assert!(is_non_retryable(&anyhow::anyhow!("404 Not Found")));
+        assert!(is_non_retryable(&anyhow::anyhow!(
+            "invalid api key provided"
+        )));
+        assert!(is_non_retryable(&anyhow::anyhow!("authentication failed")));
+        assert!(is_non_retryable(&anyhow::anyhow!(
+            "model glm-4.7 not found"
+        )));
+        assert!(is_non_retryable(&anyhow::anyhow!(
+            "unsupported model: glm-4.7"
+        )));
         assert!(!is_non_retryable(&anyhow::anyhow!("429 Too Many Requests")));
         assert!(!is_non_retryable(&anyhow::anyhow!("408 Request Timeout")));
         assert!(!is_non_retryable(&anyhow::anyhow!(
@@ -631,6 +914,76 @@ mod tests {
         assert!(!is_non_retryable(&anyhow::anyhow!("502 Bad Gateway")));
         assert!(!is_non_retryable(&anyhow::anyhow!("timeout")));
         assert!(!is_non_retryable(&anyhow::anyhow!("connection reset")));
+        assert!(!is_non_retryable(&anyhow::anyhow!(
+            "model overloaded, try again later"
+        )));
+        assert!(is_non_retryable(&anyhow::anyhow!(
+            "OpenAI Codex stream error: Your input exceeds the context window of this model."
+        )));
+    }
+
+    #[tokio::test]
+    async fn context_window_error_aborts_retries_and_model_fallbacks() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut model_fallbacks = std::collections::HashMap::new();
+        model_fallbacks.insert(
+            "gpt-5.3-codex".to_string(),
+            vec!["gpt-5.2-codex".to_string()],
+        );
+
+        let provider = ReliableProvider::new(
+            vec![(
+                "openai-codex".into(),
+                Box::new(MockProvider {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: usize::MAX,
+                    response: "never",
+                    error: "OpenAI Codex stream error: Your input exceeds the context window of this model. Please adjust your input and try again.",
+                }),
+            )],
+            4,
+            1,
+        )
+        .with_model_fallbacks(model_fallbacks);
+
+        let err = provider
+            .simple_chat("hello", "gpt-5.3-codex", 0.0)
+            .await
+            .expect_err("context window overflow should fail fast");
+        let msg = err.to_string();
+
+        assert!(msg.contains("context window"));
+        assert!(msg.contains("skipped"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn aggregated_error_marks_non_retryable_model_mismatch_with_details() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![(
+                "custom".into(),
+                Box::new(MockProvider {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: usize::MAX,
+                    response: "never",
+                    error: "unsupported model: glm-4.7",
+                }),
+            )],
+            3,
+            1,
+        );
+
+        let err = provider
+            .simple_chat("hello", "glm-4.7", 0.0)
+            .await
+            .expect_err("provider should fail");
+        let msg = err.to_string();
+
+        assert!(msg.contains("non_retryable"));
+        assert!(msg.contains("error=unsupported model: glm-4.7"));
+        // Non-retryable errors should not consume retry budget.
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -743,7 +1096,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let mock = Arc::new(ModelAwareMock {
             calls: Arc::clone(&calls),
-            models_seen: std::sync::Mutex::new(Vec::new()),
+            models_seen: parking_lot::Mutex::new(Vec::new()),
             fail_models: vec!["claude-opus"],
             response: "ok from sonnet",
         });
@@ -767,7 +1120,7 @@ mod tests {
             .unwrap();
         assert_eq!(result, "ok from sonnet");
 
-        let seen = mock.models_seen.lock().unwrap();
+        let seen = mock.models_seen.lock();
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0], "claude-opus");
         assert_eq!(seen[1], "claude-sonnet");
@@ -778,7 +1131,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let mock = Arc::new(ModelAwareMock {
             calls: Arc::clone(&calls),
-            models_seen: std::sync::Mutex::new(Vec::new()),
+            models_seen: parking_lot::Mutex::new(Vec::new()),
             fail_models: vec!["model-a", "model-b", "model-c"],
             response: "never",
         });
@@ -802,7 +1155,7 @@ mod tests {
             .expect_err("all models should fail");
         assert!(err.to_string().contains("All providers/models failed"));
 
-        let seen = mock.models_seen.lock().unwrap();
+        let seen = mock.models_seen.lock();
         assert_eq!(seen.len(), 3);
     }
 
@@ -891,6 +1244,39 @@ mod tests {
     }
 
     #[test]
+    fn non_retryable_rate_limit_detects_plan_restricted_model() {
+        let err = anyhow::anyhow!(
+            "{}",
+            "API error (429 Too Many Requests): {\"code\":1311,\"message\":\"the current account plan does not include glm-5\"}"
+        );
+        assert!(
+            is_non_retryable_rate_limit(&err),
+            "plan-restricted 429 should skip retries"
+        );
+    }
+
+    #[test]
+    fn non_retryable_rate_limit_detects_insufficient_balance() {
+        let err = anyhow::anyhow!(
+            "{}",
+            "API error (429 Too Many Requests): {\"code\":1113,\"message\":\"insufficient balance\"}"
+        );
+        assert!(
+            is_non_retryable_rate_limit(&err),
+            "insufficient-balance 429 should skip retries"
+        );
+    }
+
+    #[test]
+    fn non_retryable_rate_limit_does_not_flag_generic_429() {
+        let err = anyhow::anyhow!("429 Too Many Requests: rate limit exceeded");
+        assert!(
+            !is_non_retryable_rate_limit(&err),
+            "generic rate-limit 429 should remain retryable"
+        );
+    }
+
+    #[test]
     fn compute_backoff_uses_retry_after() {
         let provider = ReliableProvider::new(vec![], 0, 500);
         let err = anyhow::anyhow!("429 Retry-After: 3");
@@ -909,6 +1295,169 @@ mod tests {
         let provider = ReliableProvider::new(vec![], 0, 500);
         let err = anyhow::anyhow!("500 Server Error");
         assert_eq!(provider.compute_backoff(500, &err), 500);
+    }
+
+    // ── §2.1 API auth error (401/403) tests ──────────────────
+
+    #[test]
+    fn non_retryable_detects_401() {
+        let err = anyhow::anyhow!("API error (401 Unauthorized): invalid api key");
+        assert!(
+            is_non_retryable(&err),
+            "401 errors must be detected as non-retryable"
+        );
+    }
+
+    #[test]
+    fn non_retryable_detects_403() {
+        let err = anyhow::anyhow!("API error (403 Forbidden): access denied");
+        assert!(
+            is_non_retryable(&err),
+            "403 errors must be detected as non-retryable"
+        );
+    }
+
+    #[test]
+    fn non_retryable_detects_404() {
+        let err = anyhow::anyhow!("API error (404 Not Found): model not found");
+        assert!(
+            is_non_retryable(&err),
+            "404 errors must be detected as non-retryable"
+        );
+    }
+
+    #[test]
+    fn non_retryable_does_not_flag_429() {
+        let err = anyhow::anyhow!("429 Too Many Requests");
+        assert!(
+            !is_non_retryable(&err),
+            "429 must NOT be treated as non-retryable (it is retryable with backoff)"
+        );
+    }
+
+    #[test]
+    fn non_retryable_does_not_flag_408() {
+        let err = anyhow::anyhow!("408 Request Timeout");
+        assert!(
+            !is_non_retryable(&err),
+            "408 must NOT be treated as non-retryable (it is retryable)"
+        );
+    }
+
+    #[test]
+    fn non_retryable_does_not_flag_500() {
+        let err = anyhow::anyhow!("500 Internal Server Error");
+        assert!(
+            !is_non_retryable(&err),
+            "500 must NOT be treated as non-retryable (server errors are retryable)"
+        );
+    }
+
+    #[test]
+    fn non_retryable_does_not_flag_502() {
+        let err = anyhow::anyhow!("502 Bad Gateway");
+        assert!(
+            !is_non_retryable(&err),
+            "502 must NOT be treated as non-retryable"
+        );
+    }
+
+    // ── §2.2 Rate limit Retry-After edge cases ───────────────
+
+    #[test]
+    fn parse_retry_after_zero() {
+        let err = anyhow::anyhow!("429 Too Many Requests, Retry-After: 0");
+        assert_eq!(
+            parse_retry_after_ms(&err),
+            Some(0),
+            "Retry-After: 0 should parse as 0ms"
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_with_underscore_separator() {
+        let err = anyhow::anyhow!("rate limited, retry_after: 10");
+        assert_eq!(
+            parse_retry_after_ms(&err),
+            Some(10_000),
+            "retry_after with underscore must be parsed"
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_space_separator() {
+        let err = anyhow::anyhow!("Retry-After 7");
+        assert_eq!(
+            parse_retry_after_ms(&err),
+            Some(7000),
+            "Retry-After with space separator must be parsed"
+        );
+    }
+
+    #[test]
+    fn rate_limited_false_for_generic_error() {
+        let err = anyhow::anyhow!("Connection refused");
+        assert!(
+            !is_rate_limited(&err),
+            "generic errors must not be flagged as rate-limited"
+        );
+    }
+
+    // ── §2.3 Malformed API response error classification ─────
+
+    #[tokio::test]
+    async fn non_retryable_skips_retries_for_401() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![(
+                "primary".into(),
+                Box::new(MockProvider {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: usize::MAX,
+                    response: "never",
+                    error: "API error (401 Unauthorized): invalid key",
+                }),
+            )],
+            5,
+            1,
+        );
+
+        let result = provider.simple_chat("hello", "test", 0.0).await;
+        assert!(result.is_err(), "401 should fail without retries");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "must not retry on 401 — should be exactly 1 call"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_retryable_rate_limit_skips_retries_for_plan_errors() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![(
+                "primary".into(),
+                Box::new(MockProvider {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: usize::MAX,
+                    response: "never",
+                    error: "API error (429 Too Many Requests): {\"code\":1311,\"message\":\"plan does not include glm-5\"}",
+                }),
+            )],
+            5,
+            1,
+        );
+
+        let result = provider.simple_chat("hello", "test", 0.0).await;
+        assert!(
+            result.is_err(),
+            "plan-restricted 429 should fail quickly without retrying"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "must not retry non-retryable 429 business errors"
+        );
     }
 
     // ── Arc<ModelAwareMock> Provider impl for test ──

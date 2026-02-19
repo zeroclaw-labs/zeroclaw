@@ -107,20 +107,22 @@ mod tests {
     use crate::config::Config;
     use tempfile::TempDir;
 
-    fn test_config(tmp: &TempDir) -> Arc<Config> {
+    async fn test_config(tmp: &TempDir) -> Arc<Config> {
         let config = Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        tokio::fs::create_dir_all(&config.workspace_dir)
+            .await
+            .unwrap();
         Arc::new(config)
     }
 
     #[tokio::test]
     async fn force_runs_job_and_records_history() {
         let tmp = TempDir::new().unwrap();
-        let cfg = test_config(&tmp);
+        let cfg = test_config(&tmp).await;
         let job = cron::add_job(&cfg, "*/5 * * * *", "echo run-now").unwrap();
         let tool = CronRunTool::new(cfg.clone());
 
@@ -134,7 +136,7 @@ mod tests {
     #[tokio::test]
     async fn errors_for_missing_job() {
         let tmp = TempDir::new().unwrap();
-        let cfg = test_config(&tmp);
+        let cfg = test_config(&tmp).await;
         let tool = CronRunTool::new(cfg);
 
         let result = tool

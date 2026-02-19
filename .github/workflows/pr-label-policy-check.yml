@@ -1,0 +1,74 @@
+name: PR Label Policy Check
+
+on:
+    pull_request:
+        paths:
+            - ".github/label-policy.json"
+            - ".github/workflows/pr-labeler.yml"
+            - ".github/workflows/pr-auto-response.yml"
+    push:
+        paths:
+            - ".github/label-policy.json"
+            - ".github/workflows/pr-labeler.yml"
+            - ".github/workflows/pr-auto-response.yml"
+
+concurrency:
+    group: pr-label-policy-check-${{ github.event.pull_request.number || github.sha }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+
+jobs:
+    contributor-tier-consistency:
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        timeout-minutes: 10
+        steps:
+            - name: Checkout
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - name: Verify shared label policy and workflow wiring
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  python3 - <<'PY'
+                  import json
+                  import re
+                  from pathlib import Path
+
+                  policy_path = Path('.github/label-policy.json')
+                  policy = json.loads(policy_path.read_text(encoding='utf-8'))
+                  color = str(policy.get('contributor_tier_color', '')).upper()
+                  rules = policy.get('contributor_tiers', [])
+                  if not re.fullmatch(r'[0-9A-F]{6}', color):
+                    raise SystemExit('invalid contributor_tier_color in .github/label-policy.json')
+                  if not rules:
+                    raise SystemExit('contributor_tiers must not be empty in .github/label-policy.json')
+
+                  labels = set()
+                  prev_min = None
+                  for entry in rules:
+                    label = str(entry.get('label', '')).strip().lower()
+                    min_merged = int(entry.get('min_merged_prs', 0))
+                    if not label.endswith('contributor'):
+                      raise SystemExit(f'invalid contributor tier label: {label}')
+                    if label in labels:
+                      raise SystemExit(f'duplicate contributor tier label: {label}')
+                    if prev_min is not None and min_merged > prev_min:
+                      raise SystemExit('contributor_tiers must be sorted descending by min_merged_prs')
+                    labels.add(label)
+                    prev_min = min_merged
+
+                  workflow_paths = [
+                    Path('.github/workflows/pr-labeler.yml'),
+                    Path('.github/workflows/pr-auto-response.yml'),
+                  ]
+                  for workflow in workflow_paths:
+                    text = workflow.read_text(encoding='utf-8')
+                    if '.github/label-policy.json' not in text:
+                      raise SystemExit(f'{workflow} must load .github/label-policy.json')
+                    if re.search(r'contributorTierColor\s*=\s*"[0-9A-Fa-f]{6}"', text):
+                      raise SystemExit(f'{workflow} contains hardcoded contributorTierColor')
+
+                  print('label policy file is valid and workflow consumers are wired to shared policy')
+                  PY

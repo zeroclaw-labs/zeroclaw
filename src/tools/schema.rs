@@ -103,7 +103,7 @@ pub enum CleaningStrategy {
 
 impl CleaningStrategy {
     /// Get the list of unsupported keywords for this strategy.
-    pub fn unsupported_keywords(&self) -> &'static [&'static str] {
+    pub fn unsupported_keywords(self) -> &'static [&'static str] {
         match self {
             Self::Gemini => GEMINI_UNSUPPORTED_KEYWORDS,
             Self::Anthropic => &["$ref", "$defs", "definitions"], // Anthropic doesn't resolve refs

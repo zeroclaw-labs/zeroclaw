@@ -1,5 +1,7 @@
 use super::traits::{Tool, ToolResult};
 use crate::memory::{Memory, MemoryCategory};
+use crate::security::policy::ToolOperation;
+use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -7,11 +9,12 @@ use std::sync::Arc;
 /// Let the agent store memories — its own brain writes
 pub struct MemoryStoreTool {
     memory: Arc<dyn Memory>,
+    security: Arc<SecurityPolicy>,
 }
 
 impl MemoryStoreTool {
-    pub fn new(memory: Arc<dyn Memory>) -> Self {
-        Self { memory }
+    pub fn new(memory: Arc<dyn Memory>, security: Arc<SecurityPolicy>) -> Self {
+        Self { memory, security }
     }
 }
 
@@ -22,7 +25,7 @@ impl Tool for MemoryStoreTool {
     }
 
     fn description(&self) -> &str {
-        "Store a fact, preference, or note in long-term memory. Use category 'core' for permanent facts, 'daily' for session notes, 'conversation' for chat context."
+        "Store a fact, preference, or note in long-term memory. Use category 'core' for permanent facts, 'daily' for session notes, 'conversation' for chat context, or a custom category name."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -39,8 +42,7 @@ impl Tool for MemoryStoreTool {
                 },
                 "category": {
                     "type": "string",
-                    "enum": ["core", "daily", "conversation"],
-                    "description": "Memory category: core (permanent), daily (session), conversation (chat)"
+                    "description": "Memory category: 'core' (permanent), 'daily' (session), 'conversation' (chat), or a custom category name. Defaults to 'core'."
                 }
             },
             "required": ["key", "content"]
@@ -59,10 +61,22 @@ impl Tool for MemoryStoreTool {
             .ok_or_else(|| anyhow::anyhow!("Missing 'content' parameter"))?;
 
         let category = match args.get("category").and_then(|v| v.as_str()) {
+            Some("core") | None => MemoryCategory::Core,
             Some("daily") => MemoryCategory::Daily,
             Some("conversation") => MemoryCategory::Conversation,
-            _ => MemoryCategory::Core,
+            Some(other) => MemoryCategory::Custom(other.to_string()),
         };
+
+        if let Err(error) = self
+            .security
+            .enforce_tool_operation(ToolOperation::Act, "memory_store")
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(error),
+            });
+        }
 
         match self.memory.store(key, content, category, None).await {
             Ok(()) => Ok(ToolResult {
@@ -83,7 +97,12 @@ impl Tool for MemoryStoreTool {
 mod tests {
     use super::*;
     use crate::memory::SqliteMemory;
+    use crate::security::{AutonomyLevel, SecurityPolicy};
     use tempfile::TempDir;
+
+    fn test_security() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy::default())
+    }
 
     fn test_mem() -> (TempDir, Arc<dyn Memory>) {
         let tmp = TempDir::new().unwrap();
@@ -94,7 +113,7 @@ mod tests {
     #[test]
     fn name_and_schema() {
         let (_tmp, mem) = test_mem();
-        let tool = MemoryStoreTool::new(mem);
+        let tool = MemoryStoreTool::new(mem, test_security());
         assert_eq!(tool.name(), "memory_store");
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["key"].is_object());
@@ -104,7 +123,7 @@ mod tests {
     #[tokio::test]
     async fn store_core() {
         let (_tmp, mem) = test_mem();
-        let tool = MemoryStoreTool::new(mem.clone());
+        let tool = MemoryStoreTool::new(mem.clone(), test_security());
         let result = tool
             .execute(json!({"key": "lang", "content": "Prefers Rust"}))
             .await
@@ -120,7 +139,7 @@ mod tests {
     #[tokio::test]
     async fn store_with_category() {
         let (_tmp, mem) = test_mem();
-        let tool = MemoryStoreTool::new(mem.clone());
+        let tool = MemoryStoreTool::new(mem.clone(), test_security());
         let result = tool
             .execute(json!({"key": "note", "content": "Fixed bug", "category": "daily"}))
             .await
@@ -129,9 +148,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn store_with_custom_category() {
+        let (_tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem.clone(), test_security());
+        let result = tool
+            .execute(
+                json!({"key": "proj_note", "content": "Uses async runtime", "category": "project"}),
+            )
+            .await
+            .unwrap();
+        assert!(result.success);
+
+        let entry = mem.get("proj_note").await.unwrap().unwrap();
+        assert_eq!(entry.content, "Uses async runtime");
+        assert_eq!(entry.category, MemoryCategory::Custom("project".into()));
+    }
+
+    #[tokio::test]
     async fn store_missing_key() {
         let (_tmp, mem) = test_mem();
-        let tool = MemoryStoreTool::new(mem);
+        let tool = MemoryStoreTool::new(mem, test_security());
         let result = tool.execute(json!({"content": "no key"})).await;
         assert!(result.is_err());
     }
@@ -139,8 +175,50 @@ mod tests {
     #[tokio::test]
     async fn store_missing_content() {
         let (_tmp, mem) = test_mem();
-        let tool = MemoryStoreTool::new(mem);
+        let tool = MemoryStoreTool::new(mem, test_security());
         let result = tool.execute(json!({"key": "no_content"})).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn store_blocked_in_readonly_mode() {
+        let (_tmp, mem) = test_mem();
+        let readonly = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            ..SecurityPolicy::default()
+        });
+        let tool = MemoryStoreTool::new(mem.clone(), readonly);
+        let result = tool
+            .execute(json!({"key": "lang", "content": "Prefers Rust"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("read-only mode"));
+        assert!(mem.get("lang").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn store_blocked_when_rate_limited() {
+        let (_tmp, mem) = test_mem();
+        let limited = Arc::new(SecurityPolicy {
+            max_actions_per_hour: 0,
+            ..SecurityPolicy::default()
+        });
+        let tool = MemoryStoreTool::new(mem.clone(), limited);
+        let result = tool
+            .execute(json!({"key": "lang", "content": "Prefers Rust"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Rate limit exceeded"));
+        assert!(mem.get("lang").await.unwrap().is_none());
     }
 }

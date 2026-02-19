@@ -2,11 +2,12 @@ use super::types::{BudgetCheck, CostRecord, CostSummary, ModelStats, TokenUsage,
 use crate::config::schema::CostConfig;
 use anyhow::{anyhow, Context, Result};
 use chrono::{Datelike, NaiveDate, Utc};
+use parking_lot::{Mutex, MutexGuard};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 
 /// Cost tracker for API usage monitoring and budget enforcement.
 pub struct CostTracker {
@@ -38,16 +39,12 @@ impl CostTracker {
         &self.session_id
     }
 
-    fn lock_storage(&self) -> Result<MutexGuard<'_, CostStorage>> {
-        self.storage
-            .lock()
-            .map_err(|_| anyhow!("Cost storage lock poisoned"))
+    fn lock_storage(&self) -> MutexGuard<'_, CostStorage> {
+        self.storage.lock()
     }
 
-    fn lock_session_costs(&self) -> Result<MutexGuard<'_, Vec<CostRecord>>> {
-        self.session_costs
-            .lock()
-            .map_err(|_| anyhow!("Session cost lock poisoned"))
+    fn lock_session_costs(&self) -> MutexGuard<'_, Vec<CostRecord>> {
+        self.session_costs.lock()
     }
 
     /// Check if a request is within budget.
@@ -62,7 +59,7 @@ impl CostTracker {
             ));
         }
 
-        let mut storage = self.lock_storage()?;
+        let mut storage = self.lock_storage();
         let (daily_cost, monthly_cost) = storage.get_aggregated_costs()?;
 
         // Check daily limit
@@ -125,12 +122,12 @@ impl CostTracker {
 
         // Persist first for durability guarantees.
         {
-            let mut storage = self.lock_storage()?;
+            let mut storage = self.lock_storage();
             storage.add_record(record.clone())?;
         }
 
         // Then update in-memory session snapshot.
-        let mut session_costs = self.lock_session_costs()?;
+        let mut session_costs = self.lock_session_costs();
         session_costs.push(record);
 
         Ok(())
@@ -139,11 +136,11 @@ impl CostTracker {
     /// Get the current cost summary.
     pub fn get_summary(&self) -> Result<CostSummary> {
         let (daily_cost, monthly_cost) = {
-            let mut storage = self.lock_storage()?;
+            let mut storage = self.lock_storage();
             storage.get_aggregated_costs()?
         };
 
-        let session_costs = self.lock_session_costs()?;
+        let session_costs = self.lock_session_costs();
         let session_cost: f64 = session_costs
             .iter()
             .map(|record| record.usage.cost_usd)
@@ -167,13 +164,13 @@ impl CostTracker {
 
     /// Get the daily cost for a specific date.
     pub fn get_daily_cost(&self, date: NaiveDate) -> Result<f64> {
-        let storage = self.lock_storage()?;
+        let storage = self.lock_storage();
         storage.get_cost_for_date(date)
     }
 
     /// Get the monthly cost for a specific month.
     pub fn get_monthly_cost(&self, year: i32, month: u32) -> Result<f64> {
-        let storage = self.lock_storage()?;
+        let storage = self.lock_storage();
         storage.get_cost_for_month(year, month)
     }
 }

@@ -1,0 +1,62 @@
+name: Test Rust Build
+
+on:
+  workflow_call:
+    inputs:
+      run_command:
+        description: "Shell command(s) to execute."
+        required: true
+        type: string
+      timeout_minutes:
+        description: "Job timeout in minutes."
+        required: false
+        default: 20
+        type: number
+      toolchain:
+        description: "Rust toolchain channel/version."
+        required: false
+        default: "stable"
+        type: string
+      components:
+        description: "Optional rustup components."
+        required: false
+        default: ""
+        type: string
+      targets:
+        description: "Optional rustup targets."
+        required: false
+        default: ""
+        type: string
+      use_cache:
+        description: "Whether to enable rust-cache."
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: ${{ inputs.toolchain }}
+          components: ${{ inputs.components }}
+          targets: ${{ inputs.targets }}
+
+      - name: Restore Rust cache
+        if: inputs.use_cache
+        uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
+
+      - name: Run command
+        shell: bash
+        run: |
+          set -euo pipefail
+          ${{ inputs.run_command }}

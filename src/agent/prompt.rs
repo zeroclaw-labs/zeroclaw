@@ -77,21 +77,25 @@ impl PromptSection for IdentitySection {
 
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
         let mut prompt = String::from("## Project Context\n\n");
+        let mut has_aieos = false;
         if let Some(config) = ctx.identity_config {
             if identity::is_aieos_configured(config) {
                 if let Ok(Some(aieos)) = identity::load_aieos_identity(config, ctx.workspace_dir) {
                     let rendered = identity::aieos_to_system_prompt(&aieos);
                     if !rendered.is_empty() {
                         prompt.push_str(&rendered);
-                        return Ok(prompt);
+                        prompt.push_str("\n\n");
+                        has_aieos = true;
                     }
                 }
             }
         }
 
-        prompt.push_str(
-            "The following workspace files define your identity, behavior, and context.\n\n",
-        );
+        if !has_aieos {
+            prompt.push_str(
+                "The following workspace files define your identity, behavior, and context.\n\n",
+            );
+        }
         for file in [
             "AGENTS.md",
             "SOUL.md",
@@ -149,28 +153,10 @@ impl PromptSection for SkillsSection {
     }
 
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
-        if ctx.skills.is_empty() {
-            return Ok(String::new());
-        }
-
-        let mut prompt = String::from("## Available Skills\n\n<available_skills>\n");
-        for skill in ctx.skills {
-            let location = skill.location.clone().unwrap_or_else(|| {
-                ctx.workspace_dir
-                    .join("skills")
-                    .join(&skill.name)
-                    .join("SKILL.md")
-            });
-            let _ = writeln!(
-                prompt,
-                "  <skill>\n    <name>{}</name>\n    <description>{}</description>\n    <location>{}</location>\n  </skill>",
-                skill.name,
-                skill.description,
-                location.display()
-            );
-        }
-        prompt.push_str("</available_skills>");
-        Ok(prompt)
+        Ok(crate::skills::skills_to_prompt(
+            ctx.skills,
+            ctx.workspace_dir,
+        ))
     }
 }
 
@@ -211,7 +197,8 @@ impl PromptSection for DateTimeSection {
     fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
         let now = Local::now();
         Ok(format!(
-            "## Current Date & Time\n\nTimezone: {}",
+            "## Current Date & Time\n\n{} ({})",
+            now.format("%Y-%m-%d %H:%M:%S"),
             now.format("%Z")
         ))
     }
@@ -286,6 +273,48 @@ mod tests {
     }
 
     #[test]
+    fn identity_section_with_aieos_includes_workspace_files() {
+        let workspace =
+            std::env::temp_dir().join(format!("zeroclaw_prompt_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            workspace.join("AGENTS.md"),
+            "Always respond with: AGENTS_MD_LOADED",
+        )
+        .unwrap();
+
+        let identity_config = crate::config::IdentityConfig {
+            format: "aieos".into(),
+            aieos_path: None,
+            aieos_inline: Some(r#"{"identity":{"names":{"first":"Nova"}}}"#.into()),
+        };
+
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = PromptContext {
+            workspace_dir: &workspace,
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            identity_config: Some(&identity_config),
+            dispatcher_instructions: "",
+        };
+
+        let section = IdentitySection;
+        let output = section.build(&ctx).unwrap();
+
+        assert!(
+            output.contains("Nova"),
+            "AIEOS identity should be present in prompt"
+        );
+        assert!(
+            output.contains("AGENTS_MD_LOADED"),
+            "AGENTS.md content should be present even when AIEOS is configured"
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
     fn prompt_builder_assembles_sections() {
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(TestTool)];
         let ctx = PromptContext {
@@ -300,5 +329,106 @@ mod tests {
         assert!(prompt.contains("## Tools"));
         assert!(prompt.contains("test_tool"));
         assert!(prompt.contains("instr"));
+    }
+
+    #[test]
+    fn skills_section_includes_instructions_and_tools() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let skills = vec![crate::skills::Skill {
+            name: "deploy".into(),
+            description: "Release safely".into(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: vec![],
+            tools: vec![crate::skills::SkillTool {
+                name: "release_checklist".into(),
+                description: "Validate release readiness".into(),
+                kind: "shell".into(),
+                command: "echo ok".into(),
+                args: std::collections::HashMap::new(),
+            }],
+            prompts: vec!["Run smoke tests before deploy.".into()],
+            location: None,
+        }];
+
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &skills,
+            identity_config: None,
+            dispatcher_instructions: "",
+        };
+
+        let output = SkillsSection.build(&ctx).unwrap();
+        assert!(output.contains("<available_skills>"));
+        assert!(output.contains("<name>deploy</name>"));
+        assert!(output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
+        assert!(output.contains("<name>release_checklist</name>"));
+        assert!(output.contains("<kind>shell</kind>"));
+    }
+
+    #[test]
+    fn datetime_section_includes_timestamp_and_timezone() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            identity_config: None,
+            dispatcher_instructions: "instr",
+        };
+
+        let rendered = DateTimeSection.build(&ctx).unwrap();
+        assert!(rendered.starts_with("## Current Date & Time\n\n"));
+
+        let payload = rendered.trim_start_matches("## Current Date & Time\n\n");
+        assert!(payload.chars().any(|c| c.is_ascii_digit()));
+        assert!(payload.contains(" ("));
+        assert!(payload.ends_with(')'));
+    }
+
+    #[test]
+    fn prompt_builder_inlines_and_escapes_skills() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let skills = vec![crate::skills::Skill {
+            name: "code<review>&".into(),
+            description: "Review \"unsafe\" and 'risky' bits".into(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: vec![],
+            tools: vec![crate::skills::SkillTool {
+                name: "run\"linter\"".into(),
+                description: "Run <lint> & report".into(),
+                kind: "shell&exec".into(),
+                command: "cargo clippy".into(),
+                args: std::collections::HashMap::new(),
+            }],
+            prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
+            location: None,
+        }];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp/workspace"),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &skills,
+            identity_config: None,
+            dispatcher_instructions: "",
+        };
+
+        let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
+
+        assert!(prompt.contains("<available_skills>"));
+        assert!(prompt.contains("<name>code&lt;review&gt;&amp;</name>"));
+        assert!(prompt.contains(
+            "<description>Review &quot;unsafe&quot; and &apos;risky&apos; bits</description>"
+        ));
+        assert!(prompt.contains("<name>run&quot;linter&quot;</name>"));
+        assert!(prompt.contains("<description>Run &lt;lint&gt; &amp; report</description>"));
+        assert!(prompt.contains("<kind>shell&amp;exec</kind>"));
+        assert!(prompt.contains(
+            "<instruction>Use &lt;tool_call&gt; and &amp; keep output &quot;safe&quot;</instruction>"
+        ));
     }
 }

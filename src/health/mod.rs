@@ -1,7 +1,8 @@
 use chrono::Utc;
+use parking_lot::Mutex;
 use serde::Serialize;
 use std::collections::BTreeMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 #[derive(Debug, Clone, Serialize)]
@@ -43,20 +44,19 @@ fn upsert_component<F>(component: &str, update: F)
 where
     F: FnOnce(&mut ComponentHealth),
 {
-    if let Ok(mut map) = registry().components.lock() {
-        let now = now_rfc3339();
-        let entry = map
-            .entry(component.to_string())
-            .or_insert_with(|| ComponentHealth {
-                status: "starting".into(),
-                updated_at: now.clone(),
-                last_ok: None,
-                last_error: None,
-                restart_count: 0,
-            });
-        update(entry);
-        entry.updated_at = now;
-    }
+    let mut map = registry().components.lock();
+    let now = now_rfc3339();
+    let entry = map
+        .entry(component.to_string())
+        .or_insert_with(|| ComponentHealth {
+            status: "starting".into(),
+            updated_at: now.clone(),
+            last_ok: None,
+            last_error: None,
+            restart_count: 0,
+        });
+    update(entry);
+    entry.updated_at = now;
 }
 
 pub fn mark_component_ok(component: &str) {
@@ -83,10 +83,7 @@ pub fn bump_component_restart(component: &str) {
 }
 
 pub fn snapshot() -> HealthSnapshot {
-    let components = registry()
-        .components
-        .lock()
-        .map_or_else(|_| BTreeMap::new(), |map| map.clone());
+    let components = registry().components.lock().clone();
 
     HealthSnapshot {
         pid: std::process::id(),

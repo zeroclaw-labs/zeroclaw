@@ -29,6 +29,7 @@ allow = [
     "MPL-2.0",
     "CDLA-Permissive-2.0",
     "0BSD",
+    "BSL-1.0",
 ]
 unused-allowed-license = "allow"
 

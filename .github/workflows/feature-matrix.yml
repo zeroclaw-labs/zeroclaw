@@ -1,0 +1,57 @@
+name: Feature Matrix
+
+on:
+    schedule:
+        - cron: "30 4 * * 1" # Weekly Monday 4:30am UTC
+    workflow_dispatch:
+
+concurrency:
+    group: feature-matrix-${{ github.event.pull_request.number || github.sha }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+
+env:
+    CARGO_TERM_COLOR: always
+
+jobs:
+    feature-check:
+        name: Check (${{ matrix.name }})
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        timeout-minutes: 30
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - name: no-default-features
+                      args: --no-default-features
+                      install_libudev: false
+                    - name: all-features
+                      args: --all-features
+                      install_libudev: true
+                    - name: hardware-only
+                      args: --no-default-features --features hardware
+                      install_libudev: false
+                    - name: browser-native
+                      args: --no-default-features --features browser-native
+                      install_libudev: false
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+
+            - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
+              with:
+                  key: features-${{ matrix.name }}
+
+            - name: Install Linux system dependencies for all-features
+              if: matrix.install_libudev
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y --no-install-recommends libudev-dev pkg-config
+
+            - name: Check feature combination
+              run: cargo check --locked ${{ matrix.args }}

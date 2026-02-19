@@ -1,5 +1,5 @@
 [workspace]
-members = ["."]
+members = [".", "crates/robot-kit"]
 resolver = "2"
 
 [package]
@@ -7,7 +7,7 @@ name = "zeroclaw"
 version = "0.1.0"
 edition = "2021"
 authors = ["theonlyhennygod"]
-license = "MIT"
+license = "Apache-2.0"
 description = "Zero overhead. Zero compromise. 100% Rust. The fastest, smallest AI assistant."
 repository = "https://github.com/zeroclaw-labs/zeroclaw"
 readme = "README.md"
@@ -20,18 +20,25 @@ clap = { version = "4.5", features = ["derive"] }
 
 # Async runtime - feature-optimized for size
 tokio = { version = "1.42", default-features = false, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync", "process", "io-std", "fs", "signal"] }
+tokio-util = { version = "0.7", default-features = false }
 
 # HTTP client - minimal features
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "multipart", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "multipart", "stream", "socks"] }
+
+# Matrix client + E2EE decryption
+matrix-sdk = { version = "0.16", optional = true, default-features = false, features = ["e2e-encryption", "rustls-tls", "markdown"] }
 
 # Serialization
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 
 # Config
-directories = "5.0"
+directories = "6.0"
 toml = "1.0"
 shellexpand = "3.1"
+
+# JSON Schema generation for config export
+schemars = "1.2"
 
 # Logging - minimal
 tracing = { version = "0.1", default-features = false }
@@ -42,6 +49,9 @@ prometheus = { version = "0.14", default-features = false }
 
 # Base64 encoding (screenshots, image data)
 base64 = "0.22"
+
+# URL encoding for web search
+urlencoding = "2.1"
 
 # Optional Rust-native browser automation backend
 fantoccini = { version = "0.22.0", optional = true, default-features = false, features = ["rustls-tls"] }
@@ -62,7 +72,10 @@ sha2 = "0.10"
 hex = "0.4"
 
 # CSPRNG for secure token generation
-rand = "0.8"
+rand = "0.9"
+
+# serde-big-array for wa-rs storage (large array serialization)
+serde-big-array = { version = "0.5", optional = true }
 
 # Fast mutexes that don't poison on panic
 parking_lot = "0.12"
@@ -70,37 +83,44 @@ parking_lot = "0.12"
 # Async traits
 async-trait = "0.1"
 
+# HMAC-SHA256 (Zhipu/GLM JWT auth)
+ring = "0.17"
+
 # Protobuf encode/decode (Feishu WS long-connection frame codec)
 prost = { version = "0.14", default-features = false }
 
 # Memory / persistence
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+postgres = { version = "0.19", features = ["with-chrono-0_4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 chrono-tz = "0.10"
-cron = "0.12"
+cron = "0.15"
 
 # Interactive CLI prompts
 dialoguer = { version = "0.12", features = ["fuzzy-select"] }
-console = "0.15"
+console = "0.16"
 
 # Hardware discovery (device path globbing)
 glob = "0.3"
 
-# Discord WebSocket gateway
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+# WebSocket client channels (Discord/Lark/DingTalk)
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 futures = "0.3"
 regex = "1.10"
 hostname = "0.4.2"
-lettre = { version = "0.11.19", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }
-mail-parser = "0.11.2"
 rustls = "0.23"
 rustls-pki-types = "1.14.0"
 tokio-rustls = "0.26.4"
 webpki-roots = "1.0.6"
 
+# email
+lettre = { version = "0.11.19", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }
+mail-parser = "0.11.2"
+async-imap = { version = "0.11",features = ["runtime-tokio"], default-features = false }
+
 # HTTP server (gateway) — replaces raw TCP for proper HTTP/1.1 compliance
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "ws"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "ws", "macros"] }
 tower = { version = "0.5", default-features = false }
 tower-http = { version = "0.6", default-features = false, features = ["limit", "timeout"] }
 http-body-util = "0.1"
@@ -110,26 +130,39 @@ opentelemetry = { version = "0.31", default-features = false, features = ["trace
 opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "metrics"] }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-client", "reqwest-rustls-webpki-roots"] }
 
-# USB device enumeration (hardware discovery)
-nusb = { version = "0.2", default-features = false, optional = true }
-
 # Serial port for peripheral communication (STM32, etc.)
 tokio-serial = { version = "5", default-features = false, optional = true }
+
+# USB device enumeration (hardware discovery) — only on platforms nusb supports
+# (Linux, macOS, Windows). Android/Termux uses target_os="android" and is excluded.
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
+nusb = { version = "0.2", default-features = false, optional = true }
 
 # probe-rs for STM32/Nucleo memory read (Phase B)
 probe-rs = { version = "0.30", optional = true }
 
 # PDF extraction for datasheet RAG (optional, enable with --features rag-pdf)
 pdf-extract = { version = "0.10", optional = true }
+tokio-stream = { version = "0.1.18", features = ["full"] }
+
+# WhatsApp Web client (wa-rs) — optional, enable with --features whatsapp-web
+# Uses wa-rs for Bot and Client, wa-rs-core for storage traits, custom rusqlite backend avoids Diesel conflict.
+wa-rs = { version = "0.2", optional = true, default-features = false }
+wa-rs-core = { version = "0.2", optional = true, default-features = false }
+wa-rs-binary = { version = "0.2", optional = true, default-features = false }
+wa-rs-proto = { version = "0.2", optional = true, default-features = false }
+wa-rs-ureq-http = { version = "0.2", optional = true }
+wa-rs-tokio-transport = { version = "0.2", optional = true, default-features = false }
 
 # Raspberry Pi GPIO / Landlock (Linux only) — target-specific to avoid compile failure on macOS
 [target.'cfg(target_os = "linux")'.dependencies]
-rppal = { version = "0.14", optional = true }
+rppal = { version = "0.22", optional = true }
 landlock = { version = "0.4", optional = true }
 
 [features]
-default = ["hardware"]
+default = ["hardware", "channel-matrix"]
 hardware = ["nusb", "tokio-serial"]
+channel-matrix = ["dep:matrix-sdk"]
 peripheral-rpi = ["rppal"]
 # Browser backend feature alias used by cfg(feature = "browser-native")
 browser-native = ["dep:fantoccini"]
@@ -144,6 +177,9 @@ landlock = ["sandbox-landlock"]
 probe = ["dep:probe-rs"]
 # rag-pdf = PDF ingestion for datasheet RAG
 rag-pdf = ["dep:pdf-extract"]
+# whatsapp-web = Native WhatsApp Web client with custom rusqlite storage backend
+whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "serde-big-array"]
+
 [profile.release]
 opt-level = "z"      # Optimize for size
 lto = "thin"         # Lower memory use during release builds
@@ -166,5 +202,9 @@ strip = true
 panic = "abort"
 
 [dev-dependencies]
-tokio-test = "0.4"
 tempfile = "3.14"
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "agent_benchmarks"
+harness = false

@@ -94,4 +94,90 @@ mod tests {
         // Either way, the name should still work
         assert_eq!(sandbox.name(), "bubblewrap");
     }
+
+    // ── §1.1 Sandbox isolation flag tests ──────────────────────
+
+    #[test]
+    fn bubblewrap_wrap_command_includes_isolation_flags() {
+        let sandbox = BubblewrapSandbox;
+        let mut cmd = Command::new("echo");
+        cmd.arg("hello");
+        sandbox.wrap_command(&mut cmd).unwrap();
+
+        assert_eq!(
+            cmd.get_program().to_string_lossy(),
+            "bwrap",
+            "wrapped command should use bwrap as program"
+        );
+
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+
+        assert!(
+            args.contains(&"--unshare-all".to_string()),
+            "must include --unshare-all for namespace isolation"
+        );
+        assert!(
+            args.contains(&"--die-with-parent".to_string()),
+            "must include --die-with-parent to prevent orphan processes"
+        );
+        assert!(
+            !args.contains(&"--share-net".to_string()),
+            "must NOT include --share-net (network should be blocked)"
+        );
+    }
+
+    #[test]
+    fn bubblewrap_wrap_command_preserves_original_command() {
+        let sandbox = BubblewrapSandbox;
+        let mut cmd = Command::new("ls");
+        cmd.arg("-la");
+        cmd.arg("/tmp");
+        sandbox.wrap_command(&mut cmd).unwrap();
+
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+
+        assert!(
+            args.contains(&"ls".to_string()),
+            "original program must be passed as argument"
+        );
+        assert!(
+            args.contains(&"-la".to_string()),
+            "original args must be preserved"
+        );
+        assert!(
+            args.contains(&"/tmp".to_string()),
+            "original args must be preserved"
+        );
+    }
+
+    #[test]
+    fn bubblewrap_wrap_command_binds_required_paths() {
+        let sandbox = BubblewrapSandbox;
+        let mut cmd = Command::new("echo");
+        sandbox.wrap_command(&mut cmd).unwrap();
+
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+
+        assert!(
+            args.contains(&"--ro-bind".to_string()),
+            "must include read-only bind for /usr"
+        );
+        assert!(
+            args.contains(&"--dev".to_string()),
+            "must include /dev mount"
+        );
+        assert!(
+            args.contains(&"--proc".to_string()),
+            "must include /proc mount"
+        );
+    }
 }

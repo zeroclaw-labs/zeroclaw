@@ -99,6 +99,132 @@ pub fn run(config: &Config) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelProbeOutcome {
+    Ok,
+    Skipped,
+    AuthOrAccess,
+    Error,
+}
+
+fn classify_model_probe_error(err_message: &str) -> ModelProbeOutcome {
+    let lower = err_message.to_lowercase();
+
+    if lower.contains("does not support live model discovery") {
+        return ModelProbeOutcome::Skipped;
+    }
+
+    if [
+        "401",
+        "403",
+        "429",
+        "unauthorized",
+        "forbidden",
+        "api key",
+        "token",
+        "insufficient balance",
+        "insufficient quota",
+        "plan does not include",
+        "rate limit",
+    ]
+    .iter()
+    .any(|hint| lower.contains(hint))
+    {
+        return ModelProbeOutcome::AuthOrAccess;
+    }
+
+    ModelProbeOutcome::Error
+}
+
+fn doctor_model_targets(provider_override: Option<&str>) -> Vec<String> {
+    if let Some(provider) = provider_override.map(str::trim).filter(|p| !p.is_empty()) {
+        return vec![provider.to_string()];
+    }
+
+    crate::providers::list_providers()
+        .into_iter()
+        .map(|provider| provider.name.to_string())
+        .collect()
+}
+
+pub fn run_models(config: &Config, provider_override: Option<&str>, use_cache: bool) -> Result<()> {
+    let targets = doctor_model_targets(provider_override);
+
+    if targets.is_empty() {
+        anyhow::bail!("No providers available for model probing");
+    }
+
+    println!("🩺 ZeroClaw Doctor — Model Catalog Probe");
+    println!("  Providers to probe: {}", targets.len());
+    println!(
+        "  Mode: {}",
+        if use_cache {
+            "cache-first"
+        } else {
+            "force live refresh"
+        }
+    );
+    println!();
+
+    let mut ok_count = 0usize;
+    let mut skipped_count = 0usize;
+    let mut auth_count = 0usize;
+    let mut error_count = 0usize;
+
+    for provider_name in &targets {
+        println!("  [{}]", provider_name);
+
+        match crate::onboard::run_models_refresh(config, Some(provider_name), !use_cache) {
+            Ok(()) => {
+                ok_count += 1;
+                println!("    ✅ model catalog check passed");
+            }
+            Err(error) => {
+                let error_text = format_error_chain(&error);
+                match classify_model_probe_error(&error_text) {
+                    ModelProbeOutcome::Skipped => {
+                        skipped_count += 1;
+                        println!("    ⚪ skipped: {}", truncate_for_display(&error_text, 160));
+                    }
+                    ModelProbeOutcome::AuthOrAccess => {
+                        auth_count += 1;
+                        println!(
+                            "    ⚠️  auth/access: {}",
+                            truncate_for_display(&error_text, 160)
+                        );
+                    }
+                    ModelProbeOutcome::Error => {
+                        error_count += 1;
+                        println!("    ❌ error: {}", truncate_for_display(&error_text, 160));
+                    }
+                    ModelProbeOutcome::Ok => {
+                        ok_count += 1;
+                    }
+                }
+            }
+        }
+
+        println!();
+    }
+
+    println!(
+        "  Summary: {} ok, {} skipped, {} auth/access, {} errors",
+        ok_count, skipped_count, auth_count, error_count
+    );
+
+    if auth_count > 0 {
+        println!(
+            "  💡 Some providers need valid API keys/plan access before `/models` can be fetched."
+        );
+    }
+
+    if provider_override.is_some() && ok_count == 0 {
+        anyhow::bail!("Model probe failed for target provider")
+    }
+
+    Ok(())
+}
+
 // ── Config semantic validation ───────────────────────────────────
 
 fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
@@ -218,6 +344,58 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         }
     }
 
+    // Embedding routes validation
+    for route in &config.embedding_routes {
+        if route.hint.trim().is_empty() {
+            items.push(DiagItem::warn(cat, "embedding route with empty hint"));
+        }
+        if let Some(reason) = embedding_provider_validation_error(&route.provider) {
+            items.push(DiagItem::warn(
+                cat,
+                format!(
+                    "embedding route \"{}\" uses invalid provider \"{}\": {}",
+                    route.hint, route.provider, reason
+                ),
+            ));
+        }
+        if route.model.trim().is_empty() {
+            items.push(DiagItem::warn(
+                cat,
+                format!("embedding route \"{}\" has empty model", route.hint),
+            ));
+        }
+        if route.dimensions.is_some_and(|value| value == 0) {
+            items.push(DiagItem::warn(
+                cat,
+                format!(
+                    "embedding route \"{}\" has invalid dimensions=0",
+                    route.hint
+                ),
+            ));
+        }
+    }
+
+    if let Some(hint) = config
+        .memory
+        .embedding_model
+        .strip_prefix("hint:")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if !config
+            .embedding_routes
+            .iter()
+            .any(|route| route.hint.trim() == hint)
+        {
+            items.push(DiagItem::warn(
+                cat,
+                format!(
+                    "memory.embedding_model uses hint \"{hint}\" but no matching [[embedding_routes]] entry exists"
+                ),
+            ));
+        }
+    }
+
     // Channel: at least one configured
     let cc = &config.channels_config;
     let has_channel = cc.telegram.is_some()
@@ -241,7 +419,10 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     }
 
     // Delegate agents: provider validity
-    for (name, agent) in &config.agents {
+    let mut agent_names: Vec<_> = config.agents.keys().collect();
+    agent_names.sort();
+    for name in agent_names {
+        let agent = config.agents.get(name).unwrap();
         if let Some(reason) = provider_validation_error(&agent.provider) {
             items.push(DiagItem::warn(
                 cat,
@@ -264,6 +445,31 @@ fn provider_validation_error(name: &str) -> Option<String> {
                 .unwrap_or("invalid provider")
                 .into(),
         ),
+    }
+}
+
+fn embedding_provider_validation_error(name: &str) -> Option<String> {
+    let normalized = name.trim();
+    if normalized.eq_ignore_ascii_case("none") || normalized.eq_ignore_ascii_case("openai") {
+        return None;
+    }
+
+    let Some(url) = normalized.strip_prefix("custom:") else {
+        return Some("supported values: none, openai, custom:<url>".into());
+    };
+
+    let url = url.trim();
+    if url.is_empty() {
+        return Some("custom provider requires a non-empty URL after 'custom:'".into());
+    }
+
+    match reqwest::Url::parse(url) {
+        Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => None,
+        Ok(parsed) => Some(format!(
+            "custom provider URL must use http/https, got '{}'",
+            parsed.scheme()
+        )),
+        Err(err) => Some(format!("invalid custom provider URL: {err}")),
     }
 }
 
@@ -569,6 +775,22 @@ fn check_command_available(cmd: &str, args: &[&str], cat: &'static str, items: &
     }
 }
 
+fn format_error_chain(error: &anyhow::Error) -> String {
+    let mut parts = Vec::new();
+    for cause in error.chain() {
+        let message = cause.to_string();
+        if !message.is_empty() {
+            parts.push(message);
+        }
+    }
+
+    if parts.is_empty() {
+        return String::new();
+    }
+
+    parts.join(": ")
+}
+
 fn truncate_for_display(input: &str, max_chars: usize) -> String {
     let mut chars = input.chars();
     let preview: String = chars.by_ref().take(max_chars).collect();
@@ -610,6 +832,25 @@ mod tests {
         assert_eq!(DiagItem::ok("t", "m").icon(), "✅");
         assert_eq!(DiagItem::warn("t", "m").icon(), "⚠️ ");
         assert_eq!(DiagItem::error("t", "m").icon(), "❌");
+    }
+
+    #[test]
+    fn classify_model_probe_error_marks_unsupported_as_skipped() {
+        let outcome = classify_model_probe_error(
+            "Provider 'copilot' does not support live model discovery yet",
+        );
+        assert_eq!(outcome, ModelProbeOutcome::Skipped);
+    }
+
+    #[test]
+    fn classify_model_probe_error_marks_auth_and_plan_issues() {
+        let auth_outcome = classify_model_probe_error("OpenAI API error (401): unauthorized");
+        assert_eq!(auth_outcome, ModelProbeOutcome::AuthOrAccess);
+
+        let plan_outcome = classify_model_probe_error(
+            "Z.AI API error (429): plan does not include requested model",
+        );
+        assert_eq!(plan_outcome, ModelProbeOutcome::AuthOrAccess);
     }
 
     #[test]
@@ -728,6 +969,62 @@ mod tests {
     }
 
     #[test]
+    fn config_validation_warns_empty_embedding_route_model() {
+        let mut config = Config::default();
+        config.embedding_routes = vec![crate::config::EmbeddingRouteConfig {
+            hint: "semantic".into(),
+            provider: "openai".into(),
+            model: String::new(),
+            dimensions: Some(1536),
+            api_key: None,
+        }];
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        let route_item = items.iter().find(|item| {
+            item.message
+                .contains("embedding route \"semantic\" has empty model")
+        });
+        assert!(route_item.is_some());
+        assert_eq!(route_item.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn config_validation_warns_invalid_embedding_route_provider() {
+        let mut config = Config::default();
+        config.embedding_routes = vec![crate::config::EmbeddingRouteConfig {
+            hint: "semantic".into(),
+            provider: "groq".into(),
+            model: "text-embedding-3-small".into(),
+            dimensions: None,
+            api_key: None,
+        }];
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        let route_item = items
+            .iter()
+            .find(|item| item.message.contains("uses invalid provider \"groq\""));
+        assert!(route_item.is_some());
+        assert_eq!(route_item.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn config_validation_warns_missing_embedding_hint_target() {
+        let mut config = Config::default();
+        config.memory.embedding_model = "hint:semantic".into();
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        let route_item = items.iter().find(|item| {
+            item.message
+                .contains("no matching [[embedding_routes]] entry exists")
+        });
+        assert!(route_item.is_some());
+        assert_eq!(route_item.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
     fn environment_check_finds_git() {
         let mut items = Vec::new();
         check_environment(&mut items);
@@ -746,8 +1043,8 @@ mod tests {
 
     #[test]
     fn truncate_for_display_preserves_utf8_boundaries() {
-        let preview = truncate_for_display("版本号-alpha-build", 3);
-        assert_eq!(preview, "版本号…");
+        let preview = truncate_for_display("🙂example-alpha-build", 3);
+        assert_eq!(preview, "🙂ex…");
     }
 
     #[test]
@@ -761,5 +1058,45 @@ mod tests {
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.starts_with(".zeroclaw_doctor_probe_")));
+    }
+
+    #[test]
+    fn config_validation_reports_delegate_agents_in_sorted_order() {
+        let mut config = Config::default();
+        config.agents.insert(
+            "zeta".into(),
+            crate::config::DelegateAgentConfig {
+                provider: "totally-fake".into(),
+                model: "model-z".into(),
+                system_prompt: None,
+                api_key: None,
+                temperature: None,
+                max_depth: 3,
+            },
+        );
+        config.agents.insert(
+            "alpha".into(),
+            crate::config::DelegateAgentConfig {
+                provider: "totally-fake".into(),
+                model: "model-a".into(),
+                system_prompt: None,
+                api_key: None,
+                temperature: None,
+                max_depth: 3,
+            },
+        );
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+
+        let agent_messages: Vec<_> = items
+            .iter()
+            .filter(|item| item.message.starts_with("agent \""))
+            .map(|item| item.message.as_str())
+            .collect();
+
+        assert_eq!(agent_messages.len(), 2);
+        assert!(agent_messages[0].contains("agent \"alpha\""));
+        assert!(agent_messages[1].contains("agent \"zeta\""));
     }
 }

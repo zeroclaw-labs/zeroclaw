@@ -1,0 +1,44 @@
+name: PR Check Stale
+
+on:
+    schedule:
+        - cron: "20 2 * * *"
+    workflow_dispatch:
+
+permissions: {}
+
+jobs:
+    stale:
+        permissions:
+            issues: write
+            pull-requests: write
+        runs-on: ubuntu-latest
+        steps:
+            - name: Mark stale issues and pull requests
+              uses: actions/stale@b5d41d4e1d5dceea10e7104786b73624c18a190f # v10.2.0
+              with:
+                  repo-token: ${{ secrets.GITHUB_TOKEN }}
+                  days-before-issue-stale: 21
+                  days-before-issue-close: 7
+                  days-before-pr-stale: 14
+                  days-before-pr-close: 7
+                  stale-issue-label: stale
+                  stale-pr-label: stale
+                  exempt-issue-labels: security,pinned,no-stale,no-pr-hygiene,maintainer
+                  exempt-pr-labels: no-stale,no-pr-hygiene,maintainer
+                  remove-stale-when-updated: true
+                  exempt-all-assignees: true
+                  operations-per-run: 300
+                  stale-issue-message: |
+                      This issue was automatically marked as stale due to inactivity.
+                      Please provide an update, reproduction details, or current status to keep it open.
+                  close-issue-message: |
+                      Closing this issue due to inactivity.
+                      If the problem still exists on the latest `main`, please open a new issue with fresh repro steps.
+                  close-issue-reason: not_planned
+                  stale-pr-message: |
+                      This PR was automatically marked as stale due to inactivity.
+                      Please rebase/update and post the latest validation results.
+                  close-pr-message: |
+                      Closing this PR due to inactivity.
+                      Maintainers can reopen once the branch is updated and validation is provided.

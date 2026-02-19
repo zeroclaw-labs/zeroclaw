@@ -188,15 +188,21 @@ To keep docs useful under high PR volume, we use these rules:
 - **Risk-proportionate detail**: high-risk paths need deeper evidence; low-risk paths stay lightweight.
 - **Side-effect visibility**: document blast radius, failure modes, and rollback before merge.
 - **Automation assists, humans decide**: bots triage and label, but merge accountability stays human.
+- **Index-first discoverability**: `docs/README.md` is the first entry point for operational documentation.
+- **Template-first authoring**: start new operational docs from `docs/doc-template.md`.
 
 ### Documentation System Map
 
 | Doc | Primary purpose | When to update |
 |---|---|---|
+| `docs/README.md` | canonical docs index and taxonomy | add/remove docs or change documentation ownership/navigation |
+| `docs/doc-template.md` | standard skeleton for new operational documentation | when required sections or documentation quality bar changes |
 | `CONTRIBUTING.md` | contributor contract and readiness baseline | contributor expectations or policy changes |
 | `docs/pr-workflow.md` | governance logic and merge contract | workflow/risk/merge gate changes |
 | `docs/reviewer-playbook.md` | reviewer operating checklist | review depth or triage behavior changes |
 | `docs/ci-map.md` | CI ownership and triage entry points | workflow trigger/job ownership changes |
+| `docs/network-deployment.md` | runtime deployment and network operating guide | gateway/channel/tunnel/network runtime behavior changes |
+| `docs/proxy-agent-playbook.md` | agent-operable proxy runbook and rollback recipes | proxy scope/selector/tooling behavior changes |
 
 ## PR Definition of Ready (DoR)
 
@@ -209,6 +215,8 @@ Before requesting review, ensure all of the following are true:
 - No personal/sensitive data is introduced in code/docs/tests/fixtures/logs/examples/commit messages.
 - Tests/fixtures/examples use neutral project-scoped wording (no identity-specific or first-person phrasing).
 - If identity-like wording is required, use ZeroClaw-centric labels only (for example: `ZeroClawAgent`, `ZeroClawOperator`, `zeroclaw_user`).
+- If docs were changed, update `docs/README.md` navigation and reciprocal links with related docs.
+- If a new operational doc was added, start from `docs/doc-template.md` and keep risk/rollback/troubleshooting sections where applicable.
 - Linked issue (or rationale for no issue) is included.
 
 ## PR Definition of Done (DoD)
@@ -220,6 +228,7 @@ A PR is merge-ready when:
 - Risk level matches changed paths (`risk: low/medium/high`).
 - User-visible behavior, migration, and rollback notes are complete.
 - Follow-up TODOs are explicit and tracked in issues.
+- For documentation changes, links and ownership mapping in `CONTRIBUTING.md` and `docs/README.md` are consistent.
 
 ## High-Volume Collaboration Rules
 

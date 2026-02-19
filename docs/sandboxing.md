@@ -1,5 +1,10 @@
 # ZeroClaw Sandboxing Strategies
 
+> ⚠️ **Status: Proposal / Roadmap**
+>
+> This document describes proposed approaches and may include hypothetical commands or config.
+> For current runtime behavior, see [config-reference.md](config-reference.md), [operations-runbook.md](operations-runbook.md), and [troubleshooting.md](troubleshooting.md).
+
 ## Problem
 ZeroClaw currently has application-layer security (allowlists, path blocking, command injection protection) but lacks OS-level containment. If an attacker is on the allowlist, they can run any allowed command with zeroclaw's user permissions.
 

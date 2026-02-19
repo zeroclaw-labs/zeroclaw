@@ -68,6 +68,18 @@ impl ScreenshotTool {
             |n| n.to_string_lossy().to_string(),
         );
 
+        // Reject filenames with shell-breaking characters to prevent injection in sh -c
+        const SHELL_UNSAFE: &[char] = &[
+            '\'', '"', '`', '$', '\\', ';', '|', '&', '\n', '\0', '(', ')',
+        ];
+        if safe_name.contains(SHELL_UNSAFE) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Filename contains characters unsafe for shell execution".into()),
+            });
+        }
+
         let output_path = self.security.workspace_dir.join(&safe_name);
         let output_str = output_path.to_string_lossy().to_string();
 
@@ -286,6 +298,17 @@ mod tests {
         assert!(cmd.is_some());
         let args = cmd.unwrap();
         assert!(!args.is_empty());
+    }
+
+    #[tokio::test]
+    async fn screenshot_rejects_shell_injection_filename() {
+        let tool = ScreenshotTool::new(test_security());
+        let result = tool
+            .execute(json!({"filename": "test'injection.png"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("unsafe for shell execution"));
     }
 
     #[test]

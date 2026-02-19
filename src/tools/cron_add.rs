@@ -217,13 +217,15 @@ mod tests {
     use crate::security::AutonomyLevel;
     use tempfile::TempDir;
 
-    fn test_config(tmp: &TempDir) -> Arc<Config> {
+    async fn test_config(tmp: &TempDir) -> Arc<Config> {
         let config = Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        tokio::fs::create_dir_all(&config.workspace_dir)
+            .await
+            .unwrap();
         Arc::new(config)
     }
 
@@ -237,7 +239,7 @@ mod tests {
     #[tokio::test]
     async fn adds_shell_job() {
         let tmp = TempDir::new().unwrap();
-        let cfg = test_config(&tmp);
+        let cfg = test_config(&tmp).await;
         let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
         let result = tool
             .execute(json!({
@@ -262,7 +264,9 @@ mod tests {
         };
         config.autonomy.allowed_commands = vec!["echo".into()];
         config.autonomy.level = AutonomyLevel::Supervised;
-        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        tokio::fs::create_dir_all(&config.workspace_dir)
+            .await
+            .unwrap();
         let cfg = Arc::new(config);
         let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
 
@@ -285,7 +289,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_invalid_schedule() {
         let tmp = TempDir::new().unwrap();
-        let cfg = test_config(&tmp);
+        let cfg = test_config(&tmp).await;
         let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
 
         let result = tool
@@ -307,7 +311,7 @@ mod tests {
     #[tokio::test]
     async fn agent_job_requires_prompt() {
         let tmp = TempDir::new().unwrap();
-        let cfg = test_config(&tmp);
+        let cfg = test_config(&tmp).await;
         let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
 
         let result = tool

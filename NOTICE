@@ -1,47 +1,43 @@
 ZeroClaw
-Copyright 2025-2026 Argenis Delarosa
+Copyright 2025 ZeroClaw Labs
 
-This product includes software developed by ZeroClaw Labs and its contributors.
+This product includes software developed at ZeroClaw Labs (https://github.com/zeroclaw-labs).
 
-Author
-======
-theonlyhennygod (Argenis Delarosa)
+Official Repository
+===================
+
+The only official ZeroClaw repository is:
+https://github.com/zeroclaw-labs/zeroclaw
+
+Any other repository claiming to be ZeroClaw is unauthorized.
+See TRADEMARK.md for the full trademark policy.
+
+License
+=======
+
+This software is available under a dual-license model:
+
+  1. MIT License — see LICENSE
+  2. Apache License 2.0 — see LICENSE-APACHE
+
+You may use either license. Contributors grant rights under both.
+See CLA.md for the contributor license agreement.
 
 Contributors
 ============
 
-The following individuals have contributed to ZeroClaw:
+This NOTICE file is maintained by repository automation.
+For the latest contributor list, see the repository contributors page:
+https://github.com/zeroclaw-labs/zeroclaw/graphs/contributors
 
-- Abdzsam
-- adie
-- agorevski
-- cd-slash
-- chumyin
-- ecschoye
-- elonfeng
-- Extreammouse
-- fettpl
-- haeli05
-- jereanon
-- junbaor
-- kumanday
-- lawyered0
-- mai1015
-- Mgrsc
-- Moeblack
-- radkrish
-- reidliu41
-- sahajre
-- stakeswky
-- theonlyhennygod
-- vernonstinebaker
-- vrescobar
-- willsarg
+All contributors retain copyright ownership of their contributions.
+Contributions are permanently attributed in the repository commit history.
+Patent rights are protected for all contributors under Apache License 2.0.
 
 Third-Party Dependencies
 ========================
 
-This project uses the following third-party libraries and components,
-each licensed under their respective terms:
+This project uses third-party libraries and components,
+each licensed under their respective terms.
 
-See Cargo.lock for a complete list of dependencies and their licenses.
+See Cargo.lock for a complete dependency list.

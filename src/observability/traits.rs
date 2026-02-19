@@ -25,6 +25,8 @@ pub enum ObserverEvent {
         error_message: Option<String>,
     },
     AgentEnd {
+        provider: String,
+        model: String,
         duration: Duration,
         tokens_used: Option<u64>,
         cost_usd: Option<f64>,
@@ -75,18 +77,13 @@ pub trait Observer: Send + Sync + 'static {
     fn name(&self) -> &str;
 
     /// Downcast to `Any` for backend-specific operations
-    fn as_any(&self) -> &dyn std::any::Any
-    where
-        Self: Sized,
-    {
-        self
-    }
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
     use std::time::Duration;
 
     #[derive(Default)]
@@ -97,17 +94,21 @@ mod tests {
 
     impl Observer for DummyObserver {
         fn record_event(&self, _event: &ObserverEvent) {
-            let mut guard = self.events.lock().unwrap();
+            let mut guard = self.events.lock();
             *guard += 1;
         }
 
         fn record_metric(&self, _metric: &ObserverMetric) {
-            let mut guard = self.metrics.lock().unwrap();
+            let mut guard = self.metrics.lock();
             *guard += 1;
         }
 
         fn name(&self) -> &str {
             "dummy-observer"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
         }
     }
 
@@ -122,8 +123,8 @@ mod tests {
         });
         observer.record_metric(&ObserverMetric::TokensUsed(42));
 
-        assert_eq!(*observer.events.lock().unwrap(), 2);
-        assert_eq!(*observer.metrics.lock().unwrap(), 1);
+        assert_eq!(*observer.events.lock(), 2);
+        assert_eq!(*observer.metrics.lock(), 1);
     }
 
     #[test]

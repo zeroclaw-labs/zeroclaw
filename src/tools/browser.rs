@@ -19,7 +19,7 @@ use tokio::process::Command;
 use tracing::debug;
 
 /// Computer-use sidecar settings.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ComputerUseConfig {
     pub endpoint: String,
     pub api_key: Option<String>,
@@ -28,6 +28,20 @@ pub struct ComputerUseConfig {
     pub window_allowlist: Vec<String>,
     pub max_coordinate_x: Option<i64>,
     pub max_coordinate_y: Option<i64>,
+}
+
+impl std::fmt::Debug for ComputerUseConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ComputerUseConfig")
+            .field("endpoint", &self.endpoint)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("timeout_ms", &self.timeout_ms)
+            .field("allow_remote_endpoint", &self.allow_remote_endpoint)
+            .field("window_allowlist", &self.window_allowlist)
+            .field("max_coordinate_x", &self.max_coordinate_x)
+            .field("max_coordinate_y", &self.max_coordinate_y)
+            .finish()
+    }
 }
 
 impl Default for ComputerUseConfig {
@@ -736,7 +750,7 @@ impl BrowserTool {
             }
         });
 
-        let client = reqwest::Client::new();
+        let client = crate::config::build_runtime_proxy_client("tool.browser");
         let mut request = client
             .post(endpoint)
             .timeout(Duration::from_millis(self.computer_use.timeout_ms))
@@ -1211,7 +1225,8 @@ mod native_backend {
                     });
 
                     if let Some(path_str) = path {
-                        std::fs::write(&path_str, &png)
+                        tokio::fs::write(&path_str, &png)
+                            .await
                             .with_context(|| format!("Failed to write screenshot to {path_str}"))?;
                         payload["path"] = Value::String(path_str);
                     } else {

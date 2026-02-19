@@ -1,5 +1,10 @@
 # Agnostic Security: Zero Impact on Portability
 
+> ⚠️ **Status: Proposal / Roadmap**
+>
+> This document describes proposed approaches and may include hypothetical commands or config.
+> For current runtime behavior, see [config-reference.md](config-reference.md), [operations-runbook.md](operations-runbook.md), and [troubleshooting.md](troubleshooting.md).
+
 ## Core Question: Will security features break...
 1. ❓ Fast cross-compilation builds?
 2. ❓ Pluggable architecture (swap anything)?
