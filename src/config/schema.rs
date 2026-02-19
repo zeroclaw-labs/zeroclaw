@@ -2070,6 +2070,12 @@ pub struct ChannelsConfig {
     /// Default: 300s for on-device LLMs (Ollama) which are slower than cloud APIs.
     #[serde(default = "default_channel_message_timeout_secs")]
     pub message_timeout_secs: u64,
+    /// When true, a new message from the same sender cancels any in-flight LLM
+    /// request for that sender. The interrupted message content is preserved in
+    /// conversation history so the new request sees full context.
+    /// Default: false.
+    #[serde(default)]
+    pub interrupt_on_new_message: bool,
 }
 
 fn default_channel_message_timeout_secs() -> u64 {
@@ -2096,6 +2102,7 @@ impl Default for ChannelsConfig {
             dingtalk: None,
             qq: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
+            interrupt_on_new_message: false,
         }
     }
 }
@@ -3537,6 +3544,7 @@ default_temperature = 0.7
                 dingtalk: None,
                 qq: None,
                 message_timeout_secs: 300,
+                interrupt_on_new_message: false,
             },
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -4060,6 +4068,7 @@ allowed_users = ["@ops:matrix.org"]
             dingtalk: None,
             qq: None,
             message_timeout_secs: 300,
+            interrupt_on_new_message: false,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -4237,6 +4246,7 @@ channel_id = "C123"
             dingtalk: None,
             qq: None,
             message_timeout_secs: 300,
+            interrupt_on_new_message: false,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();

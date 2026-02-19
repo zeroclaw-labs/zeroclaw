@@ -142,6 +142,7 @@ struct ChannelRuntimeContext {
     workspace_dir: Arc<PathBuf>,
     message_timeout_secs: u64,
     multimodal: crate::config::MultimodalConfig,
+    interrupt_on_new_message: bool,
 }
 
 fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
@@ -653,6 +654,58 @@ fn spawn_scoped_typing_task(
     handle
 }
 
+/// Wrapper around [`process_channel_message`] that respects a cancellation token.
+///
+/// When the token is cancelled (because a newer message from the same sender
+/// arrived), the in-flight LLM request is aborted. The interrupted message's
+/// user content is preserved in conversation history so the next request has
+/// full context.
+async fn process_channel_message_cancellable(
+    ctx: Arc<ChannelRuntimeContext>,
+    msg: traits::ChannelMessage,
+    cancel: CancellationToken,
+) {
+    let history_key = conversation_history_key(&msg);
+    let sender = msg.sender.clone();
+    let content = msg.content.clone();
+    let channel_name = msg.channel.clone();
+    let reply_target = msg.reply_target.clone();
+
+    tokio::select! {
+        () = cancel.cancelled() => {
+            // The request was interrupted by a newer message from the same sender.
+            // Save the user message to conversation history so the next request
+            // sees it as context.
+            {
+                let mut histories = ctx
+                    .conversation_histories
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let turns = histories.entry(history_key).or_default();
+                turns.push(ChatMessage::user(&content));
+                // Trim to MAX_CHANNEL_HISTORY
+                while turns.len() > MAX_CHANNEL_HISTORY {
+                    turns.remove(0);
+                }
+            }
+
+            // Stop typing indicator if the channel supports it.
+            if let Some(channel) = ctx.channels_by_name.get(&channel_name) {
+                let _ = channel.stop_typing(&reply_target).await;
+            }
+
+            println!(
+                "  ⚡ Cancelled processing for {}: {}",
+                sender,
+                truncate_with_ellipsis(&content, 40)
+            );
+        }
+        () = process_channel_message(Arc::clone(&ctx), msg) => {
+            // Normal completion — nothing extra to do.
+        }
+    }
+}
+
 async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::ChannelMessage) {
     println!(
         "  💬 [{}] from {}: {}",
@@ -962,18 +1015,48 @@ async fn run_message_dispatch_loop(
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_in_flight_messages));
     let mut workers = tokio::task::JoinSet::new();
 
+    // Per-sender task tracking for interrupt_on_new_message.
+    // Maps sender key → cancellation token so we can cancel the in-flight LLM
+    // request when a new message arrives from the same sender.
+    let mut active_senders: HashMap<String, CancellationToken> = HashMap::new();
+
     while let Some(msg) = rx.recv().await {
+        let sender_key = conversation_history_key(&msg);
+
+        // If interrupt is enabled, cancel any in-flight task for this sender.
+        if ctx.interrupt_on_new_message {
+            if let Some(cancel_token) = active_senders.remove(&sender_key) {
+                println!(
+                    "  ⚡ Interrupting in-flight request for {} (new message arrived)",
+                    msg.sender
+                );
+                // Signal cancellation — the `cancelled` branch in
+                // `process_channel_message_cancellable` will save the
+                // interrupted user message to conversation history and
+                // clean up typing indicators before the task exits.
+                cancel_token.cancel();
+            }
+        }
+
         let permit = match Arc::clone(&semaphore).acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => break,
         };
 
         let worker_ctx = Arc::clone(&ctx);
+        let cancel_token = CancellationToken::new();
+        let token_clone = cancel_token.clone();
+
         workers.spawn(async move {
             let _permit = permit;
-            process_channel_message(worker_ctx, msg).await;
+            process_channel_message_cancellable(worker_ctx, msg, token_clone).await;
         });
 
+        if ctx.interrupt_on_new_message {
+            active_senders.insert(sender_key, cancel_token);
+        }
+
+        // Reap completed workers.
         while let Some(result) = workers.try_join_next() {
             log_worker_join_result(result);
         }
@@ -2091,7 +2174,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
         workspace_dir: Arc::new(config.workspace_dir.clone()),
         message_timeout_secs,
         multimodal: config.multimodal.clone(),
+        interrupt_on_new_message: config.channels_config.interrupt_on_new_message,
     });
+
+    if config.channels_config.interrupt_on_new_message {
+        println!("  ⚡ Message interruption: enabled (same-sender cancellation)");
+    }
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
 
@@ -2211,6 +2299,7 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -2593,6 +2682,7 @@ mod tests {
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             multimodal: crate::config::MultimodalConfig::default(),
+            interrupt_on_new_message: false,
         });
 
         process_channel_message(
@@ -2648,6 +2738,7 @@ mod tests {
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             multimodal: crate::config::MultimodalConfig::default(),
+            interrupt_on_new_message: false,
         });
 
         process_channel_message(
@@ -2712,6 +2803,7 @@ mod tests {
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             multimodal: crate::config::MultimodalConfig::default(),
+            interrupt_on_new_message: false,
         });
 
         process_channel_message(
@@ -2797,6 +2889,7 @@ mod tests {
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             multimodal: crate::config::MultimodalConfig::default(),
+            interrupt_on_new_message: false,
         });
 
         process_channel_message(
@@ -2858,6 +2951,7 @@ mod tests {
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             multimodal: crate::config::MultimodalConfig::default(),
+            interrupt_on_new_message: false,
         });
 
         process_channel_message(
@@ -2914,6 +3008,7 @@ mod tests {
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             multimodal: crate::config::MultimodalConfig::default(),
+            interrupt_on_new_message: false,
         });
 
         process_channel_message(
@@ -3021,6 +3116,7 @@ mod tests {
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             multimodal: crate::config::MultimodalConfig::default(),
+            interrupt_on_new_message: false,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -3095,6 +3191,7 @@ mod tests {
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             multimodal: crate::config::MultimodalConfig::default(),
+            interrupt_on_new_message: false,
         });
 
         process_channel_message(
@@ -3493,6 +3590,7 @@ mod tests {
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             multimodal: crate::config::MultimodalConfig::default(),
+            interrupt_on_new_message: false,
         });
 
         process_channel_message(
@@ -3762,5 +3860,260 @@ mod tests {
             .unwrap_or("")
             .contains("listen boom"));
         assert!(calls.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn interrupt_cancels_inflight_request_for_same_sender() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(SlowProvider {
+                delay: Duration::from_millis(500),
+            }),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            multimodal: crate::config::MultimodalConfig::default(),
+            interrupt_on_new_message: true,
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
+
+        // Send first message from alice (will be slow — 500ms)
+        tx.send(traits::ChannelMessage {
+            id: "1".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "alice".to_string(),
+            content: "first message".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+        })
+        .await
+        .unwrap();
+
+        // Small delay so the first message starts processing
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Send second message from alice — should interrupt the first
+        tx.send(traits::ChannelMessage {
+            id: "2".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "alice".to_string(),
+            content: "second message".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 2,
+            thread_ts: None,
+        })
+        .await
+        .unwrap();
+
+        drop(tx);
+
+        run_message_dispatch_loop(rx, runtime_ctx.clone(), 4).await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        // Only the second message should produce a reply (first was interrupted)
+        assert_eq!(
+            sent.len(),
+            1,
+            "expected 1 reply, got {}: {:?}",
+            sent.len(),
+            *sent
+        );
+        assert!(
+            sent[0].contains("echo: second message"),
+            "expected reply to second message, got: {}",
+            sent[0]
+        );
+
+        // The interrupted first message's content should be preserved in history
+        let histories = runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let key = "test-channel_alice";
+        let turns = histories.get(key).expect("history should exist for alice");
+        // Should contain the interrupted user message + the second exchange
+        assert!(
+            turns.iter().any(|t| t.content.contains("first message")),
+            "interrupted message should be in history"
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupt_disabled_processes_all_messages() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(SlowProvider {
+                delay: Duration::from_millis(100),
+            }),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            multimodal: crate::config::MultimodalConfig::default(),
+            interrupt_on_new_message: false,
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
+
+        tx.send(traits::ChannelMessage {
+            id: "1".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "alice".to_string(),
+            content: "hello".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+        })
+        .await
+        .unwrap();
+
+        tx.send(traits::ChannelMessage {
+            id: "2".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "alice".to_string(),
+            content: "world".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 2,
+            thread_ts: None,
+        })
+        .await
+        .unwrap();
+
+        drop(tx);
+
+        run_message_dispatch_loop(rx, runtime_ctx, 4).await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        // Both messages should produce replies when interrupt is disabled
+        assert_eq!(
+            sent.len(),
+            2,
+            "expected 2 replies, got {}: {:?}",
+            sent.len(),
+            *sent
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupt_does_not_affect_different_senders() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(SlowProvider {
+                delay: Duration::from_millis(100),
+            }),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            multimodal: crate::config::MultimodalConfig::default(),
+            interrupt_on_new_message: true,
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
+
+        // Messages from different senders should NOT interrupt each other
+        tx.send(traits::ChannelMessage {
+            id: "1".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "alice".to_string(),
+            content: "hello from alice".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+        })
+        .await
+        .unwrap();
+
+        tx.send(traits::ChannelMessage {
+            id: "2".to_string(),
+            sender: "bob".to_string(),
+            reply_target: "bob".to_string(),
+            content: "hello from bob".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 2,
+            thread_ts: None,
+        })
+        .await
+        .unwrap();
+
+        drop(tx);
+
+        run_message_dispatch_loop(rx, runtime_ctx, 4).await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        // Both should get replies — different senders don't interrupt each other
+        assert_eq!(
+            sent.len(),
+            2,
+            "expected 2 replies, got {}: {:?}",
+            sent.len(),
+            *sent
+        );
     }
 }
