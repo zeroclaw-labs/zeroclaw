@@ -18,7 +18,9 @@ mod tests {
         {
             let source_dir = tmp.path().join("source_skill");
             tokio::fs::create_dir_all(&source_dir).await.unwrap();
-            tokio::fs::write(source_dir.join("SKILL.md"), "# Test Skill\nContent").await.unwrap();
+            tokio::fs::write(source_dir.join("SKILL.md"), "# Test Skill\nContent")
+                .await
+                .unwrap();
 
             let dest_link = skills_path.join("linked_skill");
 
@@ -94,7 +96,9 @@ mod tests {
             // Test case: Symlink outside workspace should be allowed (user responsibility)
             let outside_dir = tmp.path().join("outside_skill");
             tokio::fs::create_dir_all(&outside_dir).await.unwrap();
-            tokio::fs::write(outside_dir.join("SKILL.md"), "# Outside Skill\nContent").await.unwrap();
+            tokio::fs::write(outside_dir.join("SKILL.md"), "# Outside Skill\nContent")
+                .await
+                .unwrap();
 
             let dest_link = skills_path.join("outside_skill");
             let result = std::os::unix::fs::symlink(&outside_dir, &dest_link);

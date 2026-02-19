@@ -223,7 +223,9 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        tokio::fs::create_dir_all(&config.workspace_dir).await.unwrap();
+        tokio::fs::create_dir_all(&config.workspace_dir)
+            .await
+            .unwrap();
         Arc::new(config)
     }
 
@@ -262,7 +264,9 @@ mod tests {
         };
         config.autonomy.allowed_commands = vec!["echo".into()];
         config.autonomy.level = AutonomyLevel::Supervised;
-        tokio::fs::create_dir_all(&config.workspace_dir).await.unwrap();
+        tokio::fs::create_dir_all(&config.workspace_dir)
+            .await
+            .unwrap();
         let cfg = Arc::new(config);
         let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
 
