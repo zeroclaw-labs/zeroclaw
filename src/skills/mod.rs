@@ -354,39 +354,84 @@ fn extract_description(content: &str) -> String {
         .to_string()
 }
 
-/// Build a system prompt addition from all loaded skills
-pub fn skills_to_prompt(skills: &[Skill]) -> String {
+fn append_xml_escaped(out: &mut String, text: &str) {
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(ch),
+        }
+    }
+}
+
+fn write_xml_text_element(out: &mut String, indent: usize, tag: &str, value: &str) {
+    for _ in 0..indent {
+        out.push(' ');
+    }
+    out.push('<');
+    out.push_str(tag);
+    out.push('>');
+    append_xml_escaped(out, value);
+    out.push_str("</");
+    out.push_str(tag);
+    out.push_str(">\n");
+}
+
+/// Build the "Available Skills" system prompt section with full skill instructions.
+pub fn skills_to_prompt(skills: &[Skill], workspace_dir: &Path) -> String {
     use std::fmt::Write;
 
     if skills.is_empty() {
         return String::new();
     }
 
-    let mut prompt = String::from("\n## Active Skills\n\n");
+    let mut prompt = String::from(
+        "## Available Skills\n\n\
+         Skill instructions and tool metadata are preloaded below.\n\
+         Follow these instructions directly; do not read skill files at runtime unless the user asks.\n\n\
+         <available_skills>\n",
+    );
 
     for skill in skills {
-        let _ = writeln!(prompt, "### {} (v{})", skill.name, skill.version);
-        let _ = writeln!(prompt, "{}", skill.description);
+        let _ = writeln!(prompt, "  <skill>");
+        write_xml_text_element(&mut prompt, 4, "name", &skill.name);
+        write_xml_text_element(&mut prompt, 4, "description", &skill.description);
+
+        let location = skill.location.clone().unwrap_or_else(|| {
+            workspace_dir
+                .join("skills")
+                .join(&skill.name)
+                .join("SKILL.md")
+        });
+        write_xml_text_element(&mut prompt, 4, "location", &location.display().to_string());
+
+        if !skill.prompts.is_empty() {
+            let _ = writeln!(prompt, "    <instructions>");
+            for instruction in &skill.prompts {
+                write_xml_text_element(&mut prompt, 6, "instruction", instruction);
+            }
+            let _ = writeln!(prompt, "    </instructions>");
+        }
 
         if !skill.tools.is_empty() {
-            prompt.push_str("Tools:\n");
+            let _ = writeln!(prompt, "    <tools>");
             for tool in &skill.tools {
-                let _ = writeln!(
-                    prompt,
-                    "- **{}**: {} ({})",
-                    tool.name, tool.description, tool.kind
-                );
+                let _ = writeln!(prompt, "      <tool>");
+                write_xml_text_element(&mut prompt, 8, "name", &tool.name);
+                write_xml_text_element(&mut prompt, 8, "description", &tool.description);
+                write_xml_text_element(&mut prompt, 8, "kind", &tool.kind);
+                let _ = writeln!(prompt, "      </tool>");
             }
+            let _ = writeln!(prompt, "    </tools>");
         }
 
-        for p in &skill.prompts {
-            prompt.push_str(p);
-            prompt.push('\n');
-        }
-
-        prompt.push('\n');
+        let _ = writeln!(prompt, "  </skill>");
     }
 
+    prompt.push_str("</available_skills>");
     prompt
 }
 
@@ -683,7 +728,7 @@ command = "echo hello"
 
     #[test]
     fn skills_to_prompt_empty() {
-        let prompt = skills_to_prompt(&[]);
+        let prompt = skills_to_prompt(&[], Path::new("/tmp"));
         assert!(prompt.is_empty());
     }
 
@@ -699,9 +744,10 @@ command = "echo hello"
             prompts: vec!["Do the thing.".to_string()],
             location: None,
         }];
-        let prompt = skills_to_prompt(&skills);
-        assert!(prompt.contains("test"));
-        assert!(prompt.contains("Do the thing"));
+        let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
+        assert!(prompt.contains("<available_skills>"));
+        assert!(prompt.contains("<name>test</name>"));
+        assert!(prompt.contains("<instruction>Do the thing.</instruction>"));
     }
 
     #[test]
@@ -889,11 +935,32 @@ description = "Bare minimum"
             prompts: vec![],
             location: None,
         }];
-        let prompt = skills_to_prompt(&skills);
+        let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
         assert!(prompt.contains("weather"));
-        assert!(prompt.contains("get_weather"));
-        assert!(prompt.contains("Fetch forecast"));
-        assert!(prompt.contains("shell"));
+        assert!(prompt.contains("<name>get_weather</name>"));
+        assert!(prompt.contains("<description>Fetch forecast</description>"));
+        assert!(prompt.contains("<kind>shell</kind>"));
+    }
+
+    #[test]
+    fn skills_to_prompt_escapes_xml_content() {
+        let skills = vec![Skill {
+            name: "xml<skill>".to_string(),
+            description: "A & B".to_string(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: vec![],
+            tools: vec![],
+            prompts: vec!["Use <tool> & check \"quotes\".".to_string()],
+            location: None,
+        }];
+
+        let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
+        assert!(prompt.contains("<name>xml&lt;skill&gt;</name>"));
+        assert!(prompt.contains("<description>A &amp; B</description>"));
+        assert!(prompt.contains(
+            "<instruction>Use &lt;tool&gt; &amp; check &quot;quotes&quot;.</instruction>"
+        ));
     }
 
     #[test]

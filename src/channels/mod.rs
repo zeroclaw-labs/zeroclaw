@@ -1194,7 +1194,7 @@ fn load_openclaw_bootstrap_files(
 /// Follows the `OpenClaw` framework structure by default:
 /// 1. Tooling — tool list + descriptions
 /// 2. Safety — guardrail reminder
-/// 3. Skills — compact list with paths (loaded on-demand)
+/// 3. Skills — full skill instructions and tool metadata
 /// 4. Workspace — working directory
 /// 5. Bootstrap files — AGENTS, SOUL, TOOLS, IDENTITY, USER, BOOTSTRAP, MEMORY
 /// 6. Date & Time — timezone for cache stability
@@ -1271,52 +1271,10 @@ pub fn build_system_prompt(
          - When in doubt, ask before acting externally.\n\n",
     );
 
-    // ── 3. Skills (inline prompts + tools) ──────────────────────
+    // ── 3. Skills (full instructions + tool metadata) ───────────
     if !skills.is_empty() {
-        prompt.push_str("## Available Skills\n\n");
-        prompt.push_str("<available_skills>\n");
-        for skill in skills {
-            let escaped_name = xml_escape(&skill.name);
-            let escaped_description = xml_escape(&skill.description);
-            let _ = writeln!(prompt, "  <skill>");
-            let _ = writeln!(prompt, "    <name>{escaped_name}</name>");
-            let _ = writeln!(
-                prompt,
-                "    <description>{escaped_description}</description>"
-            );
-            let location = skill.location.clone().unwrap_or_else(|| {
-                workspace_dir
-                    .join("skills")
-                    .join(&skill.name)
-                    .join("SKILL.md")
-            });
-            let escaped_location = xml_escape(&location.display().to_string());
-            let _ = writeln!(prompt, "    <location>{escaped_location}</location>");
-            if !skill.tools.is_empty() {
-                let _ = writeln!(prompt, "    <tools>");
-                for tool in &skill.tools {
-                    let escaped_tool_name = xml_escape(&tool.name);
-                    let escaped_tool_kind = xml_escape(&tool.kind);
-                    let escaped_tool_description = xml_escape(&tool.description);
-                    let _ = writeln!(
-                        prompt,
-                        "      <tool name=\"{}\" kind=\"{}\">{}</tool>",
-                        escaped_tool_name, escaped_tool_kind, escaped_tool_description
-                    );
-                }
-                let _ = writeln!(prompt, "    </tools>");
-            }
-            if !skill.prompts.is_empty() {
-                let _ = writeln!(prompt, "    <instructions>");
-                for p in &skill.prompts {
-                    let escaped_prompt = xml_escape(p);
-                    let _ = writeln!(prompt, "      {escaped_prompt}");
-                }
-                let _ = writeln!(prompt, "    </instructions>");
-            }
-            let _ = writeln!(prompt, "  </skill>");
-        }
-        prompt.push_str("</available_skills>\n\n");
+        prompt.push_str(&crate::skills::skills_to_prompt(skills, workspace_dir));
+        prompt.push_str("\n\n");
     }
 
     // ── 4. Workspace ────────────────────────────────────────────
@@ -1397,14 +1355,6 @@ pub fn build_system_prompt(
     } else {
         prompt
     }
-}
-
-fn xml_escape(raw: &str) -> String {
-    raw.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
 }
 
 /// Inject a single workspace file into the prompt with truncation and missing-file markers.
@@ -3692,7 +3642,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_skills_inline_prompts_and_tools() {
+    fn prompt_skills_include_instructions_and_tools() {
         let ws = make_workspace();
         let skills = vec![crate::skills::Skill {
             name: "code-review".into(),
@@ -3701,13 +3651,13 @@ mod tests {
             author: None,
             tags: vec![],
             tools: vec![crate::skills::SkillTool {
-                name: "run_linter".into(),
-                description: "Run linter on code".into(),
+                name: "lint".into(),
+                description: "Run static checks".into(),
                 kind: "shell".into(),
                 command: "cargo clippy".into(),
-                args: std::collections::HashMap::new(),
+                args: HashMap::new(),
             }],
-            prompts: vec!["When reviewing code, check for common bugs and style issues.".into()],
+            prompts: vec!["Always run cargo test before final response.".into()],
             location: None,
         }];
 
@@ -3717,21 +3667,13 @@ mod tests {
         assert!(prompt.contains("<name>code-review</name>"));
         assert!(prompt.contains("<description>Review code for bugs</description>"));
         assert!(prompt.contains("SKILL.md</location>"));
-        // Skill prompts should be inlined
-        assert!(
-            prompt.contains("When reviewing code, check for common bugs"),
-            "skill prompt should be inlined in system prompt"
-        );
-        assert!(
-            prompt.contains("<instructions>"),
-            "should have instructions block"
-        );
-        // Skill tools should be inlined
-        assert!(
-            prompt.contains("run_linter"),
-            "skill tool should be inlined"
-        );
-        assert!(prompt.contains("<tools>"), "should have tools block");
+        assert!(prompt.contains("<instructions>"));
+        assert!(prompt
+            .contains("<instruction>Always run cargo test before final response.</instruction>"));
+        assert!(prompt.contains("<tools>"));
+        assert!(prompt.contains("<name>lint</name>"));
+        assert!(prompt.contains("<kind>shell</kind>"));
+        assert!(!prompt.contains("loaded on demand"));
     }
 
     #[test]
@@ -3748,7 +3690,7 @@ mod tests {
                 description: "Run <lint> & report".into(),
                 kind: "shell&exec".into(),
                 command: "cargo clippy".into(),
-                args: std::collections::HashMap::new(),
+                args: HashMap::new(),
             }],
             prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
             location: None,
@@ -3760,12 +3702,12 @@ mod tests {
         assert!(prompt.contains(
             "<description>Review &quot;unsafe&quot; and &apos;risky&apos; bits</description>"
         ));
-        assert!(
-            prompt.contains(
-                "<tool name=\"run&quot;linter&quot;\" kind=\"shell&amp;exec\">Run &lt;lint&gt; &amp; report</tool>"
-            )
-        );
-        assert!(prompt.contains("Use &lt;tool_call&gt; and &amp; keep output &quot;safe&quot;"));
+        assert!(prompt.contains("<name>run&quot;linter&quot;</name>"));
+        assert!(prompt.contains("<description>Run &lt;lint&gt; &amp; report</description>"));
+        assert!(prompt.contains("<kind>shell&amp;exec</kind>"));
+        assert!(prompt.contains(
+            "<instruction>Use &lt;tool_call&gt; and &amp; keep output &quot;safe&quot;</instruction>"
+        ));
     }
 
     #[test]
