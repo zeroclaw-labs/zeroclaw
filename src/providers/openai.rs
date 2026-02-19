@@ -89,6 +89,20 @@ struct NativeToolFunctionSpec {
     parameters: serde_json::Value,
 }
 
+fn parse_native_tool_spec(value: serde_json::Value) -> anyhow::Result<NativeToolSpec> {
+    let spec: NativeToolSpec = serde_json::from_value(value)
+        .map_err(|e| anyhow::anyhow!("Invalid OpenAI tool specification: {e}"))?;
+
+    if spec.kind != "function" {
+        anyhow::bail!(
+            "Invalid OpenAI tool specification: unsupported tool type '{}', expected 'function'",
+            spec.kind
+        );
+    }
+
+    Ok(spec)
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct NativeToolCall {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -372,9 +386,8 @@ impl Provider for OpenAiProvider {
                 tools
                     .iter()
                     .cloned()
-                    .map(serde_json::from_value::<NativeToolSpec>)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| anyhow::anyhow!("Invalid OpenAI tool specification: {e}"))?,
+                    .map(parse_native_tool_spec)
+                    .collect::<Result<Vec<_>, _>>()?,
             )
         };
 
@@ -657,7 +670,7 @@ mod tests {
                 }
             }
         });
-        let spec: NativeToolSpec = serde_json::from_value(json).unwrap();
+        let spec = parse_native_tool_spec(json).unwrap();
         assert_eq!(spec.kind, "function");
         assert_eq!(spec.function.name, "shell");
     }

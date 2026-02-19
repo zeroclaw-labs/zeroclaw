@@ -153,63 +153,11 @@ impl PromptSection for SkillsSection {
     }
 
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
-        if ctx.skills.is_empty() {
-            return Ok(String::new());
-        }
-
-        let mut prompt = String::from("## Available Skills\n\n<available_skills>\n");
-        for skill in ctx.skills {
-            let location = skill.location.clone().unwrap_or_else(|| {
-                ctx.workspace_dir
-                    .join("skills")
-                    .join(&skill.name)
-                    .join("SKILL.md")
-            });
-            let escaped_name = xml_escape(&skill.name);
-            let escaped_description = xml_escape(&skill.description);
-            let escaped_location = xml_escape(&location.display().to_string());
-            let _ = writeln!(prompt, "  <skill>");
-            let _ = writeln!(prompt, "    <name>{escaped_name}</name>");
-            let _ = writeln!(
-                prompt,
-                "    <description>{escaped_description}</description>"
-            );
-            let _ = writeln!(prompt, "    <location>{escaped_location}</location>");
-            if !skill.tools.is_empty() {
-                let _ = writeln!(prompt, "    <tools>");
-                for tool in &skill.tools {
-                    let escaped_tool_name = xml_escape(&tool.name);
-                    let escaped_tool_kind = xml_escape(&tool.kind);
-                    let escaped_tool_description = xml_escape(&tool.description);
-                    let _ = writeln!(
-                        prompt,
-                        "      <tool name=\"{}\" kind=\"{}\">{}</tool>",
-                        escaped_tool_name, escaped_tool_kind, escaped_tool_description
-                    );
-                }
-                let _ = writeln!(prompt, "    </tools>");
-            }
-            if !skill.prompts.is_empty() {
-                let _ = writeln!(prompt, "    <instructions>");
-                for p in &skill.prompts {
-                    let escaped_prompt = xml_escape(p);
-                    let _ = writeln!(prompt, "      {escaped_prompt}");
-                }
-                let _ = writeln!(prompt, "    </instructions>");
-            }
-            let _ = writeln!(prompt, "  </skill>");
-        }
-        prompt.push_str("</available_skills>");
-        Ok(prompt)
+        Ok(crate::skills::skills_to_prompt(
+            ctx.skills,
+            ctx.workspace_dir,
+        ))
     }
-}
-
-fn xml_escape(raw: &str) -> String {
-    raw.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
 }
 
 impl PromptSection for WorkspaceSection {
@@ -384,6 +332,43 @@ mod tests {
     }
 
     #[test]
+    fn skills_section_includes_instructions_and_tools() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let skills = vec![crate::skills::Skill {
+            name: "deploy".into(),
+            description: "Release safely".into(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: vec![],
+            tools: vec![crate::skills::SkillTool {
+                name: "release_checklist".into(),
+                description: "Validate release readiness".into(),
+                kind: "shell".into(),
+                command: "echo ok".into(),
+                args: std::collections::HashMap::new(),
+            }],
+            prompts: vec!["Run smoke tests before deploy.".into()],
+            location: None,
+        }];
+
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &skills,
+            identity_config: None,
+            dispatcher_instructions: "",
+        };
+
+        let output = SkillsSection.build(&ctx).unwrap();
+        assert!(output.contains("<available_skills>"));
+        assert!(output.contains("<name>deploy</name>"));
+        assert!(output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
+        assert!(output.contains("<name>release_checklist</name>"));
+        assert!(output.contains("<kind>shell</kind>"));
+    }
+
+    #[test]
     fn datetime_section_includes_timestamp_and_timezone() {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let ctx = PromptContext {
@@ -439,11 +424,11 @@ mod tests {
         assert!(prompt.contains(
             "<description>Review &quot;unsafe&quot; and &apos;risky&apos; bits</description>"
         ));
-        assert!(
-            prompt.contains(
-                "<tool name=\"run&quot;linter&quot;\" kind=\"shell&amp;exec\">Run &lt;lint&gt; &amp; report</tool>"
-            )
-        );
-        assert!(prompt.contains("Use &lt;tool_call&gt; and &amp; keep output &quot;safe&quot;"));
+        assert!(prompt.contains("<name>run&quot;linter&quot;</name>"));
+        assert!(prompt.contains("<description>Run &lt;lint&gt; &amp; report</description>"));
+        assert!(prompt.contains("<kind>shell&amp;exec</kind>"));
+        assert!(prompt.contains(
+            "<instruction>Use &lt;tool_call&gt; and &amp; keep output &quot;safe&quot;</instruction>"
+        ));
     }
 }
