@@ -166,6 +166,10 @@ pub(crate) fn is_qianfan_alias(name: &str) -> bool {
     matches!(name, "qianfan" | "baidu")
 }
 
+pub(crate) fn is_doubao_alias(name: &str) -> bool {
+    matches!(name, "doubao" | "volcengine" | "ark" | "doubao-cn")
+}
+
 #[derive(Clone, Copy, Debug)]
 enum MinimaxOauthRegion {
     Global,
@@ -606,6 +610,8 @@ pub(crate) fn canonical_china_provider_name(name: &str) -> Option<&'static str> 
         Some("zai")
     } else if is_qianfan_alias(name) {
         Some("qianfan")
+    } else if is_doubao_alias(name) {
+        Some("doubao")
     } else {
         None
     }
@@ -824,6 +830,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         // not a single API key. Credential resolution happens inside BedrockProvider.
         "bedrock" | "aws-bedrock" => return None,
         name if is_qianfan_alias(name) => vec!["QIANFAN_API_KEY"],
+        name if is_doubao_alias(name) => vec!["ARK_API_KEY", "DOUBAO_API_KEY"],
         name if is_qwen_alias(name) => vec!["DASHSCOPE_API_KEY"],
         name if is_zai_alias(name) => vec!["ZAI_API_KEY"],
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => vec!["NVIDIA_API_KEY"],
@@ -1029,6 +1036,12 @@ fn create_provider_with_url_and_options(
         }
         name if is_qianfan_alias(name) => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Qianfan", "https://aip.baidubce.com", key, AuthStyle::Bearer,
+        ))),
+        name if is_doubao_alias(name) => Ok(Box::new(OpenAiCompatibleProvider::new(
+            "Doubao",
+            "https://ark.cn-beijing.volces.com/api/v3",
+            key,
+            AuthStyle::Bearer,
         ))),
         name if qwen_base_url(name).is_some() => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Qwen",
@@ -1442,6 +1455,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             local: false,
         },
         ProviderInfo {
+            name: "doubao",
+            display_name: "Doubao (Volcengine)",
+            aliases: &["volcengine", "ark", "doubao-cn"],
+            local: false,
+        },
+        ProviderInfo {
             name: "qwen",
             display_name: "Qwen (DashScope / Qwen Code OAuth)",
             aliases: &[
@@ -1730,12 +1749,17 @@ mod tests {
         assert!(is_zai_alias("zai-cn"));
         assert!(is_qianfan_alias("qianfan"));
         assert!(is_qianfan_alias("baidu"));
+        assert!(is_doubao_alias("doubao"));
+        assert!(is_doubao_alias("volcengine"));
+        assert!(is_doubao_alias("ark"));
+        assert!(is_doubao_alias("doubao-cn"));
 
         assert!(!is_moonshot_alias("openrouter"));
         assert!(!is_glm_alias("openai"));
         assert!(!is_qwen_alias("gemini"));
         assert!(!is_zai_alias("anthropic"));
         assert!(!is_qianfan_alias("cohere"));
+        assert!(!is_doubao_alias("deepseek"));
     }
 
     #[test]
@@ -1753,6 +1777,8 @@ mod tests {
         assert_eq!(canonical_china_provider_name("z.ai-cn"), Some("zai"));
         assert_eq!(canonical_china_provider_name("qianfan"), Some("qianfan"));
         assert_eq!(canonical_china_provider_name("baidu"), Some("qianfan"));
+        assert_eq!(canonical_china_provider_name("doubao"), Some("doubao"));
+        assert_eq!(canonical_china_provider_name("volcengine"), Some("doubao"));
         assert_eq!(canonical_china_provider_name("openai"), None);
     }
 
@@ -1924,6 +1950,14 @@ mod tests {
     fn factory_qianfan() {
         assert!(create_provider("qianfan", Some("key")).is_ok());
         assert!(create_provider("baidu", Some("key")).is_ok());
+    }
+
+    #[test]
+    fn factory_doubao() {
+        assert!(create_provider("doubao", Some("key")).is_ok());
+        assert!(create_provider("volcengine", Some("key")).is_ok());
+        assert!(create_provider("ark", Some("key")).is_ok());
+        assert!(create_provider("doubao-cn", Some("key")).is_ok());
     }
 
     #[test]
@@ -2291,6 +2325,7 @@ mod tests {
             "minimax-cn",
             "bedrock",
             "qianfan",
+            "doubao",
             "qwen",
             "qwen-intl",
             "qwen-cn",
