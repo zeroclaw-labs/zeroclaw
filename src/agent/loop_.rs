@@ -17,6 +17,7 @@ use std::fmt::Write;
 use std::io::Write as _;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 /// Minimum characters per chunk when relaying LLM text to a streaming draft.
@@ -983,6 +984,21 @@ struct ParsedToolCall {
     arguments: serde_json::Value,
 }
 
+#[derive(Debug)]
+pub(crate) struct ToolLoopCancelled;
+
+impl std::fmt::Display for ToolLoopCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("tool loop cancelled")
+    }
+}
+
+impl std::error::Error for ToolLoopCancelled {}
+
+pub(crate) fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
+    err.chain().any(|source| source.is::<ToolLoopCancelled>())
+}
+
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
 /// When `silent` is true, suppresses stdout (for channel use).
@@ -1034,6 +1050,7 @@ pub(crate) async fn run_tool_call_loop(
     channel_name: &str,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
+    cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     streaming_enabled: bool,
 ) -> Result<String> {
@@ -1048,6 +1065,13 @@ pub(crate) async fn run_tool_call_loop(
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
 
     for _iteration in 0..max_iterations {
+        if cancellation_token
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(ToolLoopCancelled.into());
+        }
+
         let image_marker_count = multimodal::count_image_markers(history);
         if image_marker_count > 0 && !provider.supports_vision() {
             return Err(ProviderCapabilityError {
@@ -1079,6 +1103,7 @@ pub(crate) async fn run_tool_call_loop(
             None
         };
 
+<<<<<<< HEAD
         // Try streaming first if enabled, provider supports it, and we have on_delta
         let chat_request = ChatRequest {
             messages: &prepared_messages.messages,
@@ -1102,6 +1127,29 @@ pub(crate) async fn run_tool_call_loop(
         let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
             match streaming_result {
                 Some(Ok(result)) => {
+=======
+        let chat_future = provider.chat(
+            ChatRequest {
+                messages: &prepared_messages.messages,
+                tools: request_tools,
+            },
+            model,
+            temperature,
+        );
+
+        let chat_result = if let Some(token) = cancellation_token.as_ref() {
+            tokio::select! {
+                () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                result = chat_future => result,
+            }
+        } else {
+            chat_future.await
+        };
+
+        let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
+            match chat_result {
+                Ok(resp) => {
+>>>>>>> ef82c7d (fix(channels): interrupt in-flight telegram requests on newer sender messages)
                     observer.record_event(&ObserverEvent::LlmResponse {
                         provider: provider_name.to_string(),
                         model: model.to_string(),
@@ -1200,6 +1248,12 @@ pub(crate) async fn run_tool_call_loop(
                 // STREAM_CHUNK_MIN_CHARS characters for progressive draft updates.
                 let mut chunk = String::new();
                 for word in display_text.split_inclusive(char::is_whitespace) {
+                    if cancellation_token
+                        .as_ref()
+                        .is_some_and(CancellationToken::is_cancelled)
+                    {
+                        return Err(ToolLoopCancelled.into());
+                    }
                     chunk.push_str(word);
                     if chunk.len() >= STREAM_CHUNK_MIN_CHARS
                         && tx.send(std::mem::take(&mut chunk)).await.is_err()
@@ -1262,7 +1316,17 @@ pub(crate) async fn run_tool_call_loop(
             });
             let start = Instant::now();
             let result = if let Some(tool) = find_tool(tools_registry, &call.name) {
-                match tool.execute(call.arguments.clone()).await {
+                let tool_future = tool.execute(call.arguments.clone());
+                let tool_result = if let Some(token) = cancellation_token.as_ref() {
+                    tokio::select! {
+                        () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                        result = tool_future => result,
+                    }
+                } else {
+                    tool_future.await
+                };
+
+                match tool_result {
                     Ok(r) => {
                         observer.record_event(&ObserverEvent::ToolCall {
                             tool: call.name.clone(),
@@ -1641,7 +1705,11 @@ pub async fn run(
             &config.multimodal,
             config.agent.max_tool_iterations,
             None,
+<<<<<<< HEAD
             config.reliability.streaming_enabled,
+=======
+            None,
+>>>>>>> ef82c7d (fix(channels): interrupt in-flight telegram requests on newer sender messages)
         )
         .await?;
         final_output = response.clone();
@@ -1760,7 +1828,11 @@ pub async fn run(
                 &config.multimodal,
                 config.agent.max_tool_iterations,
                 None,
+<<<<<<< HEAD
                 config.reliability.streaming_enabled,
+=======
+                None,
+>>>>>>> ef82c7d (fix(channels): interrupt in-flight telegram requests on newer sender messages)
             )
             .await
             {
@@ -2108,7 +2180,11 @@ mod tests {
             &crate::config::MultimodalConfig::default(),
             3,
             None,
+<<<<<<< HEAD
             false,
+=======
+            None,
+>>>>>>> ef82c7d (fix(channels): interrupt in-flight telegram requests on newer sender messages)
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -2152,7 +2228,11 @@ mod tests {
             &multimodal,
             3,
             None,
+<<<<<<< HEAD
             false,
+=======
+            None,
+>>>>>>> ef82c7d (fix(channels): interrupt in-flight telegram requests on newer sender messages)
         )
         .await
         .expect_err("oversized payload must fail");
@@ -2190,7 +2270,11 @@ mod tests {
             &crate::config::MultimodalConfig::default(),
             3,
             None,
+<<<<<<< HEAD
             false,
+=======
+            None,
+>>>>>>> ef82c7d (fix(channels): interrupt in-flight telegram requests on newer sender messages)
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -3020,7 +3104,10 @@ browser_open/url>https://example.com"#;
     fn parse_tool_calls_closing_tag_only_returns_text() {
         let response = "Some text </tool_call> more text";
         let (text, calls) = parse_tool_calls(response);
-        assert!(calls.is_empty(), "closing tag only should not produce calls");
+        assert!(
+            calls.is_empty(),
+            "closing tag only should not produce calls"
+        );
         assert!(
             !text.is_empty(),
             "text around orphaned closing tag should be preserved"
@@ -3069,7 +3156,11 @@ browser_open/url>https://example.com"#;
 
 Let me check the result."#;
         let (text, calls) = parse_tool_calls(response);
-        assert_eq!(calls.len(), 1, "should extract one tool call from mixed content");
+        assert_eq!(
+            calls.len(),
+            1,
+            "should extract one tool call from mixed content"
+        );
         assert_eq!(calls[0].name, "shell");
         assert!(
             text.contains("help you"),
@@ -3091,7 +3182,10 @@ Let me check the result."#;
     fn scrub_credentials_no_sensitive_data() {
         let input = "normal text without any secrets";
         let result = scrub_credentials(input);
-        assert_eq!(result, input, "non-sensitive text should pass through unchanged");
+        assert_eq!(
+            result, input,
+            "non-sensitive text should pass through unchanged"
+        );
     }
 
     #[test]
