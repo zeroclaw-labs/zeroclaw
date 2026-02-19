@@ -648,7 +648,7 @@ impl Default for GatewayConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ComposioConfig {
     /// Enable Composio integration for 1000+ OAuth tools
-    #[serde(default)]
+    #[serde(default, alias = "enable")]
     pub enabled: bool,
     /// Composio API key (stored encrypted when secrets.encrypt = true)
     #[serde(default)]
@@ -4416,6 +4416,21 @@ enabled = true
         assert!(parsed.enabled);
         assert!(parsed.api_key.is_none());
         assert_eq!(parsed.entity_id, "default");
+    }
+
+    #[test]
+    async fn composio_config_enable_alias_accepted() {
+        let toml_str = r#"
+enable = true
+api_key = "test-key"
+entity_id = "default"
+"#;
+        let parsed: ComposioConfig = toml::from_str(toml_str).unwrap();
+        assert!(
+            parsed.enabled,
+            "'enable' must be accepted as alias for 'enabled' (issue #926)"
+        );
+        assert_eq!(parsed.api_key.as_deref(), Some("test-key"));
     }
 
     // ══════════════════════════════════════════════════════════
