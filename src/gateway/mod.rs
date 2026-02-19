@@ -547,10 +547,10 @@ async fn handle_pair(
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let client_key =
+    let rate_key =
         client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
-    if !state.rate_limiter.allow_pair(&client_key) {
-        tracing::warn!("/pair rate limit exceeded for key: {client_key}");
+    if !state.rate_limiter.allow_pair(&rate_key) {
+        tracing::warn!("/pair rate limit exceeded");
         let err = serde_json::json!({
             "error": "Too many pairing requests. Please retry later.",
             "retry_after": RATE_LIMIT_WINDOW_SECS,
@@ -624,10 +624,10 @@ async fn handle_webhook(
     headers: HeaderMap,
     body: Result<Json<WebhookBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
-    let client_key =
+    let rate_key =
         client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
-    if !state.rate_limiter.allow_webhook(&client_key) {
-        tracing::warn!("/webhook rate limit exceeded for key: {client_key}");
+    if !state.rate_limiter.allow_webhook(&rate_key) {
+        tracing::warn!("/webhook rate limit exceeded");
         let err = serde_json::json!({
             "error": "Too many webhook requests. Please retry later.",
             "retry_after": RATE_LIMIT_WINDOW_SECS,
@@ -979,6 +979,13 @@ mod tests {
     use http_body_util::BodyExt;
     use parking_lot::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Generate a random hex secret at runtime to avoid hard-coded cryptographic values.
+    fn generate_test_secret() -> String {
+        use rand::Rng;
+        let bytes: [u8; 32] = rand::rng().random();
+        hex::encode(bytes)
+    }
 
     #[test]
     fn security_body_limit_is_64kb() {
@@ -1518,9 +1525,11 @@ mod tests {
 
     #[test]
     fn webhook_secret_hash_is_deterministic_and_nonempty() {
-        let one = hash_webhook_secret("secret-value");
-        let two = hash_webhook_secret("secret-value");
-        let other = hash_webhook_secret("other-value");
+        let secret_a = generate_test_secret();
+        let secret_b = generate_test_secret();
+        let one = hash_webhook_secret(&secret_a);
+        let two = hash_webhook_secret(&secret_a);
+        let other = hash_webhook_secret(&secret_b);
 
         assert_eq!(one, two);
         assert_ne!(one, other);
@@ -1532,6 +1541,7 @@ mod tests {
         let provider_impl = Arc::new(MockProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let secret = generate_test_secret();
 
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
@@ -1540,7 +1550,7 @@ mod tests {
             temperature: 0.0,
             mem: memory,
             auto_save: false,
-            webhook_secret_hash: Some(Arc::from(hash_webhook_secret("super-secret"))),
+            webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -1570,6 +1580,8 @@ mod tests {
         let provider_impl = Arc::new(MockProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let valid_secret = generate_test_secret();
+        let wrong_secret = generate_test_secret();
 
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
@@ -1578,7 +1590,7 @@ mod tests {
             temperature: 0.0,
             mem: memory,
             auto_save: false,
-            webhook_secret_hash: Some(Arc::from(hash_webhook_secret("super-secret"))),
+            webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&valid_secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -1589,7 +1601,10 @@ mod tests {
         };
 
         let mut headers = HeaderMap::new();
-        headers.insert("X-Webhook-Secret", HeaderValue::from_static("wrong-secret"));
+        headers.insert(
+            "X-Webhook-Secret",
+            HeaderValue::from_str(&wrong_secret).unwrap(),
+        );
 
         let response = handle_webhook(
             State(state),
@@ -1611,6 +1626,7 @@ mod tests {
         let provider_impl = Arc::new(MockProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let secret = generate_test_secret();
 
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
@@ -1619,7 +1635,7 @@ mod tests {
             temperature: 0.0,
             mem: memory,
             auto_save: false,
-            webhook_secret_hash: Some(Arc::from(hash_webhook_secret("super-secret"))),
+            webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -1630,7 +1646,10 @@ mod tests {
         };
 
         let mut headers = HeaderMap::new();
-        headers.insert("X-Webhook-Secret", HeaderValue::from_static("super-secret"));
+        headers.insert(
+            "X-Webhook-Secret",
+            HeaderValue::from_str(&secret).unwrap(),
+        );
 
         let response = handle_webhook(
             State(state),
@@ -1666,14 +1685,13 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_valid() {
-        // Test with known values
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"test body content";
 
-        let signature_header = compute_whatsapp_signature_header(app_secret, body);
+        let signature_header = compute_whatsapp_signature_header(&app_secret, body);
 
         assert!(verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             &signature_header
         ));
@@ -1681,14 +1699,14 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_invalid_wrong_secret() {
-        let app_secret = "correct_secret_key_abc";
-        let wrong_secret = "wrong_secret_key_xyz";
+        let app_secret = generate_test_secret();
+        let wrong_secret = generate_test_secret();
         let body = b"test body content";
 
-        let signature_header = compute_whatsapp_signature_header(wrong_secret, body);
+        let signature_header = compute_whatsapp_signature_header(&wrong_secret, body);
 
         assert!(!verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             &signature_header
         ));
@@ -1696,15 +1714,15 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_invalid_wrong_body() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let original_body = b"original body";
         let tampered_body = b"tampered body";
 
-        let signature_header = compute_whatsapp_signature_header(app_secret, original_body);
+        let signature_header = compute_whatsapp_signature_header(&app_secret, original_body);
 
         // Verify with tampered body should fail
         assert!(!verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             tampered_body,
             &signature_header
         ));
@@ -1712,14 +1730,14 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_missing_prefix() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"test body";
 
         // Signature without "sha256=" prefix
         let signature_header = "abc123def456";
 
         assert!(!verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             signature_header
         ));
@@ -1727,22 +1745,22 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_empty_header() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"test body";
 
-        assert!(!verify_whatsapp_signature(app_secret, body, ""));
+        assert!(!verify_whatsapp_signature(&app_secret, body, ""));
     }
 
     #[test]
     fn whatsapp_signature_invalid_hex() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"test body";
 
         // Invalid hex characters
         let signature_header = "sha256=not_valid_hex_zzz";
 
         assert!(!verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             signature_header
         ));
@@ -1750,13 +1768,13 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_empty_body() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"";
 
-        let signature_header = compute_whatsapp_signature_header(app_secret, body);
+        let signature_header = compute_whatsapp_signature_header(&app_secret, body);
 
         assert!(verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             &signature_header
         ));
@@ -1764,13 +1782,13 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_unicode_body() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = "Hello 🦀 World".as_bytes();
 
-        let signature_header = compute_whatsapp_signature_header(app_secret, body);
+        let signature_header = compute_whatsapp_signature_header(&app_secret, body);
 
         assert!(verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             &signature_header
         ));
@@ -1778,13 +1796,13 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_json_payload() {
-        let app_secret = "test_app_secret_key_xyz";
+        let app_secret = generate_test_secret();
         let body = br#"{"entry":[{"changes":[{"value":{"messages":[{"from":"1234567890","text":{"body":"Hello"}}]}}]}]}"#;
 
-        let signature_header = compute_whatsapp_signature_header(app_secret, body);
+        let signature_header = compute_whatsapp_signature_header(&app_secret, body);
 
         assert!(verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             &signature_header
         ));
@@ -1792,31 +1810,31 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_case_sensitive_prefix() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"test body";
 
-        let hex_sig = compute_whatsapp_signature_hex(app_secret, body);
+        let hex_sig = compute_whatsapp_signature_hex(&app_secret, body);
 
         // Wrong case prefix should fail
         let wrong_prefix = format!("SHA256={hex_sig}");
-        assert!(!verify_whatsapp_signature(app_secret, body, &wrong_prefix));
+        assert!(!verify_whatsapp_signature(&app_secret, body, &wrong_prefix));
 
         // Correct prefix should pass
         let correct_prefix = format!("sha256={hex_sig}");
-        assert!(verify_whatsapp_signature(app_secret, body, &correct_prefix));
+        assert!(verify_whatsapp_signature(&app_secret, body, &correct_prefix));
     }
 
     #[test]
     fn whatsapp_signature_truncated_hex() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"test body";
 
-        let hex_sig = compute_whatsapp_signature_hex(app_secret, body);
+        let hex_sig = compute_whatsapp_signature_hex(&app_secret, body);
         let truncated = &hex_sig[..32]; // Only half the signature
         let signature_header = format!("sha256={truncated}");
 
         assert!(!verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             &signature_header
         ));
@@ -1824,15 +1842,15 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_extra_bytes() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"test body";
 
-        let hex_sig = compute_whatsapp_signature_hex(app_secret, body);
+        let hex_sig = compute_whatsapp_signature_hex(&app_secret, body);
         let extended = format!("{hex_sig}deadbeef");
         let signature_header = format!("sha256={extended}");
 
         assert!(!verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             &signature_header
         ));

@@ -600,12 +600,12 @@ impl TelegramChannel {
         let username = username_opt.unwrap_or("unknown");
         let normalized_username = Self::normalize_identity(username);
 
-        let user_id = message
+        let sender_id = message
             .get("from")
             .and_then(|from| from.get("id"))
             .and_then(serde_json::Value::as_i64);
-        let user_id_str = user_id.map(|id| id.to_string());
-        let normalized_user_id = user_id_str.as_deref().map(Self::normalize_identity);
+        let sender_id_str = sender_id.map(|id| id.to_string());
+        let normalized_sender_id = sender_id_str.as_deref().map(Self::normalize_identity);
 
         let chat_id = message
             .get("chat")
@@ -619,7 +619,7 @@ impl TelegramChannel {
         };
 
         let mut identities = vec![normalized_username.as_str()];
-        if let Some(ref id) = normalized_user_id {
+        if let Some(ref id) = normalized_sender_id {
             identities.push(id.as_str());
         }
 
@@ -631,7 +631,7 @@ impl TelegramChannel {
             if let Some(pairing) = self.pairing.as_ref() {
                 match pairing.try_pair(code) {
                     Ok(Some(_token)) => {
-                        let bind_identity = normalized_user_id.clone().or_else(|| {
+                        let bind_identity = normalized_sender_id.clone().or_else(|| {
                             if normalized_username.is_empty() || normalized_username == "unknown" {
                                 None
                             } else {
@@ -703,12 +703,12 @@ impl TelegramChannel {
         }
 
         tracing::warn!(
-            "Telegram: ignoring message from unauthorized user: username={username}, user_id={}. \
+            "Telegram: ignoring message from unauthorized user: username={username}, sender_id={}. \
 Allowlist Telegram username (without '@') or numeric user ID.",
-            user_id_str.as_deref().unwrap_or("unknown")
+            sender_id_str.as_deref().unwrap_or("unknown")
         );
 
-        let suggested_identity = normalized_user_id
+        let suggested_identity = normalized_sender_id
             .clone()
             .or_else(|| {
                 if normalized_username.is_empty() || normalized_username == "unknown" {
@@ -750,20 +750,20 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .unwrap_or("unknown")
             .to_string();
 
-        let user_id = message
+        let sender_id = message
             .get("from")
             .and_then(|from| from.get("id"))
             .and_then(serde_json::Value::as_i64)
             .map(|id| id.to_string());
 
         let sender_identity = if username == "unknown" {
-            user_id.clone().unwrap_or_else(|| "unknown".to_string())
+            sender_id.clone().unwrap_or_else(|| "unknown".to_string())
         } else {
             username.clone()
         };
 
         let mut identities = vec![username.as_str()];
-        if let Some(id) = user_id.as_deref() {
+        if let Some(id) = sender_id.as_deref() {
             identities.push(id);
         }
 
