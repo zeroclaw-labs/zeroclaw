@@ -26,6 +26,10 @@ const STREAM_CHUNK_MIN_CHARS: usize = 80;
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 
+/// Minimum user-message length (in chars) for auto-save to memory.
+/// Matches the channel-side constant in `channels/mod.rs`.
+const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
+
 static SENSITIVE_KEY_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSet::new([
         r"(?i)token",
@@ -1475,8 +1479,8 @@ pub async fn run(
     let mut final_output = String::new();
 
     if let Some(msg) = message {
-        // Auto-save user message to memory
-        if config.memory.auto_save {
+        // Auto-save user message to memory (skip short/trivial messages)
+        if config.memory.auto_save && msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
             let user_key = autosave_memory_key("user_msg");
             let _ = mem
                 .store(&user_key, &msg, MemoryCategory::Conversation, None)
@@ -1597,8 +1601,10 @@ pub async fn run(
                 _ => {}
             }
 
-            // Auto-save conversation turns
-            if config.memory.auto_save {
+            // Auto-save conversation turns (skip short/trivial messages)
+            if config.memory.auto_save
+                && user_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+            {
                 let user_key = autosave_memory_key("user_msg");
                 let _ = mem
                     .store(&user_key, &user_input, MemoryCategory::Conversation, None)

@@ -81,6 +81,10 @@ use tokio_util::sync::CancellationToken;
 type ConversationHistoryMap = Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>;
 /// Maximum history messages to keep per sender.
 const MAX_CHANNEL_HISTORY: usize = 50;
+/// Minimum user-message length (in chars) for auto-save to memory.
+/// Messages shorter than this (e.g. "ok", "thanks") are not stored,
+/// reducing noise in memory recall.
+const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 
 /// Maximum characters per injected workspace file (matches `OpenClaw` default).
 const BOOTSTRAP_MAX_CHARS: usize = 20_000;
@@ -808,7 +812,7 @@ async fn process_channel_message(
     let memory_context =
         build_memory_context(ctx.memory.as_ref(), &msg.content, ctx.min_relevance_score).await;
 
-    if ctx.auto_save_memory {
+    if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
         let autosave_key = conversation_memory_key(&msg);
         let _ = ctx
             .memory
