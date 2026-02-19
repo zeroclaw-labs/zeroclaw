@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ClawSuite - Orange Background (Final)</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        background: #0f172a;
+        color: #e2e8f0;
+        padding: 3rem;
+      }
+      h1 {
+        text-align: center;
+        margin-bottom: 0.5rem;
+        font-size: 3rem;
+        background: linear-gradient(135deg, #ea580c, #fb923c);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
+      }
+      .subtitle {
+        text-align: center;
+        margin-bottom: 3rem;
+        font-size: 1.25rem;
+        color: #f97316;
+        font-weight: 600;
+      }
+      .hero {
+        max-width: 600px;
+        margin: 0 auto 4rem;
+        background: linear-gradient(135deg, #1e293b, #475569);
+        border-radius: 2rem;
+        padding: 4rem;
+        border: 2px solid #f97316;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        box-shadow: 0 20px 60px rgba(249, 115, 22, 0.3);
+      }
+      .hero img {
+        width: 350px;
+        height: 350px;
+        filter: drop-shadow(0 10px 30px rgba(249, 115, 22, 0.4));
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+        gap: 2rem;
+        max-width: 1400px;
+        margin: 0 auto 4rem;
+      }
+      .card {
+        background: #1e293b;
+        border-radius: 1.5rem;
+        padding: 2rem;
+        border: 1px solid #334155;
+      }
+      .card h2 {
+        text-align: center;
+        margin-bottom: 1.5rem;
+        font-size: 1rem;
+        color: #fb923c;
+        text-transform: uppercase;
+        letter-spacing: 0.1em;
+        font-weight: 700;
+      }
+      .preview-box {
+        aspect-ratio: 1;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 0.75rem;
+        margin-bottom: 1.5rem;
+        position: relative;
+      }
+      .preview-box.dark {
+        background: #0f172a;
+      }
+      .preview-box.light {
+        background: #f8fafc;
+      }
+      .preview-box.sidebar {
+        background: #f3f4f6;
+        padding: 1rem;
+        aspect-ratio: auto;
+        height: auto;
+      }
+      .preview-box img {
+        width: 80%;
+        height: 80%;
+        object-fit: contain;
+      }
+      .sidebar-preview {
+        background: #f3f4f6;
+        border-radius: 0.75rem;
+        padding: 1rem;
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        font-size: 1rem;
+        color: #1f2937;
+        font-weight: 500;
+      }
+      .sidebar-preview img {
+        width: 32px;
+        height: 32px;
+      }
+      .sizes {
+        display: flex;
+        gap: 1rem;
+        justify-content: center;
+        flex-wrap: wrap;
+      }
+      .size-box {
+        background: #0f172a;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 0.5rem;
+        border: 1px solid #334155;
+      }
+      .size-label {
+        font-size: 0.75rem;
+        color: #94a3b8;
+        font-weight: 600;
+      }
+      .banner {
+        max-width: 900px;
+        margin: 0 auto;
+        padding: 2.5rem;
+        background: linear-gradient(135deg, #ea580c, #f97316);
+        border-radius: 1.5rem;
+        text-align: center;
+        color: white;
+      }
+      .banner h3 {
+        font-size: 2rem;
+        margin-bottom: 1rem;
+      }
+      .banner p {
+        font-size: 1.125rem;
+        opacity: 0.95;
+        line-height: 1.6;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>ClawSuite</h1>
+    <div class="subtitle">🔥 Bold Orange Background (Final)</div>
+
+    <div class="hero">
+      <img src="/favicon.svg" alt="ClawSuite Logo" />
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h2>Dark Background</h2>
+        <div class="preview-box dark">
+          <img src="/favicon.svg" alt="Logo on dark" />
+        </div>
+        <div class="sizes">
+          <div class="size-box">
+            <img src="/favicon.svg" style="width: 64px; height: 64px" />
+            <div class="size-label">64px</div>
+          </div>
+          <div class="size-box">
+            <img src="/favicon.svg" style="width: 32px; height: 32px" />
+            <div class="size-label">32px</div>
+          </div>
+          <div class="size-box">
+            <img src="/favicon.svg" style="width: 16px; height: 16px" />
+            <div class="size-label">16px</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Light Background</h2>
+        <div class="preview-box light">
+          <img src="/favicon.svg" alt="Logo on light" />
+        </div>
+        <div class="sizes">
+          <div class="size-box">
+            <img src="/favicon.svg" style="width: 64px; height: 64px" />
+            <div class="size-label">64px</div>
+          </div>
+          <div class="size-box">
+            <img src="/favicon.svg" style="width: 32px; height: 32px" />
+            <div class="size-label">32px</div>
+          </div>
+          <div class="size-box">
+            <img src="/favicon.svg" style="width: 16px; height: 16px" />
+            <div class="size-label">16px</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>In Context</h2>
+        <div class="preview-box sidebar">
+          <div class="sidebar-preview">
+            <img src="/favicon.svg" alt="Logo" />
+            ClawSuite
+          </div>
+        </div>
+        <div class="preview-box sidebar">
+          <div class="sidebar-preview">
+            <img
+              src="/favicon.svg"
+              alt="Logo"
+              style="width: 24px; height: 24px"
+            />
+            New Session
+          </div>
+        </div>
+        <div class="preview-box sidebar">
+          <div class="sidebar-preview">
+            <img
+              src="/favicon.svg"
+              alt="Logo"
+              style="width: 20px; height: 20px"
+            />
+            Settings
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="banner">
+      <h3>✅ This Is It!</h3>
+      <p>
+        <strong>Orange background + dark outlines</strong> – Bold, eye-catching,
+        and instantly recognizable. The perfect balance of warmth,
+        professionalism, and brand identity. Clean design without extra details
+        that get muddy at small sizes.
+      </p>
+    </div>
+  </body>
+</html>

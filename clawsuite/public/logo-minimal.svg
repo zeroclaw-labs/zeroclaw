@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" fill="none">
+  <defs>
+    <linearGradient id="minimalGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#0e7490;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#06b6d4;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  
+  <!-- Abstract geometric claw -->
+  <!-- Left claw -->
+  <path d="M 25 35 Q 20 50, 25 65" 
+        stroke="url(#minimalGradient)" 
+        stroke-width="4" 
+        stroke-linecap="round" 
+        fill="none"/>
+  
+  <!-- Center blade/cursor -->
+  <path d="M 50 30 L 50 70" 
+        stroke="url(#minimalGradient)" 
+        stroke-width="5" 
+        stroke-linecap="round" 
+        fill="none"/>
+  
+  <!-- Right claw -->
+  <path d="M 75 35 Q 80 50, 75 65" 
+        stroke="url(#minimalGradient)" 
+        stroke-width="4" 
+        stroke-linecap="round" 
+        fill="none"/>
+  
+  <!-- Code brackets accent -->
+  <path d="M 30 45 L 27 50 L 30 55" 
+        stroke="url(#minimalGradient)" 
+        stroke-width="2.5" 
+        stroke-linecap="round" 
+        stroke-linejoin="round" 
+        fill="none" 
+        opacity="0.7"/>
+  <path d="M 70 45 L 73 50 L 70 55" 
+        stroke="url(#minimalGradient)" 
+        stroke-width="2.5" 
+        stroke-linecap="round" 
+        stroke-linejoin="round" 
+        fill="none" 
+        opacity="0.7"/>
+</svg>

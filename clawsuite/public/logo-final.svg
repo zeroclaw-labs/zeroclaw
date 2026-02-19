@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" fill="none">
+  <defs>
+    <linearGradient id="orangeOutline" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#ea580c;stop-opacity:1" />
+      <stop offset="50%" style="stop-color:#f97316;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#fb923c;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="darkBg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1e293b;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#334155;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  
+  <!-- Dark background -->
+  <rect x="5" y="5" width="90" height="90" rx="16" fill="url(#darkBg)"/>
+  
+  <!-- Terminal window frame - orange outline, no fill -->
+  <rect x="20" y="25" width="60" height="50" rx="4" stroke="url(#orangeOutline)" stroke-width="3" fill="none"/>
+  
+  <!-- Terminal header dots - orange fill -->
+  <circle cx="28" cy="32" r="2.5" fill="url(#orangeOutline)"/>
+  <circle cx="37" cy="32" r="2.5" fill="url(#orangeOutline)"/>
+  <circle cx="46" cy="32" r="2.5" fill="url(#orangeOutline)"/>
+  
+  <!-- Left claw bracket - orange -->
+  <path d="M 38 45 L 32 50 L 38 55" 
+        stroke="url(#orangeOutline)" 
+        stroke-width="4" 
+        stroke-linecap="round" 
+        stroke-linejoin="round" 
+        fill="none"/>
+  
+  <!-- Right claw bracket - orange -->
+  <path d="M 62 45 L 68 50 L 62 55" 
+        stroke="url(#orangeOutline)" 
+        stroke-width="4" 
+        stroke-linecap="round" 
+        stroke-linejoin="round" 
+        fill="none"/>
+  
+  <!-- Center cursor bar - orange fill -->
+  <rect x="47" y="46" width="4" height="10" rx="2" fill="url(#orangeOutline)">
+    <animate attributeName="opacity" values="1;0.4;1" dur="1.5s" repeatCount="indefinite"/>
+  </rect>
+</svg>

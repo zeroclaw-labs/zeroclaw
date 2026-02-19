@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" fill="none">
+  <defs>
+    <linearGradient id="orangeBgDetail" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#ea580c;stop-opacity:1" />
+      <stop offset="50%" style="stop-color:#f97316;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#fb923c;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  
+  <!-- Orange background -->
+  <rect x="5" y="5" width="90" height="90" rx="12" fill="url(#orangeBgDetail)"/>
+  
+  <!-- Terminal window frame - dark -->
+  <rect x="20" y="25" width="60" height="50" rx="4" stroke="#1e293b" stroke-width="3.5" fill="none"/>
+  
+  <!-- Terminal header dots - dark -->
+  <circle cx="28" cy="32" r="2.5" fill="#1e293b"/>
+  <circle cx="37" cy="32" r="2.5" fill="#1e293b"/>
+  <circle cx="46" cy="32" r="2.5" fill="#1e293b"/>
+  
+  <!-- Left claw bracket - dark -->
+  <path d="M 37 45 L 31 50 L 37 55" stroke="#1e293b" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  <!-- Pincer details -->
+  <path d="M 31 47.5 L 27 47.5" stroke="#1e293b" stroke-width="2.5" stroke-linecap="round" fill="none"/>
+  <path d="M 31 52.5 L 27 52.5" stroke="#1e293b" stroke-width="2.5" stroke-linecap="round" fill="none"/>
+  
+  <!-- Right claw bracket - dark -->
+  <path d="M 63 45 L 69 50 L 63 55" stroke="#1e293b" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  <!-- Pincer details -->
+  <path d="M 69 47.5 L 73 47.5" stroke="#1e293b" stroke-width="2.5" stroke-linecap="round" fill="none"/>
+  <path d="M 69 52.5 L 73 52.5" stroke="#1e293b" stroke-width="2.5" stroke-linecap="round" fill="none"/>
+  
+  <!-- Cursor - dark -->
+  <rect x="46.5" y="47" width="3.5" height="10" rx="1.5" fill="#1e293b">
+    <animate attributeName="opacity" values="1;0.4;1" dur="1.5s" repeatCount="indefinite"/>
+  </rect>
+</svg>

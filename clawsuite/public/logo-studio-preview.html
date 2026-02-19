@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ClawSuite Logo - Orange Edition</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        background: #0f172a;
+        color: #e2e8f0;
+        padding: 3rem;
+      }
+      h1 {
+        text-align: center;
+        margin-bottom: 1rem;
+        font-size: 2.5rem;
+        background: linear-gradient(135deg, #ea580c, #fb923c);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
+      }
+      .subtitle {
+        text-align: center;
+        margin-bottom: 3rem;
+        font-size: 1rem;
+        color: #94a3b8;
+      }
+      .hero {
+        max-width: 600px;
+        margin: 0 auto 4rem;
+        background: linear-gradient(135deg, #1e293b, #334155);
+        border-radius: 1.5rem;
+        padding: 3rem;
+        border: 1px solid #475569;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .hero img {
+        width: 200px;
+        height: 200px;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+        gap: 2rem;
+        max-width: 1200px;
+        margin: 0 auto;
+      }
+      .card {
+        background: #1e293b;
+        border-radius: 1rem;
+        padding: 1.5rem;
+        border: 1px solid #334155;
+      }
+      .card h2 {
+        text-align: center;
+        margin-bottom: 1rem;
+        font-size: 0.875rem;
+        color: #f97316;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+      }
+      .preview-box {
+        aspect-ratio: 1;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 0.5rem;
+        position: relative;
+        margin-bottom: 1rem;
+      }
+      .preview-box.dark {
+        background: #0f172a;
+      }
+      .preview-box.light {
+        background: #f8fafc;
+      }
+      .preview-box.gradient {
+        background: linear-gradient(135deg, #1e293b, #334155);
+      }
+      .preview-box img {
+        width: 70%;
+        height: 70%;
+        object-fit: contain;
+      }
+      .sizes {
+        display: flex;
+        gap: 0.75rem;
+        justify-content: center;
+      }
+      .size-box {
+        background: #0f172a;
+        padding: 0.75rem;
+        border-radius: 0.5rem;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 0.5rem;
+      }
+      .size-label {
+        font-size: 0.75rem;
+        color: #94a3b8;
+      }
+      .features {
+        max-width: 800px;
+        margin: 3rem auto;
+        padding: 2rem;
+        background: #1e293b;
+        border-radius: 1rem;
+        border: 1px solid #334155;
+      }
+      .features h3 {
+        color: #f97316;
+        margin-bottom: 1rem;
+        font-size: 1.25rem;
+      }
+      .features ul {
+        list-style: none;
+        padding: 0;
+      }
+      .features li {
+        padding: 0.5rem 0;
+        padding-left: 1.5rem;
+        position: relative;
+        color: #cbd5e1;
+      }
+      .features li:before {
+        content: '🦞';
+        position: absolute;
+        left: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>ClawSuite</h1>
+    <div class="subtitle">
+      Premium enterprise logo with lobster claw details
+    </div>
+
+    <div class="hero">
+      <img src="/logo-studio.svg" alt="ClawSuite Logo" />
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h2>Dark Background</h2>
+        <div class="preview-box dark">
+          <img src="/logo-studio.svg" alt="Logo on dark" />
+        </div>
+        <div class="sizes">
+          <div class="size-box">
+            <img src="/logo-studio.svg" style="width: 48px; height: 48px" />
+            <div class="size-label">48px</div>
+          </div>
+          <div class="size-box">
+            <img src="/logo-studio.svg" style="width: 32px; height: 32px" />
+            <div class="size-label">32px</div>
+          </div>
+          <div class="size-box">
+            <img src="/logo-studio.svg" style="width: 16px; height: 16px" />
+            <div class="size-label">16px</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Light Background</h2>
+        <div class="preview-box light">
+          <img src="/logo-studio.svg" alt="Logo on light" />
+        </div>
+        <div class="sizes">
+          <div class="size-box">
+            <img src="/logo-studio.svg" style="width: 48px; height: 48px" />
+            <div class="size-label">48px</div>
+          </div>
+          <div class="size-box">
+            <img src="/logo-studio.svg" style="width: 32px; height: 32px" />
+            <div class="size-label">32px</div>
+          </div>
+          <div class="size-box">
+            <img src="/logo-studio.svg" style="width: 16px; height: 16px" />
+            <div class="size-label">16px</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Gradient Background</h2>
+        <div class="preview-box gradient">
+          <img src="/logo-studio.svg" alt="Logo on gradient" />
+        </div>
+        <div class="sizes">
+          <div class="size-box">
+            <img src="/logo-studio.svg" style="width: 48px; height: 48px" />
+            <div class="size-label">48px</div>
+          </div>
+          <div class="size-box">
+            <img src="/logo-studio.svg" style="width: 32px; height: 32px" />
+            <div class="size-label">32px</div>
+          </div>
+          <div class="size-box">
+            <img src="/logo-studio.svg" style="width: 16px; height: 16px" />
+            <div class="size-label">16px</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="features">
+      <h3>Design Features</h3>
+      <ul>
+        <li>Orange gradient (#ea580c → #fb923c) matching OpenClaw brand</li>
+        <li>Terminal window frame representing code/developer tools</li>
+        <li>
+          Lobster claw pincers on the code brackets (< >) for family connection
+        </li>
+        <li>Animated cursor for dynamic feel</li>
+        <li>Scales perfectly from 16px to large sizes</li>
+        <li>Works on any background (light, dark, gradient)</li>
+        <li>Clean vector SVG for crisp rendering</li>
+      </ul>
+    </div>
+  </body>
+</html>

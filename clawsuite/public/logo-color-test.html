@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ClawSuite Logo - Color Test</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        background: #0f172a;
+        color: #e2e8f0;
+        padding: 3rem;
+      }
+      h1 {
+        text-align: center;
+        margin-bottom: 0.5rem;
+        font-size: 2.5rem;
+        background: linear-gradient(135deg, #ea580c, #fb923c);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
+      }
+      .subtitle {
+        text-align: center;
+        margin-bottom: 3rem;
+        font-size: 1.125rem;
+        color: #94a3b8;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 2rem;
+        max-width: 1400px;
+        margin: 0 auto 4rem;
+      }
+      .option {
+        background: #1e293b;
+        border-radius: 1.5rem;
+        padding: 2rem;
+        border: 2px solid #334155;
+        transition: all 0.3s ease;
+      }
+      .option:hover {
+        border-color: #f97316;
+        transform: translateY(-4px);
+        box-shadow: 0 10px 30px rgba(249, 115, 22, 0.2);
+      }
+      .option h2 {
+        text-align: center;
+        margin-bottom: 1.5rem;
+        font-size: 1.25rem;
+        color: #fb923c;
+      }
+      .large-preview {
+        background: linear-gradient(135deg, #0f172a, #1e293b);
+        border-radius: 1rem;
+        padding: 2rem;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        margin-bottom: 1.5rem;
+        min-height: 250px;
+      }
+      .large-preview img {
+        width: 180px;
+        height: 180px;
+        filter: drop-shadow(0 4px 20px rgba(0, 0, 0, 0.3));
+      }
+      .context-tests {
+        display: grid;
+        gap: 1rem;
+      }
+      .test-row {
+        background: #f3f4f6;
+        border-radius: 0.75rem;
+        padding: 1rem;
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+      }
+      .test-row img {
+        width: 32px;
+        height: 32px;
+        flex-shrink: 0;
+      }
+      .test-label {
+        color: #1f2937;
+        font-weight: 500;
+        font-size: 0.95rem;
+      }
+      .tiny-sizes {
+        display: flex;
+        gap: 1rem;
+        justify-content: center;
+        margin-top: 1rem;
+      }
+      .tiny-box {
+        background: #0f172a;
+        padding: 0.75rem;
+        border-radius: 0.5rem;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 0.5rem;
+        border: 1px solid #334155;
+      }
+      .tiny-label {
+        font-size: 0.7rem;
+        color: #94a3b8;
+      }
+      .vote-section {
+        max-width: 800px;
+        margin: 0 auto;
+        background: linear-gradient(135deg, #ea580c, #f97316);
+        border-radius: 1rem;
+        padding: 2rem;
+        text-align: center;
+        color: white;
+      }
+      .vote-section h3 {
+        font-size: 1.75rem;
+        margin-bottom: 1rem;
+      }
+      .vote-section p {
+        font-size: 1rem;
+        opacity: 0.95;
+        line-height: 1.6;
+      }
+      .pros {
+        margin-top: 1rem;
+        text-align: left;
+      }
+      .pros h4 {
+        font-size: 0.875rem;
+        margin-bottom: 0.5rem;
+        opacity: 0.8;
+      }
+      .pros ul {
+        list-style: none;
+        padding-left: 0;
+      }
+      .pros li {
+        padding: 0.25rem 0;
+        padding-left: 1.5rem;
+        position: relative;
+        font-size: 0.875rem;
+      }
+      .pros li:before {
+        content: '✓';
+        position: absolute;
+        left: 0;
+        font-weight: bold;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Logo Color Test</h1>
+    <div class="subtitle">Orange background vs Dark background</div>
+
+    <div class="grid">
+      <!-- Option 1: Simplified Dark BG -->
+      <div class="option">
+        <h2>A. Simplified - Dark Background</h2>
+        <div class="large-preview">
+          <img src="/logo-icon-simple.svg" alt="Simple dark" />
+        </div>
+        <div class="context-tests">
+          <div class="test-row">
+            <img src="/logo-icon-simple.svg" />
+            <div class="test-label">ClawSuite</div>
+          </div>
+          <div class="test-row">
+            <img src="/logo-icon-simple.svg" />
+            <div class="test-label">New Session</div>
+          </div>
+        </div>
+        <div class="tiny-sizes">
+          <div class="tiny-box">
+            <img
+              src="/logo-icon-simple.svg"
+              style="width: 24px; height: 24px"
+            />
+            <div class="tiny-label">24px</div>
+          </div>
+          <div class="tiny-box">
+            <img
+              src="/logo-icon-simple.svg"
+              style="width: 16px; height: 16px"
+            />
+            <div class="tiny-label">16px</div>
+          </div>
+        </div>
+        <div class="pros">
+          <h4>Pros:</h4>
+          <ul>
+            <li>Tech-forward, modern</li>
+            <li>High contrast orange pops</li>
+            <li>Fits dark UI themes</li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- Option 2: Simplified Orange BG -->
+      <div class="option">
+        <h2>B. Simplified - Orange Background</h2>
+        <div class="large-preview">
+          <img src="/logo-inverted-simple.svg" alt="Simple orange" />
+        </div>
+        <div class="context-tests">
+          <div class="test-row">
+            <img src="/logo-inverted-simple.svg" />
+            <div class="test-label">ClawSuite</div>
+          </div>
+          <div class="test-row">
+            <img src="/logo-inverted-simple.svg" />
+            <div class="test-label">New Session</div>
+          </div>
+        </div>
+        <div class="tiny-sizes">
+          <div class="tiny-box">
+            <img
+              src="/logo-inverted-simple.svg"
+              style="width: 24px; height: 24px"
+            />
+            <div class="tiny-label">24px</div>
+          </div>
+          <div class="tiny-box">
+            <img
+              src="/logo-inverted-simple.svg"
+              style="width: 16px; height: 16px"
+            />
+            <div class="tiny-label">16px</div>
+          </div>
+        </div>
+        <div class="pros">
+          <h4>Pros:</h4>
+          <ul>
+            <li>Bold, eye-catching</li>
+            <li>Stands out more</li>
+            <li>Warm, energetic vibe</li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- Option 3: Detailed Dark BG -->
+      <div class="option">
+        <h2>C. Detailed - Dark Background</h2>
+        <div class="large-preview">
+          <img src="/logo-studio-bold.svg" alt="Detailed dark" />
+        </div>
+        <div class="context-tests">
+          <div class="test-row">
+            <img src="/logo-studio-bold.svg" />
+            <div class="test-label">ClawSuite</div>
+          </div>
+          <div class="test-row">
+            <img src="/logo-studio-bold.svg" />
+            <div class="test-label">New Session</div>
+          </div>
+        </div>
+        <div class="tiny-sizes">
+          <div class="tiny-box">
+            <img
+              src="/logo-studio-bold.svg"
+              style="width: 24px; height: 24px"
+            />
+            <div class="tiny-label">24px</div>
+          </div>
+          <div class="tiny-box">
+            <img
+              src="/logo-studio-bold.svg"
+              style="width: 16px; height: 16px"
+            />
+            <div class="tiny-label">16px (busy)</div>
+          </div>
+        </div>
+        <div class="pros">
+          <h4>Pros:</h4>
+          <ul>
+            <li>Terminal window reference</li>
+            <li>Lobster pincer details</li>
+            <li>Professional look</li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- Option 4: Detailed Orange BG -->
+      <div class="option">
+        <h2>D. Detailed - Orange Background</h2>
+        <div class="large-preview">
+          <img src="/logo-inverted-detailed.svg" alt="Detailed orange" />
+        </div>
+        <div class="context-tests">
+          <div class="test-row">
+            <img src="/logo-inverted-detailed.svg" />
+            <div class="test-label">ClawSuite</div>
+          </div>
+          <div class="test-row">
+            <img src="/logo-inverted-detailed.svg" />
+            <div class="test-label">New Session</div>
+          </div>
+        </div>
+        <div class="tiny-sizes">
+          <div class="tiny-box">
+            <img
+              src="/logo-inverted-detailed.svg"
+              style="width: 24px; height: 24px"
+            />
+            <div class="tiny-label">24px</div>
+          </div>
+          <div class="tiny-box">
+            <img
+              src="/logo-inverted-detailed.svg"
+              style="width: 16px; height: 16px"
+            />
+            <div class="tiny-label">16px (busy)</div>
+          </div>
+        </div>
+        <div class="pros">
+          <h4>Pros:</h4>
+          <ul>
+            <li>Most distinctive</li>
+            <li>Warm + detailed</li>
+            <li>Premium badge feel</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="vote-section">
+      <h3>🤔 Which One?</h3>
+      <p><strong>My recommendation: Option B (Simplified Orange)</strong></p>
+      <p style="margin-top: 1rem">
+        Best balance of visibility, brand warmth, and clarity at all sizes. The
+        orange background makes it pop in sidebars, and the simplified design
+        stays readable even at 16px.
+      </p>
+    </div>
+  </body>
+</html>
