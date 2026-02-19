@@ -822,15 +822,14 @@ pub fn create_resilient_provider_with_options(
 
         // Each fallback provider resolves its own credential via provider-
         // specific env vars (e.g. DEEPSEEK_API_KEY for "deepseek") instead
-        // of inheriting the primary provider's key.  Passing `None` lets
+        // of inheriting the primary provider's key. Passing `None` lets
         // `resolve_provider_credential` check the correct env var for the
         // fallback provider name.
         //
-        // Route through `create_provider_with_url` (not
-        // `create_provider_with_options`) so that `custom:` URL prefixes
-        // (e.g. "custom:http://host.docker.internal:1234/v1") work as
-        // fallback entries.
-        match create_provider_with_url(fallback, None, None) {
+        // Keep using `create_provider_with_options` so fallback entries that
+        // require runtime options (for example Codex auth profile overrides)
+        // continue to work.
+        match create_provider_with_options(fallback, None, options) {
             Ok(provider) => providers.push((fallback.clone(), provider)),
             Err(_error) => {
                 tracing::warn!(
