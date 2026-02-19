@@ -5428,7 +5428,8 @@ mod tests {
 
         let config = Config {
             workspace_dir: tmp.path().to_path_buf(),
-            default_provider: Some("venice".to_string()),
+            // Use a non-provider channel key to keep this test deterministic and offline.
+            default_provider: Some("imessage".to_string()),
             ..Config::default()
         };
 

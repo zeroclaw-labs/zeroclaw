@@ -2166,7 +2166,7 @@ mod tests {
     }
 
     #[test]
-    fn strip_think_tags_removes_multiple_blocks() {
+    fn strip_think_tags_removes_multiple_blocks_with_surrounding_text() {
         let input = "Answer A <think>hidden 1</think> and B <think>hidden 2</think> done";
         let output = strip_think_tags(input);
         assert_eq!(output, "Answer A  and B  done");
