@@ -1,0 +1,83 @@
+name: CI Build (Fast)
+
+# Optional accelerated release build using cargo-slicer.
+# Runs alongside the normal Build (Smoke) job — does not gate merges.
+# Stubs 2,059 unreachable library functions to skip LLVM codegen,
+# saving ~29% wall time on 2-vCPU runners.
+#
+# See docs/cargo-slicer-speedup.md for benchmarks and details.
+
+on:
+    push:
+        branches: [main]
+    pull_request:
+        branches: [main]
+
+concurrency:
+    group: ci-fast-${{ github.event.pull_request.number || github.sha }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+
+env:
+    CARGO_TERM_COLOR: always
+    CARGO_SLICER_VERSION: "0.0.2"
+
+jobs:
+    changes:
+        name: Detect Change Scope
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        outputs:
+            rust_changed: ${{ steps.scope.outputs.rust_changed }}
+            docs_only: ${{ steps.scope.outputs.docs_only }}
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+              with:
+                  fetch-depth: 0
+            - name: Detect docs-only changes
+              id: scope
+              shell: bash
+              env:
+                  EVENT_NAME: ${{ github.event_name }}
+                  BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+              run: ./scripts/ci/detect_change_scope.sh
+
+    build-fast:
+        name: Build (Fast — cargo-slicer)
+        needs: [changes]
+        if: needs.changes.outputs.rust_changed == 'true'
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        timeout-minutes: 25
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # nightly
+              with:
+                  toolchain: nightly
+                  components: rust-src, rustc-dev, llvm-tools-preview
+
+            - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
+              with:
+                  prefix-key: fast-build
+                  cache-targets: true
+
+            - name: Install cargo-slicer
+              run: |
+                  cargo install cargo-slicer --locked 2>/dev/null \
+                    || cargo install cargo-slicer
+                  cargo +nightly install cargo-slicer --profile release-rustc \
+                    --bin cargo-slicer-rustc --bin cargo_slicer_dispatch \
+                    --features rustc-driver --locked 2>/dev/null \
+                    || cargo +nightly install cargo-slicer --profile release-rustc \
+                      --bin cargo-slicer-rustc --bin cargo_slicer_dispatch \
+                      --features rustc-driver
+
+            - name: Pre-analyze workspace
+              run: cargo-slicer pre-analyze
+
+            - name: Build release binary (virtual slicing)
+              run: |
+                  CARGO_SLICER_VIRTUAL=1 CARGO_SLICER_CODEGEN_FILTER=1 \
+                    RUSTC_WRAPPER=$(which cargo_slicer_dispatch) \
+                    cargo +nightly build --release --verbose
