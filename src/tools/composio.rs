@@ -517,11 +517,10 @@ impl Tool for ComposioTool {
                     })?;
 
                 let params = args.get("params").cloned().unwrap_or(json!({}));
-                let connected_account_ref =
-                    args.get("connected_account_id").and_then(|v| v.as_str());
+                let acct_ref = args.get("connected_account_id").and_then(|v| v.as_str());
 
                 match self
-                    .execute_action(action_name, params, Some(entity_id), connected_account_ref)
+                    .execute_action(action_name, params, Some(entity_id), acct_ref)
                     .await
                 {
                     Ok(result) => {

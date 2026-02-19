@@ -121,12 +121,12 @@ impl AuthService {
             return Ok(None);
         };
 
-        let token = match profile.kind {
+        let credential = match profile.kind {
             AuthProfileKind::Token => profile.token,
             AuthProfileKind::OAuth => profile.token_set.map(|t| t.access_token),
         };
 
-        Ok(token.filter(|t| !t.trim().is_empty()))
+        Ok(credential.filter(|t| !t.trim().is_empty()))
     }
 
     pub async fn get_valid_openai_access_token(

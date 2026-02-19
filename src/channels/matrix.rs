@@ -24,7 +24,7 @@ pub struct MatrixChannel {
     access_token: String,
     room_id: String,
     allowed_users: Vec<String>,
-    session_user_id_hint: Option<String>,
+    session_owner_hint: Option<String>,
     session_device_id_hint: Option<String>,
     resolved_room_id_cache: Arc<RwLock<Option<String>>>,
     sdk_client: Arc<OnceCell<MatrixSdkClient>>,
@@ -108,7 +108,7 @@ impl MatrixChannel {
         access_token: String,
         room_id: String,
         allowed_users: Vec<String>,
-        user_id_hint: Option<String>,
+        owner_hint: Option<String>,
         device_id_hint: Option<String>,
     ) -> Self {
         let homeserver = homeserver.trim_end_matches('/').to_string();
@@ -125,7 +125,7 @@ impl MatrixChannel {
             access_token,
             room_id,
             allowed_users,
-            session_user_id_hint: Self::normalize_optional_field(user_id_hint),
+            session_owner_hint: Self::normalize_optional_field(owner_hint),
             session_device_id_hint: Self::normalize_optional_field(device_id_hint),
             resolved_room_id_cache: Arc::new(RwLock::new(None)),
             sdk_client: Arc::new(OnceCell::new()),
@@ -245,7 +245,7 @@ impl MatrixChannel {
                 let whoami = match identity {
                     Ok(whoami) => Some(whoami),
                     Err(error) => {
-                        if self.session_user_id_hint.is_some() && self.session_device_id_hint.is_some()
+                        if self.session_owner_hint.is_some() && self.session_device_id_hint.is_some()
                         {
                             tracing::warn!(
                                 "Matrix whoami failed; falling back to configured session hints for E2EE session restore: {error}"
@@ -258,7 +258,7 @@ impl MatrixChannel {
                 };
 
                 let resolved_user_id = if let Some(whoami) = whoami.as_ref() {
-                    if let Some(hinted) = self.session_user_id_hint.as_ref() {
+                    if let Some(hinted) = self.session_owner_hint.as_ref() {
                         if hinted != &whoami.user_id {
                             tracing::warn!(
                                 "Matrix configured user_id '{}' does not match whoami '{}'; using whoami.",
@@ -269,7 +269,7 @@ impl MatrixChannel {
                     }
                     whoami.user_id.clone()
                 } else {
-                    self.session_user_id_hint.clone().ok_or_else(|| {
+                    self.session_owner_hint.clone().ok_or_else(|| {
                         anyhow::anyhow!(
                             "Matrix session restore requires user_id when whoami is unavailable"
                         )
@@ -513,7 +513,7 @@ impl Channel for MatrixChannel {
         let my_user_id: OwnedUserId = match self.get_my_user_id().await {
             Ok(user_id) => user_id.parse()?,
             Err(error) => {
-                if let Some(hinted) = self.session_user_id_hint.as_ref() {
+                if let Some(hinted) = self.session_owner_hint.as_ref() {
                     tracing::warn!(
                         "Matrix whoami failed while resolving listener user_id; using configured user_id hint: {error}"
                     );
@@ -714,7 +714,7 @@ mod tests {
             Some("  DEVICE123  ".to_string()),
         );
 
-        assert_eq!(ch.session_user_id_hint.as_deref(), Some("@bot:matrix.org"));
+        assert_eq!(ch.session_owner_hint.as_deref(), Some("@bot:matrix.org"));
         assert_eq!(ch.session_device_id_hint.as_deref(), Some("DEVICE123"));
     }
 
@@ -729,7 +729,7 @@ mod tests {
             Some("".to_string()),
         );
 
-        assert!(ch.session_user_id_hint.is_none());
+        assert!(ch.session_owner_hint.is_none());
         assert!(ch.session_device_id_hint.is_none());
     }
 

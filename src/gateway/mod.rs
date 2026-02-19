@@ -547,10 +547,10 @@ async fn handle_pair(
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let client_key =
+    let rate_key =
         client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
-    if !state.rate_limiter.allow_pair(&client_key) {
-        tracing::warn!("/pair rate limit exceeded for key: {client_key}");
+    if !state.rate_limiter.allow_pair(&rate_key) {
+        tracing::warn!("/pair rate limit exceeded");
         let err = serde_json::json!({
             "error": "Too many pairing requests. Please retry later.",
             "retry_after": RATE_LIMIT_WINDOW_SECS,
@@ -624,10 +624,10 @@ async fn handle_webhook(
     headers: HeaderMap,
     body: Result<Json<WebhookBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
-    let client_key =
+    let rate_key =
         client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
-    if !state.rate_limiter.allow_webhook(&client_key) {
-        tracing::warn!("/webhook rate limit exceeded for key: {client_key}");
+    if !state.rate_limiter.allow_webhook(&rate_key) {
+        tracing::warn!("/webhook rate limit exceeded");
         let err = serde_json::json!({
             "error": "Too many webhook requests. Please retry later.",
             "retry_after": RATE_LIMIT_WINDOW_SECS,
