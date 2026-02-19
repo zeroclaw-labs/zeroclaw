@@ -1749,7 +1749,6 @@ async fn process_channel_message(
                 } else {
                     sanitized_response
                 };
-            };
 
             // Extract condensed tool-use context from the history messages
             // added during run_tool_call_loop, so the LLM retains awareness

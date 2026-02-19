@@ -21,12 +21,7 @@ impl HookHandler for CounterHook {
         self.gateway_starts.fetch_add(1, Ordering::SeqCst);
     }
 
-    async fn on_after_tool_call(
-        &self,
-        _tool: &str,
-        _result: &ToolResult,
-        _duration: Duration,
-    ) {
+    async fn on_after_tool_call(&self, _tool: &str, _result: &ToolResult, _duration: Duration) {
         self.tool_calls.fetch_add(1, Ordering::SeqCst);
     }
 }
