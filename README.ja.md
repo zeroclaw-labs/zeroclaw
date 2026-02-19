@@ -142,6 +142,106 @@ zeroclaw gateway
 zeroclaw daemon
 ```
 
+## Subscription Auth（OpenAI Codex / Claude Code）
+
+ZeroClaw はサブスクリプションベースのネイティブ認証プロファイルをサポートしています（マルチアカウント対応、保存時暗号化）。
+
+- 保存先: `~/.zeroclaw/auth-profiles.json`
+- 暗号化キー: `~/.zeroclaw/.secret_key`
+- Profile ID 形式: `<provider>:<profile_name>`（例: `openai-codex:work`）
+
+OpenAI Codex OAuth（ChatGPT サブスクリプション）:
+
+```bash
+# サーバー/ヘッドレス環境向け推奨
+zeroclaw auth login --provider openai-codex --device-code
+
+# ブラウザ/コールバックフロー（ペーストフォールバック付き）
+zeroclaw auth login --provider openai-codex --profile default
+zeroclaw auth paste-redirect --provider openai-codex --profile default
+
+# 確認 / リフレッシュ / プロファイル切替
+zeroclaw auth status
+zeroclaw auth refresh --provider openai-codex --profile default
+zeroclaw auth use --provider openai-codex --profile work
+```
+
+Claude Code / Anthropic setup-token:
+
+```bash
+# サブスクリプション/setup token の貼り付け（Authorization header モード）
+zeroclaw auth paste-token --provider anthropic --profile default --auth-kind authorization
+
+# エイリアスコマンド
+zeroclaw auth setup-token --provider anthropic --profile default
+```
+
+Subscription auth で agent を実行:
+
+```bash
+zeroclaw agent --provider openai-codex -m "hello"
+zeroclaw agent --provider openai-codex --auth-profile openai-codex:work -m "hello"
+
+# Anthropic は API key と auth token の両方の環境変数をサポート:
+# ANTHROPIC_AUTH_TOKEN, ANTHROPIC_OAUTH_TOKEN, ANTHROPIC_API_KEY
+zeroclaw agent --provider anthropic -m "hello"
+```
+
+## アーキテクチャ
+
+すべてのサブシステムは **Trait** — 設定変更だけで実装を差し替え可能、コード変更不要。
+
+<p align="center">
+  <img src="docs/architecture.svg" alt="ZeroClaw アーキテクチャ" width="900" />
+</p>
+
+| サブシステム | Trait | 内蔵実装 | 拡張方法 |
+|-------------|-------|----------|----------|
+| **AI モデル** | `Provider` | `zeroclaw providers` で確認（現在 28 個の組み込み + エイリアス、カスタムエンドポイント対応） | `custom:https://your-api.com`（OpenAI 互換）または `anthropic-custom:https://your-api.com` |
+| **チャネル** | `Channel` | CLI, Telegram, Discord, Slack, Mattermost, iMessage, Matrix, Signal, WhatsApp, Email, IRC, Lark, DingTalk, QQ, Webhook | 任意のメッセージ API |
+| **メモリ** | `Memory` | SQLite ハイブリッド検索, PostgreSQL バックエンド, Lucid ブリッジ, Markdown ファイル, 明示的 `none` バックエンド, スナップショット/復元, オプション応答キャッシュ | 任意の永続化バックエンド |
+| **ツール** | `Tool` | shell/file/memory, cron/schedule, git, pushover, browser, http_request, screenshot/image_info, composio (opt-in), delegate, ハードウェアツール | 任意の機能 |
+| **オブザーバビリティ** | `Observer` | Noop, Log, Multi | Prometheus, OTel |
+| **ランタイム** | `RuntimeAdapter` | Native, Docker（サンドボックス） | adapter 経由で追加可能；未対応の kind は即座にエラー |
+| **セキュリティ** | `SecurityPolicy` | Gateway ペアリング, サンドボックス, allowlist, レート制限, ファイルシステムスコープ, 暗号化シークレット | — |
+| **アイデンティティ** | `IdentityConfig` | OpenClaw (markdown), AIEOS v1.1 (JSON) | 任意の ID フォーマット |
+| **トンネル** | `Tunnel` | None, Cloudflare, Tailscale, ngrok, Custom | 任意のトンネルバイナリ |
+| **ハートビート** | Engine | HEARTBEAT.md 定期タスク | — |
+| **スキル** | Loader | TOML マニフェスト + SKILL.md インストラクション | コミュニティスキルパック |
+| **インテグレーション** | Registry | 9 カテゴリ、70 件以上の連携 | プラグインシステム |
+
+### ランタイムサポート（現状）
+
+- ✅ 現在サポート: `runtime.kind = "native"` または `runtime.kind = "docker"`
+- 🚧 計画中（未実装）: WASM / エッジランタイム
+
+未対応の `runtime.kind` が設定された場合、ZeroClaw は native へのサイレントフォールバックではなく、明確なエラーで終了します。
+
+### メモリシステム（フルスタック検索エンジン）
+
+すべて自社実装、外部依存ゼロ — Pinecone、Elasticsearch、LangChain 不要:
+
+| レイヤー | 実装 |
+|---------|------|
+| **ベクトル DB** | Embeddings を SQLite に BLOB として保存、コサイン類似度検索 |
+| **キーワード検索** | FTS5 仮想テーブル、BM25 スコアリング |
+| **ハイブリッドマージ** | カスタム重み付きマージ関数（`vector.rs`） |
+| **Embeddings** | `EmbeddingProvider` trait — OpenAI、カスタム URL、または noop |
+| **チャンキング** | 行ベースの Markdown チャンカー（見出し構造保持） |
+| **キャッシュ** | SQLite `embedding_cache` テーブル、LRU エビクション |
+| **安全な再インデックス** | FTS5 再構築 + 欠落ベクトルの再埋め込みをアトミックに実行 |
+
+Agent はツール経由でメモリの呼び出し・保存・管理を自動的に行います。
+
+```toml
+[memory]
+backend = "sqlite"             # "sqlite", "lucid", "postgres", "markdown", "none"
+auto_save = true
+embedding_provider = "none"    # "none", "openai", "custom:https://..."
+vector_weight = 0.7
+keyword_weight = 0.3
+```
+
 ## セキュリティのデフォルト
 
 - Gateway の既定バインド: `127.0.0.1:3000`

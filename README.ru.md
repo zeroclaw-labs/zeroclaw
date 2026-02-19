@@ -142,6 +142,106 @@ zeroclaw gateway
 zeroclaw daemon
 ```
 
+## Subscription Auth (OpenAI Codex / Claude Code)
+
+ZeroClaw поддерживает нативные профили авторизации на основе подписки (мультиаккаунт, шифрование при хранении).
+
+- Файл хранения: `~/.zeroclaw/auth-profiles.json`
+- Ключ шифрования: `~/.zeroclaw/.secret_key`
+- Формат Profile ID: `<provider>:<profile_name>` (пример: `openai-codex:work`)
+
+OpenAI Codex OAuth (подписка ChatGPT):
+
+```bash
+# Рекомендуется для серверов/headless-окружений
+zeroclaw auth login --provider openai-codex --device-code
+
+# Браузерный/callback-поток с paste-фолбэком
+zeroclaw auth login --provider openai-codex --profile default
+zeroclaw auth paste-redirect --provider openai-codex --profile default
+
+# Проверка / обновление / переключение профиля
+zeroclaw auth status
+zeroclaw auth refresh --provider openai-codex --profile default
+zeroclaw auth use --provider openai-codex --profile work
+```
+
+Claude Code / Anthropic setup-token:
+
+```bash
+# Вставка subscription/setup token (режим Authorization header)
+zeroclaw auth paste-token --provider anthropic --profile default --auth-kind authorization
+
+# Команда-алиас
+zeroclaw auth setup-token --provider anthropic --profile default
+```
+
+Запуск agent с subscription auth:
+
+```bash
+zeroclaw agent --provider openai-codex -m "hello"
+zeroclaw agent --provider openai-codex --auth-profile openai-codex:work -m "hello"
+
+# Anthropic поддерживает и API key, и auth token через переменные окружения:
+# ANTHROPIC_AUTH_TOKEN, ANTHROPIC_OAUTH_TOKEN, ANTHROPIC_API_KEY
+zeroclaw agent --provider anthropic -m "hello"
+```
+
+## Архитектура
+
+Каждая подсистема — это **Trait**: меняйте реализации через конфигурацию, без изменения кода.
+
+<p align="center">
+  <img src="docs/architecture.svg" alt="Архитектура ZeroClaw" width="900" />
+</p>
+
+| Подсистема | Trait | Встроенные реализации | Расширение |
+|-----------|-------|---------------------|------------|
+| **AI-модели** | `Provider` | Каталог через `zeroclaw providers` (сейчас 28 встроенных + алиасы, плюс пользовательские endpoint) | `custom:https://your-api.com` (OpenAI-совместимый) или `anthropic-custom:https://your-api.com` |
+| **Каналы** | `Channel` | CLI, Telegram, Discord, Slack, Mattermost, iMessage, Matrix, Signal, WhatsApp, Email, IRC, Lark, DingTalk, QQ, Webhook | Любой messaging API |
+| **Память** | `Memory` | SQLite гибридный поиск, PostgreSQL-бэкенд, Lucid-мост, Markdown-файлы, явный `none`-бэкенд, snapshot/hydrate, опциональный кэш ответов | Любой persistence-бэкенд |
+| **Инструменты** | `Tool` | shell/file/memory, cron/schedule, git, pushover, browser, http_request, screenshot/image_info, composio (opt-in), delegate, аппаратные инструменты | Любая функциональность |
+| **Наблюдаемость** | `Observer` | Noop, Log, Multi | Prometheus, OTel |
+| **Runtime** | `RuntimeAdapter` | Native, Docker (sandbox) | Через adapter; неподдерживаемые kind завершаются с ошибкой |
+| **Безопасность** | `SecurityPolicy` | Gateway pairing, sandbox, allowlist, rate limits, scoping файловой системы, шифрование секретов | — |
+| **Идентификация** | `IdentityConfig` | OpenClaw (markdown), AIEOS v1.1 (JSON) | Любой формат идентификации |
+| **Туннели** | `Tunnel` | None, Cloudflare, Tailscale, ngrok, Custom | Любой tunnel-бинарник |
+| **Heartbeat** | Engine | HEARTBEAT.md — периодические задачи | — |
+| **Навыки** | Loader | TOML-манифесты + SKILL.md-инструкции | Пакеты навыков сообщества |
+| **Интеграции** | Registry | 70+ интеграций в 9 категориях | Плагинная система |
+
+### Поддержка runtime (текущая)
+
+- ✅ Поддерживается сейчас: `runtime.kind = "native"` или `runtime.kind = "docker"`
+- 🚧 Запланировано, но ещё не реализовано: WASM / edge-runtime
+
+При указании неподдерживаемого `runtime.kind` ZeroClaw завершается с явной ошибкой, а не молча откатывается к native.
+
+### Система памяти (полнофункциональный поисковый движок)
+
+Полностью собственная реализация, ноль внешних зависимостей — без Pinecone, Elasticsearch, LangChain:
+
+| Уровень | Реализация |
+|---------|-----------|
+| **Векторная БД** | Embeddings хранятся как BLOB в SQLite, поиск по косинусному сходству |
+| **Поиск по ключевым словам** | Виртуальные таблицы FTS5 со скорингом BM25 |
+| **Гибридное слияние** | Пользовательская взвешенная функция слияния (`vector.rs`) |
+| **Embeddings** | Trait `EmbeddingProvider` — OpenAI, пользовательский URL или noop |
+| **Чанкинг** | Построчный Markdown-чанкер с сохранением заголовков |
+| **Кэширование** | Таблица `embedding_cache` в SQLite с LRU-вытеснением |
+| **Безопасная переиндексация** | Атомарная перестройка FTS5 + повторное встраивание отсутствующих векторов |
+
+Agent автоматически вспоминает, сохраняет и управляет памятью через инструменты.
+
+```toml
+[memory]
+backend = "sqlite"             # "sqlite", "lucid", "postgres", "markdown", "none"
+auto_save = true
+embedding_provider = "none"    # "none", "openai", "custom:https://..."
+vector_weight = 0.7
+keyword_weight = 0.3
+```
+
 ## Важные security-дефолты
 
 - Gateway по умолчанию: `127.0.0.1:3000`

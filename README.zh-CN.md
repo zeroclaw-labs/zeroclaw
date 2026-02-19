@@ -147,6 +147,106 @@ zeroclaw gateway
 zeroclaw daemon
 ```
 
+## Subscription Auth（OpenAI Codex / Claude Code）
+
+ZeroClaw 现已支持基于订阅的原生鉴权配置（多账号、静态加密存储）。
+
+- 配置文件：`~/.zeroclaw/auth-profiles.json`
+- 加密密钥：`~/.zeroclaw/.secret_key`
+- Profile ID 格式：`<provider>:<profile_name>`（例：`openai-codex:work`）
+
+OpenAI Codex OAuth（ChatGPT 订阅）：
+
+```bash
+# 推荐用于服务器/无显示器环境
+zeroclaw auth login --provider openai-codex --device-code
+
+# 浏览器/回调流程，支持粘贴回退
+zeroclaw auth login --provider openai-codex --profile default
+zeroclaw auth paste-redirect --provider openai-codex --profile default
+
+# 检查 / 刷新 / 切换 profile
+zeroclaw auth status
+zeroclaw auth refresh --provider openai-codex --profile default
+zeroclaw auth use --provider openai-codex --profile work
+```
+
+Claude Code / Anthropic setup-token：
+
+```bash
+# 粘贴订阅/setup token（Authorization header 模式）
+zeroclaw auth paste-token --provider anthropic --profile default --auth-kind authorization
+
+# 别名命令
+zeroclaw auth setup-token --provider anthropic --profile default
+```
+
+使用 subscription auth 运行 agent：
+
+```bash
+zeroclaw agent --provider openai-codex -m "hello"
+zeroclaw agent --provider openai-codex --auth-profile openai-codex:work -m "hello"
+
+# Anthropic 同时支持 API key 和 auth token 环境变量：
+# ANTHROPIC_AUTH_TOKEN, ANTHROPIC_OAUTH_TOKEN, ANTHROPIC_API_KEY
+zeroclaw agent --provider anthropic -m "hello"
+```
+
+## 架构
+
+每个子系统都是一个 **Trait** — 通过配置切换即可更换实现，无需修改代码。
+
+<p align="center">
+  <img src="docs/architecture.svg" alt="ZeroClaw 架构图" width="900" />
+</p>
+
+| 子系统 | Trait | 内置实现 | 扩展方式 |
+|--------|-------|----------|----------|
+| **AI 模型** | `Provider` | 通过 `zeroclaw providers` 查看（当前 28 个内置 + 别名，以及自定义端点） | `custom:https://your-api.com`（OpenAI 兼容）或 `anthropic-custom:https://your-api.com` |
+| **通道** | `Channel` | CLI, Telegram, Discord, Slack, Mattermost, iMessage, Matrix, Signal, WhatsApp, Email, IRC, Lark, DingTalk, QQ, Webhook | 任意消息 API |
+| **记忆** | `Memory` | SQLite 混合搜索, PostgreSQL 后端, Lucid 桥接, Markdown 文件, 显式 `none` 后端, 快照/恢复, 可选响应缓存 | 任意持久化后端 |
+| **工具** | `Tool` | shell/file/memory, cron/schedule, git, pushover, browser, http_request, screenshot/image_info, composio (opt-in), delegate, 硬件工具 | 任意能力 |
+| **可观测性** | `Observer` | Noop, Log, Multi | Prometheus, OTel |
+| **运行时** | `RuntimeAdapter` | Native, Docker（沙箱） | 通过 adapter 添加；不支持的类型会快速失败 |
+| **安全** | `SecurityPolicy` | Gateway 配对, 沙箱, allowlist, 速率限制, 文件系统作用域, 加密密钥 | — |
+| **身份** | `IdentityConfig` | OpenClaw (markdown), AIEOS v1.1 (JSON) | 任意身份格式 |
+| **隧道** | `Tunnel` | None, Cloudflare, Tailscale, ngrok, Custom | 任意隧道工具 |
+| **心跳** | Engine | HEARTBEAT.md 定期任务 | — |
+| **技能** | Loader | TOML 清单 + SKILL.md 指令 | 社区技能包 |
+| **集成** | Registry | 9 个分类下 70+ 集成 | 插件系统 |
+
+### 运行时支持（当前）
+
+- ✅ 当前支持：`runtime.kind = "native"` 或 `runtime.kind = "docker"`
+- 🚧 计划中，尚未实现：WASM / 边缘运行时
+
+配置了不支持的 `runtime.kind` 时，ZeroClaw 会以明确的错误退出，而非静默回退到 native。
+
+### 记忆系统（全栈搜索引擎）
+
+全部自研，零外部依赖 — 无需 Pinecone、Elasticsearch、LangChain：
+
+| 层级 | 实现 |
+|------|------|
+| **向量数据库** | Embeddings 以 BLOB 存储于 SQLite，余弦相似度搜索 |
+| **关键词搜索** | FTS5 虚拟表，BM25 评分 |
+| **混合合并** | 自定义加权合并函数（`vector.rs`） |
+| **Embeddings** | `EmbeddingProvider` trait — OpenAI、自定义 URL 或 noop |
+| **分块** | 基于行的 Markdown 分块器，保留标题结构 |
+| **缓存** | SQLite `embedding_cache` 表，LRU 淘汰策略 |
+| **安全重索引** | 原子化重建 FTS5 + 重新嵌入缺失向量 |
+
+Agent 通过工具自动进行记忆的回忆、保存和管理。
+
+```toml
+[memory]
+backend = "sqlite"             # "sqlite", "lucid", "postgres", "markdown", "none"
+auto_save = true
+embedding_provider = "none"    # "none", "openai", "custom:https://..."
+vector_weight = 0.7
+keyword_weight = 0.3
+```
+
 ## 安全默认行为（关键）
 
 - Gateway 默认绑定：`127.0.0.1:3000`
