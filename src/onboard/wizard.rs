@@ -2695,7 +2695,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
         let choice = Select::new()
             .with_prompt("  Connect a channel (or Done to continue)")
             .items(&options)
-            .default(11)
+            .default(options.len() - 1)
             .interact()?;
 
         match choice {
