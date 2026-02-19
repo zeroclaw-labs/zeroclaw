@@ -2910,6 +2910,7 @@ impl Config {
                 decrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
             }
             config.apply_env_overrides();
+            config.validate()?;
             tracing::info!(
                 path = %config.config_path.display(),
                 workspace = %config.workspace_dir.display(),
@@ -2932,6 +2933,7 @@ impl Config {
             }
 
             config.apply_env_overrides();
+            config.validate()?;
             tracing::info!(
                 path = %config.config_path.display(),
                 workspace = %config.workspace_dir.display(),
@@ -2941,6 +2943,61 @@ impl Config {
             );
             Ok(config)
         }
+    }
+
+    /// Validate configuration values that would cause runtime failures.
+    ///
+    /// Called after TOML deserialization and env-override application to catch
+    /// obviously invalid values early instead of failing at arbitrary runtime points.
+    pub fn validate(&self) -> Result<()> {
+        // Gateway
+        if self.gateway.host.trim().is_empty() {
+            anyhow::bail!("gateway.host must not be empty");
+        }
+
+        // Autonomy
+        if self.autonomy.max_actions_per_hour == 0 {
+            anyhow::bail!("autonomy.max_actions_per_hour must be greater than 0");
+        }
+
+        // Scheduler
+        if self.scheduler.max_concurrent == 0 {
+            anyhow::bail!("scheduler.max_concurrent must be greater than 0");
+        }
+        if self.scheduler.max_tasks == 0 {
+            anyhow::bail!("scheduler.max_tasks must be greater than 0");
+        }
+
+        // Model routes
+        for (i, route) in self.model_routes.iter().enumerate() {
+            if route.hint.trim().is_empty() {
+                anyhow::bail!("model_routes[{i}].hint must not be empty");
+            }
+            if route.provider.trim().is_empty() {
+                anyhow::bail!("model_routes[{i}].provider must not be empty");
+            }
+            if route.model.trim().is_empty() {
+                anyhow::bail!("model_routes[{i}].model must not be empty");
+            }
+        }
+
+        // Embedding routes
+        for (i, route) in self.embedding_routes.iter().enumerate() {
+            if route.hint.trim().is_empty() {
+                anyhow::bail!("embedding_routes[{i}].hint must not be empty");
+            }
+            if route.provider.trim().is_empty() {
+                anyhow::bail!("embedding_routes[{i}].provider must not be empty");
+            }
+            if route.model.trim().is_empty() {
+                anyhow::bail!("embedding_routes[{i}].model must not be empty");
+            }
+        }
+
+        // Proxy (delegate to existing validation)
+        self.proxy.validate()?;
+
+        Ok(())
     }
 
     /// Apply environment variable overrides to config
