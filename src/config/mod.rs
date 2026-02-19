@@ -9,12 +9,12 @@ pub use schema::{
     DelegateAgentConfig, DiscordConfig, DockerRuntimeConfig, EmbeddingRouteConfig, GatewayConfig,
     HardwareConfig, HardwareTransport, HeartbeatConfig, HttpRequestConfig, IMessageConfig,
     IdentityConfig, LarkConfig, MatrixConfig, MemoryConfig, ModelRouteConfig, MultimodalConfig,
-    NextcloudTalkConfig, ObservabilityConfig, PeripheralBoardConfig, PeripheralsConfig,
-    ProxyConfig, ProxyScope, QueryClassificationConfig, ReliabilityConfig, ResourceLimitsConfig,
-    RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig, SecretsConfig, SecurityConfig,
-    SkillsConfig, SkillsPromptInjectionMode, SlackConfig, StorageConfig, StorageProviderConfig,
-    StorageProviderSection, StreamMode, TelegramConfig, TranscriptionConfig, TunnelConfig,
-    WebSearchConfig, WebhookConfig,
+    BuiltinHooksConfig, HooksConfig, NextcloudTalkConfig, ObservabilityConfig,
+    PeripheralBoardConfig, PeripheralsConfig, ProxyConfig, ProxyScope, QueryClassificationConfig,
+    ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig,
+    SchedulerConfig, SecretsConfig, SecurityConfig, SkillsConfig, SkillsPromptInjectionMode,
+    SlackConfig, StorageConfig, StorageProviderConfig, StorageProviderSection, StreamMode,
+    TelegramConfig, TranscriptionConfig, TunnelConfig, WebSearchConfig, WebhookConfig,
 };
 
 #[cfg(test)]
