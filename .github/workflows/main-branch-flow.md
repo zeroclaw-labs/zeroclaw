@@ -143,7 +143,7 @@ Workflow: `.github/workflows/pub-docker-img.yml`
    - `latest` + SHA tag (`sha-<12 chars>`) for `main`
    - semantic tag from pushed git tag (`vX.Y.Z`) + SHA tag for tag pushes
    - branch name + SHA tag for non-`main` manual dispatch refs
-5. Multi-platform publish is used for tag pushes (`linux/amd64,linux/arm64`), while `main` publish stays `linux/amd64`.
+5. Multi-platform publish is used for both `main` and tag pushes (`linux/amd64,linux/arm64`).
 6. Typical runtime in recent sample: ~139.9s.
 7. Result: pushed image tags under `ghcr.io/<owner>/<repo>`.
 
