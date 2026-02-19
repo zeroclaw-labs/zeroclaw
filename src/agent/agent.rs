@@ -10,7 +10,6 @@ use crate::providers::{self, ChatMessage, ChatRequest, ConversationMessage, Prov
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool, ToolSpec};
-use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use std::io::Write as IoWrite;
 use std::sync::Arc;
@@ -486,14 +485,6 @@ impl Agent {
                         final_text.clone(),
                     )));
                 self.trim_history();
-
-                if self.auto_save {
-                    let summary = truncate_with_ellipsis(&final_text, 100);
-                    let _ = self
-                        .memory
-                        .store("assistant_resp", &summary, MemoryCategory::Daily, None)
-                        .await;
-                }
 
                 return Ok(final_text);
             }

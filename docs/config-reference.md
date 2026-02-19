@@ -129,12 +129,16 @@ Notes:
 | Key | Default | Purpose |
 |---|---|---|
 | `backend` | `sqlite` | `sqlite`, `lucid`, `markdown`, `none` |
-| `auto_save` | `true` | automatic persistence |
+| `auto_save` | `true` | persist user-stated inputs only (assistant outputs are excluded) |
 | `embedding_provider` | `none` | `none`, `openai`, or custom endpoint |
 | `embedding_model` | `text-embedding-3-small` | embedding model ID, or `hint:<name>` route |
 | `embedding_dimensions` | `1536` | expected vector size for selected embedding model |
 | `vector_weight` | `0.7` | hybrid ranking vector weight |
 | `keyword_weight` | `0.3` | hybrid ranking keyword weight |
+
+Notes:
+
+- Memory context injection ignores legacy `assistant_resp*` auto-save keys to prevent old model-authored summaries from being treated as facts.
 
 ## `[[model_routes]]` and `[[embedding_routes]]`
 

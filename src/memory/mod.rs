@@ -75,6 +75,13 @@ pub fn effective_memory_backend_name(
     memory_backend.trim().to_ascii_lowercase()
 }
 
+/// Legacy auto-save key used for model-authored assistant summaries.
+/// These entries are treated as untrusted context and should not be re-injected.
+pub fn is_assistant_autosave_key(key: &str) -> bool {
+    let normalized = key.trim().to_ascii_lowercase();
+    normalized == "assistant_resp" || normalized.starts_with("assistant_resp_")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedEmbeddingConfig {
     provider: String,
@@ -341,6 +348,15 @@ mod tests {
         };
         let mem = create_memory(&cfg, tmp.path(), None).unwrap();
         assert_eq!(mem.name(), "sqlite");
+    }
+
+    #[test]
+    fn assistant_autosave_key_detection_matches_legacy_patterns() {
+        assert!(is_assistant_autosave_key("assistant_resp"));
+        assert!(is_assistant_autosave_key("assistant_resp_1234"));
+        assert!(is_assistant_autosave_key("ASSISTANT_RESP_abcd"));
+        assert!(!is_assistant_autosave_key("assistant_response"));
+        assert!(!is_assistant_autosave_key("user_msg_1234"));
     }
 
     #[test]
