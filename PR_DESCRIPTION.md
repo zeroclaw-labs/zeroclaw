@@ -2,13 +2,13 @@
 
 - **Problem:** LLM responses were fetched in a single blocking request, causing users to wait until the entire response was generated before seeing any output. This creates poor perceived latency, especially for long responses.
 - **Why it matters:** Real-time streaming improves user experience by showing response chunks as they arrive from the provider, making the system feel more responsive and interactive.
-- **What changed:** 
+- **What changed:**
   - Added `streaming_enabled` config option (default: false) in `ReliabilityConfig`
   - Added `stream_chat()` method to Provider trait for streaming-compatible providers
   - Implemented streaming for `OpenAiCompatibleProvider` (custom, moonshot, groq, etc.)
   - Added real-time tool call detection from streaming chunks
   - Integrated streaming into agent loop with automatic fallback to non-streaming
-- **What did not change:** 
+- **What did not change:**
   - Non-streaming behavior is preserved when `streaming_enabled=false` (default)
   - Existing timeout configuration (120s) remains unchanged
   - Tool call parsing logic for non-streaming path is unchanged
@@ -105,7 +105,7 @@ streaming_enabled = true  # Optional, defaults to false
 
 - **Fast rollback command:** `git revert <commit-hash>`
 - **Feature toggle:** `streaming_enabled = false` in config
-- **Observable failure symptoms:** 
+- **Observable failure symptoms:**
   - Increased latency when enabled (should be faster)
   - Streaming errors in logs
   - Missing chunks in responses
