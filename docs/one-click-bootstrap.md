@@ -58,6 +58,15 @@ If you run Option B outside a repository checkout, the bootstrap script automati
 
 ## Optional onboarding modes
 
+### Containerized onboarding (Docker)
+
+```bash
+./bootstrap.sh --docker
+```
+
+This builds a local ZeroClaw image and launches onboarding inside a container while
+persisting config/workspace to `./.zeroclaw-docker`.
+
 ### Quick onboarding (non-interactive)
 
 ```bash

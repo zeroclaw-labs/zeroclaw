@@ -203,6 +203,9 @@ cd zeroclaw
 
 # Optional: run onboarding in the same flow
 ./bootstrap.sh --onboard --api-key "sk-..." --provider openrouter [--model "openrouter/auto"]
+
+# Optional: run bootstrap + onboarding fully in Docker
+./bootstrap.sh --docker
 ```
 
 Remote one-liner (review first in security-sensitive environments):
