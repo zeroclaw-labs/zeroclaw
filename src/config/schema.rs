@@ -190,6 +190,10 @@ pub struct Config {
     #[serde(default)]
     pub agents: HashMap<String, DelegateAgentConfig>,
 
+    /// Hooks configuration (lifecycle hooks and built-in hook toggles).
+    #[serde(default)]
+    pub hooks: HooksConfig,
+
     /// Hardware configuration (wizard-driven physical world setup).
     #[serde(default)]
     pub hardware: HardwareConfig,
@@ -1755,6 +1759,41 @@ impl Default for ObservabilityConfig {
     }
 }
 
+// ── Hooks ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HooksConfig {
+    pub enabled: bool,
+    #[serde(default)]
+    pub builtin: BuiltinHooksConfig,
+}
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            builtin: BuiltinHooksConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuiltinHooksConfig {
+    pub session_memory: bool,
+    pub command_logger: bool,
+    pub boot_script: bool,
+}
+
+impl Default for BuiltinHooksConfig {
+    fn default() -> Self {
+        Self {
+            session_memory: true,
+            command_logger: false,
+            boot_script: true,
+        }
+    }
+}
+
 // ── Autonomy / Security ──────────────────────────────────────────
 
 /// Autonomy and security policy configuration (`[autonomy]` section).
@@ -2928,6 +2967,7 @@ impl Default for Config {
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
+            hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
@@ -4125,6 +4165,7 @@ default_temperature = 0.7
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
+            hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
         };
@@ -4295,6 +4336,7 @@ tool_dispatcher = "xml"
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
+            hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
         };
