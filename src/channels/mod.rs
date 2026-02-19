@@ -293,6 +293,10 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
 }
 
 fn should_skip_memory_context_entry(key: &str, content: &str) -> bool {
+    if memory::is_assistant_autosave_key(key) {
+        return true;
+    }
+
     if key.trim().to_ascii_lowercase().ends_with("_history") {
         return true;
     }
@@ -2166,6 +2170,10 @@ mod tests {
         assert!(should_skip_memory_context_entry(
             "telegram_123_history",
             r#"[{"role":"user"}]"#
+        ));
+        assert!(should_skip_memory_context_entry(
+            "assistant_resp_legacy",
+            "fabricated memory"
         ));
         assert!(!should_skip_memory_context_entry("telegram_123_45", "hi"));
     }
