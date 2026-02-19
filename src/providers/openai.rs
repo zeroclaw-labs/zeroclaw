@@ -54,12 +54,12 @@ impl ResponseMessage {
 }
 
 #[derive(Debug, Serialize)]
-struct NativeChatRequest<'a> {
+struct NativeChatRequest {
     model: String,
     messages: Vec<NativeMessage>,
     temperature: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<NativeToolSpec<'a>>>,
+    tools: Option<Vec<NativeToolSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
 }
@@ -75,18 +75,18 @@ struct NativeMessage {
     tool_calls: Option<Vec<NativeToolCall>>,
 }
 
-#[derive(Debug, Serialize)]
-struct NativeToolSpec<'a> {
+#[derive(Debug, Serialize, Deserialize)]
+struct NativeToolSpec {
     #[serde(rename = "type")]
-    kind: &'static str,
-    function: NativeToolFunctionSpec<'a>,
+    kind: String,
+    function: NativeToolFunctionSpec,
 }
 
-#[derive(Debug, Serialize)]
-struct NativeToolFunctionSpec<'a> {
-    name: &'a str,
-    description: &'a str,
-    parameters: &'a serde_json::Value,
+#[derive(Debug, Serialize, Deserialize)]
+struct NativeToolFunctionSpec {
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -150,16 +150,16 @@ impl OpenAiProvider {
         }
     }
 
-    fn convert_tools<'a>(tools: Option<&'a [ToolSpec]>) -> Option<Vec<NativeToolSpec<'a>>> {
+    fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
         tools.map(|items| {
             items
                 .iter()
                 .map(|tool| NativeToolSpec {
-                    kind: "function",
+                    kind: "function".to_string(),
                     function: NativeToolFunctionSpec {
-                        name: &tool.name,
-                        description: &tool.description,
-                        parameters: &tool.parameters,
+                        name: tool.name.clone(),
+                        description: tool.description.clone(),
+                        parameters: tool.parameters.clone(),
                     },
                 })
                 .collect()
