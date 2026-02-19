@@ -809,10 +809,29 @@ impl Provider for OpenAiCompatibleProvider {
 
         let url = self.chat_completions_url();
 
-        let response = self
+        let response = match self
             .apply_auth_header(self.http_client().post(&url).json(&request), credential)
             .send()
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(chat_error) => {
+                if self.supports_responses_fallback {
+                    let sanitized = super::sanitize_api_error(&chat_error.to_string());
+                    return self
+                        .chat_via_responses(credential, system_prompt, message, model)
+                        .await
+                        .map_err(|responses_err| {
+                            anyhow::anyhow!(
+                                "{} chat completions transport error: {sanitized} (responses fallback failed: {responses_err})",
+                                self.name
+                            )
+                        });
+                }
+
+                return Err(chat_error.into());
+            }
+        };
 
         if !response.status().is_success() {
             let status = response.status();
@@ -891,10 +910,38 @@ impl Provider for OpenAiCompatibleProvider {
         };
 
         let url = self.chat_completions_url();
-        let response = self
+        let response = match self
             .apply_auth_header(self.http_client().post(&url).json(&request), credential)
             .send()
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(chat_error) => {
+                if self.supports_responses_fallback {
+                    let system = messages.iter().find(|m| m.role == "system");
+                    let last_user = messages.iter().rfind(|m| m.role == "user");
+                    if let Some(user_msg) = last_user {
+                        let sanitized = super::sanitize_api_error(&chat_error.to_string());
+                        return self
+                            .chat_via_responses(
+                                credential,
+                                system.map(|m| m.content.as_str()),
+                                &user_msg.content,
+                                model,
+                            )
+                            .await
+                            .map_err(|responses_err| {
+                                anyhow::anyhow!(
+                                    "{} chat completions transport error: {sanitized} (responses fallback failed: {responses_err})",
+                                    self.name
+                                )
+                            });
+                    }
+                }
+
+                return Err(chat_error.into());
+            }
+        };
 
         if !response.status().is_success() {
             let status = response.status();
@@ -991,10 +1038,24 @@ impl Provider for OpenAiCompatibleProvider {
         };
 
         let url = self.chat_completions_url();
-        let response = self
+        let response = match self
             .apply_auth_header(self.http_client().post(&url).json(&request), credential)
             .send()
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(
+                    "{} native tool call transport failed: {error}; falling back to history path",
+                    self.name
+                );
+                let text = self.chat_with_history(messages, model, temperature).await?;
+                return Ok(ProviderChatResponse {
+                    text: Some(text),
+                    tool_calls: vec![],
+                });
+            }
+        };
 
         if !response.status().is_success() {
             return Err(super::api_error(&self.name, response).await);
@@ -1053,13 +1114,45 @@ impl Provider for OpenAiCompatibleProvider {
         };
 
         let url = self.chat_completions_url();
-        let response = self
+        let response = match self
             .apply_auth_header(
                 self.http_client().post(&url).json(&native_request),
                 credential,
             )
             .send()
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(chat_error) => {
+                if self.supports_responses_fallback {
+                    let system = request.messages.iter().find(|m| m.role == "system");
+                    let last_user = request.messages.iter().rfind(|m| m.role == "user");
+                    if let Some(user_msg) = last_user {
+                        let sanitized = super::sanitize_api_error(&chat_error.to_string());
+                        return self
+                            .chat_via_responses(
+                                credential,
+                                system.map(|m| m.content.as_str()),
+                                &user_msg.content,
+                                model,
+                            )
+                            .await
+                            .map(|text| ProviderChatResponse {
+                                text: Some(text),
+                                tool_calls: vec![],
+                            })
+                            .map_err(|responses_err| {
+                                anyhow::anyhow!(
+                                    "{} native chat transport error: {sanitized} (responses fallback failed: {responses_err})",
+                                    self.name
+                                )
+                            });
+                    }
+                }
+
+                return Err(chat_error.into());
+            }
+        };
 
         if !response.status().is_success() {
             let status = response.status();
