@@ -75,6 +75,7 @@ mod tests {
                 content: "hello".into(),
                 recipient: "user".into(),
                 subject: None,
+                thread_ts: None,
             })
             .await;
         assert!(result.is_ok());
@@ -88,6 +89,7 @@ mod tests {
                 content: String::new(),
                 recipient: String::new(),
                 subject: None,
+                thread_ts: None,
             })
             .await;
         assert!(result.is_ok());
