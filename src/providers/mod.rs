@@ -42,6 +42,15 @@ const MOONSHOT_CN_BASE_URL: &str = "https://api.moonshot.cn/v1";
 const QWEN_CN_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 const QWEN_INTL_BASE_URL: &str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1";
 const QWEN_US_BASE_URL: &str = "https://dashscope-us.aliyuncs.com/compatible-mode/v1";
+const QWEN_OAUTH_BASE_FALLBACK_URL: &str = QWEN_CN_BASE_URL;
+const QWEN_OAUTH_TOKEN_ENDPOINT: &str = "https://chat.qwen.ai/api/v1/oauth2/token";
+const QWEN_OAUTH_PLACEHOLDER: &str = "qwen-oauth";
+const QWEN_OAUTH_TOKEN_ENV: &str = "QWEN_OAUTH_TOKEN";
+const QWEN_OAUTH_REFRESH_TOKEN_ENV: &str = "QWEN_OAUTH_REFRESH_TOKEN";
+const QWEN_OAUTH_RESOURCE_URL_ENV: &str = "QWEN_OAUTH_RESOURCE_URL";
+const QWEN_OAUTH_CLIENT_ID_ENV: &str = "QWEN_OAUTH_CLIENT_ID";
+const QWEN_OAUTH_DEFAULT_CLIENT_ID: &str = "f0304373b74a44d2b584a3fb70ca9e56";
+const QWEN_OAUTH_CREDENTIAL_FILE: &str = ".qwen/oauth_creds.json";
 const ZAI_GLOBAL_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
 const ZAI_CN_BASE_URL: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
 
@@ -112,8 +121,15 @@ pub(crate) fn is_qwen_us_alias(name: &str) -> bool {
     matches!(name, "qwen-us" | "dashscope-us")
 }
 
+pub(crate) fn is_qwen_oauth_alias(name: &str) -> bool {
+    matches!(name, "qwen-code" | "qwen-oauth" | "qwen_oauth")
+}
+
 pub(crate) fn is_qwen_alias(name: &str) -> bool {
-    is_qwen_cn_alias(name) || is_qwen_intl_alias(name) || is_qwen_us_alias(name)
+    is_qwen_cn_alias(name)
+        || is_qwen_intl_alias(name)
+        || is_qwen_us_alias(name)
+        || is_qwen_oauth_alias(name)
 }
 
 pub(crate) fn is_zai_global_alias(name: &str) -> bool {
@@ -163,6 +179,40 @@ struct MinimaxOauthBaseResponse {
     status_msg: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+struct QwenOauthCredentials {
+    #[serde(default)]
+    access_token: Option<String>,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    resource_url: Option<String>,
+    #[serde(default)]
+    expiry_date: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QwenOauthTokenResponse {
+    #[serde(default)]
+    access_token: Option<String>,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    expires_in: Option<i64>,
+    #[serde(default)]
+    resource_url: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    error_description: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct QwenOauthProviderContext {
+    credential: Option<String>,
+    base_url: Option<String>,
+}
+
 fn read_non_empty_env(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -196,6 +246,233 @@ fn minimax_oauth_region(name: &str) -> MinimaxOauthRegion {
 fn minimax_oauth_client_id() -> String {
     read_non_empty_env(MINIMAX_OAUTH_CLIENT_ID_ENV)
         .unwrap_or_else(|| MINIMAX_OAUTH_DEFAULT_CLIENT_ID.to_string())
+}
+
+fn qwen_oauth_client_id() -> String {
+    read_non_empty_env(QWEN_OAUTH_CLIENT_ID_ENV)
+        .unwrap_or_else(|| QWEN_OAUTH_DEFAULT_CLIENT_ID.to_string())
+}
+
+fn qwen_oauth_credentials_file_path() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+        .map(|home| home.join(QWEN_OAUTH_CREDENTIAL_FILE))
+}
+
+fn normalize_qwen_oauth_base_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let with_scheme = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
+    };
+
+    let normalized = with_scheme.trim_end_matches('/').to_string();
+    if normalized.ends_with("/v1") {
+        Some(normalized)
+    } else {
+        Some(format!("{normalized}/v1"))
+    }
+}
+
+fn read_qwen_oauth_cached_credentials() -> Option<QwenOauthCredentials> {
+    let path = qwen_oauth_credentials_file_path()?;
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<QwenOauthCredentials>(&content).ok()
+}
+
+fn normalized_qwen_expiry_millis(raw: i64) -> i64 {
+    if raw < 10_000_000_000 {
+        raw.saturating_mul(1000)
+    } else {
+        raw
+    }
+}
+
+fn qwen_oauth_token_expired(credentials: &QwenOauthCredentials) -> bool {
+    let Some(expiry) = credentials.expiry_date else {
+        return false;
+    };
+
+    let expiry_millis = normalized_qwen_expiry_millis(expiry);
+    let now_millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .unwrap_or(i64::MAX);
+
+    expiry_millis <= now_millis.saturating_add(30_000)
+}
+
+fn refresh_qwen_oauth_access_token(refresh_token: &str) -> anyhow::Result<QwenOauthCredentials> {
+    let client_id = qwen_oauth_client_id();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_else(|_| reqwest::blocking::Client::new());
+
+    let response = client
+        .post(QWEN_OAUTH_TOKEN_ENDPOINT)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Accept", "application/json")
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", client_id.as_str()),
+        ])
+        .send()
+        .map_err(|error| anyhow::anyhow!("Qwen OAuth refresh request failed: {error}"))?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .unwrap_or_else(|_| "<failed to read Qwen OAuth response body>".to_string());
+
+    let parsed = serde_json::from_str::<QwenOauthTokenResponse>(&body).ok();
+
+    if !status.is_success() {
+        let detail = parsed
+            .as_ref()
+            .and_then(|payload| payload.error_description.as_deref())
+            .or_else(|| parsed.as_ref().and_then(|payload| payload.error.as_deref()))
+            .filter(|msg| !msg.trim().is_empty())
+            .unwrap_or(body.as_str());
+        anyhow::bail!("Qwen OAuth refresh failed (HTTP {status}): {detail}");
+    }
+
+    let payload =
+        parsed.ok_or_else(|| anyhow::anyhow!("Qwen OAuth refresh response is not JSON"))?;
+
+    if let Some(error_code) = payload
+        .error
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        let detail = payload.error_description.as_deref().unwrap_or(error_code);
+        anyhow::bail!("Qwen OAuth refresh failed: {detail}");
+    }
+
+    let access_token = payload
+        .access_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Qwen OAuth refresh response missing access_token"))?
+        .to_string();
+
+    let expiry_date = payload.expires_in.and_then(|seconds| {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| i64::try_from(duration.as_secs()).ok())?;
+        now_secs
+            .checked_add(seconds)
+            .and_then(|unix_secs| unix_secs.checked_mul(1000))
+    });
+
+    Ok(QwenOauthCredentials {
+        access_token: Some(access_token),
+        refresh_token: payload
+            .refresh_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string),
+        resource_url: payload
+            .resource_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string),
+        expiry_date,
+    })
+}
+
+fn resolve_qwen_oauth_context(credential_override: Option<&str>) -> QwenOauthProviderContext {
+    let override_value = credential_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let placeholder_requested = override_value
+        .map(|value| value.eq_ignore_ascii_case(QWEN_OAUTH_PLACEHOLDER))
+        .unwrap_or(false);
+
+    if let Some(explicit) = override_value {
+        if !placeholder_requested {
+            return QwenOauthProviderContext {
+                credential: Some(explicit.to_string()),
+                base_url: None,
+            };
+        }
+    }
+
+    let mut cached = read_qwen_oauth_cached_credentials();
+
+    let env_token = read_non_empty_env(QWEN_OAUTH_TOKEN_ENV);
+    let env_refresh_token = read_non_empty_env(QWEN_OAUTH_REFRESH_TOKEN_ENV);
+    let env_resource_url = read_non_empty_env(QWEN_OAUTH_RESOURCE_URL_ENV);
+
+    if env_token.is_none() {
+        let refresh_token = env_refresh_token.clone().or_else(|| {
+            cached
+                .as_ref()
+                .and_then(|credentials| credentials.refresh_token.clone())
+        });
+
+        let should_refresh = cached.as_ref().is_some_and(qwen_oauth_token_expired)
+            || cached
+                .as_ref()
+                .and_then(|credentials| credentials.access_token.as_deref())
+                .is_none_or(|value| value.trim().is_empty());
+
+        if should_refresh {
+            if let Some(refresh_token) = refresh_token.as_deref() {
+                match refresh_qwen_oauth_access_token(refresh_token) {
+                    Ok(refreshed) => {
+                        cached = Some(refreshed);
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "Qwen OAuth refresh failed");
+                    }
+                }
+            }
+        }
+    }
+
+    let mut credential = env_token.or_else(|| {
+        cached
+            .as_ref()
+            .and_then(|credentials| credentials.access_token.clone())
+    });
+    credential = credential
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+
+    if credential.is_none() && !placeholder_requested {
+        credential = read_non_empty_env("DASHSCOPE_API_KEY");
+    }
+
+    let base_url = env_resource_url
+        .as_deref()
+        .and_then(normalize_qwen_oauth_base_url)
+        .or_else(|| {
+            cached
+                .as_ref()
+                .and_then(|credentials| credentials.resource_url.as_deref())
+                .and_then(normalize_qwen_oauth_base_url)
+        });
+
+    QwenOauthProviderContext {
+        credential,
+        base_url,
+    }
 }
 
 fn resolve_minimax_static_credential() -> Option<String> {
@@ -599,11 +876,17 @@ pub fn create_provider_with_url(
     api_key: Option<&str>,
     api_url: Option<&str>,
 ) -> anyhow::Result<Box<dyn Provider>> {
+    let qwen_oauth_context = is_qwen_oauth_alias(name).then(|| resolve_qwen_oauth_context(api_key));
+
     // Resolve credential and break static-analysis taint chain from the
     // `api_key` parameter so that downstream provider storage of the value
     // is not linked to the original sensitive-named source.
-    let resolved_credential = resolve_provider_credential(name, api_key)
-        .map(|v| String::from_utf8(v.into_bytes()).unwrap_or_default());
+    let resolved_credential = if let Some(context) = qwen_oauth_context.as_ref() {
+        context.credential.clone()
+    } else {
+        resolve_provider_credential(name, api_key)
+    }
+    .map(|v| String::from_utf8(v.into_bytes()).unwrap_or_default());
     #[allow(clippy::option_as_ref_deref)]
     let key = resolved_credential.as_ref().map(String::as_str);
     match name {
@@ -674,6 +957,22 @@ pub fn create_provider_with_url(
             )
         )),
         "bedrock" | "aws-bedrock" => Ok(Box::new(bedrock::BedrockProvider::new())),
+        name if is_qwen_oauth_alias(name) => {
+            let base_url = api_url
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .or_else(|| qwen_oauth_context.as_ref().and_then(|context| context.base_url.clone()))
+                .unwrap_or_else(|| QWEN_OAUTH_BASE_FALLBACK_URL.to_string());
+
+            Ok(Box::new(OpenAiCompatibleProvider::new_with_user_agent(
+                "Qwen Code",
+                &base_url,
+                key,
+                AuthStyle::Bearer,
+                "QwenCode/1.0",
+            )))
+        }
         name if is_qianfan_alias(name) => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Qianfan", "https://aip.baidubce.com", key, AuthStyle::Bearer,
         ))),
@@ -1063,13 +1362,16 @@ pub fn list_providers() -> Vec<ProviderInfo> {
         },
         ProviderInfo {
             name: "qwen",
-            display_name: "Qwen (DashScope)",
+            display_name: "Qwen (DashScope / Qwen Code OAuth)",
             aliases: &[
                 "dashscope",
                 "qwen-intl",
                 "dashscope-intl",
                 "qwen-us",
                 "dashscope-us",
+                "qwen-code",
+                "qwen-oauth",
+                "qwen_oauth",
             ],
             local: false,
         },
@@ -1233,6 +1535,87 @@ mod tests {
     }
 
     #[test]
+    fn resolve_qwen_oauth_context_prefers_explicit_override() {
+        let fake_home = format!("/tmp/zeroclaw-qwen-oauth-home-{}", std::process::id());
+        let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
+        let _token_guard = EnvGuard::set(QWEN_OAUTH_TOKEN_ENV, Some("oauth-token"));
+        let _resource_guard = EnvGuard::set(
+            QWEN_OAUTH_RESOURCE_URL_ENV,
+            Some("coding-intl.dashscope.aliyuncs.com"),
+        );
+
+        let context = resolve_qwen_oauth_context(Some("  explicit-qwen-token  "));
+
+        assert_eq!(context.credential.as_deref(), Some("explicit-qwen-token"));
+        assert!(context.base_url.is_none());
+    }
+
+    #[test]
+    fn resolve_qwen_oauth_context_uses_env_token_and_resource_url() {
+        let fake_home = format!("/tmp/zeroclaw-qwen-oauth-home-{}-env", std::process::id());
+        let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
+        let _token_guard = EnvGuard::set(QWEN_OAUTH_TOKEN_ENV, Some("oauth-token"));
+        let _refresh_guard = EnvGuard::set(QWEN_OAUTH_REFRESH_TOKEN_ENV, None);
+        let _resource_guard = EnvGuard::set(
+            QWEN_OAUTH_RESOURCE_URL_ENV,
+            Some("coding-intl.dashscope.aliyuncs.com"),
+        );
+        let _dashscope_guard = EnvGuard::set("DASHSCOPE_API_KEY", Some("dashscope-fallback"));
+
+        let context = resolve_qwen_oauth_context(Some(QWEN_OAUTH_PLACEHOLDER));
+
+        assert_eq!(context.credential.as_deref(), Some("oauth-token"));
+        assert_eq!(
+            context.base_url.as_deref(),
+            Some("https://coding-intl.dashscope.aliyuncs.com/v1")
+        );
+    }
+
+    #[test]
+    fn resolve_qwen_oauth_context_reads_cached_credentials_file() {
+        let fake_home = format!("/tmp/zeroclaw-qwen-oauth-home-{}-file", std::process::id());
+        let creds_dir = PathBuf::from(&fake_home).join(".qwen");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        let creds_path = creds_dir.join("oauth_creds.json");
+        std::fs::write(
+            &creds_path,
+            r#"{"access_token":"cached-token","refresh_token":"cached-refresh","resource_url":"https://resource.example.com","expiry_date":4102444800000}"#,
+        )
+        .unwrap();
+
+        let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
+        let _token_guard = EnvGuard::set(QWEN_OAUTH_TOKEN_ENV, None);
+        let _refresh_guard = EnvGuard::set(QWEN_OAUTH_REFRESH_TOKEN_ENV, None);
+        let _resource_guard = EnvGuard::set(QWEN_OAUTH_RESOURCE_URL_ENV, None);
+        let _dashscope_guard = EnvGuard::set("DASHSCOPE_API_KEY", None);
+
+        let context = resolve_qwen_oauth_context(Some(QWEN_OAUTH_PLACEHOLDER));
+
+        assert_eq!(context.credential.as_deref(), Some("cached-token"));
+        assert_eq!(
+            context.base_url.as_deref(),
+            Some("https://resource.example.com/v1")
+        );
+    }
+
+    #[test]
+    fn resolve_qwen_oauth_context_placeholder_does_not_use_dashscope_fallback() {
+        let fake_home = format!(
+            "/tmp/zeroclaw-qwen-oauth-home-{}-placeholder",
+            std::process::id()
+        );
+        let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
+        let _token_guard = EnvGuard::set(QWEN_OAUTH_TOKEN_ENV, None);
+        let _refresh_guard = EnvGuard::set(QWEN_OAUTH_REFRESH_TOKEN_ENV, None);
+        let _resource_guard = EnvGuard::set(QWEN_OAUTH_RESOURCE_URL_ENV, None);
+        let _dashscope_guard = EnvGuard::set("DASHSCOPE_API_KEY", Some("dashscope-fallback"));
+
+        let context = resolve_qwen_oauth_context(Some(QWEN_OAUTH_PLACEHOLDER));
+
+        assert!(context.credential.is_none());
+    }
+
+    #[test]
     fn regional_alias_predicates_cover_expected_variants() {
         assert!(is_moonshot_alias("moonshot"));
         assert!(is_moonshot_alias("kimi-global"));
@@ -1244,6 +1627,9 @@ mod tests {
         assert!(is_minimax_alias("minimax-portal-cn"));
         assert!(is_qwen_alias("dashscope"));
         assert!(is_qwen_alias("qwen-us"));
+        assert!(is_qwen_alias("qwen-code"));
+        assert!(is_qwen_oauth_alias("qwen-code"));
+        assert!(is_qwen_oauth_alias("qwen_oauth"));
         assert!(is_zai_alias("z.ai"));
         assert!(is_zai_alias("zai-cn"));
         assert!(is_qianfan_alias("qianfan"));
@@ -1266,6 +1652,7 @@ mod tests {
         assert_eq!(canonical_china_provider_name("minimax-cn"), Some("minimax"));
         assert_eq!(canonical_china_provider_name("qwen"), Some("qwen"));
         assert_eq!(canonical_china_provider_name("dashscope-us"), Some("qwen"));
+        assert_eq!(canonical_china_provider_name("qwen-code"), Some("qwen"));
         assert_eq!(canonical_china_provider_name("zai"), Some("zai"));
         assert_eq!(canonical_china_provider_name("z.ai-cn"), Some("zai"));
         assert_eq!(canonical_china_provider_name("qianfan"), Some("qianfan"));
@@ -1296,6 +1683,7 @@ mod tests {
         assert_eq!(qwen_base_url("qwen-cn"), Some(QWEN_CN_BASE_URL));
         assert_eq!(qwen_base_url("qwen-intl"), Some(QWEN_INTL_BASE_URL));
         assert_eq!(qwen_base_url("qwen-us"), Some(QWEN_US_BASE_URL));
+        assert_eq!(qwen_base_url("qwen-code"), Some(QWEN_CN_BASE_URL));
 
         assert_eq!(zai_base_url("zai"), Some(ZAI_GLOBAL_BASE_URL));
         assert_eq!(zai_base_url("z.ai"), Some(ZAI_GLOBAL_BASE_URL));
@@ -1454,6 +1842,8 @@ mod tests {
         assert!(create_provider("dashscope-international", Some("key")).is_ok());
         assert!(create_provider("qwen-us", Some("key")).is_ok());
         assert!(create_provider("dashscope-us", Some("key")).is_ok());
+        assert!(create_provider("qwen-code", Some("key")).is_ok());
+        assert!(create_provider("qwen-oauth", Some("key")).is_ok());
     }
 
     #[test]
@@ -1809,6 +2199,7 @@ mod tests {
             "qwen-intl",
             "qwen-cn",
             "qwen-us",
+            "qwen-code",
             "lmstudio",
             "groq",
             "mistral",

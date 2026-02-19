@@ -43,7 +43,7 @@ credential is not reused for fallback providers.
 | `minimax` | `minimax-intl`, `minimax-io`, `minimax-global`, `minimax-cn`, `minimaxi`, `minimax-oauth`, `minimax-oauth-cn`, `minimax-portal`, `minimax-portal-cn` | No | `MINIMAX_OAUTH_TOKEN`, `MINIMAX_API_KEY` |
 | `bedrock` | `aws-bedrock` | No | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (optional: `AWS_REGION`) |
 | `qianfan` | `baidu` | No | `QIANFAN_API_KEY` |
-| `qwen` | `dashscope`, `qwen-intl`, `dashscope-intl`, `qwen-us`, `dashscope-us` | No | `DASHSCOPE_API_KEY` |
+| `qwen` | `dashscope`, `qwen-intl`, `dashscope-intl`, `qwen-us`, `dashscope-us`, `qwen-code`, `qwen-oauth`, `qwen_oauth` | No | `QWEN_OAUTH_TOKEN`, `DASHSCOPE_API_KEY` |
 | `groq` | — | No | `GROQ_API_KEY` |
 | `mistral` | — | No | `MISTRAL_API_KEY` |
 | `xai` | `grok` | No | `XAI_API_KEY` |
@@ -121,6 +121,28 @@ Optional:
 
 - `MINIMAX_OAUTH_REGION=global` or `cn` (defaults by provider alias)
 - `MINIMAX_OAUTH_CLIENT_ID` to override the default OAuth client id
+
+## Qwen Code OAuth Setup (config.toml)
+
+Set Qwen Code OAuth mode in config:
+
+```toml
+default_provider = "qwen-code"
+api_key = "qwen-oauth"
+```
+
+Credential resolution for `qwen-code`:
+
+1. Explicit `api_key` value (if not the placeholder `qwen-oauth`)
+2. `QWEN_OAUTH_TOKEN`
+3. `~/.qwen/oauth_creds.json` (reuses Qwen Code cached OAuth credentials)
+4. Optional refresh via `QWEN_OAUTH_REFRESH_TOKEN` (or cached refresh token)
+5. If no OAuth placeholder is used, `DASHSCOPE_API_KEY` can still be used as fallback
+
+Optional endpoint override:
+
+- `QWEN_OAUTH_RESOURCE_URL` (normalized to `https://.../v1` if needed)
+- If unset, `resource_url` from cached OAuth credentials is used when available
 
 ## Model Routing (`hint:<name>`)
 
