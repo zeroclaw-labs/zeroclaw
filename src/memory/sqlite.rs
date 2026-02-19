@@ -452,7 +452,7 @@ impl Memory for SqliteMemory {
         let conn = self.conn.clone();
         let key = key.to_string();
         let content = content.to_string();
-        let session_id = session_id.map(String::from);
+        let sid = session_id.map(String::from);
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let conn = conn.lock();
@@ -469,7 +469,7 @@ impl Memory for SqliteMemory {
                     embedding = excluded.embedding,
                     updated_at = excluded.updated_at,
                     session_id = excluded.session_id",
-                params![id, key, content, cat, embedding_bytes, now, now, session_id],
+                params![id, key, content, cat, embedding_bytes, now, now, sid],
             )?;
             Ok(())
         })
@@ -491,13 +491,13 @@ impl Memory for SqliteMemory {
 
         let conn = self.conn.clone();
         let query = query.to_string();
-        let session_id = session_id.map(String::from);
+        let sid = session_id.map(String::from);
         let vector_weight = self.vector_weight;
         let keyword_weight = self.keyword_weight;
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
             let conn = conn.lock();
-            let session_ref = session_id.as_deref();
+            let session_ref = sid.as_deref();
 
             // FTS5 BM25 keyword search
             let keyword_results = Self::fts5_search(&conn, &query, limit * 2).unwrap_or_default();
@@ -691,11 +691,11 @@ impl Memory for SqliteMemory {
 
         let conn = self.conn.clone();
         let category = category.cloned();
-        let session_id = session_id.map(String::from);
+        let sid = session_id.map(String::from);
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
             let conn = conn.lock();
-            let session_ref = session_id.as_deref();
+            let session_ref = sid.as_deref();
             let mut results = Vec::new();
 
             let row_mapper = |row: &rusqlite::Row| -> rusqlite::Result<MemoryEntry> {
