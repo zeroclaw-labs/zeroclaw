@@ -131,6 +131,10 @@ tower = { version = "0.5", default-features = false }
 tower-http = { version = "0.6", default-features = false, features = ["limit", "timeout"] }
 http-body-util = "0.1"
 
+# Embed frontend assets into binary (web dashboard)
+rust-embed = { version = "8", features = ["compression"] }
+mime_guess = "2"
+
 # OpenTelemetry — OTLP trace + metrics export.
 # Use the blocking HTTP exporter client to avoid Tokio-reactor panics in
 # OpenTelemetry background batch threads when ZeroClaw emits spans/metrics from
