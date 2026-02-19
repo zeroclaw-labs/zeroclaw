@@ -629,7 +629,7 @@ impl TelegramChannel {
 
         if let Some(code) = Self::extract_bind_code(text) {
             if let Some(pairing) = self.pairing.as_ref() {
-                match pairing.try_pair(code).await {
+                match pairing.try_pair(code, &chat_id).await {
                     Ok(Some(_token)) => {
                         let bind_identity = normalized_sender_id.clone().or_else(|| {
                             if normalized_username.is_empty() || normalized_username == "unknown" {
