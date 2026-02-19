@@ -13,6 +13,7 @@ repository = "https://github.com/zeroclaw-labs/zeroclaw"
 readme = "README.md"
 keywords = ["ai", "agent", "cli", "assistant", "chatbot"]
 categories = ["command-line-utilities", "api-bindings"]
+rust-version = "1.87"
 
 [dependencies]
 # CLI - minimal and fast
