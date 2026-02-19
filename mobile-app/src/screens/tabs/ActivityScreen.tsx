@@ -7,20 +7,33 @@ import { Text } from "../../../ui/primitives/Text";
 import { useActivity } from "../../state/activity";
 import { theme } from "../../../ui/theme";
 import { getRuntimeSupervisorState, type RuntimeSupervisorState } from "../../runtime/supervisor";
+import { getAndroidRuntimeBridgeStatus } from "../../native/androidAgentBridge";
 
 export function ActivityScreen() {
   const { items, refresh } = useActivity();
   const [runtimeState, setRuntimeState] = React.useState<RuntimeSupervisorState | null>(null);
+  const [bridgeState, setBridgeState] = React.useState<{
+    queueSize: number;
+    alwaysOn: boolean;
+    runtimeReady: boolean;
+    daemonUp: boolean;
+    telegramSeenCount: number;
+    webhookSuccessCount: number;
+    webhookFailCount: number;
+    lastEventNote: string;
+  } | null>(null);
 
   useEffect(() => {
     refresh();
     void getRuntimeSupervisorState().then(setRuntimeState);
+    void getAndroidRuntimeBridgeStatus().then(setBridgeState);
   }, [refresh]);
 
   useFocusEffect(
     React.useCallback(() => {
       void refresh();
       void getRuntimeSupervisorState().then(setRuntimeState);
+      void getAndroidRuntimeBridgeStatus().then(setBridgeState);
     }, [refresh])
   );
 
@@ -45,7 +58,7 @@ export function ActivityScreen() {
             <Text variant="bodyMedium">ZeroClaw Runtime</Text>
             <Text variant="mono" style={{ marginTop: 6, color: theme.colors.base.textMuted }}>
               {runtimeState
-                ? `status=${runtimeState.status} | restarts=${runtimeState.restartCount}`
+                ? `status=${runtimeState.status} | reason=${runtimeState.degradeReason} | restarts=${runtimeState.restartCount}`
                 : "status=unknown"}
             </Text>
             {runtimeState?.components?.length ? (
@@ -60,6 +73,16 @@ export function ActivityScreen() {
             {runtimeState?.missingConfig?.length ? (
               <Text variant="muted" style={{ marginTop: 4 }}>
                 Missing config: {runtimeState.missingConfig.join(", ")}
+              </Text>
+            ) : null}
+            {bridgeState ? (
+              <Text variant="muted" style={{ marginTop: 4 }}>
+                Native bridge: queue={bridgeState.queueSize}, always_on={bridgeState.alwaysOn ? "on" : "off"}, runtime_ready={bridgeState.runtimeReady ? "yes" : "no"}, daemon_up={bridgeState.daemonUp ? "yes" : "no"}, telegram_seen={bridgeState.telegramSeenCount}, handled_ok={bridgeState.webhookSuccessCount}, handled_fail={bridgeState.webhookFailCount}
+              </Text>
+            ) : null}
+            {bridgeState?.lastEventNote ? (
+              <Text variant="muted" style={{ marginTop: 4 }}>
+                Last bridge event: {bridgeState.lastEventNote}
               </Text>
             ) : null}
           </View>

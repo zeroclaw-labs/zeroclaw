@@ -1,5 +1,5 @@
 import { executeAndroidToolAction } from "../native/androidAgentBridge";
-import type { MobileToolCapability, SecurityConfig } from "../state/mobileclaw";
+import type { IntegrationsConfig, MobileToolCapability, SecurityConfig } from "../state/mobileclaw";
 import type { ToolCallDirective, ToolExecutionEvent } from "./types";
 
 const HIGH_RISK_TOOLS = new Set<string>([
@@ -240,18 +240,191 @@ function defaultPayloadForTool(tool: string, args: Record<string, unknown>): Rec
   return args;
 }
 
+function extractMessageText(args: Record<string, unknown>): string {
+  const text =
+    (typeof args.text === "string" && args.text.trim()) ||
+    (typeof args.message === "string" && args.message.trim()) ||
+    (typeof args.body === "string" && args.body.trim()) ||
+    "";
+  return text;
+}
+
+async function executeTelegramSendMessage(
+  directive: ToolCallDirective,
+  integrations: IntegrationsConfig,
+): Promise<ToolExecutionEvent> {
+  if (!integrations.telegramEnabled) {
+    return {
+      tool: directive.tool,
+      status: "blocked",
+      detail: "Telegram integration is disabled in Integrations screen.",
+    };
+  }
+
+  const botToken = integrations.telegramBotToken.trim();
+  let chatId = integrations.telegramChatId.trim();
+  if (!botToken) {
+    return {
+      tool: directive.tool,
+      status: "blocked",
+      detail: "Telegram bot token is missing. Open Integrations and add bot token first.",
+    };
+  }
+
+  if (!chatId) {
+    try {
+      const updatesResponse = await fetch(`https://api.telegram.org/bot${botToken}/getUpdates`);
+      const updatesPayload = (await updatesResponse.json()) as {
+        ok?: boolean;
+        result?: Array<{ message?: { chat?: { id?: number | string } } }>;
+      };
+      const updates = Array.isArray(updatesPayload.result) ? updatesPayload.result : [];
+      const latest = [...updates]
+        .reverse()
+        .map((update) => update.message?.chat?.id)
+        .find((id) => id !== undefined && id !== null);
+      if (latest !== undefined && latest !== null) {
+        chatId = String(latest);
+      }
+    } catch {
+      // Keep fallback behavior below.
+    }
+  }
+
+  if (!chatId) {
+    return {
+      tool: directive.tool,
+      status: "blocked",
+      detail: "Telegram chat is not detected yet. Send any message to your bot, then retry.",
+    };
+  }
+
+  const text = extractMessageText(directive.arguments);
+  if (!text) {
+    return {
+      tool: directive.tool,
+      status: "blocked",
+      detail: "Telegram message text is empty. Provide the message text.",
+    };
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    const response = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text,
+      }),
+      signal: controller.signal,
+    });
+
+    const payload = (await response.json()) as {
+      ok?: boolean;
+      description?: string;
+      result?: { message_id?: number };
+    };
+
+    if (!response.ok || !payload.ok) {
+      const detail = payload.description ? `: ${payload.description}` : "";
+      return {
+        tool: directive.tool,
+        status: "failed",
+        detail: `Telegram API request failed${detail}`,
+      };
+    }
+
+    return {
+      tool: directive.tool,
+      status: "executed",
+      detail: "Telegram message sent successfully.",
+      output: payload.result ?? null,
+    };
+  } catch (error) {
+    return {
+      tool: directive.tool,
+      status: "failed",
+      detail: error instanceof Error ? error.message : "Telegram send failed.",
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function integrationBlockedEvent(tool: string, enabled: boolean, configured: boolean, detail: string): ToolExecutionEvent {
+  if (!enabled) {
+    return {
+      tool,
+      status: "blocked",
+      detail: `${detail} integration is disabled in Integrations screen.`,
+    };
+  }
+  if (!configured) {
+    return {
+      tool,
+      status: "blocked",
+      detail: `${detail} integration is enabled but incomplete. Finish setup in Integrations screen first.`,
+    };
+  }
+  return {
+    tool,
+    status: "failed",
+    detail: `${detail} execution from mobile chat is not implemented yet. Keep ZeroClaw backend runtime healthy and use ${detail} channel inbound for now.`,
+  };
+}
+
 export async function executeToolDirective(
   directive: ToolCallDirective,
   config: {
     tools: MobileToolCapability[];
+    integrations: IntegrationsConfig;
     security: SecurityConfig;
   },
 ): Promise<ToolExecutionEvent> {
   if (directive.tool.startsWith("integration.")) {
+    if (directive.tool === "integration.telegram.send_message") {
+      return executeTelegramSendMessage(directive, config.integrations);
+    }
+    if (directive.tool === "integration.discord.send_message") {
+      return integrationBlockedEvent(
+        directive.tool,
+        config.integrations.discordEnabled,
+        Boolean(config.integrations.discordBotToken.trim()),
+        "Discord",
+      );
+    }
+    if (directive.tool === "integration.slack.send_message") {
+      return integrationBlockedEvent(
+        directive.tool,
+        config.integrations.slackEnabled,
+        Boolean(config.integrations.slackBotToken.trim()),
+        "Slack",
+      );
+    }
+    if (directive.tool === "integration.whatsapp.send_message") {
+      return integrationBlockedEvent(
+        directive.tool,
+        config.integrations.whatsappEnabled,
+        Boolean(config.integrations.whatsappAccessToken.trim()),
+        "WhatsApp",
+      );
+    }
+    if (directive.tool === "integration.composio.invoke_action") {
+      return integrationBlockedEvent(
+        directive.tool,
+        config.integrations.composioEnabled,
+        Boolean(config.integrations.composioApiKey.trim()),
+        "Composio",
+      );
+    }
     return {
       tool: directive.tool,
       status: "failed",
-      detail: "Integration tools are available in ZeroClaw backend runtime and are not executed by mobile native bridge.",
+      detail: `Unsupported integration tool: ${directive.tool}`,
     };
   }
 

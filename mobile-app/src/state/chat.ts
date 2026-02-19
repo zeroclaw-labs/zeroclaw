@@ -13,7 +13,7 @@ export type ChatMessage = {
 
 const KEY = "mobileclaw:chat:v1";
 
-function sanitizeAssistantArtifacts(text: string): string {
+export function sanitizeAssistantArtifacts(text: string): string {
   const value = String(text || "");
   return value
     .replace(/<[^>]*system\s*[-_ ]?reminder[^>]*>[\s\S]*?<\/[^>]*system\s*[-_ ]?reminder\s*>/gi, "")

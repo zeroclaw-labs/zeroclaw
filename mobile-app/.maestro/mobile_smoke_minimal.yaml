@@ -1,0 +1,15 @@
+appId: com.mobileclaw.app
+---
+- launchApp
+- extendedWaitUntil:
+    visible: "MobileClaw agent chat with voice mode."
+    timeout: 30000
+- tapOn:
+    id: "dock-tab-integrations"
+- tapOn:
+    id: "dock-tab-integrations"
+- extendedWaitUntil:
+    visible:
+      id: "screen-integrations"
+    timeout: 15000
+- assertVisible: "Telegram"

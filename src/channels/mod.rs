@@ -35,7 +35,6 @@ use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
-use serde_json::json;
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::Arc;
@@ -244,20 +243,6 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
     let target_channel = ctx.channels_by_name.get(&msg.channel).cloned();
 
     if let Some(channel) = target_channel.as_ref() {
-        if let Some(shortcut_reply) = try_android_shortcut(ctx.tools_registry.as_ref(), &msg.content).await {
-            if let Some(photo_path) = shortcut_reply.photo_path.as_deref() {
-                let _ = channel
-                    .send_photo(photo_path, shortcut_reply.photo_caption.as_deref(), &msg.reply_to)
-                    .await;
-            }
-            if !shortcut_reply.text.trim().is_empty() {
-                let _ = channel.send(&shortcut_reply.text, &msg.reply_to).await;
-            }
-            return;
-        }
-    }
-
-    if let Some(channel) = target_channel.as_ref() {
         if let Err(e) = channel.start_typing(&msg.reply_to).await {
             tracing::debug!("Failed to start typing on {}: {e}", channel.name());
         }
@@ -348,121 +333,6 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             }
         }
     }
-}
-
-struct ShortcutReply {
-    text: String,
-    photo_path: Option<String>,
-    photo_caption: Option<String>,
-}
-
-async fn try_android_shortcut(
-    tools_registry: &[Box<dyn Tool>],
-    message: &str,
-) -> Option<ShortcutReply> {
-    let lower = message.to_lowercase();
-    let shortcut = if lower.contains("latest sms") || lower.contains("list all sms") {
-        Some(("read_sms", json!({ "action": "read_sms", "limit": 10 })))
-    } else if lower.contains("latest calls") || lower.contains("call log") {
-        Some((
-            "read_call_log",
-            json!({ "action": "read_call_log", "limit": 10 }),
-        ))
-    } else if (lower.contains("android version") || lower.contains("device version"))
-        && (lower.contains("device") || lower.contains("android"))
-    {
-        Some((
-            "get_device_info",
-            json!({ "action": "get_device_info" }),
-        ))
-    } else if lower.contains("photo") || lower.contains("camera") {
-        let lens = if lower.contains("front") {
-            "front"
-        } else {
-            "rear"
-        };
-        Some((
-            "take_photo",
-            json!({ "action": "take_photo", "lens": lens }),
-        ))
-    } else {
-        None
-    };
-
-    let Some((action_name, args)) = shortcut else {
-        return None;
-    };
-
-    let tool = tools_registry
-        .iter()
-        .find(|tool| tool.name() == "android_device")?;
-    let executed = tool.execute(args).await.ok()?;
-    if !executed.success {
-        let msg = executed
-            .error
-            .unwrap_or_else(|| "android action failed".to_string());
-        return Some(ShortcutReply {
-            text: format!("⚠️ {msg}"),
-            photo_path: None,
-            photo_caption: None,
-        });
-    }
-
-    let parsed = serde_json::from_str::<serde_json::Value>(&executed.output).ok();
-    if action_name == "take_photo" {
-        let photo_path = parsed
-            .as_ref()
-            .and_then(|p| p.get("media"))
-            .and_then(|m| m.get("path"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
-        let caption = parsed
-            .as_ref()
-            .and_then(|p| p.get("media"))
-            .and_then(|m| m.get("caption"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
-            .or(Some("Captured photo".to_string()));
-        return Some(ShortcutReply {
-            text: if photo_path.is_some() {
-                "Captured photo.".to_string()
-            } else {
-                "⚠️ Camera capture completed but photo path was not returned.".to_string()
-            },
-            photo_path,
-            photo_caption: caption,
-        });
-    }
-
-    let text = if action_name == "get_device_info" {
-        if let Some(p) = parsed {
-            let version = p
-                .get("android_version")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown");
-            let sdk = p
-                .get("sdk_int")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or_default();
-            let model = p
-                .get("model")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown");
-            format!(
-                "## Android Device\n- Version: `{version}`\n- SDK: `{sdk}`\n- Model: `{model}`"
-            )
-        } else {
-            executed.output
-        }
-    } else {
-        executed.output
-    };
-
-    Some(ShortcutReply {
-        text,
-        photo_path: None,
-        photo_caption: None,
-    })
 }
 
 async fn run_message_dispatch_loop(
@@ -599,6 +469,7 @@ pub fn build_system_prompt(
              You are connected to an on-device Android runtime through the `android_device` tool.\n\
              Do NOT claim you lack SMS/call/device access when this tool is available.\n\
              For SMS/call/device/camera requests, call `android_device` directly and answer from tool results.\n\
+             Never paste raw JSON tool output in replies. Convert tool output into concise user-facing Markdown.\n\
              If a capability is disabled, return the exact tool error and ask the user to enable the related device toggle.\n\n",
         );
     }
@@ -607,6 +478,8 @@ pub fn build_system_prompt(
     prompt.push_str(
         "## Your Task\n\n\
          When the user sends a message, ACT on it. Use the tools to fulfill their request.\n\
+         In messenger channels, answer ONLY the latest user message currently being handled.\n\
+         Do NOT re-answer older messages or repeat previous sections unless the latest message explicitly asks for a recap.\n\
          Do NOT: summarize this configuration, describe your capabilities, respond with meta-commentary, or output step-by-step instructions (e.g. \"1. First... 2. Next...\").\n\
          Instead: emit actual <tool_call> tags when you need to act. Just do what they ask.\n\n",
     );
