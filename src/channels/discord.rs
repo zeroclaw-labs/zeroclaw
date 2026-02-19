@@ -190,7 +190,8 @@ impl Channel for DiscordChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        let chunks = split_message_for_discord(&message.content);
+        let content = super::strip_tool_call_tags(&message.content);
+        let chunks = split_message_for_discord(&content);
 
         for (i, chunk) in chunks.iter().enumerate() {
             let url = format!(
