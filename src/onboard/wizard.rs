@@ -2590,116 +2590,155 @@ fn setup_channels() -> Result<ChannelsConfig> {
     println!();
 
     let mut config = ChannelsConfig::default();
+    #[derive(Clone, Copy)]
+    enum ChannelMenuChoice {
+        Telegram,
+        Discord,
+        Slack,
+        IMessage,
+        Matrix,
+        WhatsApp,
+        Linq,
+        Irc,
+        Webhook,
+        DingTalk,
+        QqOfficial,
+        LarkFeishu,
+        Done,
+    }
+    let menu_choices = [
+        ChannelMenuChoice::Telegram,
+        ChannelMenuChoice::Discord,
+        ChannelMenuChoice::Slack,
+        ChannelMenuChoice::IMessage,
+        ChannelMenuChoice::Matrix,
+        ChannelMenuChoice::WhatsApp,
+        ChannelMenuChoice::Linq,
+        ChannelMenuChoice::Irc,
+        ChannelMenuChoice::Webhook,
+        ChannelMenuChoice::DingTalk,
+        ChannelMenuChoice::QqOfficial,
+        ChannelMenuChoice::LarkFeishu,
+        ChannelMenuChoice::Done,
+    ];
 
     loop {
-        let options = vec![
-            format!(
-                "Telegram   {}",
-                if config.telegram.is_some() {
-                    "✅ connected"
-                } else {
-                    "— connect your bot"
-                }
-            ),
-            format!(
-                "Discord    {}",
-                if config.discord.is_some() {
-                    "✅ connected"
-                } else {
-                    "— connect your bot"
-                }
-            ),
-            format!(
-                "Slack      {}",
-                if config.slack.is_some() {
-                    "✅ connected"
-                } else {
-                    "— connect your bot"
-                }
-            ),
-            format!(
-                "iMessage   {}",
-                if config.imessage.is_some() {
-                    "✅ configured"
-                } else {
-                    "— macOS only"
-                }
-            ),
-            format!(
-                "Matrix     {}",
-                if config.matrix.is_some() {
-                    "✅ connected"
-                } else {
-                    "— self-hosted chat"
-                }
-            ),
-            format!(
-                "WhatsApp   {}",
-                if config.whatsapp.is_some() {
-                    "✅ connected"
-                } else {
-                    "— Business Cloud API"
-                }
-            ),
-            format!(
-                "Linq       {}",
-                if config.linq.is_some() {
-                    "✅ connected"
-                } else {
-                    "— iMessage/RCS/SMS via Linq API"
-                }
-            ),
-            format!(
-                "IRC        {}",
-                if config.irc.is_some() {
-                    "✅ configured"
-                } else {
-                    "— IRC over TLS"
-                }
-            ),
-            format!(
-                "Webhook    {}",
-                if config.webhook.is_some() {
-                    "✅ configured"
-                } else {
-                    "— HTTP endpoint"
-                }
-            ),
-            format!(
-                "DingTalk   {}",
-                if config.dingtalk.is_some() {
-                    "✅ connected"
-                } else {
-                    "— DingTalk Stream Mode"
-                }
-            ),
-            format!(
-                "QQ Official {}",
-                if config.qq.is_some() {
-                    "✅ connected"
-                } else {
-                    "— Tencent QQ Bot"
-                }
-            ),
-            format!(
-                "Lark/Feishu {}",
-                if config.lark.is_some() {
-                    "✅ connected"
-                } else {
-                    "— Lark/Feishu Bot"
-                }
-            ),
-            "Done — finish setup".to_string(),
-        ];
+        let options: Vec<String> = menu_choices
+            .iter()
+            .map(|choice| match choice {
+                ChannelMenuChoice::Telegram => format!(
+                    "Telegram   {}",
+                    if config.telegram.is_some() {
+                        "✅ connected"
+                    } else {
+                        "— connect your bot"
+                    }
+                ),
+                ChannelMenuChoice::Discord => format!(
+                    "Discord    {}",
+                    if config.discord.is_some() {
+                        "✅ connected"
+                    } else {
+                        "— connect your bot"
+                    }
+                ),
+                ChannelMenuChoice::Slack => format!(
+                    "Slack      {}",
+                    if config.slack.is_some() {
+                        "✅ connected"
+                    } else {
+                        "— connect your bot"
+                    }
+                ),
+                ChannelMenuChoice::IMessage => format!(
+                    "iMessage   {}",
+                    if config.imessage.is_some() {
+                        "✅ configured"
+                    } else {
+                        "— macOS only"
+                    }
+                ),
+                ChannelMenuChoice::Matrix => format!(
+                    "Matrix     {}",
+                    if config.matrix.is_some() {
+                        "✅ connected"
+                    } else {
+                        "— self-hosted chat"
+                    }
+                ),
+                ChannelMenuChoice::WhatsApp => format!(
+                    "WhatsApp   {}",
+                    if config.whatsapp.is_some() {
+                        "✅ connected"
+                    } else {
+                        "— Business Cloud API"
+                    }
+                ),
+                ChannelMenuChoice::Linq => format!(
+                    "Linq       {}",
+                    if config.linq.is_some() {
+                        "✅ connected"
+                    } else {
+                        "— iMessage/RCS/SMS via Linq API"
+                    }
+                ),
+                ChannelMenuChoice::Irc => format!(
+                    "IRC        {}",
+                    if config.irc.is_some() {
+                        "✅ configured"
+                    } else {
+                        "— IRC over TLS"
+                    }
+                ),
+                ChannelMenuChoice::Webhook => format!(
+                    "Webhook    {}",
+                    if config.webhook.is_some() {
+                        "✅ configured"
+                    } else {
+                        "— HTTP endpoint"
+                    }
+                ),
+                ChannelMenuChoice::DingTalk => format!(
+                    "DingTalk   {}",
+                    if config.dingtalk.is_some() {
+                        "✅ connected"
+                    } else {
+                        "— DingTalk Stream Mode"
+                    }
+                ),
+                ChannelMenuChoice::QqOfficial => format!(
+                    "QQ Official {}",
+                    if config.qq.is_some() {
+                        "✅ connected"
+                    } else {
+                        "— Tencent QQ Bot"
+                    }
+                ),
+                ChannelMenuChoice::LarkFeishu => format!(
+                    "Lark/Feishu {}",
+                    if config.lark.is_some() {
+                        "✅ connected"
+                    } else {
+                        "— Lark/Feishu Bot"
+                    }
+                ),
+                ChannelMenuChoice::Done => "Done — finish setup".to_string(),
+            })
+            .collect();
 
-        let choice = Select::new()
+        let selection = Select::new()
             .with_prompt("  Connect a channel (or Done to continue)")
             .items(&options)
             .default(options.len() - 1)
             .interact()?;
 
+        let choice = menu_choices
+            .get(selection)
+            .copied()
+            .unwrap_or(ChannelMenuChoice::Done);
+
         match choice {
-            0 => {
+            ChannelMenuChoice::Telegram => {
                 // ── Telegram ──
                 println!();
                 println!(
@@ -2797,7 +2836,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     mention_only: false,
                 });
             }
-            1 => {
+            ChannelMenuChoice::Discord => {
                 // ── Discord ──
                 println!();
                 println!(
@@ -2896,7 +2935,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     mention_only: false,
                 });
             }
-            2 => {
+            ChannelMenuChoice::Slack => {
                 // ── Slack ──
                 println!();
                 println!(
@@ -3021,7 +3060,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     allowed_users,
                 });
             }
-            3 => {
+            ChannelMenuChoice::IMessage => {
                 // ── iMessage ──
                 println!();
                 println!(
@@ -3065,7 +3104,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     style(&contacts_str).cyan()
                 );
             }
-            4 => {
+            ChannelMenuChoice::Matrix => {
                 // ── Matrix ──
                 println!();
                 println!(
@@ -3177,7 +3216,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     allowed_users,
                 });
             }
-            5 => {
+            ChannelMenuChoice::WhatsApp => {
                 // ── WhatsApp ──
                 println!();
                 println!(
@@ -3274,7 +3313,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     allowed_numbers,
                 });
             }
-            6 => {
+            ChannelMenuChoice::Linq => {
                 // ── Linq ──
                 println!();
                 println!(
@@ -3366,7 +3405,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     allowed_senders,
                 });
             }
-            7 => {
+            ChannelMenuChoice::Irc => {
                 // ── IRC ──
                 println!();
                 println!(
@@ -3505,7 +3544,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     verify_tls: Some(verify_tls),
                 });
             }
-            8 => {
+            ChannelMenuChoice::Webhook => {
                 // ── Webhook ──
                 println!();
                 println!(
@@ -3538,7 +3577,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     style(&port).cyan()
                 );
             }
-            9 => {
+            ChannelMenuChoice::DingTalk => {
                 // ── DingTalk ──
                 println!();
                 println!(
@@ -3608,7 +3647,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     allowed_users,
                 });
             }
-            10 => {
+            ChannelMenuChoice::QqOfficial => {
                 // ── QQ Official ──
                 println!();
                 println!(
@@ -3684,7 +3723,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     allowed_users,
                 });
             }
-            11 => {
+            ChannelMenuChoice::LarkFeishu => {
                 // ── Lark/Feishu ──
                 println!();
                 println!(
@@ -3871,7 +3910,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     port,
                 });
             }
-            _ => break, // Done
+            ChannelMenuChoice::Done => break,
         }
         println!();
     }
