@@ -1096,12 +1096,9 @@ pub fn build_system_prompt(
          - When in doubt, ask before acting externally.\n\n",
     );
 
-    // ── 3. Skills (compact list — load on-demand) ───────────────
+    // ── 3. Skills (inline prompts + tools) ──────────────────────
     if !skills.is_empty() {
         prompt.push_str("## Available Skills\n\n");
-        prompt.push_str(
-            "Skills are loaded on demand. Use `read` on the skill path to get full instructions.\n\n",
-        );
         prompt.push_str("<available_skills>\n");
         for skill in skills {
             let _ = writeln!(prompt, "  <skill>");
@@ -1118,6 +1115,26 @@ pub fn build_system_prompt(
                     .join("SKILL.md")
             });
             let _ = writeln!(prompt, "    <location>{}</location>", location.display());
+            if !skill.tools.is_empty() {
+                let _ = writeln!(prompt, "    <tools>");
+                for tool in &skill.tools {
+                    let _ = writeln!(
+                        prompt,
+                        "      <tool name=\"{}\" kind=\"{}\">{}</tool>",
+                        tool.name, tool.kind, tool.description
+                    );
+                }
+                let _ = writeln!(prompt, "    </tools>");
+            }
+            if !skill.prompts.is_empty() {
+                let _ = writeln!(prompt, "    <instructions>");
+                for p in &skill.prompts {
+                    prompt.push_str("      ");
+                    prompt.push_str(p);
+                    prompt.push('\n');
+                }
+                let _ = writeln!(prompt, "    </instructions>");
+            }
             let _ = writeln!(prompt, "  </skill>");
         }
         prompt.push_str("</available_skills>\n\n");
@@ -3263,7 +3280,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_skills_compact_list() {
+    fn prompt_skills_inline_prompts_and_tools() {
         let ws = make_workspace();
         let skills = vec![crate::skills::Skill {
             name: "code-review".into(),
@@ -3271,8 +3288,14 @@ mod tests {
             version: "1.0.0".into(),
             author: None,
             tags: vec![],
-            tools: vec![],
-            prompts: vec!["Long prompt content that should NOT appear in system prompt".into()],
+            tools: vec![crate::skills::SkillTool {
+                name: "run_linter".into(),
+                description: "Run linter on code".into(),
+                kind: "shell".into(),
+                command: "cargo clippy".into(),
+                args: std::collections::HashMap::new(),
+            }],
+            prompts: vec!["When reviewing code, check for common bugs and style issues.".into()],
             location: None,
         }];
 
@@ -3282,12 +3305,21 @@ mod tests {
         assert!(prompt.contains("<name>code-review</name>"));
         assert!(prompt.contains("<description>Review code for bugs</description>"));
         assert!(prompt.contains("SKILL.md</location>"));
+        // Skill prompts should be inlined
         assert!(
-            prompt.contains("loaded on demand"),
-            "should mention on-demand loading"
+            prompt.contains("When reviewing code, check for common bugs"),
+            "skill prompt should be inlined in system prompt"
         );
-        // Full prompt content should NOT be dumped
-        assert!(!prompt.contains("Long prompt content that should NOT appear"));
+        assert!(
+            prompt.contains("<instructions>"),
+            "should have instructions block"
+        );
+        // Skill tools should be inlined
+        assert!(
+            prompt.contains("run_linter"),
+            "skill tool should be inlined"
+        );
+        assert!(prompt.contains("<tools>"), "should have tools block");
     }
 
     #[test]
