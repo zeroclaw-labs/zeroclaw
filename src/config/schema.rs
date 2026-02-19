@@ -1783,20 +1783,14 @@ impl Default for HooksConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuiltinHooksConfig {
-    /// Persist selected session memory events via built-in hook handler.
-    pub session_memory: bool,
-    /// Log hook-related command activity for audit/troubleshooting.
+    /// Enable the command-logger hook (logs tool calls for auditing).
     pub command_logger: bool,
-    /// Run boot-time initialization script hook.
-    pub boot_script: bool,
 }
 
 impl Default for BuiltinHooksConfig {
     fn default() -> Self {
         Self {
-            session_memory: true,
             command_logger: false,
-            boot_script: true,
         }
     }
 }

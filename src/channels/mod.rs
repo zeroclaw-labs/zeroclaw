@@ -3069,7 +3069,15 @@ pub async fn start_channels(config: Config) -> Result<()> {
         message_timeout_secs,
         interrupt_on_new_message,
         multimodal: config.multimodal.clone(),
-        hooks: None,
+        hooks: if config.hooks.enabled {
+            let mut runner = crate::hooks::HookRunner::new();
+            if config.hooks.builtin.command_logger {
+                runner.register(Box::new(crate::hooks::builtin::CommandLoggerHook::new()));
+            }
+            Some(Arc::new(runner))
+        } else {
+            None
+        },
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;

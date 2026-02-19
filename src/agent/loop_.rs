@@ -1720,19 +1720,21 @@ pub(crate) async fn run_tool_call_loop(
                 tool: tool_name.clone(),
             });
             let start = Instant::now();
-            let result = if let Some(tool) = find_tool(tools_registry, &tool_name) {
+            let (result, tool_success) = if let Some(tool) = find_tool(tools_registry, &tool_name) {
                 match tool.execute(tool_args).await {
                     Ok(r) => {
+                        let success = r.success;
                         observer.record_event(&ObserverEvent::ToolCall {
                             tool: tool_name.clone(),
                             duration: start.elapsed(),
-                            success: r.success,
+                            success,
                         });
-                        if r.success {
+                        let output = if r.success {
                             scrub_credentials(&r.output)
                         } else {
                             format!("Error: {}", r.error.unwrap_or_else(|| r.output))
-                        }
+                        };
+                        (output, success)
                     }
                     Err(e) => {
                         observer.record_event(&ObserverEvent::ToolCall {
@@ -1740,17 +1742,17 @@ pub(crate) async fn run_tool_call_loop(
                             duration: start.elapsed(),
                             success: false,
                         });
-                        format!("Error executing {}: {e}", tool_name)
+                        (format!("Error executing {}: {e}", tool_name), false)
                     }
                 }
             } else {
-                format!("Unknown tool: {}", tool_name)
+                (format!("Unknown tool: {}", tool_name), false)
             };
 
             // ── Hook: after_tool_call (void) ─────────────────
             if let Some(hooks) = hooks {
                 let tool_result_obj = crate::tools::ToolResult {
-                    success: !result.starts_with("Error"),
+                    success: tool_success,
                     output: result.clone(),
                     error: None,
                 };
