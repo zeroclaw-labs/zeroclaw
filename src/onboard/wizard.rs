@@ -21,10 +21,10 @@ use dialoguer::{Confirm, Input, Select};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
-use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tokio::fs;
 
 // ── Project context collected during wizard ──────────────────────
 
@@ -115,11 +115,11 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
     println!();
 
     print_step(1, 9, "Workspace Setup");
-    let (workspace_dir, config_path) = setup_workspace()?;
+    let (workspace_dir, config_path) = setup_workspace().await?;
     ensure_onboard_overwrite_allowed(&config_path, force)?;
 
     print_step(2, 9, "AI Provider & API Key");
-    let (provider, api_key, model, provider_api_url) = setup_provider(&workspace_dir)?;
+    let (provider, api_key, model, provider_api_url) = setup_provider(&workspace_dir).await?;
 
     print_step(3, 9, "Channels (How You Talk to ZeroClaw)");
     let channels_config = setup_channels()?;
@@ -140,7 +140,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
     let project_ctx = setup_project_context()?;
 
     print_step(9, 9, "Workspace Files");
-    scaffold_workspace(&workspace_dir, &project_ctx)?;
+    scaffold_workspace(&workspace_dir, &project_ctx).await?;
 
     // ── Build config ──
     // Defaults: SQLite memory, supervised autonomy, workspace-scoped, native runtime
@@ -374,7 +374,9 @@ async fn run_quick_setup_with_home(
     let config_path = zeroclaw_dir.join("config.toml");
 
     ensure_onboard_overwrite_allowed(&config_path, force)?;
-    fs::create_dir_all(&workspace_dir).context("Failed to create workspace directory")?;
+    fs::create_dir_all(&workspace_dir)
+        .await
+        .context("Failed to create workspace directory")?;
 
     let provider_name = provider.unwrap_or("openrouter").to_string();
     let model = model_override
@@ -442,7 +444,7 @@ async fn run_quick_setup_with_home(
             "Be warm, natural, and clear. Use occasional relevant emojis (1-2 max) and avoid robotic phrasing."
                 .into(),
     };
-    scaffold_workspace(&workspace_dir, &default_ctx)?;
+    scaffold_workspace(&workspace_dir, &default_ctx).await?;
 
     println!(
         "  {} Workspace:  {}",
@@ -1391,13 +1393,14 @@ fn now_unix_secs() -> u64 {
         .map_or(0, |duration| duration.as_secs())
 }
 
-fn load_model_cache_state(workspace_dir: &Path) -> Result<ModelCacheState> {
+async fn load_model_cache_state(workspace_dir: &Path) -> Result<ModelCacheState> {
     let path = model_cache_path(workspace_dir);
     if !path.exists() {
         return Ok(ModelCacheState::default());
     }
 
     let raw = fs::read_to_string(&path)
+        .await
         .with_context(|| format!("failed to read model cache at {}", path.display()))?;
 
     match serde_json::from_str::<ModelCacheState>(&raw) {
@@ -1406,10 +1409,10 @@ fn load_model_cache_state(workspace_dir: &Path) -> Result<ModelCacheState> {
     }
 }
 
-fn save_model_cache_state(workspace_dir: &Path, state: &ModelCacheState) -> Result<()> {
+async fn save_model_cache_state(workspace_dir: &Path, state: &ModelCacheState) -> Result<()> {
     let path = model_cache_path(workspace_dir);
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
+        fs::create_dir_all(parent).await.with_context(|| {
             format!(
                 "failed to create model cache directory {}",
                 parent.display()
@@ -1419,12 +1422,13 @@ fn save_model_cache_state(workspace_dir: &Path, state: &ModelCacheState) -> Resu
 
     let json = serde_json::to_vec_pretty(state).context("failed to serialize model cache")?;
     fs::write(&path, json)
+        .await
         .with_context(|| format!("failed to write model cache at {}", path.display()))?;
 
     Ok(())
 }
 
-fn cache_live_models_for_provider(
+async fn cache_live_models_for_provider(
     workspace_dir: &Path,
     provider_name: &str,
     models: &[String],
@@ -1434,7 +1438,7 @@ fn cache_live_models_for_provider(
         return Ok(());
     }
 
-    let mut state = load_model_cache_state(workspace_dir)?;
+    let mut state = load_model_cache_state(workspace_dir).await?;
     let now = now_unix_secs();
 
     if let Some(entry) = state
@@ -1452,15 +1456,15 @@ fn cache_live_models_for_provider(
         });
     }
 
-    save_model_cache_state(workspace_dir, &state)
+    save_model_cache_state(workspace_dir, &state).await
 }
 
-fn load_cached_models_for_provider_internal(
+async fn load_cached_models_for_provider_internal(
     workspace_dir: &Path,
     provider_name: &str,
     ttl_secs: Option<u64>,
 ) -> Result<Option<CachedModels>> {
-    let state = load_model_cache_state(workspace_dir)?;
+    let state = load_model_cache_state(workspace_dir).await?;
     let now = now_unix_secs();
 
     let Some(entry) = state
@@ -1486,19 +1490,19 @@ fn load_cached_models_for_provider_internal(
     }))
 }
 
-fn load_cached_models_for_provider(
+async fn load_cached_models_for_provider(
     workspace_dir: &Path,
     provider_name: &str,
     ttl_secs: u64,
 ) -> Result<Option<CachedModels>> {
-    load_cached_models_for_provider_internal(workspace_dir, provider_name, Some(ttl_secs))
+    load_cached_models_for_provider_internal(workspace_dir, provider_name, Some(ttl_secs)).await
 }
 
-fn load_any_cached_models_for_provider(
+async fn load_any_cached_models_for_provider(
     workspace_dir: &Path,
     provider_name: &str,
 ) -> Result<Option<CachedModels>> {
-    load_cached_models_for_provider_internal(workspace_dir, provider_name, None)
+    load_cached_models_for_provider_internal(workspace_dir, provider_name, None).await
 }
 
 fn humanize_age(age_secs: u64) -> String {
@@ -1535,7 +1539,7 @@ fn print_model_preview(models: &[String]) {
     }
 }
 
-pub fn run_models_refresh(
+pub async fn run_models_refresh(
     config: &Config,
     provider_override: Option<&str>,
     force: bool,
@@ -1559,7 +1563,9 @@ pub fn run_models_refresh(
             &config.workspace_dir,
             &provider_name,
             MODEL_CACHE_TTL_SECS,
-        )? {
+        )
+        .await?
+        {
             println!(
                 "Using cached model list for '{}' (updated {} ago):",
                 provider_name,
@@ -1579,7 +1585,7 @@ pub fn run_models_refresh(
 
     match fetch_live_models_for_provider(&provider_name, &api_key, config.api_url.as_deref()) {
         Ok(models) if !models.is_empty() => {
-            cache_live_models_for_provider(&config.workspace_dir, &provider_name, &models)?;
+            cache_live_models_for_provider(&config.workspace_dir, &provider_name, &models).await?;
             println!(
                 "Refreshed '{}' model cache with {} models.",
                 provider_name,
@@ -1590,7 +1596,7 @@ pub fn run_models_refresh(
         }
         Ok(_) => {
             if let Some(stale_cache) =
-                load_any_cached_models_for_provider(&config.workspace_dir, &provider_name)?
+                load_any_cached_models_for_provider(&config.workspace_dir, &provider_name).await?
             {
                 println!(
                     "Provider returned no models; using stale cache (updated {} ago):",
@@ -1604,7 +1610,7 @@ pub fn run_models_refresh(
         }
         Err(error) => {
             if let Some(stale_cache) =
-                load_any_cached_models_for_provider(&config.workspace_dir, &provider_name)?
+                load_any_cached_models_for_provider(&config.workspace_dir, &provider_name).await?
             {
                 println!(
                     "Live refresh failed ({}). Falling back to stale cache (updated {} ago):",
@@ -1689,7 +1695,7 @@ async fn persist_workspace_selection(config_path: &Path) -> Result<()> {
 
 // ── Step 1: Workspace ────────────────────────────────────────────
 
-fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
+async fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
     let home = directories::UserDirs::new()
         .map(|u| u.home_dir().to_path_buf())
         .context("Could not find home directory")?;
@@ -1718,7 +1724,9 @@ fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
     let workspace_dir = zeroclaw_dir.join("workspace");
     let config_path = zeroclaw_dir.join("config.toml");
 
-    fs::create_dir_all(&workspace_dir).context("Failed to create workspace directory")?;
+    fs::create_dir_all(&workspace_dir)
+        .await
+        .context("Failed to create workspace directory")?;
 
     println!(
         "  {} Workspace: {}",
@@ -1732,7 +1740,7 @@ fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
 // ── Step 2: Provider & API Key ───────────────────────────────────
 
 #[allow(clippy::too_many_lines)]
-fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Option<String>)> {
+async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Option<String>)> {
     // ── Tier selection ──
     let tiers = vec![
         "⭐ Recommended (OpenRouter, Venice, Anthropic, OpenAI, Gemini)",
@@ -2233,7 +2241,8 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
 
         if can_fetch_without_key || has_api_key {
             if let Some(cached) =
-                load_cached_models_for_provider(workspace_dir, provider_name, MODEL_CACHE_TTL_SECS)?
+                load_cached_models_for_provider(workspace_dir, provider_name, MODEL_CACHE_TTL_SECS)
+                    .await?
             {
                 let shown_count = cached.models.len().min(LIVE_MODEL_MAX_OPTIONS);
                 print_bullet(&format!(
@@ -2271,7 +2280,8 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
                             workspace_dir,
                             provider_name,
                             &live_model_ids,
-                        )?;
+                        )
+                        .await?;
 
                         let fetched_count = live_model_ids.len();
                         let shown_count = fetched_count.min(LIVE_MODEL_MAX_OPTIONS);
@@ -2301,7 +2311,8 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
 
                         if live_options.is_none() {
                             if let Some(stale) =
-                                load_any_cached_models_for_provider(workspace_dir, provider_name)?
+                                load_any_cached_models_for_provider(workspace_dir, provider_name)
+                                    .await?
                             {
                                 print_bullet(&format!(
                                     "Loaded stale cache from {} ago.",
@@ -4475,7 +4486,7 @@ fn setup_tunnel() -> Result<crate::config::TunnelConfig> {
 // ── Step 6: Scaffold workspace files ─────────────────────────────
 
 #[allow(clippy::too_many_lines)]
-fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> {
+async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> {
     let agent = if ctx.agent_name.is_empty() {
         "ZeroClaw"
     } else {
@@ -4704,7 +4715,7 @@ fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> 
     // Create subdirectories
     let subdirs = ["sessions", "memory", "state", "cron", "skills"];
     for dir in &subdirs {
-        fs::create_dir_all(workspace_dir.join(dir))?;
+        fs::create_dir_all(workspace_dir.join(dir)).await?;
     }
 
     let mut created = 0;
@@ -4715,7 +4726,7 @@ fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> 
         if path.exists() {
             skipped += 1;
         } else {
-            fs::write(&path, content)?;
+            fs::write(&path, content).await?;
             created += 1;
         }
     }
@@ -5131,11 +5142,11 @@ mod tests {
 
     // ── scaffold_workspace: basic file creation ─────────────────
 
-    #[test]
-    fn scaffold_creates_all_md_files() {
+    #[tokio::test]
+    async fn scaffold_creates_all_md_files() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         let expected = [
             "IDENTITY.md",
@@ -5152,11 +5163,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn scaffold_creates_all_subdirectories() {
+    #[tokio::test]
+    async fn scaffold_creates_all_subdirectories() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         for dir in &["sessions", "memory", "state", "cron", "skills"] {
             assert!(tmp.path().join(dir).is_dir(), "missing subdirectory: {dir}");
@@ -5172,7 +5183,7 @@ mod tests {
             user_name: "Alice".into(),
             ..Default::default()
         };
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
             .await
@@ -5198,7 +5209,7 @@ mod tests {
             timezone: "US/Pacific".into(),
             ..Default::default()
         };
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
             .await
@@ -5224,7 +5235,7 @@ mod tests {
             agent_name: "Crabby".into(),
             ..Default::default()
         };
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         let identity = tokio::fs::read_to_string(tmp.path().join("IDENTITY.md"))
             .await
@@ -5274,7 +5285,7 @@ mod tests {
             communication_style: "Be technical and detailed.".into(),
             ..Default::default()
         };
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
             .await
@@ -5307,7 +5318,7 @@ mod tests {
     async fn scaffold_uses_defaults_for_empty_context() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default(); // all empty
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         let identity = tokio::fs::read_to_string(tmp.path().join("IDENTITY.md"))
             .await
@@ -5350,9 +5361,11 @@ mod tests {
 
         // Pre-create SOUL.md with custom content
         let soul_path = tmp.path().join("SOUL.md");
-        fs::write(&soul_path, "# My Custom Soul\nDo not overwrite me.").unwrap();
+        fs::write(&soul_path, "# My Custom Soul\nDo not overwrite me.")
+            .await
+            .unwrap();
 
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         // SOUL.md should be untouched
         let soul = tokio::fs::read_to_string(&soul_path).await.unwrap();
@@ -5383,13 +5396,13 @@ mod tests {
             ..Default::default()
         };
 
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
         let soul_v1 = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
             .await
             .unwrap();
 
         // Run again — should not change anything
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
         let soul_v2 = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
             .await
             .unwrap();
@@ -5403,7 +5416,7 @@ mod tests {
     async fn scaffold_files_are_non_empty() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         for f in &[
             "IDENTITY.md",
@@ -5426,7 +5439,7 @@ mod tests {
     async fn agents_md_references_on_demand_memory() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         let agents = tokio::fs::read_to_string(tmp.path().join("AGENTS.md"))
             .await
@@ -5447,7 +5460,7 @@ mod tests {
     async fn memory_md_warns_about_token_cost() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         let memory = tokio::fs::read_to_string(tmp.path().join("MEMORY.md"))
             .await
@@ -5468,7 +5481,7 @@ mod tests {
     async fn tools_md_lists_all_builtin_tools() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         let tools = tokio::fs::read_to_string(tmp.path().join("TOOLS.md"))
             .await
@@ -5500,7 +5513,7 @@ mod tests {
     async fn soul_md_includes_emoji_awareness_guidance() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
             .await
@@ -5526,7 +5539,7 @@ mod tests {
             timezone: "Europe/Madrid".into(),
             communication_style: "Be direct.".into(),
         };
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
             .await
@@ -5552,7 +5565,7 @@ mod tests {
                 "Be friendly, human, and conversational. Show warmth and empathy while staying efficient. Use natural contractions."
                     .into(),
         };
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         // Verify every file got personalized
         let identity = tokio::fs::read_to_string(tmp.path().join("IDENTITY.md"))
@@ -6047,15 +6060,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn model_cache_round_trip_returns_fresh_entry() {
+    #[tokio::test]
+    async fn model_cache_round_trip_returns_fresh_entry() {
         let tmp = TempDir::new().unwrap();
         let models = vec!["gpt-5.1".to_string(), "gpt-5-mini".to_string()];
 
-        cache_live_models_for_provider(tmp.path(), "openai", &models).unwrap();
+        cache_live_models_for_provider(tmp.path(), "openai", &models)
+            .await
+            .unwrap();
 
-        let cached =
-            load_cached_models_for_provider(tmp.path(), "openai", MODEL_CACHE_TTL_SECS).unwrap();
+        let cached = load_cached_models_for_provider(tmp.path(), "openai", MODEL_CACHE_TTL_SECS)
+            .await
+            .unwrap();
         let cached = cached.expect("expected fresh cached models");
 
         assert_eq!(cached.models.len(), 2);
@@ -6063,8 +6079,8 @@ mod tests {
         assert!(cached.models.contains(&"gpt-5-mini".to_string()));
     }
 
-    #[test]
-    fn model_cache_ttl_filters_stale_entries() {
+    #[tokio::test]
+    async fn model_cache_ttl_filters_stale_entries() {
         let tmp = TempDir::new().unwrap();
         let stale = ModelCacheState {
             entries: vec![ModelCacheEntry {
@@ -6074,21 +6090,26 @@ mod tests {
             }],
         };
 
-        save_model_cache_state(tmp.path(), &stale).unwrap();
+        save_model_cache_state(tmp.path(), &stale).await.unwrap();
 
-        let fresh =
-            load_cached_models_for_provider(tmp.path(), "openai", MODEL_CACHE_TTL_SECS).unwrap();
+        let fresh = load_cached_models_for_provider(tmp.path(), "openai", MODEL_CACHE_TTL_SECS)
+            .await
+            .unwrap();
         assert!(fresh.is_none());
 
-        let stale_any = load_any_cached_models_for_provider(tmp.path(), "openai").unwrap();
+        let stale_any = load_any_cached_models_for_provider(tmp.path(), "openai")
+            .await
+            .unwrap();
         assert!(stale_any.is_some());
     }
 
-    #[test]
-    fn run_models_refresh_uses_fresh_cache_without_network() {
+    #[tokio::test]
+    async fn run_models_refresh_uses_fresh_cache_without_network() {
         let tmp = TempDir::new().unwrap();
 
-        cache_live_models_for_provider(tmp.path(), "openai", &["gpt-5.1".to_string()]).unwrap();
+        cache_live_models_for_provider(tmp.path(), "openai", &["gpt-5.1".to_string()])
+            .await
+            .unwrap();
 
         let config = Config {
             workspace_dir: tmp.path().to_path_buf(),
@@ -6096,11 +6117,11 @@ mod tests {
             ..Config::default()
         };
 
-        run_models_refresh(&config, None, false).unwrap();
+        run_models_refresh(&config, None, false).await.unwrap();
     }
 
-    #[test]
-    fn run_models_refresh_rejects_unsupported_provider() {
+    #[tokio::test]
+    async fn run_models_refresh_rejects_unsupported_provider() {
         let tmp = TempDir::new().unwrap();
 
         let config = Config {
@@ -6110,7 +6131,7 @@ mod tests {
             ..Config::default()
         };
 
-        let err = run_models_refresh(&config, None, true).unwrap_err();
+        let err = run_models_refresh(&config, None, true).await.unwrap_err();
         assert!(err
             .to_string()
             .contains("does not support live model discovery"));
