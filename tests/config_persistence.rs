@@ -232,7 +232,10 @@ fn workspace_dir_creation_in_tempdir() {
 
     fs::create_dir_all(&workspace_dir).expect("workspace dir creation should succeed");
     assert!(workspace_dir.exists(), "workspace dir should exist");
-    assert!(workspace_dir.is_dir(), "workspace path should be a directory");
+    assert!(
+        workspace_dir.is_dir(),
+        "workspace path should be a directory"
+    );
 }
 
 #[test]

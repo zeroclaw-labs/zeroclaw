@@ -188,6 +188,8 @@ Notes:
 - If using cloud APIs (OpenAI, Anthropic, etc.), you can reduce this to `60` or lower.
 - Values below `30` are clamped to `30` to avoid immediate timeout churn.
 - When a timeout occurs, users receive: `⚠️ Request timed out while waiting for the model. Please try again.`
+- Telegram-only interruption behavior is controlled with `channels_config.telegram.interrupt_on_new_message` (default `false`).
+  When enabled, a newer message from the same sender in the same chat cancels the in-flight request and preserves interrupted user context.
 
 See detailed channel matrix and allowlist behavior in [channels-reference.md](channels-reference.md).
 
