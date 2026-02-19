@@ -211,8 +211,8 @@ impl PromptSection for DateTimeSection {
     fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
         let now = Local::now();
         Ok(format!(
-            "## Current Date & Time\n\nTimezone: {}",
-            now.format("%Z")
+            "## Current Date & Time\n\n{}",
+            now.format("%Y-%m-%d %H:%M %Z")
         ))
     }
 }
