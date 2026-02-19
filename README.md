@@ -601,6 +601,8 @@ window_allowlist = []          # optional window title/process allowlist hints
 enabled = false                # opt-in: 1000+ OAuth apps via composio.dev
 # api_key = "cmp_..."          # optional: stored encrypted when [secrets].encrypt = true
 entity_id = "default"          # default user_id for Composio tool calls
+# Runtime tip: if execute asks for connected_account_id, run composio with
+# action='list_accounts' and app='gmail' (or your toolkit) to retrieve account IDs.
 
 [identity]
 format = "openclaw"            # "openclaw" (default, markdown files) or "aieos" (JSON)
