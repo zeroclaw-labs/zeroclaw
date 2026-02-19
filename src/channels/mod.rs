@@ -230,10 +230,6 @@ fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
         }
     }
 
-    if normalized.last().map_or(false, |msg| msg.role == "user") {
-        normalized.pop();
-    }
-
     normalized
 }
 
