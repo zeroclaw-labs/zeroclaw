@@ -81,12 +81,12 @@ struct CachedApiKey {
 // ── Chat completions types ───────────────────────────────────────
 
 #[derive(Debug, Serialize)]
-struct ApiChatRequest {
+struct ApiChatRequest<'a> {
     model: String,
     messages: Vec<ApiMessage>,
     temperature: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<NativeToolSpec>>,
+    tools: Option<Vec<NativeToolSpec<'a>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
 }
@@ -103,17 +103,17 @@ struct ApiMessage {
 }
 
 #[derive(Debug, Serialize)]
-struct NativeToolSpec {
+struct NativeToolSpec<'a> {
     #[serde(rename = "type")]
-    kind: String,
-    function: NativeToolFunctionSpec,
+    kind: &'static str,
+    function: NativeToolFunctionSpec<'a>,
 }
 
 #[derive(Debug, Serialize)]
-struct NativeToolFunctionSpec {
-    name: String,
-    description: String,
-    parameters: serde_json::Value,
+struct NativeToolFunctionSpec<'a> {
+    name: &'a str,
+    description: &'a str,
+    parameters: &'a serde_json::Value,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -219,16 +219,16 @@ impl CopilotProvider {
         ("Accept", "application/json"),
     ];
 
-    fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
+    fn convert_tools<'a>(tools: Option<&'a [ToolSpec]>) -> Option<Vec<NativeToolSpec<'a>>> {
         tools.map(|items| {
             items
                 .iter()
                 .map(|tool| NativeToolSpec {
-                    kind: "function".to_string(),
+                    kind: "function",
                     function: NativeToolFunctionSpec {
-                        name: tool.name.clone(),
-                        description: tool.description.clone(),
-                        parameters: tool.parameters.clone(),
+                        name: &tool.name,
+                        description: &tool.description,
+                        parameters: &tool.parameters,
                     },
                 })
                 .collect()
