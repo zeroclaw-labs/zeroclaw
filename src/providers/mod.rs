@@ -270,10 +270,13 @@ pub async fn api_error(provider: &str, response: reqwest::Response) -> anyhow::E
 /// Resolution order:
 /// 1. Explicitly provided `api_key` parameter (trimmed, filtered if empty)
 /// 2. Provider-specific environment variable (e.g., `ANTHROPIC_OAUTH_TOKEN`, `OPENROUTER_API_KEY`)
-/// 3. Generic fallback variables (`ZEROCLAW_API_KEY`, `API_KEY`)
+/// 3. Generic fallback variables (`ZEROCLAW_API_KEY`, `API_KEY`) for non-OAuth providers
 ///
 /// For Anthropic, the provider-specific env var is `ANTHROPIC_OAUTH_TOKEN` (for setup-tokens)
 /// followed by `ANTHROPIC_API_KEY` (for regular API keys).
+///
+/// OAuth providers (`codex`/`openai-codex`, `antigravity`/`google-antigravity`)
+/// intentionally skip the generic fallback to avoid masking missing credentials.
 fn resolve_provider_credential(name: &str, credential_override: Option<&str>) -> Option<String> {
     if let Some(raw_override) = credential_override {
         let trimmed_override = raw_override.trim();
@@ -296,7 +299,6 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "fireworks" | "fireworks-ai" => vec!["FIREWORKS_API_KEY"],
         "perplexity" => vec!["PERPLEXITY_API_KEY"],
         "cohere" => vec!["COHERE_API_KEY"],
-        "google-antigravity" | "antigravity" => vec!["GOOGLE_ANTIGRAVITY_ACCESS_TOKEN"],
         name if is_moonshot_alias(name) => vec!["MOONSHOT_API_KEY"],
         name if is_glm_alias(name) => vec!["GLM_API_KEY"],
         name if is_minimax_intl_alias(name) => vec!["MINIMAX_PORTAL_ACCESS_TOKEN"],
@@ -310,6 +312,8 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "vercel" | "vercel-ai" => vec!["VERCEL_API_KEY"],
         "cloudflare" | "cloudflare-ai" => vec!["CLOUDFLARE_API_KEY"],
         "astrai" => vec!["ASTRAI_API_KEY"],
+        "codex" | "openai-codex" => vec!["OPENAI_CODEX_TOKEN", "CHATGPT_TOKEN", "OPENAI_API_KEY"],
+        "antigravity" | "google-antigravity" => vec!["GOOGLE_ANTIGRAVITY_TOKEN"],
         _ => vec![],
     };
 
@@ -322,11 +326,21 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         }
     }
 
-    for env_var in ["ZEROCLAW_API_KEY", "API_KEY"] {
-        if let Ok(value) = std::env::var(env_var) {
-            let value = value.trim();
-            if !value.is_empty() {
-                return Some(value.to_string());
+    // OAuth-authenticated providers use dedicated token flows; generic
+    // API keys (ZEROCLAW_API_KEY / API_KEY) are never valid for them and
+    // would mask configuration errors.
+    let skip_generic_fallback = matches!(
+        name,
+        "antigravity" | "google-antigravity" | "codex" | "openai-codex"
+    );
+
+    if !skip_generic_fallback {
+        for env_var in ["ZEROCLAW_API_KEY", "API_KEY"] {
+            if let Ok(value) = std::env::var(env_var) {
+                let value = value.trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
             }
         }
     }
@@ -380,6 +394,20 @@ pub fn create_provider_with_url(
         // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)
         "ollama" => Ok(Box::new(ollama::OllamaProvider::new(api_url, key))),
         "gemini" | "google" | "google-gemini" => {
+            // When the key is a JSON string with a "token" field (produced by
+            // Gemini CLI OAuth or the zeroclaw onboard flow), extract the
+            // access_token and use the OAuth auth path so we hit the
+            // cloudcode-pa endpoint with Bearer auth instead of ?key=.
+            if let Some(json_key) = key {
+                if let Some(access_token) = serde_json::from_str::<serde_json::Value>(json_key)
+                    .ok()
+                    .and_then(|v| v.get("token")?.as_str().map(String::from))
+                {
+                    return Ok(Box::new(gemini::GeminiProvider::new_with_oauth_token(
+                        &access_token,
+                    )));
+                }
+            }
             Ok(Box::new(gemini::GeminiProvider::new(key)))
         }
 
@@ -478,9 +506,6 @@ pub fn create_provider_with_url(
         "copilot" | "github-copilot" => {
             Ok(Box::new(copilot::CopilotProvider::new(api_key)))
         },
-        "google-antigravity" | "antigravity" => {
-            Ok(Box::new(gemini::GeminiProvider::with_antigravity_token(key)))
-        }
         "lmstudio" | "lm-studio" => {
             let lm_studio_key = api_key
                 .map(str::trim)
@@ -506,6 +531,57 @@ pub fn create_provider_with_url(
         "astrai" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Astrai", "https://as-trai.com/v1", key, AuthStyle::Bearer,
         ))),
+
+        // ── OAuth-authenticated providers ────────────────────
+        "codex" | "openai-codex" => {
+            // OpenAI Codex uses ChatGPT backend API with Bearer token
+            let codex_key = key.map(|k| k.to_string()).or_else(|| {
+                crate::auth::codex_oauth::try_load_cached_token()
+            });
+            Ok(Box::new(OpenAiCompatibleProvider::new(
+                "OpenAI Codex",
+                "https://chatgpt.com/backend-api",
+                codex_key.as_deref(),
+                AuthStyle::Bearer,
+            )))
+        }
+        "antigravity" | "google-antigravity" => {
+            // Google Antigravity uses Cloudcode PA endpoint with OAuth Bearer token.
+            // The credential may be:
+            //   - a JSON string {"token":"...","projectId":"..."} from the OAuth flow
+            //   - a plain Bearer token string
+            // In both cases we use the OAuth auth path (cloudcode-pa + Bearer).
+            let ag_cred = key.map(|k| k.to_string()).or_else(|| {
+                crate::auth::antigravity_oauth::try_load_cached_token()
+            });
+            match ag_cred {
+                Some(cred) => {
+                    // Try to extract token from JSON; fall back to using the
+                    // raw string as a Bearer token if it is not JSON.
+                    let access_token =
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&cred) {
+                            v.get("token")
+                                .and_then(|t| t.as_str())
+                                .map(String::from)
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "Antigravity credential is JSON but missing \"token\" field. \
+                                         Re-run `zeroclaw onboard --interactive` to re-authenticate."
+                                    )
+                                })?
+                        } else {
+                            cred
+                        };
+                    Ok(Box::new(gemini::GeminiProvider::new_with_oauth_token(
+                        &access_token,
+                    )))
+                }
+                None => anyhow::bail!(
+                    "No Antigravity credential found. Set GOOGLE_ANTIGRAVITY_TOKEN or \
+                     run `zeroclaw onboard --interactive` to authenticate."
+                ),
+            }
+        }
 
         // ── Bring Your Own Provider (custom URL) ───────────
         // Format: "custom:https://your-api.com" or "custom:http://localhost:1234"
@@ -843,12 +919,6 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             local: false,
         },
         ProviderInfo {
-            name: "google-antigravity",
-            display_name: "Google Antigravity",
-            aliases: &["antigravity"],
-            local: false,
-        },
-        ProviderInfo {
             name: "lmstudio",
             display_name: "LM Studio",
             aliases: &["lm-studio"],
@@ -858,6 +928,19 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             name: "nvidia",
             display_name: "NVIDIA NIM",
             aliases: &["nvidia-nim", "build.nvidia.com"],
+            local: false,
+        },
+        // ── OAuth-authenticated providers ────────────────────
+        ProviderInfo {
+            name: "codex",
+            display_name: "OpenAI Codex",
+            aliases: &["openai-codex"],
+            local: false,
+        },
+        ProviderInfo {
+            name: "antigravity",
+            display_name: "Google Antigravity (Cloud Code Assist)",
+            aliases: &["google-antigravity"],
             local: false,
         },
     ]

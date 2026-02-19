@@ -461,7 +461,10 @@ fn canonical_provider_name(provider_name: &str) -> &str {
     match provider_name {
         "grok" => "xai",
         "together" => "together-ai",
-        "google" | "google-gemini" => "gemini",
+        "google" | "google-gemini" | "gemini-cli-oauth" => "gemini",
+        "anthropic-setup-token" => "anthropic",
+        "openai-codex" => "codex",
+        "google-antigravity" => "antigravity",
         _ => provider_name,
     }
 }
@@ -486,7 +489,8 @@ fn default_model_for_provider(provider: &str) -> String {
         "groq" => "llama-3.3-70b-versatile".into(),
         "deepseek" => "deepseek-chat".into(),
         "gemini" => "gemini-2.5-pro".into(),
-        "google-antigravity" => "claude-opus-4-6-thinking".into(),
+        "openai-codex" | "codex" => "gpt-5.3-codex".into(),
+        "antigravity" | "google-antigravity" => "claude-opus-4-6-thinking".into(),
         _ => "anthropic/claude-sonnet-4.5".into(),
     }
 }
@@ -1396,7 +1400,8 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
         "⭐ Recommended (OpenRouter, Venice, Anthropic, OpenAI, Gemini)",
         "⚡ Fast inference (Groq, Fireworks, Together AI, NVIDIA NIM)",
         "🌐 Gateway / proxy (Vercel AI, Cloudflare AI, Amazon Bedrock)",
-        "🔬 Specialized (Moonshot/Kimi, GLM/Zhipu, MiniMax, Qwen/DashScope, Qianfan, Z.AI, Synthetic, OpenCode Zen, Cohere, Google Antigravity)",
+        "🔬 Specialized (Moonshot/Kimi, GLM/Zhipu, MiniMax, Qwen/DashScope, Qianfan, Z.AI, Synthetic, OpenCode Zen, Cohere)",
+        "🔑 OAuth login (OpenAI Codex, Anthropic Setup Token, Gemini CLI, Google Antigravity)",
         "🏠 Local / private (Ollama — no API key needed)",
         "🔧 Custom — bring your own OpenAI-compatible API",
     ];
@@ -1459,12 +1464,20 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
             ("synthetic", "Synthetic — Synthetic AI models"),
             ("opencode", "OpenCode Zen — code-focused AI"),
             ("cohere", "Cohere — Command R+ & embeddings"),
+        ],
+        4 => vec![
+            ("openai-codex", "OpenAI Codex — ChatGPT OAuth login"),
             (
-                "google-antigravity",
-                "Google Antigravity — Claude via Google Cloud (OAuth login)",
+                "anthropic-setup-token",
+                "Anthropic — Setup Token (paste sk-ant-oat01-*)",
+            ),
+            ("gemini-cli-oauth", "Google Gemini — CLI OAuth login"),
+            (
+                "antigravity",
+                "Google Antigravity — Cloud Code Assist OAuth",
             ),
         ],
-        4 => vec![("ollama", "Ollama — local models (Llama, Mistral, Phi)")],
+        5 => vec![("ollama", "Ollama — local models (Llama, Mistral, Phi)")],
         _ => vec![], // Custom — handled below
     };
 
@@ -1661,86 +1674,6 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
                 String::new()
             }
         }
-    } else if provider_name == "google-antigravity" {
-        // Google Antigravity: run OAuth during onboarding
-        print_bullet("Google Antigravity uses Google OAuth login — no API key needed.");
-        print_bullet("You will authenticate via your browser.");
-        print_bullet("Or set GOOGLE_ANTIGRAVITY_ACCESS_TOKEN env var if you already have a token.");
-        print_bullet(
-            "Optional: set GOOGLE_ANTIGRAVITY_PROJECT_ID to pin a licensed Google Cloud project.",
-        );
-        println!();
-
-        let env_token = std::env::var("GOOGLE_ANTIGRAVITY_ACCESS_TOKEN")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
-
-        if let Some(token) = env_token {
-            print_bullet(&format!(
-                "{} GOOGLE_ANTIGRAVITY_ACCESS_TOKEN detected!",
-                style("✓").green().bold()
-            ));
-            if let Ok(project_id) = std::env::var("GOOGLE_ANTIGRAVITY_PROJECT_ID") {
-                let project_id = project_id.trim();
-                if !project_id.is_empty() {
-                    if let Err(error) = persist_antigravity_project_id(workspace_dir, project_id) {
-                        print_bullet(&format!(
-                            "{} Failed to persist GOOGLE_ANTIGRAVITY_PROJECT_ID: {error}",
-                            style("!").yellow().bold()
-                        ));
-                    }
-                }
-            }
-            token
-        } else {
-            let login_now = Confirm::new()
-                .with_prompt("  Start Google Antigravity OAuth login now?")
-                .default(true)
-                .interact()?;
-
-            if login_now {
-                let credential = std::thread::spawn(|| -> Result<_> {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .context("failed to initialize runtime for Google Antigravity OAuth")?;
-                    rt.block_on(
-                        crate::providers::google_antigravity_oauth::login_google_antigravity(),
-                    )
-                })
-                .join()
-                .map_err(|_| anyhow::anyhow!("Google Antigravity OAuth thread panicked"))??;
-
-                if let Some(ref email) = credential.email {
-                    print_bullet(&format!(
-                        "{} Authenticated as {}",
-                        style("✓").green().bold(),
-                        style(email).cyan()
-                    ));
-                }
-                print_bullet(&format!(
-                    "{} Project ID: {}",
-                    style("✓").green().bold(),
-                    style(&credential.project_id).cyan()
-                ));
-                if let Err(error) =
-                    persist_antigravity_project_id(workspace_dir, &credential.project_id)
-                {
-                    print_bullet(&format!(
-                        "{} Failed to persist Antigravity project ID: {error}",
-                        style("!").yellow().bold()
-                    ));
-                }
-
-                credential.access_token
-            } else {
-                print_bullet(
-                    "Skipped OAuth login. Set GOOGLE_ANTIGRAVITY_ACCESS_TOKEN later or rerun onboarding.",
-                );
-                String::new()
-            }
-        }
     } else if canonical_provider_name(provider_name) == "anthropic" {
         if std::env::var("ANTHROPIC_OAUTH_TOKEN").is_ok() {
             print_bullet(&format!(
@@ -1778,6 +1711,237 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
             }
 
             key
+        }
+    } else if provider_name == "openai-codex" {
+        // OpenAI Codex — ChatGPT OAuth login
+        print_bullet("OpenAI Codex uses ChatGPT OAuth — no API key needed.");
+        print_bullet("You can authenticate now in this onboarding flow.");
+        print_bullet("Or set OPENAI_CODEX_TOKEN env var if you already have a token.");
+        println!();
+
+        let env_token = std::env::var("OPENAI_CODEX_TOKEN")
+            .or_else(|_| std::env::var("CHATGPT_TOKEN"))
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+
+        if let Some(token) = env_token {
+            print_bullet(&format!(
+                "{} Codex token detected from environment!",
+                style("✓").green().bold()
+            ));
+            token
+        } else if crate::auth::codex_oauth::has_cached_credentials() {
+            if let Some(token) = crate::auth::codex_oauth::try_load_cached_token() {
+                print_bullet(&format!(
+                    "{} Cached Codex OAuth credentials found!",
+                    style("✓").green().bold()
+                ));
+                token
+            } else {
+                print_bullet("Cached Codex credentials expired — re-authentication required.");
+                let login_now = Confirm::new()
+                    .with_prompt("  Start OpenAI Codex OAuth login now?")
+                    .default(true)
+                    .interact()?;
+
+                if login_now {
+                    let token = std::thread::spawn(|| -> Result<_> {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .context("failed to initialize runtime for Codex OAuth")?;
+                        rt.block_on(crate::auth::codex_oauth::login_codex_oauth())
+                    })
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("Codex OAuth thread panicked"))??;
+                    token
+                } else {
+                    print_bullet(
+                        "Skipped OAuth login. Set OPENAI_CODEX_TOKEN later or rerun onboarding.",
+                    );
+                    String::new()
+                }
+            }
+        } else {
+            let login_now = Confirm::new()
+                .with_prompt("  Start OpenAI Codex OAuth login now?")
+                .default(true)
+                .interact()?;
+
+            if login_now {
+                let token = std::thread::spawn(|| -> Result<_> {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .context("failed to initialize runtime for Codex OAuth")?;
+                    rt.block_on(crate::auth::codex_oauth::login_codex_oauth())
+                })
+                .join()
+                .map_err(|_| anyhow::anyhow!("Codex OAuth thread panicked"))??;
+                token
+            } else {
+                print_bullet(
+                    "Skipped OAuth login. Set OPENAI_CODEX_TOKEN later or rerun onboarding.",
+                );
+                String::new()
+            }
+        }
+    } else if provider_name == "anthropic-setup-token" {
+        // Anthropic setup-token (paste flow)
+        print_bullet("Anthropic Setup Token — paste your token from `claude setup-token`.");
+        println!();
+
+        let token = std::thread::spawn(|| -> Result<_> {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("failed to initialize runtime for Anthropic token verification")?;
+            rt.block_on(crate::auth::anthropic_setup_token::login_anthropic_setup_token())
+        })
+        .join()
+        .map_err(|_| anyhow::anyhow!("Anthropic setup-token thread panicked"))??;
+
+        token
+    } else if provider_name == "gemini-cli-oauth" {
+        // Google Gemini CLI OAuth
+        print_bullet("Google Gemini CLI OAuth — browser-based Google account login.");
+        println!();
+
+        if crate::auth::gemini_cli_oauth::has_cli_credentials() {
+            if let Some(token) = crate::auth::gemini_cli_oauth::try_load_cached_token() {
+                print_bullet(&format!(
+                    "{} Existing Gemini CLI credentials found!",
+                    style("✓").green().bold()
+                ));
+
+                let use_existing = Confirm::new()
+                    .with_prompt("  Use existing Gemini CLI credentials?")
+                    .default(true)
+                    .interact()?;
+
+                if use_existing {
+                    token
+                } else {
+                    let token = std::thread::spawn(|| -> Result<_> {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .context("failed to initialize runtime for Gemini CLI OAuth")?;
+                        rt.block_on(crate::auth::gemini_cli_oauth::login_gemini_cli_oauth())
+                    })
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("Gemini CLI OAuth thread panicked"))??;
+                    token
+                }
+            } else {
+                print_bullet("Gemini CLI credentials expired. Starting fresh OAuth flow.");
+                let token = std::thread::spawn(|| -> Result<_> {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .context("failed to initialize runtime for Gemini CLI OAuth")?;
+                    rt.block_on(crate::auth::gemini_cli_oauth::login_gemini_cli_oauth())
+                })
+                .join()
+                .map_err(|_| anyhow::anyhow!("Gemini CLI OAuth thread panicked"))??;
+                token
+            }
+        } else {
+            let login_now = Confirm::new()
+                .with_prompt("  Start Google Gemini CLI OAuth login now?")
+                .default(true)
+                .interact()?;
+
+            if login_now {
+                let token = std::thread::spawn(|| -> Result<_> {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .context("failed to initialize runtime for Gemini CLI OAuth")?;
+                    rt.block_on(crate::auth::gemini_cli_oauth::login_gemini_cli_oauth())
+                })
+                .join()
+                .map_err(|_| anyhow::anyhow!("Gemini CLI OAuth thread panicked"))??;
+                token
+            } else {
+                print_bullet("Skipped. Run `gemini` CLI or rerun onboarding to authenticate.");
+                String::new()
+            }
+        }
+    } else if provider_name == "antigravity" || provider_name == "google-antigravity" {
+        // Google Antigravity OAuth (Cloud Code Assist)
+        print_bullet(
+            "Google Antigravity — Cloud Code Assist OAuth (access Claude models via Google).",
+        );
+        println!();
+
+        let env_token = std::env::var("GOOGLE_ANTIGRAVITY_TOKEN")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+
+        if let Some(token) = env_token {
+            print_bullet(&format!(
+                "{} GOOGLE_ANTIGRAVITY_TOKEN detected!",
+                style("✓").green().bold()
+            ));
+            token
+        } else if crate::auth::antigravity_oauth::has_cached_credentials() {
+            if let Some(token) = crate::auth::antigravity_oauth::try_load_cached_token() {
+                print_bullet(&format!(
+                    "{} Cached Antigravity credentials found!",
+                    style("✓").green().bold()
+                ));
+                token
+            } else {
+                print_bullet(
+                    "Cached Antigravity credentials expired — re-authentication required.",
+                );
+                let login_now = Confirm::new()
+                    .with_prompt("  Start Google Antigravity OAuth login now?")
+                    .default(true)
+                    .interact()?;
+
+                if login_now {
+                    let token = std::thread::spawn(|| -> Result<_> {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .context("failed to initialize runtime for Antigravity OAuth")?;
+                        rt.block_on(crate::auth::antigravity_oauth::login_antigravity_oauth())
+                    })
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("Antigravity OAuth thread panicked"))??;
+                    token
+                } else {
+                    print_bullet(
+                        "Skipped. Set GOOGLE_ANTIGRAVITY_TOKEN later or rerun onboarding.",
+                    );
+                    String::new()
+                }
+            }
+        } else {
+            let login_now = Confirm::new()
+                .with_prompt("  Start Google Antigravity OAuth login now?")
+                .default(true)
+                .interact()?;
+
+            if login_now {
+                let token = std::thread::spawn(|| -> Result<_> {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .context("failed to initialize runtime for Antigravity OAuth")?;
+                    rt.block_on(crate::auth::antigravity_oauth::login_antigravity_oauth())
+                })
+                .join()
+                .map_err(|_| anyhow::anyhow!("Antigravity OAuth thread panicked"))??;
+                token
+            } else {
+                print_bullet("Skipped. Set GOOGLE_ANTIGRAVITY_TOKEN later or rerun onboarding.");
+                String::new()
+            }
         }
     } else {
         let key_url = if is_moonshot_alias(provider_name) {
@@ -1962,17 +2126,6 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
             ("codellama", "Code Llama"),
             ("phi3", "Phi-3 (small, fast)"),
         ],
-        "google-antigravity" => vec![
-            (
-                "claude-opus-4-6-thinking",
-                "Claude Opus 4.6 Thinking (recommended)",
-            ),
-            ("claude-opus-4-5-thinking", "Claude Opus 4.5 Thinking"),
-            ("claude-sonnet-4-5-thinking", "Claude Sonnet 4.5 Thinking"),
-            ("gemini-3-flash", "Gemini 3 Flash (fast)"),
-            ("gemini-3-pro-high", "Gemini 3 Pro High (best quality)"),
-            ("gemini-3-pro-low", "Gemini 3 Pro Low (cost-efficient)"),
-        ],
         "gemini" | "google" | "google-gemini" => vec![
             ("gemini-2.0-flash", "Gemini 2.0 Flash (fast, recommended)"),
             (
@@ -1981,6 +2134,22 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
             ),
             ("gemini-1.5-pro", "Gemini 1.5 Pro (best quality)"),
             ("gemini-1.5-flash", "Gemini 1.5 Flash (balanced)"),
+        ],
+        "openai-codex" | "codex" => vec![
+            ("gpt-5.3-codex", "GPT-5.3 Codex (default)"),
+            ("gpt-4o", "GPT-4o (fallback)"),
+        ],
+        "antigravity" | "google-antigravity" => vec![
+            (
+                "claude-opus-4-6-thinking",
+                "Claude Opus 4.6 Thinking (recommended)",
+            ),
+            ("claude-opus-4-5-thinking", "Claude Opus 4.5 Thinking"),
+            ("claude-sonnet-4-5-thinking", "Claude Sonnet 4.5 Thinking"),
+            ("claude-sonnet-4-20250514", "Claude Sonnet 4 (fast)"),
+            ("gemini-3-flash", "Gemini 3 Flash (fast)"),
+            ("gemini-3-pro-high", "Gemini 3 Pro High (best quality)"),
+            ("gemini-3-pro-low", "Gemini 3 Pro Low (cost-efficient)"),
         ],
         _ => vec![("default", "Default model")],
     };
@@ -2140,14 +2309,18 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
         selected_model
     };
 
+    // Return the canonical provider name so the factory can recognise it.
+    // e.g. "gemini-cli-oauth" → "gemini", "anthropic-setup-token" → "anthropic"
+    let final_provider = canonical_provider_name(provider_name);
+
     println!(
         "  {} Provider: {} | Model: {}",
         style("✓").green().bold(),
-        style(provider_name).green(),
+        style(final_provider).green(),
         style(&model).green()
     );
 
-    Ok((provider_name.to_string(), api_key, model, provider_api_url))
+    Ok((final_provider.to_string(), api_key, model, provider_api_url))
 }
 
 /// Map provider name to its conventional env var
@@ -2186,9 +2359,10 @@ fn provider_env_var(name: &str) -> &'static str {
         "cloudflare" | "cloudflare-ai" => "CLOUDFLARE_API_KEY",
         "bedrock" | "aws-bedrock" => "AWS_ACCESS_KEY_ID",
         "gemini" => "GEMINI_API_KEY",
-        "google-antigravity" => "GOOGLE_ANTIGRAVITY_ACCESS_TOKEN",
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => "NVIDIA_API_KEY",
         "astrai" => "ASTRAI_API_KEY",
+        "openai-codex" | "codex" => "OPENAI_CODEX_TOKEN",
+        "antigravity" | "google-antigravity" => "GOOGLE_ANTIGRAVITY_TOKEN",
         _ => "API_KEY",
     }
 }
