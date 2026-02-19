@@ -165,13 +165,35 @@ impl PromptSection for SkillsSection {
                     .join(&skill.name)
                     .join("SKILL.md")
             });
+            let _ = writeln!(prompt, "  <skill>");
+            let _ = writeln!(prompt, "    <name>{}</name>", skill.name);
             let _ = writeln!(
                 prompt,
-                "  <skill>\n    <name>{}</name>\n    <description>{}</description>\n    <location>{}</location>\n  </skill>",
-                skill.name,
-                skill.description,
-                location.display()
+                "    <description>{}</description>",
+                skill.description
             );
+            let _ = writeln!(prompt, "    <location>{}</location>", location.display());
+            if !skill.tools.is_empty() {
+                let _ = writeln!(prompt, "    <tools>");
+                for tool in &skill.tools {
+                    let _ = writeln!(
+                        prompt,
+                        "      <tool name=\"{}\" kind=\"{}\">{}</tool>",
+                        tool.name, tool.kind, tool.description
+                    );
+                }
+                let _ = writeln!(prompt, "    </tools>");
+            }
+            if !skill.prompts.is_empty() {
+                let _ = writeln!(prompt, "    <instructions>");
+                for p in &skill.prompts {
+                    prompt.push_str("      ");
+                    prompt.push_str(p);
+                    prompt.push('\n');
+                }
+                let _ = writeln!(prompt, "    </instructions>");
+            }
+            let _ = writeln!(prompt, "  </skill>");
         }
         prompt.push_str("</available_skills>");
         Ok(prompt)
