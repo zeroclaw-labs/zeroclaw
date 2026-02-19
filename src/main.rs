@@ -41,6 +41,7 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 mod agent;
 mod approval;
+mod completion;
 mod auth;
 mod channels;
 mod rag {
@@ -86,6 +87,22 @@ pub use zeroclaw::{HardwareCommands, PeripheralCommands};
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum CompletionCommands {
+    /// Install shell completion (auto-detects shell from $SHELL, or use --shell)
+    Install {
+        /// Shell to install completion for (bash, zsh, fish)
+        #[arg(long)]
+        shell: Option<clap_complete::Shell>,
+    },
+    /// Uninstall shell completion
+    Uninstall {
+        /// Shell to uninstall completion for (bash, zsh, fish)
+        #[arg(long)]
+        shell: Option<clap_complete::Shell>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -250,6 +267,12 @@ enum Commands {
     Config {
         #[command(subcommand)]
         config_command: ConfigCommands,
+    },
+
+    /// Manage shell tab completion
+    Completion {
+        #[command(subcommand)]
+        completion_command: CompletionCommands,
     },
 }
 
@@ -787,6 +810,11 @@ async fn main() -> Result<()> {
         Commands::Peripheral { peripheral_command } => {
             peripherals::handle_command(peripheral_command.clone(), &config).await
         }
+
+        Commands::Completion { completion_command } => match completion_command {
+            CompletionCommands::Install { shell } => completion::install(shell),
+            CompletionCommands::Uninstall { shell } => completion::uninstall(shell),
+        },
 
         Commands::Config { config_command } => match config_command {
             ConfigCommands::Schema => {
