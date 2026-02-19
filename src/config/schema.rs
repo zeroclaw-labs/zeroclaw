@@ -1763,6 +1763,10 @@ impl Default for ObservabilityConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HooksConfig {
+    /// Enable lifecycle hook execution.
+    ///
+    /// Hooks run in-process with the same privileges as the main runtime.
+    /// Keep enabled hook handlers narrowly scoped and auditable.
     pub enabled: bool,
     #[serde(default)]
     pub builtin: BuiltinHooksConfig,
@@ -1779,8 +1783,11 @@ impl Default for HooksConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuiltinHooksConfig {
+    /// Persist selected session memory events via built-in hook handler.
     pub session_memory: bool,
+    /// Log hook-related command activity for audit/troubleshooting.
     pub command_logger: bool,
+    /// Run boot-time initialization script hook.
     pub boot_script: bool,
 }
 

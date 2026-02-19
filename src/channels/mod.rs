@@ -116,6 +116,8 @@ const MEMORY_CONTEXT_ENTRY_MAX_CHARS: usize = 800;
 const MEMORY_CONTEXT_MAX_CHARS: usize = 4_000;
 const CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES: usize = 12;
 const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 600;
+/// Guardrail for hook-modified outbound channel content.
+const CHANNEL_HOOK_MAX_OUTBOUND_CHARS: usize = 20_000;
 
 type ProviderCacheMap = Arc<Mutex<HashMap<String, Arc<dyn Provider>>>>;
 type RouteSelectionMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
@@ -215,6 +217,7 @@ struct ChannelRuntimeContext {
     message_timeout_secs: u64,
     interrupt_on_new_message: bool,
     multimodal: crate::config::MultimodalConfig,
+    hooks: Option<Arc<crate::hooks::HookRunner>>,
 }
 
 #[derive(Clone)]
@@ -1444,6 +1447,19 @@ async fn process_channel_message(
         truncate_with_ellipsis(&msg.content, 80)
     );
 
+    // ── Hook: on_message_received (modifying) ────────────
+    let msg = if let Some(hooks) = &ctx.hooks {
+        match hooks.run_on_message_received(msg).await {
+            crate::hooks::HookResult::Cancel(reason) => {
+                tracing::info!(%reason, "incoming message dropped by hook");
+                return;
+            }
+            crate::hooks::HookResult::Continue(modified) => modified,
+        }
+    } else {
+        msg
+    };
+
     let target_channel = ctx.channels_by_name.get(&msg.channel).cloned();
     if let Err(err) = maybe_apply_runtime_config_update(ctx.as_ref()).await {
         tracing::warn!("Failed to apply runtime config update: {err}");
@@ -1630,6 +1646,7 @@ async fn process_channel_message(
                 ctx.max_tool_iterations,
                 Some(cancellation_token.clone()),
                 delta_tx,
+                ctx.hooks.as_deref(),
             ),
         ) => LlmExecutionResult::Completed(result),
     };
@@ -1666,13 +1683,72 @@ async fn process_channel_message(
             }
         }
         LlmExecutionResult::Completed(Ok(Ok(response))) => {
+            // ── Hook: on_message_sending (modifying) ─────────
+            let mut outbound_response = response;
+            if let Some(hooks) = &ctx.hooks {
+                match hooks
+                    .run_on_message_sending(
+                        msg.channel.clone(),
+                        msg.reply_target.clone(),
+                        outbound_response.clone(),
+                    )
+                    .await
+                {
+                    crate::hooks::HookResult::Cancel(reason) => {
+                        tracing::info!(%reason, "outgoing message suppressed by hook");
+                        return;
+                    }
+                    crate::hooks::HookResult::Continue((
+                        hook_channel,
+                        hook_recipient,
+                        mut modified_content,
+                    )) => {
+                        if hook_channel != msg.channel || hook_recipient != msg.reply_target {
+                            tracing::warn!(
+                                from_channel = %msg.channel,
+                                from_recipient = %msg.reply_target,
+                                to_channel = %hook_channel,
+                                to_recipient = %hook_recipient,
+                                "on_message_sending attempted to rewrite channel routing; only content mutation is applied"
+                            );
+                        }
+
+                        let modified_len = modified_content.chars().count();
+                        if modified_len > CHANNEL_HOOK_MAX_OUTBOUND_CHARS {
+                            tracing::warn!(
+                                limit = CHANNEL_HOOK_MAX_OUTBOUND_CHARS,
+                                attempted = modified_len,
+                                "hook-modified outbound content exceeded limit; truncating"
+                            );
+                            modified_content = truncate_with_ellipsis(
+                                &modified_content,
+                                CHANNEL_HOOK_MAX_OUTBOUND_CHARS,
+                            );
+                        }
+
+                        if modified_content != outbound_response {
+                            tracing::info!(
+                                channel = %msg.channel,
+                                sender = %msg.sender,
+                                before_len = outbound_response.chars().count(),
+                                after_len = modified_content.chars().count(),
+                                "outgoing message content modified by hook"
+                            );
+                        }
+
+                        outbound_response = modified_content;
+                    }
+                }
+            }
+
             let sanitized_response =
-                sanitize_channel_response(&response, ctx.tools_registry.as_ref());
-            let delivered_response = if sanitized_response.is_empty() && !response.trim().is_empty()
-            {
-                "I encountered malformed tool-call output and could not produce a safe reply. Please try again.".to_string()
-            } else {
-                sanitized_response
+                sanitize_channel_response(&outbound_response, ctx.tools_registry.as_ref());
+            let delivered_response =
+                if sanitized_response.is_empty() && !outbound_response.trim().is_empty() {
+                    "I encountered malformed tool-call output and could not produce a safe reply. Please try again.".to_string()
+                } else {
+                    sanitized_response
+                };
             };
 
             // Extract condensed tool-use context from the history messages
@@ -2994,6 +3070,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         message_timeout_secs,
         interrupt_on_new_message,
         multimodal: config.multimodal.clone(),
+        hooks: None,
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -3646,6 +3723,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
         });
 
         process_channel_message(
@@ -3760,6 +3838,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
         });
 
         process_channel_message(
@@ -3826,6 +3905,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
         });
 
         process_channel_message(
@@ -3913,6 +3993,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
         });
 
         process_channel_message(
@@ -4135,6 +4216,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
         });
 
         process_channel_message(
@@ -4193,6 +4275,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
         });
 
         process_channel_message(
@@ -4362,6 +4445,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -4602,6 +4686,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
         });
 
         process_channel_message(
@@ -5173,6 +5258,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
         });
 
         process_channel_message(
@@ -5256,6 +5342,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
         });
 
         process_channel_message(

@@ -1473,6 +1473,7 @@ pub(crate) async fn run_tool_call_loop(
     max_tool_iterations: usize,
     cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
+    hooks: Option<&crate::hooks::HookRunner>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -1514,6 +1515,11 @@ pub(crate) async fn run_tool_call_loop(
         });
 
         let llm_started_at = Instant::now();
+
+        // Fire void hook before LLM call
+        if let Some(hooks) = hooks {
+            hooks.fire_llm_input(history, model).await;
+        }
 
         // Unified path via Provider::chat so provider-specific native tool logic
         // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
@@ -1655,32 +1661,107 @@ pub(crate) async fn run_tool_call_loop(
         // When multiple tool calls are present and interactive CLI approval is not needed, run
         // tool executions concurrently for lower wall-clock latency.
         let mut tool_results = String::new();
-        let should_parallel = should_execute_tools_in_parallel(&tool_calls, approval);
-        let individual_results = if should_parallel {
-            execute_tools_parallel(
-                &tool_calls,
-                tools_registry,
-                observer,
-                cancellation_token.as_ref(),
-            )
-            .await?
-        } else {
-            execute_tools_sequential(
-                &tool_calls,
-                tools_registry,
-                observer,
-                approval,
-                channel_name,
-                cancellation_token.as_ref(),
-            )
-            .await?
-        };
+        let mut individual_results: Vec<String> = Vec::new();
+        for call in &tool_calls {
+            // ── Hook: before_tool_call (modifying) ──────────
+            let mut tool_name = call.name.clone();
+            let mut tool_args = call.arguments.clone();
+            if let Some(hooks) = hooks {
+                match hooks.run_before_tool_call(tool_name, tool_args).await {
+                    crate::hooks::HookResult::Cancel(reason) => {
+                        tracing::info!(tool = %call.name, %reason, "tool call cancelled by hook");
+                        let cancelled = format!("Cancelled by hook: {reason}");
+                        individual_results.push(cancelled.clone());
+                        let _ = writeln!(
+                            tool_results,
+                            "<tool_result name=\"{}\">\n{cancelled}\n</tool_result>",
+                            call.name
+                        );
+                        continue;
+                    }
+                    crate::hooks::HookResult::Continue((name, args)) => {
+                        tool_name = name;
+                        tool_args = args;
+                    }
+                }
+            }
 
-        for (call, result) in tool_calls.iter().zip(individual_results.iter()) {
+            // ── Approval hook ────────────────────────────────
+            if let Some(mgr) = approval {
+                if mgr.needs_approval(&tool_name) {
+                    let request = ApprovalRequest {
+                        tool_name: tool_name.clone(),
+                        arguments: tool_args.clone(),
+                    };
+
+                    // Only prompt interactively on CLI; auto-approve on other channels.
+                    let decision = if channel_name == "cli" {
+                        mgr.prompt_cli(&request)
+                    } else {
+                        ApprovalResponse::Yes
+                    };
+
+                    mgr.record_decision(&tool_name, &tool_args, decision, channel_name);
+
+                    if decision == ApprovalResponse::No {
+                        let denied = "Denied by user.".to_string();
+                        individual_results.push(denied.clone());
+                        let _ = writeln!(
+                            tool_results,
+                            "<tool_result name=\"{}\">\n{denied}\n</tool_result>",
+                            tool_name
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            observer.record_event(&ObserverEvent::ToolCallStart {
+                tool: tool_name.clone(),
+            });
+            let start = Instant::now();
+            let result = if let Some(tool) = find_tool(tools_registry, &tool_name) {
+                match tool.execute(tool_args).await {
+                    Ok(r) => {
+                        observer.record_event(&ObserverEvent::ToolCall {
+                            tool: tool_name.clone(),
+                            duration: start.elapsed(),
+                            success: r.success,
+                        });
+                        if r.success {
+                            scrub_credentials(&r.output)
+                        } else {
+                            format!("Error: {}", r.error.unwrap_or_else(|| r.output))
+                        }
+                    }
+                    Err(e) => {
+                        observer.record_event(&ObserverEvent::ToolCall {
+                            tool: tool_name.clone(),
+                            duration: start.elapsed(),
+                            success: false,
+                        });
+                        format!("Error executing {}: {e}", tool_name)
+                    }
+                }
+            } else {
+                format!("Unknown tool: {}", tool_name)
+            };
+
+            // ── Hook: after_tool_call (void) ─────────────────
+            if let Some(hooks) = hooks {
+                let tool_result_obj = crate::tools::ToolResult {
+                    success: !result.starts_with("Error"),
+                    output: result.clone(),
+                    error: None,
+                };
+                hooks.fire_after_tool_call(&tool_name, &tool_result_obj, start.elapsed()).await;
+            }
+
+            individual_results.push(result.clone());
             let _ = writeln!(
                 tool_results,
                 "<tool_result name=\"{}\">\n{}\n</tool_result>",
-                call.name, result
+                tool_name, result
             );
         }
 
