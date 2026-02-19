@@ -786,9 +786,28 @@ async fn handle_webhook(
             messages_count: 1,
         });
 
+    // Build system prompt with workspace context (IDENTITY.md, AGENTS.md, etc.)
+    let system_prompt = {
+        let config_guard = state.config.lock();
+        crate::channels::build_system_prompt(
+            &config_guard.workspace_dir,
+            &state.model,
+            &[], // tools - empty for simple chat
+            &[], // skills
+            Some(&config_guard.identity),
+            None, // bootstrap_max_chars - use default
+        )
+    };
+
+    // Call the LLM with separate system prompt
     match state
         .provider
-        .simple_chat(message, &state.model, state.temperature)
+        .chat_with_system(
+            Some(&system_prompt),
+            message,
+            &state.model,
+            state.temperature,
+        )
         .await
     {
         Ok(response) => {
@@ -990,10 +1009,28 @@ async fn handle_whatsapp_message(
                 .await;
         }
 
-        // Call the LLM
+        // Build system prompt with workspace context (IDENTITY.md, AGENTS.md, etc.)
+        let system_prompt = {
+            let config_guard = state.config.lock();
+            crate::channels::build_system_prompt(
+                &config_guard.workspace_dir,
+                &state.model,
+                &[], // tools - empty for simple chat
+                &[], // skills
+                Some(&config_guard.identity),
+                None, // bootstrap_max_chars - use default
+            )
+        };
+
+        // Call the LLM with separate system prompt
         match state
             .provider
-            .simple_chat(&msg.content, &state.model, state.temperature)
+            .chat_with_system(
+                Some(&system_prompt),
+                &msg.content,
+                &state.model,
+                state.temperature,
+            )
             .await
         {
             Ok(response) => {
