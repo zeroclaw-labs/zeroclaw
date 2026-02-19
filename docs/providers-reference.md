@@ -67,6 +67,21 @@ credential is not reused for fallback providers.
 - Cross-region inference profiles supported (e.g., `us.anthropic.claude-*`).
 - Model IDs use Bedrock format: `anthropic.claude-sonnet-4-6`, `anthropic.claude-opus-4-6-v1`, etc.
 
+### Ollama Reasoning Toggle
+
+You can control Ollama reasoning/thinking behavior from `config.toml`:
+
+```toml
+[runtime]
+reasoning_enabled = false
+```
+
+Behavior:
+
+- `false`: sends `think: false` to Ollama `/api/chat` requests.
+- `true`: sends `think: true`.
+- Unset: omits `think` and keeps Ollama/model defaults.
+
 ### Kimi Code Notes
 
 - Provider ID: `kimi-code`

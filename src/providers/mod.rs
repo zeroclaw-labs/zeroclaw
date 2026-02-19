@@ -630,6 +630,7 @@ pub struct ProviderRuntimeOptions {
     pub auth_profile_override: Option<String>,
     pub zeroclaw_dir: Option<PathBuf>,
     pub secrets_encrypt: bool,
+    pub reasoning_enabled: Option<bool>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -638,6 +639,7 @@ impl Default for ProviderRuntimeOptions {
             auth_profile_override: None,
             zeroclaw_dir: None,
             secrets_encrypt: true,
+            reasoning_enabled: None,
         }
     }
 }
@@ -865,16 +867,26 @@ pub fn create_provider_with_options(
         "openai-codex" | "openai_codex" | "codex" => {
             Ok(Box::new(openai_codex::OpenAiCodexProvider::new(options)))
         }
-        _ => create_provider_with_url(name, api_key, None),
+        _ => create_provider_with_url_and_options(name, api_key, None, options),
     }
 }
 
 /// Factory: create the right provider from config with optional custom base URL
-#[allow(clippy::too_many_lines)]
 pub fn create_provider_with_url(
     name: &str,
     api_key: Option<&str>,
     api_url: Option<&str>,
+) -> anyhow::Result<Box<dyn Provider>> {
+    create_provider_with_url_and_options(name, api_key, api_url, &ProviderRuntimeOptions::default())
+}
+
+/// Factory: create provider with optional base URL and runtime options.
+#[allow(clippy::too_many_lines)]
+fn create_provider_with_url_and_options(
+    name: &str,
+    api_key: Option<&str>,
+    api_url: Option<&str>,
+    options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
     let qwen_oauth_context = is_qwen_oauth_alias(name).then(|| resolve_qwen_oauth_context(api_key));
 
@@ -895,7 +907,11 @@ pub fn create_provider_with_url(
         "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(key))),
         "openai" => Ok(Box::new(openai::OpenAiProvider::with_base_url(api_url, key))),
         // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)
-        "ollama" => Ok(Box::new(ollama::OllamaProvider::new(api_url, key))),
+        "ollama" => Ok(Box::new(ollama::OllamaProvider::new_with_reasoning(
+            api_url,
+            key,
+            options.reasoning_enabled,
+        ))),
         "gemini" | "google" | "google-gemini" => {
             Ok(Box::new(gemini::GeminiProvider::new(key)))
         }
@@ -1109,7 +1125,7 @@ pub fn create_resilient_provider_with_options(
         "openai-codex" | "openai_codex" | "codex" => {
             create_provider_with_options(primary_name, api_key, options)?
         }
-        _ => create_provider_with_url(primary_name, api_key, api_url)?,
+        _ => create_provider_with_url_and_options(primary_name, api_key, api_url, options)?,
     };
     providers.push((primary_name.to_string(), primary_provider));
 
@@ -1160,8 +1176,35 @@ pub fn create_routed_provider(
     model_routes: &[crate::config::ModelRouteConfig],
     default_model: &str,
 ) -> anyhow::Result<Box<dyn Provider>> {
+    create_routed_provider_with_options(
+        primary_name,
+        api_key,
+        api_url,
+        reliability,
+        model_routes,
+        default_model,
+        &ProviderRuntimeOptions::default(),
+    )
+}
+
+/// Create a routed provider using explicit runtime options.
+pub fn create_routed_provider_with_options(
+    primary_name: &str,
+    api_key: Option<&str>,
+    api_url: Option<&str>,
+    reliability: &crate::config::ReliabilityConfig,
+    model_routes: &[crate::config::ModelRouteConfig],
+    default_model: &str,
+    options: &ProviderRuntimeOptions,
+) -> anyhow::Result<Box<dyn Provider>> {
     if model_routes.is_empty() {
-        return create_resilient_provider(primary_name, api_key, api_url, reliability);
+        return create_resilient_provider_with_options(
+            primary_name,
+            api_key,
+            api_url,
+            reliability,
+            options,
+        );
     }
 
     // Collect unique provider names needed
@@ -1187,7 +1230,7 @@ pub fn create_routed_provider(
         let key = routed_credential.or(api_key);
         // Only use api_url for the primary provider
         let url = if name == primary_name { api_url } else { None };
-        match create_resilient_provider(name, key, url, reliability) {
+        match create_resilient_provider_with_options(name, key, url, reliability, options) {
             Ok(provider) => providers.push((name.clone(), provider)),
             Err(e) => {
                 if name == primary_name {

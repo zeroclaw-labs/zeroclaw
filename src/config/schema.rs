@@ -1607,6 +1607,13 @@ pub struct RuntimeConfig {
     /// Docker runtime settings (used when `kind = "docker"`).
     #[serde(default)]
     pub docker: DockerRuntimeConfig,
+
+    /// Global reasoning override for providers that expose explicit controls.
+    /// - `None`: provider default behavior
+    /// - `Some(true)`: request reasoning/thinking when supported
+    /// - `Some(false)`: disable reasoning/thinking when supported
+    #[serde(default)]
+    pub reasoning_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1679,6 +1686,7 @@ impl Default for RuntimeConfig {
         Self {
             kind: default_runtime_kind(),
             docker: DockerRuntimeConfig::default(),
+            reasoning_enabled: None,
         }
     }
 }
@@ -2979,6 +2987,18 @@ impl Config {
             }
         }
 
+        // Reasoning override: ZEROCLAW_REASONING_ENABLED or REASONING_ENABLED
+        if let Ok(flag) = std::env::var("ZEROCLAW_REASONING_ENABLED")
+            .or_else(|_| std::env::var("REASONING_ENABLED"))
+        {
+            let normalized = flag.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "1" | "true" | "yes" | "on" => self.runtime.reasoning_enabled = Some(true),
+                "0" | "false" | "no" | "off" => self.runtime.reasoning_enabled = Some(false),
+                _ => {}
+            }
+        }
+
         // Web search enabled: ZEROCLAW_WEB_SEARCH_ENABLED or WEB_SEARCH_ENABLED
         if let Ok(enabled) = std::env::var("ZEROCLAW_WEB_SEARCH_ENABLED")
             .or_else(|_| std::env::var("WEB_SEARCH_ENABLED"))
@@ -3558,6 +3578,19 @@ connect_timeout_secs = 12
             parsed.storage.provider.config.connect_timeout_secs,
             Some(12)
         );
+    }
+
+    #[test]
+    fn runtime_reasoning_enabled_deserializes() {
+        let raw = r#"
+default_temperature = 0.7
+
+[runtime]
+reasoning_enabled = false
+"#;
+
+        let parsed: Config = toml::from_str(raw).unwrap();
+        assert_eq!(parsed.runtime.reasoning_enabled, Some(false));
     }
 
     #[test]
@@ -4999,6 +5032,36 @@ default_model = "legacy-model"
         );
 
         std::env::remove_var("ZEROCLAW_TEMPERATURE");
+    }
+
+    #[test]
+    async fn env_override_reasoning_enabled() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        assert_eq!(config.runtime.reasoning_enabled, None);
+
+        std::env::set_var("ZEROCLAW_REASONING_ENABLED", "false");
+        config.apply_env_overrides();
+        assert_eq!(config.runtime.reasoning_enabled, Some(false));
+
+        std::env::set_var("ZEROCLAW_REASONING_ENABLED", "true");
+        config.apply_env_overrides();
+        assert_eq!(config.runtime.reasoning_enabled, Some(true));
+
+        std::env::remove_var("ZEROCLAW_REASONING_ENABLED");
+    }
+
+    #[test]
+    async fn env_override_reasoning_invalid_value_ignored() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        config.runtime.reasoning_enabled = Some(false);
+
+        std::env::set_var("ZEROCLAW_REASONING_ENABLED", "maybe");
+        config.apply_env_overrides();
+        assert_eq!(config.runtime.reasoning_enabled, Some(false));
+
+        std::env::remove_var("ZEROCLAW_REASONING_ENABLED");
     }
 
     #[test]

@@ -50,6 +50,18 @@ Notes:
 - Setting `max_tool_iterations = 0` falls back to safe default `10`.
 - If a channel message exceeds this value, the runtime returns: `Agent exceeded maximum tool iterations (<value>)`.
 
+## `[runtime]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `reasoning_enabled` | unset (`None`) | Global reasoning/thinking override for providers that support explicit controls |
+
+Notes:
+
+- `reasoning_enabled = false` explicitly disables provider-side reasoning for supported providers (currently `ollama`, via request field `think: false`).
+- `reasoning_enabled = true` explicitly requests reasoning for supported providers (`think: true` on `ollama`).
+- Unset keeps provider defaults.
+
 ## `[gateway]`
 
 | Key | Default | Purpose |
