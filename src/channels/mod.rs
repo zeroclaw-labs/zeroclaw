@@ -6,6 +6,7 @@ pub mod imessage;
 pub mod irc;
 pub mod lark;
 pub mod linq;
+#[cfg(feature = "channel-matrix")]
 pub mod matrix;
 pub mod mattermost;
 pub mod qq;
@@ -27,6 +28,7 @@ pub use imessage::IMessageChannel;
 pub use irc::IrcChannel;
 pub use lark::LarkChannel;
 pub use linq::LinqChannel;
+#[cfg(feature = "channel-matrix")]
 pub use matrix::MatrixChannel;
 pub use mattermost::MattermostChannel;
 pub use qq::QQChannel;
@@ -1387,7 +1389,10 @@ pub async fn handle_command(command: crate::ChannelCommands, config: &Config) ->
                 ("Mattermost", config.channels_config.mattermost.is_some()),
                 ("Webhook", config.channels_config.webhook.is_some()),
                 ("iMessage", config.channels_config.imessage.is_some()),
-                ("Matrix", config.channels_config.matrix.is_some()),
+                (
+                    "Matrix",
+                    cfg!(feature = "channel-matrix") && config.channels_config.matrix.is_some(),
+                ),
                 ("Signal", config.channels_config.signal.is_some()),
                 ("WhatsApp", config.channels_config.whatsapp.is_some()),
                 ("Linq", config.channels_config.linq.is_some()),
@@ -1398,6 +1403,11 @@ pub async fn handle_command(command: crate::ChannelCommands, config: &Config) ->
                 ("QQ", config.channels_config.qq.is_some()),
             ] {
                 println!("  {} {name}", if configured { "✅" } else { "❌" });
+            }
+            if !cfg!(feature = "channel-matrix") {
+                println!(
+                    "  ℹ️ Matrix channel support is disabled in this build (enable `channel-matrix`)."
+                );
             }
             println!("\nTo start channels: zeroclaw channel start");
             println!("To check health:    zeroclaw channel doctor");
@@ -1487,6 +1497,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         ));
     }
 
+    #[cfg(feature = "channel-matrix")]
     if let Some(ref mx) = config.channels_config.matrix {
         channels.push((
             "Matrix",
@@ -1499,6 +1510,13 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 mx.device_id.clone(),
             )),
         ));
+    }
+
+    #[cfg(not(feature = "channel-matrix"))]
+    if config.channels_config.matrix.is_some() {
+        tracing::warn!(
+            "Matrix channel is configured but this build was compiled without `channel-matrix`; skipping Matrix health check."
+        );
     }
 
     if let Some(ref sig) = config.channels_config.signal {
@@ -1862,6 +1880,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         channels.push(Arc::new(IMessageChannel::new(im.allowed_contacts.clone())));
     }
 
+    #[cfg(feature = "channel-matrix")]
     if let Some(ref mx) = config.channels_config.matrix {
         channels.push(Arc::new(MatrixChannel::new_with_session_hint(
             mx.homeserver.clone(),
@@ -1871,6 +1890,13 @@ pub async fn start_channels(config: Config) -> Result<()> {
             mx.user_id.clone(),
             mx.device_id.clone(),
         )));
+    }
+
+    #[cfg(not(feature = "channel-matrix"))]
+    if config.channels_config.matrix.is_some() {
+        tracing::warn!(
+            "Matrix channel is configured but this build was compiled without `channel-matrix`; skipping Matrix runtime startup."
+        );
     }
 
     if let Some(ref sig) = config.channels_config.signal {
