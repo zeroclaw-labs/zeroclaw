@@ -2,10 +2,15 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" >/dev/null 2>&1 && pwd || pwd)"
+INSTALLER_LOCAL="$(cd "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd || pwd)/zeroclaw_install.sh"
 BOOTSTRAP_LOCAL="$SCRIPT_DIR/bootstrap.sh"
 REPO_URL="https://github.com/zeroclaw-labs/zeroclaw.git"
 
-echo "[deprecated] scripts/install.sh -> bootstrap.sh" >&2
+echo "[deprecated] scripts/install.sh -> ./zeroclaw_install.sh" >&2
+
+if [[ -x "$INSTALLER_LOCAL" ]]; then
+  exec "$INSTALLER_LOCAL" "$@"
+fi
 
 if [[ -f "$BOOTSTRAP_LOCAL" ]]; then
   exec "$BOOTSTRAP_LOCAL" "$@"
@@ -24,35 +29,15 @@ trap cleanup EXIT
 
 git clone --depth 1 "$REPO_URL" "$TEMP_DIR" >/dev/null 2>&1
 
+if [[ -x "$TEMP_DIR/zeroclaw_install.sh" ]]; then
+  exec "$TEMP_DIR/zeroclaw_install.sh" "$@"
+fi
+
 if [[ -x "$TEMP_DIR/scripts/bootstrap.sh" ]]; then
-  "$TEMP_DIR/scripts/bootstrap.sh" "$@"
-  exit 0
+  exec "$TEMP_DIR/scripts/bootstrap.sh" "$@"
 fi
 
-echo "[deprecated] cloned revision has no bootstrap.sh; falling back to legacy source install flow" >&2
-
-if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-  cat <<'USAGE'
-Legacy install.sh fallback mode
-
-Behavior:
-  - Clone repository
-  - cargo build --release --locked
-  - cargo install --path <clone> --force --locked
-
-For the new dual-mode installer, use:
-  ./bootstrap.sh --help
-USAGE
-  exit 0
-fi
-
-if ! command -v cargo >/dev/null 2>&1; then
-  echo "error: cargo is required for legacy install.sh fallback mode" >&2
-  echo "Install Rust first: https://rustup.rs/" >&2
-  exit 1
-fi
-
-cargo build --release --locked --manifest-path "$TEMP_DIR/Cargo.toml"
-cargo install --path "$TEMP_DIR" --force --locked
-
-echo "Legacy source install completed." >&2
+echo "error: zeroclaw_install.sh/bootstrap.sh was not found in the fetched revision." >&2
+echo "Run the local bootstrap directly when possible:" >&2
+echo "  ./zeroclaw_install.sh --help" >&2
+exit 1

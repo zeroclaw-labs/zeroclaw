@@ -15,16 +15,20 @@ error() {
 
 usage() {
   cat <<'USAGE'
-ZeroClaw one-click bootstrap
+ZeroClaw installer bootstrap engine
 
 Usage:
-  ./bootstrap.sh [options]
+  ./zeroclaw_install.sh [options]
+  ./bootstrap.sh [options]         # compatibility entrypoint
 
 Modes:
   Default mode installs/builds ZeroClaw only (requires existing Rust toolchain).
+  Guided mode asks setup questions and configures options interactively.
   Optional bootstrap mode can also install system dependencies and Rust.
 
 Options:
+  --guided                   Run interactive guided installer
+  --no-guided                Disable guided installer
   --docker                   Run bootstrap in Docker and launch onboarding inside the container
   --install-system-deps      Install build dependencies (Linux/macOS)
   --install-rust             Install Rust via rustup if missing
@@ -36,18 +40,22 @@ Options:
   --api-key <key>            API key for non-interactive onboarding
   --provider <id>            Provider for non-interactive onboarding (default: openrouter)
   --model <id>               Model for non-interactive onboarding (optional)
+  --build-first              Alias for explicitly enabling separate `cargo build --release --locked`
   --skip-build               Skip `cargo build --release --locked`
   --skip-install             Skip `cargo install --path . --force --locked`
   -h, --help                 Show help
 
 Examples:
-  ./bootstrap.sh
+  ./zeroclaw_install.sh
+  ./zeroclaw_install.sh --guided
+  ./zeroclaw_install.sh --install-system-deps --install-rust
+  ./zeroclaw_install.sh --prefer-prebuilt
+  ./zeroclaw_install.sh --prebuilt-only
+  ./zeroclaw_install.sh --onboard --api-key "sk-..." --provider openrouter [--model "openrouter/auto"]
+  ./zeroclaw_install.sh --interactive-onboard
+
+  # Compatibility entrypoint:
   ./bootstrap.sh --docker
-  ./bootstrap.sh --install-system-deps --install-rust
-  ./bootstrap.sh --prefer-prebuilt
-  ./bootstrap.sh --prebuilt-only
-  ./bootstrap.sh --onboard --api-key "sk-..." --provider openrouter [--model "openrouter/auto"]
-  ./bootstrap.sh --interactive-onboard
 
   # Remote one-liner
   curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/scripts/bootstrap.sh | bash
@@ -60,6 +68,8 @@ Environment:
   ZEROCLAW_MODEL             Used when --model is not provided
   ZEROCLAW_BOOTSTRAP_MIN_RAM_MB   Minimum RAM threshold for source build preflight (default: 2048)
   ZEROCLAW_BOOTSTRAP_MIN_DISK_MB  Minimum free disk threshold for source build preflight (default: 6144)
+  ZEROCLAW_DISABLE_ALPINE_AUTO_DEPS
+                            Set to 1 to disable Alpine auto-install of missing prerequisites
 USAGE
 }
 
@@ -227,19 +237,152 @@ run_privileged() {
   fi
 }
 
+is_container_runtime() {
+  if [[ -f /.dockerenv || -f /run/.containerenv ]]; then
+    return 0
+  fi
+
+  if [[ -r /proc/1/cgroup ]] && grep -Eq '(docker|containerd|kubepods|podman|lxc)' /proc/1/cgroup; then
+    return 0
+  fi
+
+  return 1
+}
+
+run_pacman() {
+  if ! have_cmd pacman; then
+    error "pacman is not available."
+    return 1
+  fi
+
+  if ! is_container_runtime; then
+    run_privileged pacman "$@"
+    return $?
+  fi
+
+  local pacman_cfg_tmp=""
+  local pacman_rc=0
+  pacman_cfg_tmp="$(mktemp /tmp/zeroclaw-pacman.XXXXXX.conf)"
+  cp /etc/pacman.conf "$pacman_cfg_tmp"
+  if ! grep -Eq '^[[:space:]]*DisableSandboxSyscalls([[:space:]]|$)' "$pacman_cfg_tmp"; then
+    printf '\nDisableSandboxSyscalls\n' >> "$pacman_cfg_tmp"
+  fi
+
+  if run_privileged pacman --config "$pacman_cfg_tmp" "$@"; then
+    pacman_rc=0
+  else
+    pacman_rc=$?
+  fi
+
+  rm -f "$pacman_cfg_tmp"
+  return "$pacman_rc"
+}
+
+ALPINE_PREREQ_PACKAGES=(
+  bash
+  build-base
+  pkgconf
+  git
+  curl
+  openssl-dev
+  perl
+  ca-certificates
+)
+ALPINE_MISSING_PKGS=()
+
+find_missing_alpine_prereqs() {
+  ALPINE_MISSING_PKGS=()
+  if ! have_cmd apk; then
+    return 0
+  fi
+
+  local pkg=""
+  for pkg in "${ALPINE_PREREQ_PACKAGES[@]}"; do
+    if ! apk info -e "$pkg" >/dev/null 2>&1; then
+      ALPINE_MISSING_PKGS+=("$pkg")
+    fi
+  done
+}
+
+bool_to_word() {
+  if [[ "$1" == true ]]; then
+    echo "yes"
+  else
+    echo "no"
+  fi
+}
+
+prompt_yes_no() {
+  local question="$1"
+  local default_answer="$2"
+  local prompt=""
+  local answer=""
+
+  if [[ "$default_answer" == "yes" ]]; then
+    prompt="[Y/n]"
+  else
+    prompt="[y/N]"
+  fi
+
+  while true; do
+    if ! read -r -p "$question $prompt " answer; then
+      error "guided installer input was interrupted."
+      exit 1
+    fi
+    answer="${answer:-$default_answer}"
+    case "$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]')" in
+      y|yes)
+        return 0
+        ;;
+      n|no)
+        return 1
+        ;;
+      *)
+        echo "Please answer yes or no."
+        ;;
+    esac
+  done
+}
+
 install_system_deps() {
   info "Installing system dependencies"
 
   case "$(uname -s)" in
     Linux)
-      if have_cmd apt-get; then
+      if have_cmd apk; then
+        find_missing_alpine_prereqs
+        if [[ ${#ALPINE_MISSING_PKGS[@]} -eq 0 ]]; then
+          info "Alpine prerequisites already installed"
+        else
+          info "Installing Alpine prerequisites: ${ALPINE_MISSING_PKGS[*]}"
+          run_privileged apk add --no-cache "${ALPINE_MISSING_PKGS[@]}"
+        fi
+      elif have_cmd apt-get; then
         run_privileged apt-get update -qq
         run_privileged apt-get install -y build-essential pkg-config git curl
       elif have_cmd dnf; then
-        run_privileged dnf group install -y development-tools
-        run_privileged dnf install -y pkg-config git curl
+        run_privileged dnf install -y \
+          gcc \
+          gcc-c++ \
+          make \
+          pkgconf-pkg-config \
+          git \
+          curl \
+          openssl-devel \
+          perl
+      elif have_cmd pacman; then
+        run_pacman -Sy --noconfirm
+        run_pacman -S --noconfirm --needed \
+          gcc \
+          make \
+          pkgconf \
+          git \
+          curl \
+          openssl \
+          perl \
+          ca-certificates
       else
-        warn "Unsupported Linux distribution. Install compiler toolchain + pkg-config + git + curl manually."
+        warn "Unsupported Linux distribution. Install compiler toolchain + pkg-config + git + curl + OpenSSL headers + perl manually."
       fi
       ;;
     Darwin)
@@ -288,12 +431,125 @@ install_rust_toolchain() {
   fi
 }
 
+run_guided_installer() {
+  local os_name="$1"
+  local provider_input=""
+  local model_input=""
+  local api_key_input=""
+
+  echo
+  echo "ZeroClaw guided installer"
+  echo "Answer a few questions, then the installer will run automatically."
+  echo
+
+  if [[ "$os_name" == "Linux" ]]; then
+    if prompt_yes_no "Install Linux build dependencies (toolchain/pkg-config/git/curl)?" "yes"; then
+      INSTALL_SYSTEM_DEPS=true
+    fi
+  else
+    if prompt_yes_no "Install system dependencies for $os_name?" "no"; then
+      INSTALL_SYSTEM_DEPS=true
+    fi
+  fi
+
+  if have_cmd cargo && have_cmd rustc; then
+    info "Detected Rust toolchain: $(rustc --version)"
+  else
+    if prompt_yes_no "Rust toolchain not found. Install Rust via rustup now?" "yes"; then
+      INSTALL_RUST=true
+    fi
+  fi
+
+  if prompt_yes_no "Run a separate prebuild before install?" "yes"; then
+    SKIP_BUILD=false
+  else
+    SKIP_BUILD=true
+  fi
+
+  if prompt_yes_no "Install zeroclaw into cargo bin now?" "yes"; then
+    SKIP_INSTALL=false
+  else
+    SKIP_INSTALL=true
+  fi
+
+  if prompt_yes_no "Run onboarding after install?" "no"; then
+    RUN_ONBOARD=true
+    if prompt_yes_no "Use interactive onboarding?" "yes"; then
+      INTERACTIVE_ONBOARD=true
+    else
+      INTERACTIVE_ONBOARD=false
+      if ! read -r -p "Provider [$PROVIDER]: " provider_input; then
+        error "guided installer input was interrupted."
+        exit 1
+      fi
+      if [[ -n "$provider_input" ]]; then
+        PROVIDER="$provider_input"
+      fi
+
+      if ! read -r -p "Model [${MODEL:-leave empty}]: " model_input; then
+        error "guided installer input was interrupted."
+        exit 1
+      fi
+      if [[ -n "$model_input" ]]; then
+        MODEL="$model_input"
+      fi
+
+      if [[ -z "$API_KEY" ]]; then
+        if ! read -r -s -p "API key (hidden, leave empty to switch to interactive onboarding): " api_key_input; then
+          echo
+          error "guided installer input was interrupted."
+          exit 1
+        fi
+        echo
+        if [[ -n "$api_key_input" ]]; then
+          API_KEY="$api_key_input"
+        else
+          warn "No API key entered. Using interactive onboarding instead."
+          INTERACTIVE_ONBOARD=true
+        fi
+      fi
+    fi
+  fi
+
+  echo
+  info "Installer plan"
+  local install_binary=true
+  local build_first=false
+  if [[ "$SKIP_INSTALL" == true ]]; then
+    install_binary=false
+  fi
+  if [[ "$SKIP_BUILD" == false ]]; then
+    build_first=true
+  fi
+  echo "    docker-mode: $(bool_to_word "$DOCKER_MODE")"
+  echo "    install-system-deps: $(bool_to_word "$INSTALL_SYSTEM_DEPS")"
+  echo "    install-rust: $(bool_to_word "$INSTALL_RUST")"
+  echo "    build-first: $(bool_to_word "$build_first")"
+  echo "    install-binary: $(bool_to_word "$install_binary")"
+  echo "    onboard: $(bool_to_word "$RUN_ONBOARD")"
+  if [[ "$RUN_ONBOARD" == true ]]; then
+    echo "    interactive-onboard: $(bool_to_word "$INTERACTIVE_ONBOARD")"
+    if [[ "$INTERACTIVE_ONBOARD" == false ]]; then
+      echo "    provider: $PROVIDER"
+      if [[ -n "$MODEL" ]]; then
+        echo "    model: $MODEL"
+      fi
+    fi
+  fi
+
+  echo
+  if ! prompt_yes_no "Proceed with this install plan?" "yes"; then
+    info "Installation canceled by user."
+    exit 0
+  fi
+}
+
 ensure_docker_ready() {
   if ! have_cmd docker; then
     error "docker is not installed."
     cat <<'MSG' >&2
 Install Docker first, then re-run with:
-  ./bootstrap.sh --docker
+  ./zeroclaw_install.sh --docker
 MSG
     exit 1
   fi
@@ -342,9 +598,9 @@ run_docker_bootstrap() {
 Use either:
   --api-key "sk-..."
 or:
-  ZEROCLAW_API_KEY="sk-..." ./bootstrap.sh --docker
+  ZEROCLAW_API_KEY="sk-..." ./zeroclaw_install.sh --docker
 or run interactive:
-  ./bootstrap.sh --docker --interactive-onboard
+  ./zeroclaw_install.sh --docker --interactive-onboard
 MSG
       exit 1
     fi
@@ -373,6 +629,8 @@ SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" >/dev/null 2>&1 && pwd || pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd || pwd)"
 REPO_URL="https://github.com/zeroclaw-labs/zeroclaw.git"
+ORIGINAL_ARG_COUNT=$#
+GUIDED_MODE="auto"
 
 DOCKER_MODE=false
 INSTALL_SYSTEM_DEPS=false
@@ -391,6 +649,14 @@ MODEL="${ZEROCLAW_MODEL:-}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --guided)
+      GUIDED_MODE="on"
+      shift
+      ;;
+    --no-guided)
+      GUIDED_MODE="off"
+      shift
+      ;;
     --docker)
       DOCKER_MODE=true
       shift
@@ -448,6 +714,10 @@ while [[ $# -gt 0 ]]; do
       }
       shift 2
       ;;
+    --build-first)
+      SKIP_BUILD=false
+      shift
+      ;;
     --skip-build)
       SKIP_BUILD=true
       shift
@@ -469,14 +739,41 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+OS_NAME="$(uname -s)"
+if [[ "$GUIDED_MODE" == "auto" ]]; then
+  if [[ "$OS_NAME" == "Linux" && "$ORIGINAL_ARG_COUNT" -eq 0 && -t 0 && -t 1 ]]; then
+    GUIDED_MODE="on"
+  else
+    GUIDED_MODE="off"
+  fi
+fi
+
+if [[ "$DOCKER_MODE" == true && "$GUIDED_MODE" == "on" ]]; then
+  warn "--guided is ignored with --docker."
+  GUIDED_MODE="off"
+fi
+
+if [[ "$GUIDED_MODE" == "on" ]]; then
+  run_guided_installer "$OS_NAME"
+fi
+
 if [[ "$DOCKER_MODE" == true ]]; then
   if [[ "$INSTALL_SYSTEM_DEPS" == true ]]; then
     warn "--install-system-deps is ignored with --docker."
   fi
   if [[ "$INSTALL_RUST" == true ]]; then
-    warn "--install-rust is ignored with --docker."
+      warn "--install-rust is ignored with --docker."
   fi
 else
+  if [[ "$OS_NAME" == "Linux" && -z "${ZEROCLAW_DISABLE_ALPINE_AUTO_DEPS:-}" ]] && have_cmd apk; then
+    find_missing_alpine_prereqs
+    if [[ ${#ALPINE_MISSING_PKGS[@]} -gt 0 && "$INSTALL_SYSTEM_DEPS" == false ]]; then
+      info "Detected Alpine with missing prerequisites: ${ALPINE_MISSING_PKGS[*]}"
+      info "Auto-enabling system dependency installation (set ZEROCLAW_DISABLE_ALPINE_AUTO_DEPS=1 to disable)."
+      INSTALL_SYSTEM_DEPS=true
+    fi
+  fi
+
   if [[ "$INSTALL_SYSTEM_DEPS" == true ]]; then
     install_system_deps
   fi
@@ -554,8 +851,8 @@ DONE
   cat <<'DONE'
 
 Next steps:
-  ./bootstrap.sh --docker --interactive-onboard
-  ./bootstrap.sh --docker --api-key "sk-..." --provider openrouter
+  ./zeroclaw_install.sh --docker --interactive-onboard
+  ./zeroclaw_install.sh --docker --api-key "sk-..." --provider openrouter
 DONE
   exit 0
 fi
@@ -588,7 +885,7 @@ if [[ "$PREBUILT_INSTALLED" == false && ( "$SKIP_BUILD" == false || "$SKIP_INSTA
   cat <<'MSG' >&2
 Install Rust first: https://rustup.rs/
 or re-run with:
-  ./bootstrap.sh --install-rust
+  ./zeroclaw_install.sh --install-rust
 MSG
   exit 1
 fi
@@ -633,9 +930,9 @@ if [[ "$RUN_ONBOARD" == true ]]; then
 Use either:
   --api-key "sk-..."
 or:
-  ZEROCLAW_API_KEY="sk-..." ./bootstrap.sh --onboard
+  ZEROCLAW_API_KEY="sk-..." ./zeroclaw_install.sh --onboard
 or run interactive:
-  ./bootstrap.sh --interactive-onboard
+  ./zeroclaw_install.sh --interactive-onboard
 MSG
       exit 1
     fi
