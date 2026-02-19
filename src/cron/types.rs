@@ -145,3 +145,22 @@ pub struct CronJobPatch {
     pub session_target: Option<SessionTarget>,
     pub delete_after_run: Option<bool>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::JobType;
+
+    #[test]
+    fn job_type_try_from_accepts_known_values_case_insensitive() {
+        assert_eq!(JobType::try_from("shell").unwrap(), JobType::Shell);
+        assert_eq!(JobType::try_from("SHELL").unwrap(), JobType::Shell);
+        assert_eq!(JobType::try_from("agent").unwrap(), JobType::Agent);
+        assert_eq!(JobType::try_from("AgEnT").unwrap(), JobType::Agent);
+    }
+
+    #[test]
+    fn job_type_try_from_rejects_invalid_values() {
+        assert!(JobType::try_from("").is_err());
+        assert!(JobType::try_from("unknown").is_err());
+    }
+}
