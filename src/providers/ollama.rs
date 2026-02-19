@@ -730,6 +730,7 @@ mod tests {
             vec![Message {
                 role: "user".to_string(),
                 content: Some("hello".to_string()),
+                images: None,
                 tool_calls: None,
                 tool_name: None,
             }],
@@ -749,6 +750,7 @@ mod tests {
             vec![Message {
                 role: "user".to_string(),
                 content: Some("hello".to_string()),
+                images: None,
                 tool_calls: None,
                 tool_name: None,
             }],
