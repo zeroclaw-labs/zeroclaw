@@ -80,6 +80,8 @@ pub enum ServiceCommands {
     Start,
     /// Stop daemon service
     Stop,
+    /// Restart daemon service to apply latest config
+    Restart,
     /// Check daemon service status
     Status,
     /// Uninstall daemon service unit

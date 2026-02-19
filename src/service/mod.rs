@@ -16,6 +16,7 @@ pub fn handle_command(command: &crate::ServiceCommands, config: &Config) -> Resu
         crate::ServiceCommands::Install => install(config),
         crate::ServiceCommands::Start => start(config),
         crate::ServiceCommands::Stop => stop(config),
+        crate::ServiceCommands::Restart => restart(config),
         crate::ServiceCommands::Status => status(config),
         crate::ServiceCommands::Uninstall => uninstall(config),
     }
@@ -82,6 +83,13 @@ fn stop(config: &Config) -> Result<()> {
         let _ = config;
         anyhow::bail!("Service management is supported on macOS and Linux only")
     }
+}
+
+fn restart(config: &Config) -> Result<()> {
+    stop(config)?;
+    start(config)?;
+    println!("✅ Service restarted");
+    Ok(())
 }
 
 fn status(config: &Config) -> Result<()> {
