@@ -1101,12 +1101,13 @@ pub fn build_system_prompt(
         prompt.push_str("## Available Skills\n\n");
         prompt.push_str("<available_skills>\n");
         for skill in skills {
+            let escaped_name = xml_escape(&skill.name);
+            let escaped_description = xml_escape(&skill.description);
             let _ = writeln!(prompt, "  <skill>");
-            let _ = writeln!(prompt, "    <name>{}</name>", skill.name);
+            let _ = writeln!(prompt, "    <name>{escaped_name}</name>");
             let _ = writeln!(
                 prompt,
-                "    <description>{}</description>",
-                skill.description
+                "    <description>{escaped_description}</description>"
             );
             let location = skill.location.clone().unwrap_or_else(|| {
                 workspace_dir
@@ -1114,14 +1115,18 @@ pub fn build_system_prompt(
                     .join(&skill.name)
                     .join("SKILL.md")
             });
-            let _ = writeln!(prompt, "    <location>{}</location>", location.display());
+            let escaped_location = xml_escape(&location.display().to_string());
+            let _ = writeln!(prompt, "    <location>{escaped_location}</location>");
             if !skill.tools.is_empty() {
                 let _ = writeln!(prompt, "    <tools>");
                 for tool in &skill.tools {
+                    let escaped_tool_name = xml_escape(&tool.name);
+                    let escaped_tool_kind = xml_escape(&tool.kind);
+                    let escaped_tool_description = xml_escape(&tool.description);
                     let _ = writeln!(
                         prompt,
                         "      <tool name=\"{}\" kind=\"{}\">{}</tool>",
-                        tool.name, tool.kind, tool.description
+                        escaped_tool_name, escaped_tool_kind, escaped_tool_description
                     );
                 }
                 let _ = writeln!(prompt, "    </tools>");
@@ -1129,9 +1134,8 @@ pub fn build_system_prompt(
             if !skill.prompts.is_empty() {
                 let _ = writeln!(prompt, "    <instructions>");
                 for p in &skill.prompts {
-                    prompt.push_str("      ");
-                    prompt.push_str(p);
-                    prompt.push('\n');
+                    let escaped_prompt = xml_escape(p);
+                    let _ = writeln!(prompt, "      {escaped_prompt}");
                 }
                 let _ = writeln!(prompt, "    </instructions>");
             }
@@ -1213,10 +1217,19 @@ pub fn build_system_prompt(
     prompt.push_str("- If a tool output contains credentials, they have already been redacted — do not mention them.\n\n");
 
     if prompt.is_empty() {
-        "You are ZeroClaw, a fast and efficient AI assistant built in Rust. Be helpful, concise, and direct.".to_string()
+        "You are ZeroClaw, a fast and efficient AI assistant built in Rust. Be helpful, concise, and direct."
+            .to_string()
     } else {
         prompt
     }
+}
+
+fn xml_escape(raw: &str) -> String {
+    raw.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 /// Inject a single workspace file into the prompt with truncation and missing-file markers.
@@ -3320,6 +3333,40 @@ mod tests {
             "skill tool should be inlined"
         );
         assert!(prompt.contains("<tools>"), "should have tools block");
+    }
+
+    #[test]
+    fn prompt_skills_escape_reserved_xml_chars() {
+        let ws = make_workspace();
+        let skills = vec![crate::skills::Skill {
+            name: "code<review>&".into(),
+            description: "Review \"unsafe\" and 'risky' bits".into(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: vec![],
+            tools: vec![crate::skills::SkillTool {
+                name: "run\"linter\"".into(),
+                description: "Run <lint> & report".into(),
+                kind: "shell&exec".into(),
+                command: "cargo clippy".into(),
+                args: std::collections::HashMap::new(),
+            }],
+            prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
+            location: None,
+        }];
+
+        let prompt = build_system_prompt(ws.path(), "model", &[], &skills, None, None);
+
+        assert!(prompt.contains("<name>code&lt;review&gt;&amp;</name>"));
+        assert!(prompt.contains(
+            "<description>Review &quot;unsafe&quot; and &apos;risky&apos; bits</description>"
+        ));
+        assert!(
+            prompt.contains(
+                "<tool name=\"run&quot;linter&quot;\" kind=\"shell&amp;exec\">Run &lt;lint&gt; &amp; report</tool>"
+            )
+        );
+        assert!(prompt.contains("Use &lt;tool_call&gt; and &amp; keep output &quot;safe&quot;"));
     }
 
     #[test]
