@@ -3,6 +3,7 @@ package main
 import (
     "bytes"
     "encoding/json"
+    "io"
     "log"
     "net/http"
     "os"
@@ -219,13 +220,17 @@ func handleZeroClawForward(ws *websocket.Conn, writeMu *sync.Mutex, f Frame) {
     }
     defer resp.Body.Close()
 
+    // Log raw response for diagnosis
+    b, _ := io.ReadAll(resp.Body)
+    log.Printf("[zeroclaw] status=%d body=%s", resp.StatusCode, string(b))
+
     // Decode ZeroClaw response but don't forward it directly
     var zeroclawResp struct {
         Response string `json:"response"`
         Model    string `json:"model"`
         Error    string `json:"error"`
     }
-    if err := json.NewDecoder(resp.Body).Decode(&zeroclawResp); err != nil {
+    if err := json.Unmarshal(b, &zeroclawResp); err != nil {
         sendError(ws, writeMu, f.ID, "failed to decode zeroclaw response: "+err.Error())
         return
     }
