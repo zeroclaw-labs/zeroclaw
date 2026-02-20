@@ -1185,6 +1185,22 @@ fn create_provider_with_url_and_options(
     }
 }
 
+/// Parse `"provider:profile"` syntax for fallback entries.
+///
+/// Returns `(provider_name, Some(profile))` when the entry contains a colon-
+/// delimited profile, or `(original_str, None)` otherwise.  Entries starting
+/// with `custom:` or `anthropic-custom:` are left untouched because the colon
+/// is part of the URL scheme.
+fn parse_provider_profile(s: &str) -> (&str, Option<&str>) {
+    if s.starts_with("custom:") || s.starts_with("anthropic-custom:") {
+        return (s, None);
+    }
+    match s.split_once(':') {
+        Some((provider, profile)) if !profile.is_empty() => (provider, Some(profile)),
+        _ => (s, None),
+    }
+}
+
 /// Create provider chain with retry and fallback behavior.
 pub fn create_resilient_provider(
     primary_name: &str,
@@ -1224,16 +1240,27 @@ pub fn create_resilient_provider_with_options(
             continue;
         }
 
+        let (provider_name, profile_override) = parse_provider_profile(fallback);
+
         // Each fallback provider resolves its own credential via provider-
         // specific env vars (e.g. DEEPSEEK_API_KEY for "deepseek") instead
         // of inheriting the primary provider's key. Passing `None` lets
         // `resolve_provider_credential` check the correct env var for the
         // fallback provider name.
         //
-        // Keep using `create_provider_with_options` so fallback entries that
-        // require runtime options (for example Codex auth profile overrides)
-        // continue to work.
-        match create_provider_with_options(fallback, None, options) {
+        // When a profile override is present (e.g. "openai-codex:second"),
+        // propagate it through `auth_profile_override` so the provider
+        // picks up the correct OAuth credential set.
+        let fallback_options = match profile_override {
+            Some(profile) => {
+                let mut opts = options.clone();
+                opts.auth_profile_override = Some(profile.to_string());
+                opts
+            }
+            None => options.clone(),
+        };
+
+        match create_provider_with_options(provider_name, None, &fallback_options) {
             Ok(provider) => providers.push((fallback.clone(), provider)),
             Err(_error) => {
                 tracing::warn!(
@@ -2582,5 +2609,102 @@ mod tests {
         let input = "failed: github_pat_11AABBC_xyzzy789";
         let result = scrub_secret_patterns(input);
         assert_eq!(result, "failed: [REDACTED]");
+    }
+
+    // --- parse_provider_profile ---
+
+    #[test]
+    fn parse_provider_profile_plain_name() {
+        let (name, profile) = parse_provider_profile("gemini");
+        assert_eq!(name, "gemini");
+        assert_eq!(profile, None);
+    }
+
+    #[test]
+    fn parse_provider_profile_with_profile() {
+        let (name, profile) = parse_provider_profile("openai-codex:second");
+        assert_eq!(name, "openai-codex");
+        assert_eq!(profile, Some("second"));
+    }
+
+    #[test]
+    fn parse_provider_profile_custom_url_not_split() {
+        let input = "custom:https://my-api.example.com/v1";
+        let (name, profile) = parse_provider_profile(input);
+        assert_eq!(name, input);
+        assert_eq!(profile, None);
+    }
+
+    #[test]
+    fn parse_provider_profile_anthropic_custom_not_split() {
+        let input = "anthropic-custom:https://bedrock.example.com";
+        let (name, profile) = parse_provider_profile(input);
+        assert_eq!(name, input);
+        assert_eq!(profile, None);
+    }
+
+    #[test]
+    fn parse_provider_profile_empty_profile_ignored() {
+        let (name, profile) = parse_provider_profile("openai-codex:");
+        assert_eq!(name, "openai-codex:");
+        assert_eq!(profile, None);
+    }
+
+    #[test]
+    fn parse_provider_profile_extra_colons_kept() {
+        let (name, profile) = parse_provider_profile("provider:profile:extra");
+        assert_eq!(name, "provider");
+        assert_eq!(profile, Some("profile:extra"));
+    }
+
+    // --- resilient fallback with profile syntax ---
+
+    #[test]
+    fn resilient_fallback_with_profile_syntax() {
+        let _guard = env_lock();
+
+        let reliability = crate::config::ReliabilityConfig {
+            provider_retries: 1,
+            provider_backoff_ms: 100,
+            fallback_providers: vec!["openai-codex:second".into()],
+            api_keys: Vec::new(),
+            model_fallbacks: std::collections::HashMap::new(),
+            channel_initial_backoff_secs: 2,
+            channel_max_backoff_secs: 60,
+            scheduler_poll_secs: 15,
+            scheduler_retries: 2,
+        };
+
+        // openai-codex resolves its own OAuth credential; it should not
+        // fail even with a profile override that has no local token file.
+        // The provider initializes successfully and will attempt auth at
+        // request time.
+        let provider = create_resilient_provider("lmstudio", None, None, &reliability);
+        assert!(provider.is_ok());
+    }
+
+    #[test]
+    fn resilient_fallback_mixed_profiles_and_custom() {
+        let _guard = env_lock();
+
+        let reliability = crate::config::ReliabilityConfig {
+            provider_retries: 1,
+            provider_backoff_ms: 100,
+            fallback_providers: vec![
+                "openai-codex:second".into(),
+                "custom:http://localhost:8080/v1".into(),
+                "lmstudio".into(),
+                "nonexistent-provider".into(),
+            ],
+            api_keys: Vec::new(),
+            model_fallbacks: std::collections::HashMap::new(),
+            channel_initial_backoff_secs: 2,
+            channel_max_backoff_secs: 60,
+            scheduler_poll_secs: 15,
+            scheduler_retries: 2,
+        };
+
+        let provider = create_resilient_provider("ollama", None, None, &reliability);
+        assert!(provider.is_ok());
     }
 }
