@@ -6,7 +6,7 @@
 
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ProviderCapabilities, ToolCall as ProviderToolCall, ToolsPayload,
+    Provider, ProviderCapabilities, TokenUsage, ToolCall as ProviderToolCall, ToolsPayload,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -403,6 +403,17 @@ struct ConverseResponse {
     #[serde(default)]
     #[allow(dead_code)]
     stop_reason: Option<String>,
+    #[serde(default)]
+    usage: Option<BedrockUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BedrockUsage {
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    #[serde(default)]
+    output_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -735,6 +746,11 @@ impl BedrockProvider {
         let mut text_parts = Vec::new();
         let mut tool_calls = Vec::new();
 
+        let usage = response.usage.map(|u| TokenUsage {
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+        });
+
         if let Some(output) = response.output {
             if let Some(message) = output.message {
                 for block in message.content {
@@ -767,7 +783,7 @@ impl BedrockProvider {
                 Some(text_parts.join("\n"))
             },
             tool_calls,
-            usage: None,
+            usage,
         }
     }
 
@@ -1455,5 +1471,24 @@ mod tests {
         let provider = BedrockProvider { credentials: None };
         let caps = provider.capabilities();
         assert!(caps.native_tool_calling);
+    }
+
+    #[test]
+    fn converse_response_parses_usage() {
+        let json = r#"{
+            "output": {"message": {"role": "assistant", "content": [{"text": {"text": "Hello"}}]}},
+            "usage": {"inputTokens": 500, "outputTokens": 100}
+        }"#;
+        let resp: ConverseResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.unwrap();
+        assert_eq!(usage.input_tokens, Some(500));
+        assert_eq!(usage.output_tokens, Some(100));
+    }
+
+    #[test]
+    fn converse_response_parses_without_usage() {
+        let json = r#"{"output": {"message": {"role": "assistant", "content": []}}}"#;
+        let resp: ConverseResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.usage.is_none());
     }
 }

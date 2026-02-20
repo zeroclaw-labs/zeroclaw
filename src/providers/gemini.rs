@@ -3,7 +3,7 @@
 //! - Gemini CLI OAuth tokens (reuse existing ~/.gemini/ authentication)
 //! - Google Cloud ADC (`GOOGLE_APPLICATION_CREDENTIALS`)
 
-use crate::providers::traits::{ChatMessage, Provider};
+use crate::providers::traits::{ChatMessage, ChatResponse, Provider, TokenUsage};
 use async_trait::async_trait;
 use directories::UserDirs;
 use reqwest::Client;
@@ -140,6 +140,16 @@ struct GenerateContentResponse {
     error: Option<ApiError>,
     #[serde(default)]
     response: Option<Box<GenerateContentResponse>>,
+    #[serde(default, rename = "usageMetadata")]
+    usage_metadata: Option<GeminiUsageMetadata>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiUsageMetadata {
+    #[serde(default, rename = "promptTokenCount")]
+    prompt_token_count: Option<u64>,
+    #[serde(default, rename = "candidatesTokenCount")]
+    candidates_token_count: Option<u64>,
 }
 
 /// Response envelope for the internal cloudcode-pa API.
@@ -692,7 +702,7 @@ impl GeminiProvider {
         system_instruction: Option<Content>,
         model: &str,
         temperature: f64,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<(String, Option<TokenUsage>)> {
         let auth = self.auth.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "Gemini API key not found. Options:\n\
@@ -777,12 +787,19 @@ impl GeminiProvider {
             anyhow::bail!("Gemini API error: {}", err.message);
         }
 
-        result
+        let usage = result.usage_metadata.map(|u| TokenUsage {
+            input_tokens: u.prompt_token_count,
+            output_tokens: u.candidates_token_count,
+        });
+
+        let text = result
             .candidates
             .and_then(|c| c.into_iter().next())
             .and_then(|c| c.content)
             .and_then(|c| c.effective_text())
-            .ok_or_else(|| anyhow::anyhow!("No response from Gemini"))
+            .ok_or_else(|| anyhow::anyhow!("No response from Gemini"))?;
+
+        Ok((text, usage))
     }
 }
 
@@ -809,8 +826,10 @@ impl Provider for GeminiProvider {
             }],
         }];
 
-        self.send_generate_content(contents, system_instruction, model, temperature)
-            .await
+        let (text, _usage) = self
+            .send_generate_content(contents, system_instruction, model, temperature)
+            .await?;
+        Ok(text)
     }
 
     async fn chat_with_history(
@@ -859,8 +878,60 @@ impl Provider for GeminiProvider {
             })
         };
 
-        self.send_generate_content(contents, system_instruction, model, temperature)
-            .await
+        let (text, _usage) = self
+            .send_generate_content(contents, system_instruction, model, temperature)
+            .await?;
+        Ok(text)
+    }
+
+    async fn chat(
+        &self,
+        request: crate::providers::traits::ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ChatResponse> {
+        let mut system_parts: Vec<&str> = Vec::new();
+        let mut contents: Vec<Content> = Vec::new();
+
+        for msg in request.messages {
+            match msg.role.as_str() {
+                "system" => system_parts.push(&msg.content),
+                "user" => contents.push(Content {
+                    role: Some("user".to_string()),
+                    parts: vec![Part {
+                        text: msg.content.clone(),
+                    }],
+                }),
+                "assistant" => contents.push(Content {
+                    role: Some("model".to_string()),
+                    parts: vec![Part {
+                        text: msg.content.clone(),
+                    }],
+                }),
+                _ => {}
+            }
+        }
+
+        let system_instruction = if system_parts.is_empty() {
+            None
+        } else {
+            Some(Content {
+                role: None,
+                parts: vec![Part {
+                    text: system_parts.join("\n\n"),
+                }],
+            })
+        };
+
+        let (text, usage) = self
+            .send_generate_content(contents, system_instruction, model, temperature)
+            .await?;
+
+        Ok(ChatResponse {
+            text: Some(text),
+            tool_calls: Vec::new(),
+            usage,
+        })
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
@@ -1555,5 +1626,24 @@ mod tests {
         };
         let result = provider.warmup().await;
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn response_parses_usage_metadata() {
+        let json = r#"{
+            "candidates": [{"content": {"parts": [{"text": "Hello"}]}}],
+            "usageMetadata": {"promptTokenCount": 120, "candidatesTokenCount": 40}
+        }"#;
+        let resp: GenerateContentResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage_metadata.unwrap();
+        assert_eq!(usage.prompt_token_count, Some(120));
+        assert_eq!(usage.candidates_token_count, Some(40));
+    }
+
+    #[test]
+    fn response_parses_without_usage_metadata() {
+        let json = r#"{"candidates": [{"content": {"parts": [{"text": "Hello"}]}}]}"#;
+        let resp: GenerateContentResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.usage_metadata.is_none());
     }
 }
