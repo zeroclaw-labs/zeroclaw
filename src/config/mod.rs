@@ -11,9 +11,9 @@ pub use schema::{
     IdentityConfig, LarkConfig, MatrixConfig, MemoryConfig, ModelRouteConfig, MultimodalConfig,
     ObservabilityConfig, PeripheralBoardConfig, PeripheralsConfig, ProxyConfig, ProxyScope,
     QueryClassificationConfig, ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig,
-    SandboxBackend, SandboxConfig, SchedulerConfig, SecretsConfig, SecurityConfig, SlackConfig,
-    StorageConfig, StorageProviderConfig, StorageProviderSection, StreamMode, TelegramConfig,
-    TunnelConfig, WebSearchConfig, WebhookConfig,
+    SandboxBackend, SandboxConfig, SchedulerConfig, SecretsConfig, SecurityConfig, SkillsConfig,
+    SlackConfig, StorageConfig, StorageProviderConfig, StorageProviderSection, StreamMode,
+    TelegramConfig, TunnelConfig, WebSearchConfig, WebhookConfig,
 };
 
 #[cfg(test)]

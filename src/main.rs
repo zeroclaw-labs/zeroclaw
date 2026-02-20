@@ -884,9 +884,7 @@ async fn main() -> Result<()> {
             integration_command,
         } => integrations::handle_command(integration_command, &config),
 
-        Commands::Skills { skill_command } => {
-            skills::handle_command(skill_command, &config.workspace_dir)
-        }
+        Commands::Skills { skill_command } => skills::handle_command(skill_command, &config),
 
         Commands::Migrate { migrate_command } => {
             migration::handle_command(migrate_command, &config).await

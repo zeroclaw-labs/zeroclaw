@@ -71,9 +71,28 @@ fn default_version() -> String {
 
 /// Load all skills from the workspace skills directory
 pub fn load_skills(workspace_dir: &Path) -> Vec<Skill> {
+    load_skills_with_open_skills_config(workspace_dir, None, None)
+}
+
+/// Load skills using runtime config values (preferred at runtime).
+pub fn load_skills_with_config(workspace_dir: &Path, config: &crate::config::Config) -> Vec<Skill> {
+    load_skills_with_open_skills_config(
+        workspace_dir,
+        Some(config.skills.open_skills_enabled),
+        config.skills.open_skills_dir.as_deref(),
+    )
+}
+
+fn load_skills_with_open_skills_config(
+    workspace_dir: &Path,
+    config_open_skills_enabled: Option<bool>,
+    config_open_skills_dir: Option<&str>,
+) -> Vec<Skill> {
     let mut skills = Vec::new();
 
-    if let Some(open_skills_dir) = ensure_open_skills_repo() {
+    if let Some(open_skills_dir) =
+        ensure_open_skills_repo(config_open_skills_enabled, config_open_skills_dir)
+    {
         skills.extend(load_open_skills(&open_skills_dir));
     }
 
@@ -158,33 +177,79 @@ fn load_open_skills(repo_dir: &Path) -> Vec<Skill> {
     skills
 }
 
-fn open_skills_enabled() -> bool {
-    if let Ok(raw) = std::env::var("ZEROCLAW_OPEN_SKILLS_ENABLED") {
-        let value = raw.trim().to_ascii_lowercase();
-        return !matches!(value.as_str(), "0" | "false" | "off" | "no");
+fn parse_open_skills_enabled(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
     }
-
-    // Keep tests deterministic and network-free by default.
-    !cfg!(test)
 }
 
-fn resolve_open_skills_dir() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("ZEROCLAW_OPEN_SKILLS_DIR") {
-        let trimmed = path.trim();
-        if !trimmed.is_empty() {
-            return Some(PathBuf::from(trimmed));
+fn open_skills_enabled_from_sources(
+    config_open_skills_enabled: Option<bool>,
+    env_override: Option<&str>,
+) -> bool {
+    if let Some(raw) = env_override {
+        if let Some(enabled) = parse_open_skills_enabled(&raw) {
+            return enabled;
+        }
+        if !raw.trim().is_empty() {
+            tracing::warn!(
+                "Ignoring invalid ZEROCLAW_OPEN_SKILLS_ENABLED (valid: 1|0|true|false|yes|no|on|off)"
+            );
         }
     }
 
-    UserDirs::new().map(|dirs| dirs.home_dir().join("open-skills"))
+    config_open_skills_enabled.unwrap_or(false)
 }
 
-fn ensure_open_skills_repo() -> Option<PathBuf> {
-    if !open_skills_enabled() {
+fn open_skills_enabled(config_open_skills_enabled: Option<bool>) -> bool {
+    let env_override = std::env::var("ZEROCLAW_OPEN_SKILLS_ENABLED").ok();
+    open_skills_enabled_from_sources(config_open_skills_enabled, env_override.as_deref())
+}
+
+fn resolve_open_skills_dir_from_sources(
+    env_dir: Option<&str>,
+    config_dir: Option<&str>,
+    home_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    let parse_dir = |raw: &str| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(trimmed))
+        }
+    };
+
+    if let Some(env_dir) = env_dir.and_then(parse_dir) {
+        return Some(env_dir);
+    }
+    if let Some(config_dir) = config_dir.and_then(parse_dir) {
+        return Some(config_dir);
+    }
+    home_dir.map(|home| home.join("open-skills"))
+}
+
+fn resolve_open_skills_dir(config_open_skills_dir: Option<&str>) -> Option<PathBuf> {
+    let env_dir = std::env::var("ZEROCLAW_OPEN_SKILLS_DIR").ok();
+    let home_dir = UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
+    resolve_open_skills_dir_from_sources(
+        env_dir.as_deref(),
+        config_open_skills_dir,
+        home_dir.as_deref(),
+    )
+}
+
+fn ensure_open_skills_repo(
+    config_open_skills_enabled: Option<bool>,
+    config_open_skills_dir: Option<&str>,
+) -> Option<PathBuf> {
+    if !open_skills_enabled(config_open_skills_enabled) {
         return None;
     }
 
-    let repo_dir = resolve_open_skills_dir()?;
+    let repo_dir = resolve_open_skills_dir(config_open_skills_dir)?;
 
     if !repo_dir.exists() {
         if !clone_open_skills_repo(&repo_dir) {
@@ -542,10 +607,11 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
 
 /// Handle the `skills` CLI command
 #[allow(clippy::too_many_lines)]
-pub fn handle_command(command: crate::SkillCommands, workspace_dir: &Path) -> Result<()> {
+pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Config) -> Result<()> {
+    let workspace_dir = &config.workspace_dir;
     match command {
         crate::SkillCommands::List => {
-            let skills = load_skills(workspace_dir);
+            let skills = load_skills_with_config(workspace_dir, config);
             if skills.is_empty() {
                 println!("No skills installed.");
                 println!();
@@ -711,6 +777,35 @@ pub fn handle_command(command: crate::SkillCommands, workspace_dir: &Path) -> Re
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::{Mutex, OnceLock};
+
+    fn open_skills_env_lock() -> &'static Mutex<()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn unset(key: &'static str) -> Self {
+            let original = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.original {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     #[test]
     fn load_empty_skills_dir() {
@@ -1070,6 +1165,78 @@ description = "Bare minimum"
         let skills = load_skills(dir.path());
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "from-toml"); // TOML takes priority
+    }
+
+    #[test]
+    fn open_skills_enabled_resolution_prefers_env_then_config_then_default_false() {
+        assert!(!open_skills_enabled_from_sources(None, None));
+        assert!(open_skills_enabled_from_sources(Some(true), None));
+        assert!(!open_skills_enabled_from_sources(Some(true), Some("0")));
+        assert!(open_skills_enabled_from_sources(Some(false), Some("yes")));
+        // Invalid env values should fall back to config.
+        assert!(open_skills_enabled_from_sources(
+            Some(true),
+            Some("invalid")
+        ));
+        assert!(!open_skills_enabled_from_sources(
+            Some(false),
+            Some("invalid")
+        ));
+    }
+
+    #[test]
+    fn resolve_open_skills_dir_resolution_prefers_env_then_config_then_home() {
+        let home = Path::new("/tmp/home-dir");
+        assert_eq!(
+            resolve_open_skills_dir_from_sources(
+                Some("/tmp/env-skills"),
+                Some("/tmp/config"),
+                Some(home)
+            ),
+            Some(PathBuf::from("/tmp/env-skills"))
+        );
+        assert_eq!(
+            resolve_open_skills_dir_from_sources(
+                Some("   "),
+                Some("/tmp/config-skills"),
+                Some(home)
+            ),
+            Some(PathBuf::from("/tmp/config-skills"))
+        );
+        assert_eq!(
+            resolve_open_skills_dir_from_sources(None, None, Some(home)),
+            Some(PathBuf::from("/tmp/home-dir/open-skills"))
+        );
+        assert_eq!(resolve_open_skills_dir_from_sources(None, None, None), None);
+    }
+
+    #[test]
+    fn load_skills_with_config_reads_open_skills_dir_without_network() {
+        let _env_guard = open_skills_env_lock().lock().unwrap();
+        let _enabled_guard = EnvVarGuard::unset("ZEROCLAW_OPEN_SKILLS_ENABLED");
+        let _dir_guard = EnvVarGuard::unset("ZEROCLAW_OPEN_SKILLS_DIR");
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_dir = dir.path().join("workspace");
+        fs::create_dir_all(workspace_dir.join("skills")).unwrap();
+
+        let open_skills_dir = dir.path().join("open-skills-local");
+        fs::create_dir_all(&open_skills_dir).unwrap();
+        fs::write(open_skills_dir.join("README.md"), "# open skills\n").unwrap();
+        fs::write(
+            open_skills_dir.join("http_request.md"),
+            "# HTTP request\nFetch API responses.\n",
+        )
+        .unwrap();
+
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace_dir.clone();
+        config.skills.open_skills_enabled = true;
+        config.skills.open_skills_dir = Some(open_skills_dir.to_string_lossy().to_string());
+
+        let skills = load_skills_with_config(&workspace_dir, &config);
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "http_request");
     }
 }
 

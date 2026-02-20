@@ -308,7 +308,10 @@ impl Agent {
             .classification_config(config.query_classification.clone())
             .available_hints(available_hints)
             .identity_config(config.identity.clone())
-            .skills(crate::skills::load_skills(&config.workspace_dir))
+            .skills(crate::skills::load_skills_with_config(
+                &config.workspace_dir,
+                config,
+            ))
             .auto_save(config.memory.auto_save)
             .build()
     }

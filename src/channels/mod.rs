@@ -2285,7 +2285,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config,
     ));
 
-    let skills = crate::skills::load_skills(&workspace);
+    let skills = crate::skills::load_skills_with_config(&workspace, &config);
 
     // Collect tool descriptions for the prompt
     let mut tool_descs: Vec<(&str, &str)> = vec![

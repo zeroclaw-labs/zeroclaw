@@ -94,6 +94,10 @@ pub struct Config {
     #[serde(default)]
     pub agent: AgentConfig,
 
+    /// Skills loading and community repository behavior (`[skills]`).
+    #[serde(default)]
+    pub skills: SkillsConfig,
+
     /// Model routing rules — route `hint:<name>` to specific provider+model combos.
     #[serde(default)]
     pub model_routes: Vec<ModelRouteConfig>,
@@ -321,6 +325,28 @@ impl Default for AgentConfig {
             max_history_messages: default_agent_max_history_messages(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
+        }
+    }
+}
+
+/// Skills loading configuration (`[skills]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SkillsConfig {
+    /// Enable loading and syncing the community open-skills repository.
+    /// Default: `false` (opt-in).
+    #[serde(default)]
+    pub open_skills_enabled: bool,
+    /// Optional path to a local open-skills repository.
+    /// If unset, defaults to `$HOME/open-skills` when enabled.
+    #[serde(default)]
+    pub open_skills_dir: Option<String>,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            open_skills_enabled: false,
+            open_skills_dir: None,
         }
     }
 }
@@ -2735,6 +2761,7 @@ impl Default for Config {
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
             agent: AgentConfig::default(),
+            skills: SkillsConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             heartbeat: HeartbeatConfig::default(),
@@ -3228,6 +3255,27 @@ impl Config {
             }
         }
 
+        // Open-skills opt-in flag: ZEROCLAW_OPEN_SKILLS_ENABLED
+        if let Ok(flag) = std::env::var("ZEROCLAW_OPEN_SKILLS_ENABLED") {
+            if !flag.trim().is_empty() {
+                match flag.trim().to_ascii_lowercase().as_str() {
+                    "1" | "true" | "yes" | "on" => self.skills.open_skills_enabled = true,
+                    "0" | "false" | "no" | "off" => self.skills.open_skills_enabled = false,
+                    _ => tracing::warn!(
+                        "Ignoring invalid ZEROCLAW_OPEN_SKILLS_ENABLED (valid: 1|0|true|false|yes|no|on|off)"
+                    ),
+                }
+            }
+        }
+
+        // Open-skills directory override: ZEROCLAW_OPEN_SKILLS_DIR
+        if let Ok(path) = std::env::var("ZEROCLAW_OPEN_SKILLS_DIR") {
+            let trimmed = path.trim();
+            if !trimmed.is_empty() {
+                self.skills.open_skills_dir = Some(trimmed.to_string());
+            }
+        }
+
         // Gateway port: ZEROCLAW_GATEWAY_PORT or PORT
         if let Ok(port_str) =
             std::env::var("ZEROCLAW_GATEWAY_PORT").or_else(|_| std::env::var("PORT"))
@@ -3564,6 +3612,7 @@ mod tests {
         assert!(c.default_model.as_deref().unwrap().contains("claude"));
         assert!((c.default_temperature - 0.7).abs() < f64::EPSILON);
         assert!(c.api_key.is_none());
+        assert!(!c.skills.open_skills_enabled);
         assert!(c.workspace_dir.to_string_lossy().contains("workspace"));
         assert!(c.config_path.to_string_lossy().contains("config.toml"));
     }
@@ -3586,6 +3635,7 @@ mod tests {
             .expect("schema should expose top-level properties");
 
         assert!(properties.contains_key("default_provider"));
+        assert!(properties.contains_key("skills"));
         assert!(properties.contains_key("gateway"));
         assert!(properties.contains_key("channels_config"));
         assert!(!properties.contains_key("workspace_dir"));
@@ -3735,6 +3785,7 @@ default_temperature = 0.7
             },
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
+            skills: SkillsConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             query_classification: QueryClassificationConfig::default(),
@@ -3918,6 +3969,7 @@ tool_dispatcher = "xml"
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
+            skills: SkillsConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             query_classification: QueryClassificationConfig::default(),
@@ -4843,6 +4895,40 @@ default_temperature = 0.7
         assert_eq!(config.default_provider.as_deref(), Some("anthropic"));
 
         std::env::remove_var("ZEROCLAW_PROVIDER");
+    }
+
+    #[test]
+    async fn env_override_open_skills_enabled_and_dir() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        assert!(!config.skills.open_skills_enabled);
+        assert!(config.skills.open_skills_dir.is_none());
+
+        std::env::set_var("ZEROCLAW_OPEN_SKILLS_ENABLED", "true");
+        std::env::set_var("ZEROCLAW_OPEN_SKILLS_DIR", "/tmp/open-skills");
+        config.apply_env_overrides();
+
+        assert!(config.skills.open_skills_enabled);
+        assert_eq!(
+            config.skills.open_skills_dir.as_deref(),
+            Some("/tmp/open-skills")
+        );
+
+        std::env::remove_var("ZEROCLAW_OPEN_SKILLS_ENABLED");
+        std::env::remove_var("ZEROCLAW_OPEN_SKILLS_DIR");
+    }
+
+    #[test]
+    async fn env_override_open_skills_enabled_invalid_value_keeps_existing_value() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        config.skills.open_skills_enabled = true;
+
+        std::env::set_var("ZEROCLAW_OPEN_SKILLS_ENABLED", "maybe");
+        config.apply_env_overrides();
+
+        assert!(config.skills.open_skills_enabled);
+        std::env::remove_var("ZEROCLAW_OPEN_SKILLS_ENABLED");
     }
 
     #[test]

@@ -92,6 +92,21 @@ Notes:
 - `reasoning_enabled = true` explicitly requests reasoning for supported providers (`think: true` on `ollama`).
 - Unset keeps provider defaults.
 
+## `[skills]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `open_skills_enabled` | `false` | Opt-in loading/sync of community `open-skills` repository |
+| `open_skills_dir` | unset | Optional local path for `open-skills` (defaults to `$HOME/open-skills` when enabled) |
+
+Notes:
+
+- Security-first default: ZeroClaw does **not** clone or sync `open-skills` unless `open_skills_enabled = true`.
+- Environment overrides:
+  - `ZEROCLAW_OPEN_SKILLS_ENABLED` accepts `1/0`, `true/false`, `yes/no`, `on/off`.
+  - `ZEROCLAW_OPEN_SKILLS_DIR` overrides the repository path when non-empty.
+- Precedence for enable flag: `ZEROCLAW_OPEN_SKILLS_ENABLED` → `skills.open_skills_enabled` in `config.toml` → default `false`.
+
 ## `[composio]`
 
 | Key | Default | Purpose |

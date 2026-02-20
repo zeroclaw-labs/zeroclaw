@@ -857,6 +857,18 @@ See [aieos.org](https://aieos.org) for the full schema and live examples.
 
 For a task-oriented command guide, see [`docs/commands-reference.md`](docs/commands-reference.md).
 
+### Open-Skills Opt-In
+
+Community `open-skills` sync is disabled by default. Enable it explicitly in `config.toml`:
+
+```toml
+[skills]
+open_skills_enabled = true
+# open_skills_dir = "/path/to/open-skills"  # optional
+```
+
+You can also override at runtime with `ZEROCLAW_OPEN_SKILLS_ENABLED` and `ZEROCLAW_OPEN_SKILLS_DIR`.
+
 ## Development
 
 ```bash
