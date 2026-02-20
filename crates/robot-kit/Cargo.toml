@@ -52,7 +52,7 @@ tracing = "0.1"
 chrono = { version = "0.4", features = ["clock", "std"] }
 
 # User directories
-directories = "5.0"
+directories = "6.0"
 
 
 [target.'cfg(target_os = "linux")'.dependencies]
