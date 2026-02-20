@@ -68,7 +68,7 @@ use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -993,6 +993,170 @@ fn extract_tool_context_summary(history: &[ChatMessage], start_index: usize) -> 
     format!("[Used tools: {}]", tool_names.join(", "))
 }
 
+fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
+    let known_tool_names: HashSet<String> = tools
+        .iter()
+        .map(|tool| tool.name().to_ascii_lowercase())
+        .collect();
+    strip_isolated_tool_json_artifacts(response, &known_tool_names)
+}
+
+fn is_tool_call_payload(value: &serde_json::Value, known_tool_names: &HashSet<String>) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+
+    let (name, has_args) =
+        if let Some(function) = object.get("function").and_then(|f| f.as_object()) {
+            (
+                function
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| object.get("name").and_then(|v| v.as_str())),
+                function.contains_key("arguments")
+                    || function.contains_key("parameters")
+                    || object.contains_key("arguments")
+                    || object.contains_key("parameters"),
+            )
+        } else {
+            (
+                object.get("name").and_then(|v| v.as_str()),
+                object.contains_key("arguments") || object.contains_key("parameters"),
+            )
+        };
+
+    let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) else {
+        return false;
+    };
+
+    has_args && known_tool_names.contains(&name.to_ascii_lowercase())
+}
+
+fn is_tool_result_payload(
+    object: &serde_json::Map<String, serde_json::Value>,
+    saw_tool_call_payload: bool,
+) -> bool {
+    if !saw_tool_call_payload || !object.contains_key("result") {
+        return false;
+    }
+
+    object.keys().all(|key| {
+        matches!(
+            key.as_str(),
+            "result" | "id" | "tool_call_id" | "name" | "tool"
+        )
+    })
+}
+
+fn sanitize_tool_json_value(
+    value: &serde_json::Value,
+    known_tool_names: &HashSet<String>,
+    saw_tool_call_payload: bool,
+) -> Option<(String, bool)> {
+    if is_tool_call_payload(value, known_tool_names) {
+        return Some((String::new(), true));
+    }
+
+    if let Some(array) = value.as_array() {
+        if !array.is_empty()
+            && array
+                .iter()
+                .all(|item| is_tool_call_payload(item, known_tool_names))
+        {
+            return Some((String::new(), true));
+        }
+        return None;
+    }
+
+    let Some(object) = value.as_object() else {
+        return None;
+    };
+
+    if let Some(tool_calls) = object.get("tool_calls").and_then(|value| value.as_array()) {
+        if !tool_calls.is_empty()
+            && tool_calls
+                .iter()
+                .all(|call| is_tool_call_payload(call, known_tool_names))
+        {
+            let content = object
+                .get("content")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            return Some((content, true));
+        }
+    }
+
+    if is_tool_result_payload(object, saw_tool_call_payload) {
+        return Some((String::new(), false));
+    }
+
+    None
+}
+
+fn is_line_isolated_json_segment(message: &str, start: usize, end: usize) -> bool {
+    let line_start = message[..start].rfind('\n').map_or(0, |idx| idx + 1);
+    let line_end = message[end..]
+        .find('\n')
+        .map_or(message.len(), |idx| end + idx);
+
+    message[line_start..start].trim().is_empty() && message[end..line_end].trim().is_empty()
+}
+
+fn strip_isolated_tool_json_artifacts(message: &str, known_tool_names: &HashSet<String>) -> String {
+    let mut cleaned = String::with_capacity(message.len());
+    let mut cursor = 0usize;
+    let mut saw_tool_call_payload = false;
+
+    while cursor < message.len() {
+        let Some(rel_start) = message[cursor..].find(|ch: char| ch == '{' || ch == '[') else {
+            cleaned.push_str(&message[cursor..]);
+            break;
+        };
+
+        let start = cursor + rel_start;
+        cleaned.push_str(&message[cursor..start]);
+
+        let candidate = &message[start..];
+        let mut stream =
+            serde_json::Deserializer::from_str(candidate).into_iter::<serde_json::Value>();
+
+        if let Some(Ok(value)) = stream.next() {
+            let consumed = stream.byte_offset();
+            if consumed > 0 {
+                let end = start + consumed;
+                if is_line_isolated_json_segment(message, start, end) {
+                    if let Some((replacement, marks_tool_call)) =
+                        sanitize_tool_json_value(&value, known_tool_names, saw_tool_call_payload)
+                    {
+                        if marks_tool_call {
+                            saw_tool_call_payload = true;
+                        }
+                        if !replacement.trim().is_empty() {
+                            cleaned.push_str(replacement.trim());
+                        }
+                        cursor = end;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        let Some(ch) = message[start..].chars().next() else {
+            break;
+        };
+        cleaned.push(ch);
+        cursor = start + ch.len_utf8();
+    }
+
+    let mut result = cleaned.replace("\r\n", "\n");
+    while result.contains("\n\n\n") {
+        result = result.replace("\n\n\n", "\n\n");
+    }
+    result.trim().to_string()
+}
+
 fn spawn_supervised_listener(
     ch: Arc<dyn Channel>,
     tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
@@ -1337,14 +1501,23 @@ async fn process_channel_message(
             }
         }
         LlmExecutionResult::Completed(Ok(Ok(response))) => {
+            let sanitized_response =
+                sanitize_channel_response(&response, ctx.tools_registry.as_ref());
+            let delivered_response = if sanitized_response.is_empty() && !response.trim().is_empty()
+            {
+                "I encountered malformed tool-call output and could not produce a safe reply. Please try again.".to_string()
+            } else {
+                sanitized_response
+            };
+
             // Extract condensed tool-use context from the history messages
             // added during run_tool_call_loop, so the LLM retains awareness
             // of what it did on subsequent turns.
             let tool_summary = extract_tool_context_summary(&history, history_len_before_tools);
             let history_response = if tool_summary.is_empty() {
-                response.clone()
+                delivered_response.clone()
             } else {
-                format!("{tool_summary}\n{response}")
+                format!("{tool_summary}\n{delivered_response}")
             };
 
             append_sender_turn(
@@ -1355,25 +1528,25 @@ async fn process_channel_message(
             println!(
                 "  🤖 Reply ({}ms): {}",
                 started_at.elapsed().as_millis(),
-                truncate_with_ellipsis(&response, 80)
+                truncate_with_ellipsis(&delivered_response, 80)
             );
             if let Some(channel) = target_channel.as_ref() {
                 if let Some(ref draft_id) = draft_message_id {
                     if let Err(e) = channel
-                        .finalize_draft(&msg.reply_target, draft_id, &response)
+                        .finalize_draft(&msg.reply_target, draft_id, &delivered_response)
                         .await
                     {
                         tracing::warn!("Failed to finalize draft: {e}; sending as new message");
                         let _ = channel
                             .send(
-                                &SendMessage::new(&response, &msg.reply_target)
+                                &SendMessage::new(&delivered_response, &msg.reply_target)
                                     .in_thread(msg.thread_ts.clone()),
                             )
                             .await;
                     }
                 } else if let Err(e) = channel
                     .send(
-                        &SendMessage::new(response, &msg.reply_target)
+                        &SendMessage::new(delivered_response, &msg.reply_target)
                             .in_thread(msg.thread_ts.clone()),
                     )
                     .await
@@ -2712,7 +2885,7 @@ mod tests {
     use crate::observability::NoopObserver;
     use crate::providers::{ChatMessage, Provider};
     use crate::tools::{Tool, ToolResult};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -3071,6 +3244,33 @@ mod tests {
         }
     }
 
+    struct RawToolArtifactProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for RawToolArtifactProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("fallback".to_string())
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(r#"{"name":"mock_price","parameters":{"symbol":"BTC"}}
+{"result":{"symbol":"BTC","price_usd":65000}}
+BTC is currently around $65,000 based on latest tool output."#
+                .to_string())
+        }
+    }
+
     struct IterativeToolProvider {
         required_tool_iterations: usize,
     }
@@ -3311,6 +3511,63 @@ mod tests {
         assert!(sent_messages[0].contains("BTC is currently around"));
         assert!(!sent_messages[0].contains("\"tool_calls\""));
         assert!(!sent_messages[0].contains("mock_price"));
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_strips_unexecuted_tool_json_artifacts_from_reply() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(RawToolArtifactProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-raw-json".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-raw".to_string(),
+                content: "What is the BTC price now?".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 3,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent_messages.len(), 1);
+        assert!(sent_messages[0].starts_with("chat-raw:"));
+        assert!(sent_messages[0].contains("BTC is currently around"));
+        assert!(!sent_messages[0].contains("\"name\":\"mock_price\""));
+        assert!(!sent_messages[0].contains("\"result\""));
     }
 
     #[tokio::test]
@@ -4907,6 +5164,42 @@ Mon Feb 20
 
         let summary = extract_tool_context_summary(&history, 1);
         assert_eq!(summary, "[Used tools: fresh_tool]");
+    }
+
+    #[test]
+    fn strip_isolated_tool_json_artifacts_removes_tool_calls_and_results() {
+        let mut known_tools = HashSet::new();
+        known_tools.insert("schedule".to_string());
+
+        let input = r#"{"name":"schedule","parameters":{"action":"create","message":"test"}}
+{"name":"schedule","parameters":{"action":"cancel","task_id":"test"}}
+Let me create the reminder properly:
+{"name":"schedule","parameters":{"action":"create","message":"Go to sleep"}}
+{"result":{"task_id":"abc","status":"scheduled"}}
+Done reminder set for 1:38 AM."#;
+
+        let result = strip_isolated_tool_json_artifacts(input, &known_tools);
+        let normalized = result
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            normalized,
+            "Let me create the reminder properly:\nDone reminder set for 1:38 AM."
+        );
+    }
+
+    #[test]
+    fn strip_isolated_tool_json_artifacts_preserves_non_tool_json() {
+        let mut known_tools = HashSet::new();
+        known_tools.insert("shell".to_string());
+
+        let input = r#"{"name":"profile","parameters":{"timezone":"UTC"}}
+This is an example JSON object for profile settings."#;
+
+        let result = strip_isolated_tool_json_artifacts(input, &known_tools);
+        assert_eq!(result, input);
     }
 
     // ── AIEOS Identity Tests (Issue #168) ─────────────────────────
