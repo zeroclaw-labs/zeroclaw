@@ -28,6 +28,7 @@ pub mod delegate;
 pub mod file_read;
 pub mod file_write;
 pub mod git_operations;
+pub mod glob_search;
 pub mod hardware_board_info;
 pub mod hardware_memory_map;
 pub mod hardware_memory_read;
@@ -58,6 +59,7 @@ pub use delegate::DelegateTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
 pub use git_operations::GitOperationsTool;
+pub use glob_search::GlobSearchTool;
 pub use hardware_board_info::HardwareBoardInfoTool;
 pub use hardware_memory_map::HardwareMemoryMapTool;
 pub use hardware_memory_read::HardwareMemoryReadTool;
@@ -133,7 +135,8 @@ pub fn default_tools_with_runtime(
     vec![
         Box::new(ShellTool::new(security.clone(), runtime)),
         Box::new(FileReadTool::new(security.clone())),
-        Box::new(FileWriteTool::new(security)),
+        Box::new(FileWriteTool::new(security.clone())),
+        Box::new(GlobSearchTool::new(security)),
     ]
 }
 
@@ -188,11 +191,12 @@ pub fn all_tools_with_runtime(
         Arc::new(ShellTool::new(security.clone(), runtime)),
         Arc::new(FileReadTool::new(security.clone())),
         Arc::new(FileWriteTool::new(security.clone())),
+        Arc::new(GlobSearchTool::new(security.clone())),
         Arc::new(CronAddTool::new(config.clone(), security.clone())),
         Arc::new(CronListTool::new(config.clone())),
-        Arc::new(CronRemoveTool::new(config.clone(), security.clone())),
+        Arc::new(CronRemoveTool::new(config.clone())),
         Arc::new(CronUpdateTool::new(config.clone(), security.clone())),
-        Arc::new(CronRunTool::new(config.clone(), security.clone())),
+        Arc::new(CronRunTool::new(config.clone())),
         Arc::new(CronRunsTool::new(config.clone())),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryRecallTool::new(memory.clone())),
@@ -317,10 +321,10 @@ mod tests {
     }
 
     #[test]
-    fn default_tools_has_three() {
+    fn default_tools_has_expected_count() {
         let security = Arc::new(SecurityPolicy::default());
         let tools = default_tools(security);
-        assert_eq!(tools.len(), 3);
+        assert_eq!(tools.len(), 4);
     }
 
     #[test]
@@ -410,6 +414,7 @@ mod tests {
         assert!(names.contains(&"shell"));
         assert!(names.contains(&"file_read"));
         assert!(names.contains(&"file_write"));
+        assert!(names.contains(&"glob_search"));
     }
 
     #[test]
