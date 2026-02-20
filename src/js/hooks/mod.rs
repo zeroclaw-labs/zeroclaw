@@ -16,6 +16,7 @@
 
 pub mod registry;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Result of a hook execution
@@ -74,6 +75,23 @@ impl HookResult {
     pub fn modified(value: Value) -> Self {
         HookResult::Modified(value)
     }
+}
+
+/// Thread-safe reference to a hook handler for cross-thread communication
+///
+/// This type is used when sending hook execution requests across channels
+/// to worker threads. It contains the metadata needed to execute a hook
+/// without carrying the actual Function across thread boundaries.
+///
+/// The actual Function is looked up in the worker's own HookRegistry
+/// using the plugin_id and handler_index.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HookHandlerRef {
+    /// Priority (higher = runs earlier)
+    pub priority: i32,
+
+    /// Timeout in milliseconds
+    pub timeout_ms: u64,
 }
 
 #[cfg(test)]

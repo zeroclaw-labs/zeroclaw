@@ -1,9 +1,11 @@
 // Worker thread implementation for JS runtime
 
 use crate::js::{config::RuntimeConfig, error::JsRuntimeError};
+use crate::js::events::Event;
+use crate::js::hooks::{HookHandlerRef, HookResult};
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 /// Commands that can be sent to a worker thread
@@ -18,6 +20,14 @@ pub enum WorkerCommand {
         source: String,
         filename: String,
         reply: oneshot::Sender<Result<(), JsRuntimeError>>,
+    },
+    /// Execute hook handlers for an event
+    #[cfg(feature = "js-runtime")]
+    ExecuteHook {
+        event: Event,
+        handlers: Vec<HookHandlerRef>,
+        timeout: Duration,
+        reply: oneshot::Sender<HookResult>,
     },
     /// Shutdown the worker thread
     Shutdown,
@@ -123,6 +133,17 @@ fn run_worker_internal(id: usize, mut rx: mpsc::Receiver<WorkerCommand>, config:
                 let _ = reply.send(result);
             }
 
+            #[cfg(feature = "js-runtime")]
+            WorkerCommand::ExecuteHook {
+                event,
+                handlers,
+                timeout: _,
+                reply,
+            } => {
+                let result = ctx.with(|ctx| execute_hooks(&ctx, &event, handlers));
+                let _ = reply.send(result);
+            }
+
             WorkerCommand::Shutdown => break,
         }
     }
@@ -205,6 +226,26 @@ fn simple_value_to_json<'js>(ctx: &rquickjs::Ctx<'js>, v: &rquickjs::Value<'js>)
 
     // Fallback for unsupported types (functions, symbols, etc.)
     Value::Null
+}
+
+/// Execute hook handlers for an event
+///
+/// This is a stub implementation that returns Observation for now.
+/// Actual hook execution will be implemented in a later task (Task 13).
+#[cfg(feature = "js-runtime")]
+fn execute_hooks<'js>(
+    _ctx: &rquickjs::Ctx<'js>,
+    event: &Event,
+    handlers: Vec<HookHandlerRef>,
+) -> HookResult {
+    // For now, return Observation (fire-and-forget)
+    // We'll implement actual hook execution in a later task
+    tracing::debug!(
+        "Executing {} handlers for event: {}",
+        handlers.len(),
+        event.name()
+    );
+    HookResult::Observation
 }
 
 #[cfg(test)]
