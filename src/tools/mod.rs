@@ -258,7 +258,7 @@ pub fn all_tools_with_runtime(
     }
 
     // PDF extraction (feature-gated at compile time via rag-pdf)
-    tools.push(Box::new(PdfReadTool::new(security.clone())));
+    tool_arcs.push(Arc::new(PdfReadTool::new(security.clone())));
 
     // Vision tools are always available
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
