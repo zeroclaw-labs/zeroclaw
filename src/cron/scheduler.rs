@@ -297,9 +297,9 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
 
 
     // TODO: complete delivery
-    //  There should be a method to convert XXXConfig to XXXChannel
+    //  There should be a method to convert `XXXConfig` to `XXXChannel`
     // to make it much easier...
-    //  I think XXXChannel::new() should take on this duty
+    //  I think `XXXChannel::new/new_with_config()` or `trait From` should take on this duty
     let LaunchableChannelsConfig {
         telegram,
         discord,
@@ -315,6 +315,7 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         lark: _,
         dingtalk: _,
         qq: _,
+        nextcloud_talk: _,
     } = &config.channels_config.launchable;
 
     match channel.to_ascii_lowercase().as_str() {

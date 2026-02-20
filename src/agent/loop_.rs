@@ -1083,7 +1083,7 @@ async fn execute_tools_parallel(
         })
         .collect();
 
-    let results = futures::future::join_all(futures).await;
+    let results = futures_util::future::join_all(futures).await;
     results.into_iter().collect()
 }
 
@@ -3608,6 +3608,7 @@ Let me check the result."#;
             None, // no identity config
             None, // no bootstrap_max_chars
             true, // native_tools
+            crate::config::SkillsPromptInjectionMode::Compact,
         );
 
         // Must contain zero XML protocol artifacts

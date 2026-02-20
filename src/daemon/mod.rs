@@ -333,7 +333,7 @@ mod tests {
     #[test]
     fn detects_nextcloud_talk_as_supervised_channel() {
         let mut config = Config::default();
-        config.channels_config.nextcloud_talk = Some(crate::config::schema::NextcloudTalkConfig {
+        config.channels_config.launchable.nextcloud_talk = Some(crate::config::schema::NextcloudTalkConfig {
             base_url: "https://cloud.example.com".into(),
             app_token: "app-token".into(),
             webhook_secret: None,

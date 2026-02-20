@@ -2264,6 +2264,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         lark,
         dingtalk,
         qq,
+        nextcloud_talk
     } = &config.channels_config.launchable;
 
     if let Some(ref tg) = telegram {
@@ -2333,7 +2334,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         );
     }
 
-    if let Some(ref sig) = config.channels_config.signal {
+    if let Some(ref sig) = signal {
         channels.push((
             "Signal",
             Arc::new(SignalChannel::new(
@@ -2409,7 +2410,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         ));
     }
 
-    if let Some(ref nc) = config.channels_config.nextcloud_talk {
+    if let Some(ref nc) = nextcloud_talk {
         channels.push((
             "Nextcloud Talk",
             Arc::new(NextcloudTalkChannel::new(
@@ -2705,6 +2706,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         lark,
         dingtalk,
         qq,
+        nextcloud_talk,
     } = &config.channels_config.launchable;
 
     if let Some(ref tg) = telegram {
@@ -2959,6 +2961,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         effective_channel_message_timeout_secs(config.channels_config.message_timeout_secs);
     let interrupt_on_new_message = config
         .channels_config
+        .launchable
         .telegram
         .as_ref()
         .is_some_and(|tg| tg.interrupt_on_new_message);

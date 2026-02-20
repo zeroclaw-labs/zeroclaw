@@ -421,7 +421,7 @@ impl Agent {
             .iter()
             .map(|call| self.execute_tool_call(call))
             .collect();
-        futures::future::join_all(futs).await
+        futures_util::future::join_all(futs).await
     }
 
     fn classify_model(&self, user_message: &str) -> String {

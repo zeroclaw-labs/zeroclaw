@@ -19,7 +19,6 @@ use crate::providers::{
 use anyhow::{bail, Context, Result};
 use console::style;
 use dialoguer::{Confirm, Input, Select};
-use matrix_sdk::ruma::events::poll::unstable_start::ReplacementUnstablePollStartEventContent;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -131,7 +130,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         reliability: crate::config::ReliabilityConfig::default(),
         scheduler: crate::config::schema::SchedulerConfig::default(),
         agent: crate::config::schema::AgentConfig::default(),
-        skills: crate::config::SkillsConfig::default(),
+        skills: crate::config::schema::SkillsConfig::default(),
         model_routes: Vec::new(),
         embedding_routes: Vec::new(),
         heartbeat: HeartbeatConfig::default(),
@@ -145,7 +144,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         secrets: secrets_config,
         browser: BrowserConfig::default(),
         http_request: crate::config::HttpRequestConfig::default(),
-        multimodal: crate::config::MultimodalConfig::default(),
+        multimodal: crate::config::schema::MultimodalConfig::default(),
         web_search: crate::config::WebSearchConfig::default(),
         proxy: crate::config::ProxyConfig::default(),
         identity: crate::config::IdentityConfig::default(),
@@ -374,7 +373,7 @@ async fn run_quick_setup_with_home(
         reliability: crate::config::ReliabilityConfig::default(),
         scheduler: crate::config::schema::SchedulerConfig::default(),
         agent: crate::config::schema::AgentConfig::default(),
-        skills: crate::config::SkillsConfig::default(),
+        skills: crate::config::schema::SkillsConfig::default(),
         model_routes: Vec::new(),
         embedding_routes: Vec::new(),
         heartbeat: HeartbeatConfig::default(),
@@ -388,7 +387,7 @@ async fn run_quick_setup_with_home(
         secrets: SecretsConfig::default(),
         browser: BrowserConfig::default(),
         http_request: crate::config::HttpRequestConfig::default(),
-        multimodal: crate::config::MultimodalConfig::default(),
+        multimodal: crate::config::schema::MultimodalConfig::default(),
         web_search: crate::config::WebSearchConfig::default(),
         proxy: crate::config::ProxyConfig::default(),
         identity: crate::config::IdentityConfig::default(),
@@ -2822,6 +2821,9 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
     loop {
         let webhook = &mut config.webhook;
+
+        // TODO: Some channels here are not done while channels are wildly added.
+        // I am doing a refactor, and the concrete implemention is left to be done.
         let LaunchableChannelsConfig {
             telegram,
             discord,
@@ -2837,13 +2839,13 @@ fn setup_channels() -> Result<ChannelsConfig> {
             lark,
             dingtalk,
             qq,
+            nextcloud_talk: _, // TODO
         } = &config.launchable;
 
         // here are some uncompleted options
         // because they were not present before, and I don't know how to complete
-        let mut options: Vec<(_, fn(&mut ChannelsConfig) -> Result<()>)> = Vec::new();
-
-        options.push((channel_option(telegram), |config| {
+        let mut options: [(_, fn(&mut ChannelsConfig) -> Result<()>); _] = [
+            (channel_option(telegram), |config| {
                 println!();
                 println!(
                     "  {} {}",
@@ -2941,146 +2943,143 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 });
 
                 Ok(())
-            }));
+            }),
+            (channel_option(webhook), |config| {
+                // ── Webhook ──
+                println!();
+                println!(
+                    "  {} {}",
+                    style("Webhook Setup").white().bold(),
+                    style("— HTTP endpoint for custom integrations").dim()
+                );
 
-        options.push((channel_option(webhook), |config| {
-            // ── Webhook ──
-            println!();
-            println!(
-                "  {} {}",
-                style("Webhook Setup").white().bold(),
-                style("— HTTP endpoint for custom integrations").dim()
-            );
+                let port: String = Input::new()
+                    .with_prompt("  Port")
+                    .default("8080".into())
+                    .interact_text()?;
 
-            let port: String = Input::new()
-                .with_prompt("  Port")
-                .default("8080".into())
-                .interact_text()?;
+                let secret: String = Input::new()
+                    .with_prompt("  Secret (optional, Enter to skip)")
+                    .allow_empty(true)
+                    .interact_text()?;
 
-            let secret: String = Input::new()
-                .with_prompt("  Secret (optional, Enter to skip)")
-                .allow_empty(true)
-                .interact_text()?;
+                config.webhook = Some(WebhookConfig {
+                    port: port.parse().unwrap_or(8080),
+                    secret: if secret.is_empty() {
+                        None
+                    } else {
+                        Some(secret)
+                    },
+                });
+                println!(
+                    "  {} Webhook on port {}",
+                    style("✅").green().bold(),
+                    style(&port).cyan()
+                );
 
-            config.webhook = Some(WebhookConfig {
-                port: port.parse().unwrap_or(8080),
-                secret: if secret.is_empty() {
-                    None
-                } else {
-                    Some(secret)
-                },
-            });
-            println!(
-                "  {} Webhook on port {}",
-                style("✅").green().bold(),
-                style(&port).cyan()
-            );
+                Ok(())
+            }),
+            (channel_option(discord), |config| {
+                // ── Discord ──
+                println!();
+                println!(
+                    "  {} {}",
+                    style("Discord Setup").white().bold(),
+                    style("— talk to ZeroClaw from Discord").dim()
+                );
+                print_bullet("1. Go to https://discord.com/developers/applications");
+                print_bullet("2. Create a New Application → Bot → Copy token");
+                print_bullet("3. Enable MESSAGE CONTENT intent under Bot settings");
+                print_bullet("4. Invite bot to your server with messages permission");
+                println!();
 
-            Ok(())
-        }));
+                let token: String = Input::new().with_prompt("  Bot token").interact_text()?;
 
-        options.push((channel_option(discord), |config| {
-            // ── Discord ──
-            println!();
-            println!(
-                "  {} {}",
-                style("Discord Setup").white().bold(),
-                style("— talk to ZeroClaw from Discord").dim()
-            );
-            print_bullet("1. Go to https://discord.com/developers/applications");
-            print_bullet("2. Create a New Application → Bot → Copy token");
-            print_bullet("3. Enable MESSAGE CONTENT intent under Bot settings");
-            print_bullet("4. Invite bot to your server with messages permission");
-            println!();
-
-            let token: String = Input::new().with_prompt("  Bot token").interact_text()?;
-
-            if token.trim().is_empty() {
-                println!("  {} Skipped", style("→").dim());
-                return Ok(());
-            }
-
-            // Test connection (run entirely in separate thread — Response must be used/dropped there)
-            print!("  {} Testing connection... ", style("⏳").dim());
-            let token_clone = token.clone();
-            let thread_result = std::thread::spawn(move || {
-                let client = reqwest::blocking::Client::new();
-                let resp = client
-                    .get("https://discord.com/api/v10/users/@me")
-                    .header("Authorization", format!("Bot {token_clone}"))
-                    .send()?;
-                let ok = resp.status().is_success();
-                let data: serde_json::Value = resp.json().unwrap_or_default();
-                let bot_name = data
-                    .get("username")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_string();
-                Ok::<_, reqwest::Error>((ok, bot_name))
-            })
-            .join();
-            match thread_result {
-                Ok(Ok((true, bot_name))) => {
-                    println!(
-                        "\r  {} Connected as {bot_name}        ",
-                        style("✅").green().bold()
-                    );
-                }
-                _ => {
-                    println!(
-                        "\r  {} Connection failed — check your token and try again",
-                        style("❌").red().bold()
-                    );
+                if token.trim().is_empty() {
+                    println!("  {} Skipped", style("→").dim());
                     return Ok(());
                 }
-            }
 
-            let guild: String = Input::new()
-                .with_prompt("  Server (guild) ID (optional, Enter to skip)")
-                .allow_empty(true)
-                .interact_text()?;
+                // Test connection (run entirely in separate thread — Response must be used/dropped there)
+                print!("  {} Testing connection... ", style("⏳").dim());
+                let token_clone = token.clone();
+                let thread_result = std::thread::spawn(move || {
+                    let client = reqwest::blocking::Client::new();
+                    let resp = client
+                        .get("https://discord.com/api/v10/users/@me")
+                        .header("Authorization", format!("Bot {token_clone}"))
+                        .send()?;
+                    let ok = resp.status().is_success();
+                    let data: serde_json::Value = resp.json().unwrap_or_default();
+                    let bot_name = data
+                        .get("username")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string();
+                    Ok::<_, reqwest::Error>((ok, bot_name))
+                })
+                .join();
+                match thread_result {
+                    Ok(Ok((true, bot_name))) => {
+                        println!(
+                            "\r  {} Connected as {bot_name}        ",
+                            style("✅").green().bold()
+                        );
+                    }
+                    _ => {
+                        println!(
+                            "\r  {} Connection failed — check your token and try again",
+                            style("❌").red().bold()
+                        );
+                        return Ok(());
+                    }
+                }
 
-            print_bullet("Allowlist your own Discord user ID first (recommended).");
-            print_bullet(
+                let guild: String = Input::new()
+                    .with_prompt("  Server (guild) ID (optional, Enter to skip)")
+                    .allow_empty(true)
+                    .interact_text()?;
+
+                print_bullet("Allowlist your own Discord user ID first (recommended).");
+                print_bullet(
                     "Get it in Discord: Settings -> Advanced -> Developer Mode (ON), then right-click your profile -> Copy User ID.",
                 );
-            print_bullet("Use '*' only for temporary open testing.");
+                print_bullet("Use '*' only for temporary open testing.");
 
-            let allowed_users_str: String = Input::new()
+                let allowed_users_str: String = Input::new()
                     .with_prompt(
                         "  Allowed Discord user IDs (comma-separated, recommended: your own ID, '*' for all)",
                     )
                     .allow_empty(true)
                     .interact_text()?;
 
-            let allowed_users = if allowed_users_str.trim().is_empty() {
-                vec![]
-            } else {
-                allowed_users_str
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            };
+                let allowed_users = if allowed_users_str.trim().is_empty() {
+                    vec![]
+                } else {
+                    allowed_users_str
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                };
 
-            if allowed_users.is_empty() {
-                println!(
+                if allowed_users.is_empty() {
+                    println!(
                         "  {} No users allowlisted — Discord inbound messages will be denied until you add IDs or '*'.",
                         style("⚠").yellow().bold()
                     );
-            }
+                }
 
-            config.launchable.discord = Some(DiscordConfig {
-                bot_token: token,
-                guild_id: if guild.is_empty() { None } else { Some(guild) },
-                allowed_users,
-                listen_to_bots: false,
-                mention_only: false,
-            });
-            Ok(())
-        }));
-
-        options.push((channel_option(slack), |config| {
+                config.launchable.discord = Some(DiscordConfig {
+                    bot_token: token,
+                    guild_id: if guild.is_empty() { None } else { Some(guild) },
+                    allowed_users,
+                    listen_to_bots: false,
+                    mention_only: false,
+                });
+                Ok(())
+            }),
+            (channel_option(slack), |config| {
                 // ── Slack ──
                 println!();
                 println!(
@@ -3205,53 +3204,53 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     allowed_users,
                 });
                 Ok(())
-        }));
-
-        options.push((channel_option(imessage), |config| {
-            // ── iMessage ──
-            println!();
-            println!(
-                "  {} {}",
-                style("iMessage Setup").white().bold(),
-                style("— macOS only, reads from Messages.app").dim()
-            );
-
-            if !cfg!(target_os = "macos") {
+            }),
+            (channel_option(imessage), |config| {
+                // ── iMessage ──
+                println!();
                 println!(
-                    "  {} iMessage is only available on macOS.",
-                    style("⚠").yellow().bold()
+                    "  {} {}",
+                    style("iMessage Setup").white().bold(),
+                    style("— macOS only, reads from Messages.app").dim()
                 );
-                return Ok(());
-            }
 
-            print_bullet("ZeroClaw reads your iMessage database and replies via AppleScript.");
-            print_bullet("You need to grant Full Disk Access to your terminal in System Settings.");
-            println!();
+                if !cfg!(target_os = "macos") {
+                    println!(
+                        "  {} iMessage is only available on macOS.",
+                        style("⚠").yellow().bold()
+                    );
+                    return Ok(());
+                }
 
-            let contacts_str: String = Input::new()
-                .with_prompt("  Allowed contacts (comma-separated phone/email, or * for all)")
-                .default("*".into())
-                .interact_text()?;
+                print_bullet("ZeroClaw reads your iMessage database and replies via AppleScript.");
+                print_bullet(
+                    "You need to grant Full Disk Access to your terminal in System Settings.",
+                );
+                println!();
 
-            let allowed_contacts = if contacts_str.trim() == "*" {
-                vec!["*".into()]
-            } else {
-                contacts_str
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .collect()
-            };
+                let contacts_str: String = Input::new()
+                    .with_prompt("  Allowed contacts (comma-separated phone/email, or * for all)")
+                    .default("*".into())
+                    .interact_text()?;
 
-            config.launchable.imessage = Some(IMessageConfig { allowed_contacts });
-            println!(
-                "  {} iMessage configured (contacts: {})",
-                style("✅").green().bold(),
-                style(&contacts_str).cyan()
-            );
-            Ok(())
-        }));
+                let allowed_contacts = if contacts_str.trim() == "*" {
+                    vec!["*".into()]
+                } else {
+                    contacts_str
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .collect()
+                };
 
-        options.push((channel_option(matrix), |config| {
+                config.launchable.imessage = Some(IMessageConfig { allowed_contacts });
+                println!(
+                    "  {} iMessage configured (contacts: {})",
+                    style("✅").green().bold(),
+                    style(&contacts_str).cyan()
+                );
+                Ok(())
+            }),
+            (channel_option(matrix), |config| {
                 // ── Matrix ──
                 println!();
                 println!(
@@ -3363,55 +3362,161 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     allowed_users,
                 });
                 Ok(())
-            }));
-
-        options.push((channel_option(whatsapp), |config| {
-            // ── WhatsApp ──
-            println!();
-            println!("  {}", style("WhatsApp Setup").white().bold());
-
-            let mode_options = vec![
-                "WhatsApp Web (QR / pair-code, no Meta Business API)",
-                "WhatsApp Business Cloud API (webhook)",
-            ];
-            let mode_idx = Select::new()
-                .with_prompt("  Choose WhatsApp mode")
-                .items(&mode_options)
-                .default(0)
-                .interact()?;
-
-            if mode_idx == 0 {
-                println!("  {}", style("Mode: WhatsApp Web").dim());
-                print_bullet("1. Build with --features whatsapp-web");
-                print_bullet("2. Start channel/daemon and scan QR in WhatsApp > Linked Devices");
-                print_bullet("3. Keep session_path persistent so relogin is not required");
+            }),
+            (channel_option(whatsapp), |config| {
+                // ── WhatsApp ──
                 println!();
+                println!("  {}", style("WhatsApp Setup").white().bold());
 
-                let session_path: String = Input::new()
-                    .with_prompt("  Session database path")
-                    .default("~/.zeroclaw/state/whatsapp-web/session.db".into())
-                    .interact_text()?;
+                let mode_options = vec![
+                    "WhatsApp Web (QR / pair-code, no Meta Business API)",
+                    "WhatsApp Business Cloud API (webhook)",
+                ];
+                let mode_idx = Select::new()
+                    .with_prompt("  Choose WhatsApp mode")
+                    .items(&mode_options)
+                    .default(0)
+                    .interact()?;
 
-                if session_path.trim().is_empty() {
-                    println!("  {} Skipped — session path required", style("→").dim());
+                if mode_idx == 0 {
+                    println!("  {}", style("Mode: WhatsApp Web").dim());
+                    print_bullet("1. Build with --features whatsapp-web");
+                    print_bullet(
+                        "2. Start channel/daemon and scan QR in WhatsApp > Linked Devices",
+                    );
+                    print_bullet("3. Keep session_path persistent so relogin is not required");
+                    println!();
+
+                    let session_path: String = Input::new()
+                        .with_prompt("  Session database path")
+                        .default("~/.zeroclaw/state/whatsapp-web/session.db".into())
+                        .interact_text()?;
+
+                    if session_path.trim().is_empty() {
+                        println!("  {} Skipped — session path required", style("→").dim());
+                        return Ok(());
+                    }
+
+                    let pair_phone: String = Input::new()
+                        .with_prompt(
+                            "  Pair phone (optional, digits only; leave empty to use QR flow)",
+                        )
+                        .allow_empty(true)
+                        .interact_text()?;
+
+                    let pair_code: String = if pair_phone.trim().is_empty() {
+                        String::new()
+                    } else {
+                        Input::new()
+                            .with_prompt(
+                                "  Custom pair code (optional, leave empty for auto-generated)",
+                            )
+                            .allow_empty(true)
+                            .interact_text()?
+                    };
+
+                    let users_str: String = Input::new()
+                        .with_prompt(
+                            "  Allowed phone numbers (comma-separated +1234567890, or * for all)",
+                        )
+                        .default("*".into())
+                        .interact_text()?;
+
+                    let allowed_numbers = if users_str.trim() == "*" {
+                        vec!["*".into()]
+                    } else {
+                        users_str.split(',').map(|s| s.trim().to_string()).collect()
+                    };
+
+                    config.launchable.whatsapp = Some(WhatsAppConfig {
+                        access_token: None,
+                        phone_number_id: None,
+                        verify_token: None,
+                        app_secret: None,
+                        session_path: Some(session_path.trim().to_string()),
+                        pair_phone: (!pair_phone.trim().is_empty())
+                            .then(|| pair_phone.trim().to_string()),
+                        pair_code: (!pair_code.trim().is_empty())
+                            .then(|| pair_code.trim().to_string()),
+                        allowed_numbers,
+                    });
+
+                    println!(
+                        "  {} WhatsApp Web configuration saved.",
+                        style("✅").green().bold()
+                    );
                     return Ok(());
                 }
 
-                let pair_phone: String = Input::new()
-                    .with_prompt("  Pair phone (optional, digits only; leave empty to use QR flow)")
-                    .allow_empty(true)
+                println!(
+                    "  {} {}",
+                    style("Mode:").dim(),
+                    style("Business Cloud API").dim()
+                );
+                print_bullet("1. Go to developers.facebook.com and create a WhatsApp app");
+                print_bullet("2. Add the WhatsApp product and get your phone number ID");
+                print_bullet("3. Generate a temporary access token (System User)");
+                print_bullet("4. Configure webhook URL to: https://your-domain/whatsapp");
+                println!();
+
+                let access_token: String = Input::new()
+                    .with_prompt("  Access token (from Meta Developers)")
                     .interact_text()?;
 
-                let pair_code: String = if pair_phone.trim().is_empty() {
-                    String::new()
-                } else {
-                    Input::new()
-                        .with_prompt(
-                            "  Custom pair code (optional, leave empty for auto-generated)",
+                if access_token.trim().is_empty() {
+                    println!("  {} Skipped", style("→").dim());
+                    return Ok(());
+                }
+
+                let phone_number_id: String = Input::new()
+                    .with_prompt("  Phone number ID (from WhatsApp app settings)")
+                    .interact_text()?;
+
+                if phone_number_id.trim().is_empty() {
+                    println!("  {} Skipped — phone number ID required", style("→").dim());
+                    return Ok(());
+                }
+
+                let verify_token: String = Input::new()
+                    .with_prompt("  Webhook verify token (create your own)")
+                    .default("zeroclaw-whatsapp-verify".into())
+                    .interact_text()?;
+
+                // Test connection (run entirely in separate thread — Response must be used/dropped there)
+                print!("  {} Testing connection... ", style("⏳").dim());
+                let phone_number_id_clone = phone_number_id.clone();
+                let access_token_clone = access_token.clone();
+                let thread_result = std::thread::spawn(move || {
+                    let client = reqwest::blocking::Client::new();
+                    let url = format!(
+                        "https://graph.facebook.com/v18.0/{}",
+                        phone_number_id_clone.trim()
+                    );
+                    let resp = client
+                        .get(&url)
+                        .header(
+                            "Authorization",
+                            format!("Bearer {}", access_token_clone.trim()),
                         )
-                        .allow_empty(true)
-                        .interact_text()?
-                };
+                        .send()?;
+                    Ok::<_, reqwest::Error>(resp.status().is_success())
+                })
+                .join();
+                match thread_result {
+                    Ok(Ok(true)) => {
+                        println!(
+                            "\r  {} Connected to WhatsApp API        ",
+                            style("✅").green().bold()
+                        );
+                    }
+                    _ => {
+                        println!(
+                            "\r  {} Connection failed — check access token and phone number ID",
+                            style("❌").red().bold()
+                        );
+                        return Ok(());
+                    }
+                }
 
                 let users_str: String = Input::new()
                     .with_prompt(
@@ -3426,343 +3531,253 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     users_str.split(',').map(|s| s.trim().to_string()).collect()
                 };
 
-                config.whatsapp = Some(WhatsAppConfig {
-                    access_token: None,
-                    phone_number_id: None,
-                    verify_token: None,
-                    app_secret: None,
-                    session_path: Some(session_path.trim().to_string()),
-                    pair_phone: (!pair_phone.trim().is_empty())
-                        .then(|| pair_phone.trim().to_string()),
-                    pair_code: (!pair_code.trim().is_empty()).then(|| pair_code.trim().to_string()),
+                config.launchable.whatsapp = Some(WhatsAppConfig {
+                    access_token: Some(access_token.trim().to_string()),
+                    phone_number_id: Some(phone_number_id.trim().to_string()),
+                    verify_token: Some(verify_token.trim().to_string()),
+                    app_secret: None, // Can be set via ZEROCLAW_WHATSAPP_APP_SECRET env var
+                    session_path: None,
+                    pair_phone: None,
+                    pair_code: None,
                     allowed_numbers,
                 });
 
+                Ok(())
+            }),
+            (channel_option(linq), |config| {
+                // ── Linq ──
+                println!();
                 println!(
-                    "  {} WhatsApp Web configuration saved.",
-                    style("✅").green().bold()
+                    "  {} {}",
+                    style("Linq Setup").white().bold(),
+                    style("— iMessage/RCS/SMS via Linq API").dim()
                 );
-                return Ok(());
-            }
+                print_bullet("1. Sign up at linqapp.com and get your Partner API token");
+                print_bullet("2. Note your Linq phone number (E.164 format)");
+                print_bullet("3. Configure webhook URL to: https://your-domain/linq");
+                println!();
 
-            println!(
-                "  {} {}",
-                style("Mode:").dim(),
-                style("Business Cloud API").dim()
-            );
-            print_bullet("1. Go to developers.facebook.com and create a WhatsApp app");
-            print_bullet("2. Add the WhatsApp product and get your phone number ID");
-            print_bullet("3. Generate a temporary access token (System User)");
-            print_bullet("4. Configure webhook URL to: https://your-domain/whatsapp");
-            println!();
+                let api_token: String = Input::new()
+                    .with_prompt("  API token (Linq Partner API token)")
+                    .interact_text()?;
 
-            if access_token.trim().is_empty() {
-                println!("  {} Skipped", style("→").dim());
-                return Ok(());
-            }
-
-            let phone_number_id: String = Input::new()
-                .with_prompt("  Phone number ID (from WhatsApp app settings)")
-                .interact_text()?;
-
-            if phone_number_id.trim().is_empty() {
-                println!("  {} Skipped — phone number ID required", style("→").dim());
-                return Ok(());
-            }
-
-            let verify_token: String = Input::new()
-                .with_prompt("  Webhook verify token (create your own)")
-                .default("zeroclaw-whatsapp-verify".into())
-                .interact_text()?;
-
-            // Test connection (run entirely in separate thread — Response must be used/dropped there)
-            print!("  {} Testing connection... ", style("⏳").dim());
-            let phone_number_id_clone = phone_number_id.clone();
-            let access_token_clone = access_token.clone();
-            let thread_result = std::thread::spawn(move || {
-                let client = reqwest::blocking::Client::new();
-                let url = format!(
-                    "https://graph.facebook.com/v18.0/{}",
-                    phone_number_id_clone.trim()
-                );
-                let resp = client
-                    .get(&url)
-                    .header(
-                        "Authorization",
-                        format!("Bearer {}", access_token_clone.trim()),
-                    )
-                    .send()?;
-                Ok::<_, reqwest::Error>(resp.status().is_success())
-            })
-            .join();
-            match thread_result {
-                Ok(Ok(true)) => {
-                    println!(
-                        "\r  {} Connected to WhatsApp API        ",
-                        style("✅").green().bold()
-                    );
-                }
-                _ => {
-                    println!(
-                        "\r  {} Connection failed — check access token and phone number ID",
-                        style("❌").red().bold()
-                    );
+                if api_token.trim().is_empty() {
+                    println!("  {} Skipped", style("→").dim());
                     return Ok(());
                 }
-            }
 
-            let users_str: String = Input::new()
-                .with_prompt("  Allowed phone numbers (comma-separated +1234567890, or * for all)")
-                .default("*".into())
-                .interact_text()?;
+                let from_phone: String = Input::new()
+                    .with_prompt("  From phone number (E.164 format, e.g. +12223334444)")
+                    .interact_text()?;
 
-            let allowed_numbers = if users_str.trim() == "*" {
-                vec!["*".into()]
-            } else {
-                users_str.split(',').map(|s| s.trim().to_string()).collect()
-            };
-
-            config.launchable.whatsapp = Some(WhatsAppConfig {
-                access_token: Some(access_token.trim().to_string()),
-                phone_number_id: Some(phone_number_id.trim().to_string()),
-                verify_token: Some(verify_token.trim().to_string()),
-                app_secret: None, // Can be set via ZEROCLAW_WHATSAPP_APP_SECRET env var
-                session_path: None,
-                pair_phone: None,
-                pair_code: None,
-                allowed_numbers,
-            });
-        }));
-
-        options.push((channel_option(linq), |config| {
-            // ── Linq ──
-            println!();
-            println!(
-                "  {} {}",
-                style("Linq Setup").white().bold(),
-                style("— iMessage/RCS/SMS via Linq API").dim()
-            );
-            print_bullet("1. Sign up at linqapp.com and get your Partner API token");
-            print_bullet("2. Note your Linq phone number (E.164 format)");
-            print_bullet("3. Configure webhook URL to: https://your-domain/linq");
-            println!();
-
-            let api_token: String = Input::new()
-                .with_prompt("  API token (Linq Partner API token)")
-                .interact_text()?;
-
-            if api_token.trim().is_empty() {
-                println!("  {} Skipped", style("→").dim());
-                return Ok(());
-            }
-
-            let from_phone: String = Input::new()
-                .with_prompt("  From phone number (E.164 format, e.g. +12223334444)")
-                .interact_text()?;
-
-            if from_phone.trim().is_empty() {
-                println!("  {} Skipped — phone number required", style("→").dim());
-                return Ok(());
-            }
-
-            // Test connection
-            print!("  {} Testing connection... ", style("⏳").dim());
-            let api_token_clone = api_token.clone();
-            let thread_result = std::thread::spawn(move || {
-                let client = reqwest::blocking::Client::new();
-                let url = "https://api.linqapp.com/api/partner/v3/phonenumbers";
-                let resp = client
-                    .get(url)
-                    .header(
-                        "Authorization",
-                        format!("Bearer {}", api_token_clone.trim()),
-                    )
-                    .send()?;
-                Ok::<_, reqwest::Error>(resp.status().is_success())
-            })
-            .join();
-            match thread_result {
-                Ok(Ok(true)) => {
-                    println!(
-                        "\r  {} Connected to Linq API              ",
-                        style("✅").green().bold()
-                    );
-                }
-                _ => {
-                    println!(
-                        "\r  {} Connection failed — check API token",
-                        style("❌").red().bold()
-                    );
+                if from_phone.trim().is_empty() {
+                    println!("  {} Skipped — phone number required", style("→").dim());
                     return Ok(());
                 }
-            }
 
-            let users_str: String = Input::new()
-                .with_prompt("  Allowed sender numbers (comma-separated +1234567890, or * for all)")
-                .default("*".into())
-                .interact_text()?;
-
-            let allowed_senders = if users_str.trim() == "*" {
-                vec!["*".into()]
-            } else {
-                users_str.split(',').map(|s| s.trim().to_string()).collect()
-            };
-
-            let signing_secret: String = Input::new()
-                .with_prompt("  Webhook signing secret (optional, press Enter to skip)")
-                .allow_empty(true)
-                .interact_text()?;
-
-            config.launchable.linq = Some(LinqConfig {
-                api_token: api_token.trim().to_string(),
-                from_phone: from_phone.trim().to_string(),
-                signing_secret: if signing_secret.trim().is_empty() {
-                    None
-                } else {
-                    Some(signing_secret.trim().to_string())
-                },
-                allowed_senders,
-            });
-            Ok(())
-        }));
-
-        options.push((channel_option(irc), |config| {
-            // ── IRC ──
-            println!();
-            println!(
-                "  {} {}",
-                style("IRC Setup").white().bold(),
-                style("— IRC over TLS").dim()
-            );
-            print_bullet("IRC connects over TLS to any IRC server");
-            print_bullet("Supports SASL PLAIN and NickServ authentication");
-            println!();
-
-            let server: String = Input::new()
-                .with_prompt("  IRC server (hostname)")
-                .interact_text()?;
-
-            if server.trim().is_empty() {
-                println!("  {} Skipped", style("→").dim());
-                return Ok(());
-            }
-
-            let port_str: String = Input::new()
-                .with_prompt("  Port")
-                .default("6697".into())
-                .interact_text()?;
-
-            let port: u16 = match port_str.trim().parse() {
-                Ok(p) => p,
-                Err(_) => {
-                    println!("  {} Invalid port, using 6697", style("→").dim());
-                    6697
+                // Test connection
+                print!("  {} Testing connection... ", style("⏳").dim());
+                let api_token_clone = api_token.clone();
+                let thread_result = std::thread::spawn(move || {
+                    let client = reqwest::blocking::Client::new();
+                    let url = "https://api.linqapp.com/api/partner/v3/phonenumbers";
+                    let resp = client
+                        .get(url)
+                        .header(
+                            "Authorization",
+                            format!("Bearer {}", api_token_clone.trim()),
+                        )
+                        .send()?;
+                    Ok::<_, reqwest::Error>(resp.status().is_success())
+                })
+                .join();
+                match thread_result {
+                    Ok(Ok(true)) => {
+                        println!(
+                            "\r  {} Connected to Linq API              ",
+                            style("✅").green().bold()
+                        );
+                    }
+                    _ => {
+                        println!(
+                            "\r  {} Connection failed — check API token",
+                            style("❌").red().bold()
+                        );
+                        return Ok(());
+                    }
                 }
-            };
 
-            let nickname: String = Input::new().with_prompt("  Bot nickname").interact_text()?;
+                let users_str: String = Input::new()
+                    .with_prompt(
+                        "  Allowed sender numbers (comma-separated +1234567890, or * for all)",
+                    )
+                    .default("*".into())
+                    .interact_text()?;
 
-            if nickname.trim().is_empty() {
-                println!("  {} Skipped — nickname required", style("→").dim());
-                return Ok(());
-            }
-
-            let channels_str: String = Input::new()
-                .with_prompt("  Channels to join (comma-separated: #channel1,#channel2)")
-                .allow_empty(true)
-                .interact_text()?;
-
-            let channels = if channels_str.trim().is_empty() {
-                vec![]
-            } else {
-                channels_str
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            };
-
-            print_bullet("Allowlist nicknames that can interact with the bot (case-insensitive).");
-            print_bullet("Use '*' to allow anyone (not recommended for production).");
-
-            let users_str: String = Input::new()
-                .with_prompt("  Allowed nicknames (comma-separated, or * for all)")
-                .allow_empty(true)
-                .interact_text()?;
-
-            let allowed_users = if users_str.trim() == "*" {
-                vec!["*".into()]
-            } else {
-                users_str
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            };
-
-            if allowed_users.is_empty() {
-                print_bullet("⚠️  Empty allowlist — only you can interact. Add nicknames above.");
-            }
-
-            println!();
-            print_bullet("Optional authentication (press Enter to skip each):");
-
-            let server_password: String = Input::new()
-                .with_prompt("  Server password (for bouncers like ZNC, leave empty if none)")
-                .allow_empty(true)
-                .interact_text()?;
-
-            let nickserv_password: String = Input::new()
-                .with_prompt("  NickServ password (leave empty if none)")
-                .allow_empty(true)
-                .interact_text()?;
-
-            let sasl_password: String = Input::new()
-                .with_prompt("  SASL PLAIN password (leave empty if none)")
-                .allow_empty(true)
-                .interact_text()?;
-
-            let verify_tls: bool = Confirm::new()
-                .with_prompt("  Verify TLS certificate?")
-                .default(true)
-                .interact()?;
-
-            println!(
-                "  {} IRC configured as {}@{}:{}",
-                style("✅").green().bold(),
-                style(&nickname).cyan(),
-                style(&server).cyan(),
-                style(port).cyan()
-            );
-
-            config.launchable.irc = Some(IrcConfig {
-                server: server.trim().to_string(),
-                port,
-                nickname: nickname.trim().to_string(),
-                username: None,
-                channels,
-                allowed_users,
-                server_password: if server_password.trim().is_empty() {
-                    None
+                let allowed_senders = if users_str.trim() == "*" {
+                    vec!["*".into()]
                 } else {
-                    Some(server_password.trim().to_string())
-                },
-                nickserv_password: if nickserv_password.trim().is_empty() {
-                    None
-                } else {
-                    Some(nickserv_password.trim().to_string())
-                },
-                sasl_password: if sasl_password.trim().is_empty() {
-                    None
-                } else {
-                    Some(sasl_password.trim().to_string())
-                },
-                verify_tls: Some(verify_tls),
-            });
-            Ok(())
-        }));
+                    users_str.split(',').map(|s| s.trim().to_string()).collect()
+                };
 
-        options.push((channel_option(lark), |config| {
+                let signing_secret: String = Input::new()
+                    .with_prompt("  Webhook signing secret (optional, press Enter to skip)")
+                    .allow_empty(true)
+                    .interact_text()?;
+
+                config.launchable.linq = Some(LinqConfig {
+                    api_token: api_token.trim().to_string(),
+                    from_phone: from_phone.trim().to_string(),
+                    signing_secret: if signing_secret.trim().is_empty() {
+                        None
+                    } else {
+                        Some(signing_secret.trim().to_string())
+                    },
+                    allowed_senders,
+                });
+                Ok(())
+            }),
+            (channel_option(irc), |config| {
+                // ── IRC ──
+                println!();
+                println!(
+                    "  {} {}",
+                    style("IRC Setup").white().bold(),
+                    style("— IRC over TLS").dim()
+                );
+                print_bullet("IRC connects over TLS to any IRC server");
+                print_bullet("Supports SASL PLAIN and NickServ authentication");
+                println!();
+
+                let server: String = Input::new()
+                    .with_prompt("  IRC server (hostname)")
+                    .interact_text()?;
+
+                if server.trim().is_empty() {
+                    println!("  {} Skipped", style("→").dim());
+                    return Ok(());
+                }
+
+                let port_str: String = Input::new()
+                    .with_prompt("  Port")
+                    .default("6697".into())
+                    .interact_text()?;
+
+                let port: u16 = match port_str.trim().parse() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        println!("  {} Invalid port, using 6697", style("→").dim());
+                        6697
+                    }
+                };
+
+                let nickname: String =
+                    Input::new().with_prompt("  Bot nickname").interact_text()?;
+
+                if nickname.trim().is_empty() {
+                    println!("  {} Skipped — nickname required", style("→").dim());
+                    return Ok(());
+                }
+
+                let channels_str: String = Input::new()
+                    .with_prompt("  Channels to join (comma-separated: #channel1,#channel2)")
+                    .allow_empty(true)
+                    .interact_text()?;
+
+                let channels = if channels_str.trim().is_empty() {
+                    vec![]
+                } else {
+                    channels_str
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                };
+
+                print_bullet(
+                    "Allowlist nicknames that can interact with the bot (case-insensitive).",
+                );
+                print_bullet("Use '*' to allow anyone (not recommended for production).");
+
+                let users_str: String = Input::new()
+                    .with_prompt("  Allowed nicknames (comma-separated, or * for all)")
+                    .allow_empty(true)
+                    .interact_text()?;
+
+                let allowed_users = if users_str.trim() == "*" {
+                    vec!["*".into()]
+                } else {
+                    users_str
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                };
+
+                if allowed_users.is_empty() {
+                    print_bullet(
+                        "⚠️  Empty allowlist — only you can interact. Add nicknames above.",
+                    );
+                }
+
+                println!();
+                print_bullet("Optional authentication (press Enter to skip each):");
+
+                let server_password: String = Input::new()
+                    .with_prompt("  Server password (for bouncers like ZNC, leave empty if none)")
+                    .allow_empty(true)
+                    .interact_text()?;
+
+                let nickserv_password: String = Input::new()
+                    .with_prompt("  NickServ password (leave empty if none)")
+                    .allow_empty(true)
+                    .interact_text()?;
+
+                let sasl_password: String = Input::new()
+                    .with_prompt("  SASL PLAIN password (leave empty if none)")
+                    .allow_empty(true)
+                    .interact_text()?;
+
+                let verify_tls: bool = Confirm::new()
+                    .with_prompt("  Verify TLS certificate?")
+                    .default(true)
+                    .interact()?;
+
+                println!(
+                    "  {} IRC configured as {}@{}:{}",
+                    style("✅").green().bold(),
+                    style(&nickname).cyan(),
+                    style(&server).cyan(),
+                    style(port).cyan()
+                );
+
+                config.launchable.irc = Some(IrcConfig {
+                    server: server.trim().to_string(),
+                    port,
+                    nickname: nickname.trim().to_string(),
+                    username: None,
+                    channels,
+                    allowed_users,
+                    server_password: if server_password.trim().is_empty() {
+                        None
+                    } else {
+                        Some(server_password.trim().to_string())
+                    },
+                    nickserv_password: if nickserv_password.trim().is_empty() {
+                        None
+                    } else {
+                        Some(nickserv_password.trim().to_string())
+                    },
+                    sasl_password: if sasl_password.trim().is_empty() {
+                        None
+                    } else {
+                        Some(sasl_password.trim().to_string())
+                    },
+                    verify_tls: Some(verify_tls),
+                });
+                Ok(())
+            }),
+            (channel_option(lark), |config| {
                 // ── Lark/Feishu ──
                 println!();
                 println!(
@@ -3949,157 +3964,157 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     port,
                 });
                 Ok(())
-            }));
+            }),
+            (channel_option(dingtalk), |config| {
+                // ── DingTalk ──
+                println!();
+                println!(
+                    "  {} {}",
+                    style("DingTalk Setup").white().bold(),
+                    style("— DingTalk Stream Mode").dim()
+                );
+                print_bullet("1. Go to DingTalk developer console (open.dingtalk.com)");
+                print_bullet("2. Create an app and enable the Stream Mode bot");
+                print_bullet("3. Copy the Client ID (AppKey) and Client Secret (AppSecret)");
+                println!();
 
-        options.push((channel_option(dingtalk), |config| {
-            // ── DingTalk ──
-            println!();
-            println!(
-                "  {} {}",
-                style("DingTalk Setup").white().bold(),
-                style("— DingTalk Stream Mode").dim()
-            );
-            print_bullet("1. Go to DingTalk developer console (open.dingtalk.com)");
-            print_bullet("2. Create an app and enable the Stream Mode bot");
-            print_bullet("3. Copy the Client ID (AppKey) and Client Secret (AppSecret)");
-            println!();
+                let client_id: String = Input::new()
+                    .with_prompt("  Client ID (AppKey)")
+                    .interact_text()?;
 
-            let client_id: String = Input::new()
-                .with_prompt("  Client ID (AppKey)")
-                .interact_text()?;
-
-            if client_id.trim().is_empty() {
-                println!("  {} Skipped", style("→").dim());
-                return Ok(());
-            }
-
-            let client_secret: String = Input::new()
-                .with_prompt("  Client Secret (AppSecret)")
-                .interact_text()?;
-
-            // Test connection
-            print!("  {} Testing connection... ", style("⏳").dim());
-            let client = reqwest::blocking::Client::new();
-            let body = serde_json::json!({
-                "clientId": client_id,
-                "clientSecret": client_secret,
-            });
-            match client
-                .post("https://api.dingtalk.com/v1.0/gateway/connections/open")
-                .json(&body)
-                .send()
-            {
-                Ok(resp) if resp.status().is_success() => {
-                    println!(
-                        "\r  {} DingTalk credentials verified        ",
-                        style("✅").green().bold()
-                    );
-                }
-                _ => {
-                    println!(
-                        "\r  {} Connection failed — check your credentials",
-                        style("❌").red().bold()
-                    );
+                if client_id.trim().is_empty() {
+                    println!("  {} Skipped", style("→").dim());
                     return Ok(());
                 }
-            }
 
-            let users_str: String = Input::new()
-                .with_prompt("  Allowed staff IDs (comma-separated, '*' for all)")
-                .allow_empty(true)
-                .interact_text()?;
+                let client_secret: String = Input::new()
+                    .with_prompt("  Client Secret (AppSecret)")
+                    .interact_text()?;
 
-            let allowed_users: Vec<String> = users_str
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-
-            config.launchable.dingtalk = Some(DingTalkConfig {
-                client_id,
-                client_secret,
-                allowed_users,
-            });
-            Ok(())
-        }));
-
-        options.push((channel_option(qq), |config| {
-            // ── QQ Official ──
-            println!();
-            println!(
-                "  {} {}",
-                style("QQ Official Setup").white().bold(),
-                style("— Tencent QQ Bot SDK").dim()
-            );
-            print_bullet("1. Go to QQ Bot developer console (q.qq.com)");
-            print_bullet("2. Create a bot application");
-            print_bullet("3. Copy the App ID and App Secret");
-            println!();
-
-            let app_id: String = Input::new().with_prompt("  App ID").interact_text()?;
-
-            if app_id.trim().is_empty() {
-                println!("  {} Skipped", style("→").dim());
-                return Ok(());
-            }
-
-            let app_secret: String = Input::new().with_prompt("  App Secret").interact_text()?;
-
-            // Test connection
-            print!("  {} Testing connection... ", style("⏳").dim());
-            let client = reqwest::blocking::Client::new();
-            let body = serde_json::json!({
-                "appId": app_id,
-                "clientSecret": app_secret,
-            });
-            match client
-                .post("https://bots.qq.com/app/getAppAccessToken")
-                .json(&body)
-                .send()
-            {
-                Ok(resp) if resp.status().is_success() => {
-                    let data: serde_json::Value = resp.json().unwrap_or_default();
-                    if data.get("access_token").is_some() {
+                // Test connection
+                print!("  {} Testing connection... ", style("⏳").dim());
+                let client = reqwest::blocking::Client::new();
+                let body = serde_json::json!({
+                    "clientId": client_id,
+                    "clientSecret": client_secret,
+                });
+                match client
+                    .post("https://api.dingtalk.com/v1.0/gateway/connections/open")
+                    .json(&body)
+                    .send()
+                {
+                    Ok(resp) if resp.status().is_success() => {
                         println!(
-                            "\r  {} QQ Bot credentials verified        ",
+                            "\r  {} DingTalk credentials verified        ",
                             style("✅").green().bold()
                         );
-                    } else {
+                    }
+                    _ => {
                         println!(
-                            "\r  {} Auth error — check your credentials",
+                            "\r  {} Connection failed — check your credentials",
                             style("❌").red().bold()
                         );
                         return Ok(());
                     }
                 }
-                _ => {
-                    println!(
-                        "\r  {} Connection failed — check your credentials",
-                        style("❌").red().bold()
-                    );
+
+                let users_str: String = Input::new()
+                    .with_prompt("  Allowed staff IDs (comma-separated, '*' for all)")
+                    .allow_empty(true)
+                    .interact_text()?;
+
+                let allowed_users: Vec<String> = users_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+
+                config.launchable.dingtalk = Some(DingTalkConfig {
+                    client_id,
+                    client_secret,
+                    allowed_users,
+                });
+                Ok(())
+            }),
+            (channel_option(qq), |config| {
+                // ── QQ Official ──
+                println!();
+                println!(
+                    "  {} {}",
+                    style("QQ Official Setup").white().bold(),
+                    style("— Tencent QQ Bot SDK").dim()
+                );
+                print_bullet("1. Go to QQ Bot developer console (q.qq.com)");
+                print_bullet("2. Create a bot application");
+                print_bullet("3. Copy the App ID and App Secret");
+                println!();
+
+                let app_id: String = Input::new().with_prompt("  App ID").interact_text()?;
+
+                if app_id.trim().is_empty() {
+                    println!("  {} Skipped", style("→").dim());
                     return Ok(());
                 }
-            }
 
-            let users_str: String = Input::new()
-                .with_prompt("  Allowed user IDs (comma-separated, '*' for all)")
-                .allow_empty(true)
-                .interact_text()?;
+                let app_secret: String =
+                    Input::new().with_prompt("  App Secret").interact_text()?;
 
-            let allowed_users: Vec<String> = users_str
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
+                // Test connection
+                print!("  {} Testing connection... ", style("⏳").dim());
+                let client = reqwest::blocking::Client::new();
+                let body = serde_json::json!({
+                    "appId": app_id,
+                    "clientSecret": app_secret,
+                });
+                match client
+                    .post("https://bots.qq.com/app/getAppAccessToken")
+                    .json(&body)
+                    .send()
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        let data: serde_json::Value = resp.json().unwrap_or_default();
+                        if data.get("access_token").is_some() {
+                            println!(
+                                "\r  {} QQ Bot credentials verified        ",
+                                style("✅").green().bold()
+                            );
+                        } else {
+                            println!(
+                                "\r  {} Auth error — check your credentials",
+                                style("❌").red().bold()
+                            );
+                            return Ok(());
+                        }
+                    }
+                    _ => {
+                        println!(
+                            "\r  {} Connection failed — check your credentials",
+                            style("❌").red().bold()
+                        );
+                        return Ok(());
+                    }
+                }
 
-            config.launchable.qq = Some(QQConfig {
-                app_id,
-                app_secret,
-                allowed_users,
-            });
+                let users_str: String = Input::new()
+                    .with_prompt("  Allowed user IDs (comma-separated, '*' for all)")
+                    .allow_empty(true)
+                    .interact_text()?;
 
-            Ok(())
-        }));
+                let allowed_users: Vec<String> = users_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+
+                config.launchable.qq = Some(QQConfig {
+                    app_id,
+                    app_secret,
+                    allowed_users,
+                });
+
+                Ok(())
+            }),
+        ];
 
         let choice = Select::new()
             .with_prompt("  Connect a channel (or Done to continue)")

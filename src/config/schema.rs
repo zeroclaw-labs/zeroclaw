@@ -2260,7 +2260,7 @@ impl Default for ChannelsConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
 pub struct LaunchableChannelsConfig {
     /// Telegram bot channel configuration.
     pub telegram: Option<TelegramConfig>,
@@ -2332,7 +2332,6 @@ pub struct TelegramConfig {
     pub mention_only: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 impl ChannelConfig for TelegramConfig {
     fn name() -> &'static str {
         "Telegram"
@@ -2606,6 +2605,14 @@ pub struct NextcloudTalkConfig {
     pub allowed_users: Vec<String>,
 }
 
+impl ChannelConfig for NextcloudTalkConfig {
+    fn name() -> &'static str {
+        "NextCloud Talk"
+    }
+    fn desc() -> &'static str {
+        "NextCloud Talk platform"
+    }
+}
 impl WhatsAppConfig {
     /// Detect which backend to use based on config fields.
     /// Returns "cloud" if phone_number_id is set, "web" if session_path is set.
@@ -2639,7 +2646,7 @@ impl WhatsAppConfig {
 }
 
 /// IRC channel configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct IrcConfig {
     /// IRC server hostname
     pub server: String,
@@ -3932,7 +3939,7 @@ impl LaunchableChannelsConfig {
             lark,
             dingtalk,
             qq,
-            nextcloud_talk
+            nextcloud_talk,
         } = &self;
 
         let mut ret = Vec::new();
@@ -3972,7 +3979,7 @@ impl LaunchableChannelsConfig {
             lark,
             dingtalk,
             qq,
-            nextcloud_talk
+            nextcloud_talk,
         } = &self;
 
         [
@@ -4219,6 +4226,7 @@ default_temperature = 0.7
                         stream_mode: StreamMode::default(),
                         draft_update_interval_ms: default_draft_update_interval_ms(),
                         mention_only: false,
+                        interrupt_on_new_message: false,
                     }),
                     ..Default::default()
                 },
@@ -4955,10 +4963,13 @@ channel_id = "C123"
             webhook: None,
             launchable: LaunchableChannelsConfig {
                 whatsapp: Some(WhatsAppConfig {
-                    access_token: "tok".into(),
-                    phone_number_id: "123".into(),
-                    verify_token: "ver".into(),
+                    access_token: Some("tok".into()),
+                    phone_number_id: Some("123".into()),
+                    verify_token: Some("ver".into()),
                     app_secret: None,
+                    session_path: None,
+                    pair_phone: None,
+                    pair_code: None,
                     allowed_numbers: vec!["+1".into()],
                 }),
                 ..Default::default()
@@ -4969,7 +4980,7 @@ channel_id = "C123"
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
         assert!(parsed.launchable.whatsapp.is_some());
         let wa = parsed.launchable.whatsapp.unwrap();
-        assert_eq!(wa.phone_number_id, "123");
+        assert_eq!(wa.phone_number_id, Some("123".to_string()));
         assert_eq!(wa.allowed_numbers, vec!["+1"]);
     }
 
@@ -4982,7 +4993,7 @@ channel_id = "C123"
     #[test]
     async fn channels_config_default_has_no_nextcloud_talk() {
         let c = ChannelsConfig::default();
-        assert!(c.nextcloud_talk.is_none());
+        assert!(c.launchable.nextcloud_talk.is_none());
     }
 
     // ══════════════════════════════════════════════════════════

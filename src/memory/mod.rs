@@ -30,7 +30,7 @@ pub use traits::Memory;
 #[allow(unused_imports)]
 pub use traits::{MemoryCategory, MemoryEntry};
 
-use crate::config::{EmbeddingRouteConfig, MemoryConfig, StorageProviderConfig};
+use crate::config::schema::{EmbeddingRouteConfig, MemoryConfig, StorageProviderConfig};
 #[cfg(feature = "memory-postgres")]
 use anyhow::Context;
 use std::path::Path;
@@ -362,7 +362,7 @@ pub fn create_response_cache(config: &MemoryConfig, workspace_dir: &Path) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{EmbeddingRouteConfig, StorageProviderConfig};
+    use crate::config::schema::{EmbeddingRouteConfig, StorageProviderConfig};
     use tempfile::TempDir;
 
     #[test]

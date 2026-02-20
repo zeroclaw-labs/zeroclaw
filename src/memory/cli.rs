@@ -40,20 +40,38 @@ fn create_cli_memory(config: &Config) -> Result<Box<dyn Memory>> {
             bail!("Memory backend is 'none' (disabled). No entries to manage.");
         }
         MemoryBackendKind::Postgres => {
-            let sp = &config.storage.provider.config;
-            let db_url = sp
-                .db_url
-                .as_deref()
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .context(
-                    "memory backend 'postgres' requires db_url in [storage.provider.config]",
+            #[cfg(feature = "memory-postgres")]
+            {
+                let sp = &config.storage.provider.config;
+                let db_url = sp
+                    .db_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .context(
+                        "memory backend 'postgres' requires db_url in [storage.provider.config]",
+                    )?;
+                let mem = super::PostgresMemory::new(
+                    db_url,
+                    &sp.schema,
+                    &sp.table,
+                    sp.connect_timeout_secs,
                 )?;
-            let mem =
-                super::PostgresMemory::new(db_url, &sp.schema, &sp.table, sp.connect_timeout_secs)?;
-            Ok(Box::new(mem))
+                Ok(Box::new(mem))
+            }
+            #[cfg(not(feature = "memory-postgres"))]
+            {
+                bail!(
+                    "Backend postgres is configured but this build was compiled without `postgres`."
+                );
+            }
         }
-        _ => create_memory_for_migration(&backend, &config.workspace_dir),
+        MemoryBackendKind::Sqlite
+        | MemoryBackendKind::Lucid
+        | MemoryBackendKind::Markdown
+        | MemoryBackendKind::Unknown => {
+            create_memory_for_migration(&backend, &config.workspace_dir)
+        }
     }
 }
 

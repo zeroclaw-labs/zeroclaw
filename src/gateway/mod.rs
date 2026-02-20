@@ -434,7 +434,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     // Nextcloud Talk channel (if configured)
     let nextcloud_talk_channel: Option<Arc<NextcloudTalkChannel>> =
-        config.channels_config.nextcloud_talk.as_ref().map(|nc| {
+        config.channels_config.launchable.nextcloud_talk.as_ref().map(|nc| {
             Arc::new(NextcloudTalkChannel::new(
                 nc.base_url.clone(),
                 nc.app_token.clone(),
@@ -454,6 +454,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             .or_else(|| {
                 config
                     .channels_config
+                    .launchable
                     .nextcloud_talk
                     .as_ref()
                     .and_then(|nc| {
