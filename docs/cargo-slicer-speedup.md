@@ -1,16 +1,16 @@
 # Faster Builds with cargo-slicer
 
-[cargo-slicer](https://github.com/nickel-org/cargo-slicer) is a `RUSTC_WRAPPER` that stubs unreachable library functions at the MIR level, skipping LLVM codegen for code the final binary never calls. It identified **2,059 unreachable functions** in ZeroClaw's workspace crates.
+[cargo-slicer](https://github.com/nickel-org/cargo-slicer) is a `RUSTC_WRAPPER` that stubs unreachable library functions at the MIR level, skipping LLVM codegen for code the final binary never calls.
 
 ## Benchmark Results
 
-| Environment | Baseline | With cargo-slicer | Wall-time savings |
-|---|---|---|---|
-| 48-core server (AMD EPYC) | 192.9 s | 170.4 s | **-11.7%** |
-| Raspberry Pi 4 (4-core ARM) | 25m 03s | 17m 54s | **-28.6%** |
-| 2-vCPU CI runner (estimated) | — | — | **~25-30%** |
+| Environment | Mode | Baseline | With cargo-slicer | Wall-time savings |
+|---|---|---|---|---|
+| 48-core server | syn pre-analysis | 3m 52s | 3m 31s | **-9.1%** |
+| 48-core server | MIR-precise | 3m 52s | 2m 49s | **-27.2%** |
+| Raspberry Pi 4 | syn pre-analysis | 25m 03s | 17m 54s | **-28.6%** |
 
-All measurements are clean `cargo build --release` on nightly. Fewer cores = larger relative improvement, because each crate's compile time is a bigger fraction of total wall time. The 2-vCPU CI runners should see savings similar to the Pi.
+All measurements are clean `cargo +nightly build --release`. MIR-precise mode reads actual compiler MIR to build a more accurate call graph, stubbing 1,060 mono items vs 799 with syn-based analysis.
 
 ## CI Integration
 
@@ -26,17 +26,26 @@ cargo +nightly install cargo-slicer --profile release-rustc \
   --bin cargo-slicer-rustc --bin cargo_slicer_dispatch \
   --features rustc-driver
 
-# Build (from zeroclaw root)
+# Build with syn pre-analysis (from zeroclaw root)
 cargo-slicer pre-analyze
 CARGO_SLICER_VIRTUAL=1 CARGO_SLICER_CODEGEN_FILTER=1 \
   RUSTC_WRAPPER=$(which cargo_slicer_dispatch) \
   cargo +nightly build --release
+
+# Build with MIR-precise analysis (more stubs, bigger savings)
+# Step 1: generate .mir-cache (first build with MIR_PRECISE)
+CARGO_SLICER_MIR_PRECISE=1 CARGO_SLICER_WORKSPACE_CRATES=zeroclaw,zeroclaw_robot_kit \
+  CARGO_SLICER_VIRTUAL=1 CARGO_SLICER_CODEGEN_FILTER=1 \
+  RUSTC_WRAPPER=$(which cargo_slicer_dispatch) \
+  cargo +nightly build --release
+# Step 2: subsequent builds automatically use .mir-cache
 ```
 
 ## How It Works
 
-1. **Pre-analysis** scans workspace sources via `syn` to build a cross-crate call graph (~5 s).
+1. **Pre-analysis** scans workspace sources via `syn` to build a cross-crate call graph (~2 s).
 2. **Cross-crate BFS** from `main()` identifies which public library functions are actually reachable.
 3. **MIR stubbing** replaces unreachable bodies with `Unreachable` terminators — the mono collector finds no callees and prunes entire codegen subtrees.
+4. **MIR-precise mode** (optional) reads actual compiler MIR from the binary crate's perspective, building a ground-truth call graph that identifies even more unreachable functions.
 
 No source files are modified. The output binary is functionally identical.

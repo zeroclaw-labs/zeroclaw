@@ -2,8 +2,8 @@ name: CI Build (Fast)
 
 # Optional accelerated release build using cargo-slicer.
 # Runs alongside the normal Build (Smoke) job — does not gate merges.
-# Stubs 2,059 unreachable library functions to skip LLVM codegen,
-# saving ~29% wall time on 2-vCPU runners.
+# Stubs unreachable library functions to skip LLVM codegen,
+# saving ~27% wall time on a 48-core server (more on fewer cores).
 #
 # See docs/cargo-slicer-speedup.md for benchmarks and details.
 
@@ -76,8 +76,10 @@ jobs:
             - name: Pre-analyze workspace
               run: cargo-slicer pre-analyze
 
-            - name: Build release binary (virtual slicing)
+            - name: Build release binary (virtual slicing + MIR-precise)
               run: |
-                  CARGO_SLICER_VIRTUAL=1 CARGO_SLICER_CODEGEN_FILTER=1 \
+                  CARGO_SLICER_MIR_PRECISE=1 \
+                    CARGO_SLICER_WORKSPACE_CRATES=zeroclaw,zeroclaw_robot_kit \
+                    CARGO_SLICER_VIRTUAL=1 CARGO_SLICER_CODEGEN_FILTER=1 \
                     RUSTC_WRAPPER=$(which cargo_slicer_dispatch) \
                     cargo +nightly build --release --verbose
