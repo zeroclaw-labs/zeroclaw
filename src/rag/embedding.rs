@@ -7,11 +7,16 @@
 //!
 //! Requests are batched in groups of [`BATCH_SIZE`] inputs and retried with
 //! exponential back-off on transient failures.
+//!
+//! # Key isolation
+//!
+//! The embedding API key is read exclusively from `[rag] embedding_api_key` in
+//! `config.toml`.  It is never inherited from the LLM provider key.  Startup
+//! fails with a clear error when the key is absent or empty.
 
 use anyhow::{bail, Result};
 
-/// Default NVIDIA NIM embedding endpoint.
-const NVIDIA_EMBEDDING_URL: &str = "https://integrate.api.nvidia.com/v1/embeddings";
+use crate::config::schema::RagConfig;
 
 /// Maximum inputs per API request (NVIDIA NIM limit).
 const BATCH_SIZE: usize = 50;
@@ -24,24 +29,47 @@ const MAX_RETRIES: u32 = 3;
 /// HTTP client for the NVIDIA NIM embeddings endpoint.
 ///
 /// Instantiate once and share across ingest and retrieval calls.
+#[derive(Debug)]
 pub struct NvidiaEmbeddingClient {
     api_key: String,
     model: String,
-    /// Override endpoint (for testing / private NIM deployments).
+    /// Embeddings endpoint URL (base URL + `/embeddings`).
     endpoint: String,
 }
 
 impl NvidiaEmbeddingClient {
-    /// Create a client using the default NVIDIA NIM endpoint.
-    pub fn new(api_key: &str, model: &str) -> Self {
-        Self {
+    /// Build a client from [`RagConfig`].
+    ///
+    /// Returns a config error if `rag.embedding_api_key` is absent or blank.
+    /// The key is never derived from the LLM provider key.
+    pub fn from_config(rag: &RagConfig) -> Result<Self> {
+        let api_key = rag
+            .embedding_api_key
+            .as_deref()
+            .filter(|k| !k.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "rag.embedding_api_key is required but not set; \
+                     add a dedicated key under [rag] in config.toml — \
+                     do not reuse the LLM provider key"
+                )
+            })?;
+
+        let endpoint = format!(
+            "{}/embeddings",
+            rag.embedding_base_url.trim_end_matches('/')
+        );
+
+        Ok(Self {
             api_key: api_key.to_string(),
-            model: model.to_string(),
-            endpoint: NVIDIA_EMBEDDING_URL.to_string(),
-        }
+            model: rag.embedding_model.clone(),
+            endpoint,
+        })
     }
 
-    /// Create a client with a custom endpoint (primarily for tests).
+    /// Create a client with an explicit endpoint — for tests and private NIM deployments.
+    ///
+    /// Callers are responsible for providing a non-empty `api_key`.
     pub fn with_endpoint(api_key: &str, model: &str, endpoint: &str) -> Self {
         Self {
             api_key: api_key.to_string(),
@@ -180,12 +208,62 @@ fn parse_embedding_response(json: &serde_json::Value) -> Result<Vec<Vec<f32>>> {
 mod tests {
     use super::*;
 
+    fn make_rag_config(api_key: Option<&str>) -> RagConfig {
+        RagConfig {
+            embedding_api_key: api_key.map(str::to_string),
+            ..RagConfig::default()
+        }
+    }
+
     #[test]
-    fn client_stores_api_key_and_model() {
-        let c = NvidiaEmbeddingClient::new("test-key", "nvidia/nv-embedqa-e5-v5");
-        assert_eq!(c.api_key, "test-key");
+    fn from_config_succeeds_with_key() {
+        let cfg = make_rag_config(Some("nvapi-test-key"));
+        let c = NvidiaEmbeddingClient::from_config(&cfg).unwrap();
+        assert_eq!(c.api_key, "nvapi-test-key");
         assert_eq!(c.model, "nvidia/nv-embedqa-e5-v5");
-        assert_eq!(c.endpoint, NVIDIA_EMBEDDING_URL);
+        assert!(c.endpoint.ends_with("/embeddings"));
+    }
+
+    #[test]
+    fn from_config_fails_when_key_missing() {
+        let cfg = make_rag_config(None);
+        let err = NvidiaEmbeddingClient::from_config(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("rag.embedding_api_key"),
+            "error should mention rag.embedding_api_key: {err}"
+        );
+    }
+
+    #[test]
+    fn from_config_fails_when_key_empty() {
+        let cfg = make_rag_config(Some(""));
+        let err = NvidiaEmbeddingClient::from_config(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("rag.embedding_api_key"),
+            "error should mention rag.embedding_api_key: {err}"
+        );
+    }
+
+    #[test]
+    fn from_config_endpoint_uses_base_url() {
+        let cfg = RagConfig {
+            embedding_api_key: Some("k".into()),
+            embedding_base_url: "https://custom.example.com/v1".into(),
+            ..RagConfig::default()
+        };
+        let c = NvidiaEmbeddingClient::from_config(&cfg).unwrap();
+        assert_eq!(c.endpoint, "https://custom.example.com/v1/embeddings");
+    }
+
+    #[test]
+    fn from_config_strips_trailing_slash_from_base_url() {
+        let cfg = RagConfig {
+            embedding_api_key: Some("k".into()),
+            embedding_base_url: "https://custom.example.com/v1/".into(),
+            ..RagConfig::default()
+        };
+        let c = NvidiaEmbeddingClient::from_config(&cfg).unwrap();
+        assert_eq!(c.endpoint, "https://custom.example.com/v1/embeddings");
     }
 
     #[test]
