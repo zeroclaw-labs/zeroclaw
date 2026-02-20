@@ -30,7 +30,10 @@ Full MobileClaw app behavior on a phone depends on Android, enabled capabilities
 
 [![MobileClaw demo video](https://img.youtube.com/vi/-3fpcQAL6II/maxresdefault.jpg)](https://youtu.be/-3fpcQAL6II)
 
-Demo video: https://youtu.be/-3fpcQAL6II
+[![MobileClaw demo video 2](https://img.youtube.com/vi/HtNMcQIDsZ8/maxresdefault.jpg)](https://youtu.be/HtNMcQIDsZ8)
+
+[![MobileClaw demo video 3](https://img.youtube.com/vi/OGHg3Fzgg70/maxresdefault.jpg)](https://youtu.be/OGHg3Fzgg70)
+
 
 ## What You Can Do Today
 
