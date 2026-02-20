@@ -818,6 +818,9 @@ impl OpenAiCompatibleProvider {
                                             name: Some(tc.name),
                                             arguments: Some(tc.arguments),
                                         }),
+                                        name: None,
+                                        arguments: None,
+                                        parameters: None,
                                     })
                                     .collect::<Vec<_>>();
 
@@ -1997,6 +2000,9 @@ mod tests {
                     name: Some("shell".to_string()),
                     arguments: Some(r#"{"command":"pwd"}"#.to_string()),
                 }),
+                name: None,
+                arguments: None,
+                parameters: None,
             }]),
             reasoning_content: None,
         };
