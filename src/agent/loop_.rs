@@ -1561,6 +1561,7 @@ pub async fn run(
         Some(&config.identity),
         bootstrap_max_chars,
         native_tools,
+        config.skills.prompt_injection_mode,
     );
 
     // Append structured tool-use instructions with schemas (only for non-native providers)
@@ -1928,6 +1929,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         Some(&config.identity),
         bootstrap_max_chars,
         native_tools,
+        config.skills.prompt_injection_mode,
     );
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(&tools_registry));

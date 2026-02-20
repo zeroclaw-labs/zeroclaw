@@ -946,9 +946,10 @@ Community `open-skills` sync is disabled by default. Enable it explicitly in `co
 [skills]
 open_skills_enabled = true
 # open_skills_dir = "/path/to/open-skills"  # optional
+# prompt_injection_mode = "compact"          # optional: use for low-context local models
 ```
 
-You can also override at runtime with `ZEROCLAW_OPEN_SKILLS_ENABLED` and `ZEROCLAW_OPEN_SKILLS_DIR`.
+You can also override at runtime with `ZEROCLAW_OPEN_SKILLS_ENABLED`, `ZEROCLAW_OPEN_SKILLS_DIR`, and `ZEROCLAW_SKILLS_PROMPT_MODE` (`full` or `compact`).
 
 ## Development
 

@@ -30,6 +30,7 @@ pub struct Agent {
     workspace_dir: std::path::PathBuf,
     identity_config: crate::config::IdentityConfig,
     skills: Vec<crate::skills::Skill>,
+    skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
     auto_save: bool,
     history: Vec<ConversationMessage>,
     classification_config: crate::config::QueryClassificationConfig,
@@ -50,6 +51,7 @@ pub struct AgentBuilder {
     workspace_dir: Option<std::path::PathBuf>,
     identity_config: Option<crate::config::IdentityConfig>,
     skills: Option<Vec<crate::skills::Skill>>,
+    skills_prompt_mode: Option<crate::config::SkillsPromptInjectionMode>,
     auto_save: Option<bool>,
     classification_config: Option<crate::config::QueryClassificationConfig>,
     available_hints: Option<Vec<String>>,
@@ -71,6 +73,7 @@ impl AgentBuilder {
             workspace_dir: None,
             identity_config: None,
             skills: None,
+            skills_prompt_mode: None,
             auto_save: None,
             classification_config: None,
             available_hints: None,
@@ -142,6 +145,14 @@ impl AgentBuilder {
         self
     }
 
+    pub fn skills_prompt_mode(
+        mut self,
+        skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
+    ) -> Self {
+        self.skills_prompt_mode = Some(skills_prompt_mode);
+        self
+    }
+
     pub fn auto_save(mut self, auto_save: bool) -> Self {
         self.auto_save = Some(auto_save);
         self
@@ -197,6 +208,7 @@ impl AgentBuilder {
                 .unwrap_or_else(|| std::path::PathBuf::from(".")),
             identity_config: self.identity_config.unwrap_or_default(),
             skills: self.skills.unwrap_or_default(),
+            skills_prompt_mode: self.skills_prompt_mode.unwrap_or_default(),
             auto_save: self.auto_save.unwrap_or(false),
             history: Vec::new(),
             classification_config: self.classification_config.unwrap_or_default(),
@@ -312,6 +324,7 @@ impl Agent {
                 &config.workspace_dir,
                 config,
             ))
+            .skills_prompt_mode(config.skills.prompt_injection_mode)
             .auto_save(config.memory.auto_save)
             .build()
     }
@@ -350,6 +363,7 @@ impl Agent {
             model_name: &self.model_name,
             tools: &self.tools,
             skills: &self.skills,
+            skills_prompt_mode: self.skills_prompt_mode,
             identity_config: Some(&self.identity_config),
             dispatcher_instructions: &instructions,
         };

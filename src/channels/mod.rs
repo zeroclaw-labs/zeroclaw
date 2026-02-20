@@ -1796,6 +1796,7 @@ pub fn build_system_prompt(
         identity_config,
         bootstrap_max_chars,
         false,
+        crate::config::SkillsPromptInjectionMode::Full,
     )
 }
 
@@ -1807,6 +1808,7 @@ pub fn build_system_prompt_with_mode(
     identity_config: Option<&crate::config::IdentityConfig>,
     bootstrap_max_chars: Option<usize>,
     native_tools: bool,
+    skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
 ) -> String {
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
@@ -1869,9 +1871,13 @@ pub fn build_system_prompt_with_mode(
          - When in doubt, ask before acting externally.\n\n",
     );
 
-    // ── 3. Skills (full instructions + tool metadata) ───────────
+    // ── 3. Skills (full or compact, based on config) ─────────────
     if !skills.is_empty() {
-        prompt.push_str(&crate::skills::skills_to_prompt(skills, workspace_dir));
+        prompt.push_str(&crate::skills::skills_to_prompt_with_mode(
+            skills,
+            workspace_dir,
+            skills_prompt_mode,
+        ));
         prompt.push_str("\n\n");
     }
 
@@ -2626,6 +2632,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         Some(&config.identity),
         bootstrap_max_chars,
         native_tools,
+        config.skills.prompt_injection_mode,
     );
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(tools_registry.as_ref()));
@@ -4708,6 +4715,47 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(prompt.contains("<name>lint</name>"));
         assert!(prompt.contains("<kind>shell</kind>"));
         assert!(!prompt.contains("loaded on demand"));
+    }
+
+    #[test]
+    fn prompt_skills_compact_mode_omits_instructions_and_tools() {
+        let ws = make_workspace();
+        let skills = vec![crate::skills::Skill {
+            name: "code-review".into(),
+            description: "Review code for bugs".into(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: vec![],
+            tools: vec![crate::skills::SkillTool {
+                name: "lint".into(),
+                description: "Run static checks".into(),
+                kind: "shell".into(),
+                command: "cargo clippy".into(),
+                args: HashMap::new(),
+            }],
+            prompts: vec!["Always run cargo test before final response.".into()],
+            location: None,
+        }];
+
+        let prompt = build_system_prompt_with_mode(
+            ws.path(),
+            "model",
+            &[],
+            &skills,
+            None,
+            None,
+            false,
+            crate::config::SkillsPromptInjectionMode::Compact,
+        );
+
+        assert!(prompt.contains("<available_skills>"), "missing skills XML");
+        assert!(prompt.contains("<name>code-review</name>"));
+        assert!(prompt.contains("<location>skills/code-review/SKILL.md</location>"));
+        assert!(prompt.contains("loaded on demand"));
+        assert!(!prompt.contains("<instructions>"));
+        assert!(!prompt
+            .contains("<instruction>Always run cargo test before final response.</instruction>"));
+        assert!(!prompt.contains("<tools>"));
     }
 
     #[test]

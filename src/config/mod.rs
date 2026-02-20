@@ -12,8 +12,9 @@ pub use schema::{
     NextcloudTalkConfig, ObservabilityConfig, PeripheralBoardConfig, PeripheralsConfig,
     ProxyConfig, ProxyScope, QueryClassificationConfig, ReliabilityConfig, ResourceLimitsConfig,
     RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig, SecretsConfig, SecurityConfig,
-    SkillsConfig, SlackConfig, StorageConfig, StorageProviderConfig, StorageProviderSection,
-    StreamMode, TelegramConfig, TunnelConfig, WebSearchConfig, WebhookConfig,
+    SkillsConfig, SkillsPromptInjectionMode, SlackConfig, StorageConfig, StorageProviderConfig,
+    StorageProviderSection, StreamMode, TelegramConfig, TunnelConfig, WebSearchConfig,
+    WebhookConfig,
 };
 
 #[cfg(test)]

@@ -344,6 +344,25 @@ impl Default for AgentConfig {
 }
 
 /// Skills loading configuration (`[skills]` section).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillsPromptInjectionMode {
+    /// Inline full skill instructions and tool metadata into the system prompt.
+    #[default]
+    Full,
+    /// Inline only compact skill metadata (name/description/location) and load details on demand.
+    Compact,
+}
+
+fn parse_skills_prompt_injection_mode(raw: &str) -> Option<SkillsPromptInjectionMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "full" => Some(SkillsPromptInjectionMode::Full),
+        "compact" => Some(SkillsPromptInjectionMode::Compact),
+        _ => None,
+    }
+}
+
+/// Skills loading configuration (`[skills]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SkillsConfig {
     /// Enable loading and syncing the community open-skills repository.
@@ -354,6 +373,10 @@ pub struct SkillsConfig {
     /// If unset, defaults to `$HOME/open-skills` when enabled.
     #[serde(default)]
     pub open_skills_dir: Option<String>,
+    /// Controls how skills are injected into the system prompt.
+    /// `full` preserves legacy behavior. `compact` keeps context small and loads skills on demand.
+    #[serde(default)]
+    pub prompt_injection_mode: SkillsPromptInjectionMode,
 }
 
 impl Default for SkillsConfig {
@@ -361,6 +384,7 @@ impl Default for SkillsConfig {
         Self {
             open_skills_enabled: false,
             open_skills_dir: None,
+            prompt_injection_mode: SkillsPromptInjectionMode::default(),
         }
     }
 }
@@ -3335,6 +3359,19 @@ impl Config {
             }
         }
 
+        // Skills prompt mode override: ZEROCLAW_SKILLS_PROMPT_MODE
+        if let Ok(mode) = std::env::var("ZEROCLAW_SKILLS_PROMPT_MODE") {
+            if !mode.trim().is_empty() {
+                if let Some(parsed) = parse_skills_prompt_injection_mode(&mode) {
+                    self.skills.prompt_injection_mode = parsed;
+                } else {
+                    tracing::warn!(
+                        "Ignoring invalid ZEROCLAW_SKILLS_PROMPT_MODE (valid: full|compact)"
+                    );
+                }
+            }
+        }
+
         // Gateway port: ZEROCLAW_GATEWAY_PORT or PORT
         if let Ok(port_str) =
             std::env::var("ZEROCLAW_GATEWAY_PORT").or_else(|_| std::env::var("PORT"))
@@ -3675,6 +3712,10 @@ mod tests {
         assert!((c.default_temperature - 0.7).abs() < f64::EPSILON);
         assert!(c.api_key.is_none());
         assert!(!c.skills.open_skills_enabled);
+        assert_eq!(
+            c.skills.prompt_injection_mode,
+            SkillsPromptInjectionMode::Full
+        );
         assert!(c.workspace_dir.to_string_lossy().contains("workspace"));
         assert!(c.config_path.to_string_lossy().contains("config.toml"));
     }
@@ -5030,9 +5071,14 @@ default_temperature = 0.7
         let mut config = Config::default();
         assert!(!config.skills.open_skills_enabled);
         assert!(config.skills.open_skills_dir.is_none());
+        assert_eq!(
+            config.skills.prompt_injection_mode,
+            SkillsPromptInjectionMode::Full
+        );
 
         std::env::set_var("ZEROCLAW_OPEN_SKILLS_ENABLED", "true");
         std::env::set_var("ZEROCLAW_OPEN_SKILLS_DIR", "/tmp/open-skills");
+        std::env::set_var("ZEROCLAW_SKILLS_PROMPT_MODE", "compact");
         config.apply_env_overrides();
 
         assert!(config.skills.open_skills_enabled);
@@ -5040,9 +5086,14 @@ default_temperature = 0.7
             config.skills.open_skills_dir.as_deref(),
             Some("/tmp/open-skills")
         );
+        assert_eq!(
+            config.skills.prompt_injection_mode,
+            SkillsPromptInjectionMode::Compact
+        );
 
         std::env::remove_var("ZEROCLAW_OPEN_SKILLS_ENABLED");
         std::env::remove_var("ZEROCLAW_OPEN_SKILLS_DIR");
+        std::env::remove_var("ZEROCLAW_SKILLS_PROMPT_MODE");
     }
 
     #[test]
@@ -5050,12 +5101,19 @@ default_temperature = 0.7
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
         config.skills.open_skills_enabled = true;
+        config.skills.prompt_injection_mode = SkillsPromptInjectionMode::Compact;
 
         std::env::set_var("ZEROCLAW_OPEN_SKILLS_ENABLED", "maybe");
+        std::env::set_var("ZEROCLAW_SKILLS_PROMPT_MODE", "invalid");
         config.apply_env_overrides();
 
         assert!(config.skills.open_skills_enabled);
+        assert_eq!(
+            config.skills.prompt_injection_mode,
+            SkillsPromptInjectionMode::Compact
+        );
         std::env::remove_var("ZEROCLAW_OPEN_SKILLS_ENABLED");
+        std::env::remove_var("ZEROCLAW_SKILLS_PROMPT_MODE");
     }
 
     #[test]

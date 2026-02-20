@@ -134,6 +134,7 @@ Notes:
 |---|---|---|
 | `open_skills_enabled` | `false` | Opt-in loading/sync of community `open-skills` repository |
 | `open_skills_dir` | unset | Optional local path for `open-skills` (defaults to `$HOME/open-skills` when enabled) |
+| `prompt_injection_mode` | `full` | Skill prompt verbosity: `full` (inline instructions/tools) or `compact` (name/description/location only) |
 
 Notes:
 
@@ -141,7 +142,9 @@ Notes:
 - Environment overrides:
   - `ZEROCLAW_OPEN_SKILLS_ENABLED` accepts `1/0`, `true/false`, `yes/no`, `on/off`.
   - `ZEROCLAW_OPEN_SKILLS_DIR` overrides the repository path when non-empty.
+  - `ZEROCLAW_SKILLS_PROMPT_MODE` accepts `full` or `compact`.
 - Precedence for enable flag: `ZEROCLAW_OPEN_SKILLS_ENABLED` → `skills.open_skills_enabled` in `config.toml` → default `false`.
+- `prompt_injection_mode = "compact"` is recommended on low-context local models to reduce startup prompt size while keeping skill files available on demand.
 
 ## `[composio]`
 
