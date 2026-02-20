@@ -142,9 +142,9 @@ Examples:
 pub enum SkillCommands {
     /// List all installed skills
     List,
-    /// Install a new skill from a git URL (HTTPS/SSH) or local path
+    /// Install a new skill from a URL or local path
     Install {
-        /// Source git URL (HTTPS/SSH) or local path
+        /// Source URL or local path
         source: String,
     },
     /// Remove an installed skill
@@ -281,6 +281,45 @@ Examples:
     Resume {
         /// Task ID
         id: String,
+    },
+}
+
+/// Memory management subcommands
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MemoryCommands {
+    /// List memory entries with optional filters
+    List {
+        /// Filter by category (core, daily, conversation, or custom name)
+        #[arg(long)]
+        category: Option<String>,
+        /// Filter by session ID
+        #[arg(long)]
+        session: Option<String>,
+        /// Maximum number of entries to display
+        #[arg(long, default_value = "50")]
+        limit: usize,
+        /// Number of entries to skip (for pagination)
+        #[arg(long, default_value = "0")]
+        offset: usize,
+    },
+    /// Get a specific memory entry by key
+    Get {
+        /// Memory key to look up
+        key: String,
+    },
+    /// Show memory backend statistics and health
+    Stats,
+    /// Clear memories by category, by key, or clear all
+    Clear {
+        /// Delete a single entry by key (supports prefix match)
+        #[arg(long)]
+        key: Option<String>,
+        /// Only clear entries in this category
+        #[arg(long)]
+        category: Option<String>,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        yes: bool,
     },
 }
 

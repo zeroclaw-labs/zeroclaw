@@ -350,6 +350,25 @@ Examples:
         peripheral_command: zeroclaw::PeripheralCommands,
     },
 
+    /// Manage agent memory (list, get, stats, clear)
+    #[command(long_about = "\
+Manage agent memory entries.
+
+List, inspect, and clear memory entries stored by the agent. \
+Supports filtering by category and session, pagination, and \
+batch clearing with confirmation.
+
+Examples:
+  zeroclaw memory stats
+  zeroclaw memory list
+  zeroclaw memory list --category core --limit 10
+  zeroclaw memory get <key>
+  zeroclaw memory clear --category conversation --yes")]
+    Memory {
+        #[command(subcommand)]
+        memory_command: MemoryCommands,
+    },
+
     /// Manage configuration
     #[command(long_about = "\
 Manage ZeroClaw configuration.
@@ -598,15 +617,45 @@ enum ChannelCommands {
 enum SkillCommands {
     /// List installed skills
     List,
-    /// Install a skill from a git URL (HTTPS/SSH) or local path
+    /// Install a skill from a GitHub URL or local path
     Install {
-        /// Git URL (HTTPS/SSH) or local path
+        /// GitHub URL or local path
         source: String,
     },
     /// Remove an installed skill
     Remove {
         /// Skill name
         name: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum MemoryCommands {
+    /// List memory entries with optional filters
+    List {
+        #[arg(long)]
+        category: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long, default_value = "50")]
+        limit: usize,
+        #[arg(long, default_value = "0")]
+        offset: usize,
+    },
+    /// Get a specific memory entry by key
+    Get { key: String },
+    /// Show memory backend statistics and health
+    Stats,
+    /// Clear memories by category, by key, or clear all
+    Clear {
+        /// Delete a single entry by key (supports prefix match)
+        #[arg(long)]
+        key: Option<String>,
+        #[arg(long)]
+        category: Option<String>,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -890,6 +939,10 @@ async fn main() -> Result<()> {
 
         Commands::Migrate { migrate_command } => {
             migration::handle_command(migrate_command, &config).await
+        }
+
+        Commands::Memory { memory_command } => {
+            memory::cli::handle_command(memory_command, &config).await
         }
 
         Commands::Auth { auth_command } => handle_auth_command(auth_command, &config).await,

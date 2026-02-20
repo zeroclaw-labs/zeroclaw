@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod chunker;
+pub mod cli;
 pub mod embeddings;
 pub mod hygiene;
 pub mod lucid;
