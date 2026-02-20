@@ -550,7 +550,7 @@ fn canonical_provider_name(provider_name: &str) -> &str {
 fn allows_unauthenticated_model_fetch(provider_name: &str) -> bool {
     matches!(
         canonical_provider_name(provider_name),
-        "openrouter" | "ollama" | "llamacpp" | "venice" | "astrai" | "nvidia"
+        "openrouter" | "ollama" | "llamacpp" | "vllm" | "venice" | "astrai" | "nvidia"
     )
 }
 
@@ -585,6 +585,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "qwen-code" => "qwen3-coder-plus".into(),
         "ollama" => "llama3.2".into(),
         "llamacpp" => "ggml-org/gpt-oss-20b-GGUF".into(),
+        "vllm" => "default".into(),
         "gemini" => "gemini-2.5-pro".into(),
         "kimi-code" => "kimi-for-coding".into(),
         "bedrock" => "anthropic.claude-sonnet-4-5-20250929-v1:0".into(),
@@ -933,6 +934,20 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "Qwen2.5 Coder 7B GGUF (coding-focused)".to_string(),
             ),
         ],
+        "vllm" => vec![
+            (
+                "meta-llama/Llama-3.1-8B-Instruct".to_string(),
+                "Llama 3.1 8B Instruct (popular, fast)".to_string(),
+            ),
+            (
+                "meta-llama/Llama-3.1-70B-Instruct".to_string(),
+                "Llama 3.1 70B Instruct (high quality)".to_string(),
+            ),
+            (
+                "Qwen/Qwen2.5-Coder-7B-Instruct".to_string(),
+                "Qwen2.5 Coder 7B Instruct (coding-focused)".to_string(),
+            ),
+        ],
         "bedrock" => vec![
             (
                 "anthropic.claude-sonnet-4-6".to_string(),
@@ -987,6 +1002,7 @@ fn supports_live_model_fetch(provider_name: &str) -> bool {
             | "gemini"
             | "ollama"
             | "llamacpp"
+            | "vllm"
             | "astrai"
             | "venice"
             | "fireworks"
@@ -1023,6 +1039,7 @@ fn models_endpoint_for_provider(provider_name: &str) -> Option<&'static str> {
             "nvidia" => Some("https://integrate.api.nvidia.com/v1/models"),
             "astrai" => Some("https://as-trai.com/v1/models"),
             "llamacpp" => Some("http://localhost:8080/v1/models"),
+            "vllm" => Some("http://localhost:8000/v1/models"),
             _ => None,
         },
     }
@@ -1253,7 +1270,7 @@ fn resolve_live_models_endpoint(
     provider_name: &str,
     provider_api_url: Option<&str>,
 ) -> Option<String> {
-    if canonical_provider_name(provider_name) == "llamacpp" {
+    if matches!(canonical_provider_name(provider_name), "llamacpp" | "vllm") {
         if let Some(url) = provider_api_url
             .map(str::trim)
             .filter(|url| !url.is_empty())
@@ -1724,7 +1741,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
         "⚡ Fast inference (Groq, Fireworks, Together AI, NVIDIA NIM)",
         "🌐 Gateway / proxy (Vercel AI, Cloudflare AI, Amazon Bedrock)",
         "🔬 Specialized (Moonshot/Kimi, GLM/Zhipu, MiniMax, Qwen/DashScope, Qianfan, Z.AI, Synthetic, OpenCode Zen, Cohere)",
-        "🏠 Local / private (Ollama, llama.cpp server — no API key needed)",
+        "🏠 Local / private (Ollama, llama.cpp server, vLLM — no API key needed)",
         "🔧 Custom — bring your own OpenAI-compatible API",
     ];
 
@@ -1807,6 +1824,10 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
             (
                 "llamacpp",
                 "llama.cpp server — local OpenAI-compatible endpoint",
+            ),
+            (
+                "vllm",
+                "vLLM — high-performance local inference engine",
             ),
         ],
         _ => vec![], // Custom — handled below
@@ -1947,6 +1968,37 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
             print_bullet(&format!(
                 "No API key provided. Set {} later only if your server requires authentication.",
                 style("LLAMACPP_API_KEY").yellow()
+            ));
+        }
+
+        key
+    } else if provider_name == "vllm" {
+        let raw_url: String = Input::new()
+            .with_prompt("  vLLM server endpoint URL")
+            .default("http://localhost:8000/v1".into())
+            .interact_text()?;
+
+        let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
+        if normalized_url.is_empty() {
+            anyhow::bail!("vLLM endpoint URL cannot be empty.");
+        }
+        provider_api_url = Some(normalized_url.clone());
+
+        print_bullet(&format!(
+            "Using vLLM server endpoint: {}",
+            style(&normalized_url).cyan()
+        ));
+        print_bullet("No API key needed unless your vLLM server requires authentication.");
+
+        let key: String = Input::new()
+            .with_prompt("  API key for vLLM server (or Enter to skip)")
+            .allow_empty(true)
+            .interact_text()?;
+
+        if key.trim().is_empty() {
+            print_bullet(&format!(
+                "No API key provided. Set {} later only if your server requires authentication.",
+                style("VLLM_API_KEY").yellow()
             ));
         }
 
@@ -2352,6 +2404,7 @@ fn provider_env_var(name: &str) -> &'static str {
         "openai" => "OPENAI_API_KEY",
         "ollama" => "OLLAMA_API_KEY",
         "llamacpp" => "LLAMACPP_API_KEY",
+        "vllm" => "VLLM_API_KEY",
         "venice" => "VENICE_API_KEY",
         "groq" => "GROQ_API_KEY",
         "mistral" => "MISTRAL_API_KEY",
@@ -2383,7 +2436,7 @@ fn provider_env_var(name: &str) -> &'static str {
 fn provider_supports_keyless_local_usage(provider_name: &str) -> bool {
     matches!(
         canonical_provider_name(provider_name),
-        "ollama" | "llamacpp"
+        "ollama" | "llamacpp" | "vllm"
     )
 }
 
@@ -5588,6 +5641,7 @@ mod tests {
             default_model_for_provider("llamacpp"),
             "ggml-org/gpt-oss-20b-GGUF"
         );
+        assert_eq!(default_model_for_provider("vllm"), "default");
         assert_eq!(
             default_model_for_provider("astrai"),
             "anthropic/claude-sonnet-4.6"
@@ -5698,6 +5752,7 @@ mod tests {
         assert!(allows_unauthenticated_model_fetch("ollama"));
         assert!(allows_unauthenticated_model_fetch("llamacpp"));
         assert!(allows_unauthenticated_model_fetch("llama.cpp"));
+        assert!(allows_unauthenticated_model_fetch("vllm"));
         assert!(!allows_unauthenticated_model_fetch("openai"));
         assert!(!allows_unauthenticated_model_fetch("deepseek"));
     }
@@ -5739,6 +5794,7 @@ mod tests {
         assert!(supports_live_model_fetch("ollama"));
         assert!(supports_live_model_fetch("llamacpp"));
         assert!(supports_live_model_fetch("llama.cpp"));
+        assert!(supports_live_model_fetch("vllm"));
         assert!(supports_live_model_fetch("astrai"));
         assert!(supports_live_model_fetch("venice"));
         assert!(supports_live_model_fetch("glm-cn"));
@@ -5849,6 +5905,10 @@ mod tests {
             models_endpoint_for_provider("llama.cpp"),
             Some("http://localhost:8080/v1/models")
         );
+        assert_eq!(
+            models_endpoint_for_provider("vllm"),
+            Some("http://localhost:8000/v1/models")
+        );
         assert_eq!(models_endpoint_for_provider("perplexity"), None);
         assert_eq!(models_endpoint_for_provider("unknown-provider"), None);
     }
@@ -5874,6 +5934,10 @@ mod tests {
         assert_eq!(
             resolve_live_models_endpoint("llamacpp", None),
             Some("http://localhost:8080/v1/models".to_string())
+        );
+        assert_eq!(
+            resolve_live_models_endpoint("vllm", None),
+            Some("http://localhost:8000/v1/models".to_string())
         );
         assert_eq!(
             resolve_live_models_endpoint("venice", Some("http://localhost:9999/v1")),
@@ -5904,6 +5968,18 @@ mod tests {
         )));
         assert!(ollama_uses_remote_endpoint(Some("https://ollama.com")));
         assert!(ollama_uses_remote_endpoint(Some("https://ollama.com/api")));
+    }
+
+    #[test]
+    fn resolve_live_models_endpoint_prefers_vllm_custom_url() {
+        assert_eq!(
+            resolve_live_models_endpoint("vllm", Some("http://127.0.0.1:9000/v1")),
+            Some("http://127.0.0.1:9000/v1/models".to_string())
+        );
+        assert_eq!(
+            resolve_live_models_endpoint("vllm", Some("http://127.0.0.1:9000/v1/models")),
+            Some("http://127.0.0.1:9000/v1/models".to_string())
+        );
     }
 
     #[test]
@@ -6055,6 +6131,7 @@ mod tests {
         assert_eq!(provider_env_var("ollama"), "OLLAMA_API_KEY");
         assert_eq!(provider_env_var("llamacpp"), "LLAMACPP_API_KEY");
         assert_eq!(provider_env_var("llama.cpp"), "LLAMACPP_API_KEY");
+        assert_eq!(provider_env_var("vllm"), "VLLM_API_KEY");
         assert_eq!(provider_env_var("xai"), "XAI_API_KEY");
         assert_eq!(provider_env_var("grok"), "XAI_API_KEY"); // alias
         assert_eq!(provider_env_var("together"), "TOGETHER_API_KEY"); // alias
@@ -6087,6 +6164,7 @@ mod tests {
         assert!(provider_supports_keyless_local_usage("ollama"));
         assert!(provider_supports_keyless_local_usage("llamacpp"));
         assert!(provider_supports_keyless_local_usage("llama.cpp"));
+        assert!(provider_supports_keyless_local_usage("vllm"));
         assert!(!provider_supports_keyless_local_usage("openai"));
     }
 

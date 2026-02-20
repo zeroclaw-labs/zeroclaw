@@ -850,6 +850,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "ovhcloud" | "ovh" => vec!["OVH_AI_ENDPOINTS_ACCESS_TOKEN"],
         "astrai" => vec!["ASTRAI_API_KEY"],
         "llamacpp" | "llama.cpp" => vec!["LLAMACPP_API_KEY"],
+        "vllm" => vec!["VLLM_API_KEY"],
         _ => vec![],
     };
 
@@ -1111,6 +1112,18 @@ fn create_provider_with_url_and_options(
                 "llama.cpp",
                 base_url,
                 Some(llama_cpp_key),
+                AuthStyle::Bearer,
+            )))
+        }
+        "vllm" => {
+            let base_url = api_url
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("http://localhost:8000/v1");
+            Ok(Box::new(OpenAiCompatibleProvider::new(
+                "vLLM",
+                base_url,
+                key,
                 AuthStyle::Bearer,
             )))
         }
@@ -1568,6 +1581,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             local: true,
         },
         ProviderInfo {
+            name: "vllm",
+            display_name: "vLLM",
+            aliases: &[],
+            local: true,
+        },
+        ProviderInfo {
             name: "nvidia",
             display_name: "NVIDIA NIM",
             aliases: &["nvidia-nim", "build.nvidia.com"],
@@ -2022,6 +2041,12 @@ mod tests {
         assert!(create_provider("llamacpp", None).is_ok());
     }
 
+    #[test]
+    fn factory_vllm() {
+        assert!(create_provider("vllm", None).is_ok());
+        assert!(create_provider("vllm", Some("key")).is_ok());
+    }
+
     // ── Extended ecosystem ───────────────────────────────────
 
     #[test]
@@ -2372,6 +2397,7 @@ mod tests {
             "qwen-code",
             "lmstudio",
             "llamacpp",
+            "vllm",
             "groq",
             "mistral",
             "xai",
