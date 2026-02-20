@@ -1606,9 +1606,7 @@ pub async fn run(
             }
 
             // Auto-save conversation turns (skip short/trivial messages)
-            if config.memory.auto_save
-                && user_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-            {
+            if config.memory.auto_save && user_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
                 let user_key = autosave_memory_key("user_msg");
                 let _ = mem
                     .store(&user_key, &user_input, MemoryCategory::Conversation, None)
@@ -3045,5 +3043,61 @@ Let me check the result."#;
         assert_eq!(history.len(), 3); // system + 2 kept
         assert_eq!(history[0].role, "system");
         assert_eq!(history[1].content, "new msg");
+    }
+
+    /// When `build_system_prompt_with_mode` is called with `native_tools = true`,
+    /// the output must contain ZERO XML protocol artifacts. In the native path
+    /// `build_tool_instructions` is never called, so the system prompt alone
+    /// must be clean of XML tool-call protocol.
+    #[test]
+    fn native_tools_system_prompt_contains_zero_xml() {
+        use crate::channels::build_system_prompt_with_mode;
+
+        let tool_summaries: Vec<(&str, &str)> = vec![
+            ("shell", "Execute shell commands"),
+            ("file_read", "Read files"),
+        ];
+
+        let system_prompt = build_system_prompt_with_mode(
+            std::path::Path::new("/tmp"),
+            "test-model",
+            &tool_summaries,
+            &[],  // no skills
+            None, // no identity config
+            None, // no bootstrap_max_chars
+            true, // native_tools
+        );
+
+        // Must contain zero XML protocol artifacts
+        assert!(
+            !system_prompt.contains("<tool_call>"),
+            "Native prompt must not contain <tool_call>"
+        );
+        assert!(
+            !system_prompt.contains("</tool_call>"),
+            "Native prompt must not contain </tool_call>"
+        );
+        assert!(
+            !system_prompt.contains("<tool_result>"),
+            "Native prompt must not contain <tool_result>"
+        );
+        assert!(
+            !system_prompt.contains("</tool_result>"),
+            "Native prompt must not contain </tool_result>"
+        );
+        assert!(
+            !system_prompt.contains("## Tool Use Protocol"),
+            "Native prompt must not contain XML protocol header"
+        );
+
+        // Positive: native prompt should still list tools and contain task instructions
+        assert!(
+            system_prompt.contains("shell"),
+            "Native prompt must list tool names"
+        );
+        assert!(
+            system_prompt.contains("## Your Task"),
+            "Native prompt should contain task instructions"
+        );
     }
 }
