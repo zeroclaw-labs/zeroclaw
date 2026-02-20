@@ -2039,7 +2039,8 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                     tg.mention_only,
                 )
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
-                .with_transcription(config.transcription.clone()),
+                .with_transcription(config.transcription.clone())
+                .with_workspace_dir(config.workspace_dir.clone()),
             ),
         ));
     }
@@ -2439,7 +2440,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 tg.mention_only,
             )
             .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
-            .with_transcription(config.transcription.clone()),
+            .with_transcription(config.transcription.clone())
+            .with_workspace_dir(config.workspace_dir.clone()),
         ));
     }
 
@@ -5245,5 +5247,76 @@ Mon Feb 20
     fn normalize_empty_input() {
         let result = normalize_cached_channel_turns(vec![]);
         assert!(result.is_empty());
+    }
+
+    // ── E2E: photo [IMAGE:] marker rejected by non-vision provider ───
+
+    /// End-to-end test: a photo attachment message (containing `[IMAGE:]`
+    /// marker) sent through `process_channel_message` with a non-vision
+    /// provider must produce a `"⚠️ Error: …does not support vision"` reply
+    /// on the recording channel — no real Telegram or LLM API required.
+    #[tokio::test]
+    async fn e2e_photo_attachment_rejected_by_non_vision_provider() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        // DummyProvider has default capabilities (vision: false).
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(DummyProvider),
+            default_provider: Arc::new("dummy".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("You are a helpful assistant.".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+        });
+
+        // Simulate a photo attachment message with [IMAGE:] marker.
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-photo-1".to_string(),
+                sender: "zeroclaw_user".to_string(),
+                reply_target: "chat-photo".to_string(),
+                content: "[IMAGE:/tmp/workspace/photo_99_1.jpg]\n\nWhat is this?".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1, "expected exactly one reply message");
+        assert!(
+            sent[0].contains("does not support vision"),
+            "reply must mention vision capability error, got: {}",
+            sent[0]
+        );
+        assert!(
+            sent[0].contains("⚠️ Error"),
+            "reply must start with error prefix, got: {}",
+            sent[0]
+        );
     }
 }

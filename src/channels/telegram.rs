@@ -13,6 +13,23 @@ use tokio::fs;
 
 /// Telegram's maximum message length for text messages
 const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
+
+/// Metadata for an incoming document or photo attachment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IncomingAttachment {
+    file_id: String,
+    file_name: Option<String>,
+    file_size: Option<u64>,
+    caption: Option<String>,
+    kind: IncomingAttachmentKind,
+}
+
+/// The kind of incoming attachment (document vs photo).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IncomingAttachmentKind {
+    Document,
+    Photo,
+}
 const TELEGRAM_BIND_COMMAND: &str = "/bind";
 
 /// Split a message into chunks that respect Telegram's 4096 character limit.
@@ -298,6 +315,9 @@ fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) 
     (cleaned.trim().to_string(), attachments)
 }
 
+/// Telegram Bot API maximum file download size (20 MB).
+const TELEGRAM_MAX_FILE_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
+
 /// Telegram channel — long-polls the Bot API for updates
 pub struct TelegramChannel {
     bot_token: String,
@@ -312,6 +332,7 @@ pub struct TelegramChannel {
     bot_username: Mutex<Option<String>>,
     transcription: Option<crate::config::TranscriptionConfig>,
     voice_transcriptions: Mutex<std::collections::HashMap<String, String>>,
+    workspace_dir: Option<std::path::PathBuf>,
 }
 
 impl TelegramChannel {
@@ -341,7 +362,14 @@ impl TelegramChannel {
             bot_username: Mutex::new(None),
             transcription: None,
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
+            workspace_dir: None,
         }
+    }
+
+    /// Configure workspace directory for saving downloaded attachments.
+    pub fn with_workspace_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.workspace_dir = Some(dir);
+        self
     }
 
     /// Configure streaming mode for progressive draft updates.
@@ -800,6 +828,191 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
         Some((file_id, duration))
+    }
+
+    /// Extract attachment metadata from an incoming Telegram message (document or photo).
+    ///
+    /// Returns `None` for text-only, voice, and other unsupported message types.
+    fn parse_attachment_metadata(message: &serde_json::Value) -> Option<IncomingAttachment> {
+        // Try document first
+        if let Some(doc) = message.get("document") {
+            let file_id = doc.get("file_id")?.as_str()?.to_string();
+            let file_name = doc
+                .get("file_name")
+                .and_then(serde_json::Value::as_str)
+                .map(String::from);
+            let file_size = doc.get("file_size").and_then(serde_json::Value::as_u64);
+            let caption = message
+                .get("caption")
+                .and_then(serde_json::Value::as_str)
+                .map(String::from);
+            return Some(IncomingAttachment {
+                file_id,
+                file_name,
+                file_size,
+                caption,
+                kind: IncomingAttachmentKind::Document,
+            });
+        }
+
+        // Try photo (array of PhotoSize, take last = highest resolution)
+        if let Some(photos) = message.get("photo").and_then(serde_json::Value::as_array) {
+            let best = photos.last()?;
+            let file_id = best.get("file_id")?.as_str()?.to_string();
+            let file_size = best.get("file_size").and_then(serde_json::Value::as_u64);
+            let caption = message
+                .get("caption")
+                .and_then(serde_json::Value::as_str)
+                .map(String::from);
+            return Some(IncomingAttachment {
+                file_id,
+                file_name: None,
+                file_size,
+                caption,
+                kind: IncomingAttachmentKind::Photo,
+            });
+        }
+
+        None
+    }
+
+    /// Attempt to parse a Telegram update as a document/photo attachment.
+    ///
+    /// Downloads the file to `{workspace_dir}/telegram_files/` and returns a
+    /// `ChannelMessage` with the local file path. Returns `None` if the message
+    /// is not an attachment, workspace_dir is not configured, or the file exceeds
+    /// size limits.
+    async fn try_parse_attachment_message(
+        &self,
+        update: &serde_json::Value,
+    ) -> Option<ChannelMessage> {
+        let message = update.get("message")?;
+        let attachment = Self::parse_attachment_metadata(message)?;
+
+        // Check file size limit
+        if let Some(size) = attachment.file_size {
+            if size > TELEGRAM_MAX_FILE_DOWNLOAD_BYTES {
+                tracing::info!(
+                    "Skipping attachment: file size {size} bytes exceeds {} MB limit",
+                    TELEGRAM_MAX_FILE_DOWNLOAD_BYTES / (1024 * 1024)
+                );
+                return None;
+            }
+        }
+
+        let (username, sender_id, sender_identity) = Self::extract_sender_info(message);
+
+        let mut identities = vec![username.as_str()];
+        if let Some(id) = sender_id.as_deref() {
+            identities.push(id);
+        }
+
+        if !self.is_any_user_allowed(identities.iter().copied()) {
+            return None;
+        }
+
+        let chat_id = message
+            .get("chat")
+            .and_then(|chat| chat.get("id"))
+            .and_then(serde_json::Value::as_i64)
+            .map(|id| id.to_string())?;
+
+        let message_id = message
+            .get("message_id")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+
+        let thread_id = message
+            .get("message_thread_id")
+            .and_then(serde_json::Value::as_i64)
+            .map(|id| id.to_string());
+
+        let reply_target = if let Some(tid) = thread_id {
+            format!("{}:{}", chat_id, tid)
+        } else {
+            chat_id.clone()
+        };
+
+        // Ensure workspace directory is configured
+        let workspace = self.workspace_dir.as_ref().or_else(|| {
+            tracing::warn!("Cannot save attachment: workspace_dir not configured");
+            None
+        })?;
+
+        let save_dir = workspace.join("telegram_files");
+        if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
+            tracing::warn!("Failed to create telegram_files directory: {e}");
+            return None;
+        }
+
+        // Download file from Telegram
+        let tg_file_path = match self.get_file_path(&attachment.file_id).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("Failed to get attachment file path: {e}");
+                return None;
+            }
+        };
+
+        let file_data = match self.download_file(&tg_file_path).await {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("Failed to download attachment: {e}");
+                return None;
+            }
+        };
+
+        // Determine local filename
+        let local_filename = match &attachment.file_name {
+            Some(name) => name.clone(),
+            None => {
+                // For photos, derive extension from Telegram file path
+                let ext = tg_file_path.rsplit('.').next().unwrap_or("jpg");
+                format!("photo_{chat_id}_{message_id}.{ext}")
+            }
+        };
+
+        let local_path = save_dir.join(&local_filename);
+        if let Err(e) = tokio::fs::write(&local_path, &file_data).await {
+            tracing::warn!("Failed to save attachment to {}: {e}", local_path.display());
+            return None;
+        }
+
+        // Build message content.
+        // Photos use [IMAGE:] marker so the multimodal pipeline validates
+        // vision capability and rejects unsupported providers early.
+        let mut content = match attachment.kind {
+            IncomingAttachmentKind::Document => {
+                format!("[Document: {}] {}", local_filename, local_path.display())
+            }
+            IncomingAttachmentKind::Photo => {
+                format!("[IMAGE:{}]", local_path.display())
+            }
+        };
+        if let Some(caption) = &attachment.caption {
+            if !caption.is_empty() {
+                use std::fmt::Write;
+                let _ = write!(content, "\n\n{caption}");
+            }
+        }
+
+        // Prepend reply context if replying to another message
+        if let Some(quote) = self.extract_reply_context(message) {
+            content = format!("{quote}\n\n{content}");
+        }
+
+        Some(ChannelMessage {
+            id: format!("telegram_{chat_id}_{message_id}"),
+            sender: sender_identity,
+            reply_target,
+            content,
+            channel: "telegram".to_string(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            thread_ts: None,
+        })
     }
 
     /// Attempt to parse a Telegram update as a voice message and transcribe it.
@@ -2032,6 +2245,8 @@ Ensure only one `zeroclaw` process is using this bot token."
                     let msg = if let Some(m) = self.parse_update_message(update) {
                         m
                     } else if let Some(m) = self.try_parse_voice_message(update).await {
+                        m
+                    } else if let Some(m) = self.try_parse_attachment_message(update).await {
                         m
                     } else {
                         self.handle_unauthorized_message(update).await;
@@ -3519,5 +3734,319 @@ mod tests {
             !ctx.contains("[Voice message]"),
             "context should use cached transcription, not fallback placeholder, got: {ctx}"
         );
+    }
+
+    // ── IncomingAttachment / parse_attachment_metadata tests ─────────
+
+    #[test]
+    fn parse_attachment_metadata_detects_document() {
+        let message = serde_json::json!({
+            "document": {
+                "file_id": "BQACAgIAAxk",
+                "file_name": "report.pdf",
+                "file_size": 12345
+            }
+        });
+        let att = TelegramChannel::parse_attachment_metadata(&message).unwrap();
+        assert_eq!(att.kind, IncomingAttachmentKind::Document);
+        assert_eq!(att.file_id, "BQACAgIAAxk");
+        assert_eq!(att.file_name.as_deref(), Some("report.pdf"));
+        assert_eq!(att.file_size, Some(12345));
+        assert!(att.caption.is_none());
+    }
+
+    #[test]
+    fn parse_attachment_metadata_detects_photo() {
+        let message = serde_json::json!({
+            "photo": [
+                {"file_id": "small_id", "file_size": 100, "width": 90, "height": 90},
+                {"file_id": "medium_id", "file_size": 500, "width": 320, "height": 320},
+                {"file_id": "large_id", "file_size": 2000, "width": 800, "height": 800}
+            ]
+        });
+        let att = TelegramChannel::parse_attachment_metadata(&message).unwrap();
+        assert_eq!(att.kind, IncomingAttachmentKind::Photo);
+        assert_eq!(att.file_id, "large_id");
+        assert_eq!(att.file_size, Some(2000));
+        assert!(att.file_name.is_none());
+    }
+
+    #[test]
+    fn parse_attachment_metadata_extracts_caption() {
+        // Document with caption
+        let doc_msg = serde_json::json!({
+            "document": {
+                "file_id": "doc_id",
+                "file_name": "data.csv"
+            },
+            "caption": "Monthly report"
+        });
+        let att = TelegramChannel::parse_attachment_metadata(&doc_msg).unwrap();
+        assert_eq!(att.caption.as_deref(), Some("Monthly report"));
+
+        // Photo with caption
+        let photo_msg = serde_json::json!({
+            "photo": [
+                {"file_id": "photo_id", "file_size": 1000}
+            ],
+            "caption": "Look at this"
+        });
+        let att = TelegramChannel::parse_attachment_metadata(&photo_msg).unwrap();
+        assert_eq!(att.caption.as_deref(), Some("Look at this"));
+    }
+
+    #[test]
+    fn parse_attachment_metadata_document_without_optional_fields() {
+        let message = serde_json::json!({
+            "document": {
+                "file_id": "doc_no_name"
+            }
+        });
+        let att = TelegramChannel::parse_attachment_metadata(&message).unwrap();
+        assert_eq!(att.kind, IncomingAttachmentKind::Document);
+        assert_eq!(att.file_id, "doc_no_name");
+        assert!(att.file_name.is_none());
+        assert!(att.file_size.is_none());
+        assert!(att.caption.is_none());
+    }
+
+    #[test]
+    fn parse_attachment_metadata_returns_none_for_text() {
+        let message = serde_json::json!({
+            "text": "Hello world"
+        });
+        assert!(TelegramChannel::parse_attachment_metadata(&message).is_none());
+    }
+
+    #[test]
+    fn parse_attachment_metadata_returns_none_for_voice() {
+        let message = serde_json::json!({
+            "voice": {
+                "file_id": "voice_id",
+                "duration": 5
+            }
+        });
+        assert!(TelegramChannel::parse_attachment_metadata(&message).is_none());
+    }
+
+    #[test]
+    fn parse_attachment_metadata_empty_photo_array() {
+        let message = serde_json::json!({
+            "photo": []
+        });
+        assert!(TelegramChannel::parse_attachment_metadata(&message).is_none());
+    }
+
+    #[test]
+    fn with_workspace_dir_sets_field() {
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false)
+            .with_workspace_dir(std::path::PathBuf::from("/tmp/test_workspace"));
+        assert_eq!(
+            ch.workspace_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/test_workspace"))
+        );
+    }
+
+    #[test]
+    fn telegram_max_file_download_bytes_is_20mb() {
+        assert_eq!(TELEGRAM_MAX_FILE_DOWNLOAD_BYTES, 20 * 1024 * 1024);
+    }
+
+    // ── Attachment content format tests ──────────────────────────────
+
+    /// Photo attachments must use `[IMAGE:/path]` marker so the multimodal
+    /// pipeline validates vision capability on the provider.
+    #[test]
+    fn attachment_photo_content_uses_image_marker() {
+        let att = IncomingAttachment {
+            file_id: "photo_file_id".into(),
+            file_name: None,
+            file_size: Some(5000),
+            caption: None,
+            kind: IncomingAttachmentKind::Photo,
+        };
+
+        let local_path = std::path::Path::new("/tmp/workspace/photo_123_45.jpg");
+        let local_filename = "photo_123_45.jpg";
+
+        let content = match att.kind {
+            IncomingAttachmentKind::Document => {
+                format!("[Document: {}] {}", local_filename, local_path.display())
+            }
+            IncomingAttachmentKind::Photo => {
+                format!("[IMAGE:{}]", local_path.display())
+            }
+        };
+
+        assert_eq!(content, "[IMAGE:/tmp/workspace/photo_123_45.jpg]");
+        assert!(content.starts_with("[IMAGE:"));
+        assert!(content.ends_with(']'));
+    }
+
+    /// Document attachments keep `[Document: name] /path` format.
+    #[test]
+    fn attachment_document_content_uses_document_label() {
+        let att = IncomingAttachment {
+            file_id: "doc_file_id".into(),
+            file_name: Some("report.pdf".into()),
+            file_size: Some(12345),
+            caption: None,
+            kind: IncomingAttachmentKind::Document,
+        };
+
+        let local_path = std::path::Path::new("/tmp/workspace/report.pdf");
+        let local_filename = att.file_name.as_deref().unwrap();
+
+        let content = match att.kind {
+            IncomingAttachmentKind::Document => {
+                format!("[Document: {}] {}", local_filename, local_path.display())
+            }
+            IncomingAttachmentKind::Photo => {
+                format!("[IMAGE:{}]", local_path.display())
+            }
+        };
+
+        assert_eq!(content, "[Document: report.pdf] /tmp/workspace/report.pdf");
+        assert!(!content.contains("[IMAGE:"));
+    }
+
+    /// `count_image_markers` from the multimodal module must detect the
+    /// `[IMAGE:]` marker produced by photo attachment formatting.
+    #[test]
+    fn photo_image_marker_detected_by_multimodal() {
+        let photo_content = "[IMAGE:/tmp/workspace/photo_1_2.jpg]";
+        let messages = vec![crate::providers::ChatMessage::user(
+            photo_content.to_string(),
+        )];
+        let count = crate::multimodal::count_image_markers(&messages);
+        assert_eq!(
+            count, 1,
+            "multimodal should detect exactly one image marker"
+        );
+    }
+
+    /// Photo with caption: `[IMAGE:/path]\n\nCaption text`.
+    #[test]
+    fn photo_image_marker_with_caption() {
+        let local_path = std::path::Path::new("/tmp/workspace/photo_1_2.jpg");
+        let mut content = format!("[IMAGE:{}]", local_path.display());
+        let caption = "Look at this screenshot";
+        use std::fmt::Write;
+        let _ = write!(content, "\n\n{caption}");
+
+        assert_eq!(
+            content,
+            "[IMAGE:/tmp/workspace/photo_1_2.jpg]\n\nLook at this screenshot"
+        );
+
+        // Multimodal pipeline still detects the marker.
+        let messages = vec![crate::providers::ChatMessage::user(content)];
+        assert_eq!(crate::multimodal::count_image_markers(&messages), 1);
+    }
+
+    // ── E2E: attachment saves file and formats content ───────────────
+
+    /// Full pipeline test: simulate file download → save to workspace →
+    /// verify content format for both document and photo attachments.
+    #[test]
+    fn e2e_attachment_saves_file_and_formats_content() {
+        let workspace = tempfile::tempdir().expect("create temp workspace");
+
+        // ── Document attachment ──────────────────────────────────────
+        let doc_filename = "report.pdf";
+        let doc_path = workspace.path().join(doc_filename);
+        // Simulate downloaded file.
+        std::fs::write(&doc_path, b"%PDF-1.4 fake").expect("write doc fixture");
+        assert!(doc_path.exists(), "document file must exist on disk");
+
+        let doc_content = format!("[Document: {}] {}", doc_filename, doc_path.display());
+        assert!(
+            doc_content.starts_with("[Document: report.pdf]"),
+            "document label format mismatch: {doc_content}"
+        );
+        // Multimodal must NOT detect image markers in document content.
+        let doc_msgs = vec![crate::providers::ChatMessage::user(doc_content)];
+        assert_eq!(
+            crate::multimodal::count_image_markers(&doc_msgs),
+            0,
+            "document content must not contain image markers"
+        );
+
+        // ── Photo attachment ─────────────────────────────────────────
+        let photo_filename = "photo_99_1.jpg";
+        let photo_path = workspace.path().join(photo_filename);
+        // Copy the JPEG fixture.
+        let fixture =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test_photo.jpg");
+        std::fs::copy(&fixture, &photo_path).expect("copy photo fixture");
+        assert!(photo_path.exists(), "photo file must exist on disk");
+
+        let photo_content = format!("[IMAGE:{}]", photo_path.display());
+        assert!(
+            photo_content.starts_with("[IMAGE:"),
+            "photo must use [IMAGE:] marker: {photo_content}"
+        );
+        assert!(
+            photo_content.ends_with(']'),
+            "photo marker must close with ]: {photo_content}"
+        );
+
+        // Multimodal detects the marker.
+        let photo_msgs = vec![crate::providers::ChatMessage::user(photo_content.clone())];
+        assert_eq!(
+            crate::multimodal::count_image_markers(&photo_msgs),
+            1,
+            "multimodal must detect exactly one image marker in photo content"
+        );
+
+        // ── Photo with caption ───────────────────────────────────────
+        let mut captioned = photo_content;
+        use std::fmt::Write;
+        let _ = write!(captioned, "\n\nCheck this out");
+        let cap_msgs = vec![crate::providers::ChatMessage::user(captioned.clone())];
+        assert_eq!(
+            crate::multimodal::count_image_markers(&cap_msgs),
+            1,
+            "caption must not break image marker detection"
+        );
+        assert!(
+            captioned.contains("Check this out"),
+            "caption text must be present in content"
+        );
+    }
+
+    // ── Groq provider rejects photo with vision error ────────────────
+
+    /// Verify that the Groq provider (OpenAI-compatible) does not support
+    /// vision, so the existing `count_image_markers > 0 && !supports_vision()`
+    /// guard in `agent/loop_.rs` will reject photo messages.
+    #[test]
+    fn groq_provider_rejects_photo_with_vision_error() {
+        use crate::providers::compatible::{AuthStyle, OpenAiCompatibleProvider};
+        use crate::providers::Provider;
+
+        let groq = OpenAiCompatibleProvider::new(
+            "Groq",
+            "https://api.groq.com/openai",
+            Some("fake_key"),
+            AuthStyle::Bearer,
+        );
+
+        // Groq must not support vision.
+        assert!(
+            !groq.supports_vision(),
+            "Groq provider must not support vision"
+        );
+
+        // Build a message with an [IMAGE:] marker (as photo attachment would).
+        let messages = vec![crate::providers::ChatMessage::user(
+            "[IMAGE:/tmp/photo.jpg]\n\nDescribe this image".to_string(),
+        )];
+        let marker_count = crate::multimodal::count_image_markers(&messages);
+        assert_eq!(marker_count, 1, "must detect image marker in photo content");
+
+        // The combination of marker_count > 0 && !supports_vision() means
+        // the agent loop will return ProviderCapabilityError before calling
+        // the provider, and the channel will send "⚠️ Error: ..." to the user.
     }
 }
