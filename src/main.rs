@@ -89,6 +89,20 @@ pub use zeroclaw::{
     PeripheralCommands, ServiceCommands, SkillCommands,
 };
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum CompletionShell {
+    #[value(name = "bash")]
+    Bash,
+    #[value(name = "fish")]
+    Fish,
+    #[value(name = "zsh")]
+    Zsh,
+    #[value(name = "powershell")]
+    PowerShell,
+    #[value(name = "elvish")]
+    Elvish,
+}
+
 /// `ZeroClaw` - Zero overhead. Zero compromise. 100% Rust.
 #[derive(Parser, Debug)]
 #[command(name = "zeroclaw")]
