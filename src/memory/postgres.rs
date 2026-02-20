@@ -13,8 +13,9 @@ const POSTGRES_CONNECT_TIMEOUT_CAP_SECS: u64 = 300;
 
 /// PostgreSQL-backed persistent memory.
 ///
-/// This backend focuses on reliable CRUD and keyword recall using SQL, without
-/// requiring extension setup (for example pgvector).
+/// This backend focuses on reliable CRUD and keyword recall using SQL.
+/// During initialization it enables the `vector` extension (pgvector) so that
+/// callers can add vector columns or indexes later without a separate migration.
 pub struct PostgresMemory {
     client: Arc<Mutex<Client>>,
     qualified_table: String,
@@ -69,6 +70,14 @@ impl PostgresMemory {
     }
 
     fn init_schema(client: &mut Client, schema_ident: &str, qualified_table: &str) -> Result<()> {
+        // Enable pgvector. Requires the extension to be installed on the server
+        // (e.g. postgresql-*-pgvector package). IF NOT EXISTS makes this safe
+        // to run repeatedly without error. Run this before schema/table DDL so
+        // that the extension is available for any vector columns added later.
+        client
+            .batch_execute("CREATE EXTENSION IF NOT EXISTS vector;")
+            .context("failed to enable pgvector extension; ensure the extension is installed on the PostgreSQL server")?;
+
         client.batch_execute(&format!(
             "
             CREATE SCHEMA IF NOT EXISTS {schema_ident};
