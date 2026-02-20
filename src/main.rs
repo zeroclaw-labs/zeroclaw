@@ -83,8 +83,11 @@ mod util;
 
 use config::Config;
 
-// Re-export so binary's hardware/peripherals modules can use crate::HardwareCommands etc.
-pub use zeroclaw::{HardwareCommands, PeripheralCommands};
+// Re-export so binary modules can use crate::<CommandEnum> while keeping a single source of truth.
+pub use zeroclaw::{
+    ChannelCommands, CronCommands, HardwareCommands, IntegrationCommands, MigrateCommands,
+    PeripheralCommands, ServiceCommands, SkillCommands,
+};
 
 /// `ZeroClaw` - Zero overhead. Zero compromise. 100% Rust.
 #[derive(Parser, Debug)]
@@ -98,36 +101,6 @@ struct Cli {
 
     #[command(subcommand)]
     command: Commands,
-}
-
-#[derive(Subcommand, Debug)]
-enum ServiceCommands {
-    /// Install daemon service unit for auto-start and restart
-    Install,
-    /// Start daemon service
-    Start,
-    /// Stop daemon service
-    Stop,
-    /// Restart daemon service to apply latest config
-    Restart,
-    /// Check daemon service status
-    Status,
-    /// Uninstall daemon service unit
-    Uninstall,
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
-enum CompletionShell {
-    #[value(name = "bash")]
-    Bash,
-    #[value(name = "fish")]
-    Fish,
-    #[value(name = "zsh")]
-    Zsh,
-    #[value(name = "powershell")]
-    PowerShell,
-    #[value(name = "elvish")]
-    Elvish,
 }
 
 #[derive(Subcommand, Debug)]
@@ -518,89 +491,6 @@ enum AuthCommands {
 }
 
 #[derive(Subcommand, Debug)]
-enum MigrateCommands {
-    /// Import memory from an `OpenClaw` workspace into this `ZeroClaw` workspace
-    Openclaw {
-        /// Optional path to `OpenClaw` workspace (defaults to ~/.openclaw/workspace)
-        #[arg(long)]
-        source: Option<std::path::PathBuf>,
-
-        /// Validate and preview migration without writing any data
-        #[arg(long)]
-        dry_run: bool,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum CronCommands {
-    /// List all scheduled tasks
-    List,
-    /// Add a new scheduled task
-    Add {
-        /// Cron expression
-        expression: String,
-        /// Optional IANA timezone (e.g. America/Los_Angeles)
-        #[arg(long)]
-        tz: Option<String>,
-        /// Command to run
-        command: String,
-    },
-    /// Add a one-shot scheduled task at an RFC3339 timestamp
-    AddAt {
-        /// One-shot timestamp in RFC3339 format
-        at: String,
-        /// Command to run
-        command: String,
-    },
-    /// Add a fixed-interval scheduled task
-    AddEvery {
-        /// Interval in milliseconds
-        every_ms: u64,
-        /// Command to run
-        command: String,
-    },
-    /// Add a one-shot delayed task (e.g. "30m", "2h", "1d")
-    Once {
-        /// Delay duration
-        delay: String,
-        /// Command to run
-        command: String,
-    },
-    /// Remove a scheduled task
-    Remove {
-        /// Task ID
-        id: String,
-    },
-    /// Update a scheduled task
-    Update {
-        /// Task ID
-        id: String,
-        /// New cron expression
-        #[arg(long)]
-        expression: Option<String>,
-        /// New IANA timezone
-        #[arg(long)]
-        tz: Option<String>,
-        /// New command to run
-        #[arg(long)]
-        command: Option<String>,
-        /// New job name
-        #[arg(long)]
-        name: Option<String>,
-    },
-    /// Pause a scheduled task
-    Pause {
-        /// Task ID
-        id: String,
-    },
-    /// Resume a paused task
-    Resume {
-        /// Task ID
-        id: String,
-    },
-}
-
-#[derive(Subcommand, Debug)]
 enum ModelCommands {
     /// Refresh and cache provider models
     Refresh {
@@ -625,49 +515,6 @@ enum DoctorCommands {
         /// Prefer cached catalogs when available (skip forced live refresh)
         #[arg(long)]
         use_cache: bool,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum ChannelCommands {
-    /// List configured channels
-    List,
-    /// Start all configured channels (Telegram, Discord, Slack)
-    Start,
-    /// Run health checks for configured channels
-    Doctor,
-    /// Add a new channel
-    Add {
-        /// Channel type
-        channel_type: String,
-        /// Configuration JSON
-        config: String,
-    },
-    /// Remove a channel
-    Remove {
-        /// Channel name
-        name: String,
-    },
-    /// Bind a Telegram identity (username or numeric user ID) into allowlist
-    BindTelegram {
-        /// Telegram identity to allow (username without '@' or numeric user ID)
-        identity: String,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum SkillCommands {
-    /// List installed skills
-    List,
-    /// Install a skill from a GitHub URL or local path
-    Install {
-        /// GitHub URL or local path
-        source: String,
-    },
-    /// Remove an installed skill
-    Remove {
-        /// Skill name
-        name: String,
     },
 }
 
@@ -698,15 +545,6 @@ enum MemoryCommands {
         /// Skip confirmation prompt
         #[arg(long)]
         yes: bool,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum IntegrationCommands {
-    /// Show details about a specific integration
-    Info {
-        /// Integration name
-        name: String,
     },
 }
 
