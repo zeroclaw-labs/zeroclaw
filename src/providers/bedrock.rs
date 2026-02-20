@@ -190,6 +190,24 @@ enum ContentBlock {
     ToolUse(ToolUseWrapper),
     ToolResult(ToolResultWrapper),
     CachePointBlock(CachePointWrapper),
+    Image(ImageWrapper),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ImageWrapper {
+    image: ImageBlock,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ImageBlock {
+    format: String,
+    source: ImageSource,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ImageSource {
+    bytes: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -438,11 +456,10 @@ impl BedrockProvider {
                     }
                 }
                 _ => {
+                    let content_blocks = Self::parse_user_content_blocks(&msg.content);
                     converse_messages.push(ConverseMessage {
                         role: "user".to_string(),
-                        content: vec![ContentBlock::Text(TextBlock {
-                            text: msg.content.clone(),
-                        })],
+                        content: content_blocks,
                     });
                 }
             }
@@ -454,6 +471,69 @@ impl BedrockProvider {
             Some(system_blocks)
         };
         (system, converse_messages)
+    }
+
+    /// Parse user message content, extracting [IMAGE:data:...] markers into image blocks.
+    fn parse_user_content_blocks(content: &str) -> Vec<ContentBlock> {
+        let mut blocks: Vec<ContentBlock> = Vec::new();
+        let mut remaining = content;
+        let has_image = content.contains("[IMAGE:");
+        tracing::info!("parse_user_content_blocks called, len={}, has_image={}", content.len(), has_image);
+
+        while let Some(start) = remaining.find("[IMAGE:") {
+            // Add any text before the marker
+            let text_before = &remaining[..start];
+            if !text_before.trim().is_empty() {
+                blocks.push(ContentBlock::Text(TextBlock { text: text_before.to_string() }));
+            }
+
+            let after = &remaining[start + 7..]; // skip "[IMAGE:"
+            if let Some(end) = after.find(']') {
+                let src = &after[..end];
+                remaining = &after[end + 1..];
+
+                // Only handle data URIs (base64 encoded images)
+                if let Some(rest) = src.strip_prefix("data:") {
+                    if let Some(semi) = rest.find(';') {
+                        let mime = &rest[..semi];
+                        let after_semi = &rest[semi + 1..];
+                        if let Some(b64) = after_semi.strip_prefix("base64,") {
+                            let format = match mime {
+                                "image/jpeg" | "image/jpg" => "jpeg",
+                                "image/png" => "png",
+                                "image/gif" => "gif",
+                                "image/webp" => "webp",
+                                _ => "jpeg",
+                            };
+                            blocks.push(ContentBlock::Image(ImageWrapper {
+                                image: ImageBlock {
+                                    format: format.to_string(),
+                                    source: ImageSource { bytes: b64.to_string() },
+                                },
+                            }));
+                            continue;
+                        }
+                    }
+                }
+                // Non-data-uri image: just include as text reference
+                blocks.push(ContentBlock::Text(TextBlock { text: format!("[image: {}]", src) }));
+            } else {
+                // No closing bracket, treat rest as text
+                blocks.push(ContentBlock::Text(TextBlock { text: remaining.to_string() }));
+                break;
+            }
+        }
+
+        // Add any remaining text
+        if !remaining.trim().is_empty() {
+            blocks.push(ContentBlock::Text(TextBlock { text: remaining.to_string() }));
+        }
+
+        if blocks.is_empty() {
+            blocks.push(ContentBlock::Text(TextBlock { text: content.to_string() }));
+        }
+
+        blocks
     }
 
     /// Parse assistant message containing structured tool calls.
@@ -584,6 +664,31 @@ impl BedrockProvider {
         request_body: &ConverseRequest,
     ) -> anyhow::Result<ConverseResponse> {
         let payload = serde_json::to_vec(request_body)?;
+
+        // Debug: log image blocks in payload (truncated)
+        if let Ok(debug_val) = serde_json::from_slice::<serde_json::Value>(&payload) {
+            if let Some(msgs) = debug_val.get("messages").and_then(|m| m.as_array()) {
+                for msg in msgs {
+                    if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
+                        for block in content {
+                            if block.get("image").is_some() {
+                                let mut b = block.clone();
+                                if let Some(img) = b.get_mut("image") {
+                                    if let Some(src) = img.get_mut("source") {
+                                        if let Some(bytes) = src.get_mut("bytes") {
+                                            if let Some(s) = bytes.as_str() {
+                                                *bytes = serde_json::json!(format!("<base64 {} chars>", s.len()));
+                                            }
+                                        }
+                                    }
+                                }
+                                tracing::info!("Bedrock image block: {}", serde_json::to_string(&b).unwrap_or_default());
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let url = Self::endpoint_url(&credentials.region, model);
         let canonical_uri = Self::canonical_uri(model);
         let now = chrono::Utc::now();
@@ -639,7 +744,7 @@ impl Provider for BedrockProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             native_tool_calling: true,
-            vision: false,
+            vision: true,
         }
     }
 
@@ -688,9 +793,7 @@ impl Provider for BedrockProvider {
             system,
             messages: vec![ConverseMessage {
                 role: "user".to_string(),
-                content: vec![ContentBlock::Text(TextBlock {
-                    text: message.to_string(),
-                })],
+                content: Self::parse_user_content_blocks(message),
             }],
             inference_config: Some(InferenceConfig {
                 max_tokens: DEFAULT_MAX_TOKENS,
