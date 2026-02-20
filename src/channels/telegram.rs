@@ -756,10 +756,29 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
     }
 
-    fn parse_update_message(&self, update: &serde_json::Value) -> Option<ChannelMessage> {
+    fn parse_update_message(&self, update: &serde_json::Value) -> Option<(ChannelMessage, Option<String>)> {
         let message = update.get("message")?;
 
-        let text = message.get("text").and_then(serde_json::Value::as_str)?;
+        // Support both text messages and photo messages (with optional caption)
+        let text_opt = message.get("text").and_then(serde_json::Value::as_str);
+        let caption_opt = message.get("caption").and_then(serde_json::Value::as_str);
+
+        // Extract file_id from photo (highest resolution = last element)
+        let photo_file_id = message.get("photo")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|photos| photos.last())
+            .and_then(|p| p.get("file_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(|s| s.to_string());
+
+        // Require at least text, caption, or photo
+        let text = match (text_opt, caption_opt, &photo_file_id) {
+            (Some(t), _, _) => t.to_string(),
+            (None, Some(c), Some(_)) => c.to_string(),
+            (None, Some(c), None) => c.to_string(),
+            (None, None, Some(_)) => String::new(), // will be filled with image marker later
+            (None, None, None) => return None,
+        };
 
         let username = message
             .get("from")
@@ -793,7 +812,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         if self.mention_only && is_group {
             let bot_username = self.bot_username.lock();
             if let Some(ref bot_username) = *bot_username {
-                if !Self::contains_bot_mention(text, bot_username) {
+                if !Self::contains_bot_mention(&text, bot_username) {
                     return None;
                 }
             } else {
@@ -828,12 +847,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let content = if self.mention_only && is_group {
             let bot_username = self.bot_username.lock();
             let bot_username = bot_username.as_ref()?;
-            Self::normalize_incoming_content(text, bot_username)?
+            Self::normalize_incoming_content(&text, bot_username)?
         } else {
             text.to_string()
         };
 
-        Some(ChannelMessage {
+        Some((ChannelMessage {
             id: format!("telegram_{chat_id}_{message_id}"),
             sender: sender_identity,
             reply_target,
@@ -844,7 +863,52 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .unwrap_or_default()
                 .as_secs(),
             thread_ts: None,
-        })
+        }, photo_file_id))
+    }
+
+    /// Download a Telegram photo by file_id, resize to fit within 1024px, and return as base64 data URI.
+    async fn resolve_photo_data_uri(&self, file_id: &str) -> anyhow::Result<String> {
+        use base64::Engine as _;
+
+        // Step 1: call getFile to get file_path
+        let get_file_url = self.api_url(&format!("getFile?file_id={}", file_id));
+        let resp = self.http_client().get(&get_file_url).send().await?;
+        let json: serde_json::Value = resp.json().await?;
+        let file_path = json
+            .get("result")
+            .and_then(|r| r.get("file_path"))
+            .and_then(|p| p.as_str())
+            .ok_or_else(|| anyhow::anyhow!("getFile: no file_path in response"))?
+            .to_string();
+
+        // Step 2: download the actual file
+        let download_url = format!(
+            "https://api.telegram.org/file/bot{}/{}",
+            self.bot_token, file_path
+        );
+        let img_resp = self.http_client().get(&download_url).send().await?;
+        let bytes = img_resp.bytes().await?;
+
+        // Step 3: resize to max 1024px on longest side to fit within model context
+        let resized_bytes = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
+            let img = image::load_from_memory(&bytes)?;
+            let (w, h) = (img.width(), img.height());
+            let max_dim = 512u32;
+            let resized = if w > max_dim || h > max_dim {
+                img.thumbnail(max_dim, max_dim)
+            } else {
+                img
+            };
+            let mut buf = Vec::new();
+            resized.write_to(
+                &mut std::io::Cursor::new(&mut buf),
+                image::ImageFormat::Jpeg,
+            )?;
+            Ok(buf)
+        }).await??;
+
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&resized_bytes);
+        Ok(format!("data:image/jpeg;base64,{}", b64))
     }
 
     async fn send_text_chunks(
@@ -1794,10 +1858,23 @@ Ensure only one `zeroclaw` process is using this bot token."
                         offset = uid + 1;
                     }
 
-                    let Some(msg) = self.parse_update_message(update) else {
+                    let Some((mut msg, photo_file_id)) = self.parse_update_message(update) else {
                         self.handle_unauthorized_message(update).await;
                         continue;
                     };
+
+                    // Resolve photo file_id to data URI and inject as IMAGE marker
+                    if let Some(file_id) = photo_file_id {
+                        if let Ok(data_uri) = self.resolve_photo_data_uri(&file_id).await {
+                            let image_marker = format!("[IMAGE:{}]", data_uri);
+                            if msg.content.is_empty() {
+                                msg.content = image_marker;
+                            } else {
+                                msg.content = format!("{}\n{}", msg.content, image_marker);
+                            }
+                        }
+                    }
+
                     // Send "typing" indicator immediately when we receive a message
                     let typing_body = serde_json::json!({
                         "chat_id": &msg.reply_target,
@@ -2164,7 +2241,7 @@ mod tests {
         });
 
         let msg = ch
-            .parse_update_message(&update)
+            .parse_update_message(&update).map(|(m,_)|m)
             .expect("message should parse");
 
         assert_eq!(msg.sender, "alice");
@@ -2191,7 +2268,7 @@ mod tests {
         });
 
         let msg = ch
-            .parse_update_message(&update)
+            .parse_update_message(&update).map(|(m,_)|m)
             .expect("numeric allowlist should pass");
 
         assert_eq!(msg.sender, "555");
@@ -2218,7 +2295,7 @@ mod tests {
         });
 
         let msg = ch
-            .parse_update_message(&update)
+            .parse_update_message(&update).map(|(m,_)|m)
             .expect("message with thread_id should parse");
 
         assert_eq!(msg.sender, "alice");
@@ -2831,7 +2908,7 @@ mod tests {
         });
 
         let parsed = ch
-            .parse_update_message(&update)
+            .parse_update_message(&update).map(|(m,_)|m)
             .expect("mention should parse");
         assert_eq!(parsed.content, "Hi status please");
 
