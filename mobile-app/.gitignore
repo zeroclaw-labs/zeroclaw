@@ -12,6 +12,10 @@ node_modules/
 .env.local
 .env.*.local
 
+# Credential files and dev scripts (NEVER COMMIT)
+scripts/prepopulate-config.ts
+scripts/check-automotive.sh
+
 # Build artifacts
 *.apk
 *.aab
