@@ -91,7 +91,7 @@ impl<'js> HookRegistry<'js> {
             .or_insert_with(|| (worker_id, HashMap::new()))
             .1
             .entry(event_name)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(handler);
     }
 
@@ -171,12 +171,6 @@ mod tests {
         pub timeout_ms: u64,
     }
 
-    impl TestHookHandler {
-        fn to_registry_key(&self) -> (i32, u64) {
-            (self.priority, self.timeout_ms)
-        }
-    }
-
     // For testing purposes, we store handlers as tuples of (priority, timeout)
     // instead of full HookHandler with Function
     type TestRegistry = HashMap<String, (usize, HashMap<String, Vec<(i32, u64)>>)>;
@@ -194,7 +188,7 @@ mod tests {
             .or_insert_with(|| (worker_id, HashMap::new()))
             .1
             .entry(event_name)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push((priority, timeout_ms));
     }
 
@@ -224,6 +218,14 @@ mod tests {
 
     fn test_unregister_plugin(hooks: &mut TestRegistry, plugin_id: &str) {
         hooks.remove(plugin_id);
+    }
+
+    fn test_has_hooks_for(hooks: &TestRegistry, plugin_id: &str, event_name: &str) -> bool {
+        if let Some((_, handlers)) = hooks.get(plugin_id) {
+            handlers.get(event_name).map_or(false, |h| !h.is_empty())
+        } else {
+            false
+        }
     }
 
     #[test]
@@ -418,5 +420,62 @@ mod tests {
 
         let handlers = test_get_handlers(&hooks, "tool.call.pre");
         assert!(handlers.is_empty());
+    }
+
+    #[test]
+    fn has_hooks_for_returns_true_when_plugin_has_hook() {
+        let mut hooks = TestRegistry::new();
+
+        test_register_hook(
+            &mut hooks,
+            "plugin1".to_string(),
+            0,
+            "message.received".to_string(),
+            100,
+            5000,
+        );
+
+        assert!(test_has_hooks_for(&hooks, "plugin1", "message.received"));
+    }
+
+    #[test]
+    fn has_hooks_for_returns_false_when_plugin_has_no_hook_for_event() {
+        let mut hooks = TestRegistry::new();
+
+        test_register_hook(
+            &mut hooks,
+            "plugin1".to_string(),
+            0,
+            "message.received".to_string(),
+            100,
+            5000,
+        );
+
+        assert!(!test_has_hooks_for(&hooks, "plugin1", "tool.call.pre"));
+    }
+
+    #[test]
+    fn has_hooks_for_returns_false_when_plugin_not_found() {
+        let hooks = TestRegistry::new();
+
+        assert!(!test_has_hooks_for(&hooks, "nonexistent", "message.received"));
+    }
+
+    #[test]
+    fn has_hooks_for_returns_false_for_empty_handler_list() {
+        let mut hooks = TestRegistry::new();
+
+        // Register a hook, then remove the plugin (leaving no hooks)
+        test_register_hook(
+            &mut hooks,
+            "plugin1".to_string(),
+            0,
+            "message.received".to_string(),
+            100,
+            5000,
+        );
+        test_unregister_plugin(&mut hooks, "plugin1");
+
+        assert!(!test_has_hooks_for(&hooks, "plugin1", "message.received"));
     }
 }

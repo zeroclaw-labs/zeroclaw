@@ -22,12 +22,13 @@ use serde_json::Value;
 ///
 /// Represents the outcome of a plugin hook handler. Each hook can
 /// either observe events passively, modify event data, or veto the operation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum HookResult {
     /// Fire-and-forget observation, no effect on event
     ///
     /// The hook runs for its side effects only (logging, metrics, etc.)
     /// and does not influence the execution flow.
+    #[default]
     Observation,
 
     /// Modified the event data
@@ -72,12 +73,6 @@ impl HookResult {
     /// Creates a new modified result with the given value
     pub fn modified(value: Value) -> Self {
         HookResult::Modified(value)
-    }
-}
-
-impl Default for HookResult {
-    fn default() -> Self {
-        HookResult::Observation
     }
 }
 
