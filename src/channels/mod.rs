@@ -260,20 +260,40 @@ fn build_channel_system_prompt(base_prompt: &str, channel_name: &str) -> String 
 }
 
 fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    if turns.is_empty() {
+        return turns;
+    }
+
+    // Find the last assistant message to split into "paired" and "trailing" sections.
+    let last_assistant_idx = turns.iter().rposition(|t| t.role == "assistant");
+
+    let (paired_end, trailing_start) = match last_assistant_idx {
+        Some(idx) => (idx + 1, idx + 1),
+        // No assistant messages — all turns are trailing user messages.
+        None => return turns,
+    };
+
+    // Enforce strict user/assistant alternation in the paired section.
     let mut normalized = Vec::with_capacity(turns.len());
     let mut expecting_user = true;
-
-    for turn in turns {
+    for turn in &turns[..paired_end] {
         match (expecting_user, turn.role.as_str()) {
             (true, "user") => {
-                normalized.push(turn);
+                normalized.push(turn.clone());
                 expecting_user = false;
             }
             (false, "assistant") => {
-                normalized.push(turn);
+                normalized.push(turn.clone());
                 expecting_user = true;
             }
             _ => {}
+        }
+    }
+
+    // Keep all trailing user messages (from interrupted turns + current turn).
+    for turn in &turns[trailing_start..] {
+        if turn.role == "user" {
+            normalized.push(turn.clone());
         }
     }
 
@@ -3837,7 +3857,7 @@ mod tests {
         channels_by_name.insert(channel.name().to_string(), channel);
 
         let provider_impl = Arc::new(DelayedHistoryCaptureProvider {
-            delay: Duration::from_millis(250),
+            delay: Duration::from_millis(500),
             calls: std::sync::Mutex::new(Vec::new()),
         });
 
@@ -3880,7 +3900,9 @@ mod tests {
             })
             .await
             .unwrap();
-            tokio::time::sleep(Duration::from_millis(40)).await;
+            // Give msg-1 enough time to start processing and append its
+            // user turn to conversation history before msg-2 arrives.
+            tokio::time::sleep(Duration::from_millis(300)).await;
             tx.send(traits::ChannelMessage {
                 id: "msg-2".to_string(),
                 sender: "alice".to_string(),
