@@ -686,27 +686,40 @@ async fn build_memory_context(
 /// or native tool-call JSON to collect tool names used.
 /// Returns an empty string when no tools were invoked.
 fn extract_tool_context_summary(history: &[ChatMessage], start_index: usize) -> String {
-    let mut tool_names: Vec<String> = Vec::new();
-
-    for msg in history.iter().skip(start_index) {
-        if msg.role != "assistant" {
-            continue;
+    fn push_unique_tool_name(tool_names: &mut Vec<String>, name: &str) {
+        let candidate = name.trim();
+        if candidate.is_empty() {
+            return;
         }
-        // Extract tool names from XML-style <tool_call> blocks
-        for segment in msg.content.split("<tool_call>") {
-            if let Some(json_end) = segment.find("</tool_call>") {
-                let json_str = segment[..json_end].trim();
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
-                    if let Some(name) = val.get("name").and_then(|n| n.as_str()) {
-                        if !tool_names.contains(&name.to_string()) {
-                            tool_names.push(name.to_string());
+        if !tool_names.iter().any(|existing| existing == candidate) {
+            tool_names.push(candidate.to_string());
+        }
+    }
+
+    fn collect_tool_names_from_tool_call_tags(content: &str, tool_names: &mut Vec<String>) {
+        const TAG_PAIRS: [(&str, &str); 4] = [
+            ("<tool_call>", "</tool_call>"),
+            ("<toolcall>", "</toolcall>"),
+            ("<tool-call>", "</tool-call>"),
+            ("<invoke>", "</invoke>"),
+        ];
+
+        for (open_tag, close_tag) in TAG_PAIRS {
+            for segment in content.split(open_tag) {
+                if let Some(json_end) = segment.find(close_tag) {
+                    let json_str = segment[..json_end].trim();
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
+                        if let Some(name) = val.get("name").and_then(|n| n.as_str()) {
+                            push_unique_tool_name(tool_names, name);
                         }
                     }
                 }
             }
         }
-        // Extract tool names from native tool-call JSON (tool_calls array in content)
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&msg.content) {
+    }
+
+    fn collect_tool_names_from_native_json(content: &str, tool_names: &mut Vec<String>) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(content) {
             if let Some(calls) = val.get("tool_calls").and_then(|c| c.as_array()) {
                 for call in calls {
                     let name = call
@@ -714,13 +727,44 @@ fn extract_tool_context_summary(history: &[ChatMessage], start_index: usize) -> 
                         .and_then(|f| f.get("name"))
                         .and_then(|n| n.as_str())
                         .or_else(|| call.get("name").and_then(|n| n.as_str()));
-                    if let Some(n) = name {
-                        if !tool_names.contains(&n.to_string()) {
-                            tool_names.push(n.to_string());
-                        }
+                    if let Some(name) = name {
+                        push_unique_tool_name(tool_names, name);
                     }
                 }
             }
+        }
+    }
+
+    fn collect_tool_names_from_tool_results(content: &str, tool_names: &mut Vec<String>) {
+        let marker = "<tool_result name=\"";
+        let mut remaining = content;
+        while let Some(start) = remaining.find(marker) {
+            let name_start = start + marker.len();
+            let after_name_start = &remaining[name_start..];
+            if let Some(name_end) = after_name_start.find('"') {
+                let name = &after_name_start[..name_end];
+                push_unique_tool_name(tool_names, name);
+                remaining = &after_name_start[name_end + 1..];
+            } else {
+                break;
+            }
+        }
+    }
+
+    let mut tool_names: Vec<String> = Vec::new();
+
+    for msg in history.iter().skip(start_index) {
+        match msg.role.as_str() {
+            "assistant" => {
+                collect_tool_names_from_tool_call_tags(&msg.content, &mut tool_names);
+                collect_tool_names_from_native_json(&msg.content, &mut tool_names);
+            }
+            "user" => {
+                // Prompt-mode tool calls are always followed by [Tool results] entries
+                // containing `<tool_result name="...">` tags with canonical tool names.
+                collect_tool_names_from_tool_results(&msg.content, &mut tool_names);
+            }
+            _ => {}
         }
     }
 
@@ -4281,6 +4325,63 @@ mod tests {
             "telegram delivery instruction should live in the system prompt"
         );
         assert!(!calls[0].iter().skip(1).any(|(role, _)| role == "system"));
+    }
+
+    #[test]
+    fn extract_tool_context_summary_collects_alias_and_native_tool_calls() {
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::assistant(
+                r#"<toolcall>
+{"name":"shell","arguments":{"command":"date"}}
+</toolcall>"#,
+            ),
+            ChatMessage::assistant(
+                r#"{"content":null,"tool_calls":[{"id":"1","name":"web_search","arguments":"{}"}]}"#,
+            ),
+        ];
+
+        let summary = extract_tool_context_summary(&history, 1);
+        assert_eq!(summary, "[Used tools: shell, web_search]");
+    }
+
+    #[test]
+    fn extract_tool_context_summary_collects_prompt_mode_tool_result_names() {
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::assistant("Using markdown tool call fence"),
+            ChatMessage::user(
+                r#"[Tool results]
+<tool_result name="http_request">
+{"status":200}
+</tool_result>
+<tool_result name="shell">
+Mon Feb 20
+</tool_result>"#,
+            ),
+        ];
+
+        let summary = extract_tool_context_summary(&history, 1);
+        assert_eq!(summary, "[Used tools: http_request, shell]");
+    }
+
+    #[test]
+    fn extract_tool_context_summary_respects_start_index() {
+        let history = vec![
+            ChatMessage::assistant(
+                r#"<tool_call>
+{"name":"stale_tool","arguments":{}}
+</tool_call>"#,
+            ),
+            ChatMessage::assistant(
+                r#"<tool_call>
+{"name":"fresh_tool","arguments":{}}
+</tool_call>"#,
+            ),
+        ];
+
+        let summary = extract_tool_context_summary(&history, 1);
+        assert_eq!(summary, "[Used tools: fresh_tool]");
     }
 
     // ── AIEOS Identity Tests (Issue #168) ─────────────────────────
