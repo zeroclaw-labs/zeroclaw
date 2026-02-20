@@ -93,7 +93,7 @@ jobs:
             - name: Build binary (smoke check)
               run: cargo build --profile release-fast --locked --verbose
             - name: Check binary size
-              run: ./scripts/ci/check_binary_size.sh target/release/zeroclaw
+              run: bash scripts/ci/check_binary_size.sh target/release/zeroclaw
 
     docs-only:
         name: Docs-Only Fast Path
