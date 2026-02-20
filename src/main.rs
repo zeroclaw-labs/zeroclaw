@@ -33,9 +33,10 @@
 )]
 
 use anyhow::{bail, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use dialoguer::{Input, Password};
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -110,6 +111,20 @@ enum ServiceCommands {
     Status,
     /// Uninstall daemon service unit
     Uninstall,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum CompletionShell {
+    #[value(name = "bash")]
+    Bash,
+    #[value(name = "fish")]
+    Fish,
+    #[value(name = "zsh")]
+    Zsh,
+    #[value(name = "powershell")]
+    PowerShell,
+    #[value(name = "elvish")]
+    Elvish,
 }
 
 #[derive(Subcommand, Debug)]
@@ -364,6 +379,22 @@ Examples:
     Config {
         #[command(subcommand)]
         config_command: ConfigCommands,
+    },
+
+    /// Generate shell completion script to stdout
+    #[command(long_about = "\
+Generate shell completion scripts for `zeroclaw`.
+
+The script is printed to stdout so it can be sourced directly:
+
+Examples:
+  source <(zeroclaw completions bash)
+  zeroclaw completions zsh > ~/.zfunc/_zeroclaw
+  zeroclaw completions fish > ~/.config/fish/completions/zeroclaw.fish")]
+    Completions {
+        /// Target shell
+        #[arg(value_enum)]
+        shell: CompletionShell,
     },
 }
 
@@ -631,6 +662,14 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // Completions must remain stdout-only and should not load config or initialize logging.
+    // This avoids warnings/log lines corrupting sourced completion scripts.
+    if let Commands::Completions { shell } = &cli.command {
+        let mut stdout = std::io::stdout().lock();
+        write_shell_completion(*shell, &mut stdout)?;
+        return Ok(());
+    }
+
     // Initialize logging - respects RUST_LOG env var, defaults to INFO
     let subscriber = fmt::Subscriber::builder()
         .with_env_filter(
@@ -694,6 +733,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Onboard { .. } => unreachable!(),
+        Commands::Completions { .. } => unreachable!(),
 
         Commands::Agent {
             message,
@@ -911,6 +951,27 @@ async fn main() -> Result<()> {
             }
         },
     }
+}
+
+fn write_shell_completion<W: Write>(shell: CompletionShell, writer: &mut W) -> Result<()> {
+    use clap_complete::generate;
+    use clap_complete::shells;
+
+    let mut cmd = Cli::command();
+    let bin_name = cmd.get_name().to_string();
+
+    match shell {
+        CompletionShell::Bash => generate(shells::Bash, &mut cmd, bin_name.clone(), writer),
+        CompletionShell::Fish => generate(shells::Fish, &mut cmd, bin_name.clone(), writer),
+        CompletionShell::Zsh => generate(shells::Zsh, &mut cmd, bin_name.clone(), writer),
+        CompletionShell::PowerShell => {
+            generate(shells::PowerShell, &mut cmd, bin_name.clone(), writer);
+        }
+        CompletionShell::Elvish => generate(shells::Elvish, &mut cmd, bin_name, writer),
+    }
+
+    writer.flush()?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1406,5 +1467,29 @@ mod tests {
             }
             other => panic!("expected onboard command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn completions_cli_parses_supported_shells() {
+        for shell in ["bash", "fish", "zsh", "powershell", "elvish"] {
+            let cli = Cli::try_parse_from(["zeroclaw", "completions", shell])
+                .expect("completions invocation should parse");
+            match cli.command {
+                Commands::Completions { .. } => {}
+                other => panic!("expected completions command, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn completion_generation_mentions_binary_name() {
+        let mut output = Vec::new();
+        write_shell_completion(CompletionShell::Bash, &mut output)
+            .expect("completion generation should succeed");
+        let script = String::from_utf8(output).expect("completion output should be valid utf-8");
+        assert!(
+            script.contains("zeroclaw"),
+            "completion script should reference binary name"
+        );
     }
 }
