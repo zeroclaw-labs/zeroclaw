@@ -46,6 +46,9 @@ static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Clie
 
 // ── Top-level config ──────────────────────────────────────────────
 
+/// Top-level ZeroClaw configuration, loaded from `config.toml`.
+///
+/// Resolution order: `ZEROCLAW_WORKSPACE` env → `active_workspace.toml` marker → `~/.zeroclaw/config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Config {
     /// Workspace directory - computed from home, not serialized
@@ -54,28 +57,38 @@ pub struct Config {
     /// Path to config.toml - computed from home, not serialized
     #[serde(skip)]
     pub config_path: PathBuf,
+    /// API key for the selected provider. Overridden by `ZEROCLAW_API_KEY` or `API_KEY` env vars.
     pub api_key: Option<String>,
     /// Base URL override for provider API (e.g. "http://10.0.0.1:11434" for remote Ollama)
     pub api_url: Option<String>,
+    /// Default provider ID or alias (e.g. `"openrouter"`, `"ollama"`, `"anthropic"`). Default: `"openrouter"`.
     pub default_provider: Option<String>,
+    /// Default model routed through the selected provider (e.g. `"anthropic/claude-sonnet-4-6"`).
     pub default_model: Option<String>,
+    /// Default model temperature (0.0–2.0). Default: `0.7`.
     pub default_temperature: f64,
 
+    /// Observability backend configuration (`[observability]`).
     #[serde(default)]
     pub observability: ObservabilityConfig,
 
+    /// Autonomy and security policy configuration (`[autonomy]`).
     #[serde(default)]
     pub autonomy: AutonomyConfig,
 
+    /// Runtime adapter configuration (`[runtime]`). Controls native vs Docker execution.
     #[serde(default)]
     pub runtime: RuntimeConfig,
 
+    /// Reliability settings: retries, fallback providers, backoff (`[reliability]`).
     #[serde(default)]
     pub reliability: ReliabilityConfig,
 
+    /// Scheduler configuration for periodic task execution (`[scheduler]`).
     #[serde(default)]
     pub scheduler: SchedulerConfig,
 
+    /// Agent orchestration settings (`[agent]`).
     #[serde(default)]
     pub agent: AgentConfig,
 
@@ -91,54 +104,71 @@ pub struct Config {
     #[serde(default)]
     pub query_classification: QueryClassificationConfig,
 
+    /// Heartbeat configuration for periodic health pings (`[heartbeat]`).
     #[serde(default)]
     pub heartbeat: HeartbeatConfig,
 
+    /// Cron job configuration (`[cron]`).
     #[serde(default)]
     pub cron: CronConfig,
 
+    /// Channel configurations: Telegram, Discord, Slack, etc. (`[channels_config]`).
     #[serde(default)]
     pub channels_config: ChannelsConfig,
 
+    /// Memory backend configuration: sqlite, markdown, embeddings (`[memory]`).
     #[serde(default)]
     pub memory: MemoryConfig,
 
+    /// Persistent storage provider configuration (`[storage]`).
     #[serde(default)]
     pub storage: StorageConfig,
 
+    /// Tunnel configuration for exposing the gateway publicly (`[tunnel]`).
     #[serde(default)]
     pub tunnel: TunnelConfig,
 
+    /// Gateway server configuration: host, port, pairing, rate limits (`[gateway]`).
     #[serde(default)]
     pub gateway: GatewayConfig,
 
+    /// Composio managed OAuth tools integration (`[composio]`).
     #[serde(default)]
     pub composio: ComposioConfig,
 
+    /// Secrets encryption configuration (`[secrets]`).
     #[serde(default)]
     pub secrets: SecretsConfig,
 
+    /// Browser automation configuration (`[browser]`).
     #[serde(default)]
     pub browser: BrowserConfig,
 
+    /// HTTP request tool configuration (`[http_request]`).
     #[serde(default)]
     pub http_request: HttpRequestConfig,
 
+    /// Multimodal (image) handling configuration (`[multimodal]`).
     #[serde(default)]
     pub multimodal: MultimodalConfig,
 
+    /// Web search tool configuration (`[web_search]`).
     #[serde(default)]
     pub web_search: WebSearchConfig,
 
+    /// Proxy configuration for outbound HTTP/HTTPS/SOCKS5 traffic (`[proxy]`).
     #[serde(default)]
     pub proxy: ProxyConfig,
 
+    /// Identity format configuration: OpenClaw or AIEOS (`[identity]`).
     #[serde(default)]
     pub identity: IdentityConfig,
 
+    /// Cost tracking and budget enforcement configuration (`[cost]`).
     #[serde(default)]
     pub cost: CostConfig,
 
+    /// Peripheral board configuration for hardware integration (`[peripherals]`).
     #[serde(default)]
     pub peripherals: PeripheralsConfig,
 
@@ -248,17 +278,23 @@ impl Default for HardwareConfig {
     }
 }
 
+/// Agent orchestration configuration (`[agent]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AgentConfig {
     /// When true: bootstrap_max_chars=6000, rag_chunk_limit=2. Use for 13B or smaller models.
     #[serde(default)]
     pub compact_context: bool,
+    /// Maximum tool-call loop turns per user message. Default: `10`.
+    /// Setting to `0` falls back to the safe default of `10`.
     #[serde(default = "default_agent_max_tool_iterations")]
     pub max_tool_iterations: usize,
+    /// Maximum conversation history messages retained per session. Default: `50`.
     #[serde(default = "default_agent_max_history_messages")]
     pub max_history_messages: usize,
+    /// Enable parallel tool execution within a single iteration. Default: `false`.
     #[serde(default)]
     pub parallel_tools: bool,
+    /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
     #[serde(default = "default_agent_tool_dispatcher")]
     pub tool_dispatcher: String,
 }
@@ -287,6 +323,7 @@ impl Default for AgentConfig {
     }
 }
 
+/// Multimodal (image) handling configuration (`[multimodal]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MultimodalConfig {
     /// Maximum number of image attachments accepted per request.
@@ -329,6 +366,9 @@ impl Default for MultimodalConfig {
 
 // ── Identity (AIEOS / OpenClaw format) ──────────────────────────
 
+/// Identity format configuration (`[identity]` section).
+///
+/// Supports `"openclaw"` (default) or `"aieos"` identity documents.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct IdentityConfig {
     /// Identity format: "openclaw" (default) or "aieos"
@@ -358,6 +398,7 @@ impl Default for IdentityConfig {
 
 // ── Cost tracking and budget enforcement ───────────────────────────
 
+/// Cost tracking and budget enforcement configuration (`[cost]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CostConfig {
     /// Enable cost tracking (default: false)
@@ -385,6 +426,7 @@ pub struct CostConfig {
     pub prices: std::collections::HashMap<String, ModelPricing>,
 }
 
+/// Per-model pricing entry (USD per 1M tokens).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ModelPricing {
     /// Input price per 1M tokens
@@ -499,6 +541,9 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
 
 // ── Peripherals (hardware: STM32, RPi GPIO, etc.) ────────────────────────
 
+/// Peripheral board integration configuration (`[peripherals]` section).
+///
+/// Boards become agent tools when enabled.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
 pub struct PeripheralsConfig {
     /// Enable peripheral support (boards become agent tools)
@@ -513,6 +558,7 @@ pub struct PeripheralsConfig {
     pub datasheet_dir: Option<String>,
 }
 
+/// Configuration for a single peripheral board (e.g. STM32, RPi GPIO).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PeripheralBoardConfig {
     /// Board type: "nucleo-f401re", "rpi-gpio", "esp32", etc.
@@ -549,6 +595,9 @@ impl Default for PeripheralBoardConfig {
 
 // ── Gateway security ─────────────────────────────────────────────
 
+/// Gateway server configuration (`[gateway]` section).
+///
+/// Controls the HTTP gateway for webhook and pairing endpoints.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GatewayConfig {
     /// Gateway port (default: 3000)
@@ -645,6 +694,9 @@ impl Default for GatewayConfig {
 
 // ── Composio (managed tool surface) ─────────────────────────────
 
+/// Composio managed OAuth tools integration (`[composio]` section).
+///
+/// Provides access to 1000+ OAuth-connected tools via the Composio platform.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ComposioConfig {
     /// Enable Composio integration for 1000+ OAuth tools
@@ -674,6 +726,7 @@ impl Default for ComposioConfig {
 
 // ── Secrets (encrypted credential store) ────────────────────────
 
+/// Secrets encryption configuration (`[secrets]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SecretsConfig {
     /// Enable encryption for API keys and tokens in config.toml
@@ -689,6 +742,9 @@ impl Default for SecretsConfig {
 
 // ── Browser (friendly-service browsing only) ───────────────────
 
+/// Computer-use sidecar configuration (`[browser.computer_use]` section).
+///
+/// Delegates OS-level mouse, keyboard, and screenshot actions to a local sidecar.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct BrowserComputerUseConfig {
     /// Sidecar endpoint for computer-use actions (OS-level mouse/keyboard/screenshot)
@@ -736,6 +792,9 @@ impl Default for BrowserComputerUseConfig {
     }
 }
 
+/// Browser automation configuration (`[browser]` section).
+///
+/// Controls the `browser_open` tool and browser automation backends.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct BrowserConfig {
     /// Enable `browser_open` tool (opens URLs in Brave without scraping)
@@ -789,6 +848,9 @@ impl Default for BrowserConfig {
 
 // ── HTTP request tool ───────────────────────────────────────────
 
+/// HTTP request tool configuration (`[http_request]` section).
+///
+/// Deny-by-default: if `allowed_domains` is empty, all HTTP requests are rejected.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
 pub struct HttpRequestConfig {
     /// Enable `http_request` tool for API interactions
@@ -815,6 +877,7 @@ fn default_http_timeout_secs() -> u64 {
 
 // ── Web search ───────────────────────────────────────────────────
 
+/// Web search tool configuration (`[web_search]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
@@ -860,15 +923,20 @@ impl Default for WebSearchConfig {
 
 // ── Proxy ───────────────────────────────────────────────────────
 
+/// Proxy application scope — determines which outbound traffic uses the proxy.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProxyScope {
+    /// Use system environment proxy variables only.
     Environment,
+    /// Apply proxy to all ZeroClaw-managed HTTP traffic (default).
     #[default]
     Zeroclaw,
+    /// Apply proxy only to explicitly listed service selectors.
     Services,
 }
 
+/// Proxy configuration for outbound HTTP/HTTPS/SOCKS5 traffic (`[proxy]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ProxyConfig {
     /// Enable proxy support for selected scope.
@@ -1319,18 +1387,23 @@ fn parse_proxy_enabled(raw: &str) -> Option<bool> {
 }
 // ── Memory ───────────────────────────────────────────────────
 
+/// Persistent storage configuration (`[storage]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
 pub struct StorageConfig {
+    /// Storage provider settings (e.g. sqlite, postgres).
     #[serde(default)]
     pub provider: StorageProviderSection,
 }
 
+/// Wrapper for the storage provider configuration section.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
 pub struct StorageProviderSection {
+    /// Storage provider backend settings.
     #[serde(default)]
     pub config: StorageProviderConfig,
 }
 
+/// Storage provider backend configuration (e.g. postgres connection details).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct StorageProviderConfig {
     /// Storage engine key (e.g. "postgres", "sqlite").
@@ -1380,6 +1453,10 @@ impl Default for StorageProviderConfig {
     }
 }
 
+/// Memory backend configuration (`[memory]` section).
+///
+/// Controls conversation memory storage, embeddings, hybrid search, response caching,
+/// and memory snapshot/hydration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct MemoryConfig {
@@ -1530,6 +1607,7 @@ impl Default for MemoryConfig {
 
 // ── Observability ─────────────────────────────────────────────────
 
+/// Observability backend configuration (`[observability]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ObservabilityConfig {
     /// "none" | "log" | "prometheus" | "otel"
@@ -1556,13 +1634,23 @@ impl Default for ObservabilityConfig {
 
 // ── Autonomy / Security ──────────────────────────────────────────
 
+/// Autonomy and security policy configuration (`[autonomy]` section).
+///
+/// Controls what the agent is allowed to do: shell commands, filesystem access,
+/// risk approval gates, and per-policy budgets.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AutonomyConfig {
+    /// Autonomy level: `read_only`, `supervised` (default), or `full`.
     pub level: AutonomyLevel,
+    /// Restrict file writes and command paths to the workspace directory. Default: `true`.
     pub workspace_only: bool,
+    /// Allowlist of executable names permitted for shell execution.
     pub allowed_commands: Vec<String>,
+    /// Explicit path denylist. Default includes system-critical paths.
     pub forbidden_paths: Vec<String>,
+    /// Maximum actions allowed per hour per policy. Default: `100`.
     pub max_actions_per_hour: u32,
+    /// Maximum cost per day in cents per policy. Default: `1000`.
     pub max_cost_per_day_cents: u32,
 
     /// Require explicit approval for medium-risk shell commands.
@@ -1641,6 +1729,7 @@ impl Default for AutonomyConfig {
 
 // ── Runtime ──────────────────────────────────────────────────────
 
+/// Runtime adapter configuration (`[runtime]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RuntimeConfig {
     /// Runtime kind (`native` | `docker`).
@@ -1659,6 +1748,7 @@ pub struct RuntimeConfig {
     pub reasoning_enabled: Option<bool>,
 }
 
+/// Docker runtime configuration (`[runtime.docker]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DockerRuntimeConfig {
     /// Runtime image used to execute shell commands.
@@ -1736,6 +1826,9 @@ impl Default for RuntimeConfig {
 
 // ── Reliability / supervision ────────────────────────────────────
 
+/// Reliability and supervision configuration (`[reliability]` section).
+///
+/// Controls provider retries, fallback chains, API key rotation, and channel restart backoff.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ReliabilityConfig {
     /// Retries per provider before failing over.
@@ -1811,6 +1904,7 @@ impl Default for ReliabilityConfig {
 
 // ── Scheduler ────────────────────────────────────────────────────
 
+/// Scheduler configuration for periodic task execution (`[scheduler]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SchedulerConfig {
     /// Enable the built-in scheduler loop.
@@ -1912,8 +2006,10 @@ pub struct EmbeddingRouteConfig {
 /// and routes to the appropriate model hint. Disabled by default.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
 pub struct QueryClassificationConfig {
+    /// Enable automatic query classification. Default: `false`.
     #[serde(default)]
     pub enabled: bool,
+    /// Classification rules evaluated in priority order.
     #[serde(default)]
     pub rules: Vec<ClassificationRule>,
 }
@@ -1942,9 +2038,12 @@ pub struct ClassificationRule {
 
 // ── Heartbeat ────────────────────────────────────────────────────
 
+/// Heartbeat configuration for periodic health pings (`[heartbeat]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HeartbeatConfig {
+    /// Enable periodic heartbeat pings. Default: `false`.
     pub enabled: bool,
+    /// Interval in minutes between heartbeat pings. Default: `30`.
     pub interval_minutes: u32,
 }
 
@@ -1959,10 +2058,13 @@ impl Default for HeartbeatConfig {
 
 // ── Cron ────────────────────────────────────────────────────────
 
+/// Cron job configuration (`[cron]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CronConfig {
+    /// Enable the cron subsystem. Default: `true`.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Maximum number of historical cron run records to retain. Default: `50`.
     #[serde(default = "default_max_run_history")]
     pub max_run_history: u32,
 }
@@ -1982,20 +2084,27 @@ impl Default for CronConfig {
 
 // ── Tunnel ──────────────────────────────────────────────────────
 
+/// Tunnel configuration for exposing the gateway publicly (`[tunnel]` section).
+///
+/// Supported providers: `"none"` (default), `"cloudflare"`, `"tailscale"`, `"ngrok"`, `"custom"`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TunnelConfig {
-    /// "none", "cloudflare", "tailscale", "ngrok", "custom"
+    /// Tunnel provider: `"none"`, `"cloudflare"`, `"tailscale"`, `"ngrok"`, or `"custom"`. Default: `"none"`.
     pub provider: String,
 
+    /// Cloudflare Tunnel configuration (used when `provider = "cloudflare"`).
     #[serde(default)]
     pub cloudflare: Option<CloudflareTunnelConfig>,
 
+    /// Tailscale Funnel/Serve configuration (used when `provider = "tailscale"`).
     #[serde(default)]
     pub tailscale: Option<TailscaleTunnelConfig>,
 
+    /// ngrok tunnel configuration (used when `provider = "ngrok"`).
     #[serde(default)]
     pub ngrok: Option<NgrokTunnelConfig>,
 
+    /// Custom tunnel command configuration (used when `provider = "custom"`).
     #[serde(default)]
     pub custom: Option<CustomTunnelConfig>,
 }
@@ -2048,23 +2157,43 @@ pub struct CustomTunnelConfig {
 
 // ── Channels ─────────────────────────────────────────────────────
 
+/// Top-level channel configurations (`[channels_config]` section).
+///
+/// Each channel sub-section (e.g. `telegram`, `discord`) is optional;
+/// setting it to `Some(...)` enables that channel.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ChannelsConfig {
+    /// Enable the CLI interactive channel. Default: `true`.
     pub cli: bool,
+    /// Telegram bot channel configuration.
     pub telegram: Option<TelegramConfig>,
+    /// Discord bot channel configuration.
     pub discord: Option<DiscordConfig>,
+    /// Slack bot channel configuration.
     pub slack: Option<SlackConfig>,
+    /// Mattermost bot channel configuration.
     pub mattermost: Option<MattermostConfig>,
+    /// Webhook channel configuration.
     pub webhook: Option<WebhookConfig>,
+    /// iMessage channel configuration (macOS only).
     pub imessage: Option<IMessageConfig>,
+    /// Matrix channel configuration.
     pub matrix: Option<MatrixConfig>,
+    /// Signal channel configuration.
     pub signal: Option<SignalConfig>,
+    /// WhatsApp channel configuration (Cloud API or Web mode).
     pub whatsapp: Option<WhatsAppConfig>,
+    /// Linq Partner API channel configuration.
     pub linq: Option<LinqConfig>,
+    /// Email channel configuration.
     pub email: Option<crate::channels::email_channel::EmailConfig>,
+    /// IRC channel configuration.
     pub irc: Option<IrcConfig>,
+    /// Lark/Feishu channel configuration.
     pub lark: Option<LarkConfig>,
+    /// DingTalk channel configuration.
     pub dingtalk: Option<DingTalkConfig>,
+    /// QQ Official Bot channel configuration.
     pub qq: Option<QQConfig>,
     /// Timeout in seconds for processing a single channel message (LLM + tools).
     /// Default: 300s for on-device LLMs (Ollama) which are slower than cloud APIs.
@@ -2115,9 +2244,12 @@ fn default_draft_update_interval_ms() -> u64 {
     1000
 }
 
+/// Telegram bot channel configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TelegramConfig {
+    /// Telegram Bot API token (from @BotFather).
     pub bot_token: String,
+    /// Allowed Telegram user IDs or usernames. Empty = deny all.
     pub allowed_users: Vec<String>,
     /// Streaming mode for progressive response delivery via message edits.
     #[serde(default)]
@@ -2135,10 +2267,14 @@ pub struct TelegramConfig {
     pub mention_only: bool,
 }
 
+/// Discord bot channel configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DiscordConfig {
+    /// Discord bot token (from Discord Developer Portal).
     pub bot_token: String,
+    /// Optional guild (server) ID to restrict the bot to a single guild.
     pub guild_id: Option<String>,
+    /// Allowed Discord user IDs. Empty = deny all.
     #[serde(default)]
     pub allowed_users: Vec<String>,
     /// When true, process messages from other bots (not just humans).
@@ -2151,20 +2287,30 @@ pub struct DiscordConfig {
     pub mention_only: bool,
 }
 
+/// Slack bot channel configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SlackConfig {
+    /// Slack bot OAuth token (xoxb-...).
     pub bot_token: String,
+    /// Slack app-level token for Socket Mode (xapp-...).
     pub app_token: Option<String>,
+    /// Optional channel ID to restrict the bot to a single channel.
     pub channel_id: Option<String>,
+    /// Allowed Slack user IDs. Empty = deny all.
     #[serde(default)]
     pub allowed_users: Vec<String>,
 }
 
+/// Mattermost bot channel configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MattermostConfig {
+    /// Mattermost server URL (e.g. `"https://mattermost.example.com"`).
     pub url: String,
+    /// Mattermost bot access token.
     pub bot_token: String,
+    /// Optional channel ID to restrict the bot to a single channel.
     pub channel_id: Option<String>,
+    /// Allowed Mattermost user IDs. Empty = deny all.
     #[serde(default)]
     pub allowed_users: Vec<String>,
     /// When true (default), replies thread on the original post.
@@ -2177,26 +2323,38 @@ pub struct MattermostConfig {
     pub mention_only: Option<bool>,
 }
 
+/// Webhook channel configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WebhookConfig {
+    /// Port to listen on for incoming webhooks.
     pub port: u16,
+    /// Optional shared secret for webhook signature verification.
     pub secret: Option<String>,
 }
 
+/// iMessage channel configuration (macOS only).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct IMessageConfig {
+    /// Allowed iMessage contacts (phone numbers or email addresses). Empty = deny all.
     pub allowed_contacts: Vec<String>,
 }
 
+/// Matrix channel configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MatrixConfig {
+    /// Matrix homeserver URL (e.g. `"https://matrix.org"`).
     pub homeserver: String,
+    /// Matrix access token for the bot account.
     pub access_token: String,
+    /// Optional Matrix user ID (e.g. `"@bot:matrix.org"`).
     #[serde(default)]
     pub user_id: Option<String>,
+    /// Optional Matrix device ID.
     #[serde(default)]
     pub device_id: Option<String>,
+    /// Matrix room ID to listen in (e.g. `"!abc123:matrix.org"`).
     pub room_id: String,
+    /// Allowed Matrix user IDs. Empty = deny all.
     pub allowed_users: Vec<String>,
 }
 
@@ -2223,6 +2381,9 @@ pub struct SignalConfig {
     pub ignore_stories: bool,
 }
 
+/// WhatsApp channel configuration (Cloud API or Web mode).
+///
+/// Set `phone_number_id` for Cloud API mode, or `session_path` for Web mode.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WhatsAppConfig {
     /// Access token from Meta Business Suite (Cloud API mode)
@@ -2297,6 +2458,7 @@ impl WhatsAppConfig {
     }
 }
 
+/// IRC channel configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct IrcConfig {
     /// IRC server hostname
