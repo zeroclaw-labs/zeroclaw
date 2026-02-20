@@ -125,10 +125,13 @@ tower = { version = "0.5", default-features = false }
 tower-http = { version = "0.6", default-features = false, features = ["limit", "timeout"] }
 http-body-util = "0.1"
 
-# OpenTelemetry — OTLP trace + metrics export
+# OpenTelemetry — OTLP trace + metrics export.
+# Use the blocking HTTP exporter client to avoid Tokio-reactor panics in
+# OpenTelemetry background batch threads when ZeroClaw emits spans/metrics from
+# non-Tokio contexts.
 opentelemetry = { version = "0.31", default-features = false, features = ["trace", "metrics"] }
 opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "metrics"] }
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-client", "reqwest-rustls-webpki-roots"] }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls-webpki-roots"] }
 
 # Serial port for peripheral communication (STM32, etc.)
 tokio-serial = { version = "5", default-features = false, optional = true }

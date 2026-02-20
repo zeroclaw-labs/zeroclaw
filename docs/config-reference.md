@@ -26,6 +26,28 @@ Schema export command:
 | `default_model` | `anthropic/claude-sonnet-4-6` | model routed through selected provider |
 | `default_temperature` | `0.7` | model temperature |
 
+## `[observability]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `backend` | `none` | Observability backend: `none`, `noop`, `log`, `prometheus`, `otel`, `opentelemetry`, or `otlp` |
+| `otel_endpoint` | `http://localhost:4318` | OTLP HTTP endpoint used when backend is `otel` |
+| `otel_service_name` | `zeroclaw` | Service name emitted to OTLP collector |
+
+Notes:
+
+- `backend = "otel"` uses OTLP HTTP export with a blocking exporter client so spans and metrics can be emitted safely from non-Tokio contexts.
+- Alias values `opentelemetry` and `otlp` map to the same OTel backend.
+
+Example:
+
+```toml
+[observability]
+backend = "otel"
+otel_endpoint = "http://localhost:4318"
+otel_service_name = "zeroclaw"
+```
+
 ## Environment Provider Overrides
 
 Provider selection can also be controlled by environment variables. Precedence is:
