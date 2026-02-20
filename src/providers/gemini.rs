@@ -330,7 +330,7 @@ impl GeminiProvider {
                 // { model, project?, user_prompt_id?, request: { contents, systemInstruction?, generationConfig } }
                 let internal_request = InternalGenerateContentRequest {
                     model: model.to_string(),
-                    project: None,
+                    project: Self::resolve_oauth_project_id(),
                     user_prompt_id: Some(uuid::Uuid::new_v4().to_string()),
                     request: InternalVertexGenerateContentRequest {
                         contents: request
@@ -367,6 +367,22 @@ impl GeminiProvider {
             }
             _ => req,
         }
+    }
+
+    fn resolve_oauth_project_id() -> Option<String> {
+        for key in [
+            "GEMINI_CODE_ASSIST_PROJECT",
+            "GOOGLE_CLOUD_PROJECT",
+            "GOOGLE_PROJECT_ID",
+        ] {
+            if let Ok(value) = std::env::var(key) {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+        None
     }
 }
 
