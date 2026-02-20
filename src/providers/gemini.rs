@@ -58,10 +58,10 @@ impl GeminiAuth {
 // API REQUEST/RESPONSE TYPES
 // ══════════════════════════════════════════════════════════════════════════════
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct GenerateContentRequest {
     contents: Vec<Content>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "systemInstruction", skip_serializing_if = "Option::is_none")]
     system_instruction: Option<Content>,
     #[serde(rename = "generationConfig")]
     generation_config: GenerationConfig,
@@ -70,23 +70,33 @@ struct GenerateContentRequest {
 /// Request envelope for the internal cloudcode-pa API.
 /// OAuth tokens from Gemini CLI are scoped for this endpoint.
 #[derive(Debug, Serialize)]
-struct InternalGenerateContentRequest {
+struct InternalGenerateContentEnvelope {
     model: String,
-    #[serde(rename = "generationConfig")]
-    generation_config: GenerationConfig,
-    contents: Vec<Content>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    system_instruction: Option<Content>,
+    project: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_prompt_id: Option<String>,
+    request: InternalGenerateContentRequest,
 }
 
+/// Nested request payload for cloudcode-pa's code assist APIs.
 #[derive(Debug, Serialize)]
+struct InternalGenerateContentRequest {
+    contents: Vec<Content>,
+    #[serde(rename = "systemInstruction", skip_serializing_if = "Option::is_none")]
+    system_instruction: Option<Content>,
+    #[serde(rename = "generationConfig")]
+    generation_config: GenerationConfig,
+}
+
+#[derive(Debug, Serialize, Clone)]
 struct Content {
     #[serde(skip_serializing_if = "Option::is_none")]
     role: Option<String>,
     parts: Vec<Part>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct Part {
     text: String,
 }
@@ -102,6 +112,8 @@ struct GenerationConfig {
 struct GenerateContentResponse {
     candidates: Option<Vec<Candidate>>,
     error: Option<ApiError>,
+    #[serde(default)]
+    response: Option<Box<GenerateContentResponse>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -122,6 +134,19 @@ struct ResponsePart {
 #[derive(Debug, Deserialize)]
 struct ApiError {
     message: String,
+}
+
+impl GenerateContentResponse {
+    /// cloudcode-pa wraps the actual response under `response`.
+    fn into_effective_response(self) -> Self {
+        match self {
+            Self {
+                response: Some(inner),
+                ..
+            } => *inner,
+            other => other,
+        }
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -243,6 +268,10 @@ impl GeminiProvider {
         }
     }
 
+    fn format_internal_model_name(model: &str) -> String {
+        model.strip_prefix("models/").unwrap_or(model).to_string()
+    }
+
     /// Build the API URL based on auth type.
     ///
     /// - API key users → public `generativelanguage.googleapis.com/v1beta`
@@ -287,34 +316,16 @@ impl GeminiProvider {
         let req = self.http_client().post(url).json(request);
         match auth {
             GeminiAuth::OAuthToken(token) => {
-                // Internal API expects the model in the request body envelope
-                let internal_request = InternalGenerateContentRequest {
-                    model: Self::format_model_name(model),
-                    generation_config: request.generation_config.clone(),
-                    contents: request
-                        .contents
-                        .iter()
-                        .map(|c| Content {
-                            role: c.role.clone(),
-                            parts: c
-                                .parts
-                                .iter()
-                                .map(|p| Part {
-                                    text: p.text.clone(),
-                                })
-                                .collect(),
-                        })
-                        .collect(),
-                    system_instruction: request.system_instruction.as_ref().map(|si| Content {
-                        role: si.role.clone(),
-                        parts: si
-                            .parts
-                            .iter()
-                            .map(|p| Part {
-                                text: p.text.clone(),
-                            })
-                            .collect(),
-                    }),
+                // cloudcode-pa expects an outer envelope with `request`.
+                let internal_request = InternalGenerateContentEnvelope {
+                    model: Self::format_internal_model_name(model),
+                    project: None,
+                    user_prompt_id: None,
+                    request: InternalGenerateContentRequest {
+                        contents: request.contents.clone(),
+                        system_instruction: request.system_instruction.clone(),
+                        generation_config: request.generation_config.clone(),
+                    },
                 };
                 self.http_client()
                     .post(url)
@@ -367,7 +378,10 @@ impl GeminiProvider {
         }
 
         let result: GenerateContentResponse = response.json().await?;
-
+        if let Some(err) = &result.error {
+            anyhow::bail!("Gemini API error: {}", err.message);
+        }
+        let result = result.into_effective_response();
         if let Some(err) = result.error {
             anyhow::bail!("Gemini API error: {}", err.message);
         }
@@ -460,6 +474,12 @@ impl Provider for GeminiProvider {
 
     async fn warmup(&self) -> anyhow::Result<()> {
         if let Some(auth) = self.auth.as_ref() {
+            // cloudcode-pa does not expose a lightweight model-list probe like the public API.
+            // Avoid false negatives for valid Gemini CLI OAuth credentials.
+            if auth.is_oauth() {
+                return Ok(());
+            }
+
             let url = if auth.is_api_key() {
                 format!(
                     "https://generativelanguage.googleapis.com/v1beta/models?key={}",
@@ -469,12 +489,11 @@ impl Provider for GeminiProvider {
                 "https://generativelanguage.googleapis.com/v1beta/models".to_string()
             };
 
-            let mut request = self.http_client().get(&url);
-            if let GeminiAuth::OAuthToken(token) = auth {
-                request = request.bearer_auth(token);
-            }
-
-            request.send().await?.error_for_status()?;
+            self.http_client()
+                .get(&url)
+                .send()
+                .await?
+                .error_for_status()?;
         }
         Ok(())
     }
@@ -559,6 +578,14 @@ mod tests {
             GeminiProvider::format_model_name("models/gemini-1.5-pro"),
             "models/gemini-1.5-pro"
         );
+        assert_eq!(
+            GeminiProvider::format_internal_model_name("models/gemini-2.5-flash"),
+            "gemini-2.5-flash"
+        );
+        assert_eq!(
+            GeminiProvider::format_internal_model_name("gemini-2.5-flash"),
+            "gemini-2.5-flash"
+        );
     }
 
     #[test]
@@ -622,6 +649,44 @@ mod tests {
     }
 
     #[test]
+    fn oauth_request_wraps_payload_in_request_envelope() {
+        let provider = GeminiProvider {
+            auth: Some(GeminiAuth::OAuthToken("ya29.mock-token".into())),
+        };
+        let auth = GeminiAuth::OAuthToken("ya29.mock-token".into());
+        let url = GeminiProvider::build_generate_content_url("gemini-2.0-flash", &auth);
+        let body = GenerateContentRequest {
+            contents: vec![Content {
+                role: Some("user".into()),
+                parts: vec![Part {
+                    text: "hello".into(),
+                }],
+            }],
+            system_instruction: None,
+            generation_config: GenerationConfig {
+                temperature: 0.7,
+                max_output_tokens: 8192,
+            },
+        };
+
+        let request = provider
+            .build_generate_content_request(&auth, &url, &body, "models/gemini-2.0-flash")
+            .build()
+            .unwrap();
+
+        let payload = request
+            .body()
+            .and_then(|b| b.as_bytes())
+            .expect("json request body should be bytes");
+        let json: serde_json::Value = serde_json::from_slice(payload).unwrap();
+
+        assert_eq!(json["model"], "gemini-2.0-flash");
+        assert!(json.get("generationConfig").is_none());
+        assert!(json.get("request").is_some());
+        assert!(json["request"].get("generationConfig").is_some());
+    }
+
+    #[test]
     fn api_key_request_does_not_set_bearer_header() {
         let provider = GeminiProvider {
             auth: Some(GeminiAuth::ExplicitKey("api-key-123".into())),
@@ -674,31 +739,38 @@ mod tests {
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("\"role\":\"user\""));
         assert!(json.contains("\"text\":\"Hello\""));
+        assert!(json.contains("\"systemInstruction\""));
+        assert!(!json.contains("\"system_instruction\""));
         assert!(json.contains("\"temperature\":0.7"));
         assert!(json.contains("\"maxOutputTokens\":8192"));
     }
 
     #[test]
     fn internal_request_includes_model() {
-        let request = InternalGenerateContentRequest {
-            model: "models/gemini-3-pro-preview".to_string(),
-            generation_config: GenerationConfig {
-                temperature: 0.7,
-                max_output_tokens: 8192,
-            },
-            contents: vec![Content {
-                role: Some("user".to_string()),
-                parts: vec![Part {
-                    text: "Hello".to_string(),
+        let request = InternalGenerateContentEnvelope {
+            model: "gemini-test-model".to_string(),
+            project: None,
+            user_prompt_id: None,
+            request: InternalGenerateContentRequest {
+                contents: vec![Content {
+                    role: Some("user".to_string()),
+                    parts: vec![Part {
+                        text: "Hello".to_string(),
+                    }],
                 }],
-            }],
-            system_instruction: None,
+                system_instruction: None,
+                generation_config: GenerationConfig {
+                    temperature: 0.7,
+                    max_output_tokens: 8192,
+                },
+            },
         };
 
-        let json = serde_json::to_string(&request).unwrap();
-        assert!(json.contains("\"model\":\"models/gemini-3-pro-preview\""));
-        assert!(json.contains("\"role\":\"user\""));
-        assert!(json.contains("\"temperature\":0.7"));
+        let json: serde_json::Value = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["model"], "gemini-test-model");
+        assert!(json.get("generationConfig").is_none());
+        assert!(json["request"].get("generationConfig").is_some());
+        assert_eq!(json["request"]["contents"][0]["role"], "user");
     }
 
     #[test]
@@ -741,9 +813,47 @@ mod tests {
         assert_eq!(response.error.unwrap().message, "Invalid API key");
     }
 
+    #[test]
+    fn internal_response_deserialization() {
+        let json = r#"{
+            "response": {
+                "candidates": [{
+                    "content": {
+                        "parts": [{"text": "Hello from internal"}]
+                    }
+                }]
+            }
+        }"#;
+
+        let response: GenerateContentResponse = serde_json::from_str(json).unwrap();
+        let text = response
+            .into_effective_response()
+            .candidates
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .content
+            .parts
+            .into_iter()
+            .next()
+            .unwrap()
+            .text;
+        assert_eq!(text, Some("Hello from internal".to_string()));
+    }
+
     #[tokio::test]
     async fn warmup_without_key_is_noop() {
         let provider = GeminiProvider { auth: None };
+        let result = provider.warmup().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn warmup_oauth_is_noop() {
+        let provider = GeminiProvider {
+            auth: Some(GeminiAuth::OAuthToken("ya29.mock-token".into())),
+        };
         let result = provider.warmup().await;
         assert!(result.is_ok());
     }
