@@ -72,13 +72,21 @@ struct GenerateContentRequest {
 #[derive(Debug, Serialize)]
 struct InternalGenerateContentEnvelope {
     model: String,
-    generation_config: InternalGenerationConfig,
-    contents: Vec<Content>,
     #[serde(skip_serializing_if = "Option::is_none")]
     project: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     user_prompt_id: Option<String>,
-    request: InternalGenerateContentRequest,
+    request: InternalVertexGenerateContentRequest,
+}
+
+#[derive(Debug, Serialize)]
+struct InternalVertexGenerateContentRequest {
+    contents: Vec<Content>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "systemInstruction")]
+    system_instruction: Option<Content>,
+    #[serde(rename = "generationConfig")]
+    generation_config: GenerationConfig,
 }
 
 /// Nested request payload for cloudcode-pa's code assist APIs.
@@ -107,12 +115,6 @@ struct Part {
 struct GenerationConfig {
     temperature: f64,
     #[serde(rename = "maxOutputTokens")]
-    max_output_tokens: u32,
-}
-
-#[derive(Debug, Serialize, Clone)]
-struct InternalGenerationConfig {
-    temperature: f64,
     max_output_tokens: u32,
 }
 
@@ -324,37 +326,39 @@ impl GeminiProvider {
         let req = self.http_client().post(url).json(request);
         match auth {
             GeminiAuth::OAuthToken(token) => {
-                // Internal API expects the model in the request body envelope
+                // Internal Code Assist API uses a wrapped payload shape:
+                // { model, project?, user_prompt_id?, request: { contents, systemInstruction?, generationConfig } }
                 let internal_request = InternalGenerateContentRequest {
-                    model: Self::format_model_name(model),
-                    generation_config: InternalGenerationConfig {
-                        temperature: request.generation_config.temperature,
-                        max_output_tokens: request.generation_config.max_output_tokens,
-                    },
-                    contents: request
-                        .contents
-                        .iter()
-                        .map(|c| Content {
-                            role: c.role.clone(),
-                            parts: c
+                    model: model.to_string(),
+                    project: None,
+                    user_prompt_id: Some(uuid::Uuid::new_v4().to_string()),
+                    request: InternalVertexGenerateContentRequest {
+                        contents: request
+                            .contents
+                            .iter()
+                            .map(|c| Content {
+                                role: c.role.clone(),
+                                parts: c
+                                    .parts
+                                    .iter()
+                                    .map(|p| Part {
+                                        text: p.text.clone(),
+                                    })
+                                    .collect(),
+                            })
+                            .collect(),
+                        system_instruction: request.system_instruction.as_ref().map(|si| Content {
+                            role: si.role.clone(),
+                            parts: si
                                 .parts
                                 .iter()
                                 .map(|p| Part {
                                     text: p.text.clone(),
                                 })
                                 .collect(),
-                        })
-                        .collect(),
-                    system_instruction: request.system_instruction.as_ref().map(|si| Content {
-                        role: si.role.clone(),
-                        parts: si
-                            .parts
-                            .iter()
-                            .map(|p| Part {
-                                text: p.text.clone(),
-                            })
-                            .collect(),
-                    }),
+                        }),
+                        generation_config: request.generation_config.clone(),
+                    },
                 };
                 self.http_client()
                     .post(url)
@@ -777,28 +781,30 @@ mod tests {
     #[test]
     fn internal_request_includes_model() {
         let request = InternalGenerateContentRequest {
-            model: "models/gemini-3-pro-preview".to_string(),
-            generation_config: InternalGenerationConfig {
-                temperature: 0.7,
-                max_output_tokens: 8192,
-            },
-            contents: vec![Content {
-                role: Some("user".to_string()),
-                parts: vec![Part {
-                    text: "Hello".to_string(),
-                }],
-                system_instruction: None,
+            model: "gemini-3-pro-preview".to_string(),
+            project: None,
+            user_prompt_id: Some("prompt-123".to_string()),
+            request: InternalVertexGenerateContentRequest {
                 generation_config: GenerationConfig {
                     temperature: 0.7,
                     max_output_tokens: 8192,
                 },
+                contents: vec![Content {
+                    role: Some("user".to_string()),
+                    parts: vec![Part {
+                        text: "Hello".to_string(),
+                    }],
+                }],
+                system_instruction: None,
             },
         };
 
         let json = serde_json::to_string(&request).unwrap();
-        assert!(json.contains("\"model\":\"models/gemini-3-pro-preview\""));
-        assert!(json.contains("\"generation_config\""));
-        assert!(json.contains("\"max_output_tokens\":8192"));
+        assert!(json.contains("\"model\":\"gemini-3-pro-preview\""));
+        assert!(json.contains("\"request\""));
+        assert!(json.contains("\"generationConfig\""));
+        assert!(json.contains("\"maxOutputTokens\":8192"));
+        assert!(json.contains("\"user_prompt_id\":\"prompt-123\""));
         assert!(json.contains("\"role\":\"user\""));
         assert!(json.contains("\"temperature\":0.7"));
     }
