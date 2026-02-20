@@ -148,8 +148,8 @@ pub struct LarkChannel {
     use_feishu: bool,
     /// How to receive events: WebSocket long-connection or HTTP webhook.
     receive_mode: crate::config::schema::LarkReceiveMode,
-    /// Cached tenant access token
-    tenant_token: Arc<RwLock<Option<String>>>,
+    /// Cached tenant access token + expiry timestamp (epoch seconds).
+    tenant_token: Arc<RwLock<Option<(String, u64)>>>,
     /// Dedup set: WS message_ids seen in last ~30 min to prevent double-dispatch
     ws_seen_ids: Arc<RwLock<HashMap<String, Instant>>>,
 }
@@ -490,13 +490,23 @@ impl LarkChannel {
         self.allowed_users.iter().any(|u| u == "*" || u == open_id)
     }
 
-    /// Get or refresh tenant access token
+    /// Get or refresh tenant access token.
+    ///
+    /// Caches the token together with an expiry timestamp derived from the
+    /// `expire` field in the Feishu response. The token is proactively
+    /// refreshed 60 seconds before it expires to avoid edge-case failures.
     async fn get_tenant_access_token(&self) -> anyhow::Result<String> {
-        // Check cache first
+        // Check cache — return early if the token is still valid.
         {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
             let cached = self.tenant_token.read().await;
-            if let Some(ref token) = *cached {
-                return Ok(token.clone());
+            if let Some((ref token, expiry)) = *cached {
+                if now < expiry {
+                    return Ok(token.clone());
+                }
             }
         }
 
@@ -524,10 +534,22 @@ impl LarkChannel {
             .ok_or_else(|| anyhow::anyhow!("missing tenant_access_token in response"))?
             .to_string();
 
-        // Cache it
+        // Feishu returns `expire` in seconds (typically 7200 = 2 hours).
+        // Refresh 60 seconds early to avoid edge-case failures.
+        let expires_in = data
+            .get("expire")
+            .and_then(|e| e.as_u64())
+            .unwrap_or(7200);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let expiry = now + expires_in.saturating_sub(60);
+
+        // Cache token + expiry
         {
             let mut cached = self.tenant_token.write().await;
-            *cached = Some(token.clone());
+            *cached = Some((token.clone(), expiry));
         }
 
         Ok(token)
@@ -669,8 +691,32 @@ impl Channel for LarkChannel {
             .send()
             .await?;
 
-        if resp.status().as_u16() == 401 {
-            // Token expired, invalidate and retry once
+        // Feishu may return HTTP 401 for expired tokens, or HTTP 200 with
+        // error code 99991663 in the response body. Both cases require a
+        // token refresh + single retry.
+        let needs_refresh = if resp.status().as_u16() == 401 {
+            true
+        } else if resp.status().is_success() {
+            // Parse response body to check for token-expired error code.
+            let resp_body: serde_json::Value = resp.json().await.unwrap_or_default();
+            let code = resp_body.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
+            if code == 99991663 {
+                true
+            } else if code != 0 {
+                let msg = resp_body
+                    .get("msg")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("unknown error");
+                anyhow::bail!("Lark send failed (code {code}): {msg}");
+            } else {
+                false
+            }
+        } else {
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Lark send failed: {err}");
+        };
+
+        if needs_refresh {
             self.invalidate_token().await;
             let new_token = self.get_tenant_access_token().await?;
             let retry_resp = self
@@ -686,12 +732,6 @@ impl Channel for LarkChannel {
                 let err = retry_resp.text().await.unwrap_or_default();
                 anyhow::bail!("Lark send failed after token refresh: {err}");
             }
-            return Ok(());
-        }
-
-        if !resp.status().is_success() {
-            let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Lark send failed: {err}");
         }
 
         Ok(())
@@ -1267,5 +1307,57 @@ mod tests {
         let msgs = ch.parse_event_payload(&payload);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].sender, "ou_user");
+    }
+
+    // ── Token expiry tests ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn lark_token_cache_returns_valid_token() {
+        let ch = make_channel();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // Seed cache with a token that expires in the future.
+        {
+            let mut cached = ch.tenant_token.write().await;
+            *cached = Some(("valid_token".to_string(), now + 3600));
+        }
+
+        let token = ch.get_tenant_access_token().await.unwrap();
+        assert_eq!(token, "valid_token");
+    }
+
+    #[tokio::test]
+    async fn lark_token_cache_expired_triggers_refresh() {
+        let ch = make_channel();
+        // Seed cache with an already-expired token.
+        {
+            let mut cached = ch.tenant_token.write().await;
+            *cached = Some(("expired_token".to_string(), 0));
+        }
+
+        // Refresh will fail (no real Feishu server), but it should NOT
+        // return the expired token — it should attempt a refresh.
+        let result = ch.get_tenant_access_token().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn lark_invalidate_token_clears_cache() {
+        let ch = make_channel();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        {
+            let mut cached = ch.tenant_token.write().await;
+            *cached = Some(("some_token".to_string(), now + 3600));
+        }
+
+        ch.invalidate_token().await;
+
+        let cached = ch.tenant_token.read().await;
+        assert!(cached.is_none());
     }
 }
