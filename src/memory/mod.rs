@@ -4,6 +4,7 @@ pub mod embeddings;
 pub mod hygiene;
 pub mod lucid;
 pub mod markdown;
+pub mod neo4j;
 pub mod none;
 pub mod postgres;
 pub mod response_cache;
@@ -19,6 +20,7 @@ pub use backend::{
 };
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
+pub use neo4j::Neo4jMemory;
 pub use none::NoneMemory;
 pub use postgres::PostgresMemory;
 pub use response_cache::ResponseCache;
@@ -51,6 +53,9 @@ where
         }
         MemoryBackendKind::Postgres => Ok(Box::new(postgres_builder()?)),
         MemoryBackendKind::Markdown => Ok(Box::new(MarkdownMemory::new(workspace_dir))),
+        MemoryBackendKind::Neo4j => {
+            anyhow::bail!("neo4j backend requires [storage.provider.config] settings")
+        }
         MemoryBackendKind::None => Ok(Box::new(NoneMemory::new())),
         MemoryBackendKind::Unknown => {
             tracing::warn!(
@@ -281,6 +286,69 @@ pub fn create_memory_with_storage_and_routes(
         )
     }
 
+    fn build_neo4j_memory(
+        config: &MemoryConfig,
+        storage_provider: Option<&StorageProviderConfig>,
+        resolved_embedding: &ResolvedEmbeddingConfig,
+    ) -> anyhow::Result<Neo4jMemory> {
+        let storage_provider = storage_provider
+            .context("memory backend 'neo4j' requires [storage.provider.config] settings")?;
+
+        let uri = storage_provider
+            .neo4j_uri
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .context("memory backend 'neo4j' requires [storage.provider.config].neo4j_uri")?;
+
+        let user = storage_provider
+            .neo4j_user
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("neo4j");
+
+        let password = storage_provider
+            .neo4j_password
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .context("memory backend 'neo4j' requires [storage.provider.config].neo4j_password")?;
+
+        let database = storage_provider
+            .neo4j_database
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("neo4j");
+
+        let embedder: Arc<dyn embeddings::EmbeddingProvider> =
+            Arc::from(embeddings::create_embedding_provider(
+                &resolved_embedding.provider,
+                resolved_embedding.api_key.as_deref(),
+                &resolved_embedding.model,
+                resolved_embedding.dimensions,
+            ));
+
+        let mem = Neo4jMemory::new(
+            uri,
+            user,
+            password,
+            database,
+            embedder,
+            config.vector_weight as f32,
+            config.keyword_weight as f32,
+        )
+        .await?;
+        Ok(mem)
+    }
+
+    if matches!(backend_kind, MemoryBackendKind::Neo4j) {
+        return build_neo4j_memory(config, storage_provider, &resolved_embedding)
+            .await
+            .map(|mem| Box::new(mem) as Box<dyn Memory>);
+    }
+
     create_memory_with_builders(
         &backend_name,
         workspace_dir,
@@ -306,6 +374,15 @@ pub fn create_memory_for_migration(
     ) {
         anyhow::bail!(
             "memory migration for backend 'postgres' is unsupported; migrate with sqlite or markdown first"
+        );
+    }
+
+    if matches!(
+        classify_memory_backend(backend),
+        MemoryBackendKind::Neo4j
+    ) {
+        anyhow::bail!(
+            "memory migration for backend 'neo4j' is unsupported; migrate with sqlite or markdown first"
         );
     }
 
