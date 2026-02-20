@@ -905,10 +905,11 @@ impl Channel for LarkChannel {
         let token = self.get_tenant_access_token().await?;
         let url = self.send_message_url();
 
-        let content = serde_json::json!({ "text": message.content }).to_string();
+        let post = markdown_to_lark_post(&message.content);
+        let content = serde_json::json!({ "post": post }).to_string();
         let body = serde_json::json!({
             "receive_id": message.recipient,
-            "msg_type": "text",
+            "msg_type": "post",
             "content": content,
         });
 
@@ -1345,6 +1346,255 @@ fn strip_at_placeholders(text: &str) -> String {
 /// In group chats, only respond when the bot is explicitly @-mentioned.
 fn should_respond_in_group(mentions: &[serde_json::Value]) -> bool {
     !mentions.is_empty()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Markdown → Lark post (rich-text) converter
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Convert a Markdown string into a Lark post `content` JSON value.
+///
+/// The returned structure follows the Lark "post" message format:
+/// ```json
+/// { "zh_cn": { "content": [ [element, ...], ... ] } }
+/// ```
+fn markdown_to_lark_post(md: &str) -> serde_json::Value {
+    let mut lines_out: Vec<Vec<serde_json::Value>> = Vec::new();
+    let mut in_code_block = false;
+    let mut code_block_buf = String::new();
+
+    for raw_line in md.lines() {
+        // ── fenced code blocks ──────────────────────────────────────
+        if raw_line.trim_start().starts_with("```") {
+            if in_code_block {
+                // closing fence
+                lines_out.push(vec![serde_json::json!({
+                    "tag": "code_block",
+                    "text": code_block_buf.trim_end_matches('\n'),
+                })]);
+                code_block_buf.clear();
+                in_code_block = false;
+            } else {
+                in_code_block = true;
+            }
+            continue;
+        }
+        if in_code_block {
+            if !code_block_buf.is_empty() {
+                code_block_buf.push('\n');
+            }
+            code_block_buf.push_str(raw_line);
+            continue;
+        }
+
+        let trimmed = raw_line.trim_start();
+
+        // ── headings → bold text ────────────────────────────────────
+        if let Some(rest) = strip_heading(trimmed) {
+            lines_out.push(vec![serde_json::json!({
+                "tag": "text",
+                "text": rest,
+                "style": ["bold"],
+            })]);
+            continue;
+        }
+
+        // ── unordered list items ────────────────────────────────────
+        if let Some(rest) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+            let mut elems = vec![serde_json::json!({"tag": "text", "text": "  \u{2022} "})];
+            elems.extend(parse_inline(rest));
+            lines_out.push(elems);
+            continue;
+        }
+
+        // ── ordered list items ──────────────────────────────────────
+        if let Some((num, rest)) = strip_ordered_prefix(trimmed) {
+            let mut elems =
+                vec![serde_json::json!({"tag": "text", "text": format!("  {num}. ")})];
+            elems.extend(parse_inline(rest));
+            lines_out.push(elems);
+            continue;
+        }
+
+        // ── plain / inline-formatted line ───────────────────────────
+        let elems = parse_inline(trimmed);
+        if !elems.is_empty() {
+            lines_out.push(elems);
+        } else {
+            // preserve blank lines as empty text segments
+            lines_out.push(vec![serde_json::json!({"tag": "text", "text": ""})]);
+        }
+    }
+
+    // Unclosed code block — flush as-is
+    if in_code_block && !code_block_buf.is_empty() {
+        lines_out.push(vec![serde_json::json!({
+            "tag": "code_block",
+            "text": code_block_buf.trim_end_matches('\n'),
+        })]);
+    }
+
+    serde_json::json!({
+        "zh_cn": {
+            "content": lines_out,
+        }
+    })
+}
+
+/// Strip a Markdown heading prefix (`# `, `## `, …) and return the remainder.
+fn strip_heading(line: &str) -> Option<&str> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i] == b'#' {
+        i += 1;
+    }
+    if i > 0 && i < bytes.len() && bytes[i] == b' ' {
+        Some(&line[i + 1..])
+    } else {
+        None
+    }
+}
+
+/// Match `1. `, `2. `, etc. and return `(number, rest)`.
+fn strip_ordered_prefix(line: &str) -> Option<(&str, &str)> {
+    let dot = line.find(". ")?;
+    let num = &line[..dot];
+    if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
+        Some((num, &line[dot + 2..]))
+    } else {
+        None
+    }
+}
+
+/// Parse inline Markdown spans into a sequence of Lark post elements.
+///
+/// Supported: `**bold**`, `*italic*`, `` `code` ``, `[text](url)`.
+fn parse_inline(text: &str) -> Vec<serde_json::Value> {
+    let mut elems: Vec<serde_json::Value> = Vec::new();
+    let mut buf = String::new();
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        // ── link [text](url) ────────────────────────────────────────
+        if chars[i] == '[' {
+            if let Some((link_text, href, end)) = try_parse_link(&chars, i) {
+                flush_text(&mut buf, &mut elems);
+                elems.push(serde_json::json!({"tag": "a", "text": link_text, "href": href}));
+                i = end;
+                continue;
+            }
+        }
+
+        // ── inline code `…` ─────────────────────────────────────────
+        if chars[i] == '`' {
+            if let Some((code, end)) = try_parse_backtick(&chars, i) {
+                flush_text(&mut buf, &mut elems);
+                elems.push(serde_json::json!({"tag": "code_inline", "text": code}));
+                i = end;
+                continue;
+            }
+        }
+
+        // ── bold **…** ──────────────────────────────────────────────
+        if chars[i] == '*' && i + 1 < len && chars[i + 1] == '*' {
+            if let Some((inner, end)) = try_parse_delimited(&chars, i, "**") {
+                flush_text(&mut buf, &mut elems);
+                elems.push(
+                    serde_json::json!({"tag": "text", "text": inner, "style": ["bold"]}),
+                );
+                i = end;
+                continue;
+            }
+        }
+
+        // ── italic *…* (single asterisk, not double) ────────────────
+        if chars[i] == '*' && !(i + 1 < len && chars[i + 1] == '*') {
+            if let Some((inner, end)) = try_parse_delimited(&chars, i, "*") {
+                flush_text(&mut buf, &mut elems);
+                elems.push(
+                    serde_json::json!({"tag": "text", "text": inner, "style": ["italic"]}),
+                );
+                i = end;
+                continue;
+            }
+        }
+
+        buf.push(chars[i]);
+        i += 1;
+    }
+    flush_text(&mut buf, &mut elems);
+    elems
+}
+
+/// Flush accumulated plain text into the elements list.
+fn flush_text(buf: &mut String, elems: &mut Vec<serde_json::Value>) {
+    if !buf.is_empty() {
+        elems.push(serde_json::json!({"tag": "text", "text": buf.as_str()}));
+        buf.clear();
+    }
+}
+
+/// Try to parse `[text](url)` starting at position `start`.
+/// Returns `(link_text, href, next_index)` on success.
+fn try_parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
+    // chars[start] == '['
+    let close_bracket = find_char(chars, start + 1, ']')?;
+    let link_text: String = chars[start + 1..close_bracket].iter().collect();
+    // Expect '(' immediately after ']'
+    if close_bracket + 1 >= chars.len() || chars[close_bracket + 1] != '(' {
+        return None;
+    }
+    let close_paren = find_char(chars, close_bracket + 2, ')')?;
+    let href: String = chars[close_bracket + 2..close_paren].iter().collect();
+    Some((link_text, href, close_paren + 1))
+}
+
+/// Try to parse `` `code` `` starting at position `start`.
+fn try_parse_backtick(chars: &[char], start: usize) -> Option<(String, usize)> {
+    let close = find_char(chars, start + 1, '`')?;
+    let code: String = chars[start + 1..close].iter().collect();
+    if code.is_empty() {
+        return None;
+    }
+    Some((code, close + 1))
+}
+
+/// Try to parse a delimited span (`*…*` or `**…**`) starting at `start`.
+fn try_parse_delimited(chars: &[char], start: usize, delim: &str) -> Option<(String, usize)> {
+    let dlen = delim.len();
+    let after = start + dlen;
+    if after >= chars.len() {
+        return None;
+    }
+    // Search for closing delimiter
+    let delim_chars: Vec<char> = delim.chars().collect();
+    let mut j = after;
+    while j + dlen <= chars.len() {
+        if chars[j..j + dlen] == delim_chars[..] {
+            let inner: String = chars[after..j].iter().collect();
+            if inner.is_empty() {
+                return None;
+            }
+            return Some((inner, j + dlen));
+        }
+        j += 1;
+    }
+    None
+}
+
+/// Find the first occurrence of `target` in `chars` starting from `from`.
+fn find_char(chars: &[char], from: usize, target: char) -> Option<usize> {
+    chars.iter().enumerate().skip(from).find_map(
+        |(idx, &ch)| {
+            if ch == target {
+                Some(idx)
+            } else {
+                None
+            }
+        },
+    )
 }
 
 #[cfg(test)]
@@ -1894,5 +2144,147 @@ mod tests {
         });
         let selected = random_lark_ack_reaction(Some(&payload), "hello");
         assert!(LARK_ACK_REACTIONS_JA.contains(&selected));
+    }
+
+    // ── markdown_to_lark_post tests ─────────────────────────────────
+
+    /// Helper: extract the content array from the post structure.
+    fn post_content(val: &serde_json::Value) -> &Vec<serde_json::Value> {
+        val["zh_cn"]["content"].as_array().unwrap()
+    }
+
+    #[test]
+    fn md_to_post_plain_text() {
+        let post = markdown_to_lark_post("hello world");
+        let content = post_content(&post);
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0][0]["tag"], "text");
+        assert_eq!(content[0][0]["text"], "hello world");
+    }
+
+    #[test]
+    fn md_to_post_bold() {
+        let post = markdown_to_lark_post("this is **bold** text");
+        let line = &post_content(&post)[0];
+        assert_eq!(line[0]["text"], "this is ");
+        assert_eq!(line[1]["text"], "bold");
+        assert_eq!(line[1]["style"][0], "bold");
+        assert_eq!(line[2]["text"], " text");
+    }
+
+    #[test]
+    fn md_to_post_italic() {
+        let post = markdown_to_lark_post("this is *italic* text");
+        let line = &post_content(&post)[0];
+        assert_eq!(line[0]["text"], "this is ");
+        assert_eq!(line[1]["text"], "italic");
+        assert_eq!(line[1]["style"][0], "italic");
+        assert_eq!(line[2]["text"], " text");
+    }
+
+    #[test]
+    fn md_to_post_link() {
+        let post = markdown_to_lark_post("click [here](https://example.com) now");
+        let line = &post_content(&post)[0];
+        assert_eq!(line[0]["text"], "click ");
+        assert_eq!(line[1]["tag"], "a");
+        assert_eq!(line[1]["text"], "here");
+        assert_eq!(line[1]["href"], "https://example.com");
+        assert_eq!(line[2]["text"], " now");
+    }
+
+    #[test]
+    fn md_to_post_inline_code() {
+        let post = markdown_to_lark_post("run `cargo test` now");
+        let line = &post_content(&post)[0];
+        assert_eq!(line[0]["text"], "run ");
+        assert_eq!(line[1]["tag"], "code_inline");
+        assert_eq!(line[1]["text"], "cargo test");
+        assert_eq!(line[2]["text"], " now");
+    }
+
+    #[test]
+    fn md_to_post_heading() {
+        let post = markdown_to_lark_post("# Title\n## Subtitle");
+        let content = post_content(&post);
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0][0]["text"], "Title");
+        assert_eq!(content[0][0]["style"][0], "bold");
+        assert_eq!(content[1][0]["text"], "Subtitle");
+        assert_eq!(content[1][0]["style"][0], "bold");
+    }
+
+    #[test]
+    fn md_to_post_unordered_list() {
+        let post = markdown_to_lark_post("- first\n- second");
+        let content = post_content(&post);
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0][0]["text"], "  \u{2022} ");
+        assert_eq!(content[0][1]["text"], "first");
+        assert_eq!(content[1][0]["text"], "  \u{2022} ");
+        assert_eq!(content[1][1]["text"], "second");
+    }
+
+    #[test]
+    fn md_to_post_ordered_list() {
+        let post = markdown_to_lark_post("1. alpha\n2. beta");
+        let content = post_content(&post);
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0][0]["text"], "  1. ");
+        assert_eq!(content[0][1]["text"], "alpha");
+        assert_eq!(content[1][0]["text"], "  2. ");
+        assert_eq!(content[1][1]["text"], "beta");
+    }
+
+    #[test]
+    fn md_to_post_code_block() {
+        let post = markdown_to_lark_post("```rust\nfn main() {}\n```");
+        let content = post_content(&post);
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0][0]["tag"], "code_block");
+        assert_eq!(content[0][0]["text"], "fn main() {}");
+    }
+
+    #[test]
+    fn md_to_post_mixed_inline() {
+        let post = markdown_to_lark_post("**bold** and *italic* and `code`");
+        let line = &post_content(&post)[0];
+        assert_eq!(line[0]["text"], "bold");
+        assert_eq!(line[0]["style"][0], "bold");
+        assert_eq!(line[1]["text"], " and ");
+        assert_eq!(line[2]["text"], "italic");
+        assert_eq!(line[2]["style"][0], "italic");
+        assert_eq!(line[3]["text"], " and ");
+        assert_eq!(line[4]["tag"], "code_inline");
+        assert_eq!(line[4]["text"], "code");
+    }
+
+    #[test]
+    fn md_to_post_multiline() {
+        let post = markdown_to_lark_post("line one\n\nline three");
+        let content = post_content(&post);
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0][0]["text"], "line one");
+        assert_eq!(content[1][0]["text"], ""); // blank line preserved
+        assert_eq!(content[2][0]["text"], "line three");
+    }
+
+    #[test]
+    fn md_to_post_list_with_bold_item() {
+        let post = markdown_to_lark_post("- **important** item");
+        let line = &post_content(&post)[0];
+        assert_eq!(line[0]["text"], "  \u{2022} ");
+        assert_eq!(line[1]["text"], "important");
+        assert_eq!(line[1]["style"][0], "bold");
+        assert_eq!(line[2]["text"], " item");
+    }
+
+    #[test]
+    fn md_to_post_unclosed_code_block() {
+        let post = markdown_to_lark_post("```\nsome code");
+        let content = post_content(&post);
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0][0]["tag"], "code_block");
+        assert_eq!(content[0][0]["text"], "some code");
     }
 }
