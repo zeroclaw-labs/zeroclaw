@@ -647,6 +647,44 @@ impl Provider for OllamaProvider {
         // definitions in the request and returns structured ToolCall objects.
         true
     }
+
+    async fn chat(
+        &self,
+        request: crate::providers::traits::ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ChatResponse> {
+        // Convert ToolSpec to OpenAI-compatible JSON and delegate to chat_with_tools.
+        if let Some(specs) = request.tools {
+            if !specs.is_empty() {
+                let tools: Vec<serde_json::Value> = specs
+                    .iter()
+                    .map(|s| {
+                        serde_json::json!({
+                            "type": "function",
+                            "function": {
+                                "name": s.name,
+                                "description": s.description,
+                                "parameters": s.parameters
+                            }
+                        })
+                    })
+                    .collect();
+                return self
+                    .chat_with_tools(request.messages, &tools, model, temperature)
+                    .await;
+            }
+        }
+
+        // No tools — fall back to plain text chat.
+        let text = self
+            .chat_with_history(request.messages, model, temperature)
+            .await?;
+        Ok(ChatResponse {
+            text: Some(text),
+            tool_calls: vec![],
+        })
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
