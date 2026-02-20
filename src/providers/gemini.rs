@@ -76,17 +76,7 @@ struct InternalGenerateContentEnvelope {
     project: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     user_prompt_id: Option<String>,
-    request: InternalVertexGenerateContentRequest,
-}
-
-#[derive(Debug, Serialize)]
-struct InternalVertexGenerateContentRequest {
-    contents: Vec<Content>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "systemInstruction")]
-    system_instruction: Option<Content>,
-    #[serde(rename = "generationConfig")]
-    generation_config: GenerationConfig,
+    request: InternalGenerateContentRequest,
 }
 
 /// Nested request payload for cloudcode-pa's code assist APIs.
@@ -328,35 +318,13 @@ impl GeminiProvider {
             GeminiAuth::OAuthToken(token) => {
                 // Internal Code Assist API uses a wrapped payload shape:
                 // { model, project?, user_prompt_id?, request: { contents, systemInstruction?, generationConfig } }
-                let internal_request = InternalGenerateContentRequest {
-                    model: model.to_string(),
+                let internal_request = InternalGenerateContentEnvelope {
+                    model: Self::format_internal_model_name(model),
                     project: Self::resolve_oauth_project_id(),
                     user_prompt_id: Some(uuid::Uuid::new_v4().to_string()),
-                    request: InternalVertexGenerateContentRequest {
-                        contents: request
-                            .contents
-                            .iter()
-                            .map(|c| Content {
-                                role: c.role.clone(),
-                                parts: c
-                                    .parts
-                                    .iter()
-                                    .map(|p| Part {
-                                        text: p.text.clone(),
-                                    })
-                                    .collect(),
-                            })
-                            .collect(),
-                        system_instruction: request.system_instruction.as_ref().map(|si| Content {
-                            role: si.role.clone(),
-                            parts: si
-                                .parts
-                                .iter()
-                                .map(|p| Part {
-                                    text: p.text.clone(),
-                                })
-                                .collect(),
-                        }),
+                    request: InternalGenerateContentRequest {
+                        contents: request.contents.clone(),
+                        system_instruction: request.system_instruction.clone(),
                         generation_config: request.generation_config.clone(),
                     },
                 };
@@ -796,15 +764,11 @@ mod tests {
 
     #[test]
     fn internal_request_includes_model() {
-        let request = InternalGenerateContentRequest {
+        let request = InternalGenerateContentEnvelope {
             model: "gemini-3-pro-preview".to_string(),
             project: None,
             user_prompt_id: Some("prompt-123".to_string()),
-            request: InternalVertexGenerateContentRequest {
-                generation_config: GenerationConfig {
-                    temperature: 0.7,
-                    max_output_tokens: 8192,
-                },
+            request: InternalGenerateContentRequest {
                 contents: vec![Content {
                     role: Some("user".to_string()),
                     parts: vec![Part {
@@ -812,6 +776,10 @@ mod tests {
                     }],
                 }],
                 system_instruction: None,
+                generation_config: GenerationConfig {
+                    temperature: 0.7,
+                    max_output_tokens: 8192,
+                },
             },
         };
 
