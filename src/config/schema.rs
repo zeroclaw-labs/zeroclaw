@@ -3115,6 +3115,34 @@ fn config_dir_creation_error(path: &Path) -> String {
     )
 }
 
+fn is_local_ollama_endpoint(api_url: Option<&str>) -> bool {
+    let Some(raw) = api_url.map(str::trim).filter(|value| !value.is_empty()) else {
+        return true;
+    };
+
+    reqwest::Url::parse(raw)
+        .ok()
+        .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
+        .is_some_and(|host| matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1" | "0.0.0.0"))
+}
+
+fn has_ollama_cloud_credential(config_api_key: Option<&str>) -> bool {
+    let config_key_present = config_api_key
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    if config_key_present {
+        return true;
+    }
+
+    ["OLLAMA_API_KEY", "ZEROCLAW_API_KEY", "API_KEY"]
+        .iter()
+        .any(|name| {
+            std::env::var(name)
+                .ok()
+                .is_some_and(|value| !value.trim().is_empty())
+        })
+}
+
 impl Config {
     pub async fn load_or_init() -> Result<Self> {
         let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
@@ -3268,6 +3296,29 @@ impl Config {
             }
             if route.model.trim().is_empty() {
                 anyhow::bail!("embedding_routes[{i}].model must not be empty");
+            }
+        }
+
+        // Ollama cloud-routing safety checks
+        if self
+            .default_provider
+            .as_deref()
+            .is_some_and(|provider| provider.trim().eq_ignore_ascii_case("ollama"))
+            && self
+                .default_model
+                .as_deref()
+                .is_some_and(|model| model.trim().ends_with(":cloud"))
+        {
+            if is_local_ollama_endpoint(self.api_url.as_deref()) {
+                anyhow::bail!(
+                    "default_model uses ':cloud' with provider 'ollama', but api_url is local or unset. Set api_url to a remote Ollama endpoint (for example https://ollama.com)."
+                );
+            }
+
+            if !has_ollama_cloud_credential(self.api_key.as_deref()) {
+                anyhow::bail!(
+                    "default_model uses ':cloud' with provider 'ollama', but no API key is configured. Set api_key or OLLAMA_API_KEY."
+                );
             }
         }
 
@@ -5205,6 +5256,41 @@ default_temperature = 0.7
         assert_eq!(config.default_model.as_deref(), Some("gpt-4o"));
 
         std::env::remove_var("ZEROCLAW_MODEL");
+    }
+
+    #[test]
+    async fn validate_ollama_cloud_model_requires_remote_api_url() {
+        let _env_guard = env_override_lock().await;
+        let config = Config {
+            default_provider: Some("ollama".to_string()),
+            default_model: Some("glm-5:cloud".to_string()),
+            api_url: None,
+            api_key: Some("ollama-key".to_string()),
+            ..Config::default()
+        };
+
+        let error = config.validate().expect_err("expected validation to fail");
+        assert!(error.to_string().contains(
+            "default_model uses ':cloud' with provider 'ollama', but api_url is local or unset"
+        ));
+    }
+
+    #[test]
+    async fn validate_ollama_cloud_model_accepts_remote_endpoint_and_env_key() {
+        let _env_guard = env_override_lock().await;
+        let config = Config {
+            default_provider: Some("ollama".to_string()),
+            default_model: Some("glm-5:cloud".to_string()),
+            api_url: Some("https://ollama.com/api".to_string()),
+            api_key: None,
+            ..Config::default()
+        };
+
+        std::env::set_var("OLLAMA_API_KEY", "ollama-env-key");
+        let result = config.validate();
+        std::env::remove_var("OLLAMA_API_KEY");
+
+        assert!(result.is_ok(), "expected validation to pass: {result:?}");
     }
 
     #[test]

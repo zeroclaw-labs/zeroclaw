@@ -92,6 +92,19 @@ struct OllamaFunction {
 // ─── Implementation ───────────────────────────────────────────────────────────
 
 impl OllamaProvider {
+    fn normalize_base_url(raw_url: &str) -> String {
+        let trimmed = raw_url.trim().trim_end_matches('/');
+        if trimmed.is_empty() {
+            return String::new();
+        }
+
+        trimmed
+            .strip_suffix("/api")
+            .unwrap_or(trimmed)
+            .trim_end_matches('/')
+            .to_string()
+    }
+
     pub fn new(base_url: Option<&str>, api_key: Option<&str>) -> Self {
         Self::new_with_reasoning(base_url, api_key, None)
     }
@@ -107,10 +120,7 @@ impl OllamaProvider {
         });
 
         Self {
-            base_url: base_url
-                .unwrap_or("http://localhost:11434")
-                .trim_end_matches('/')
-                .to_string(),
+            base_url: Self::normalize_base_url(base_url.unwrap_or("http://localhost:11434")),
             api_key,
             reasoning_enabled,
         }
@@ -674,6 +684,12 @@ mod tests {
     }
 
     #[test]
+    fn custom_url_strips_api_suffix() {
+        let p = OllamaProvider::new(Some("https://ollama.com/api/"), None);
+        assert_eq!(p.base_url, "https://ollama.com");
+    }
+
+    #[test]
     fn empty_url_uses_empty() {
         let p = OllamaProvider::new(Some(""), None);
         assert_eq!(p.base_url, "");
@@ -713,6 +729,14 @@ mod tests {
     fn remote_endpoint_auth_enabled_when_key_present() {
         let p = OllamaProvider::new(Some("https://ollama.com"), Some("ollama-key"));
         let (_model, should_auth) = p.resolve_request_details("qwen3").unwrap();
+        assert!(should_auth);
+    }
+
+    #[test]
+    fn remote_endpoint_with_api_suffix_still_allows_cloud_models() {
+        let p = OllamaProvider::new(Some("https://ollama.com/api"), Some("ollama-key"));
+        let (model, should_auth) = p.resolve_request_details("qwen3:cloud").unwrap();
+        assert_eq!(model, "qwen3");
         assert!(should_auth);
     }
 

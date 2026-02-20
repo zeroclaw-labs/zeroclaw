@@ -71,6 +71,14 @@ credential is not reused for fallback providers.
 - After multimodal normalization, ZeroClaw sends image payloads through Ollama's native `messages[].images` field.
 - If a non-vision provider is selected, ZeroClaw returns a structured capability error instead of silently ignoring images.
 
+### Ollama Cloud Routing Notes
+
+- Use `:cloud` model suffix only with a remote Ollama endpoint.
+- Remote endpoint should be set in `api_url` (example: `https://ollama.com`).
+- ZeroClaw normalizes a trailing `/api` in `api_url` automatically.
+- If `default_model` ends with `:cloud` while `api_url` is local or unset, config validation fails early with an actionable error.
+- Local Ollama model discovery intentionally excludes `:cloud` entries to avoid selecting cloud-only models in local mode.
+
 ### llama.cpp Server Notes
 
 - Provider ID: `llamacpp` (alias: `llama.cpp`)

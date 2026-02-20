@@ -1211,7 +1211,42 @@ fn fetch_ollama_models() -> Result<Vec<String>> {
     Ok(parse_ollama_model_ids(&payload))
 }
 
-fn resolve_live_models_endpoint(provider_name: &str, provider_api_url: Option<&str>) -> Option<String> {
+fn normalize_ollama_endpoint_url(raw_url: &str) -> String {
+    let trimmed = raw_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    trimmed
+        .strip_suffix("/api")
+        .unwrap_or(trimmed)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn ollama_endpoint_is_local(endpoint_url: &str) -> bool {
+    reqwest::Url::parse(endpoint_url)
+        .ok()
+        .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
+        .is_some_and(|host| matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1" | "0.0.0.0"))
+}
+
+fn ollama_uses_remote_endpoint(provider_api_url: Option<&str>) -> bool {
+    let Some(endpoint) = provider_api_url else {
+        return false;
+    };
+
+    let normalized = normalize_ollama_endpoint_url(endpoint);
+    if normalized.is_empty() {
+        return false;
+    }
+
+    !ollama_endpoint_is_local(&normalized)
+}
+
+fn resolve_live_models_endpoint(
+    provider_name: &str,
+    provider_api_url: Option<&str>,
+) -> Option<String> {
     if canonical_provider_name(provider_name) == "llamacpp" {
         if let Some(url) = provider_api_url
             .map(str::trim)
@@ -1235,21 +1270,26 @@ fn fetch_live_models_for_provider(
 ) -> Result<Vec<String>> {
     let requested_provider_name = provider_name;
     let provider_name = canonical_provider_name(provider_name);
+    let ollama_remote = provider_name == "ollama" && ollama_uses_remote_endpoint(provider_api_url);
     let api_key = if api_key.trim().is_empty() {
-        std::env::var(provider_env_var(provider_name))
-            .ok()
-            .or_else(|| {
-                // Anthropic also accepts OAuth setup-tokens via ANTHROPIC_OAUTH_TOKEN
-                if provider_name == "anthropic" {
-                    std::env::var("ANTHROPIC_OAUTH_TOKEN").ok()
-                } else if provider_name == "minimax" {
-                    std::env::var("MINIMAX_OAUTH_TOKEN").ok()
-                } else {
-                    None
-                }
-            })
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
+        if provider_name == "ollama" && !ollama_remote {
+            None
+        } else {
+            std::env::var(provider_env_var(provider_name))
+                .ok()
+                .or_else(|| {
+                    // Anthropic also accepts OAuth setup-tokens via ANTHROPIC_OAUTH_TOKEN
+                    if provider_name == "anthropic" {
+                        std::env::var("ANTHROPIC_OAUTH_TOKEN").ok()
+                    } else if provider_name == "minimax" {
+                        std::env::var("MINIMAX_OAUTH_TOKEN").ok()
+                    } else {
+                        None
+                    }
+                })
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        }
     } else {
         Some(api_key.trim().to_string())
     };
@@ -1259,22 +1299,27 @@ fn fetch_live_models_for_provider(
         "anthropic" => fetch_anthropic_models(api_key.as_deref())?,
         "gemini" => fetch_gemini_models(api_key.as_deref())?,
         "ollama" => {
-            if api_key.as_deref().map_or(true, |k| k.trim().is_empty()) {
-                // Key is None or empty, assume local Ollama
-                fetch_ollama_models()?
-            } else {
-                // Key is present, assume Ollama Cloud and return hardcoded list
+            if ollama_remote {
+                // Remote Ollama endpoints can serve cloud-routed models.
+                // Keep this curated list aligned with current Ollama cloud catalog.
                 vec![
                     "glm-5:cloud".to_string(),
                     "glm-4.7:cloud".to_string(),
-                    "gpt-oss:cloud".to_string(),
+                    "gpt-oss:20b:cloud".to_string(),
+                    "gpt-oss:120b:cloud".to_string(),
                     "gemini-3-flash-preview:cloud".to_string(),
-                    "qwen2.5-coder:1.5b".to_string(),
-                    "qwen2.5-coder:3b".to_string(),
-                    "qwen2.5:cloud".to_string(),
+                    "qwen3-coder-next:cloud".to_string(),
+                    "qwen3-coder:480b:cloud".to_string(),
+                    "kimi-k2.5:cloud".to_string(),
                     "minimax-m2.5:cloud".to_string(),
-                    "deepseek-v3.1:cloud".to_string(),
+                    "deepseek-v3.1:671b:cloud".to_string(),
                 ]
+            } else {
+                // Local endpoints should not surface cloud-only suffixes.
+                fetch_ollama_models()?
+                    .into_iter()
+                    .filter(|model_id| !model_id.ends_with(":cloud"))
+                    .collect()
             }
         }
         _ => {
@@ -1792,9 +1837,14 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
                 .default("https://ollama.com".into())
                 .interact_text()?;
 
-            let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
+            let normalized_url = normalize_ollama_endpoint_url(&raw_url);
             if normalized_url.is_empty() {
                 anyhow::bail!("Remote Ollama endpoint URL cannot be empty.");
+            }
+            let parsed = reqwest::Url::parse(&normalized_url)
+                .context("Remote Ollama endpoint URL must be a valid URL")?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                anyhow::bail!("Remote Ollama endpoint URL must use http:// or https://");
             }
 
             provider_api_url = Some(normalized_url.clone());
@@ -1803,6 +1853,9 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
                 "Remote endpoint configured: {}",
                 style(&normalized_url).cyan()
             ));
+            if raw_url.trim().trim_end_matches('/') != normalized_url {
+                print_bullet("Normalized endpoint to base URL (removed trailing /api).");
+            }
             print_bullet(&format!(
                 "If you use cloud-only models, append {} to the model ID.",
                 style(":cloud").yellow()
@@ -2068,15 +2121,26 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
     let mut live_options: Option<Vec<(String, String)>> = None;
 
     if supports_live_model_fetch(provider_name) {
-        let can_fetch_without_key = allows_unauthenticated_model_fetch(provider_name);
+        let ollama_remote = canonical_provider == "ollama"
+            && ollama_uses_remote_endpoint(provider_api_url.as_deref());
+        let can_fetch_without_key =
+            allows_unauthenticated_model_fetch(provider_name) && !ollama_remote;
         let has_api_key = !api_key.trim().is_empty()
-            || std::env::var(provider_env_var(provider_name))
-                .ok()
-                .is_some_and(|value| !value.trim().is_empty())
+            || ((canonical_provider != "ollama" || ollama_remote)
+                && std::env::var(provider_env_var(provider_name))
+                    .ok()
+                    .is_some_and(|value| !value.trim().is_empty()))
             || (provider_name == "minimax"
                 && std::env::var("MINIMAX_OAUTH_TOKEN")
                     .ok()
                     .is_some_and(|value| !value.trim().is_empty()));
+
+        if canonical_provider == "ollama" && ollama_remote && !has_api_key {
+            print_bullet(&format!(
+                "Remote Ollama live-model refresh needs an API key ({}); using curated models.",
+                style("OLLAMA_API_KEY").yellow()
+            ));
+        }
 
         if can_fetch_without_key || has_api_key {
             if let Some(cached) =
@@ -5711,6 +5775,30 @@ mod tests {
             Some("https://api.venice.ai/api/v1/models".to_string())
         );
         assert_eq!(resolve_live_models_endpoint("unknown-provider", None), None);
+    }
+
+    #[test]
+    fn normalize_ollama_endpoint_url_strips_api_suffix_and_trailing_slash() {
+        assert_eq!(
+            normalize_ollama_endpoint_url(" https://ollama.com/api/ "),
+            "https://ollama.com".to_string()
+        );
+        assert_eq!(
+            normalize_ollama_endpoint_url("https://ollama.com/"),
+            "https://ollama.com".to_string()
+        );
+        assert_eq!(normalize_ollama_endpoint_url(""), "");
+    }
+
+    #[test]
+    fn ollama_uses_remote_endpoint_distinguishes_local_and_remote_urls() {
+        assert!(!ollama_uses_remote_endpoint(None));
+        assert!(!ollama_uses_remote_endpoint(Some("http://localhost:11434")));
+        assert!(!ollama_uses_remote_endpoint(Some(
+            "http://127.0.0.1:11434/api"
+        )));
+        assert!(ollama_uses_remote_endpoint(Some("https://ollama.com")));
+        assert!(ollama_uses_remote_endpoint(Some("https://ollama.com/api")));
     }
 
     #[test]
