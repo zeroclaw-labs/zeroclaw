@@ -83,6 +83,13 @@ func addMessage(sessionKey, role, content string) {
         Role:    role,
         Content: content,
     })
+    if os.Getenv("ZC_BRIDGE_DEBUG") == "1" {
+        preview := content
+        if len(preview) > 80 {
+            preview = preview[:80]
+        }
+        log.Printf("[history] add sessionKey=%s role=%s len=%d preview=%q", sessionKey, role, len(content), preview)
+    }
 }
 
 // getMessages returns messages for a session (up to limit)
@@ -368,6 +375,17 @@ func handleChatHistory(ws *websocket.Conn, writeMu *sync.Mutex, f Frame) {
     }
 
     msgs := getMessages(sessionKey, limit)
+
+    if os.Getenv("ZC_BRIDGE_DEBUG") == "1" {
+        log.Printf("[history] get sessionKey=%s limit=%d returning=%d", sessionKey, limit, len(msgs))
+        for i, m := range msgs {
+            preview := m.Content
+            if len(preview) > 60 {
+                preview = preview[:60]
+            }
+            log.Printf("[history] msg[%d] role=%s content=%q", i, m.Role, preview)
+        }
+    }
 
     safeWriteJSON(ws, writeMu, Frame{
         Type:    "res",
