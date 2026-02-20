@@ -813,24 +813,14 @@ mod tests {
     #[test]
     fn derive_signing_key_structure() {
         // Verify the key derivation produces a 32-byte key (SHA-256 output).
-        let key = derive_signing_key(
-            TEST_VECTOR_SECRET,
-            "20150830",
-            "us-east-1",
-            "iam",
-        );
+        let key = derive_signing_key(TEST_VECTOR_SECRET, "20150830", "us-east-1", "iam");
         assert_eq!(key.len(), 32);
     }
 
     #[test]
     fn derive_signing_key_known_test_vector() {
         // AWS SigV4 test vector from documentation.
-        let key = derive_signing_key(
-            TEST_VECTOR_SECRET,
-            "20150830",
-            "us-east-1",
-            "iam",
-        );
+        let key = derive_signing_key(TEST_VECTOR_SECRET, "20150830", "us-east-1", "iam");
         assert_eq!(
             hex::encode(&key),
             "c4afb1cc5771d871763a393e44b703571b55cc28424d1a5e86da6ed3c154a4b9"

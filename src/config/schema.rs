@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
-use tokio::fs::{self, OpenOptions};
 #[cfg(unix)]
 use tokio::fs::File;
+use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 
 const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
@@ -181,6 +181,10 @@ pub struct Config {
     /// Hardware configuration (wizard-driven physical world setup).
     #[serde(default)]
     pub hardware: HardwareConfig,
+
+    /// Retrieval-augmented generation configuration (`[rag]`).
+    #[serde(default)]
+    pub rag: RagConfig,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -919,6 +923,93 @@ impl Default for WebSearchConfig {
             brave_api_key: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
+        }
+    }
+}
+
+// ── RAG ─────────────────────────────────────────────────────────
+
+/// Retrieval-augmented generation configuration (`[rag]`).
+///
+/// The embedding API key (`embedding_api_key`) is **required** when `enabled = true`
+/// and must be a dedicated key — never shared with or derived from the LLM provider key.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RagConfig {
+    /// Enable the RAG pipeline.  Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Embedding provider identifier.  Currently only `"nvidia"` is supported.
+    /// Default: `"nvidia"`.
+    #[serde(default = "default_rag_embedding_provider")]
+    pub embedding_provider: String,
+    /// Embedding model name.  Default: `"nvidia/nv-embedqa-e5-v5"`.
+    #[serde(default = "default_rag_embedding_model")]
+    pub embedding_model: String,
+    /// Dedicated API key for the embedding service.
+    ///
+    /// **Required** when `enabled = true`.  Must not be left empty; the agent
+    /// will refuse to start if this field is absent or blank.  Do not reuse
+    /// the LLM provider key here.
+    #[serde(default)]
+    pub embedding_api_key: Option<String>,
+    /// Override base URL for the embedding endpoint.
+    /// Default: `"https://integrate.api.nvidia.com/v1"`.
+    #[serde(default = "default_rag_embedding_base_url")]
+    pub embedding_base_url: String,
+    /// Target chunk size in tokens.  Default: `500`.
+    #[serde(default = "default_rag_chunk_size_tokens")]
+    pub chunk_size_tokens: usize,
+    /// Overlap between consecutive chunks in tokens.  Default: `50`.
+    #[serde(default = "default_rag_chunk_overlap_tokens")]
+    pub chunk_overlap_tokens: usize,
+    /// Maximum number of chunks to return per retrieval query.  Default: `5`.
+    #[serde(default = "default_rag_retrieval_top_k")]
+    pub retrieval_top_k: usize,
+    /// Minimum cosine-similarity score for a chunk to be included.  Default: `0.3`.
+    #[serde(default = "default_rag_similarity_threshold")]
+    pub similarity_threshold: f64,
+}
+
+fn default_rag_embedding_provider() -> String {
+    "nvidia".into()
+}
+
+fn default_rag_embedding_model() -> String {
+    "nvidia/nv-embedqa-e5-v5".into()
+}
+
+fn default_rag_embedding_base_url() -> String {
+    "https://integrate.api.nvidia.com/v1".into()
+}
+
+fn default_rag_chunk_size_tokens() -> usize {
+    500
+}
+
+fn default_rag_chunk_overlap_tokens() -> usize {
+    50
+}
+
+fn default_rag_retrieval_top_k() -> usize {
+    5
+}
+
+fn default_rag_similarity_threshold() -> f64 {
+    0.3
+}
+
+impl Default for RagConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            embedding_provider: default_rag_embedding_provider(),
+            embedding_model: default_rag_embedding_model(),
+            embedding_api_key: None,
+            embedding_base_url: default_rag_embedding_base_url(),
+            chunk_size_tokens: default_rag_chunk_size_tokens(),
+            chunk_overlap_tokens: default_rag_chunk_overlap_tokens(),
+            retrieval_top_k: default_rag_retrieval_top_k(),
+            similarity_threshold: default_rag_similarity_threshold(),
         }
     }
 }
@@ -3544,9 +3635,9 @@ async fn sync_directory(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     #[cfg(unix)]
     use std::{fs::Permissions, os::unix::fs::PermissionsExt};
-    use std::path::PathBuf;
     use tokio::sync::{Mutex, MutexGuard};
     use tokio::test;
     use tokio_stream::wrappers::ReadDirStream;
