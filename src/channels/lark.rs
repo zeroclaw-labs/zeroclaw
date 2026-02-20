@@ -906,7 +906,7 @@ impl Channel for LarkChannel {
         let url = self.send_message_url();
 
         let post = markdown_to_lark_post(&message.content);
-        let content = serde_json::json!({ "post": post }).to_string();
+        let content = post.to_string();
         let body = serde_json::json!({
             "receive_id": message.recipient,
             "msg_type": "post",
