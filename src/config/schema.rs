@@ -1791,6 +1791,11 @@ pub struct AutonomyConfig {
     /// Tools that always require interactive approval, even after "Always".
     #[serde(default = "default_always_ask")]
     pub always_ask: Vec<String>,
+
+    /// Extra directory roots the agent may read/write outside the workspace.
+    /// Resolved paths under any of these roots pass `is_resolved_path_allowed`.
+    #[serde(default)]
+    pub allowed_roots: Vec<String>,
 }
 
 fn default_auto_approve() -> Vec<String> {
@@ -1846,6 +1851,7 @@ impl Default for AutonomyConfig {
             block_high_risk_commands: true,
             auto_approve: default_auto_approve(),
             always_ask: default_always_ask(),
+            allowed_roots: Vec::new(),
         }
     }
 }
@@ -3998,6 +4004,7 @@ default_temperature = 0.7
                 block_high_risk_commands: true,
                 auto_approve: vec!["file_read".into()],
                 always_ask: vec![],
+                allowed_roots: vec![],
             },
             runtime: RuntimeConfig {
                 kind: "docker".into(),
