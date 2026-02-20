@@ -197,7 +197,7 @@ struct MinimaxOauthBaseResponse {
     status_msg: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Clone, Deserialize, Default)]
 struct QwenOauthCredentials {
     #[serde(default)]
     access_token: Option<String>,
@@ -207,6 +207,17 @@ struct QwenOauthCredentials {
     resource_url: Option<String>,
     #[serde(default)]
     expiry_date: Option<i64>,
+}
+
+impl std::fmt::Debug for QwenOauthCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QwenOauthCredentials")
+            .field("access_token", &self.access_token.as_ref().map(|_| "[REDACTED]"))
+            .field("refresh_token", &self.refresh_token.as_ref().map(|_| "[REDACTED]"))
+            .field("resource_url", &self.resource_url)
+            .field("expiry_date", &self.expiry_date)
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -225,10 +236,19 @@ struct QwenOauthTokenResponse {
     error_description: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 struct QwenOauthProviderContext {
     credential: Option<String>,
     base_url: Option<String>,
+}
+
+impl std::fmt::Debug for QwenOauthProviderContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QwenOauthProviderContext")
+            .field("credential", &self.credential.as_ref().map(|_| "[REDACTED]"))
+            .field("base_url", &self.base_url)
+            .finish()
+    }
 }
 
 fn read_non_empty_env(name: &str) -> Option<String> {
