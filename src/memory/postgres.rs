@@ -39,18 +39,28 @@ impl PostgresMemory {
             config.connect_timeout(Duration::from_secs(bounded));
         }
 
-        let mut client = if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| config.connect(NoTls))
-        } else {
-            config.connect(NoTls)
-        }
-        .context("failed to connect to PostgreSQL memory backend")?;
-
         let schema_ident = quote_identifier(schema);
         let table_ident = quote_identifier(table);
         let qualified_table = format!("{schema_ident}.{table_ident}");
 
-        Self::init_schema(&mut client, &schema_ident, &qualified_table)?;
+        // Both connect() and batch_execute() in init_schema() call the postgres
+        // crate's internal runtime.block_on(), which panics if invoked from within
+        // an existing Tokio runtime context.  Wrap the entire connect+init sequence
+        // in block_in_place so the scheduler knows the thread will block, keeping
+        // all postgres-internal block_on calls safely off the async worker thread.
+        let do_connect = || -> Result<Client> {
+            let mut client = config
+                .connect(NoTls)
+                .context("failed to connect to PostgreSQL memory backend")?;
+            Self::init_schema(&mut client, &schema_ident, &qualified_table)?;
+            Ok(client)
+        };
+
+        let client = if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::block_in_place(do_connect)
+        } else {
+            do_connect()
+        }?;
 
         Ok(Self {
             client: Arc::new(Mutex::new(client)),
