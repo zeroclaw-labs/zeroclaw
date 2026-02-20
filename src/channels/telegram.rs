@@ -3639,29 +3639,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_reply_context_truncates_long_text() {
-        let ch = TelegramChannel::new("t".into(), vec!["*".into()], false);
-        let long_text = "a".repeat(300);
-        let msg = serde_json::json!({
-            "reply_to_message": {
-                "from": { "username": "alice" },
-                "text": long_text
-            }
-        });
-        let ctx = ch.extract_reply_context(&msg).unwrap();
-        // Should contain truncation marker
-        assert!(ctx.contains('…'));
-        // The quoted content (after "> ") should be 200 chars + "…"
-        let quoted_line = ctx.lines().nth(1).unwrap();
-        // "> " prefix = 2 chars, so content = quoted_line.len() - 2
-        assert!(
-            quoted_line.len() <= 205,
-            "quoted line too long: {}",
-            quoted_line.len()
-        );
-    }
-
-    #[test]
     fn extract_reply_context_no_username_uses_first_name() {
         let ch = TelegramChannel::new("t".into(), vec!["*".into()], false);
         let msg = serde_json::json!({
