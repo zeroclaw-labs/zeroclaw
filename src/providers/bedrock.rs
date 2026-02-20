@@ -797,9 +797,13 @@ mod tests {
         );
     }
 
+    /// AWS documentation example key for SigV4 test vectors (not a real credential).
+    const TEST_VECTOR_SECRET: &str = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+
     #[test]
     fn hmac_sha256_known_input() {
-        let result = hmac_sha256(b"key", b"message");
+        let test_key: &[u8] = b"key";
+        let result = hmac_sha256(test_key, b"message");
         assert_eq!(
             hex::encode(&result),
             "6e9ef29b75fffc5b7abae527d58fdadb2fe42e7219011976917343065f58ed4a"
@@ -810,7 +814,7 @@ mod tests {
     fn derive_signing_key_structure() {
         // Verify the key derivation produces a 32-byte key (SHA-256 output).
         let key = derive_signing_key(
-            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            TEST_VECTOR_SECRET,
             "20150830",
             "us-east-1",
             "iam",
@@ -821,10 +825,8 @@ mod tests {
     #[test]
     fn derive_signing_key_known_test_vector() {
         // AWS SigV4 test vector from documentation.
-        // Secret: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
-        // Date: "20150830", Region: "us-east-1", Service: "iam"
         let key = derive_signing_key(
-            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            TEST_VECTOR_SECRET,
             "20150830",
             "us-east-1",
             "iam",
