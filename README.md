@@ -297,6 +297,10 @@ zeroclaw daemon
 zeroclaw status
 zeroclaw auth status
 
+# Generate shell completions (stdout only, safe to source directly)
+source <(zeroclaw completions bash)
+zeroclaw completions zsh > ~/.zfunc/_zeroclaw
+
 # Run system diagnostics
 zeroclaw doctor
 
@@ -882,6 +886,7 @@ See [aieos.org](https://aieos.org) for the full schema and live examples.
 | `integrations` | Inspect integration setup details |
 | `skills` | List/install/remove skills |
 | `migrate` | Import data from other runtimes (`migrate openclaw`) |
+| `completions` | Generate shell completion scripts (`bash`, `fish`, `zsh`, `powershell`, `elvish`) |
 | `hardware` | USB discover/introspect/info commands |
 | `peripheral` | Manage and flash hardware peripherals |
 

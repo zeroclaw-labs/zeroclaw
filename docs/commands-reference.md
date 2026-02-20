@@ -2,7 +2,7 @@
 
 This reference is derived from the current CLI surface (`zeroclaw --help`).
 
-Last verified: **February 19, 2026**.
+Last verified: **February 20, 2026**.
 
 ## Top-Level Commands
 
@@ -23,6 +23,7 @@ Last verified: **February 19, 2026**.
 | `skills` | List/install/remove skills |
 | `migrate` | Import from external runtimes (currently OpenClaw) |
 | `config` | Export machine-readable config schema |
+| `completions` | Generate shell completion scripts to stdout |
 | `hardware` | Discover and introspect USB hardware |
 | `peripheral` | Configure and flash peripherals |
 
@@ -124,6 +125,16 @@ Skill manifests (`SKILL.toml`) support `prompts` and `[[tools]]`; both are injec
 - `zeroclaw config schema`
 
 `config schema` prints a JSON Schema (draft 2020-12) for the full `config.toml` contract to stdout.
+
+### `completions`
+
+- `zeroclaw completions bash`
+- `zeroclaw completions fish`
+- `zeroclaw completions zsh`
+- `zeroclaw completions powershell`
+- `zeroclaw completions elvish`
+
+`completions` is stdout-only by design so scripts can be sourced directly without log/warning contamination.
 
 ### `hardware`
 
