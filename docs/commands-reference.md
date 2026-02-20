@@ -69,6 +69,11 @@ Last verified: **February 20, 2026**.
 - `zeroclaw cron pause <id>`
 - `zeroclaw cron resume <id>`
 
+Notes:
+
+- Mutating schedule/cron actions require `cron.enabled = true`.
+- Shell command payloads for schedule creation (`create` / `add` / `once`) are validated by security command policy before job persistence.
+
 ### `models`
 
 - `zeroclaw models refresh`
