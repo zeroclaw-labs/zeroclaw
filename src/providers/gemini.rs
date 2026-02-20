@@ -118,7 +118,8 @@ struct GenerateContentResponse {
 
 #[derive(Debug, Deserialize)]
 struct Candidate {
-    content: CandidateContent,
+    #[serde(default)]
+    content: Option<CandidateContent>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,7 +129,46 @@ struct CandidateContent {
 
 #[derive(Debug, Deserialize)]
 struct ResponsePart {
+    #[serde(default)]
     text: Option<String>,
+    /// Thinking models (e.g. gemini-3-pro-preview) mark reasoning parts with `thought: true`.
+    #[serde(default)]
+    thought: bool,
+}
+
+impl CandidateContent {
+    /// Extract effective text, skipping thinking/signature parts.
+    ///
+    /// Gemini thinking models (e.g. gemini-3-pro-preview) return parts like:
+    /// - `{"thought": true, "text": "reasoning..."}` — internal reasoning
+    /// - `{"text": "actual answer"}` — the real response
+    /// - `{"thoughtSignature": "..."}` — opaque signature (no text field)
+    ///
+    /// Returns the non-thinking text, falling back to thinking text only when
+    /// no non-thinking content is available.
+    fn effective_text(self) -> Option<String> {
+        let mut answer_parts: Vec<String> = Vec::new();
+        let mut first_thinking: Option<String> = None;
+
+        for part in self.parts {
+            if let Some(text) = part.text {
+                if text.is_empty() {
+                    continue;
+                }
+                if !part.thought {
+                    answer_parts.push(text);
+                } else if first_thinking.is_none() {
+                    first_thinking = Some(text);
+                }
+            }
+        }
+
+        if answer_parts.is_empty() {
+            first_thinking
+        } else {
+            Some(answer_parts.join(""))
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -389,8 +429,8 @@ impl GeminiProvider {
         result
             .candidates
             .and_then(|c| c.into_iter().next())
-            .and_then(|c| c.content.parts.into_iter().next())
-            .and_then(|p| p.text)
+            .and_then(|c| c.content)
+            .and_then(|c| c.effective_text())
             .ok_or_else(|| anyhow::anyhow!("No response from Gemini"))
     }
 }
@@ -792,6 +832,7 @@ mod tests {
             .next()
             .unwrap()
             .content
+            .unwrap()
             .parts
             .into_iter()
             .next()
@@ -834,12 +875,145 @@ mod tests {
             .next()
             .unwrap()
             .content
+            .unwrap()
             .parts
             .into_iter()
             .next()
             .unwrap()
             .text;
         assert_eq!(text, Some("Hello from internal".to_string()));
+    }
+
+    // ── Thinking model response tests ──────────────────────────────────────
+
+    #[test]
+    fn thinking_response_extracts_non_thinking_text() {
+        let json = r#"{
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"thought": true, "text": "Let me think about this..."},
+                        {"text": "The answer is 42."},
+                        {"thoughtSignature": "c2lnbmF0dXJl"}
+                    ]
+                }
+            }]
+        }"#;
+
+        let response: GenerateContentResponse = serde_json::from_str(json).unwrap();
+        let candidate = response.candidates.unwrap().into_iter().next().unwrap();
+        let text = candidate.content.unwrap().effective_text();
+        assert_eq!(text, Some("The answer is 42.".to_string()));
+    }
+
+    #[test]
+    fn non_thinking_response_unaffected() {
+        let json = r#"{
+            "candidates": [{
+                "content": {
+                    "parts": [{"text": "Hello there!"}]
+                }
+            }]
+        }"#;
+
+        let response: GenerateContentResponse = serde_json::from_str(json).unwrap();
+        let candidate = response.candidates.unwrap().into_iter().next().unwrap();
+        let text = candidate.content.unwrap().effective_text();
+        assert_eq!(text, Some("Hello there!".to_string()));
+    }
+
+    #[test]
+    fn thinking_only_response_falls_back_to_thinking_text() {
+        let json = r#"{
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"thought": true, "text": "I need more context..."},
+                        {"thoughtSignature": "c2lnbmF0dXJl"}
+                    ]
+                }
+            }]
+        }"#;
+
+        let response: GenerateContentResponse = serde_json::from_str(json).unwrap();
+        let candidate = response.candidates.unwrap().into_iter().next().unwrap();
+        let text = candidate.content.unwrap().effective_text();
+        assert_eq!(text, Some("I need more context...".to_string()));
+    }
+
+    #[test]
+    fn empty_parts_returns_none() {
+        let json = r#"{
+            "candidates": [{
+                "content": {
+                    "parts": []
+                }
+            }]
+        }"#;
+
+        let response: GenerateContentResponse = serde_json::from_str(json).unwrap();
+        let candidate = response.candidates.unwrap().into_iter().next().unwrap();
+        let text = candidate.content.unwrap().effective_text();
+        assert_eq!(text, None);
+    }
+
+    #[test]
+    fn multiple_text_parts_concatenated() {
+        let json = r#"{
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"text": "Part one. "},
+                        {"text": "Part two."}
+                    ]
+                }
+            }]
+        }"#;
+
+        let response: GenerateContentResponse = serde_json::from_str(json).unwrap();
+        let candidate = response.candidates.unwrap().into_iter().next().unwrap();
+        let text = candidate.content.unwrap().effective_text();
+        assert_eq!(text, Some("Part one. Part two.".to_string()));
+    }
+
+    #[test]
+    fn thought_signature_only_parts_skipped() {
+        let json = r#"{
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"thoughtSignature": "c2lnbmF0dXJl"}
+                    ]
+                }
+            }]
+        }"#;
+
+        let response: GenerateContentResponse = serde_json::from_str(json).unwrap();
+        let candidate = response.candidates.unwrap().into_iter().next().unwrap();
+        let text = candidate.content.unwrap().effective_text();
+        assert_eq!(text, None);
+    }
+
+    #[test]
+    fn internal_response_thinking_model() {
+        let json = r#"{
+            "response": {
+                "candidates": [{
+                    "content": {
+                        "parts": [
+                            {"thought": true, "text": "reasoning..."},
+                            {"text": "final answer"}
+                        ]
+                    }
+                }]
+            }
+        }"#;
+
+        let response: GenerateContentResponse = serde_json::from_str(json).unwrap();
+        let effective = response.into_effective_response();
+        let candidate = effective.candidates.unwrap().into_iter().next().unwrap();
+        let text = candidate.content.unwrap().effective_text();
+        assert_eq!(text, Some("final answer".to_string()));
     }
 
     #[tokio::test]

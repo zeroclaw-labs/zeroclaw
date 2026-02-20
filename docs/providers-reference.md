@@ -64,6 +64,7 @@ credential is not reused for fallback providers.
 - Auth can come from `GEMINI_API_KEY`, `GOOGLE_API_KEY`, or Gemini CLI OAuth cache (`~/.gemini/oauth_creds.json`)
 - API key requests use `generativelanguage.googleapis.com/v1beta`
 - Gemini CLI OAuth requests use `cloudcode-pa.googleapis.com/v1internal` with Code Assist request envelope semantics
+- Thinking models (e.g. `gemini-3-pro-preview`) are supported — internal reasoning parts are automatically filtered from the response
 
 ### Ollama Vision Notes
 
