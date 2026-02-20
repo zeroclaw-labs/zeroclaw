@@ -845,25 +845,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return None;
         }
 
-        // Extract sender info (same logic as parse_update_message)
-        let username = message
-            .get("from")
-            .and_then(|from| from.get("username"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown")
-            .to_string();
-
-        let sender_id = message
-            .get("from")
-            .and_then(|from| from.get("id"))
-            .and_then(serde_json::Value::as_i64)
-            .map(|id| id.to_string());
-
-        let sender_identity = if username == "unknown" {
-            sender_id.clone().unwrap_or_else(|| "unknown".to_string())
-        } else {
-            username.clone()
-        };
+        let (username, sender_id, sender_identity) = Self::extract_sender_info(message);
 
         let mut identities = vec![username.as_str()];
         if let Some(id) = sender_id.as_deref() {
@@ -933,11 +915,17 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return None;
         }
 
+        let content = if let Some(quote) = Self::extract_reply_context(message) {
+            format!("{quote}\n\n[Voice] {text}")
+        } else {
+            format!("[Voice] {text}")
+        };
+
         Some(ChannelMessage {
             id: format!("telegram_{chat_id}_{message_id}"),
             sender: sender_identity,
             reply_target,
-            content: format!("[Voice] {text}"),
+            content,
             channel: "telegram".to_string(),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -945,6 +933,69 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .as_secs(),
             thread_ts: None,
         })
+    }
+
+    /// Extract sender username and display identity from a Telegram message object.
+    fn extract_sender_info(message: &serde_json::Value) -> (String, Option<String>, String) {
+        let username = message
+            .get("from")
+            .and_then(|from| from.get("username"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        let sender_id = message
+            .get("from")
+            .and_then(|from| from.get("id"))
+            .and_then(serde_json::Value::as_i64)
+            .map(|id| id.to_string());
+        let sender_identity = if username == "unknown" {
+            sender_id.clone().unwrap_or_else(|| "unknown".to_string())
+        } else {
+            username.clone()
+        };
+        (username, sender_id, sender_identity)
+    }
+
+    /// Extract reply context from a Telegram `reply_to_message`, if present.
+    fn extract_reply_context(message: &serde_json::Value) -> Option<String> {
+        let reply = message.get("reply_to_message")?;
+
+        let reply_sender = reply
+            .get("from")
+            .and_then(|from| from.get("username"))
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                reply
+                    .get("from")
+                    .and_then(|from| from.get("first_name"))
+                    .and_then(serde_json::Value::as_str)
+            })
+            .unwrap_or("unknown");
+
+        let reply_text = if let Some(text) = reply.get("text").and_then(serde_json::Value::as_str) {
+            text.to_string()
+        } else if reply.get("voice").is_some() || reply.get("audio").is_some() {
+            "[Voice message]".to_string()
+        } else if reply.get("photo").is_some() {
+            "[Photo]".to_string()
+        } else if reply.get("document").is_some() {
+            "[Document]".to_string()
+        } else if reply.get("video").is_some() {
+            "[Video]".to_string()
+        } else if reply.get("sticker").is_some() {
+            "[Sticker]".to_string()
+        } else {
+            "[Message]".to_string()
+        };
+
+        // Format as blockquote with sender attribution
+        let quoted_lines: String = reply_text
+            .lines()
+            .map(|line| format!("> {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        Some(format!("> @{reply_sender}:\n{quoted_lines}"))
     }
 
     fn parse_update_message(
@@ -975,24 +1026,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             (None, None, None) => return None,
         };
 
-        let username = message
-            .get("from")
-            .and_then(|from| from.get("username"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown")
-            .to_string();
-
-        let sender_id = message
-            .get("from")
-            .and_then(|from| from.get("id"))
-            .and_then(serde_json::Value::as_i64)
-            .map(|id| id.to_string());
-
-        let sender_identity = if username == "unknown" {
-            sender_id.clone().unwrap_or_else(|| "unknown".to_string())
-        } else {
-            username.clone()
-        };
+        let (username, sender_id, sender_identity) = Self::extract_sender_info(message);
 
         let mut identities = vec![username.as_str()];
         if let Some(id) = sender_id.as_deref() {
@@ -1045,6 +1079,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             Self::normalize_incoming_content(&text, bot_username)?
         } else {
             text.to_string()
+        };
+
+        let content = if let Some(quote) = Self::extract_reply_context(message) {
+            format!("{quote}\n\n{content}")
+        } else {
+            content
         };
 
         Some((
@@ -3331,6 +3371,133 @@ mod tests {
         });
         let (_, dur) = TelegramChannel::parse_voice_metadata(&msg).unwrap();
         assert_eq!(dur, 0);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // extract_sender_info tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn extract_sender_info_with_username() {
+        let msg = serde_json::json!({
+            "from": { "id": 123, "username": "alice" }
+        });
+        let (username, sender_id, identity) = TelegramChannel::extract_sender_info(&msg);
+        assert_eq!(username, "alice");
+        assert_eq!(sender_id, Some("123".to_string()));
+        assert_eq!(identity, "alice");
+    }
+
+    #[test]
+    fn extract_sender_info_without_username() {
+        let msg = serde_json::json!({
+            "from": { "id": 42 }
+        });
+        let (username, sender_id, identity) = TelegramChannel::extract_sender_info(&msg);
+        assert_eq!(username, "unknown");
+        assert_eq!(sender_id, Some("42".to_string()));
+        assert_eq!(identity, "42");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // extract_reply_context tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn extract_reply_context_text_message() {
+        let msg = serde_json::json!({
+            "reply_to_message": {
+                "from": { "username": "alice" },
+                "text": "Hello world"
+            }
+        });
+        let ctx = TelegramChannel::extract_reply_context(&msg).unwrap();
+        assert_eq!(ctx, "> @alice:\n> Hello world");
+    }
+
+    #[test]
+    fn extract_reply_context_voice_message() {
+        let msg = serde_json::json!({
+            "reply_to_message": {
+                "from": { "username": "bob" },
+                "voice": { "file_id": "abc", "duration": 5 }
+            }
+        });
+        let ctx = TelegramChannel::extract_reply_context(&msg).unwrap();
+        assert_eq!(ctx, "> @bob:\n> [Voice message]");
+    }
+
+    #[test]
+    fn extract_reply_context_no_reply() {
+        let msg = serde_json::json!({
+            "text": "just a regular message"
+        });
+        assert!(TelegramChannel::extract_reply_context(&msg).is_none());
+    }
+
+    #[test]
+    fn extract_reply_context_truncates_long_text() {
+        let long_text = "a".repeat(300);
+        let msg = serde_json::json!({
+            "reply_to_message": {
+                "from": { "username": "alice" },
+                "text": long_text
+            }
+        });
+        let ctx = TelegramChannel::extract_reply_context(&msg).unwrap();
+        // Should contain truncation marker
+        assert!(ctx.contains('…'));
+        // The quoted content (after "> ") should be 200 chars + "…"
+        let quoted_line = ctx.lines().nth(1).unwrap();
+        // "> " prefix = 2 chars, so content = quoted_line.len() - 2
+        assert!(
+            quoted_line.len() <= 205,
+            "quoted line too long: {}",
+            quoted_line.len()
+        );
+    }
+
+    #[test]
+    fn extract_reply_context_no_username_uses_first_name() {
+        let msg = serde_json::json!({
+            "reply_to_message": {
+                "from": { "id": 999, "first_name": "Charlie" },
+                "text": "Hi there"
+            }
+        });
+        let ctx = TelegramChannel::extract_reply_context(&msg).unwrap();
+        assert_eq!(ctx, "> @Charlie:\n> Hi there");
+    }
+
+    #[test]
+    fn parse_update_message_includes_reply_context() {
+        let ch = TelegramChannel::new("t".into(), vec!["*".into()], false);
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 10,
+                "text": "translate this",
+                "from": { "id": 1, "username": "alice" },
+                "chat": { "id": 100, "type": "private" },
+                "reply_to_message": {
+                    "from": { "username": "bot" },
+                    "text": "Bonjour le monde"
+                }
+            }
+        });
+        let parsed = ch.parse_update_message(&update).unwrap();
+        assert!(
+            parsed.content.starts_with("> @bot:"),
+            "content should start with quote: {}",
+            parsed.content
+        );
+        assert!(
+            parsed.content.contains("translate this"),
+            "content should contain user text"
+        );
+        assert!(
+            parsed.content.contains("Bonjour le monde"),
+            "content should contain quoted text"
+        );
     }
 
     #[test]
