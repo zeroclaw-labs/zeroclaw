@@ -208,6 +208,22 @@ pub struct DelegateAgentConfig {
     /// Max recursion depth for nested delegation
     #[serde(default = "default_max_depth")]
     pub max_depth: u32,
+    /// When true, the sub-agent runs a full tool-call loop (agentic mode)
+    /// instead of a single prompt→response. This gives it access to tools
+    /// from `allowed_tools` and lets it iterate up to `max_iterations` times.
+    #[serde(default)]
+    pub agentic: bool,
+    /// Tool names the sub-agent may use in agentic mode.
+    /// An empty list means no tools (equivalent to non-agentic).
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    /// Max tool-call iterations in agentic mode (default: 10).
+    #[serde(default = "default_max_iterations")]
+    pub max_iterations: usize,
+}
+
+fn default_max_iterations() -> usize {
+    10
 }
 
 fn default_max_depth() -> u32 {
@@ -4062,6 +4078,9 @@ tool_dispatcher = "xml"
                 api_key: Some("agent-credential".into()),
                 temperature: None,
                 max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
             },
         );
 

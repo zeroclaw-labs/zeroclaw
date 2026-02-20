@@ -1,6 +1,8 @@
 use super::traits::{Tool, ToolResult};
+use crate::agent::loop_::run_tool_call_loop;
 use crate::config::DelegateAgentConfig;
-use crate::providers::{self, Provider};
+use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
+use crate::providers::{self, ChatMessage, Provider};
 use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
@@ -12,10 +14,17 @@ use std::time::Duration;
 /// Default timeout for sub-agent provider calls.
 const DELEGATE_TIMEOUT_SECS: u64 = 120;
 
+/// Default timeout for agentic sub-agent calls (longer to allow tool iterations).
+const DELEGATE_AGENTIC_TIMEOUT_SECS: u64 = 300;
+
 /// Tool that delegates a subtask to a named agent with a different
 /// provider/model configuration. Enables multi-agent workflows where
 /// a primary agent can hand off specialized work (research, coding,
 /// summarization) to purpose-built sub-agents.
+///
+/// When `agentic: true` is set in the agent config, the sub-agent runs a
+/// full tool-call loop with access to a filtered subset of the parent's
+/// tool registry.
 pub struct DelegateTool {
     agents: Arc<HashMap<String, DelegateAgentConfig>>,
     security: Arc<SecurityPolicy>,
@@ -25,6 +34,10 @@ pub struct DelegateTool {
     provider_runtime_options: providers::ProviderRuntimeOptions,
     /// Depth at which this tool instance lives in the delegation chain.
     depth: u32,
+    /// Parent tool registry — agentic sub-agents select a subset from this.
+    parent_tools: Arc<Vec<Box<dyn Tool>>>,
+    /// Multimodal config inherited from parent.
+    multimodal_config: crate::config::MultimodalConfig,
 }
 
 impl DelegateTool {
@@ -53,6 +66,8 @@ impl DelegateTool {
             fallback_credential,
             provider_runtime_options,
             depth: 0,
+            parent_tools: Arc::new(Vec::new()),
+            multimodal_config: crate::config::MultimodalConfig::default(),
         }
     }
 
@@ -87,7 +102,22 @@ impl DelegateTool {
             fallback_credential,
             provider_runtime_options,
             depth,
+            parent_tools: Arc::new(Vec::new()),
+            multimodal_config: crate::config::MultimodalConfig::default(),
         }
+    }
+
+    /// Attach the parent tool registry so agentic sub-agents can use a
+    /// filtered subset of these tools.
+    pub fn with_parent_tools(mut self, tools: Arc<Vec<Box<dyn Tool>>>) -> Self {
+        self.parent_tools = tools;
+        self
+    }
+
+    /// Attach the multimodal config for agentic sub-agents.
+    pub fn with_multimodal_config(mut self, config: crate::config::MultimodalConfig) -> Self {
+        self.multimodal_config = config;
+        self
     }
 }
 
@@ -99,8 +129,8 @@ impl Tool for DelegateTool {
 
     fn description(&self) -> &str {
         "Delegate a subtask to a specialized agent. Use when: a task benefits from a different model \
-         (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single \
-         prompt and returns its response."
+         (e.g. fast summarization, deep reasoning, code generation). Agents configured with \
+         agentic=true run a full tool-call loop; others run a single prompt and return their response."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -251,7 +281,20 @@ impl Tool for DelegateTool {
 
         let temperature = agent_config.temperature.unwrap_or(0.7);
 
-        // Wrap the provider call in a timeout to prevent indefinite blocking
+        // ── Agentic mode: full tool-call loop ────────────────────
+        if agent_config.agentic && !agent_config.allowed_tools.is_empty() {
+            return self
+                .execute_agentic(
+                    agent_name,
+                    agent_config,
+                    &*provider,
+                    &full_prompt,
+                    temperature,
+                )
+                .await;
+        }
+
+        // ── Simple mode: single prompt→response ─────────────────
         let result = tokio::time::timeout(
             Duration::from_secs(DELEGATE_TIMEOUT_SECS),
             provider.chat_with_system(
@@ -302,6 +345,168 @@ impl Tool for DelegateTool {
     }
 }
 
+impl DelegateTool {
+    /// Run the sub-agent in agentic mode: build a filtered tool registry from
+    /// the parent tools, then execute a full tool-call loop.
+    async fn execute_agentic(
+        &self,
+        agent_name: &str,
+        agent_config: &DelegateAgentConfig,
+        provider: &dyn Provider,
+        full_prompt: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ToolResult> {
+        // Build filtered tool registry from parent tools.
+        let allowed: std::collections::HashSet<&str> = agent_config
+            .allowed_tools
+            .iter()
+            .map(String::as_str)
+            .collect();
+
+        let sub_tools: Vec<Box<dyn Tool>> = self
+            .parent_tools
+            .iter()
+            .filter(|t| allowed.contains(t.name()))
+            // The delegate tool itself is excluded to prevent re-entrant
+            // delegation from the sub-agent (depth limiting already guards
+            // against infinite recursion, but this avoids confusion).
+            .filter(|t| t.name() != "delegate")
+            .map(|t| {
+                // Wrap the parent tool reference in a ToolRef that forwards
+                // all trait methods. We use a raw pointer to erase the
+                // lifetime — this is safe because we await the entire tool
+                // loop to completion below before returning, so the parent
+                // tools outlive the sub-agent execution.
+                let ptr = t.as_ref() as *const dyn Tool;
+                Box::new(ToolRef(ptr)) as Box<dyn Tool>
+            })
+            .collect();
+
+        if sub_tools.is_empty() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Agent '{agent_name}' has agentic=true but none of the allowed_tools \
+                     ({}) are available in the parent tool registry",
+                    agent_config.allowed_tools.join(", ")
+                )),
+            });
+        }
+
+        // Build initial conversation history.
+        let mut history = Vec::new();
+        if let Some(ref sys) = agent_config.system_prompt {
+            history.push(ChatMessage::system(sys.clone()));
+        }
+        history.push(ChatMessage::user(full_prompt.to_string()));
+
+        let observer = NoopObserver;
+        let max_iterations = agent_config.max_iterations;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(DELEGATE_AGENTIC_TIMEOUT_SECS),
+            run_tool_call_loop(
+                provider,
+                &mut history,
+                &sub_tools,
+                &observer,
+                &agent_config.provider,
+                &agent_config.model,
+                temperature,
+                /*silent=*/ true,
+                /*approval=*/ None,
+                "delegate",
+                &self.multimodal_config,
+                max_iterations,
+                /*cancellation_token=*/ None,
+                /*on_delta=*/ None,
+            ),
+        )
+        .await;
+
+        match result {
+            Ok(Ok(response)) => {
+                let rendered = if response.trim().is_empty() {
+                    "[Empty response]".to_string()
+                } else {
+                    response
+                };
+                Ok(ToolResult {
+                    success: true,
+                    output: format!(
+                        "[Agent '{agent_name}' ({provider}/{model}, agentic)]\n{rendered}",
+                        provider = agent_config.provider,
+                        model = agent_config.model
+                    ),
+                    error: None,
+                })
+            }
+            Ok(Err(e)) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Agent '{agent_name}' failed: {e}")),
+            }),
+            Err(_elapsed) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Agent '{agent_name}' timed out after {DELEGATE_AGENTIC_TIMEOUT_SECS}s"
+                )),
+            }),
+        }
+    }
+}
+
+// ── ToolRef: thin wrapper to share parent tools with sub-agents ──────────
+
+/// A lightweight wrapper that holds a raw pointer to a parent tool and
+/// forwards all `Tool` trait methods. This avoids cloning the entire tool
+/// registry for each sub-agent invocation.
+///
+/// SAFETY: The parent tool registry (`Arc<Vec<Box<dyn Tool>>>`) outlives the
+/// sub-agent execution because `execute_agentic` awaits the tool loop to
+/// completion before returning.
+struct ToolRef(*const dyn Tool);
+
+// SAFETY: The inner pointer targets a type that is already Send + Sync
+// (the Tool trait requires Send + Sync). The pointer remains valid for
+// the entire duration of the sub-agent tool loop.
+unsafe impl Send for ToolRef {}
+unsafe impl Sync for ToolRef {}
+
+#[async_trait]
+impl Tool for ToolRef {
+    fn name(&self) -> &str {
+        // SAFETY: pointer is valid for the duration of the tool loop.
+        unsafe { &*self.0 }.name()
+    }
+    fn description(&self) -> &str {
+        unsafe { &*self.0 }.description()
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        unsafe { &*self.0 }.parameters_schema()
+    }
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        unsafe { &*self.0 }.execute(args).await
+    }
+}
+
+// ── NoopObserver for sub-agent execution ─────────────────────────────────
+
+struct NoopObserver;
+
+impl Observer for NoopObserver {
+    fn record_event(&self, _event: &ObserverEvent) {}
+    fn record_metric(&self, _metric: &ObserverMetric) {}
+    fn name(&self) -> &str {
+        "noop"
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,6 +527,9 @@ mod tests {
                 api_key: None,
                 temperature: Some(0.3),
                 max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
             },
         );
         agents.insert(
@@ -333,6 +541,9 @@ mod tests {
                 api_key: Some("delegate-test-credential".to_string()),
                 temperature: None,
                 max_depth: 2,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
             },
         );
         agents
@@ -440,6 +651,9 @@ mod tests {
                 api_key: None,
                 temperature: None,
                 max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -543,6 +757,9 @@ mod tests {
                 api_key: None,
                 temperature: None,
                 max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -575,6 +792,9 @@ mod tests {
                 api_key: None,
                 temperature: None,
                 max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
