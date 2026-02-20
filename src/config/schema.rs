@@ -1950,6 +1950,20 @@ impl Config {
 
             let contents =
                 fs::read_to_string(&config_path).context("Failed to read config file")?;
+
+            // Warn if TOML contains fields that are computed at runtime and ignored
+            if let Ok(raw) = contents.parse::<toml::Table>() {
+                for key in &["workspace_dir", "config_path"] {
+                    if raw.contains_key(*key) {
+                        tracing::warn!(
+                            "Config file contains \"{key}\" which is computed at runtime \
+                             and will be ignored. Remove it from {:?} to silence this warning.",
+                            config_path,
+                        );
+                    }
+                }
+            }
+
             let mut config: Config =
                 toml::from_str(&contents).context("Failed to parse config file")?;
             // Set computed paths that are skipped during serialization
@@ -2035,11 +2049,9 @@ impl Config {
         }
 
         // Workspace directory: ZEROCLAW_WORKSPACE
-        if let Ok(workspace) = std::env::var("ZEROCLAW_WORKSPACE") {
-            if !workspace.is_empty() {
-                self.workspace_dir = PathBuf::from(workspace);
-            }
-        }
+        // NOTE: workspace_dir is already resolved in load_or_init() with full priority
+        // logic (env → persisted marker → default). Do NOT re-apply here to avoid
+        // overriding the config_dir ↔ workspace_dir pairing that load_or_init() computed.
 
         // Gateway port: ZEROCLAW_GATEWAY_PORT or PORT
         if let Ok(port_str) =
@@ -2071,6 +2083,59 @@ impl Config {
                 }
             }
         }
+    }
+
+    /// Validate that the workspace directory is usable.
+    /// Call after load_or_init() + apply_env_overrides(), before daemon/gateway startup.
+    pub fn validate_workspace(&self) -> Result<()> {
+        let ws = &self.workspace_dir;
+
+        // Workspace must exist (load_or_init creates it, but env override may point elsewhere)
+        if !ws.exists() {
+            anyhow::bail!(
+                "Workspace directory does not exist: {}. \
+                 Create it or check ZEROCLAW_WORKSPACE.",
+                ws.display()
+            );
+        }
+
+        if !ws.is_dir() {
+            anyhow::bail!("Workspace path is not a directory: {}", ws.display());
+        }
+
+        // Check writable by attempting to create a probe file
+        let probe = ws.join(".zeroclaw_probe");
+        match fs::write(&probe, b"") {
+            Ok(()) => {
+                let _ = fs::remove_file(&probe);
+            }
+            Err(e) => {
+                anyhow::bail!(
+                    "Workspace directory is not writable: {} ({})",
+                    ws.display(),
+                    e
+                );
+            }
+        }
+
+        // Warn (don't fail) if workspace is world-readable (may contain memory/secrets)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = fs::metadata(ws) {
+                if meta.permissions().mode() & 0o007 != 0 {
+                    tracing::warn!(
+                        "Workspace directory {:?} is world-accessible (mode {:o}). \
+                         Consider: chmod 700 {:?}",
+                        ws,
+                        meta.permissions().mode() & 0o777,
+                        ws
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 
     pub fn save(&self) -> Result<()> {
@@ -3342,13 +3407,18 @@ default_temperature = 0.7
     }
 
     #[test]
-    fn env_override_workspace() {
+    fn env_override_workspace_is_handled_by_load_or_init_not_apply_env() {
+        // ZEROCLAW_WORKSPACE is resolved during load_or_init() where it can correctly
+        // pair workspace_dir with the matching config_dir. apply_env_overrides() no
+        // longer re-applies it to avoid the workspace_dir ↔ config_path mismatch.
         let _env_guard = env_override_test_guard();
         let mut config = Config::default();
+        let original_workspace = config.workspace_dir.clone();
 
         std::env::set_var("ZEROCLAW_WORKSPACE", "/custom/workspace");
         config.apply_env_overrides();
-        assert_eq!(config.workspace_dir, PathBuf::from("/custom/workspace"));
+        // workspace_dir should remain unchanged — it's handled by load_or_init
+        assert_eq!(config.workspace_dir, original_workspace);
 
         std::env::remove_var("ZEROCLAW_WORKSPACE");
     }

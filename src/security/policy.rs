@@ -518,10 +518,17 @@ impl SecurityPolicy {
         // Must be under workspace_dir (prevents symlink escapes).
         // Prefer canonical workspace root so `/a/../b` style config paths don't
         // cause false positives or negatives.
-        let workspace_root = self
-            .workspace_dir
-            .canonicalize()
-            .unwrap_or_else(|_| self.workspace_dir.clone());
+        let workspace_root = match self.workspace_dir.canonicalize() {
+            Ok(canonical) => canonical,
+            Err(e) => {
+                tracing::warn!(
+                    workspace_dir = %self.workspace_dir.display(),
+                    error = %e,
+                    "Failed to canonicalize workspace_dir — denying path access for safety"
+                );
+                return false;
+            }
+        };
         resolved.starts_with(workspace_root)
     }
 
@@ -1285,17 +1292,35 @@ mod tests {
 
     #[test]
     fn checklist_resolved_path_must_be_in_workspace() {
+        // Use a real temp directory so canonicalize() succeeds
+        let tmp = std::env::temp_dir().join("zeroclaw_test_ws_resolved_path");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let canonical_tmp = tmp.canonicalize().unwrap();
+
+        let inner = canonical_tmp.join("src");
+        std::fs::create_dir_all(&inner).unwrap();
+
         let p = SecurityPolicy {
-            workspace_dir: PathBuf::from("/home/user/project"),
+            workspace_dir: canonical_tmp.clone(),
             ..SecurityPolicy::default()
         };
         // Inside workspace — allowed
-        assert!(p.is_resolved_path_allowed(Path::new("/home/user/project/src/main.rs")));
+        assert!(p.is_resolved_path_allowed(&canonical_tmp.join("src/main.rs")));
         // Outside workspace — blocked (symlink escape)
         assert!(!p.is_resolved_path_allowed(Path::new("/etc/passwd")));
-        assert!(!p.is_resolved_path_allowed(Path::new("/home/user/other_project/file")));
+        assert!(!p.is_resolved_path_allowed(Path::new("/tmp/other_project/file")));
         // Root — blocked
         assert!(!p.is_resolved_path_allowed(Path::new("/")));
+
+        // Non-existent workspace_dir → canonicalize fails → deny access
+        let p_bad = SecurityPolicy {
+            workspace_dir: PathBuf::from("/nonexistent/workspace"),
+            ..SecurityPolicy::default()
+        };
+        assert!(!p_bad.is_resolved_path_allowed(Path::new("/nonexistent/workspace/file.rs")));
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
