@@ -597,11 +597,10 @@ fn chown_to_zeroclaw(path: &Path) -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // Non-fatal: warn but continue
-        eprintln!(
-            "⚠️  Warning: Could not change ownership of {} to zeroclaw:zeroclaw: {}",
+        bail!(
+            "Failed to change ownership of {} to zeroclaw:zeroclaw: {}",
             path.display(),
-            stderr.trim()
+            stderr.trim(),
         );
     }
     Ok(())
@@ -621,10 +620,10 @@ fn chown_recursive_to_zeroclaw(path: &Path) -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        eprintln!(
-            "⚠️  Warning: Could not recursively change ownership of {} to zeroclaw:zeroclaw: {}",
+        bail!(
+            "Failed to recursively change ownership of {} to zeroclaw:zeroclaw: {}",
             path.display(),
-            stderr.trim()
+            stderr.trim(),
         );
     }
 
@@ -718,6 +717,92 @@ fn migrate_openrc_runtime_state_if_needed(config_dir: &Path) -> Result<()> {
         source_dir.display(),
         config_dir.display()
     );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn shell_single_quote(raw: &str) -> String {
+    format!("'{}'", raw.replace('\'', "'\"'\"'"))
+}
+
+#[cfg(unix)]
+fn build_openrc_writability_probe_command(path: &Path, has_runuser: bool) -> (String, Vec<String>) {
+    let probe = format!("test -w {}", shell_single_quote(&path.to_string_lossy()));
+    if has_runuser {
+        (
+            "runuser".to_string(),
+            vec![
+                "-u".to_string(),
+                "zeroclaw".to_string(),
+                "--".to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                probe,
+            ],
+        )
+    } else {
+        (
+            "su".to_string(),
+            vec![
+                "-s".to_string(),
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                probe,
+                "zeroclaw".to_string(),
+            ],
+        )
+    }
+}
+
+#[cfg(unix)]
+fn ensure_openrc_runtime_path_writable(path: &Path) -> Result<()> {
+    let has_runuser = which::which("runuser").is_ok();
+    let (program, args) = build_openrc_writability_probe_command(path, has_runuser);
+    let output = Command::new(&program)
+        .args(args.iter().map(String::as_str))
+        .output()
+        .with_context(|| {
+            format!(
+                "Failed to verify OpenRC runtime write access for {}",
+                path.display()
+            )
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let details = if stderr.trim().is_empty() {
+            "write-access probe failed"
+        } else {
+            stderr.trim()
+        };
+        bail!(
+            "OpenRC runtime user 'zeroclaw' cannot write {} ({details}). \
+             Re-run `sudo zeroclaw service install` and ensure ownership is zeroclaw:zeroclaw.",
+            path.display(),
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_openrc_runtime_dirs_writable(
+    config_dir: &Path,
+    workspace_dir: &Path,
+    log_dir: &Path,
+) -> Result<()> {
+    for path in [config_dir, workspace_dir, log_dir] {
+        ensure_openrc_runtime_path_writable(path)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_openrc_runtime_dirs_writable(
+    _config_dir: &Path,
+    _workspace_dir: &Path,
+    _log_dir: &Path,
+) -> Result<()> {
     Ok(())
 }
 
@@ -862,6 +947,8 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
     }
 
     chown_to_zeroclaw(log_dir)?;
+
+    ensure_openrc_runtime_dirs_writable(config_dir, &workspace_dir, log_dir)?;
 
     if created_log_dir {
         println!(
@@ -1124,5 +1211,51 @@ mod tests {
         let system_path = PathBuf::from("/usr/local/bin/zeroclaw");
         assert!(!system_path.to_string_lossy().contains("/home/"));
         assert!(!system_path.to_string_lossy().contains(".cargo/bin"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_single_quote_escapes_single_quotes() {
+        assert_eq!(
+            shell_single_quote("/tmp/weird'path"),
+            "'/tmp/weird'\"'\"'path'"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn openrc_writability_probe_prefers_runuser_when_available() {
+        let (program, args) =
+            build_openrc_writability_probe_command(Path::new("/etc/zeroclaw"), true);
+        assert_eq!(program, "runuser");
+        assert_eq!(
+            args,
+            vec![
+                "-u".to_string(),
+                "zeroclaw".to_string(),
+                "--".to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                "test -w '/etc/zeroclaw'".to_string()
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn openrc_writability_probe_falls_back_to_su() {
+        let (program, args) =
+            build_openrc_writability_probe_command(Path::new("/etc/zeroclaw/workspace"), false);
+        assert_eq!(program, "su");
+        assert_eq!(
+            args,
+            vec![
+                "-s".to_string(),
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "test -w '/etc/zeroclaw/workspace'".to_string(),
+                "zeroclaw".to_string()
+            ]
+        );
     }
 }
