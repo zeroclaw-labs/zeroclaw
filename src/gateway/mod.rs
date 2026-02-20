@@ -540,6 +540,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/webhook", post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
+        // Management API (bearer token required)
+        .route("/status", get(handle_status))
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
@@ -569,6 +571,94 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
         "runtime": crate::health::snapshot_json(),
     });
     Json(body)
+}
+
+/// Verify bearer token from Authorization header.
+/// Returns Ok(()) if auth passes, or an error response tuple if it fails.
+fn verify_bearer_token(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if state.pairing.require_pairing() {
+        let auth = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let token = auth.strip_prefix("Bearer ").unwrap_or("");
+        if !state.pairing.is_authenticated(token) {
+            let err = serde_json::json!({
+                "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+            });
+            return Err((StatusCode::UNAUTHORIZED, Json(err)));
+        }
+    }
+    Ok(())
+}
+
+/// GET /status — system status snapshot (bearer token required)
+async fn handle_status(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if let Err(resp) = verify_bearer_token(&state, &headers) {
+        return resp;
+    }
+
+    let health = crate::health::snapshot();
+    let config = state.config.lock();
+    let version = env!("CARGO_PKG_VERSION");
+
+    let components: serde_json::Value = health
+        .components
+        .iter()
+        .map(|(name, c)| {
+            (
+                name.clone(),
+                serde_json::json!({
+                    "status": c.status,
+                    "last_ok": c.last_ok,
+                    "last_error": c.last_error,
+                    "restart_count": c.restart_count,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<String, serde_json::Value>>()
+        .into();
+
+    let ws = &config.workspace_dir;
+    let disk_free_mb = fs_free_mb(ws);
+    let workspace_info = serde_json::json!({
+        "path": ws.display().to_string(),
+        "disk_free_mb": disk_free_mb,
+    });
+
+    let body = serde_json::json!({
+        "version": version,
+        "uptime_seconds": health.uptime_seconds,
+        "pid": health.pid,
+        "provider": config.default_provider.as_deref().unwrap_or("unknown"),
+        "model": state.model,
+        "temperature": state.temperature,
+        "autonomy_level": format!("{:?}", config.autonomy.level).to_lowercase(),
+        "memory_backend": format!("{:?}", config.memory.backend).to_lowercase(),
+        "components": components,
+        "workspace": workspace_info,
+    });
+
+    (StatusCode::OK, Json(body))
+}
+
+/// Best-effort available disk space in MB for the given path.
+/// Uses `std::process::Command` to avoid adding libc as a direct dependency.
+fn fs_free_mb(path: &std::path::Path) -> Option<u64> {
+    // `df -k <path>` outputs available KB on both Linux and macOS
+    let output = std::process::Command::new("df")
+        .arg("-k")
+        .arg(path)
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Second line, fourth column = available KB
+    let line = stdout.lines().nth(1)?;
+    let available_kb: u64 = line.split_whitespace().nth(3)?.parse().ok()?;
+    Some(available_kb / 1024)
 }
 
 /// POST /pair — exchange one-time code for bearer token
@@ -666,19 +756,9 @@ async fn handle_webhook(
     }
 
     // ── Bearer token auth (pairing) ──
-    if state.pairing.require_pairing() {
-        let auth = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let token = auth.strip_prefix("Bearer ").unwrap_or("");
-        if !state.pairing.is_authenticated(token) {
-            tracing::warn!("Webhook: rejected — not paired / invalid bearer token");
-            let err = serde_json::json!({
-                "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
-            });
-            return (StatusCode::UNAUTHORIZED, Json(err));
-        }
+    if let Err(resp) = verify_bearer_token(&state, &headers) {
+        tracing::warn!("Webhook: rejected — not paired / invalid bearer token");
+        return resp;
     }
 
     // ── Webhook secret auth (optional, additional layer) ──
