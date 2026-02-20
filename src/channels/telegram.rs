@@ -3672,12 +3672,8 @@ mod tests {
         // 1. Load pre-recorded fixture (TTS-generated "hello", ~7 KB MP3)
         let fixture_path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hello.mp3");
-        let audio_data = std::fs::read(&fixture_path).unwrap_or_else(|e| {
-            panic!(
-                "Failed to read fixture {}: {e}",
-                fixture_path.display()
-            )
-        });
+        let audio_data = std::fs::read(&fixture_path)
+            .unwrap_or_else(|e| panic!("Failed to read fixture {}: {e}", fixture_path.display()));
         assert!(
             audio_data.len() > 1000,
             "fixture too small ({} bytes), likely corrupt",

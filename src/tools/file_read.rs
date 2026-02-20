@@ -690,8 +690,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&workspace).await;
         tokio::fs::create_dir_all(&workspace).await.unwrap();
 
-        let binary_data: Vec<u8> =
-            vec![0x00, 0x80, 0xFF, 0xFE, b'v', b'a', b'l', b'i', b'd', 0x80];
+        let binary_data: Vec<u8> = vec![0x00, 0x80, 0xFF, 0xFE, b'v', b'a', b'l', b'i', b'd', 0x80];
         tokio::fs::write(workspace.join("data.bin"), &binary_data)
             .await
             .unwrap();
@@ -798,8 +797,7 @@ mod tests {
         let file_read_tool: Box<dyn Tool> = Box::new(FileReadTool::new(security));
 
         // ── Real provider (OpenAI Codex uses XML tool dispatch) ──
-        let provider =
-            OpenAiCodexProvider::new(&ProviderRuntimeOptions::default());
+        let provider = OpenAiCodexProvider::new(&ProviderRuntimeOptions::default());
 
         let mut agent = Agent::builder()
             .provider(Box::new(provider) as Box<dyn Provider>)

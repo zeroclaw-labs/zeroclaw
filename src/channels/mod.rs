@@ -5319,4 +5319,72 @@ Mon Feb 20
             sent[0]
         );
     }
+
+    // ── E2E: PDF document reaches provider without vision error ──────
+
+    /// End-to-end test: a PDF document attachment message (containing
+    /// `[Document:]` marker, NOT `[IMAGE:]`) sent through
+    /// `process_channel_message` with a non-vision provider must reach
+    /// the provider and produce a normal reply — no vision error.
+    #[tokio::test]
+    async fn e2e_pdf_document_reaches_provider_without_vision_error() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        // DummyProvider has default capabilities (vision: false).
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(DummyProvider),
+            default_provider: Arc::new("dummy".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("You are a helpful assistant.".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+        });
+
+        // Simulate a PDF document attachment (no [IMAGE:] marker).
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-pdf-1".to_string(),
+                sender: "zeroclaw_user".to_string(),
+                reply_target: "chat-pdf".to_string(),
+                content:
+                    "[Document: report.pdf] /tmp/workspace/report.pdf\n\nSummarize this document"
+                        .to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1, "expected exactly one reply message");
+        assert!(
+            !sent[0].contains("does not support vision"),
+            "PDF document must NOT trigger vision error, got: {}",
+            sent[0]
+        );
+    }
 }

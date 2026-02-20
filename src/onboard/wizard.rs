@@ -1211,7 +1211,10 @@ fn fetch_ollama_models() -> Result<Vec<String>> {
     Ok(parse_ollama_model_ids(&payload))
 }
 
-fn resolve_live_models_endpoint(provider_name: &str, provider_api_url: Option<&str>) -> Option<String> {
+fn resolve_live_models_endpoint(
+    provider_name: &str,
+    provider_api_url: Option<&str>,
+) -> Option<String> {
     if canonical_provider_name(provider_name) == "llamacpp" {
         if let Some(url) = provider_api_url
             .map(str::trim)
