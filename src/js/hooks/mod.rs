@@ -16,6 +16,9 @@
 
 pub mod registry;
 
+// Re-export hook registry for convenient access
+pub use registry::{HookHandler, HookRegistry};
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

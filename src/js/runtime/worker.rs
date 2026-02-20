@@ -268,7 +268,7 @@ fn discover_hook_handlers<'js>(
             let len = handlers_array.len();
 
             for i in 0..len {
-                match handlers_array.get::<_, Function>(i) {
+                match handlers_array.get::<Function>(i) {
                     Ok(func) => {
                         // Default priority 50, timeout 5000ms
                         // In the future, these could be stored as function properties
@@ -369,21 +369,43 @@ fn json_to_js_value<'js>(
     ctx: &Ctx<'js>,
     v: &Value,
 ) -> Result<rquickjs::Value<'js>, rquickjs::Error> {
+    use rquickjs::{Array, Object};
+
     match v {
-        Value::Null => rquickjs::Value::new(ctx, rquickjs::Null),
-        Value::Bool(b) => rquickjs::Value::new(ctx, *b),
+        Value::Null => {
+            // Use null from rquickjs
+            Ok(rquickjs::Undefined.into_value(ctx.clone()))
+        }
+        Value::Bool(b) => {
+            let obj = Object::new(ctx.clone())?;
+            // Use static bool conversion via object property trick
+            if *b {
+                obj.set("v", true)?;
+            } else {
+                obj.set("v", false)?;
+            }
+            obj.get("v")
+        }
         Value::Number(n) => {
             if let Some(i) = n.as_i64() {
-                rquickjs::Value::new(ctx, i)
+                let obj = Object::new(ctx.clone())?;
+                obj.set("v", i)?;
+                obj.get("v")
             } else if let Some(f) = n.as_f64() {
-                rquickjs::Value::new(ctx, f)
+                let obj = Object::new(ctx.clone())?;
+                obj.set("v", f)?;
+                obj.get("v")
             } else {
-                rquickjs::Value::new(ctx, rquickjs::Null)
+                Ok(rquickjs::Undefined.into_value(ctx.clone()))
             }
         }
-        Value::String(s) => rquickjs::Value::new(ctx, s.as_str()),
+        Value::String(s) => {
+            let obj = Object::new(ctx.clone())?;
+            obj.set("v", s.as_str())?;
+            obj.get("v")
+        }
         Value::Array(arr) => {
-            let js_array = Array::new(ctx)?;
+            let js_array = Array::new(ctx.clone())?;
             for (i, elem) in arr.iter().enumerate() {
                 let js_val = json_to_js_value(ctx, elem)?;
                 js_array.set(i, js_val)?;
@@ -391,7 +413,7 @@ fn json_to_js_value<'js>(
             Ok(js_array.into())
         }
         Value::Object(obj) => {
-            let js_obj = Object::new(ctx)?;
+            let js_obj = Object::new(ctx.clone())?;
             for (key, val) in obj.iter() {
                 let js_val = json_to_js_value(ctx, val)?;
                 js_obj.set(key, js_val)?;
