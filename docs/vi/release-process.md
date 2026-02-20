@@ -2,7 +2,7 @@
 
 Runbook này định nghĩa quy trình release tiêu chuẩn của maintainer.
 
-Cập nhật lần cuối: **20 tháng 2 năm 2026**.
+Cập nhật lần cuối: **2026-02-20**.
 
 ## Mục tiêu Release
 

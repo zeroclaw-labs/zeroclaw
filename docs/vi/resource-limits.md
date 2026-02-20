@@ -3,7 +3,7 @@
 > ⚠️ **Trạng thái: Đề xuất / Lộ trình**
 >
 > Tài liệu này mô tả các hướng tiếp cận đề xuất và có thể bao gồm các lệnh hoặc cấu hình giả định.
-> Để biết hành vi runtime hiện tại, xem [config-reference.md](../config-reference.md), [operations-runbook.md](../operations-runbook.md), và [troubleshooting.md](../troubleshooting.md).
+> Để biết hành vi runtime hiện tại, xem [config-reference.md](config-reference.md), [operations-runbook.md](operations-runbook.md), và [troubleshooting.md](troubleshooting.md).
 
 ## Vấn Đề
 ZeroClaw có rate limiting (20 actions/hour) nhưng chưa có giới hạn tài nguyên. Một agent bị lỗi lặp vòng có thể:

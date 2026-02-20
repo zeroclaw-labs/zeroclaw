@@ -1,7 +1,7 @@
 # Sổ tay Reviewer
 
 Tài liệu này là người bạn đồng hành vận hành của [`docs/pr-workflow.md`](pr-workflow.md).
-Để điều hướng tài liệu rộng hơn, xem [`docs/README.md`](../README.md).
+Để điều hướng tài liệu rộng hơn, xem [`docs/README.md`](README.md).
 
 ## 0. Tóm tắt
 
@@ -177,7 +177,7 @@ Nếu bàn giao review cho maintainer/agent khác, bao gồm:
 
 ## 8. Tài liệu liên quan
 
-- [README.md](../README.md) — phân loại và điều hướng tài liệu.
+- [README.md](README.md) — phân loại và điều hướng tài liệu.
 - [pr-workflow.md](pr-workflow.md) — workflow quản trị và hợp đồng merge.
 - [ci-map.md](ci-map.md) — bản đồ quyền sở hữu và triage CI.
 - [actions-source-policy.md](actions-source-policy.md) — chính sách allowlist nguồn action.

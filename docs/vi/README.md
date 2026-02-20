@@ -10,7 +10,7 @@ Trang này là điểm vào tiếng Việt cho hệ thống tài liệu.
 
 | Tôi muốn… | Xem tài liệu |
 |---|---|
-| Cài đặt và chạy nhanh | [../README.vi.md](../README.vi.md) / [../README.md](../README.md) |
+| Cài đặt và chạy nhanh | [../../README.vi.md](../../README.vi.md) / [../../README.md](../../README.md) |
 | Cài đặt bằng một lệnh | [one-click-bootstrap.md](one-click-bootstrap.md) |
 | Tìm lệnh theo tác vụ | [commands-reference.md](commands-reference.md) |
 | Kiểm tra giá trị mặc định và khóa cấu hình | [config-reference.md](config-reference.md) |

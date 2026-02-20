@@ -11,7 +11,7 @@ Tài liệu này định nghĩa cách ZeroClaw xử lý khối lượng PR lớn
 
 Tài liệu liên quan:
 
-- [`docs/README.md`](../README.md) — phân loại và điều hướng tài liệu.
+- [`docs/README.md`](README.md) — phân loại và điều hướng tài liệu.
 - [`docs/ci-map.md`](ci-map.md) — quyền sở hữu từng workflow, trigger và luồng triage.
 - [`docs/reviewer-playbook.md`](reviewer-playbook.md) — hướng dẫn thực thi cho reviewer hàng ngày.
 
@@ -349,7 +349,7 @@ Khi một agent bàn giao cho agent khác (hoặc cho maintainer), bao gồm:
 
 ## 15. Tài liệu liên quan
 
-- [README.md](../README.md) — phân loại và điều hướng tài liệu.
+- [README.md](README.md) — phân loại và điều hướng tài liệu.
 - [ci-map.md](ci-map.md) — bản đồ quyền sở hữu và triage CI workflow.
 - [reviewer-playbook.md](reviewer-playbook.md) — mô hình thực thi của reviewer.
 - [actions-source-policy.md](actions-source-policy.md) — chính sách allowlist nguồn action.

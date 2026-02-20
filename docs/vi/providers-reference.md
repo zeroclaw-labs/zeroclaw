@@ -2,7 +2,7 @@
 
 Tài liệu này liệt kê các provider ID, alias và biến môi trường chứa thông tin xác thực.
 
-Cập nhật lần cuối: **19 tháng 2, 2026**.
+Cập nhật lần cuối: **2026-02-19**.
 
 ## Cách liệt kê các Provider
 
@@ -108,7 +108,7 @@ Hành vi:
 - Base API URL: `https://integrate.api.nvidia.com/v1`
 - Khám phá model: `zeroclaw models refresh --provider nvidia`
 
-Các model ID khởi đầu được khuyến nghị (đã xác minh với danh mục NVIDIA API ngày 18 tháng 2, 2026):
+Các model ID khởi đầu được khuyến nghị (đã xác minh với danh mục NVIDIA API ngày 2026-02-18):
 
 - `meta/llama-3.3-70b-instruct`
 - `deepseek-ai/deepseek-v3.2`

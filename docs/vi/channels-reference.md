@@ -3,14 +3,14 @@
 Tài liệu này là nguồn tham khảo chính thức về cấu hình channel trong ZeroClaw.
 
 Đối với các phòng Matrix được mã hóa, hãy đọc thêm hướng dẫn chuyên biệt:
-- [Hướng dẫn Matrix E2EE](../matrix-e2ee-guide.md)
+- [Hướng dẫn Matrix E2EE](matrix-e2ee-guide.md)
 
 ## Truy cập nhanh
 
 - Cần tham khảo config đầy đủ theo từng channel: xem [Ví dụ cấu hình theo từng Channel](#4-vi-d-cu-hnh-theo-tng-channel).
 - Cần chẩn đoán khi không nhận được phản hồi: xem [Danh sách kiểm tra xử lý sự cố](#6-danh-sch-kim-tra-x-l-s-c).
-- Cần hỗ trợ phòng Matrix được mã hóa: dùng [Hướng dẫn Matrix E2EE](../matrix-e2ee-guide.md).
-- Cần thông tin triển khai/mạng (polling vs webhook): dùng [Network Deployment](../network-deployment.md).
+- Cần hỗ trợ phòng Matrix được mã hóa: dùng [Hướng dẫn Matrix E2EE](matrix-e2ee-guide.md).
+- Cần thông tin triển khai/mạng (polling vs webhook): dùng [Network Deployment](network-deployment.md).
 
 ## FAQ: Cấu hình Matrix thành công nhưng không có phản hồi
 
@@ -192,7 +192,7 @@ room_id = "!room:matrix.example.com"       # hoặc room alias (#ops:matrix.exam
 allowed_users = ["*"]
 ```
 
-Xem [Hướng dẫn Matrix E2EE](../matrix-e2ee-guide.md) để xử lý sự cố phòng mã hóa.
+Xem [Hướng dẫn Matrix E2EE](matrix-e2ee-guide.md) để xử lý sự cố phòng mã hóa.
 
 ### 4.6 Signal
 
@@ -374,7 +374,7 @@ Nếu channel có vẻ đã kết nối nhưng không phản hồi:
 5. Khởi động lại `zeroclaw daemon` sau khi thay đổi config.
 
 Đặc biệt với các phòng Matrix mã hóa, dùng:
-- [Hướng dẫn Matrix E2EE](../matrix-e2ee-guide.md)
+- [Hướng dẫn Matrix E2EE](matrix-e2ee-guide.md)
 
 ---
 

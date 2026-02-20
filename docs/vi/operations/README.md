@@ -4,11 +4,11 @@ Dành cho các operator vận hành ZeroClaw trong môi trường liên tục ho
 
 ## Vận hành cốt lõi
 
-- Sổ tay Day-2: [../../operations-runbook.md](../../operations-runbook.md)
-- Sổ tay Release: [../../release-process.md](../../release-process.md)
-- Ma trận xử lý sự cố: [../../troubleshooting.md](../../troubleshooting.md)
-- Triển khai mạng/gateway an toàn: [../../network-deployment.md](../../network-deployment.md)
-- Thiết lập Mattermost (dành riêng cho channel): [../../mattermost-setup.md](../../mattermost-setup.md)
+- Sổ tay Day-2: [../operations-runbook.md](../operations-runbook.md)
+- Sổ tay Release: [../release-process.md](../release-process.md)
+- Ma trận xử lý sự cố: [../troubleshooting.md](../troubleshooting.md)
+- Triển khai mạng/gateway an toàn: [../network-deployment.md](../network-deployment.md)
+- Thiết lập Mattermost (dành riêng cho channel): [../mattermost-setup.md](../mattermost-setup.md)
 
 ## Luồng thường gặp
 
@@ -20,5 +20,5 @@ Dành cho các operator vận hành ZeroClaw trong môi trường liên tục ho
 
 ## Liên quan
 
-- Tham chiếu config: [../../config-reference.md](../../config-reference.md)
+- Tham chiếu config: [../config-reference.md](../config-reference.md)
 - Bộ sưu tập bảo mật: [../security/README.md](../security/README.md)

@@ -202,5 +202,5 @@ Cấu hình Cloudflare Tunnel để forward đến `127.0.0.1:3000`, sau đó đ
 
 - [channels-reference.md](./channels-reference.md) — Tổng quan cấu hình channel
 - [matrix-e2ee-guide.md](./matrix-e2ee-guide.md) — Thiết lập Matrix và xử lý sự cố phòng mã hóa
-- [hardware-peripherals-design.md](../hardware-peripherals-design.md) — Thiết kế peripherals
-- [adding-boards-and-tools.md](../adding-boards-and-tools.md) — Thiết lập phần cứng và thêm board
+- [hardware-peripherals-design.md](hardware-peripherals-design.md) — Thiết kế peripherals
+- [adding-boards-and-tools.md](adding-boards-and-tools.md) — Thiết lập phần cứng và thêm board

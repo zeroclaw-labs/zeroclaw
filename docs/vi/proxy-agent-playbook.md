@@ -217,7 +217,7 @@ Hành vi kỳ vọng:
 ## 10. Tài Liệu Liên Quan
 
 - [README.md](./README.md) — Chỉ mục tài liệu và phân loại.
-- [network-deployment.md](../network-deployment.md) — Hướng dẫn triển khai mạng đầu-cuối và topology tunnel.
+- [network-deployment.md](network-deployment.md) — Hướng dẫn triển khai mạng đầu-cuối và topology tunnel.
 - [resource-limits.md](./resource-limits.md) — Giới hạn an toàn runtime cho ngữ cảnh thực thi mạng/tool.
 
 ---

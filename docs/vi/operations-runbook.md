@@ -2,7 +2,7 @@
 
 Tài liệu này dành cho các operator chịu trách nhiệm duy trì tính sẵn sàng, tư thế bảo mật và xử lý sự cố.
 
-Cập nhật lần cuối: **18 tháng 2 năm 2026**.
+Cập nhật lần cuối: **2026-02-18**.
 
 ## Phạm vi
 

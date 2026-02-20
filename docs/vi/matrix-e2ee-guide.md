@@ -137,5 +137,5 @@ Sau khi cập nhật cấu hình, khởi động lại daemon và gửi tin nh�
 - [Channels Reference](./channels-reference.md)
 - [Phụ lục từ khoá log vận hành](./channels-reference.md#7-operations-appendix-log-keywords-matrix)
 - [Network Deployment](./network-deployment.md)
-- [Agnostic Security](../agnostic-security.md)
-- [Reviewer Playbook](../reviewer-playbook.md)
+- [Agnostic Security](agnostic-security.md)
+- [Reviewer Playbook](reviewer-playbook.md)

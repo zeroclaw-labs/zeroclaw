@@ -4,7 +4,7 @@ Dành cho cài đặt lần đầu và làm quen nhanh.
 
 ## Lộ trình bắt đầu
 
-1. Tổng quan và khởi động nhanh: [../../README.vi.md](../../README.vi.md)
+1. Tổng quan và khởi động nhanh: [../../../README.vi.md](../../../README.vi.md)
 2. Cài đặt một lệnh và chế độ bootstrap kép: [../one-click-bootstrap.md](../one-click-bootstrap.md)
 3. Tìm lệnh theo tác vụ: [../commands-reference.md](../commands-reference.md)
 
@@ -15,7 +15,7 @@ Dành cho cài đặt lần đầu và làm quen nhanh.
 | Có API key, muốn cài nhanh nhất | `zeroclaw onboard --api-key sk-... --provider openrouter` |
 | Muốn được hướng dẫn từng bước | `zeroclaw onboard --interactive` |
 | Đã có config, chỉ cần sửa kênh | `zeroclaw onboard --channels-only` |
-| Dùng xác thực subscription | Xem [Subscription Auth](../../README.vi.md#subscription-auth-openai-codex--claude-code) |
+| Dùng xác thực subscription | Xem [Subscription Auth](../../../README.md#subscription-auth-openai-codex--claude-code) |
 
 ## Thiết lập và kiểm tra
 

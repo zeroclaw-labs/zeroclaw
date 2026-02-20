@@ -3,7 +3,7 @@
 > ⚠️ **Trạng thái: Đề xuất / Lộ trình**
 >
 > Tài liệu này mô tả các hướng tiếp cận đề xuất và có thể bao gồm các lệnh hoặc cấu hình giả định.
-> Để biết hành vi runtime hiện tại, xem [config-reference.md](../config-reference.md), [operations-runbook.md](../operations-runbook.md), và [troubleshooting.md](../troubleshooting.md).
+> Để biết hành vi runtime hiện tại, xem [config-reference.md](config-reference.md), [operations-runbook.md](operations-runbook.md), và [troubleshooting.md](troubleshooting.md).
 
 ## Nguyên Tắc Cốt Lõi
 > **"Các tính năng bảo mật nên như túi khí — luôn hiện diện, bảo vệ, và vô hình cho đến khi cần."**

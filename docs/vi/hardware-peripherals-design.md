@@ -305,7 +305,7 @@ JSON đơn giản qua serial cho các board không hỗ trợ gRPC:
 ## 12. Tài liệu liên quan
 
 - [adding-boards-and-tools.md](./adding-boards-and-tools.md) — Cách thêm board và datasheet
-- [network-deployment.md](../network-deployment.md) — Triển khai RPi và mạng
+- [network-deployment.md](network-deployment.md) — Triển khai RPi và mạng
 
 ## 13. Tham khảo
 
