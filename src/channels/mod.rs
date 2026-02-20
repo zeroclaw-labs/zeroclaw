@@ -284,6 +284,18 @@ fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
                 normalized.push(turn);
                 expecting_user = true;
             }
+            // Interrupted channel turns can produce consecutive user messages
+            // (no assistant persisted yet). Merge instead of dropping.
+            (false, "user") | (true, "assistant") => {
+                if let Some(last_turn) = normalized.last_mut() {
+                    if !turn.content.is_empty() {
+                        if !last_turn.content.is_empty() {
+                            last_turn.content.push_str("\n\n");
+                        }
+                        last_turn.content.push_str(&turn.content);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -2733,6 +2745,38 @@ mod tests {
             "fabricated memory"
         ));
         assert!(!should_skip_memory_context_entry("telegram_123_45", "hi"));
+    }
+
+    #[test]
+    fn normalize_cached_channel_turns_merges_consecutive_user_turns() {
+        let turns = vec![
+            ChatMessage::user("forwarded content"),
+            ChatMessage::user("summarize this"),
+        ];
+
+        let normalized = normalize_cached_channel_turns(turns);
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].role, "user");
+        assert!(normalized[0].content.contains("forwarded content"));
+        assert!(normalized[0].content.contains("summarize this"));
+    }
+
+    #[test]
+    fn normalize_cached_channel_turns_merges_consecutive_assistant_turns() {
+        let turns = vec![
+            ChatMessage::user("first user"),
+            ChatMessage::assistant("assistant part 1"),
+            ChatMessage::assistant("assistant part 2"),
+            ChatMessage::user("next user"),
+        ];
+
+        let normalized = normalize_cached_channel_turns(turns);
+        assert_eq!(normalized.len(), 3);
+        assert_eq!(normalized[0].role, "user");
+        assert_eq!(normalized[1].role, "assistant");
+        assert_eq!(normalized[2].role, "user");
+        assert!(normalized[1].content.contains("assistant part 1"));
+        assert!(normalized[1].content.contains("assistant part 2"));
     }
 
     #[test]
