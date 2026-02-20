@@ -685,23 +685,42 @@ fn parse_xml_attribute_tool_calls(response: &str) -> Vec<ParsedToolCall> {
 fn parse_perl_style_tool_calls(response: &str) -> Vec<ParsedToolCall> {
     let mut calls = Vec::new();
 
-    // Regex to find TOOL_CALL blocks with Perl hash ref syntax
-    static PERL_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?s)TOOL_CALL\s*\{[^}]*tool\s*=>\s*"([^"]+)"[^}]*args\s*=>\s*\{([^}]+)\}[^}]*\}/TOOL_CALL"#)
-            .unwrap()
-    });
+    // Regex to find TOOL_CALL blocks - capture the entire content between { and }
+    static PERL_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?s)TOOL_CALL\s*\{(.+?)\}\s*/TOOL_CALL").unwrap());
+
+    // Regex to find tool => "name" in the content
+    static TOOL_NAME_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"tool\s*=>\s*"([^"]+)""#).unwrap());
+
+    // Regex to find args => { ... } block
+    static ARGS_BLOCK_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?s)args\s*=>\s*\{(.+?)\}").unwrap());
 
     // Regex to find --key "value" pairs
     static ARGS_RE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r#"--(\w+)\s+"([^"]+)""#).unwrap());
 
     for cap in PERL_RE.captures_iter(response) {
-        let tool_name = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-        let args_block = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+        let content = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+
+        // Extract tool name
+        let tool_name = TOOL_NAME_RE
+            .captures(content)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str())
+            .unwrap_or("");
 
         if tool_name.is_empty() {
             continue;
         }
+
+        // Extract args block
+        let args_block = ARGS_BLOCK_RE
+            .captures(content)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str())
+            .unwrap_or("");
 
         let mut arguments = serde_json::Map::new();
 
