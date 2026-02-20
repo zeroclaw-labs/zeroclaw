@@ -13,10 +13,14 @@ use tokio::fs;
 
 /// Telegram's maximum message length for text messages
 const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
+/// Reserve space for continuation markers added by send_text_chunks:
+/// worst case is "(continued)\n\n" + chunk + "\n\n(continues...)" = 30 extra chars
+const TELEGRAM_CONTINUATION_OVERHEAD: usize = 30;
 const TELEGRAM_BIND_COMMAND: &str = "/bind";
 
 /// Split a message into chunks that respect Telegram's 4096 character limit.
 /// Tries to split at word boundaries when possible, and handles continuation.
+/// The effective per-chunk limit is reduced to leave room for continuation markers.
 fn split_message_for_telegram(message: &str) -> Vec<String> {
     if message.chars().count() <= TELEGRAM_MAX_MESSAGE_LENGTH {
         return vec![message.to_string()];
@@ -24,12 +28,20 @@ fn split_message_for_telegram(message: &str) -> Vec<String> {
 
     let mut chunks = Vec::new();
     let mut remaining = message;
+    let chunk_limit = TELEGRAM_MAX_MESSAGE_LENGTH - TELEGRAM_CONTINUATION_OVERHEAD;
 
     while !remaining.is_empty() {
+        // If the remainder fits within the full limit, take it all (last chunk
+        // or single chunk — continuation overhead is at most 14 chars).
+        if remaining.chars().count() <= TELEGRAM_MAX_MESSAGE_LENGTH {
+            chunks.push(remaining.to_string());
+            break;
+        }
+
         // Find the byte offset for the Nth character boundary.
         let hard_split = remaining
             .char_indices()
-            .nth(TELEGRAM_MAX_MESSAGE_LENGTH)
+            .nth(chunk_limit)
             .map_or(remaining.len(), |(idx, _)| idx);
 
         let chunk_end = if hard_split == remaining.len() {
@@ -41,7 +53,7 @@ fn split_message_for_telegram(message: &str) -> Vec<String> {
             // Prefer splitting at newline
             if let Some(pos) = search_area.rfind('\n') {
                 // Don't split if the newline is too close to the start
-                if search_area[..pos].chars().count() >= TELEGRAM_MAX_MESSAGE_LENGTH / 2 {
+                if search_area[..pos].chars().count() >= chunk_limit / 2 {
                     pos + 1
                 } else {
                     // Try space as fallback
@@ -147,7 +159,9 @@ fn parse_path_only_attachment(message: &str) -> Option<TelegramAttachment> {
 /// These tags are used internally but must not be sent to Telegram as raw markup,
 /// since Telegram's Markdown parser will reject them (causing status 400 errors).
 fn strip_tool_call_tags(message: &str) -> String {
-    const TOOL_CALL_OPEN_TAGS: [&str; 5] = [
+    const TOOL_CALL_OPEN_TAGS: [&str; 7] = [
+        "<function_calls>",
+        "<function_call>",
         "<tool_call>",
         "<toolcall>",
         "<tool-call>",
@@ -163,6 +177,8 @@ fn strip_tool_call_tags(message: &str) -> String {
 
     fn matching_close_tag(open_tag: &str) -> Option<&'static str> {
         match open_tag {
+            "<function_calls>" => Some("</function_calls>"),
+            "<function_call>" => Some("</function_call>"),
             "<tool_call>" => Some("</tool_call>"),
             "<toolcall>" => Some("</toolcall>"),
             "<tool-call>" => Some("</tool-call>"),
