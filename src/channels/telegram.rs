@@ -311,6 +311,7 @@ pub struct TelegramChannel {
     mention_only: bool,
     bot_username: Mutex<Option<String>>,
     transcription: Option<crate::config::TranscriptionConfig>,
+    voice_transcriptions: Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl TelegramChannel {
@@ -339,6 +340,7 @@ impl TelegramChannel {
             mention_only,
             bot_username: Mutex::new(None),
             transcription: None,
+            voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -888,7 +890,16 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return None;
         }
 
-        let content = if let Some(quote) = Self::extract_reply_context(message) {
+        // Cache transcription for reply-context lookups
+        {
+            let mut cache = self.voice_transcriptions.lock();
+            if cache.len() >= 100 {
+                cache.clear();
+            }
+            cache.insert(format!("{chat_id}:{message_id}"), text.clone());
+        }
+
+        let content = if let Some(quote) = self.extract_reply_context(message) {
             format!("{quote}\n\n[Voice] {text}")
         } else {
             format!("[Voice] {text}")
@@ -930,7 +941,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     }
 
     /// Extract reply context from a Telegram `reply_to_message`, if present.
-    fn extract_reply_context(message: &serde_json::Value) -> Option<String> {
+    fn extract_reply_context(&self, message: &serde_json::Value) -> Option<String> {
         let reply = message.get("reply_to_message")?;
 
         let reply_sender = reply
@@ -948,7 +959,20 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let reply_text = if let Some(text) = reply.get("text").and_then(serde_json::Value::as_str) {
             text.to_string()
         } else if reply.get("voice").is_some() || reply.get("audio").is_some() {
-            "[Voice message]".to_string()
+            let reply_mid = reply.get("message_id").and_then(serde_json::Value::as_i64);
+            let chat_id = message
+                .get("chat")
+                .and_then(|c| c.get("id"))
+                .and_then(serde_json::Value::as_i64);
+            if let (Some(mid), Some(cid)) = (reply_mid, chat_id) {
+                self.voice_transcriptions
+                    .lock()
+                    .get(&format!("{cid}:{mid}"))
+                    .map(|t| format!("[Voice] {t}"))
+                    .unwrap_or_else(|| "[Voice message]".to_string())
+            } else {
+                "[Voice message]".to_string()
+            }
         } else if reply.get("photo").is_some() {
             "[Photo]".to_string()
         } else if reply.get("document").is_some() {
@@ -1038,7 +1062,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             text.to_string()
         };
 
-        let content = if let Some(quote) = Self::extract_reply_context(message) {
+        let content = if let Some(quote) = self.extract_reply_context(message) {
             format!("{quote}\n\n{content}")
         } else {
             content
@@ -3272,38 +3296,42 @@ mod tests {
 
     #[test]
     fn extract_reply_context_text_message() {
+        let ch = TelegramChannel::new("t".into(), vec!["*".into()], false);
         let msg = serde_json::json!({
             "reply_to_message": {
                 "from": { "username": "alice" },
                 "text": "Hello world"
             }
         });
-        let ctx = TelegramChannel::extract_reply_context(&msg).unwrap();
+        let ctx = ch.extract_reply_context(&msg).unwrap();
         assert_eq!(ctx, "> @alice:\n> Hello world");
     }
 
     #[test]
     fn extract_reply_context_voice_message() {
+        let ch = TelegramChannel::new("t".into(), vec!["*".into()], false);
         let msg = serde_json::json!({
             "reply_to_message": {
                 "from": { "username": "bob" },
                 "voice": { "file_id": "abc", "duration": 5 }
             }
         });
-        let ctx = TelegramChannel::extract_reply_context(&msg).unwrap();
+        let ctx = ch.extract_reply_context(&msg).unwrap();
         assert_eq!(ctx, "> @bob:\n> [Voice message]");
     }
 
     #[test]
     fn extract_reply_context_no_reply() {
+        let ch = TelegramChannel::new("t".into(), vec!["*".into()], false);
         let msg = serde_json::json!({
             "text": "just a regular message"
         });
-        assert!(TelegramChannel::extract_reply_context(&msg).is_none());
+        assert!(ch.extract_reply_context(&msg).is_none());
     }
 
     #[test]
     fn extract_reply_context_truncates_long_text() {
+        let ch = TelegramChannel::new("t".into(), vec!["*".into()], false);
         let long_text = "a".repeat(300);
         let msg = serde_json::json!({
             "reply_to_message": {
@@ -3311,7 +3339,7 @@ mod tests {
                 "text": long_text
             }
         });
-        let ctx = TelegramChannel::extract_reply_context(&msg).unwrap();
+        let ctx = ch.extract_reply_context(&msg).unwrap();
         // Should contain truncation marker
         assert!(ctx.contains('…'));
         // The quoted content (after "> ") should be 200 chars + "…"
@@ -3326,14 +3354,34 @@ mod tests {
 
     #[test]
     fn extract_reply_context_no_username_uses_first_name() {
+        let ch = TelegramChannel::new("t".into(), vec!["*".into()], false);
         let msg = serde_json::json!({
             "reply_to_message": {
                 "from": { "id": 999, "first_name": "Charlie" },
                 "text": "Hi there"
             }
         });
-        let ctx = TelegramChannel::extract_reply_context(&msg).unwrap();
+        let ctx = ch.extract_reply_context(&msg).unwrap();
         assert_eq!(ctx, "> @Charlie:\n> Hi there");
+    }
+
+    #[test]
+    fn extract_reply_context_voice_with_cached_transcription() {
+        let ch = TelegramChannel::new("t".into(), vec!["*".into()], false);
+        // Pre-populate transcription cache
+        ch.voice_transcriptions
+            .lock()
+            .insert("100:42".to_string(), "Hello from voice".to_string());
+        let msg = serde_json::json!({
+            "chat": { "id": 100 },
+            "reply_to_message": {
+                "message_id": 42,
+                "from": { "username": "bob" },
+                "voice": { "file_id": "abc", "duration": 5 }
+            }
+        });
+        let ctx = ch.extract_reply_context(&msg).unwrap();
+        assert_eq!(ctx, "> @bob:\n> [Voice] Hello from voice");
     }
 
     #[test]
@@ -3383,5 +3431,93 @@ mod tests {
         let ch =
             TelegramChannel::new("token".into(), vec!["*".into()], false).with_transcription(tc);
         assert!(ch.transcription.is_none());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Live e2e: voice transcription via Groq Whisper + reply cache lookup
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Live test: voice transcription via Groq Whisper + reply cache lookup.
+    ///
+    /// Loads a pre-recorded MP3 fixture ("hello"), sends it to Groq Whisper
+    /// API, verifies the transcription contains "hello", then caches it and
+    /// checks that `extract_reply_context` returns the cached text instead
+    /// of the `[Voice message]` fallback placeholder.
+    ///
+    /// Skipped automatically when `GROQ_API_KEY` is not set.
+    /// Run: `GROQ_API_KEY=<key> cargo test --lib -- telegram::tests::e2e_live_voice_transcription_and_reply_cache --ignored`
+    #[tokio::test]
+    #[ignore]
+    async fn e2e_live_voice_transcription_and_reply_cache() {
+        if std::env::var("GROQ_API_KEY").is_err() {
+            eprintln!("GROQ_API_KEY not set — skipping live voice transcription test");
+            return;
+        }
+
+        // 1. Load pre-recorded fixture (TTS-generated "hello", ~7 KB MP3)
+        let fixture_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hello.mp3");
+        let audio_data = std::fs::read(&fixture_path).unwrap_or_else(|e| {
+            panic!(
+                "Failed to read fixture {}: {e}",
+                fixture_path.display()
+            )
+        });
+        assert!(
+            audio_data.len() > 1000,
+            "fixture too small ({} bytes), likely corrupt",
+            audio_data.len()
+        );
+
+        // 2. Call transcribe_audio() — real Groq Whisper API
+        let config = crate::config::TranscriptionConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let transcript: String =
+            crate::channels::transcription::transcribe_audio(audio_data, "hello.mp3", &config)
+                .await
+                .expect("transcribe_audio should succeed with valid GROQ_API_KEY");
+
+        // 3. Verify Whisper actually recognized "hello"
+        assert!(
+            transcript.to_lowercase().contains("hello"),
+            "expected transcription to contain 'hello', got: '{transcript}'"
+        );
+
+        // 4. Create TelegramChannel, insert transcription into voice_transcriptions cache
+        let ch = TelegramChannel::new("test_token".into(), vec!["*".into()], false);
+        let chat_id: i64 = 12345;
+        let message_id: i64 = 67;
+        let cache_key = format!("{chat_id}:{message_id}");
+        ch.voice_transcriptions
+            .lock()
+            .insert(cache_key, transcript.clone());
+
+        // 5. Build reply message with voice + message_id + chat.id
+        let msg = serde_json::json!({
+            "chat": { "id": chat_id },
+            "reply_to_message": {
+                "message_id": message_id,
+                "from": { "username": "zeroclaw_user" },
+                "voice": { "file_id": "test_file", "duration": 1 }
+            }
+        });
+
+        // 6. Verify extract_reply_context returns cached transcription
+        let ctx = ch
+            .extract_reply_context(&msg)
+            .expect("extract_reply_context should return Some for voice reply");
+
+        assert!(
+            ctx.contains(&format!("[Voice] {transcript}")),
+            "expected cached transcription in reply context, got: {ctx}"
+        );
+
+        // Must NOT contain the fallback placeholder
+        assert!(
+            !ctx.contains("[Voice message]"),
+            "context should use cached transcription, not fallback placeholder, got: {ctx}"
+        );
     }
 }
