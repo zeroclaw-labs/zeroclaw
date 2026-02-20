@@ -43,10 +43,18 @@ type Session struct {
     CreatedAt time.Time `json:"createdAt"`
 }
 
+// ChatMessage represents a single message in history
+type ChatMessage struct {
+    Role    string `json:"role"`
+    Content string `json:"content"`
+}
+
 var (
-    sessions   = map[string]*Session{}
-    sessionsMu sync.Mutex
-    seq        int64
+    sessions      = map[string]*Session{}
+    sessionsMu    sync.Mutex
+    seq           int64
+    chatHistory   = map[string][]ChatMessage{} // sessionKey -> messages
+    chatHistoryMu sync.Mutex
 )
 
 func getenv(k, d string) string {
@@ -65,6 +73,27 @@ func mustJSON(v any) json.RawMessage {
 func nextSeq() int64 {
     seq++
     return seq
+}
+
+// addMessage appends a message to the chat history for a session
+func addMessage(sessionKey, role, content string) {
+    chatHistoryMu.Lock()
+    defer chatHistoryMu.Unlock()
+    chatHistory[sessionKey] = append(chatHistory[sessionKey], ChatMessage{
+        Role:    role,
+        Content: content,
+    })
+}
+
+// getMessages returns messages for a session (up to limit)
+func getMessages(sessionKey string, limit int) []ChatMessage {
+    chatHistoryMu.Lock()
+    defer chatHistoryMu.Unlock()
+    msgs := chatHistory[sessionKey]
+    if limit > 0 && len(msgs) > limit {
+        return msgs[len(msgs)-limit:]
+    }
+    return msgs
 }
 
 func safeWriteJSON(ws *websocket.Conn, mu *sync.Mutex, v any) error {
@@ -143,60 +172,223 @@ func handleRPC(ws *websocket.Conn, writeMu *sync.Mutex, f Frame) {
     if os.Getenv("ZC_BRIDGE_DEBUG") == "1" {
         log.Printf("[rpc] method=%s id=%s paramsLen=%d", f.Method, f.ID, len(f.Params))
     }
+
+    // Handle all known methods locally or via ZeroClaw
     switch f.Method {
-
     case "sessions.list":
-        sessionsMu.Lock()
-        list := make([]*Session, 0, len(sessions))
-        for _, s := range sessions {
-            list = append(list, s)
-        }
-        sessionsMu.Unlock()
-
-        safeWriteJSON(ws, writeMu, Frame{
-            Type:    "res",
-            ID:      f.ID,
-            Ok:      true,
-            Payload: mustJSON(map[string]any{"sessions": list}),
-        })
-
+        handleSessionsList(ws, writeMu, f)
     case "models.list":
-        safeWriteJSON(ws, writeMu, Frame{
-            Type:    "res",
-            ID:      f.ID,
-            Ok:      true,
-            Payload: mustJSON(map[string]any{
-                "models": []string{"kimi-k2.5"},
-            }),
-        })
-
+        handleModelsList(ws, writeMu, f)
     case "sessions.patch":
-        safeWriteJSON(ws, writeMu, Frame{
-            Type:    "res",
-            ID:      f.ID,
-            Ok:      true,
-            Payload: mustJSON(map[string]any{}),
-        })
-
-    default:
+        handleSessionsPatch(ws, writeMu, f)
+    case "sessions.resolve":
+        handleSessionsResolve(ws, writeMu, f)
+    case "sessions.status":
+        handleSessionsStatus(ws, writeMu, f)
+    case "session.status":
+        handleSessionStatus(ws, writeMu, f)
+    case "sessions.usage":
+        handleSessionsUsage(ws, writeMu, f)
+    case "usage.cost":
+        handleUsageCost(ws, writeMu, f)
+    case "usage.status":
+        handleUsageStatus(ws, writeMu, f)
+    case "status":
+        handleStatus(ws, writeMu, f)
+    case "cron.list", "cron.jobs.list", "scheduler.jobs.list":
+        handleEmptyList(ws, writeMu, f)
+    case "chat.history":
+        handleChatHistory(ws, writeMu, f)
+    case "sessions.send", "chat.send":
         handleZeroClawForward(ws, writeMu, f)
+    default:
+        sendError(ws, writeMu, f.ID, "unsupported method: "+f.Method)
     }
+}
+
+// --- Local RPC handlers ---
+
+func handleSessionsList(ws *websocket.Conn, writeMu *sync.Mutex, f Frame) {
+    sessionsMu.Lock()
+    list := make([]*Session, 0, len(sessions))
+    for _, s := range sessions {
+        list = append(list, s)
+    }
+    sessionsMu.Unlock()
+
+    safeWriteJSON(ws, writeMu, Frame{
+        Type:    "res",
+        ID:      f.ID,
+        Ok:      true,
+        Payload: mustJSON(map[string]any{"sessions": list}),
+    })
+}
+
+func handleModelsList(ws *websocket.Conn, writeMu *sync.Mutex, f Frame) {
+    safeWriteJSON(ws, writeMu, Frame{
+        Type:    "res",
+        ID:      f.ID,
+        Ok:      true,
+        Payload: mustJSON(map[string]any{
+            "models": []string{"kimi-k2.5"},
+        }),
+    })
+}
+
+func handleSessionsPatch(ws *websocket.Conn, writeMu *sync.Mutex, f Frame) {
+    safeWriteJSON(ws, writeMu, Frame{
+        Type:    "res",
+        ID:      f.ID,
+        Ok:      true,
+        Payload: mustJSON(map[string]any{}),
+    })
+}
+
+func handleSessionsResolve(ws *websocket.Conn, writeMu *sync.Mutex, f Frame) {
+    // Parse params to get key
+    var params struct {
+        Key string `json:"key"`
+    }
+    key := "main"
+    if len(f.Params) > 0 {
+        if err := json.Unmarshal(f.Params, &params); err == nil && params.Key != "" {
+            key = params.Key
+        }
+    }
+
+    safeWriteJSON(ws, writeMu, Frame{
+        Type:    "res",
+        ID:      f.ID,
+        Ok:      true,
+        Payload: mustJSON(map[string]any{"ok": true, "key": key}),
+    })
+}
+
+func handleSessionsStatus(ws *websocket.Conn, writeMu *sync.Mutex, f Frame) {
+    safeWriteJSON(ws, writeMu, Frame{
+        Type:    "res",
+        ID:      f.ID,
+        Ok:      true,
+        Payload: mustJSON(map[string]any{
+            "sessions": []any{},
+        }),
+    })
+}
+
+func handleSessionStatus(ws *websocket.Conn, writeMu *sync.Mutex, f Frame) {
+    safeWriteJSON(ws, writeMu, Frame{
+        Type:    "res",
+        ID:      f.ID,
+        Ok:      true,
+        Payload: mustJSON(map[string]any{
+            "status": "idle",
+        }),
+    })
+}
+
+func handleSessionsUsage(ws *websocket.Conn, writeMu *sync.Mutex, f Frame) {
+    safeWriteJSON(ws, writeMu, Frame{
+        Type:    "res",
+        ID:      f.ID,
+        Ok:      true,
+        Payload: mustJSON(map[string]any{
+            "sessions": []any{},
+            "totalInputTokens":  0,
+            "totalOutputTokens": 0,
+            "totalCostUsd":      0.0,
+        }),
+    })
+}
+
+func handleUsageCost(ws *websocket.Conn, writeMu *sync.Mutex, f Frame) {
+    safeWriteJSON(ws, writeMu, Frame{
+        Type:    "res",
+        ID:      f.ID,
+        Ok:      true,
+        Payload: mustJSON(map[string]any{
+            "totalCostUsd":      0.0,
+            "totalInputTokens":  0,
+            "totalOutputTokens": 0,
+            "byModel":           map[string]any{},
+        }),
+    })
+}
+
+func handleUsageStatus(ws *websocket.Conn, writeMu *sync.Mutex, f Frame) {
+    safeWriteJSON(ws, writeMu, Frame{
+        Type:    "res",
+        ID:      f.ID,
+        Ok:      true,
+        Payload: mustJSON(map[string]any{
+            "available": true,
+        }),
+    })
+}
+
+func handleStatus(ws *websocket.Conn, writeMu *sync.Mutex, f Frame) {
+    safeWriteJSON(ws, writeMu, Frame{
+        Type:    "res",
+        ID:      f.ID,
+        Ok:      true,
+        Payload: mustJSON(map[string]any{
+            "status":  "ok",
+            "version": "zc-bridge-1.0",
+        }),
+    })
+}
+
+func handleEmptyList(ws *websocket.Conn, writeMu *sync.Mutex, f Frame) {
+    safeWriteJSON(ws, writeMu, Frame{
+        Type:    "res",
+        ID:      f.ID,
+        Ok:      true,
+        Payload: mustJSON(map[string]any{
+            "jobs": []any{},
+        }),
+    })
+}
+
+func handleChatHistory(ws *websocket.Conn, writeMu *sync.Mutex, f Frame) {
+    // Parse params
+    var params struct {
+        SessionKey string `json:"sessionKey"`
+        Limit      int    `json:"limit"`
+    }
+    sessionKey := "main"
+    limit := 200
+    if len(f.Params) > 0 {
+        if err := json.Unmarshal(f.Params, &params); err == nil {
+            if params.SessionKey != "" {
+                sessionKey = params.SessionKey
+            }
+            if params.Limit > 0 {
+                limit = params.Limit
+            }
+        }
+    }
+
+    msgs := getMessages(sessionKey, limit)
+
+    safeWriteJSON(ws, writeMu, Frame{
+        Type:    "res",
+        ID:      f.ID,
+        Ok:      true,
+        Payload: mustJSON(map[string]any{
+            "sessionKey": sessionKey,
+            "messages":   msgs,
+        }),
+    })
 }
 
 func handleZeroClawForward(ws *websocket.Conn, writeMu *sync.Mutex, f Frame) {
     if os.Getenv("ZC_BRIDGE_DEBUG") == "1" {
         log.Printf("[forward] method=%s id=%s", f.Method, f.ID)
     }
-    // Only support chat methods that map to ZeroClaw /webhook
-    if f.Method != "sessions.send" && f.Method != "chat.send" {
-        sendError(ws, writeMu, f.ID, "unsupported method: "+f.Method)
-        return
-    }
 
     // Parse params
     var params struct {
-        SessionKey    string `json:"sessionKey"`
-        Message       string `json:"message"`
+        SessionKey     string `json:"sessionKey"`
+        Message        string `json:"message"`
         IdempotencyKey string `json:"idempotencyKey"`
     }
     if len(f.Params) > 0 {
@@ -221,6 +413,9 @@ func handleZeroClawForward(ws *websocket.Conn, writeMu *sync.Mutex, f Frame) {
     if runId == "" {
         runId = fmt.Sprintf("run_%d", time.Now().UnixNano())
     }
+
+    // Store user message in history
+    addMessage(sessionKey, "user", params.Message)
 
     // Build ZeroClaw webhook payload
     body := map[string]any{
@@ -306,6 +501,9 @@ func handleZeroClawForward(ws *websocket.Conn, writeMu *sync.Mutex, f Frame) {
     if assistantText == "" {
         assistantText = "(empty response)"
     }
+
+    // Store assistant message in history
+    addMessage(sessionKey, "assistant", assistantText)
 
     // Send RPC response frame first
     safeWriteJSON(ws, writeMu, Frame{
