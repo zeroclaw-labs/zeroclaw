@@ -72,7 +72,7 @@ sha2 = "0.10"
 hex = "0.4"
 
 # CSPRNG for secure token generation
-rand = "0.9"
+rand = "0.10"
 
 # serde-big-array for wa-rs storage (large array serialization)
 serde-big-array = { version = "0.5", optional = true }
