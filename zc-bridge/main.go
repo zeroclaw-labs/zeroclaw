@@ -43,10 +43,16 @@ type Session struct {
     CreatedAt time.Time `json:"createdAt"`
 }
 
+// ContentBlock represents a content block in ClawSuite message format
+type ContentBlock struct {
+    Type string `json:"type"` // "text"
+    Text string `json:"text"`
+}
+
 // ChatMessage represents a single message in history
 type ChatMessage struct {
-    Role    string `json:"role"`
-    Content string `json:"content"`
+    Role    string         `json:"role"`
+    Content []ContentBlock `json:"content"` // Array of content blocks
 }
 
 var (
@@ -76,19 +82,19 @@ func nextSeq() int64 {
 }
 
 // addMessage appends a message to the chat history for a session
-func addMessage(sessionKey, role, content string) {
+func addMessage(sessionKey, role, text string) {
     chatHistoryMu.Lock()
     defer chatHistoryMu.Unlock()
     chatHistory[sessionKey] = append(chatHistory[sessionKey], ChatMessage{
         Role:    role,
-        Content: content,
+        Content: []ContentBlock{{Type: "text", Text: text}},
     })
     if os.Getenv("ZC_BRIDGE_DEBUG") == "1" {
-        preview := content
+        preview := text
         if len(preview) > 80 {
             preview = preview[:80]
         }
-        log.Printf("[history] add sessionKey=%s role=%s len=%d preview=%q", sessionKey, role, len(content), preview)
+        log.Printf("[history] add sessionKey=%s role=%s len=%d preview=%q", sessionKey, role, len(text), preview)
     }
 }
 
@@ -379,11 +385,15 @@ func handleChatHistory(ws *websocket.Conn, writeMu *sync.Mutex, f Frame) {
     if os.Getenv("ZC_BRIDGE_DEBUG") == "1" {
         log.Printf("[history] get sessionKey=%s limit=%d returning=%d", sessionKey, limit, len(msgs))
         for i, m := range msgs {
-            preview := m.Content
-            if len(preview) > 60 {
-                preview = preview[:60]
+            // Log first content block text
+            var preview string
+            if len(m.Content) > 0 && m.Content[0].Type == "text" {
+                preview = m.Content[0].Text
+                if len(preview) > 60 {
+                    preview = preview[:60]
+                }
             }
-            log.Printf("[history] msg[%d] role=%s content=%q", i, m.Role, preview)
+            log.Printf("[history] msg[%d] role=%s content=[{type:text text:%q}]", i, m.Role, preview)
         }
     }
 
@@ -556,8 +566,8 @@ func handleZeroClawForward(ws *websocket.Conn, writeMu *sync.Mutex, f Frame) {
             "sessionKey": sessionKey,
             "state":      "final",
             "message": map[string]any{
-                "role":    "assistant",
-                "content": assistantText,
+                "role": "assistant",
+                "content": []ContentBlock{{Type: "text", Text: assistantText}},
             },
         }),
     })
