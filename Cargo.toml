@@ -142,7 +142,7 @@ tokio-serial = { version = "5", default-features = false, optional = true }
 nusb = { version = "0.2", default-features = false, optional = true }
 
 # probe-rs for STM32/Nucleo memory read (Phase B)
-probe-rs = { version = "0.30", optional = true }
+probe-rs = { version = "0.31", optional = true }
 
 # PDF extraction for datasheet RAG (optional, enable with --features rag-pdf)
 pdf-extract = { version = "0.10", optional = true }
