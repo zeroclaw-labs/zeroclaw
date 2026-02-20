@@ -1472,6 +1472,30 @@ pub struct StorageProviderConfig {
     /// Optional connection timeout in seconds for remote providers.
     #[serde(default)]
     pub connect_timeout_secs: Option<u64>,
+
+    /// Neo4j connection URI (e.g., "neo4j://localhost:7687").
+    #[serde(default, alias = "neo4jUri")]
+    pub neo4j_uri: Option<String>,
+
+    /// Neo4j username.
+    #[serde(default = "default_neo4j_user")]
+    pub neo4j_user: Option<String>,
+
+    /// Neo4j password.
+    #[serde(default)]
+    pub neo4j_password: Option<String>,
+
+    /// Neo4j database name (default: "neo4j").
+    #[serde(default = "default_neo4j_database")]
+    pub neo4j_database: Option<String>,
+}
+
+fn default_neo4j_user() -> Option<String> {
+    Some("neo4j".into())
+}
+
+fn default_neo4j_database() -> Option<String> {
+    Some("neo4j".into())
 }
 
 fn default_storage_schema() -> String {
@@ -1490,6 +1514,10 @@ impl Default for StorageProviderConfig {
             schema: default_storage_schema(),
             table: default_storage_table(),
             connect_timeout_secs: None,
+            neo4j_uri: None,
+            neo4j_user: default_neo4j_user(),
+            neo4j_password: None,
+            neo4j_database: default_neo4j_database(),
         }
     }
 }
@@ -1501,9 +1529,10 @@ impl Default for StorageProviderConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct MemoryConfig {
-    /// "sqlite" | "lucid" | "postgres" | "markdown" | "none" (`none` = explicit no-op memory)
+    /// "sqlite" | "lucid" | "postgres" | "markdown" | "neo4j" | "none" (`none` = explicit no-op memory)
     ///
     /// `postgres` requires `[storage.provider.config]` with `db_url` (`dbURL` alias supported).
+    /// `neo4j` requires `[storage.provider.config]` with `neo4j_uri` and `neo4j_password`.
     pub backend: String,
     /// Auto-save user-stated conversation input to memory (assistant output is excluded)
     pub auto_save: bool,

@@ -4,6 +4,7 @@ pub enum MemoryBackendKind {
     Lucid,
     Postgres,
     Markdown,
+    Neo4j,
     None,
     Unknown,
 }
@@ -55,6 +56,15 @@ const POSTGRES_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     optional_dependency: false,
 };
 
+const NEO4J_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
+    key: "neo4j",
+    label: "Neo4j Graph — node-based vector search with graph relationships",
+    auto_save_default: true,
+    uses_sqlite_hygiene: false,
+    sqlite_based: false,
+    optional_dependency: false,
+};
+
 const NONE_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     key: "none",
     label: "None — disable persistent memory",
@@ -94,6 +104,7 @@ pub fn classify_memory_backend(backend: &str) -> MemoryBackendKind {
         "lucid" => MemoryBackendKind::Lucid,
         "postgres" => MemoryBackendKind::Postgres,
         "markdown" => MemoryBackendKind::Markdown,
+        "neo4j" => MemoryBackendKind::Neo4j,
         "none" => MemoryBackendKind::None,
         _ => MemoryBackendKind::Unknown,
     }
@@ -105,6 +116,7 @@ pub fn memory_backend_profile(backend: &str) -> MemoryBackendProfile {
         MemoryBackendKind::Lucid => LUCID_PROFILE,
         MemoryBackendKind::Postgres => POSTGRES_PROFILE,
         MemoryBackendKind::Markdown => MARKDOWN_PROFILE,
+        MemoryBackendKind::Neo4j => NEO4J_PROFILE,
         MemoryBackendKind::None => NONE_PROFILE,
         MemoryBackendKind::Unknown => CUSTOM_PROFILE,
     }
