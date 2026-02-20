@@ -645,8 +645,7 @@ fn first_nonempty(text: Option<&str>) -> Option<String> {
 
 fn normalize_responses_role(role: &str) -> &'static str {
     match role {
-        "assistant" => "assistant",
-        "tool" => "assistant",
+        "assistant" | "tool" => "assistant",
         _ => "user",
     }
 }

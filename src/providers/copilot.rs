@@ -229,7 +229,7 @@ impl CopilotProvider {
         ("Accept", "application/json"),
     ];
 
-    fn convert_tools<'a>(tools: Option<&'a [ToolSpec]>) -> Option<Vec<NativeToolSpec<'a>>> {
+    fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec<'_>>> {
         tools.map(|items| {
             items
                 .iter()

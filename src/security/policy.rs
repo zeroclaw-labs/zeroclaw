@@ -356,7 +356,6 @@ fn contains_unquoted_char(command: &str, target: char) -> bool {
                 }
                 if ch == '"' {
                     quote = QuoteState::None;
-                    continue;
                 }
             }
             QuoteState::None => {
