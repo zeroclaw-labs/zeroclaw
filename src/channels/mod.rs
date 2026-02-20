@@ -2437,14 +2437,14 @@ fn collect_configured_channels(
     }
 
     if let Some(ref nc) = config.channels_config.nextcloud_talk {
-        channels.push((
-            "Nextcloud Talk",
-            Arc::new(NextcloudTalkChannel::new(
+        channels.push(ConfiguredChannel {
+            display_name: "Nextcloud Talk",
+            channel: Arc::new(NextcloudTalkChannel::new(
                 nc.base_url.clone(),
                 nc.app_token.clone(),
                 nc.allowed_users.clone(),
             )),
-        ));
+        });
     }
 
     if let Some(ref email_cfg) = config.channels_config.email {
