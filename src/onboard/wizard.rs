@@ -536,6 +536,7 @@ fn canonical_provider_name(provider_name: &str) -> &str {
         "kimi_coding" | "kimi_for_coding" => "kimi-code",
         "nvidia-nim" | "build.nvidia.com" => "nvidia",
         "aws-bedrock" => "bedrock",
+        "llama.cpp" => "llamacpp",
         _ => provider_name,
     }
 }
@@ -543,7 +544,7 @@ fn canonical_provider_name(provider_name: &str) -> &str {
 fn allows_unauthenticated_model_fetch(provider_name: &str) -> bool {
     matches!(
         canonical_provider_name(provider_name),
-        "openrouter" | "ollama" | "venice" | "astrai" | "nvidia"
+        "openrouter" | "ollama" | "llamacpp" | "venice" | "astrai" | "nvidia"
     )
 }
 
@@ -577,6 +578,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "qwen" => "qwen-plus".into(),
         "qwen-code" => "qwen3-coder-plus".into(),
         "ollama" => "llama3.2".into(),
+        "llamacpp" => "ggml-org/gpt-oss-20b-GGUF".into(),
         "gemini" => "gemini-2.5-pro".into(),
         "kimi-code" => "kimi-for-coding".into(),
         "bedrock" => "anthropic.claude-sonnet-4-5-20250929-v1:0".into(),
@@ -911,6 +913,20 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
             ("codellama".to_string(), "Code Llama".to_string()),
             ("phi3".to_string(), "Phi-3 (small, fast)".to_string()),
         ],
+        "llamacpp" => vec![
+            (
+                "ggml-org/gpt-oss-20b-GGUF".to_string(),
+                "GPT-OSS 20B GGUF (llama.cpp server example)".to_string(),
+            ),
+            (
+                "bartowski/Llama-3.3-70B-Instruct-GGUF".to_string(),
+                "Llama 3.3 70B GGUF (high quality)".to_string(),
+            ),
+            (
+                "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF".to_string(),
+                "Qwen2.5 Coder 7B GGUF (coding-focused)".to_string(),
+            ),
+        ],
         "bedrock" => vec![
             (
                 "anthropic.claude-sonnet-4-6".to_string(),
@@ -964,6 +980,7 @@ fn supports_live_model_fetch(provider_name: &str) -> bool {
             | "together-ai"
             | "gemini"
             | "ollama"
+            | "llamacpp"
             | "astrai"
             | "venice"
             | "fireworks"
@@ -999,6 +1016,7 @@ fn models_endpoint_for_provider(provider_name: &str) -> Option<&'static str> {
             "qwen" => Some("https://dashscope.aliyuncs.com/compatible-mode/v1/models"),
             "nvidia" => Some("https://integrate.api.nvidia.com/v1/models"),
             "astrai" => Some("https://as-trai.com/v1/models"),
+            "llamacpp" => Some("http://localhost:8080/v1/models"),
             _ => None,
         },
     }
@@ -1193,7 +1211,28 @@ fn fetch_ollama_models() -> Result<Vec<String>> {
     Ok(parse_ollama_model_ids(&payload))
 }
 
-fn fetch_live_models_for_provider(provider_name: &str, api_key: &str) -> Result<Vec<String>> {
+fn resolve_live_models_endpoint(provider_name: &str, provider_api_url: Option<&str>) -> Option<String> {
+    if canonical_provider_name(provider_name) == "llamacpp" {
+        if let Some(url) = provider_api_url
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+        {
+            let normalized = url.trim_end_matches('/');
+            if normalized.ends_with("/models") {
+                return Some(normalized.to_string());
+            }
+            return Some(format!("{normalized}/models"));
+        }
+    }
+
+    models_endpoint_for_provider(provider_name).map(str::to_string)
+}
+
+fn fetch_live_models_for_provider(
+    provider_name: &str,
+    api_key: &str,
+    provider_api_url: Option<&str>,
+) -> Result<Vec<String>> {
     let requested_provider_name = provider_name;
     let provider_name = canonical_provider_name(provider_name);
     let api_key = if api_key.trim().is_empty() {
@@ -1239,10 +1278,16 @@ fn fetch_live_models_for_provider(provider_name: &str, api_key: &str) -> Result<
             }
         }
         _ => {
-            if let Some(endpoint) = models_endpoint_for_provider(requested_provider_name) {
+            if let Some(endpoint) =
+                resolve_live_models_endpoint(requested_provider_name, provider_api_url)
+            {
                 let allow_unauthenticated =
                     allows_unauthenticated_model_fetch(requested_provider_name);
-                fetch_openai_compatible_models(endpoint, api_key.as_deref(), allow_unauthenticated)?
+                fetch_openai_compatible_models(
+                    &endpoint,
+                    api_key.as_deref(),
+                    allow_unauthenticated,
+                )?
             } else {
                 Vec::new()
             }
@@ -1466,7 +1511,7 @@ pub fn run_models_refresh(
 
     let api_key = config.api_key.clone().unwrap_or_default();
 
-    match fetch_live_models_for_provider(&provider_name, &api_key) {
+    match fetch_live_models_for_provider(&provider_name, &api_key, config.api_url.as_deref()) {
         Ok(models) if !models.is_empty() => {
             cache_live_models_for_provider(&config.workspace_dir, &provider_name, &models)?;
             println!(
@@ -1592,7 +1637,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
         "⚡ Fast inference (Groq, Fireworks, Together AI, NVIDIA NIM)",
         "🌐 Gateway / proxy (Vercel AI, Cloudflare AI, Amazon Bedrock)",
         "🔬 Specialized (Moonshot/Kimi, GLM/Zhipu, MiniMax, Qwen/DashScope, Qianfan, Z.AI, Synthetic, OpenCode Zen, Cohere)",
-        "🏠 Local / private (Ollama — no API key needed)",
+        "🏠 Local / private (Ollama, llama.cpp server — no API key needed)",
         "🔧 Custom — bring your own OpenAI-compatible API",
     ];
 
@@ -1670,7 +1715,13 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
             ("opencode", "OpenCode Zen — code-focused AI"),
             ("cohere", "Cohere — Command R+ & embeddings"),
         ],
-        4 => vec![("ollama", "Ollama — local models (Llama, Mistral, Phi)")],
+        4 => vec![
+            ("ollama", "Ollama — local models (Llama, Mistral, Phi)"),
+            (
+                "llamacpp",
+                "llama.cpp server — local OpenAI-compatible endpoint",
+            ),
+        ],
         _ => vec![], // Custom — handled below
     };
 
@@ -1774,6 +1825,37 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
             print_bullet("Using local Ollama at http://localhost:11434 (no API key needed).");
             String::new()
         }
+    } else if matches!(provider_name, "llamacpp" | "llama.cpp") {
+        let raw_url: String = Input::new()
+            .with_prompt("  llama.cpp server endpoint URL")
+            .default("http://localhost:8080/v1".into())
+            .interact_text()?;
+
+        let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
+        if normalized_url.is_empty() {
+            anyhow::bail!("llama.cpp endpoint URL cannot be empty.");
+        }
+        provider_api_url = Some(normalized_url.clone());
+
+        print_bullet(&format!(
+            "Using llama.cpp server endpoint: {}",
+            style(&normalized_url).cyan()
+        ));
+        print_bullet("No API key needed unless your llama.cpp server is started with --api-key.");
+
+        let key: String = Input::new()
+            .with_prompt("  API key for llama.cpp server (or Enter to skip)")
+            .allow_empty(true)
+            .interact_text()?;
+
+        if key.trim().is_empty() {
+            print_bullet(&format!(
+                "No API key provided. Set {} later only if your server requires authentication.",
+                style("LLAMACPP_API_KEY").yellow()
+            ));
+        }
+
+        key
     } else if canonical_provider_name(provider_name) == "gemini" {
         // Special handling for Gemini: check for CLI auth first
         if crate::providers::gemini::GeminiProvider::has_cli_credentials() {
@@ -2026,7 +2108,11 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
                 .interact()?;
 
             if should_fetch_now {
-                match fetch_live_models_for_provider(provider_name, &api_key) {
+                match fetch_live_models_for_provider(
+                    provider_name,
+                    &api_key,
+                    provider_api_url.as_deref(),
+                ) {
                     Ok(live_model_ids) if !live_model_ids.is_empty() => {
                         cache_live_models_for_provider(
                             workspace_dir,
@@ -2159,6 +2245,7 @@ fn provider_env_var(name: &str) -> &'static str {
         "anthropic" => "ANTHROPIC_API_KEY",
         "openai" => "OPENAI_API_KEY",
         "ollama" => "OLLAMA_API_KEY",
+        "llamacpp" => "LLAMACPP_API_KEY",
         "venice" => "VENICE_API_KEY",
         "groq" => "GROQ_API_KEY",
         "mistral" => "MISTRAL_API_KEY",
@@ -2185,6 +2272,13 @@ fn provider_env_var(name: &str) -> &'static str {
         "astrai" => "ASTRAI_API_KEY",
         _ => "API_KEY",
     }
+}
+
+fn provider_supports_keyless_local_usage(provider_name: &str) -> bool {
+    matches!(
+        canonical_provider_name(provider_name),
+        "ollama" | "llamacpp"
+    )
 }
 
 // ── Step 5: Tool Mode & Security ────────────────────────────────
@@ -4671,8 +4765,8 @@ fn print_summary(config: &Config) {
 
     let mut step = 1u8;
 
-    if config.api_key.is_none() {
-        let provider = config.default_provider.as_deref().unwrap_or("openrouter");
+    let provider = config.default_provider.as_deref().unwrap_or("openrouter");
+    if config.api_key.is_none() && !provider_supports_keyless_local_usage(provider) {
         if provider == "openai-codex" {
             println!(
                 "    {} Authenticate OpenAI Codex:",
@@ -5322,6 +5416,10 @@ mod tests {
             "meta/llama-3.3-70b-instruct"
         );
         assert_eq!(
+            default_model_for_provider("llamacpp"),
+            "ggml-org/gpt-oss-20b-GGUF"
+        );
+        assert_eq!(
             default_model_for_provider("astrai"),
             "anthropic/claude-sonnet-4.6"
         );
@@ -5345,6 +5443,7 @@ mod tests {
         assert_eq!(canonical_provider_name("nvidia-nim"), "nvidia");
         assert_eq!(canonical_provider_name("aws-bedrock"), "bedrock");
         assert_eq!(canonical_provider_name("build.nvidia.com"), "nvidia");
+        assert_eq!(canonical_provider_name("llama.cpp"), "llamacpp");
     }
 
     #[test]
@@ -5428,6 +5527,8 @@ mod tests {
         assert!(allows_unauthenticated_model_fetch("build.nvidia.com"));
         assert!(allows_unauthenticated_model_fetch("astrai"));
         assert!(allows_unauthenticated_model_fetch("ollama"));
+        assert!(allows_unauthenticated_model_fetch("llamacpp"));
+        assert!(allows_unauthenticated_model_fetch("llama.cpp"));
         assert!(!allows_unauthenticated_model_fetch("openai"));
         assert!(!allows_unauthenticated_model_fetch("deepseek"));
     }
@@ -5467,6 +5568,8 @@ mod tests {
         assert!(supports_live_model_fetch("nvidia-nim"));
         assert!(supports_live_model_fetch("build.nvidia.com"));
         assert!(supports_live_model_fetch("ollama"));
+        assert!(supports_live_model_fetch("llamacpp"));
+        assert!(supports_live_model_fetch("llama.cpp"));
         assert!(supports_live_model_fetch("astrai"));
         assert!(supports_live_model_fetch("venice"));
         assert!(supports_live_model_fetch("glm-cn"));
@@ -5518,6 +5621,10 @@ mod tests {
             curated_models_for_provider("build.nvidia.com")
         );
         assert_eq!(
+            curated_models_for_provider("llamacpp"),
+            curated_models_for_provider("llama.cpp")
+        );
+        assert_eq!(
             curated_models_for_provider("bedrock"),
             curated_models_for_provider("aws-bedrock")
         );
@@ -5565,8 +5672,45 @@ mod tests {
             models_endpoint_for_provider("moonshot"),
             Some("https://api.moonshot.ai/v1/models")
         );
+        assert_eq!(
+            models_endpoint_for_provider("llamacpp"),
+            Some("http://localhost:8080/v1/models")
+        );
+        assert_eq!(
+            models_endpoint_for_provider("llama.cpp"),
+            Some("http://localhost:8080/v1/models")
+        );
         assert_eq!(models_endpoint_for_provider("perplexity"), None);
         assert_eq!(models_endpoint_for_provider("unknown-provider"), None);
+    }
+
+    #[test]
+    fn resolve_live_models_endpoint_prefers_llamacpp_custom_url() {
+        assert_eq!(
+            resolve_live_models_endpoint("llamacpp", Some("http://127.0.0.1:8033/v1")),
+            Some("http://127.0.0.1:8033/v1/models".to_string())
+        );
+        assert_eq!(
+            resolve_live_models_endpoint("llama.cpp", Some("http://127.0.0.1:8033/v1/")),
+            Some("http://127.0.0.1:8033/v1/models".to_string())
+        );
+        assert_eq!(
+            resolve_live_models_endpoint("llamacpp", Some("http://127.0.0.1:8033/v1/models")),
+            Some("http://127.0.0.1:8033/v1/models".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_live_models_endpoint_falls_back_to_provider_defaults() {
+        assert_eq!(
+            resolve_live_models_endpoint("llamacpp", None),
+            Some("http://localhost:8080/v1/models".to_string())
+        );
+        assert_eq!(
+            resolve_live_models_endpoint("venice", Some("http://localhost:9999/v1")),
+            Some("https://api.venice.ai/api/v1/models".to_string())
+        );
+        assert_eq!(resolve_live_models_endpoint("unknown-provider", None), None);
     }
 
     #[test]
@@ -5716,6 +5860,8 @@ mod tests {
         assert_eq!(provider_env_var("anthropic"), "ANTHROPIC_API_KEY");
         assert_eq!(provider_env_var("openai"), "OPENAI_API_KEY");
         assert_eq!(provider_env_var("ollama"), "OLLAMA_API_KEY");
+        assert_eq!(provider_env_var("llamacpp"), "LLAMACPP_API_KEY");
+        assert_eq!(provider_env_var("llama.cpp"), "LLAMACPP_API_KEY");
         assert_eq!(provider_env_var("xai"), "XAI_API_KEY");
         assert_eq!(provider_env_var("grok"), "XAI_API_KEY"); // alias
         assert_eq!(provider_env_var("together"), "TOGETHER_API_KEY"); // alias
@@ -5741,6 +5887,14 @@ mod tests {
         assert_eq!(provider_env_var("nvidia-nim"), "NVIDIA_API_KEY"); // alias
         assert_eq!(provider_env_var("build.nvidia.com"), "NVIDIA_API_KEY"); // alias
         assert_eq!(provider_env_var("astrai"), "ASTRAI_API_KEY");
+    }
+
+    #[test]
+    fn provider_supports_keyless_local_usage_for_local_providers() {
+        assert!(provider_supports_keyless_local_usage("ollama"));
+        assert!(provider_supports_keyless_local_usage("llamacpp"));
+        assert!(provider_supports_keyless_local_usage("llama.cpp"));
+        assert!(!provider_supports_keyless_local_usage("openai"));
     }
 
     #[test]

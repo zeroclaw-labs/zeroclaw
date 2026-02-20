@@ -833,6 +833,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "cloudflare" | "cloudflare-ai" => vec!["CLOUDFLARE_API_KEY"],
         "ovhcloud" | "ovh" => vec!["OVH_AI_ENDPOINTS_ACCESS_TOKEN"],
         "astrai" => vec!["ASTRAI_API_KEY"],
+        "llamacpp" | "llama.cpp" => vec!["LLAMACPP_API_KEY"],
         _ => vec![],
     };
 
@@ -1072,6 +1073,22 @@ fn create_provider_with_url_and_options(
                 "LM Studio",
                 "http://localhost:1234/v1",
                 Some(lm_studio_key),
+                AuthStyle::Bearer,
+            )))
+        }
+        "llamacpp" | "llama.cpp" => {
+            let base_url = api_url
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("http://localhost:8080/v1");
+            let llama_cpp_key = key
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("llama.cpp");
+            Ok(Box::new(OpenAiCompatibleProvider::new(
+                "llama.cpp",
+                base_url,
+                Some(llama_cpp_key),
                 AuthStyle::Bearer,
             )))
         }
@@ -1517,6 +1534,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             local: true,
         },
         ProviderInfo {
+            name: "llamacpp",
+            display_name: "llama.cpp server",
+            aliases: &["llama.cpp"],
+            local: true,
+        },
+        ProviderInfo {
             name: "nvidia",
             display_name: "NVIDIA NIM",
             aliases: &["nvidia-nim", "build.nvidia.com"],
@@ -1949,6 +1972,13 @@ mod tests {
         assert!(create_provider("lmstudio", None).is_ok());
     }
 
+    #[test]
+    fn factory_llamacpp() {
+        assert!(create_provider("llamacpp", Some("key")).is_ok());
+        assert!(create_provider("llama.cpp", Some("key")).is_ok());
+        assert!(create_provider("llamacpp", None).is_ok());
+    }
+
     // ── Extended ecosystem ───────────────────────────────────
 
     #[test]
@@ -2297,6 +2327,7 @@ mod tests {
             "qwen-us",
             "qwen-code",
             "lmstudio",
+            "llamacpp",
             "groq",
             "mistral",
             "xai",

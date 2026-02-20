@@ -2,7 +2,7 @@
 
 This document maps provider IDs, aliases, and credential environment variables.
 
-Last verified: **February 19, 2026**.
+Last verified: **February 20, 2026**.
 
 ## How to List Providers
 
@@ -54,6 +54,7 @@ credential is not reused for fallback providers.
 | `cohere` | — | No | `COHERE_API_KEY` |
 | `copilot` | `github-copilot` | No | (use config/`API_KEY` fallback with GitHub token) |
 | `lmstudio` | `lm-studio` | Yes | (optional; local by default) |
+| `llamacpp` | `llama.cpp` | Yes | `LLAMACPP_API_KEY` (optional; only if server auth is enabled) |
 | `nvidia` | `nvidia-nim`, `build.nvidia.com` | No | `NVIDIA_API_KEY` |
 
 ### Gemini Notes
@@ -69,6 +70,13 @@ credential is not reused for fallback providers.
 - Vision input is supported through user message image markers: ``[IMAGE:<source>]``.
 - After multimodal normalization, ZeroClaw sends image payloads through Ollama's native `messages[].images` field.
 - If a non-vision provider is selected, ZeroClaw returns a structured capability error instead of silently ignoring images.
+
+### llama.cpp Server Notes
+
+- Provider ID: `llamacpp` (alias: `llama.cpp`)
+- Default endpoint: `http://localhost:8080/v1`
+- API key is optional by default; set `LLAMACPP_API_KEY` only when `llama-server` is started with `--api-key`.
+- Model discovery: `zeroclaw models refresh --provider llamacpp`
 
 ### Bedrock Notes
 

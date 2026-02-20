@@ -379,7 +379,7 @@ Every subsystem is a **trait** — swap implementations with a config change, ze
 
 | Subsystem | Trait | Ships with | Extend |
 |-----------|-------|------------|--------|
-| **AI Models** | `Provider` | Provider catalog via `zeroclaw providers` (currently 28 built-ins + aliases, plus custom endpoints) | `custom:https://your-api.com` (OpenAI-compatible) or `anthropic-custom:https://your-api.com` |
+| **AI Models** | `Provider` | Provider catalog via `zeroclaw providers` (currently 29 built-ins + aliases, plus custom endpoints) | `custom:https://your-api.com` (OpenAI-compatible) or `anthropic-custom:https://your-api.com` |
 | **Channels** | `Channel` | CLI, Telegram, Discord, Slack, Mattermost, iMessage, Matrix, Signal, WhatsApp, Email, IRC, Lark, DingTalk, QQ, Webhook | Any messaging API |
 | **Memory** | `Memory` | SQLite hybrid search, PostgreSQL backend (configurable storage provider), Lucid bridge, Markdown files, explicit `none` backend, snapshot/hydrate, optional response cache | Any persistence backend |
 | **Tools** | `Tool` | shell/file/memory, cron/schedule, git, pushover, browser, http_request, screenshot/image_info, composio (opt-in), delegate, hardware tools | Any capability |
@@ -721,6 +721,26 @@ default_provider = "ollama"
 default_model = "qwen3:cloud"
 api_url = "https://ollama.com"
 api_key = "ollama_api_key_here"
+```
+
+### llama.cpp Server Endpoint
+
+ZeroClaw now supports `llama-server` as a first-class local provider:
+
+- Provider ID: `llamacpp` (alias: `llama.cpp`)
+- Default endpoint: `http://localhost:8080/v1`
+- API key is optional unless your server is started with `--api-key`
+
+Example setup:
+
+```bash
+llama-server -hf ggml-org/gpt-oss-20b-GGUF --jinja -c 133000 --host 127.0.0.1 --port 8033
+```
+
+```toml
+default_provider = "llamacpp"
+api_url = "http://127.0.0.1:8033/v1"
+default_model = "ggml-org/gpt-oss-20b-GGUF"
 ```
 
 ### Custom Provider Endpoints

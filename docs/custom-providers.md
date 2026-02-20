@@ -46,6 +46,38 @@ export API_KEY="your-api-key"
 zeroclaw agent
 ```
 
+## llama.cpp Server (Recommended Local Setup)
+
+ZeroClaw includes a first-class local provider for `llama-server`:
+
+- Provider ID: `llamacpp` (alias: `llama.cpp`)
+- Default endpoint: `http://localhost:8080/v1`
+- API key is optional unless `llama-server` is started with `--api-key`
+
+Start a local server (example):
+
+```bash
+llama-server -hf ggml-org/gpt-oss-20b-GGUF --jinja -c 133000 --host 127.0.0.1 --port 8033
+```
+
+Then configure ZeroClaw:
+
+```toml
+default_provider = "llamacpp"
+api_url = "http://127.0.0.1:8033/v1"
+default_model = "ggml-org/gpt-oss-20b-GGUF"
+default_temperature = 0.7
+```
+
+Quick validation:
+
+```bash
+zeroclaw models refresh --provider llamacpp
+zeroclaw agent -m "hello"
+```
+
+You do not need to export `ZEROCLAW_API_KEY=dummy` for this flow.
+
 ## Testing Configuration
 
 Verify your custom endpoint:
@@ -88,10 +120,11 @@ curl -sS https://your-api.com/models \
 
 ## Examples
 
-### Local LLM Server
+### Local LLM Server (Generic Custom Endpoint)
 
 ```toml
-default_provider = "custom:http://localhost:8080"
+default_provider = "custom:http://localhost:8080/v1"
+api_key = "your-api-key-if-required"
 default_model = "local-model"
 ```
 
