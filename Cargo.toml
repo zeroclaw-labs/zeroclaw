@@ -219,6 +219,7 @@ panic = "abort"
 tempfile = "3.14"
 criterion = { version = "0.8", features = ["async_tokio"] }
 tokio-stream = { version = "0.1.18", default-features = false, features = ["fs"] }
+wiremock = "0.6"
 
 [[bench]]
 name = "agent_benchmarks"
