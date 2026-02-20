@@ -187,10 +187,11 @@ impl Tool for PdfReadTool {
             if text.trim().is_empty() {
                 return Ok(ToolResult {
                     success: true,
-                    output: String::new(),
-                    error: Some(
-                        "PDF contains no extractable text (may be image-only or encrypted)".into(),
-                    ),
+                    // Agent dispatchers currently forward `error` only when `success=false`.
+                    // Keep this as successful execution and expose the warning in `output`.
+                    output: "PDF contains no extractable text (may be image-only or encrypted)"
+                        .into(),
+                    error: None,
                 });
             }
 
@@ -517,12 +518,7 @@ mod tests {
 
             // Acceptable outcomes: empty text warning, or extraction error for
             // malformed hand-crafted PDF.
-            let is_empty_warning = result.success
-                && result
-                    .error
-                    .as_deref()
-                    .unwrap_or("")
-                    .contains("no extractable");
+            let is_empty_warning = result.success && result.output.contains("no extractable text");
             let is_extraction_error =
                 !result.success && result.error.as_deref().unwrap_or("").contains("extraction");
             let is_resolve_error =
