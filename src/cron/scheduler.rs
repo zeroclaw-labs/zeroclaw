@@ -131,6 +131,7 @@ async fn run_agent_job(config: &Config, job: &CronJob) -> (bool, String) {
                 model_override,
                 config.default_temperature,
                 vec![],
+                false,
             )
             .await
         }

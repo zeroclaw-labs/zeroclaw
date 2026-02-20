@@ -1235,6 +1235,7 @@ pub async fn run(
     model_override: Option<String>,
     temperature: f64,
     peripheral_overrides: Vec<String>,
+    interactive: bool,
 ) -> Result<String> {
     // ── Wire up agnostic subsystems ──────────────────────────────
     let base_observer = observability::create_observer(&config.observability);
@@ -1470,8 +1471,12 @@ pub async fn run(
     // Append structured tool-use instructions with schemas
     system_prompt.push_str(&build_tool_instructions(&tools_registry));
 
-    // ── Approval manager (supervised mode) ───────────────────────
-    let approval_manager = ApprovalManager::from_config(&config.autonomy);
+    // ── Approval manager (supervised mode, CLI-interactive only) ─
+    let approval_manager = if interactive {
+        Some(ApprovalManager::from_config(&config.autonomy))
+    } else {
+        None
+    };
 
     // ── Execute ──────────────────────────────────────────────────
     let start = Instant::now();
@@ -1507,6 +1512,7 @@ pub async fn run(
             ChatMessage::user(&enriched),
         ];
 
+        let channel_name = if interactive { "cli" } else { "daemon" };
         let response = run_tool_call_loop(
             provider.as_ref(),
             &mut history,
@@ -1515,9 +1521,9 @@ pub async fn run(
             provider_name,
             model_name,
             temperature,
-            false,
-            Some(&approval_manager),
-            "cli",
+            !interactive,
+            approval_manager.as_ref(),
+            channel_name,
             &config.multimodal,
             config.agent.max_tool_iterations,
             None,
@@ -1637,7 +1643,7 @@ pub async fn run(
                 model_name,
                 temperature,
                 false,
-                Some(&approval_manager),
+                approval_manager.as_ref(),
                 "cli",
                 &config.multimodal,
                 config.agent.max_tool_iterations,
