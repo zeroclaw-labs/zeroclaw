@@ -3219,10 +3219,92 @@ fn setup_channels() -> Result<ChannelsConfig> {
             ChannelMenuChoice::WhatsApp => {
                 // ── WhatsApp ──
                 println!();
+                println!("  {}", style("WhatsApp Setup").white().bold());
+
+                let mode_options = vec![
+                    "WhatsApp Web (QR / pair-code, no Meta Business API)",
+                    "WhatsApp Business Cloud API (webhook)",
+                ];
+                let mode_idx = Select::new()
+                    .with_prompt("  Choose WhatsApp mode")
+                    .items(&mode_options)
+                    .default(0)
+                    .interact()?;
+
+                if mode_idx == 0 {
+                    println!("  {}", style("Mode: WhatsApp Web").dim());
+                    print_bullet("1. Build with --features whatsapp-web");
+                    print_bullet(
+                        "2. Start channel/daemon and scan QR in WhatsApp > Linked Devices",
+                    );
+                    print_bullet("3. Keep session_path persistent so relogin is not required");
+                    println!();
+
+                    let session_path: String = Input::new()
+                        .with_prompt("  Session database path")
+                        .default("~/.zeroclaw/state/whatsapp-web/session.db".into())
+                        .interact_text()?;
+
+                    if session_path.trim().is_empty() {
+                        println!("  {} Skipped — session path required", style("→").dim());
+                        continue;
+                    }
+
+                    let pair_phone: String = Input::new()
+                        .with_prompt(
+                            "  Pair phone (optional, digits only; leave empty to use QR flow)",
+                        )
+                        .allow_empty(true)
+                        .interact_text()?;
+
+                    let pair_code: String = if pair_phone.trim().is_empty() {
+                        String::new()
+                    } else {
+                        Input::new()
+                            .with_prompt(
+                                "  Custom pair code (optional, leave empty for auto-generated)",
+                            )
+                            .allow_empty(true)
+                            .interact_text()?
+                    };
+
+                    let users_str: String = Input::new()
+                        .with_prompt(
+                            "  Allowed phone numbers (comma-separated +1234567890, or * for all)",
+                        )
+                        .default("*".into())
+                        .interact_text()?;
+
+                    let allowed_numbers = if users_str.trim() == "*" {
+                        vec!["*".into()]
+                    } else {
+                        users_str.split(',').map(|s| s.trim().to_string()).collect()
+                    };
+
+                    config.whatsapp = Some(WhatsAppConfig {
+                        access_token: None,
+                        phone_number_id: None,
+                        verify_token: None,
+                        app_secret: None,
+                        session_path: Some(session_path.trim().to_string()),
+                        pair_phone: (!pair_phone.trim().is_empty())
+                            .then(|| pair_phone.trim().to_string()),
+                        pair_code: (!pair_code.trim().is_empty())
+                            .then(|| pair_code.trim().to_string()),
+                        allowed_numbers,
+                    });
+
+                    println!(
+                        "  {} WhatsApp Web configuration saved.",
+                        style("✅").green().bold()
+                    );
+                    continue;
+                }
+
                 println!(
                     "  {} {}",
-                    style("WhatsApp Setup").white().bold(),
-                    style("— Business Cloud API").dim()
+                    style("Mode:").dim(),
+                    style("Business Cloud API").dim()
                 );
                 print_bullet("1. Go to developers.facebook.com and create a WhatsApp app");
                 print_bullet("2. Add the WhatsApp product and get your phone number ID");

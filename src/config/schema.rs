@@ -2461,6 +2461,13 @@ impl WhatsAppConfig {
     pub fn is_web_config(&self) -> bool {
         self.session_path.is_some()
     }
+
+    /// Returns true when both Cloud and Web selectors are present.
+    ///
+    /// Runtime currently prefers Cloud mode in this case for backward compatibility.
+    pub fn is_ambiguous_config(&self) -> bool {
+        self.phone_number_id.is_some() && self.session_path.is_some()
+    }
 }
 
 /// IRC channel configuration.
@@ -4440,6 +4447,38 @@ channel_id = "C123"
         let toml_str = toml::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.allowed_numbers, vec!["*"]);
+    }
+
+    #[test]
+    async fn whatsapp_config_backend_type_cloud_precedence_when_ambiguous() {
+        let wc = WhatsAppConfig {
+            access_token: Some("tok".into()),
+            phone_number_id: Some("123".into()),
+            verify_token: Some("ver".into()),
+            app_secret: None,
+            session_path: Some("~/.zeroclaw/state/whatsapp-web/session.db".into()),
+            pair_phone: None,
+            pair_code: None,
+            allowed_numbers: vec!["+1".into()],
+        };
+        assert!(wc.is_ambiguous_config());
+        assert_eq!(wc.backend_type(), "cloud");
+    }
+
+    #[test]
+    async fn whatsapp_config_backend_type_web() {
+        let wc = WhatsAppConfig {
+            access_token: None,
+            phone_number_id: None,
+            verify_token: None,
+            app_secret: None,
+            session_path: Some("~/.zeroclaw/state/whatsapp-web/session.db".into()),
+            pair_phone: None,
+            pair_code: None,
+            allowed_numbers: vec![],
+        };
+        assert!(!wc.is_ambiguous_config());
+        assert_eq!(wc.backend_type(), "web");
     }
 
     #[test]

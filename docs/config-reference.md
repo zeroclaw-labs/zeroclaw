@@ -356,6 +356,34 @@ Notes:
 
 See detailed channel matrix and allowlist behavior in [channels-reference.md](channels-reference.md).
 
+### `[channels_config.whatsapp]`
+
+WhatsApp supports two backends under one config table.
+
+Cloud API mode (Meta webhook):
+
+| Key | Required | Purpose |
+|---|---|---|
+| `access_token` | Yes | Meta Cloud API bearer token |
+| `phone_number_id` | Yes | Meta phone number ID |
+| `verify_token` | Yes | Webhook verification token |
+| `app_secret` | Optional | Enables webhook signature verification (`X-Hub-Signature-256`) |
+| `allowed_numbers` | Recommended | Allowed inbound numbers (`[]` = deny all, `"*"` = allow all) |
+
+WhatsApp Web mode (native client):
+
+| Key | Required | Purpose |
+|---|---|---|
+| `session_path` | Yes | Persistent SQLite session path |
+| `pair_phone` | Optional | Pair-code flow phone number (digits only) |
+| `pair_code` | Optional | Custom pair code (otherwise auto-generated) |
+| `allowed_numbers` | Recommended | Allowed inbound numbers (`[]` = deny all, `"*"` = allow all) |
+
+Notes:
+
+- WhatsApp Web requires build flag `whatsapp-web`.
+- If both Cloud and Web fields are present, Cloud mode wins for backward compatibility.
+
 ## `[hardware]`
 
 Hardware wizard configuration for physical-world access (STM32, probe, serial).

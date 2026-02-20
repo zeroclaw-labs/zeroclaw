@@ -101,7 +101,7 @@ If `[channels_config.matrix]` is present but the binary was built without `chann
 | Mattermost | polling | No |
 | Matrix | sync API (supports E2EE) | No |
 | Signal | signal-cli HTTP bridge | No (local bridge endpoint) |
-| WhatsApp | webhook | Yes (public HTTPS callback) |
+| WhatsApp | webhook (Cloud API) or websocket (Web mode) | Cloud API: Yes (public HTTPS callback), Web mode: No |
 | Webhook | gateway endpoint (`/webhook`) | Usually yes |
 | Email | IMAP polling + SMTP send | No |
 | IRC | IRC socket | No |
@@ -208,6 +208,13 @@ ignore_stories = true
 
 ### 4.7 WhatsApp
 
+ZeroClaw supports two WhatsApp backends:
+
+- **Cloud API mode** (`phone_number_id` + `access_token` + `verify_token`)
+- **WhatsApp Web mode** (`session_path`, requires build flag `--features whatsapp-web`)
+
+Cloud API mode:
+
 ```toml
 [channels_config.whatsapp]
 access_token = "EAAB..."
@@ -216,6 +223,22 @@ verify_token = "your-verify-token"
 app_secret = "your-app-secret"     # optional but recommended
 allowed_numbers = ["*"]
 ```
+
+WhatsApp Web mode:
+
+```toml
+[channels_config.whatsapp]
+session_path = "~/.zeroclaw/state/whatsapp-web/session.db"
+pair_phone = "15551234567"         # optional; omit to use QR flow
+pair_code = ""                     # optional custom pair code
+allowed_numbers = ["*"]
+```
+
+Notes:
+
+- Build with `cargo build --features whatsapp-web` (or equivalent run command).
+- Keep `session_path` on persistent storage to avoid relinking after restart.
+- Reply routing uses the originating chat JID, so direct and group replies work correctly.
 
 ### 4.8 Webhook Channel Config (Gateway)
 
@@ -375,7 +398,7 @@ rg -n "Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|D
 | Mattermost | `Mattermost channel listening on` | `Mattermost: ignoring message from unauthorized user:` | `Mattermost poll error:` / `Mattermost parse error:` |
 | Matrix | `Matrix channel listening on room` / `Matrix room ... is encrypted; E2EE decryption is enabled via matrix-sdk.` | `Matrix whoami failed; falling back to configured session hints for E2EE session restore:` / `Matrix whoami failed while resolving listener user_id; using configured user_id hint:` | `Matrix sync error: ... retrying...` |
 | Signal | `Signal channel listening via SSE on` | (allowlist checks are enforced by `allowed_from`) | `Signal SSE returned ...` / `Signal SSE connect error:` |
-| WhatsApp (channel) | `WhatsApp channel active (webhook mode).` | `WhatsApp: ignoring message from unauthorized number:` | `WhatsApp send failed:` |
+| WhatsApp (channel) | `WhatsApp channel active (webhook mode).` / `WhatsApp Web connected successfully` | `WhatsApp: ignoring message from unauthorized number:` / `WhatsApp Web: message from ... not in allowed list` | `WhatsApp send failed:` / `WhatsApp Web stream error:` |
 | Webhook / WhatsApp (gateway) | `WhatsApp webhook verified successfully` | `Webhook: rejected — not paired / invalid bearer token` / `Webhook: rejected request — invalid or missing X-Webhook-Secret` / `WhatsApp webhook verification failed — token mismatch` | `Webhook JSON parse error:` |
 | Email | `Email polling every ...` / `Email sent to ...` | `Blocked email from ...` | `Email poll failed:` / `Email poll task panicked:` |
 | IRC | `IRC channel connecting to ...` / `IRC registered as ...` | (allowlist checks are enforced by `allowed_users`) | `IRC SASL authentication failed (...)` / `IRC server does not support SASL...` / `IRC nickname ... is in use, trying ...` |

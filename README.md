@@ -524,7 +524,37 @@ For non-text replies, ZeroClaw can send Telegram attachments when the assistant 
 
 Paths can be local files (for example `/tmp/screenshot.png`) or HTTPS URLs.
 
-### WhatsApp Business Cloud API Setup
+### WhatsApp Setup
+
+ZeroClaw supports two WhatsApp backends:
+
+- **WhatsApp Web mode** (QR / pair code, no Meta Business API required)
+- **WhatsApp Business Cloud API mode** (official Meta webhook flow)
+
+#### WhatsApp Web mode (recommended for personal/self-hosted use)
+
+1. **Build with WhatsApp Web support:**
+   ```bash
+   cargo build --features whatsapp-web
+   ```
+
+2. **Configure ZeroClaw:**
+   ```toml
+   [channels_config.whatsapp]
+   session_path = "~/.zeroclaw/state/whatsapp-web/session.db"
+   pair_phone = "15551234567"   # optional; omit to use QR flow
+   pair_code = ""               # optional custom pair code
+   allowed_numbers = ["+1234567890"]  # E.164 format, or ["*"] for all
+   ```
+
+3. **Start channels/daemon and link device:**
+   - Run `zeroclaw channel start` (or `zeroclaw daemon`).
+   - Follow terminal pairing output (QR or pair code).
+   - In WhatsApp on phone: **Settings → Linked Devices**.
+
+4. **Test:** Send a message from an allowed number and verify the agent replies.
+
+#### WhatsApp Business Cloud API mode
 
 WhatsApp uses Meta's Cloud API with webhooks (push-based, not polling):
 

@@ -2061,6 +2061,11 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     }
 
     if let Some(ref wa) = config.channels_config.whatsapp {
+        if wa.is_ambiguous_config() {
+            tracing::warn!(
+                "WhatsApp config has both phone_number_id and session_path set; preferring Cloud API mode. Remove one selector to avoid ambiguity."
+            );
+        }
         // Runtime negotiation: detect backend type from config
         match wa.backend_type() {
             "cloud" => {
@@ -2450,6 +2455,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
 
     if let Some(ref wa) = config.channels_config.whatsapp {
+        if wa.is_ambiguous_config() {
+            tracing::warn!(
+                "WhatsApp config has both phone_number_id and session_path set; preferring Cloud API mode. Remove one selector to avoid ambiguity."
+            );
+        }
         // Runtime negotiation: detect backend type from config
         match wa.backend_type() {
             "cloud" => {
