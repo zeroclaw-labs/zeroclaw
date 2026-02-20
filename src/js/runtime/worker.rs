@@ -141,8 +141,8 @@ fn run_worker_internal(id: usize, mut rx: mpsc::Receiver<WorkerCommand>, config:
                 reply,
             } => {
                 let result = ctx.with(|ctx| execute_hooks(&ctx, &event, handlers));
-                if let Err(e) = reply.send(result) {
-                    tracing::warn!("Failed to send hook execution result: {}", e);
+                if let Err(_) = reply.send(result) {
+                    tracing::warn!("Failed to send hook execution result: receiver dropped");
                 }
             }
 
