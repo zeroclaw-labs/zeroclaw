@@ -4,7 +4,7 @@ use super::{
     MemoryBackendKind,
 };
 use crate::config::Config;
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use console::style;
 
 /// Handle `zeroclaw memory <subcommand>` CLI commands.

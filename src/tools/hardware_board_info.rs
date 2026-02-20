@@ -42,10 +42,12 @@ const BOARD_INFO: &[(&str, &str, &str)] = &[
 ];
 
 /// Tool: return full board info (chip, architecture, memory map) for agent/Telegram.
+#[cfg(feature = "hardware")]
 pub struct HardwareBoardInfoTool {
     boards: Vec<String>,
 }
 
+#[cfg(feature = "hardware")]
 impl HardwareBoardInfoTool {
     pub fn new(boards: Vec<String>) -> Self {
         Self { boards }
@@ -64,6 +66,7 @@ impl HardwareBoardInfoTool {
     }
 }
 
+#[cfg(feature = "hardware")]
 #[async_trait]
 impl Tool for HardwareBoardInfoTool {
     fn name(&self) -> &str {

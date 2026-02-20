@@ -2787,37 +2787,6 @@ fn setup_channels() -> Result<ChannelsConfig> {
     println!();
 
     let mut config = ChannelsConfig::default();
-    #[derive(Clone, Copy)]
-    enum ChannelMenuChoice {
-        Telegram,
-        Discord,
-        Slack,
-        IMessage,
-        Matrix,
-        WhatsApp,
-        Linq,
-        Irc,
-        Webhook,
-        DingTalk,
-        QqOfficial,
-        LarkFeishu,
-        Done,
-    }
-    let menu_choices = [
-        ChannelMenuChoice::Telegram,
-        ChannelMenuChoice::Discord,
-        ChannelMenuChoice::Slack,
-        ChannelMenuChoice::IMessage,
-        ChannelMenuChoice::Matrix,
-        ChannelMenuChoice::WhatsApp,
-        ChannelMenuChoice::Linq,
-        ChannelMenuChoice::Irc,
-        ChannelMenuChoice::Webhook,
-        ChannelMenuChoice::DingTalk,
-        ChannelMenuChoice::QqOfficial,
-        ChannelMenuChoice::LarkFeishu,
-        ChannelMenuChoice::Done,
-    ];
 
     loop {
         let webhook = &mut config.webhook;
@@ -2844,7 +2813,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
         // here are some uncompleted options
         // because they were not present before, and I don't know how to complete
-        let mut options: [(_, fn(&mut ChannelsConfig) -> Result<()>); _] = [
+        let options: [(_, fn(&mut ChannelsConfig) -> Result<()>); _] = [
             (channel_option(telegram), |config| {
                 println!();
                 println!(
