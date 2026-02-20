@@ -352,7 +352,7 @@ fn resolved_default_model(config: &Config) -> String {
     config
         .default_model
         .clone()
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".to_string())
+        .unwrap_or_else(|| "anthropic/claude-sonnet-4.6".to_string())
 }
 
 fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
@@ -3300,6 +3300,7 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
         });
 
@@ -3314,6 +3315,7 @@ mod tests {
                 timestamp: 3,
                 thread_ts: None,
             },
+            CancellationToken::new(),
         )
         .await;
 
@@ -3382,6 +3384,7 @@ mod tests {
             },
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
         });
 
@@ -3396,6 +3399,7 @@ mod tests {
                 timestamp: 4,
                 thread_ts: None,
             },
+            CancellationToken::new(),
         )
         .await;
 
