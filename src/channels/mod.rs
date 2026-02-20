@@ -3547,6 +3547,26 @@ mod tests {
     }
 
     #[test]
+    fn prompt_includes_single_tool_protocol_block_after_append() {
+        let ws = make_workspace();
+        let tools = vec![("shell", "Run commands")];
+        let mut prompt = build_system_prompt(ws.path(), "gpt-4o", &tools, &[], None, None);
+
+        assert!(
+            !prompt.contains("## Tool Use Protocol"),
+            "build_system_prompt should not emit protocol block directly"
+        );
+
+        prompt.push_str(&build_tool_instructions(&[]));
+
+        assert_eq!(
+            prompt.matches("## Tool Use Protocol").count(),
+            1,
+            "protocol block should appear exactly once in the final prompt"
+        );
+    }
+
+    #[test]
     fn prompt_injects_safety() {
         let ws = make_workspace();
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
