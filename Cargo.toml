@@ -164,7 +164,7 @@ rppal = { version = "0.22", optional = true }
 landlock = { version = "0.4", optional = true }
 
 [features]
-default = ["hardware", "channel-matrix"]
+default = ["hardware", "channel-matrix", "rag-pdf"]
 hardware = ["nusb", "tokio-serial"]
 channel-matrix = ["dep:matrix-sdk"]
 peripheral-rpi = ["rppal"]
