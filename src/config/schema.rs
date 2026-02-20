@@ -2281,7 +2281,6 @@ pub enum StreamMode {
     #[default]
     Off,
     /// Update a draft message with every flush interval.
-    #[serde(alias = "on")]
     Partial,
 }
 

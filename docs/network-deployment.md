@@ -223,9 +223,11 @@ This creates:
 
 ### 7.3 Configuration
 
-No manual config copy is required.
+Manual config copy is usually not required.
 
 `sudo zeroclaw service install` automatically prepares `/etc/zeroclaw`, migrates existing runtime state from your user setup when available, and sets ownership/permissions for the `zeroclaw` service user.
+
+If no prior runtime state is available to migrate, create `/etc/zeroclaw/config.toml` before starting the service.
 
 ### 7.4 Enable and Start
 

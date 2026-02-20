@@ -1167,9 +1167,10 @@ mod tests {
         assert_eq!(InitSystem::default(), InitSystem::Auto);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn is_root_returns_false_in_test_env() {
-        assert!(!is_root());
+    fn is_root_matches_system_uid() {
+        assert_eq!(is_root(), unsafe { libc::getuid() == 0 });
     }
 
     #[test]
