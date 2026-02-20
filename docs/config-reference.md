@@ -90,6 +90,15 @@ Delegate sub-agent configurations. Each key under `[agents]` defines a named sub
 | `api_key` | unset | Optional API key override (stored encrypted when `secrets.encrypt = true`) |
 | `temperature` | unset | Temperature override for the sub-agent |
 | `max_depth` | `3` | Max recursion depth for nested delegation |
+| `agentic` | `false` | Enable multi-turn tool-call loop mode for the sub-agent |
+| `allowed_tools` | `[]` | Tool allowlist for agentic mode |
+| `max_iterations` | `10` | Max tool-call iterations for agentic mode |
+
+Notes:
+
+- `agentic = false` preserves existing single prompt→response delegate behavior.
+- `agentic = true` requires at least one matching entry in `allowed_tools`.
+- The `delegate` tool is excluded from sub-agent allowlists to prevent re-entrant delegation loops.
 
 ```toml
 [agents.researcher]
@@ -97,6 +106,9 @@ provider = "openrouter"
 model = "anthropic/claude-sonnet-4-6"
 system_prompt = "You are a research assistant."
 max_depth = 2
+agentic = true
+allowed_tools = ["web_search", "http_request", "file_read"]
+max_iterations = 8
 
 [agents.coder]
 provider = "ollama"
