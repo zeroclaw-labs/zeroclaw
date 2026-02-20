@@ -905,7 +905,8 @@ impl Channel for LarkChannel {
         let token = self.get_tenant_access_token().await?;
         let url = self.send_message_url();
 
-        let post = markdown_to_lark_post(&message.content);
+        let cleaned = strip_tool_blocks(&message.content);
+        let post = markdown_to_lark_post(&cleaned);
         let content = post.to_string();
         let body = serde_json::json!({
             "receive_id": message.recipient,
@@ -1352,6 +1353,18 @@ fn should_respond_in_group(mentions: &[serde_json::Value]) -> bool {
 // Markdown → Lark post (rich-text) converter
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Strip `<tool_code>…</tool_code>` blocks (and similar tags) that models
+/// sometimes leak into their replies. These are internal tool-call artifacts
+/// and should never be shown to end users.
+fn strip_tool_blocks(text: &str) -> String {
+    // Matches <tool_code>…</tool_code>, <tool_call>…</tool_call>, etc.
+    let re = regex::Regex::new(r"(?s)<tool_\w+>.*?</tool_\w+>").unwrap();
+    let cleaned = re.replace_all(text, "");
+    // Collapse runs of 3+ newlines left by removal into double newlines
+    let collapse = regex::Regex::new(r"\n{3,}").unwrap();
+    collapse.replace_all(&cleaned, "\n\n").trim().to_string()
+}
+
 /// Convert a Markdown string into a Lark post `content` JSON value.
 ///
 /// The returned structure follows the Lark "post" message format:
@@ -1491,7 +1504,9 @@ fn parse_inline(text: &str) -> Vec<serde_json::Value> {
         if chars[i] == '`' {
             if let Some((code, end)) = try_parse_backtick(&chars, i) {
                 flush_text(&mut buf, &mut elems);
-                elems.push(serde_json::json!({"tag": "code_inline", "text": code}));
+                // Feishu post API does not support `code_inline` tag.
+                // Render as plain text wrapped in backticks to preserve readability.
+                elems.push(serde_json::json!({"tag": "text", "text": format!("`{code}`")}));
                 i = end;
                 continue;
             }
@@ -2198,8 +2213,8 @@ mod tests {
         let post = markdown_to_lark_post("run `cargo test` now");
         let line = &post_content(&post)[0];
         assert_eq!(line[0]["text"], "run ");
-        assert_eq!(line[1]["tag"], "code_inline");
-        assert_eq!(line[1]["text"], "cargo test");
+        assert_eq!(line[1]["tag"], "text");
+        assert_eq!(line[1]["text"], "`cargo test`");
         assert_eq!(line[2]["text"], " now");
     }
 
@@ -2255,8 +2270,8 @@ mod tests {
         assert_eq!(line[2]["text"], "italic");
         assert_eq!(line[2]["style"][0], "italic");
         assert_eq!(line[3]["text"], " and ");
-        assert_eq!(line[4]["tag"], "code_inline");
-        assert_eq!(line[4]["text"], "code");
+        assert_eq!(line[4]["tag"], "text");
+        assert_eq!(line[4]["text"], "`code`");
     }
 
     #[test]
@@ -2286,5 +2301,19 @@ mod tests {
         assert_eq!(content.len(), 1);
         assert_eq!(content[0][0]["tag"], "code_block");
         assert_eq!(content[0][0]["text"], "some code");
+    }
+
+    #[test]
+    fn strip_tool_blocks_removes_tool_code() {
+        let input = "Here is my plan.\n<tool_code>\n{\"name\":\"shell\"}\n</tool_code>\nDone.";
+        let result = strip_tool_blocks(input);
+        assert_eq!(result, "Here is my plan.\n\nDone.");
+        assert!(!result.contains("tool_code"));
+    }
+
+    #[test]
+    fn strip_tool_blocks_preserves_clean_text() {
+        let input = "No tool calls here.";
+        assert_eq!(strip_tool_blocks(input), input);
     }
 }
