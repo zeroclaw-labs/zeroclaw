@@ -404,6 +404,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         || cc.imessage.is_some()
         || cc.matrix.is_some()
         || cc.whatsapp.is_some()
+        || cc.nextcloud_talk.is_some()
         || cc.email.is_some()
         || cc.irc.is_some()
         || cc.lark.is_some()

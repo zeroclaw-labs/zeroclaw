@@ -25,6 +25,7 @@ pub mod linq;
 #[cfg(feature = "channel-matrix")]
 pub mod matrix;
 pub mod mattermost;
+pub mod nextcloud_talk;
 pub mod qq;
 pub mod signal;
 pub mod slack;
@@ -47,6 +48,7 @@ pub use linq::LinqChannel;
 #[cfg(feature = "channel-matrix")]
 pub use matrix::MatrixChannel;
 pub use mattermost::MattermostChannel;
+pub use nextcloud_talk::NextcloudTalkChannel;
 pub use qq::QQChannel;
 pub use signal::SignalChannel;
 pub use slack::SlackChannel;
@@ -1972,6 +1974,10 @@ pub async fn handle_command(command: crate::ChannelCommands, config: &Config) ->
                 ("Signal", config.channels_config.signal.is_some()),
                 ("WhatsApp", config.channels_config.whatsapp.is_some()),
                 ("Linq", config.channels_config.linq.is_some()),
+                (
+                    "Nextcloud Talk",
+                    config.channels_config.nextcloud_talk.is_some(),
+                ),
                 ("Email", config.channels_config.email.is_some()),
                 ("IRC", config.channels_config.irc.is_some()),
                 ("Lark", config.channels_config.lark.is_some()),
@@ -2167,6 +2173,17 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 lq.api_token.clone(),
                 lq.from_phone.clone(),
                 lq.allowed_senders.clone(),
+            )),
+        ));
+    }
+
+    if let Some(ref nc) = config.channels_config.nextcloud_talk {
+        channels.push((
+            "Nextcloud Talk",
+            Arc::new(NextcloudTalkChannel::new(
+                nc.base_url.clone(),
+                nc.app_token.clone(),
+                nc.allowed_users.clone(),
             )),
         ));
     }
@@ -2553,6 +2570,14 @@ pub async fn start_channels(config: Config) -> Result<()> {
             lq.api_token.clone(),
             lq.from_phone.clone(),
             lq.allowed_senders.clone(),
+        )));
+    }
+
+    if let Some(ref nc) = config.channels_config.nextcloud_talk {
+        channels.push(Arc::new(NextcloudTalkChannel::new(
+            nc.base_url.clone(),
+            nc.app_token.clone(),
+            nc.allowed_users.clone(),
         )));
     }
 

@@ -26,6 +26,7 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "channel.lark",
     "channel.matrix",
     "channel.mattermost",
+    "channel.nextcloud_talk",
     "channel.qq",
     "channel.signal",
     "channel.slack",
@@ -2226,6 +2227,8 @@ pub struct ChannelsConfig {
     pub whatsapp: Option<WhatsAppConfig>,
     /// Linq Partner API channel configuration.
     pub linq: Option<LinqConfig>,
+    /// Nextcloud Talk bot channel configuration.
+    pub nextcloud_talk: Option<NextcloudTalkConfig>,
     /// Email channel configuration.
     pub email: Option<crate::channels::email_channel::EmailConfig>,
     /// IRC channel configuration.
@@ -2263,6 +2266,7 @@ impl Default for ChannelsConfig {
             signal: None,
             whatsapp: None,
             linq: None,
+            nextcloud_talk: None,
             email: None,
             irc: None,
             lark: None,
@@ -2475,6 +2479,23 @@ pub struct LinqConfig {
     /// Allowed sender handles (phone numbers) or "*" for all
     #[serde(default)]
     pub allowed_senders: Vec<String>,
+}
+
+/// Nextcloud Talk bot configuration (webhook receive + OCS send API).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct NextcloudTalkConfig {
+    /// Nextcloud base URL (e.g. "https://cloud.example.com").
+    pub base_url: String,
+    /// Bot app token used for OCS API bearer auth.
+    pub app_token: String,
+    /// Shared secret for webhook signature verification.
+    ///
+    /// Can also be set via `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET`.
+    #[serde(default)]
+    pub webhook_secret: Option<String>,
+    /// Allowed Nextcloud actor IDs (`[]` = deny all, `"*"` = allow all).
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
 }
 
 impl WhatsAppConfig {
@@ -3836,6 +3857,7 @@ default_temperature = 0.7
                 signal: None,
                 whatsapp: None,
                 linq: None,
+                nextcloud_talk: None,
                 email: None,
                 irc: None,
                 lark: None,
@@ -4379,6 +4401,7 @@ allowed_users = ["@ops:matrix.org"]
             signal: None,
             whatsapp: None,
             linq: None,
+            nextcloud_talk: None,
             email: None,
             irc: None,
             lark: None,
@@ -4588,6 +4611,7 @@ channel_id = "C123"
                 allowed_numbers: vec!["+1".into()],
             }),
             linq: None,
+            nextcloud_talk: None,
             email: None,
             irc: None,
             lark: None,
@@ -4607,6 +4631,12 @@ channel_id = "C123"
     async fn channels_config_default_has_no_whatsapp() {
         let c = ChannelsConfig::default();
         assert!(c.whatsapp.is_none());
+    }
+
+    #[test]
+    async fn channels_config_default_has_no_nextcloud_talk() {
+        let c = ChannelsConfig::default();
+        assert!(c.nextcloud_talk.is_none());
     }
 
     // ══════════════════════════════════════════════════════════
@@ -5838,6 +5868,31 @@ default_model = "legacy-model"
         let json = r#"{"app_id":"cli_123","app_secret":"secret","allowed_users":["*"]}"#;
         let parsed: LarkConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.allowed_users, vec!["*"]);
+    }
+
+    #[test]
+    async fn nextcloud_talk_config_serde() {
+        let nc = NextcloudTalkConfig {
+            base_url: "https://cloud.example.com".into(),
+            app_token: "app-token".into(),
+            webhook_secret: Some("webhook-secret".into()),
+            allowed_users: vec!["user_a".into(), "*".into()],
+        };
+
+        let json = serde_json::to_string(&nc).unwrap();
+        let parsed: NextcloudTalkConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.base_url, "https://cloud.example.com");
+        assert_eq!(parsed.app_token, "app-token");
+        assert_eq!(parsed.webhook_secret.as_deref(), Some("webhook-secret"));
+        assert_eq!(parsed.allowed_users, vec!["user_a", "*"]);
+    }
+
+    #[test]
+    async fn nextcloud_talk_config_defaults_optional_fields() {
+        let json = r#"{"base_url":"https://cloud.example.com","app_token":"app-token"}"#;
+        let parsed: NextcloudTalkConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.webhook_secret.is_none());
+        assert!(parsed.allowed_users.is_empty());
     }
 
     // ── Config file permission hardening (Unix only) ───────────────

@@ -11,7 +11,7 @@ This document covers deploying ZeroClaw on a Raspberry Pi or other host on your 
 | **Telegram polling** | No | ZeroClaw polls Telegram API; works from anywhere |
 | **Matrix sync (including E2EE)** | No | ZeroClaw syncs via Matrix client API; no inbound webhook required |
 | **Discord/Slack** | No | Same — outbound only |
-| **Gateway webhook** | Yes | POST /webhook, WhatsApp, etc. need a public URL |
+| **Gateway webhook** | Yes | POST /webhook, /whatsapp, /linq, /nextcloud-talk need a public URL |
 | **Gateway pairing** | Yes | If you pair clients via the gateway |
 
 **Key:** Telegram, Discord, and Slack use **long-polling** — ZeroClaw makes outbound requests. No port forwarding or public IP required.
@@ -156,7 +156,7 @@ you have a polling conflict. Stop extra instances and restart only one daemon.
 
 ---
 
-## 5. Webhook Channels (WhatsApp, Custom)
+## 5. Webhook Channels (WhatsApp, Nextcloud Talk, Custom)
 
 Webhook-based channels need a **public URL** so Meta (WhatsApp) or your client can POST events.
 

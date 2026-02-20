@@ -391,6 +391,7 @@ Examples:
 - `[channels_config.telegram]`
 - `[channels_config.discord]`
 - `[channels_config.whatsapp]`
+- `[channels_config.nextcloud_talk]`
 - `[channels_config.email]`
 
 Notes:
@@ -434,6 +435,23 @@ Notes:
 
 - WhatsApp Web requires build flag `whatsapp-web`.
 - If both Cloud and Web fields are present, Cloud mode wins for backward compatibility.
+
+### `[channels_config.nextcloud_talk]`
+
+Native Nextcloud Talk bot integration (webhook receive + OCS send API).
+
+| Key | Required | Purpose |
+|---|---|---|
+| `base_url` | Yes | Nextcloud base URL (e.g. `https://cloud.example.com`) |
+| `app_token` | Yes | Bot app token used for OCS bearer auth |
+| `webhook_secret` | Optional | Enables webhook signature verification |
+| `allowed_users` | Recommended | Allowed Nextcloud actor IDs (`[]` = deny all, `"*"` = allow all) |
+
+Notes:
+
+- Webhook endpoint is `POST /nextcloud-talk`.
+- `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET` overrides `webhook_secret` when set.
+- See [nextcloud-talk-setup.md](nextcloud-talk-setup.md) for setup and troubleshooting.
 
 ## `[hardware]`
 
