@@ -685,9 +685,9 @@ fn parse_xml_attribute_tool_calls(response: &str) -> Vec<ParsedToolCall> {
 fn parse_perl_style_tool_calls(response: &str) -> Vec<ParsedToolCall> {
     let mut calls = Vec::new();
 
-    // Regex to find TOOL_CALL blocks - capture the entire content between { and }
+    // Regex to find TOOL_CALL blocks - handle double closing braces }}
     static PERL_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?s)TOOL_CALL\s*\{(.+?)\}\s*/TOOL_CALL").unwrap());
+        LazyLock::new(|| Regex::new(r"(?s)TOOL_CALL\s*\{(.+?)\}\}\s*/TOOL_CALL").unwrap());
 
     // Regex to find tool => "name" in the content
     static TOOL_NAME_RE: LazyLock<Regex> =
