@@ -1527,8 +1527,8 @@ async fn process_channel_message(
     }
 
     let reaction_done_emoji = match &llm_result {
-        Ok(Ok(_)) => "\u{2705}", // ✅
-        _ => "\u{26A0}\u{FE0F}", // ⚠️
+        LlmExecutionResult::Completed(Ok(Ok(_))) => "\u{2705}", // ✅
+        _ => "\u{26A0}\u{FE0F}",                                // ⚠️
     };
 
     match llm_result {
@@ -1616,10 +1616,7 @@ async fn process_channel_message(
                         tracing::debug!("Failed to cancel draft on {}: {err}", channel.name());
                     }
                 }
-                return;
-            }
-
-            if is_context_window_overflow_error(&e) {
+            } else if is_context_window_overflow_error(&e) {
                 let compacted = compact_sender_history(ctx.as_ref(), &history_key);
                 let error_text = if compacted {
                     "⚠️ Context window exceeded for this conversation. I compacted recent history and kept the latest context. Please resend your last message."
@@ -1645,25 +1642,24 @@ async fn process_channel_message(
                             .await;
                     }
                 }
-                return;
-            }
-
-            eprintln!(
-                "  ❌ LLM error after {}ms: {e}",
-                started_at.elapsed().as_millis()
-            );
-            if let Some(channel) = target_channel.as_ref() {
-                if let Some(ref draft_id) = draft_message_id {
-                    let _ = channel
-                        .finalize_draft(&msg.reply_target, draft_id, &format!("⚠️ Error: {e}"))
-                        .await;
-                } else {
-                    let _ = channel
-                        .send(
-                            &SendMessage::new(format!("⚠️ Error: {e}"), &msg.reply_target)
-                                .in_thread(msg.thread_ts.clone()),
-                        )
-                        .await;
+            } else {
+                eprintln!(
+                    "  ❌ LLM error after {}ms: {e}",
+                    started_at.elapsed().as_millis()
+                );
+                if let Some(channel) = target_channel.as_ref() {
+                    if let Some(ref draft_id) = draft_message_id {
+                        let _ = channel
+                            .finalize_draft(&msg.reply_target, draft_id, &format!("⚠️ Error: {e}"))
+                            .await;
+                    } else {
+                        let _ = channel
+                            .send(
+                                &SendMessage::new(format!("⚠️ Error: {e}"), &msg.reply_target)
+                                    .in_thread(msg.thread_ts.clone()),
+                            )
+                            .await;
+                    }
                 }
             }
         }
@@ -4523,6 +4519,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
         });
 
@@ -4537,6 +4534,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
             },
+            CancellationToken::new(),
         )
         .await;
 
