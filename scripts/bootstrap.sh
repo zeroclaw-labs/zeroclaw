@@ -29,7 +29,7 @@ Modes:
 Options:
   --guided                   Run interactive guided installer
   --no-guided                Disable guided installer
-  --docker                   Run bootstrap in Docker and launch onboarding inside the container
+  --docker                   Run bootstrap in Docker-compatible mode and launch onboarding inside the container
   --install-system-deps      Install build dependencies (Linux/macOS)
   --install-rust             Install Rust via rustup if missing
   --prefer-prebuilt          Try latest release binary first; fallback to source build on miss
@@ -61,6 +61,7 @@ Examples:
   curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/scripts/bootstrap.sh | bash
 
 Environment:
+  ZEROCLAW_CONTAINER_CLI     Container CLI command (default: docker; auto-fallback: podman)
   ZEROCLAW_DOCKER_DATA_DIR   Host path for Docker config/workspace persistence
   ZEROCLAW_DOCKER_IMAGE      Docker image tag to build/run (default: zeroclaw-bootstrap:local)
   ZEROCLAW_API_KEY           Used when --api-key is not provided
@@ -544,19 +545,36 @@ run_guided_installer() {
   fi
 }
 
-ensure_docker_ready() {
-  if ! have_cmd docker; then
-    error "docker is not installed."
-    cat <<'MSG' >&2
-Install Docker first, then re-run with:
-  ./zeroclaw_install.sh --docker
-MSG
-    exit 1
+resolve_container_cli() {
+  local requested_cli
+  requested_cli="${ZEROCLAW_CONTAINER_CLI:-docker}"
+
+  if have_cmd "$requested_cli"; then
+    CONTAINER_CLI="$requested_cli"
+    return 0
   fi
 
-  if ! docker info >/dev/null 2>&1; then
-    error "Docker daemon is not reachable."
-    error "Start Docker and re-run bootstrap."
+  if [[ "$requested_cli" == "docker" ]] && have_cmd podman; then
+    warn "docker CLI not found; falling back to podman."
+    CONTAINER_CLI="podman"
+    return 0
+  fi
+
+  error "Container CLI '$requested_cli' is not installed."
+  if [[ "$requested_cli" != "docker" ]]; then
+    error "Set ZEROCLAW_CONTAINER_CLI to an installed Docker-compatible CLI (e.g., docker or podman)."
+  else
+    error "Install Docker, install podman, or set ZEROCLAW_CONTAINER_CLI to an available Docker-compatible CLI."
+  fi
+  exit 1
+}
+
+ensure_docker_ready() {
+  resolve_container_cli
+
+  if ! "$CONTAINER_CLI" info >/dev/null 2>&1; then
+    error "Container runtime is not reachable via '$CONTAINER_CLI'."
+    error "Start the container runtime and re-run bootstrap."
     exit 1
   fi
 }
@@ -581,25 +599,26 @@ run_docker_bootstrap() {
 
   if [[ "$SKIP_BUILD" == false ]]; then
     info "Building Docker image ($docker_image)"
-    docker build --target release -t "$docker_image" "$WORK_DIR"
+    "$CONTAINER_CLI" build --target release -t "$docker_image" "$WORK_DIR"
   else
     info "Skipping Docker image build"
-    if ! docker image inspect "$docker_image" >/dev/null 2>&1; then
+    if ! "$CONTAINER_CLI" image inspect "$docker_image" >/dev/null 2>&1; then
       warn "Local Docker image ($docker_image) was not found."
       info "Pulling official ZeroClaw image ($fallback_image)"
-      if ! docker pull "$fallback_image"; then
+      if ! "$CONTAINER_CLI" pull "$fallback_image"; then
         error "Failed to pull fallback Docker image: $fallback_image"
         error "Run without --skip-build to build locally, or verify access to GHCR."
         exit 1
       fi
       if [[ "$docker_image" != "$fallback_image" ]]; then
         info "Tagging fallback image as $docker_image"
-        docker tag "$fallback_image" "$docker_image"
+        "$CONTAINER_CLI" tag "$fallback_image" "$docker_image"
       fi
     fi
   fi
 
   info "Docker data directory: $docker_data_dir"
+  info "Container CLI: $CONTAINER_CLI"
 
   local onboard_cmd=()
   if [[ "$INTERACTIVE_ONBOARD" == true ]]; then
@@ -629,7 +648,7 @@ MSG
     fi
   fi
 
-  docker run --rm -it \
+  "$CONTAINER_CLI" run --rm -it \
     --user "$(id -u):$(id -g)" \
     -e HOME=/zeroclaw-data \
     -e ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace \
@@ -657,6 +676,7 @@ INTERACTIVE_ONBOARD=false
 SKIP_BUILD=false
 SKIP_INSTALL=false
 PREBUILT_INSTALLED=false
+CONTAINER_CLI="${ZEROCLAW_CONTAINER_CLI:-docker}"
 API_KEY="${ZEROCLAW_API_KEY:-}"
 PROVIDER="${ZEROCLAW_PROVIDER:-openrouter}"
 MODEL="${ZEROCLAW_MODEL:-}"
