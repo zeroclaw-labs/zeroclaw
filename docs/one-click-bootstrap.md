@@ -99,6 +99,9 @@ Container CLI defaults to `docker`. If Docker CLI is unavailable and `podman` ex
 bootstrap auto-falls back to `podman`. You can also set `ZEROCLAW_CONTAINER_CLI`
 explicitly (for example: `ZEROCLAW_CONTAINER_CLI=podman ./bootstrap.sh --docker`).
 
+For Podman, bootstrap runs with `--userns keep-id` and `:Z` volume labels so
+workspace/config mounts remain writable inside the container.
+
 If you add `--skip-build`, bootstrap skips local image build. It first tries the local
 Docker tag (`ZEROCLAW_DOCKER_IMAGE`, default: `zeroclaw-bootstrap:local`); if missing,
 it pulls `ghcr.io/zeroclaw-labs/zeroclaw:latest` and tags it locally before running.

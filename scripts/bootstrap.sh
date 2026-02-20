@@ -581,6 +581,8 @@ ensure_docker_ready() {
 
 run_docker_bootstrap() {
   local docker_image docker_data_dir default_data_dir fallback_image
+  local config_mount workspace_mount
+  local -a container_run_user_args container_run_namespace_args
   docker_image="${ZEROCLAW_DOCKER_IMAGE:-zeroclaw-bootstrap:local}"
   fallback_image="ghcr.io/zeroclaw-labs/zeroclaw:latest"
   if [[ "$TEMP_CLONE" == true ]]; then
@@ -617,6 +619,18 @@ run_docker_bootstrap() {
     fi
   fi
 
+  config_mount="$docker_data_dir/.zeroclaw:/zeroclaw-data/.zeroclaw"
+  workspace_mount="$docker_data_dir/workspace:/zeroclaw-data/workspace"
+  if [[ "$CONTAINER_CLI" == "podman" ]]; then
+    config_mount+=":Z"
+    workspace_mount+=":Z"
+    container_run_namespace_args=(--userns keep-id)
+    container_run_user_args=(--user "$(id -u):$(id -g)")
+  else
+    container_run_namespace_args=()
+    container_run_user_args=(--user "$(id -u):$(id -g)")
+  fi
+
   info "Docker data directory: $docker_data_dir"
   info "Container CLI: $CONTAINER_CLI"
 
@@ -649,11 +663,12 @@ MSG
   fi
 
   "$CONTAINER_CLI" run --rm -it \
-    --user "$(id -u):$(id -g)" \
+    "${container_run_namespace_args[@]}" \
+    "${container_run_user_args[@]}" \
     -e HOME=/zeroclaw-data \
     -e ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace \
-    -v "$docker_data_dir/.zeroclaw:/zeroclaw-data/.zeroclaw" \
-    -v "$docker_data_dir/workspace:/zeroclaw-data/workspace" \
+    -v "$config_mount" \
+    -v "$workspace_mount" \
     "$docker_image" \
     "${onboard_cmd[@]}"
 }
