@@ -394,7 +394,7 @@ Every subsystem is a **trait** — swap implementations with a config change, ze
 
 | Subsystem | Trait | Ships with | Extend |
 |-----------|-------|------------|--------|
-| **AI Models** | `Provider` | Provider catalog via `zeroclaw providers` (currently 29 built-ins + aliases, plus custom endpoints) | `custom:https://your-api.com` (OpenAI-compatible) or `anthropic-custom:https://your-api.com` |
+| **AI Models** | `Provider` | Provider catalog via `zeroclaw providers` (currently 30 built-ins + aliases, plus custom endpoints) | `custom:https://your-api.com` (OpenAI-compatible) or `anthropic-custom:https://your-api.com` |
 | **Channels** | `Channel` | CLI, Telegram, Discord, Slack, Mattermost, iMessage, Matrix, Signal, WhatsApp, Linq, Email, IRC, Lark, DingTalk, QQ, Webhook | Any messaging API |
 | **Memory** | `Memory` | SQLite hybrid search, PostgreSQL backend (configurable storage provider), Lucid bridge, Markdown files, explicit `none` backend, snapshot/hydrate, optional response cache | Any persistence backend |
 | **Tools** | `Tool` | shell/file/memory, cron/schedule, git, pushover, browser, http_request, screenshot/image_info, composio (opt-in), delegate, hardware tools | Any capability |
@@ -756,6 +756,25 @@ llama-server -hf ggml-org/gpt-oss-20b-GGUF --jinja -c 133000 --host 127.0.0.1 --
 default_provider = "llamacpp"
 api_url = "http://127.0.0.1:8033/v1"
 default_model = "ggml-org/gpt-oss-20b-GGUF"
+```
+
+### vLLM Server Endpoint
+
+ZeroClaw supports [vLLM](https://docs.vllm.ai/) as a first-class local provider:
+
+- Provider ID: `vllm`
+- Default endpoint: `http://localhost:8000/v1`
+- API key is optional unless your server requires authentication
+
+Example setup:
+
+```bash
+vllm serve meta-llama/Llama-3.1-8B-Instruct
+```
+
+```toml
+default_provider = "vllm"
+default_model = "meta-llama/Llama-3.1-8B-Instruct"
 ```
 
 ### Custom Provider Endpoints
