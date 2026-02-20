@@ -6,14 +6,19 @@ pub mod permissions;
 use crate::js::{
     config::PoolConfig,
     error::{JsPluginError, JsRuntimeError},
+    events::EventBus,
+    hooks::HookHandlerRef,
     runtime::{JsRuntimePool, PluginId},
-    transpile::sourcemap::SourceMapRegistry,
 };
 
 // Re-export config permissions for convenience
 pub use crate::js::config::JsPluginPermissions;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
+
+#[cfg(any(feature = "js", feature = "js-lite", feature = "js-transpile"))]
+use crate::js::transpile::sourcemap::SourceMapRegistry;
 
 /// Sandbox configuration for plugin execution
 #[derive(Clone)]
@@ -53,13 +58,23 @@ impl SandboxConfig {
 ///
 /// The sandbox manages:
 /// - Runtime pool for executing plugins
-/// - Source map registry for error remapping
+/// - Source map registry for error remapping (when transpile feature is enabled)
 /// - Security boundaries (permissions, quotas)
+/// - Event bus for distributing events to subscribers
+/// - Hook metadata storage for plugin hooks
 #[derive(Clone)]
 pub struct PluginSandbox {
     pool: Arc<JsRuntimePool>,
+    #[cfg(any(feature = "js", feature = "js-lite", feature = "js-transpile"))]
     source_maps: Arc<std::sync::Mutex<SourceMapRegistry>>,
     config: SandboxConfig,
+    event_bus: Arc<EventBus>,
+    /// Hook metadata storage: plugin_id -> (worker_id, event_name -> handlers)
+    ///
+    /// This stores hook metadata (priorities, timeouts) without storing actual
+    /// JavaScript functions. The actual Function<'js> values are managed by
+    /// individual worker threads.
+    hook_metadata: Arc<std::sync::Mutex<HashMap<String, (usize, HashMap<String, Vec<HookHandlerRef>>)>>>,
 }
 
 impl PluginSandbox {
@@ -74,7 +89,10 @@ impl PluginSandbox {
 
         Ok(Self {
             pool: Arc::new(JsRuntimePool::new(pool_config)),
+            #[cfg(any(feature = "js", feature = "js-lite", feature = "js-transpile"))]
             source_maps: Arc::new(std::sync::Mutex::new(SourceMapRegistry::new())),
+            event_bus: Arc::new(EventBus::new()),
+            hook_metadata: Arc::new(std::sync::Mutex::new(HashMap::new())),
             config,
         })
     }
@@ -109,6 +127,7 @@ impl PluginSandbox {
     }
 
     /// Register a source map for a plugin
+    #[cfg(any(feature = "js", feature = "js-lite", feature = "js-transpile"))]
     pub fn register_source_map(&self, plugin_id: &str, map_json: String) {
         let mut maps = self.source_maps.lock().unwrap();
         maps.register(plugin_id, map_json);
@@ -117,6 +136,20 @@ impl PluginSandbox {
     /// Get the sandbox configuration
     pub fn config(&self) -> &SandboxConfig {
         &self.config
+    }
+
+    /// Get the event bus for this sandbox
+    pub fn event_bus(&self) -> &Arc<EventBus> {
+        &self.event_bus
+    }
+
+    /// Get hook metadata for this sandbox
+    ///
+    /// Returns a map of plugin_id -> (worker_id, event_name -> handlers).
+    /// This contains hook metadata (priorities, timeouts) without the actual
+    /// JavaScript functions, which are managed by worker threads.
+    pub fn hook_metadata(&self) -> &Arc<std::sync::Mutex<HashMap<String, (usize, HashMap<String, Vec<HookHandlerRef>>)>>> {
+        &self.hook_metadata
     }
 }
 
@@ -140,6 +173,7 @@ impl SandboxPluginHandle {
     }
 
     /// Remap a stack trace for this plugin
+    #[cfg(any(feature = "js", feature = "js-lite", feature = "js-transpile"))]
     pub fn remap_stack(&self, raw_stack: &str) -> String {
         let maps = self.sandbox.source_maps.lock().unwrap();
         maps.remap_stack(&self.plugin_id.0, raw_stack)
@@ -210,7 +244,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "js-runtime")]
+    #[cfg(all(feature = "js-runtime", any(feature = "js", feature = "js-lite", feature = "js-transpile")))]
     async fn sandbox_register_source_map() {
         let sandbox = PluginSandbox::new(SandboxConfig::default()).unwrap();
 
