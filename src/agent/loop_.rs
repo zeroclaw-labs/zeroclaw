@@ -366,6 +366,95 @@ fn parse_tool_calls_from_json_value(value: &serde_json::Value) -> Vec<ParsedTool
     calls
 }
 
+fn is_xml_meta_tag(tag: &str) -> bool {
+    let normalized = tag.to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "tool_call"
+            | "toolcall"
+            | "tool-call"
+            | "invoke"
+            | "thinking"
+            | "thought"
+            | "analysis"
+            | "reasoning"
+            | "reflection"
+    )
+}
+
+static XML_TOOL_TAG_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)<([a-zA-Z_][a-zA-Z0-9_-]*)>\s*(.*?)\s*</\1>").unwrap());
+
+static XML_ARG_TAG_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)<([a-zA-Z_][a-zA-Z0-9_-]*)>\s*([^<]+?)\s*</\1>").unwrap());
+
+/// Parse XML-style tool calls in `<tool_call>` bodies.
+/// Supports both nested argument tags and JSON argument payloads:
+/// - `<memory_recall><query>...</query></memory_recall>`
+/// - `<shell>{"command":"pwd"}</shell>`
+fn parse_xml_tool_calls(xml_content: &str) -> Option<Vec<ParsedToolCall>> {
+    let mut calls = Vec::new();
+    let trimmed = xml_content.trim();
+
+    if !trimmed.starts_with('<') || !trimmed.contains('>') {
+        return None;
+    }
+
+    for cap in XML_TOOL_TAG_RE.captures_iter(trimmed) {
+        let tool_name = cap[1].trim().to_string();
+        if is_xml_meta_tag(&tool_name) {
+            continue;
+        }
+
+        let inner_content = cap[2].trim();
+        if inner_content.is_empty() {
+            continue;
+        }
+
+        let mut args = serde_json::Map::new();
+
+        if let Some(first_json) = extract_json_values(inner_content).into_iter().next() {
+            match first_json {
+                serde_json::Value::Object(object_args) => {
+                    args = object_args;
+                }
+                other => {
+                    args.insert("value".to_string(), other);
+                }
+            }
+        } else {
+            for inner_cap in XML_ARG_TAG_RE.captures_iter(inner_content) {
+                let key = inner_cap[1].trim().to_string();
+                if is_xml_meta_tag(&key) {
+                    continue;
+                }
+                let value = inner_cap[2].trim();
+                if !value.is_empty() {
+                    args.insert(key, serde_json::Value::String(value.to_string()));
+                }
+            }
+
+            if args.is_empty() {
+                args.insert(
+                    "content".to_string(),
+                    serde_json::Value::String(inner_content.to_string()),
+                );
+            }
+        }
+
+        calls.push(ParsedToolCall {
+            name: tool_name,
+            arguments: serde_json::Value::Object(args),
+        });
+    }
+
+    if calls.is_empty() {
+        None
+    } else {
+        Some(calls)
+    }
+}
+
 const TOOL_CALL_OPEN_TAGS: [&str; 4] = ["<tool_call>", "<toolcall>", "<tool-call>", "<invoke>"];
 
 fn find_first_tag<'a>(haystack: &str, tags: &'a [&'a str]) -> Option<(usize, &'a str)> {
@@ -659,6 +748,8 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         if let Some(close_idx) = after_open.find(close_tag) {
             let inner = &after_open[..close_idx];
             let mut parsed_any = false;
+
+            // Try JSON format first
             let json_values = extract_json_values(inner);
             for value in json_values {
                 let parsed_calls = parse_tool_calls_from_json_value(&value);
@@ -668,8 +759,18 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                 }
             }
 
+            // If JSON parsing failed, try XML format (DeepSeek/GLM style)
             if !parsed_any {
-                tracing::warn!("Malformed <tool_call> JSON: expected tool-call object in tag body");
+                if let Some(xml_calls) = parse_xml_tool_calls(inner) {
+                    calls.extend(xml_calls);
+                    parsed_any = true;
+                }
+            }
+
+            if !parsed_any {
+                tracing::warn!(
+                    "Malformed <tool_call>: expected tool-call object in tag body (JSON/XML)"
+                );
             }
 
             remaining = &after_open[close_idx + close_tag.len()..];
@@ -2570,6 +2671,59 @@ After text."#;
         let response = r#"<tool_call>
 I will now call the tool with this payload:
 {"name": "shell", "arguments": {"command": "pwd"}}
+</tool_call>"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "pwd"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_xml_nested_tool_payload() {
+        let response = r#"<tool_call>
+<memory_recall>
+<query>project roadmap</query>
+</memory_recall>
+</tool_call>"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "memory_recall");
+        assert_eq!(
+            calls[0].arguments.get("query").unwrap().as_str().unwrap(),
+            "project roadmap"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_ignores_xml_thinking_wrapper() {
+        let response = r#"<tool_call>
+<thinking>Need to inspect memory first</thinking>
+<memory_recall>
+<query>recent deploy notes</query>
+</memory_recall>
+</tool_call>"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "memory_recall");
+        assert_eq!(
+            calls[0].arguments.get("query").unwrap().as_str().unwrap(),
+            "recent deploy notes"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_xml_with_json_arguments() {
+        let response = r#"<tool_call>
+<shell>{"command":"pwd"}</shell>
 </tool_call>"#;
 
         let (text, calls) = parse_tool_calls(response);
