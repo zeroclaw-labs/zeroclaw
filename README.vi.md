@@ -233,6 +233,9 @@ cd zeroclaw
 
 # Tùy chọn: chạy bootstrap + onboarding hoàn toàn trong Docker
 ./bootstrap.sh --docker
+
+# Tùy chọn: ở chế độ --docker, bỏ qua build image local và dùng tag local hoặc pull image fallback
+./bootstrap.sh --docker --skip-build
 ```
 
 Cài từ xa bằng một lệnh (nên xem trước nếu môi trường nhạy cảm về bảo mật):

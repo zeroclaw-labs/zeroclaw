@@ -41,7 +41,7 @@ Options:
   --provider <id>            Provider for non-interactive onboarding (default: openrouter)
   --model <id>               Model for non-interactive onboarding (optional)
   --build-first              Alias for explicitly enabling separate `cargo build --release --locked`
-  --skip-build               Skip `cargo build --release --locked`
+  --skip-build               Skip build step (`cargo build --release --locked` or Docker image build)
   --skip-install             Skip `cargo install --path . --force --locked`
   -h, --help                 Show help
 
@@ -562,8 +562,9 @@ MSG
 }
 
 run_docker_bootstrap() {
-  local docker_image docker_data_dir default_data_dir
+  local docker_image docker_data_dir default_data_dir fallback_image
   docker_image="${ZEROCLAW_DOCKER_IMAGE:-zeroclaw-bootstrap:local}"
+  fallback_image="ghcr.io/zeroclaw-labs/zeroclaw:latest"
   if [[ "$TEMP_CLONE" == true ]]; then
     default_data_dir="$HOME/.zeroclaw-docker"
   else
@@ -583,6 +584,19 @@ run_docker_bootstrap() {
     docker build --target release -t "$docker_image" "$WORK_DIR"
   else
     info "Skipping Docker image build"
+    if ! docker image inspect "$docker_image" >/dev/null 2>&1; then
+      warn "Local Docker image ($docker_image) was not found."
+      info "Pulling official ZeroClaw image ($fallback_image)"
+      if ! docker pull "$fallback_image"; then
+        error "Failed to pull fallback Docker image: $fallback_image"
+        error "Run without --skip-build to build locally, or verify access to GHCR."
+        exit 1
+      fi
+      if [[ "$docker_image" != "$fallback_image" ]]; then
+        info "Tagging fallback image as $docker_image"
+        docker tag "$fallback_image" "$docker_image"
+      fi
+    fi
   fi
 
   info "Docker data directory: $docker_data_dir"

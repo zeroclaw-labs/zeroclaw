@@ -233,6 +233,9 @@ cd zeroclaw
 
 # Optional: run bootstrap + onboarding fully in Docker
 ./bootstrap.sh --docker
+
+# Optional: in --docker mode, skip local image build and use local tag or pull fallback image
+./bootstrap.sh --docker --skip-build
 ```
 
 Remote one-liner (review first in security-sensitive environments):

@@ -95,6 +95,10 @@ If you run Option B outside a repository checkout, the bootstrap script automati
 This builds a local ZeroClaw image and launches onboarding inside a container while
 persisting config/workspace to `./.zeroclaw-docker`.
 
+If you add `--skip-build`, bootstrap skips local image build. It first tries the local
+Docker tag (`ZEROCLAW_DOCKER_IMAGE`, default: `zeroclaw-bootstrap:local`); if missing,
+it pulls `ghcr.io/zeroclaw-labs/zeroclaw:latest` and tags it locally before running.
+
 ### Quick onboarding (non-interactive)
 
 ```bash
@@ -117,7 +121,7 @@ ZEROCLAW_API_KEY="sk-..." ZEROCLAW_PROVIDER="openrouter" ./bootstrap.sh --onboar
 
 - `--install-system-deps`
 - `--install-rust`
-- `--skip-build`
+- `--skip-build` (in `--docker` mode: use local image if present, otherwise pull `ghcr.io/zeroclaw-labs/zeroclaw:latest`)
 - `--skip-install`
 - `--provider <id>`
 
