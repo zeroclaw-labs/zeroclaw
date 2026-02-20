@@ -6,6 +6,9 @@ use crate::config::{
     HeartbeatConfig, IMessageConfig, LarkConfig, LaunchableChannelsConfig, MatrixConfig,
     MemoryConfig, ObservabilityConfig, RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig,
     TelegramConfig, WebhookConfig,
+    HeartbeatConfig, IMessageConfig, LarkConfig, LaunchableChannelsConfig, MatrixConfig,
+    MemoryConfig, ObservabilityConfig, RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig,
+    TelegramConfig, WebhookConfig,
 };
 use crate::hardware::{self, HardwareConfig};
 use crate::memory::{
@@ -19,6 +22,7 @@ use crate::providers::{
 use anyhow::{bail, Context, Result};
 use console::style;
 use dialoguer::{Confirm, Input, Select};
+use matrix_sdk::ruma::events::poll::unstable_start::ReplacementUnstablePollStartEventContent;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -62,6 +66,7 @@ const MODEL_CACHE_TTL_SECS: u64 = 12 * 60 * 60;
 const CUSTOM_MODEL_SENTINEL: &str = "__custom_model__";
 
 fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
+    channels.launchable.has_any()
     channels.launchable.has_any()
 }
 
@@ -2780,6 +2785,14 @@ fn channel_option<T: crate::config::traits::ChannelConfig>(config: &Option<T>) -
     }
 }
 
+fn channel_option<T: crate::config::traits::ChannelConfig>(config: &Option<T>) -> String {
+    if config.is_some() {
+        format!("{:<11} ✅ connected", T::name())
+    } else {
+        format!("{:<11} — {}", T::name(), T::desc())
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn setup_channels() -> Result<ChannelsConfig> {
     print_bullet("Channels let you talk to ZeroClaw from anywhere.");
@@ -2833,6 +2846,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 if token.trim().is_empty() {
                     println!("  {} Skipped", style("→").dim());
                     return Ok(());
+                    return Ok(());
                 }
 
                 // Test connection (run entirely in separate thread — reqwest::blocking Response
@@ -2866,6 +2880,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                             "\r  {} Connection failed — check your token and try again",
                             style("❌").red().bold()
                         );
+                        return Ok(());
                         return Ok(());
                     }
                 }
@@ -2902,6 +2917,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     );
                 }
 
+                config.launchable.telegram = Some(TelegramConfig {
                 config.launchable.telegram = Some(TelegramConfig {
                     bot_token: token,
                     allowed_users,
@@ -2962,7 +2978,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 print_bullet("4. Invite bot to your server with messages permission");
                 println!();
 
-                let token: String = Input::new().with_prompt("  Bot token").interact_text()?;
+            let token: String = Input::new().with_prompt("  Bot token").interact_text()?;
 
                 if token.trim().is_empty() {
                     println!("  {} Skipped", style("→").dim());
@@ -3004,40 +3020,40 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     }
                 }
 
-                let guild: String = Input::new()
-                    .with_prompt("  Server (guild) ID (optional, Enter to skip)")
-                    .allow_empty(true)
-                    .interact_text()?;
+            let guild: String = Input::new()
+                .with_prompt("  Server (guild) ID (optional, Enter to skip)")
+                .allow_empty(true)
+                .interact_text()?;
 
-                print_bullet("Allowlist your own Discord user ID first (recommended).");
-                print_bullet(
+            print_bullet("Allowlist your own Discord user ID first (recommended).");
+            print_bullet(
                     "Get it in Discord: Settings -> Advanced -> Developer Mode (ON), then right-click your profile -> Copy User ID.",
                 );
-                print_bullet("Use '*' only for temporary open testing.");
+            print_bullet("Use '*' only for temporary open testing.");
 
-                let allowed_users_str: String = Input::new()
+            let allowed_users_str: String = Input::new()
                     .with_prompt(
                         "  Allowed Discord user IDs (comma-separated, recommended: your own ID, '*' for all)",
                     )
                     .allow_empty(true)
                     .interact_text()?;
 
-                let allowed_users = if allowed_users_str.trim().is_empty() {
-                    vec![]
-                } else {
-                    allowed_users_str
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect()
-                };
+            let allowed_users = if allowed_users_str.trim().is_empty() {
+                vec![]
+            } else {
+                allowed_users_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            };
 
-                if allowed_users.is_empty() {
-                    println!(
+            if allowed_users.is_empty() {
+                println!(
                         "  {} No users allowlisted — Discord inbound messages will be denied until you add IDs or '*'.",
                         style("⚠").yellow().bold()
                     );
-                }
+            }
 
                 config.launchable.discord = Some(DiscordConfig {
                     bot_token: token,
@@ -3067,6 +3083,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                 if token.trim().is_empty() {
                     println!("  {} Skipped", style("→").dim());
+                    return Ok(());
                     return Ok(());
                 }
 
@@ -3108,12 +3125,14 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     Ok(Ok((true, false, _, err))) => {
                         println!("\r  {} Slack error: {err}", style("❌").red().bold());
                         return Ok(());
+                        return Ok(());
                     }
                     _ => {
                         println!(
                             "\r  {} Connection failed — check your token",
                             style("❌").red().bold()
                         );
+                        return Ok(());
                         return Ok(());
                     }
                 }
@@ -3159,6 +3178,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 }
 
                 config.launchable.slack = Some(SlackConfig {
+                config.launchable.slack = Some(SlackConfig {
                     bot_token: token,
                     app_token: if app_token.is_empty() {
                         None
@@ -3191,25 +3211,23 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     return Ok(());
                 }
 
-                print_bullet("ZeroClaw reads your iMessage database and replies via AppleScript.");
-                print_bullet(
-                    "You need to grant Full Disk Access to your terminal in System Settings.",
-                );
-                println!();
+            print_bullet("ZeroClaw reads your iMessage database and replies via AppleScript.");
+            print_bullet("You need to grant Full Disk Access to your terminal in System Settings.");
+            println!();
 
-                let contacts_str: String = Input::new()
-                    .with_prompt("  Allowed contacts (comma-separated phone/email, or * for all)")
-                    .default("*".into())
-                    .interact_text()?;
+            let contacts_str: String = Input::new()
+                .with_prompt("  Allowed contacts (comma-separated phone/email, or * for all)")
+                .default("*".into())
+                .interact_text()?;
 
-                let allowed_contacts = if contacts_str.trim() == "*" {
-                    vec!["*".into()]
-                } else {
-                    contacts_str
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .collect()
-                };
+            let allowed_contacts = if contacts_str.trim() == "*" {
+                vec!["*".into()]
+            } else {
+                contacts_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .collect()
+            };
 
                 config.launchable.imessage = Some(IMessageConfig { allowed_contacts });
                 println!(
@@ -3238,6 +3256,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 if homeserver.trim().is_empty() {
                     println!("  {} Skipped", style("→").dim());
                     return Ok(());
+                    return Ok(());
                 }
 
                 let access_token: String =
@@ -3245,6 +3264,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                 if access_token.trim().is_empty() {
                     println!("  {} Skipped — token required", style("→").dim());
+                    return Ok(());
                     return Ok(());
                 }
 
@@ -3304,6 +3324,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                             style("❌").red().bold()
                         );
                         return Ok(());
+                        return Ok(());
                     }
                 };
 
@@ -3322,6 +3343,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     users_str.split(',').map(|s| s.trim().to_string()).collect()
                 };
 
+                config.launchable.matrix = Some(MatrixConfig {
                 config.launchable.matrix = Some(MatrixConfig {
                     homeserver: homeserver.trim_end_matches('/').to_string(),
                     access_token,
@@ -3428,28 +3450,28 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 print_bullet("4. Configure webhook URL to: https://your-domain/whatsapp");
                 println!();
 
-                let access_token: String = Input::new()
-                    .with_prompt("  Access token (from Meta Developers)")
-                    .interact_text()?;
+            let access_token: String = Input::new()
+                .with_prompt("  Access token (from Meta Developers)")
+                .interact_text()?;
 
                 if access_token.trim().is_empty() {
                     println!("  {} Skipped", style("→").dim());
                     return Ok(());
                 }
 
-                let phone_number_id: String = Input::new()
-                    .with_prompt("  Phone number ID (from WhatsApp app settings)")
-                    .interact_text()?;
+            let phone_number_id: String = Input::new()
+                .with_prompt("  Phone number ID (from WhatsApp app settings)")
+                .interact_text()?;
 
                 if phone_number_id.trim().is_empty() {
                     println!("  {} Skipped — phone number ID required", style("→").dim());
                     return Ok(());
                 }
 
-                let verify_token: String = Input::new()
-                    .with_prompt("  Webhook verify token (create your own)")
-                    .default("zeroclaw-whatsapp-verify".into())
-                    .interact_text()?;
+            let verify_token: String = Input::new()
+                .with_prompt("  Webhook verify token (create your own)")
+                .default("zeroclaw-whatsapp-verify".into())
+                .interact_text()?;
 
                 // Test connection (run entirely in separate thread — Response must be used/dropped there)
                 print!("  {} Testing connection... ", style("⏳").dim());
@@ -3487,18 +3509,16 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     }
                 }
 
-                let users_str: String = Input::new()
-                    .with_prompt(
-                        "  Allowed phone numbers (comma-separated +1234567890, or * for all)",
-                    )
-                    .default("*".into())
-                    .interact_text()?;
+            let users_str: String = Input::new()
+                .with_prompt("  Allowed phone numbers (comma-separated +1234567890, or * for all)")
+                .default("*".into())
+                .interact_text()?;
 
-                let allowed_numbers = if users_str.trim() == "*" {
-                    vec!["*".into()]
-                } else {
-                    users_str.split(',').map(|s| s.trim().to_string()).collect()
-                };
+            let allowed_numbers = if users_str.trim() == "*" {
+                vec!["*".into()]
+            } else {
+                users_str.split(',').map(|s| s.trim().to_string()).collect()
+            };
 
                 config.launchable.whatsapp = Some(WhatsAppConfig {
                     access_token: Some(access_token.trim().to_string()),
@@ -3526,18 +3546,18 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 print_bullet("3. Configure webhook URL to: https://your-domain/linq");
                 println!();
 
-                let api_token: String = Input::new()
-                    .with_prompt("  API token (Linq Partner API token)")
-                    .interact_text()?;
+            let api_token: String = Input::new()
+                .with_prompt("  API token (Linq Partner API token)")
+                .interact_text()?;
 
                 if api_token.trim().is_empty() {
                     println!("  {} Skipped", style("→").dim());
                     return Ok(());
                 }
 
-                let from_phone: String = Input::new()
-                    .with_prompt("  From phone number (E.164 format, e.g. +12223334444)")
-                    .interact_text()?;
+            let from_phone: String = Input::new()
+                .with_prompt("  From phone number (E.164 format, e.g. +12223334444)")
+                .interact_text()?;
 
                 if from_phone.trim().is_empty() {
                     println!("  {} Skipped — phone number required", style("→").dim());
@@ -3576,23 +3596,21 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     }
                 }
 
-                let users_str: String = Input::new()
-                    .with_prompt(
-                        "  Allowed sender numbers (comma-separated +1234567890, or * for all)",
-                    )
-                    .default("*".into())
-                    .interact_text()?;
+            let users_str: String = Input::new()
+                .with_prompt("  Allowed sender numbers (comma-separated +1234567890, or * for all)")
+                .default("*".into())
+                .interact_text()?;
 
-                let allowed_senders = if users_str.trim() == "*" {
-                    vec!["*".into()]
-                } else {
-                    users_str.split(',').map(|s| s.trim().to_string()).collect()
-                };
+            let allowed_senders = if users_str.trim() == "*" {
+                vec!["*".into()]
+            } else {
+                users_str.split(',').map(|s| s.trim().to_string()).collect()
+            };
 
-                let signing_secret: String = Input::new()
-                    .with_prompt("  Webhook signing secret (optional, press Enter to skip)")
-                    .allow_empty(true)
-                    .interact_text()?;
+            let signing_secret: String = Input::new()
+                .with_prompt("  Webhook signing secret (optional, press Enter to skip)")
+                .allow_empty(true)
+                .interact_text()?;
 
                 config.launchable.linq = Some(LinqConfig {
                     api_token: api_token.trim().to_string(),
@@ -3618,107 +3636,102 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 print_bullet("Supports SASL PLAIN and NickServ authentication");
                 println!();
 
-                let server: String = Input::new()
-                    .with_prompt("  IRC server (hostname)")
-                    .interact_text()?;
+            let server: String = Input::new()
+                .with_prompt("  IRC server (hostname)")
+                .interact_text()?;
 
                 if server.trim().is_empty() {
                     println!("  {} Skipped", style("→").dim());
                     return Ok(());
                 }
 
-                let port_str: String = Input::new()
-                    .with_prompt("  Port")
-                    .default("6697".into())
-                    .interact_text()?;
+            let port_str: String = Input::new()
+                .with_prompt("  Port")
+                .default("6697".into())
+                .interact_text()?;
 
-                let port: u16 = match port_str.trim().parse() {
-                    Ok(p) => p,
-                    Err(_) => {
-                        println!("  {} Invalid port, using 6697", style("→").dim());
-                        6697
-                    }
-                };
+            let port: u16 = match port_str.trim().parse() {
+                Ok(p) => p,
+                Err(_) => {
+                    println!("  {} Invalid port, using 6697", style("→").dim());
+                    6697
+                }
+            };
 
-                let nickname: String =
-                    Input::new().with_prompt("  Bot nickname").interact_text()?;
+            let nickname: String = Input::new().with_prompt("  Bot nickname").interact_text()?;
 
                 if nickname.trim().is_empty() {
                     println!("  {} Skipped — nickname required", style("→").dim());
                     return Ok(());
                 }
 
-                let channels_str: String = Input::new()
-                    .with_prompt("  Channels to join (comma-separated: #channel1,#channel2)")
-                    .allow_empty(true)
-                    .interact_text()?;
+            let channels_str: String = Input::new()
+                .with_prompt("  Channels to join (comma-separated: #channel1,#channel2)")
+                .allow_empty(true)
+                .interact_text()?;
 
-                let channels = if channels_str.trim().is_empty() {
-                    vec![]
-                } else {
-                    channels_str
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect()
-                };
+            let channels = if channels_str.trim().is_empty() {
+                vec![]
+            } else {
+                channels_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            };
 
-                print_bullet(
-                    "Allowlist nicknames that can interact with the bot (case-insensitive).",
-                );
-                print_bullet("Use '*' to allow anyone (not recommended for production).");
+            print_bullet("Allowlist nicknames that can interact with the bot (case-insensitive).");
+            print_bullet("Use '*' to allow anyone (not recommended for production).");
 
-                let users_str: String = Input::new()
-                    .with_prompt("  Allowed nicknames (comma-separated, or * for all)")
-                    .allow_empty(true)
-                    .interact_text()?;
+            let users_str: String = Input::new()
+                .with_prompt("  Allowed nicknames (comma-separated, or * for all)")
+                .allow_empty(true)
+                .interact_text()?;
 
-                let allowed_users = if users_str.trim() == "*" {
-                    vec!["*".into()]
-                } else {
-                    users_str
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect()
-                };
+            let allowed_users = if users_str.trim() == "*" {
+                vec!["*".into()]
+            } else {
+                users_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            };
 
-                if allowed_users.is_empty() {
-                    print_bullet(
-                        "⚠️  Empty allowlist — only you can interact. Add nicknames above.",
-                    );
-                }
+            if allowed_users.is_empty() {
+                print_bullet("⚠️  Empty allowlist — only you can interact. Add nicknames above.");
+            }
 
-                println!();
-                print_bullet("Optional authentication (press Enter to skip each):");
+            println!();
+            print_bullet("Optional authentication (press Enter to skip each):");
 
-                let server_password: String = Input::new()
-                    .with_prompt("  Server password (for bouncers like ZNC, leave empty if none)")
-                    .allow_empty(true)
-                    .interact_text()?;
+            let server_password: String = Input::new()
+                .with_prompt("  Server password (for bouncers like ZNC, leave empty if none)")
+                .allow_empty(true)
+                .interact_text()?;
 
-                let nickserv_password: String = Input::new()
-                    .with_prompt("  NickServ password (leave empty if none)")
-                    .allow_empty(true)
-                    .interact_text()?;
+            let nickserv_password: String = Input::new()
+                .with_prompt("  NickServ password (leave empty if none)")
+                .allow_empty(true)
+                .interact_text()?;
 
-                let sasl_password: String = Input::new()
-                    .with_prompt("  SASL PLAIN password (leave empty if none)")
-                    .allow_empty(true)
-                    .interact_text()?;
+            let sasl_password: String = Input::new()
+                .with_prompt("  SASL PLAIN password (leave empty if none)")
+                .allow_empty(true)
+                .interact_text()?;
 
-                let verify_tls: bool = Confirm::new()
-                    .with_prompt("  Verify TLS certificate?")
-                    .default(true)
-                    .interact()?;
+            let verify_tls: bool = Confirm::new()
+                .with_prompt("  Verify TLS certificate?")
+                .default(true)
+                .interact()?;
 
-                println!(
-                    "  {} IRC configured as {}@{}:{}",
-                    style("✅").green().bold(),
-                    style(&nickname).cyan(),
-                    style(&server).cyan(),
-                    style(port).cyan()
-                );
+            println!(
+                "  {} IRC configured as {}@{}:{}",
+                style("✅").green().bold(),
+                style(&nickname).cyan(),
+                style(&server).cyan(),
+                style(port).cyan()
+            );
 
                 config.launchable.irc = Some(IrcConfig {
                     server: server.trim().to_string(),
@@ -3767,6 +3780,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 if app_id.trim().is_empty() {
                     println!("  {} Skipped", style("→").dim());
                     return Ok(());
+                    return Ok(());
                 }
 
                 let app_secret: String =
@@ -3775,6 +3789,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                 if app_secret.is_empty() {
                     println!("  {} App Secret is required", style("❌").red().bold());
+                    return Ok(());
                     return Ok(());
                 }
 
@@ -3848,12 +3863,14 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         );
                         println!("    {}", style(reason).dim());
                         return Ok(());
+                        return Ok(());
                     }
                     Err(_) => {
                         println!(
                             "\r  {} Connection failed — check your credentials",
                             style("❌").red().bold()
                         );
+                        return Ok(());
                         return Ok(());
                     }
                 }
@@ -3922,6 +3939,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     );
                 }
 
+                config.launchable.lark = Some(LarkConfig {
                 config.launchable.lark = Some(LarkConfig {
                     app_id,
                     app_secret,
@@ -4107,9 +4125,13 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
     // Summary line
     let mut active: Vec<&str> = vec!["CLI"];
+
+    // Summary line
+    let mut active: Vec<&str> = vec!["CLI"];
     if config.webhook.is_some() {
         active.push("Webhook");
     }
+    active.extend(config.launchable.channels());
     active.extend(config.launchable.channels());
 
     println!(
@@ -4606,26 +4628,33 @@ fn print_summary(config: &Config) {
     // Channels summary
     let mut channels: Vec<&str> = vec!["CLI"];
     if config.channels_config.launchable.telegram.is_some() {
+    if config.channels_config.launchable.telegram.is_some() {
         channels.push("Telegram");
     }
+    if config.channels_config.launchable.discord.is_some() {
     if config.channels_config.launchable.discord.is_some() {
         channels.push("Discord");
     }
     if config.channels_config.launchable.slack.is_some() {
+    if config.channels_config.launchable.slack.is_some() {
         channels.push("Slack");
     }
+    if config.channels_config.launchable.imessage.is_some() {
     if config.channels_config.launchable.imessage.is_some() {
         channels.push("iMessage");
     }
     if config.channels_config.launchable.matrix.is_some() {
+    if config.channels_config.launchable.matrix.is_some() {
         channels.push("Matrix");
     }
+    if config.channels_config.launchable.email.is_some() {
     if config.channels_config.launchable.email.is_some() {
         channels.push("Email");
     }
     if config.channels_config.webhook.is_some() {
         channels.push("Webhook");
     }
+    if config.channels_config.launchable.lark.is_some() {
     if config.channels_config.launchable.lark.is_some() {
         channels.push("Lark");
     }
@@ -6005,6 +6034,7 @@ mod tests {
         assert!(!has_launchable_channels(&channels));
 
         channels.launchable.mattermost = Some(crate::config::schema::MattermostConfig {
+        channels.launchable.mattermost = Some(crate::config::schema::MattermostConfig {
             url: "https://mattermost.example.com".into(),
             bot_token: "token".into(),
             channel_id: Some("channel".into()),
@@ -6014,6 +6044,8 @@ mod tests {
         });
         assert!(has_launchable_channels(&channels));
 
+        channels.launchable.mattermost = None;
+        channels.launchable.qq = Some(crate::config::schema::QQConfig {
         channels.launchable.mattermost = None;
         channels.launchable.qq = Some(crate::config::schema::QQConfig {
             app_id: "app-id".into(),

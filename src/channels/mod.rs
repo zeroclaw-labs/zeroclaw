@@ -65,6 +65,7 @@ pub use whatsapp_web::WhatsAppWebChannel;
 
 use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
 use crate::config::{Config, LaunchableChannelsConfig};
+use crate::config::{Config, LaunchableChannelsConfig};
 use crate::identity;
 use crate::memory::{self, Memory};
 use crate::observability::{self, Observer};
@@ -2042,6 +2043,7 @@ async fn bind_telegram_identity(config: &Config, identity: &str) -> Result<()> {
 
     let mut updated = config.clone();
     let Some(telegram) = updated.channels_config.launchable.telegram.as_mut() else {
+    let Some(telegram) = updated.channels_config.launchable.telegram.as_mut() else {
         anyhow::bail!(
             "Telegram channel is not configured. Run `zeroclaw onboard --channels-only` first"
         );
@@ -2193,6 +2195,7 @@ pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Con
             println!("Channels:");
             println!("  ✅ CLI (always available)");
             for (name, configured) in config.channels_config.channel_identifiers() {
+            for (name, configured) in config.channels_config.channel_identifiers() {
                 println!("  {} {name}", if configured { "✅" } else { "❌" });
             }
             if !cfg!(feature = "channel-matrix") {
@@ -2282,6 +2285,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     }
 
     if let Some(ref dc) = discord {
+    if let Some(ref dc) = discord {
         channels.push((
             "Discord",
             Arc::new(DiscordChannel::new(
@@ -2295,6 +2299,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     }
 
     if let Some(ref sl) = slack {
+    if let Some(ref sl) = slack {
         channels.push((
             "Slack",
             Arc::new(SlackChannel::new(
@@ -2305,6 +2310,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         ));
     }
 
+    if let Some(ref im) = imessage {
     if let Some(ref im) = imessage {
         channels.push((
             "iMessage",
@@ -2400,6 +2406,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     }
 
     if let Some(ref lq) = linq {
+    if let Some(ref lq) = linq {
         channels.push((
             "Linq",
             Arc::new(LinqChannel::new(
@@ -2425,6 +2432,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         channels.push(("Email", Arc::new(EmailChannel::new(email_cfg.clone()))));
     }
 
+    if let Some(ref irc) = irc {
     if let Some(ref irc) = irc {
         channels.push((
             "IRC",
@@ -2466,6 +2474,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         ));
     }
 
+    if let Some(ref qq) = qq {
     if let Some(ref qq) = qq {
         channels.push((
             "QQ",
@@ -2721,6 +2730,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
 
     if let Some(ref dc) = discord {
+    if let Some(ref dc) = discord {
         channels.push(Arc::new(DiscordChannel::new(
             dc.bot_token.clone(),
             dc.guild_id.clone(),
@@ -2731,6 +2741,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
 
     if let Some(ref sl) = slack {
+    if let Some(ref sl) = slack {
         channels.push(Arc::new(SlackChannel::new(
             sl.bot_token.clone(),
             sl.channel_id.clone(),
@@ -2738,6 +2749,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         )));
     }
 
+    if let Some(ref mm) = mattermost {
     if let Some(ref mm) = mattermost {
         channels.push(Arc::new(MattermostChannel::new(
             mm.url.clone(),
@@ -2749,6 +2761,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         )));
     }
 
+    if let Some(ref im) = imessage {
     if let Some(ref im) = imessage {
         channels.push(Arc::new(IMessageChannel::new(im.allowed_contacts.clone())));
     }
@@ -2829,6 +2842,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
 
     if let Some(ref lq) = linq {
+    if let Some(ref lq) = linq {
         channels.push(Arc::new(LinqChannel::new(
             lq.api_token.clone(),
             lq.from_phone.clone(),
@@ -2848,6 +2862,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         channels.push(Arc::new(EmailChannel::new(email_cfg.clone())));
     }
 
+    if let Some(ref irc) = irc {
     if let Some(ref irc) = irc {
         channels.push(Arc::new(IrcChannel::new(irc::IrcChannelConfig {
             server: irc.server.clone(),
@@ -2883,6 +2898,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         )));
     }
 
+    if let Some(ref qq) = qq {
     if let Some(ref qq) = qq {
         channels.push(Arc::new(QQChannel::new(
             qq.app_id.clone(),

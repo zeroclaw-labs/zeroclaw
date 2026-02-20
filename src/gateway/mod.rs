@@ -378,6 +378,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let whatsapp_channel: Option<Arc<WhatsAppChannel>> = config
         .channels_config
         .launchable
+        .launchable
         .whatsapp
         .as_ref()
         .map(|wa| {
