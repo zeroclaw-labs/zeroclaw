@@ -24,6 +24,12 @@ use std::borrow::Cow;
 /// Events represent discrete lifecycle and runtime moments in ZeroClaw
 /// that plugins can observe and react to. Each event carries context
 /// specific to its type.
+///
+/// # Serialization Format
+///
+/// Events are serialized with kebab-case type names (e.g., "message-received")
+/// via serde's `rename_all = "kebab-case"`. The `name()` method returns
+/// dotted names (e.g., "message.received") for hook registration compatibility.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "kebab-case")]
 pub enum Event {
@@ -141,6 +147,8 @@ mod tests {
             session_id: Some("session-abc".to_string()),
         };
         let json = serde_json::to_value(&event).unwrap();
-        assert_eq!(json["type"], "message.received");
+        // Note: Serialized form uses kebab-case ("message-received")
+        // while name() returns dotted ("message.received") for hooks
+        assert_eq!(json["type"], "message-received");
     }
 }
