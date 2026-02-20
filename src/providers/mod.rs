@@ -212,8 +212,14 @@ struct QwenOauthCredentials {
 impl std::fmt::Debug for QwenOauthCredentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QwenOauthCredentials")
-            .field("access_token", &self.access_token.as_ref().map(|_| "[REDACTED]"))
-            .field("refresh_token", &self.refresh_token.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "access_token",
+                &self.access_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("resource_url", &self.resource_url)
             .field("expiry_date", &self.expiry_date)
             .finish()
@@ -245,7 +251,10 @@ struct QwenOauthProviderContext {
 impl std::fmt::Debug for QwenOauthProviderContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QwenOauthProviderContext")
-            .field("credential", &self.credential.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "credential",
+                &self.credential.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("base_url", &self.base_url)
             .finish()
     }

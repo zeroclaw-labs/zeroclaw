@@ -386,8 +386,9 @@ impl TelegramChannel {
         let contents = fs::read_to_string(&config_path)
             .await
             .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
-        let mut config: Config = toml::from_str(&contents)
-            .context("Failed to parse config.toml — check [channels.telegram] section for syntax errors")?;
+        let mut config: Config = toml::from_str(&contents).context(
+            "Failed to parse config.toml — check [channels.telegram] section for syntax errors",
+        )?;
         config.config_path = config_path;
         config.workspace_dir = zeroclaw_dir.join("workspace");
         Ok(config)
