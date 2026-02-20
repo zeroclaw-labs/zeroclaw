@@ -24,7 +24,7 @@ impl Tool for FileReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read the contents of a file in the workspace"
+        "Read file contents with line numbers. Supports partial reading via offset and limit."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -34,6 +34,14 @@ impl Tool for FileReadTool {
                 "path": {
                     "type": "string",
                     "description": "Relative path to the file within the workspace"
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Starting line number (1-based, default: 1)"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of lines to return (default: all)"
                 }
             },
             "required": ["path"]
@@ -123,11 +131,61 @@ impl Tool for FileReadTool {
         }
 
         match tokio::fs::read_to_string(&resolved_path).await {
-            Ok(contents) => Ok(ToolResult {
-                success: true,
-                output: contents,
-                error: None,
-            }),
+            Ok(contents) => {
+                let lines: Vec<&str> = contents.lines().collect();
+                let total = lines.len();
+
+                if total == 0 {
+                    return Ok(ToolResult {
+                        success: true,
+                        output: String::new(),
+                        error: None,
+                    });
+                }
+
+                let offset = args
+                    .get("offset")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| usize::try_from(v.max(1)).unwrap_or(usize::MAX).saturating_sub(1))
+                    .unwrap_or(0);
+                let start = offset.min(total);
+
+                let end = match args.get("limit").and_then(|v| v.as_u64()) {
+                    Some(l) => {
+                        let limit = usize::try_from(l).unwrap_or(usize::MAX);
+                        (start.saturating_add(limit)).min(total)
+                    }
+                    None => total,
+                };
+
+                if start >= end {
+                    return Ok(ToolResult {
+                        success: true,
+                        output: format!("[No lines in range, file has {total} lines]"),
+                        error: None,
+                    });
+                }
+
+                let numbered: String = lines[start..end]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, line)| format!("{}: {}", start + i + 1, line))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+
+                let partial = start > 0 || end < total;
+                let summary = if partial {
+                    format!("\n[Lines {}-{} of {total}]", start + 1, end)
+                } else {
+                    format!("\n[{total} lines total]")
+                };
+
+                Ok(ToolResult {
+                    success: true,
+                    output: format!("{numbered}{summary}"),
+                    error: None,
+                })
+            }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -174,10 +232,17 @@ mod tests {
         let tool = FileReadTool::new(test_security(std::env::temp_dir()));
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["path"].is_object());
+        assert!(schema["properties"]["offset"].is_object());
+        assert!(schema["properties"]["limit"].is_object());
         assert!(schema["required"]
             .as_array()
             .unwrap()
             .contains(&json!("path")));
+        // offset and limit are optional
+        assert!(!schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("offset")));
     }
 
     #[tokio::test]
@@ -192,7 +257,8 @@ mod tests {
         let tool = FileReadTool::new(test_security(dir.clone()));
         let result = tool.execute(json!({"path": "test.txt"})).await.unwrap();
         assert!(result.success);
-        assert_eq!(result.output, "hello world");
+        assert!(result.output.contains("1: hello world"));
+        assert!(result.output.contains("[1 lines total]"));
         assert!(result.error.is_none());
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -276,7 +342,7 @@ mod tests {
         let result = tool.execute(json!({"path": "test.txt"})).await.unwrap();
 
         assert!(result.success);
-        assert_eq!(result.output, "readonly ok");
+        assert!(result.output.contains("1: readonly ok"));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
@@ -320,7 +386,7 @@ mod tests {
             .await
             .unwrap();
         assert!(result.success);
-        assert_eq!(result.output, "deep content");
+        assert!(result.output.contains("1: deep content"));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
@@ -392,6 +458,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_read_with_offset_and_limit() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_offset");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("lines.txt"), "aaa\nbbb\nccc\nddd\neee")
+            .await
+            .unwrap();
+
+        let tool = FileReadTool::new(test_security(dir.clone()));
+
+        // Read lines 2-3
+        let result = tool
+            .execute(json!({"path": "lines.txt", "offset": 2, "limit": 2}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("2: bbb"));
+        assert!(result.output.contains("3: ccc"));
+        assert!(!result.output.contains("1: aaa"));
+        assert!(!result.output.contains("4: ddd"));
+        assert!(result.output.contains("[Lines 2-3 of 5]"));
+
+        // Read from offset 4 to end
+        let result = tool
+            .execute(json!({"path": "lines.txt", "offset": 4}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("4: ddd"));
+        assert!(result.output.contains("5: eee"));
+        assert!(result.output.contains("[Lines 4-5 of 5]"));
+
+        // Limit only (first 2 lines)
+        let result = tool
+            .execute(json!({"path": "lines.txt", "limit": 2}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("1: aaa"));
+        assert!(result.output.contains("2: bbb"));
+        assert!(!result.output.contains("3: ccc"));
+        assert!(result.output.contains("[Lines 1-2 of 5]"));
+
+        // Full read (no offset/limit) shows all lines
+        let result = tool
+            .execute(json!({"path": "lines.txt"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("1: aaa"));
+        assert!(result.output.contains("5: eee"));
+        assert!(result.output.contains("[5 lines total]"));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_read_offset_beyond_end() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_offset_end");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("short.txt"), "one\ntwo")
+            .await
+            .unwrap();
+
+        let tool = FileReadTool::new(test_security(dir.clone()));
+        let result = tool
+            .execute(json!({"path": "short.txt", "offset": 100}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("[No lines in range, file has 2 lines]"));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
     async fn file_read_rejects_oversized_file() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_read_large");
         let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -408,4 +551,5 @@ mod tests {
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
+
 }
