@@ -175,6 +175,9 @@ fn clamp_reasoning_effort(model: &str, effort: &str) -> String {
     if (id.starts_with("gpt-5.2") || id.starts_with("gpt-5.3")) && effort == "minimal" {
         return "low".to_string();
     }
+    if id.starts_with("gpt-5-codex") && effort == "xhigh" {
+        return "high".to_string();
+    }
     if id == "gpt-5.1" && effort == "xhigh" {
         return "high".to_string();
     }
@@ -560,6 +563,10 @@ mod tests {
         );
         assert_eq!(
             clamp_reasoning_effort("gpt-5.1", "xhigh"),
+            "high".to_string()
+        );
+        assert_eq!(
+            clamp_reasoning_effort("gpt-5-codex", "xhigh"),
             "high".to_string()
         );
         assert_eq!(
