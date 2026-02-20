@@ -27,7 +27,7 @@ entry = "index.js"
 [permissions]
 network = []
 file_read = []
-file_write = false
+file_write = []
 env_vars = []
 "#;
     fs::write(&manifest_path, manifest_content).unwrap();
@@ -134,7 +134,7 @@ mod lifecycle_tests {
 
         assert_eq!(manifest.permissions.network.len(), 0);
         assert_eq!(manifest.permissions.file_read.len(), 0);
-        assert!(!manifest.permissions.file_write);
+        assert!(manifest.permissions.file_write.is_empty());
         assert_eq!(manifest.permissions.env_vars.len(), 0);
     }
 
@@ -198,7 +198,7 @@ entry = "index.js"
 [permissions]
 network = ["api.example.com"]
 file_read = ["./data/**"]
-file_write = true
+file_write = ["./output/**"]
 env_vars = ["API_KEY"]
 "#;
         fs::write(&manifest_path, manifest_content).unwrap();
@@ -212,7 +212,7 @@ env_vars = ["API_KEY"]
         assert_eq!(manifest.permissions.network.len(), 1);
         assert_eq!(manifest.permissions.network[0], "api.example.com");
         assert_eq!(manifest.permissions.file_read.len(), 1);
-        assert!(manifest.permissions.file_write);
+        assert_eq!(manifest.permissions.file_write[0], "./output/**");
         assert_eq!(manifest.permissions.env_vars.len(), 1);
     }
 
@@ -237,7 +237,7 @@ entry = "index.js"
 [permissions]
 network = []
 file_read = []
-file_write = false
+file_write = []
 env_vars = []
 
 [[tools.definitions]]
@@ -279,7 +279,7 @@ entry = "index.js"
 [permissions]
 network = []
 file_read = []
-file_write = false
+file_write = []
 env_vars = []
 
 [[skills.definitions]]

@@ -24,7 +24,12 @@ pub mod events;
 pub mod hooks;
 #[cfg(any(feature = "js", feature = "js-runtime", feature = "js-transpile"))]
 pub mod install;
-#[cfg(any(feature = "js", feature = "js-lite", feature = "js-transpile"))]
+#[cfg(any(
+    feature = "js",
+    feature = "js-lite",
+    feature = "js-runtime",
+    feature = "js-transpile"
+))]
 pub mod manifest;
 #[cfg(any(feature = "js", feature = "js-registry"))]
 pub mod registry;
