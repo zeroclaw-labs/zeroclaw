@@ -889,6 +889,137 @@ pub(crate) async fn agent_turn(
     .await
 }
 
+// ── Tool Execution Helpers ───────────────────────────────────────────────
+
+/// Execute a single tool call, returning the scrubbed result string.
+/// Handles unknown tools, observer events, credential scrubbing, and
+/// cancellation via `tokio::select!`.
+async fn execute_one_tool(
+    call_name: &str,
+    call_arguments: serde_json::Value,
+    tools_registry: &[Box<dyn Tool>],
+    observer: &dyn Observer,
+    cancellation_token: Option<&CancellationToken>,
+) -> Result<String> {
+    let Some(tool) = find_tool(tools_registry, call_name) else {
+        return Ok(format!("Unknown tool: {call_name}"));
+    };
+
+    observer.record_event(&ObserverEvent::ToolCallStart {
+        tool: call_name.to_string(),
+    });
+    let start = Instant::now();
+
+    let tool_future = tool.execute(call_arguments);
+    let tool_result = if let Some(token) = cancellation_token {
+        tokio::select! {
+            () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+            result = tool_future => result,
+        }
+    } else {
+        tool_future.await
+    };
+
+    match tool_result {
+        Ok(r) => {
+            observer.record_event(&ObserverEvent::ToolCall {
+                tool: call_name.to_string(),
+                duration: start.elapsed(),
+                success: r.success,
+            });
+            if r.success {
+                Ok(scrub_credentials(&r.output))
+            } else {
+                Ok(format!("Error: {}", r.error.unwrap_or_else(|| r.output)))
+            }
+        }
+        Err(e) => {
+            observer.record_event(&ObserverEvent::ToolCall {
+                tool: call_name.to_string(),
+                duration: start.elapsed(),
+                success: false,
+            });
+            Ok(format!("Error executing {call_name}: {e}"))
+        }
+    }
+}
+
+/// Execute multiple tool calls concurrently using `futures::future::join_all`.
+/// Results are returned in the same order as the input calls.
+async fn execute_tools_parallel(
+    tool_calls: &[ParsedToolCall],
+    tools_registry: &[Box<dyn Tool>],
+    observer: &dyn Observer,
+    cancellation_token: Option<&CancellationToken>,
+) -> Result<Vec<String>> {
+    let futures: Vec<_> = tool_calls
+        .iter()
+        .map(|call| {
+            execute_one_tool(
+                &call.name,
+                call.arguments.clone(),
+                tools_registry,
+                observer,
+                cancellation_token,
+            )
+        })
+        .collect();
+
+    let results = futures::future::join_all(futures).await;
+
+    // If any tool was cancelled, propagate the cancellation error.
+    results.into_iter().collect()
+}
+
+/// Execute tool calls sequentially (used when CLI approval prompts are needed
+/// or when there is only a single tool call).
+async fn execute_tools_sequential(
+    tool_calls: &[ParsedToolCall],
+    tools_registry: &[Box<dyn Tool>],
+    observer: &dyn Observer,
+    approval: Option<&ApprovalManager>,
+    channel_name: &str,
+    cancellation_token: Option<&CancellationToken>,
+) -> Result<Vec<String>> {
+    let mut individual_results: Vec<String> = Vec::new();
+    for call in tool_calls {
+        // ── Approval hook ────────────────────────────────
+        if let Some(mgr) = approval {
+            if mgr.needs_approval(&call.name) {
+                let request = ApprovalRequest {
+                    tool_name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                };
+
+                // Only prompt interactively on CLI; auto-approve on other channels.
+                let decision = if channel_name == "cli" {
+                    mgr.prompt_cli(&request)
+                } else {
+                    ApprovalResponse::Yes
+                };
+
+                mgr.record_decision(&call.name, &call.arguments, decision, channel_name);
+
+                if decision == ApprovalResponse::No {
+                    individual_results.push("Denied by user.".to_string());
+                    continue;
+                }
+            }
+        }
+
+        let result = execute_one_tool(
+            &call.name,
+            call.arguments.clone(),
+            tools_registry,
+            observer,
+            cancellation_token,
+        )
+        .await?;
+        individual_results.push(result);
+    }
+    Ok(individual_results)
+}
+
 // ── Agent Tool-Call Loop ──────────────────────────────────────────────────
 // Core agentic iteration: send conversation to the LLM, parse any tool
 // calls from the response, execute them, append results to history, and
@@ -1085,84 +1216,45 @@ pub(crate) async fn run_tool_call_loop(
             let _ = std::io::stdout().flush();
         }
 
-        // Execute each tool call and build results.
+        // Execute tool calls and build results.
         // `individual_results` tracks per-call output so that native-mode history
         // can emit one `role: tool` message per tool call with the correct ID.
+        //
+        // When multiple tool calls are present and no interactive approval is
+        // required, execute them concurrently for better throughput. Falls back
+        // to sequential execution when CLI approval prompts are needed (they
+        // require interactive stdin access that cannot be parallelized).
         let mut tool_results = String::new();
-        let mut individual_results: Vec<String> = Vec::new();
-        for call in &tool_calls {
-            // ── Approval hook ────────────────────────────────
-            if let Some(mgr) = approval {
-                if mgr.needs_approval(&call.name) {
-                    let request = ApprovalRequest {
-                        tool_name: call.name.clone(),
-                        arguments: call.arguments.clone(),
-                    };
 
-                    // Only prompt interactively on CLI; auto-approve on other channels.
-                    let decision = if channel_name == "cli" {
-                        mgr.prompt_cli(&request)
-                    } else {
-                        ApprovalResponse::Yes
-                    };
+        let needs_sequential = approval.is_some()
+            && channel_name == "cli"
+            && tool_calls
+                .iter()
+                .any(|c| approval.unwrap().needs_approval(&c.name));
 
-                    mgr.record_decision(&call.name, &call.arguments, decision, channel_name);
+        let individual_results = if tool_calls.len() > 1 && !needs_sequential {
+            // ── Parallel execution path ──────────────────────
+            execute_tools_parallel(
+                &tool_calls,
+                tools_registry,
+                observer,
+                cancellation_token.as_ref(),
+            )
+            .await?
+        } else {
+            // ── Sequential execution path (CLI approval or single call) ──
+            execute_tools_sequential(
+                &tool_calls,
+                tools_registry,
+                observer,
+                approval,
+                channel_name,
+                cancellation_token.as_ref(),
+            )
+            .await?
+        };
 
-                    if decision == ApprovalResponse::No {
-                        let denied = "Denied by user.".to_string();
-                        individual_results.push(denied.clone());
-                        let _ = writeln!(
-                            tool_results,
-                            "<tool_result name=\"{}\">\n{denied}\n</tool_result>",
-                            call.name
-                        );
-                        continue;
-                    }
-                }
-            }
-
-            observer.record_event(&ObserverEvent::ToolCallStart {
-                tool: call.name.clone(),
-            });
-            let start = Instant::now();
-            let result = if let Some(tool) = find_tool(tools_registry, &call.name) {
-                let tool_future = tool.execute(call.arguments.clone());
-                let tool_result = if let Some(token) = cancellation_token.as_ref() {
-                    tokio::select! {
-                        () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                        result = tool_future => result,
-                    }
-                } else {
-                    tool_future.await
-                };
-
-                match tool_result {
-                    Ok(r) => {
-                        observer.record_event(&ObserverEvent::ToolCall {
-                            tool: call.name.clone(),
-                            duration: start.elapsed(),
-                            success: r.success,
-                        });
-                        if r.success {
-                            scrub_credentials(&r.output)
-                        } else {
-                            format!("Error: {}", r.error.unwrap_or_else(|| r.output))
-                        }
-                    }
-                    Err(e) => {
-                        observer.record_event(&ObserverEvent::ToolCall {
-                            tool: call.name.clone(),
-                            duration: start.elapsed(),
-                            success: false,
-                        });
-                        format!("Error executing {}: {e}", call.name)
-                    }
-                }
-            } else {
-                format!("Unknown tool: {}", call.name)
-            };
-
-            individual_results.push(result.clone());
+        for (call, result) in tool_calls.iter().zip(individual_results.iter()) {
             let _ = writeln!(
                 tool_results,
                 "<tool_result name=\"{}\">\n{}\n</tool_result>",
