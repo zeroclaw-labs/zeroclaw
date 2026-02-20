@@ -241,12 +241,12 @@ mod tests {
     #[test]
     fn type_conversion_handles_number() {
         let int_result = serde_json::json!(42);
-        assert_eq!(int_result, Value::Number(42));
+        assert_eq!(int_result, Value::Number(serde_json::Number::from(42)));
 
         let float_result = serde_json::json!(3.14);
         assert_eq!(
             float_result,
-            Value::Number(serde_json::Number::from_f64(3.14))
+            Value::Number(serde_json::Number::from_f64(3.14).unwrap())
         );
     }
 

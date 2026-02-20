@@ -5,8 +5,6 @@
 
 #[cfg(any(feature = "js", feature = "js-lite", feature = "js-runtime"))]
 pub mod api;
-#[cfg(any(feature = "js", feature = "js-runtime"))]
-pub mod events;
 #[cfg(any(feature = "js", feature = "js-bundle"))]
 pub mod bundle;
 #[cfg(any(feature = "js", feature = "js-runtime", feature = "js-transpile"))]
@@ -20,6 +18,10 @@ pub mod config;
     feature = "js-transpile"
 ))]
 pub mod error;
+#[cfg(any(feature = "js", feature = "js-runtime"))]
+pub mod events;
+#[cfg(any(feature = "js", feature = "js-runtime"))]
+pub mod hooks;
 #[cfg(any(feature = "js", feature = "js-runtime", feature = "js-transpile"))]
 pub mod install;
 #[cfg(any(feature = "js", feature = "js-lite", feature = "js-transpile"))]
