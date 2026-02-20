@@ -326,6 +326,9 @@ pub struct TelegramChannel {
     last_draft_edit: Mutex<std::collections::HashMap<String, std::time::Instant>>,
     mention_only: bool,
     bot_username: Mutex<Option<String>>,
+    /// Base URL for the Telegram Bot API. Defaults to `https://api.telegram.org`.
+    /// Override for local Bot API servers or testing.
+    api_base: String,
 }
 
 impl TelegramChannel {
@@ -353,6 +356,7 @@ impl TelegramChannel {
             typing_handle: Mutex::new(None),
             mention_only,
             bot_username: Mutex::new(None),
+            api_base: "https://api.telegram.org".to_string(),
         }
     }
 
@@ -364,6 +368,13 @@ impl TelegramChannel {
     ) -> Self {
         self.stream_mode = stream_mode;
         self.draft_update_interval_ms = draft_update_interval_ms;
+        self
+    }
+
+    /// Override the Telegram Bot API base URL.
+    /// Useful for local Bot API servers or testing.
+    pub fn with_api_base(mut self, api_base: String) -> Self {
+        self.api_base = api_base;
         self
     }
 
@@ -466,7 +477,7 @@ impl TelegramChannel {
     }
 
     fn api_url(&self, method: &str) -> String {
-        format!("https://api.telegram.org/bot{}/{method}", self.bot_token)
+        format!("{}/bot{}/{method}", self.api_base, self.bot_token)
     }
 
     async fn fetch_bot_username(&self) -> anyhow::Result<String> {
@@ -1055,7 +1066,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let target = attachment.target.trim();
 
         if is_http_url(target) {
-            return match attachment.kind {
+            let result = match attachment.kind {
                 TelegramAttachmentKind::Image => {
                     self.send_photo_by_url(chat_id, thread_id, target, None)
                         .await
@@ -1077,6 +1088,29 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                         .await
                 }
             };
+
+            // If sending media by URL failed (e.g. Telegram can't fetch the URL,
+            // wrong content type, etc.), fall back to sending the URL as a text link
+            // instead of losing the reply entirely.
+            if let Err(e) = result {
+                tracing::warn!(
+                    url = target,
+                    error = %e,
+                    "Telegram send media by URL failed; falling back to text link"
+                );
+                let kind_label = match attachment.kind {
+                    TelegramAttachmentKind::Image => "Image",
+                    TelegramAttachmentKind::Document => "Document",
+                    TelegramAttachmentKind::Video => "Video",
+                    TelegramAttachmentKind::Audio => "Audio",
+                    TelegramAttachmentKind::Voice => "Voice",
+                };
+                let fallback_text = format!("{kind_label}: {target}");
+                self.send_text_chunks(&fallback_text, chat_id, thread_id)
+                    .await?;
+            }
+
+            return Ok(());
         }
 
         let path = Path::new(target);
