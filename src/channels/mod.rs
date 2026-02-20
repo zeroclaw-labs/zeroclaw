@@ -26,6 +26,7 @@ pub mod linq;
 #[cfg(feature = "channel-matrix")]
 pub mod matrix;
 pub mod mattermost;
+pub mod nostr;
 pub mod nextcloud_talk;
 pub mod qq;
 pub mod signal;
@@ -51,6 +52,7 @@ pub use linq::LinqChannel;
 #[cfg(feature = "channel-matrix")]
 pub use matrix::MatrixChannel;
 pub use mattermost::MattermostChannel;
+pub use nostr::NostrChannel;
 pub use nextcloud_talk::NextcloudTalkChannel;
 pub use qq::QQChannel;
 pub use signal::SignalChannel;
@@ -2353,6 +2355,7 @@ pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Con
                 ),
                 ("DingTalk", config.channels_config.dingtalk.is_some()),
                 ("QQ", config.channels_config.qq.is_some()),
+                ("Nostr", config.channels_config.nostr.is_some()),
             ] {
                 println!("  {} {name}", if configured { "✅" } else { "❌" });
             }
@@ -2654,7 +2657,16 @@ fn collect_configured_channels(
 
 /// Run health checks for configured channels.
 pub async fn doctor_channels(config: Config) -> Result<()> {
-    let channels = collect_configured_channels(&config, "health check");
+    let mut channels = collect_configured_channels(&config, "health check");
+
+    if let Some(ref ns) = config.channels_config.nostr {
+        channels.push(ConfiguredChannel {
+            display_name: "Nostr",
+            channel: Arc::new(
+                NostrChannel::new(&ns.private_key, ns.relays.clone(), &ns.allowed_pubkeys).await?,
+            ),
+        });
+    }
 
     if channels.is_empty() {
         println!("No real-time channels configured. Run `zeroclaw onboard` first.");
@@ -2872,10 +2884,17 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
 
     // Collect active channels from a shared builder to keep startup and doctor parity.
-    let channels: Vec<Arc<dyn Channel>> = collect_configured_channels(&config, "runtime startup")
+    let mut channels: Vec<Arc<dyn Channel>> =
+        collect_configured_channels(&config, "runtime startup")
         .into_iter()
         .map(|configured| configured.channel)
         .collect();
+
+    if let Some(ref ns) = config.channels_config.nostr {
+        channels.push(Arc::new(
+            NostrChannel::new(&ns.private_key, ns.relays.clone(), &ns.allowed_pubkeys).await?,
+        ));
+    }
 
     if channels.is_empty() {
         println!("No channels configured. Run `zeroclaw onboard` to set up channels.");

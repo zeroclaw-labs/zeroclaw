@@ -2320,6 +2320,7 @@ pub struct ChannelsConfig {
     pub dingtalk: Option<DingTalkConfig>,
     /// QQ Official Bot channel configuration.
     pub qq: Option<QQConfig>,
+    pub nostr: Option<NostrConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
     /// (up to 4x, capped) so one slow/retried model call does not consume the
@@ -2353,6 +2354,7 @@ impl Default for ChannelsConfig {
             lark: None,
             dingtalk: None,
             qq: None,
+            nostr: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
         }
     }
@@ -2861,6 +2863,28 @@ pub struct QQConfig {
     pub allowed_users: Vec<String>,
 }
 
+/// Nostr channel configuration (NIP-04 + NIP-17 private messages)
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct NostrConfig {
+    /// Private key in hex or nsec bech32 format
+    pub private_key: String,
+    /// Relay URLs (wss://). Defaults to popular public relays if omitted.
+    #[serde(default = "default_nostr_relays")]
+    pub relays: Vec<String>,
+    /// Allowed sender public keys (hex or npub). Empty = deny all, "*" = allow all
+    #[serde(default)]
+    pub allowed_pubkeys: Vec<String>,
+}
+
+pub fn default_nostr_relays() -> Vec<String> {
+    vec![
+        "wss://relay.damus.io".to_string(),
+        "wss://nos.lol".to_string(),
+        "wss://relay.primal.net".to_string(),
+        "wss://relay.snort.social".to_string(),
+    ]
+}
+
 // ── Config impl ──────────────────────────────────────────────────
 
 impl Default for Config {
@@ -3148,6 +3172,19 @@ fn decrypt_optional_secret(
     Ok(())
 }
 
+fn decrypt_secret(
+    store: &crate::security::SecretStore,
+    value: &mut String,
+    field_name: &str,
+) -> Result<()> {
+    if crate::security::SecretStore::is_encrypted(value) {
+        *value = store
+            .decrypt(value)
+            .with_context(|| format!("Failed to decrypt {field_name}"))?;
+    }
+    Ok(())
+}
+
 fn encrypt_optional_secret(
     store: &crate::security::SecretStore,
     value: &mut Option<String>,
@@ -3161,6 +3198,19 @@ fn encrypt_optional_secret(
                     .with_context(|| format!("Failed to encrypt {field_name}"))?,
             );
         }
+    }
+    Ok(())
+}
+
+fn encrypt_secret(
+    store: &crate::security::SecretStore,
+    value: &mut String,
+    field_name: &str,
+) -> Result<()> {
+    if !crate::security::SecretStore::is_encrypted(value) {
+        *value = store
+            .encrypt(value)
+            .with_context(|| format!("Failed to encrypt {field_name}"))?;
     }
     Ok(())
 }
@@ -3272,6 +3322,15 @@ impl Config {
             for agent in config.agents.values_mut() {
                 decrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
             }
+
+            if let Some(ref mut ns) = config.channels_config.nostr {
+                decrypt_secret(
+                    &store,
+                    &mut ns.private_key,
+                    "config.channels_config.nostr.private_key",
+                )?;
+            }
+
             config.apply_env_overrides();
             config.validate()?;
             tracing::info!(
@@ -3705,6 +3764,14 @@ impl Config {
             encrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
         }
 
+        if let Some(ref mut ns) = config_to_save.channels_config.nostr {
+            encrypt_secret(
+                &store,
+                &mut ns.private_key,
+                "config.channels_config.nostr.private_key",
+            )?;
+        }
+
         let toml_str =
             toml::to_string_pretty(&config_to_save).context("Failed to serialize config")?;
 
@@ -4039,6 +4106,7 @@ default_temperature = 0.7
                 lark: None,
                 dingtalk: None,
                 qq: None,
+                nostr: None,
                 message_timeout_secs: 300,
             },
             memory: MemoryConfig::default(),
@@ -4585,6 +4653,7 @@ allowed_users = ["@ops:matrix.org"]
             lark: None,
             dingtalk: None,
             qq: None,
+            nostr: None,
             message_timeout_secs: 300,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
@@ -4795,6 +4864,7 @@ channel_id = "C123"
             lark: None,
             dingtalk: None,
             qq: None,
+            nostr: None,
             message_timeout_secs: 300,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();

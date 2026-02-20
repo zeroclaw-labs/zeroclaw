@@ -397,6 +397,7 @@ Examples:
 - `[channels_config.linq]`
 - `[channels_config.nextcloud_talk]`
 - `[channels_config.email]`
+- `[channels_config.nostr]`
 
 Notes:
 
@@ -409,6 +410,19 @@ Notes:
 - Telegram-only interruption behavior is controlled with `channels_config.telegram.interrupt_on_new_message` (default `false`).
   When enabled, a newer message from the same sender in the same chat cancels the in-flight request and preserves interrupted user context.
 - While `zeroclaw channel start` is running, updates to `default_provider`, `default_model`, `default_temperature`, `api_key`, `api_url`, and `reliability.*` are hot-applied from `config.toml` on the next inbound message.
+
+### `[channels_config.nostr]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `private_key` | _required_ | Nostr private key (hex or `nsec1…` bech32); encrypted at rest when `secrets.encrypt = true` |
+| `relays` | see note | List of relay WebSocket URLs; defaults to `relay.damus.io`, `nos.lol`, `relay.primal.net`, `relay.snort.social` |
+| `allowed_pubkeys` | `[]` (deny all) | Sender allowlist (hex or `npub1…`); use `"*"` to allow all senders |
+
+Notes:
+
+- Supports both NIP-04 (legacy encrypted DMs) and NIP-17 (gift-wrapped private messages). Replies mirror the sender's protocol automatically.
+- The `private_key` is a high-value secret; keep `secrets.encrypt = true` (the default) in production.
 
 See detailed channel matrix and allowlist behavior in [channels-reference.md](channels-reference.md).
 

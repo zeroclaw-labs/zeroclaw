@@ -227,6 +227,7 @@ fn has_supervised_channels(config: &Config) -> bool {
         linq,
         nextcloud_talk,
         qq,
+        nostr,
         ..
     } = &config.channels_config;
 
@@ -245,6 +246,7 @@ fn has_supervised_channels(config: &Config) -> bool {
         || linq.is_some()
         || nextcloud_talk.is_some()
         || qq.is_some()
+        || nostr.is_some()
 }
 
 #[cfg(test)]
