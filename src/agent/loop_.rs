@@ -663,7 +663,7 @@ fn parse_xml_attribute_tool_calls(response: &str) -> Vec<ParsedToolCall> {
 
         if !arguments.is_empty() {
             calls.push(ParsedToolCall {
-                name: tool_name.to_string(),
+                name: map_tool_name_alias(tool_name).to_string(),
                 arguments: serde_json::Value::Object(arguments),
             });
         }
@@ -738,7 +738,7 @@ fn parse_perl_style_tool_calls(response: &str) -> Vec<ParsedToolCall> {
 
         if !arguments.is_empty() {
             calls.push(ParsedToolCall {
-                name: tool_name.to_string(),
+                name: map_tool_name_alias(tool_name).to_string(),
                 arguments: serde_json::Value::Object(arguments),
             });
         }
@@ -789,7 +789,7 @@ fn parse_function_call_tool_calls(response: &str) -> Vec<ParsedToolCall> {
 
         if !arguments.is_empty() {
             calls.push(ParsedToolCall {
-                name: tool_name.to_string(),
+                name: map_tool_name_alias(tool_name).to_string(),
                 arguments: serde_json::Value::Object(arguments),
             });
         }
@@ -799,14 +799,24 @@ fn parse_function_call_tool_calls(response: &str) -> Vec<ParsedToolCall> {
 }
 
 /// Parse GLM-style tool calls from response text.
-/// GLM uses proprietary formats like:
-/// - `browser_open/url>https://example.com`
-/// - `shell/command>ls -la`
-/// - `http_request/url>https://api.example.com`
-fn map_glm_tool_alias(tool_name: &str) -> &str {
+/// Map tool name aliases from various LLM providers to ZeroClaw tool names.
+/// This handles variations like "fileread" -> "file_read", "bash" -> "shell", etc.
+fn map_tool_name_alias(tool_name: &str) -> &str {
     match tool_name {
-        "browser_open" | "browser" | "web_search" | "shell" | "bash" => "shell",
-        "http_request" | "http" => "http_request",
+        // Shell variations
+        "shell" | "bash" | "sh" | "exec" | "command" | "cmd" => "shell",
+        // File tool variations
+        "fileread" | "file_read" | "readfile" | "read_file" | "file" => "file_read",
+        "filewrite" | "file_write" | "writefile" | "write_file" => "file_write",
+        "filelist" | "file_list" | "listfiles" | "list_files" => "file_list",
+        // Memory variations
+        "memoryrecall" | "memory_recall" | "recall" | "memrecall" => "memory_recall",
+        "memorystore" | "memory_store" | "store" | "memstore" => "memory_store",
+        "memoryforget" | "memory_forget" | "forget" | "memforget" => "memory_forget",
+        // HTTP variations
+        "http_request" | "http" | "fetch" | "curl" | "wget" => "http_request",
+        // GLM aliases
+        "browser_open" | "browser" | "web_search" => "shell",
         _ => tool_name,
     }
 }
@@ -839,7 +849,7 @@ fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value, Opt
             let rest = &line[pos + 1..];
 
             if tool_part.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                let tool_name = map_glm_tool_alias(tool_part);
+                let tool_name = map_tool_name_alias(tool_part);
 
                 if let Some(gt_pos) = rest.find('>') {
                     let param_name = rest[..gt_pos].trim();
