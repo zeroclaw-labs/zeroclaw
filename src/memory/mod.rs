@@ -82,12 +82,23 @@ pub fn is_assistant_autosave_key(key: &str) -> bool {
     normalized == "assistant_resp" || normalized.starts_with("assistant_resp_")
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct ResolvedEmbeddingConfig {
     provider: String,
     model: String,
     dimensions: usize,
     api_key: Option<String>,
+}
+
+impl std::fmt::Debug for ResolvedEmbeddingConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedEmbeddingConfig")
+            .field("provider", &self.provider)
+            .field("model", &self.model)
+            .field("dimensions", &self.dimensions)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
 }
 
 fn resolve_embedding_config(

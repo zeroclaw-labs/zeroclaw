@@ -602,9 +602,12 @@ mod tests {
         assert_eq!(msgs[0].content, "First part\nSecond part");
     }
 
+    /// Fixture secret used exclusively in signature-verification unit tests (not a real credential).
+    const TEST_WEBHOOK_SECRET: &str = "test_webhook_secret";
+
     #[test]
     fn linq_signature_verification_valid() {
-        let secret = "test_webhook_secret";
+        let secret = TEST_WEBHOOK_SECRET;
         let body = r#"{"event_type":"message.received"}"#;
         let now = chrono::Utc::now().timestamp().to_string();
 
@@ -621,7 +624,7 @@ mod tests {
 
     #[test]
     fn linq_signature_verification_invalid() {
-        let secret = "test_webhook_secret";
+        let secret = TEST_WEBHOOK_SECRET;
         let body = r#"{"event_type":"message.received"}"#;
         let now = chrono::Utc::now().timestamp().to_string();
 
@@ -635,7 +638,7 @@ mod tests {
 
     #[test]
     fn linq_signature_verification_stale_timestamp() {
-        let secret = "test_webhook_secret";
+        let secret = TEST_WEBHOOK_SECRET;
         let body = r#"{"event_type":"message.received"}"#;
         // 10 minutes ago — stale
         let stale_ts = (chrono::Utc::now().timestamp() - 600).to_string();
@@ -656,7 +659,7 @@ mod tests {
 
     #[test]
     fn linq_signature_verification_accepts_sha256_prefix() {
-        let secret = "test_webhook_secret";
+        let secret = TEST_WEBHOOK_SECRET;
         let body = r#"{"event_type":"message.received"}"#;
         let now = chrono::Utc::now().timestamp().to_string();
 
@@ -672,7 +675,7 @@ mod tests {
 
     #[test]
     fn linq_signature_verification_accepts_uppercase_hex() {
-        let secret = "test_webhook_secret";
+        let secret = TEST_WEBHOOK_SECRET;
         let body = r#"{"event_type":"message.received"}"#;
         let now = chrono::Utc::now().timestamp().to_string();
 
