@@ -231,8 +231,11 @@ cd zeroclaw
 # Tùy chọn: chạy onboarding trong cùng luồng
 ./bootstrap.sh --onboard --api-key "sk-..." --provider openrouter [--model "openrouter/auto"]
 
-# Tùy chọn: chạy bootstrap + onboarding hoàn toàn trong Docker
+# Tùy chọn: chạy bootstrap + onboarding hoàn toàn ở chế độ tương thích với Docker
 ./bootstrap.sh --docker
+
+# Tùy chọn: ép dùng Podman làm container CLI
+ZEROCLAW_CONTAINER_CLI=podman ./bootstrap.sh --docker
 
 # Tùy chọn: ở chế độ --docker, bỏ qua build image local và dùng tag local hoặc pull image fallback
 ./bootstrap.sh --docker --skip-build

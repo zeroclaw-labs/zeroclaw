@@ -95,6 +95,10 @@ If you run Option B outside a repository checkout, the bootstrap script automati
 This builds a local ZeroClaw image and launches onboarding inside a container while
 persisting config/workspace to `./.zeroclaw-docker`.
 
+Container CLI defaults to `docker`. If Docker CLI is unavailable and `podman` exists,
+bootstrap auto-falls back to `podman`. You can also set `ZEROCLAW_CONTAINER_CLI`
+explicitly (for example: `ZEROCLAW_CONTAINER_CLI=podman ./bootstrap.sh --docker`).
+
 If you add `--skip-build`, bootstrap skips local image build. It first tries the local
 Docker tag (`ZEROCLAW_DOCKER_IMAGE`, default: `zeroclaw-bootstrap:local`); if missing,
 it pulls `ghcr.io/zeroclaw-labs/zeroclaw:latest` and tags it locally before running.
