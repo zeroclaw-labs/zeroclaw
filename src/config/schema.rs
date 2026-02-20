@@ -3528,20 +3528,23 @@ impl Config {
     }
 }
 
-#[cfg(unix)]
 async fn sync_directory(path: &Path) -> Result<()> {
-    let dir = File::open(path)
-        .await
-        .with_context(|| format!("Failed to open directory for fsync: {}", path.display()))?;
-    dir.sync_all()
-        .await
-        .with_context(|| format!("Failed to fsync directory metadata: {}", path.display()))?;
-    Ok(())
-}
+    #[cfg(unix)]
+    {
+        let dir = File::open(path)
+            .await
+            .with_context(|| format!("Failed to open directory for fsync: {}", path.display()))?;
+        dir.sync_all()
+            .await
+            .with_context(|| format!("Failed to fsync directory metadata: {}", path.display()))?;
+        return Ok(());
+    }
 
-#[cfg(not(unix))]
-async fn sync_directory(_path: &Path) -> Result<()> {
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -3896,6 +3899,19 @@ tool_dispatcher = "xml"
         assert_eq!(parsed.agent.max_history_messages, 80);
         assert!(parsed.agent.parallel_tools);
         assert_eq!(parsed.agent.tool_dispatcher, "xml");
+    }
+
+    #[tokio::test]
+    async fn sync_directory_handles_existing_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "zeroclaw_test_sync_directory_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).await.unwrap();
+
+        sync_directory(&dir).await.unwrap();
+
+        let _ = fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
