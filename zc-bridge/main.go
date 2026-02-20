@@ -167,6 +167,14 @@ func handleRPC(ws *websocket.Conn, writeMu *sync.Mutex, f Frame) {
             }),
         })
 
+    case "sessions.patch":
+        safeWriteJSON(ws, writeMu, Frame{
+            Type:    "res",
+            ID:      f.ID,
+            Ok:      true,
+            Payload: mustJSON(map[string]any{}),
+        })
+
     default:
         handleZeroClawForward(ws, writeMu, f)
     }
