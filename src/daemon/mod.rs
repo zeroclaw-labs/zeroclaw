@@ -210,7 +210,6 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
 
 fn has_supervised_channels(config: &Config) -> bool {
     config.channels_config.launchable.has_any()
-    config.channels_config.launchable.has_any()
 }
 
 #[cfg(test)]
@@ -285,7 +284,6 @@ mod tests {
     fn detects_supervised_channels_present() {
         let mut config = Config::default();
         config.channels_config.launchable.telegram = Some(crate::config::TelegramConfig {
-        config.channels_config.launchable.telegram = Some(crate::config::TelegramConfig {
             bot_token: "token".into(),
             allowed_users: vec![],
             stream_mode: crate::config::StreamMode::default(),
@@ -299,7 +297,6 @@ mod tests {
     #[test]
     fn detects_dingtalk_as_supervised_channel() {
         let mut config = Config::default();
-        config.channels_config.launchable.dingtalk = Some(crate::config::schema::DingTalkConfig {
         config.channels_config.launchable.dingtalk = Some(crate::config::schema::DingTalkConfig {
             client_id: "client_id".into(),
             client_secret: "client_secret".into(),
@@ -326,7 +323,6 @@ mod tests {
     #[test]
     fn detects_qq_as_supervised_channel() {
         let mut config = Config::default();
-        config.channels_config.launchable.qq = Some(crate::config::schema::QQConfig {
         config.channels_config.launchable.qq = Some(crate::config::schema::QQConfig {
             app_id: "app-id".into(),
             app_secret: "app-secret".into(),

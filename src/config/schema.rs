@@ -1,5 +1,4 @@
 use crate::config::traits::ChannelConfig;
-use crate::config::traits::ChannelConfig;
 use crate::providers::{is_glm_alias, is_zai_alias};
 use crate::security::AutonomyLevel;
 use anyhow::{Context, Result};
@@ -2256,7 +2255,6 @@ impl Default for ChannelsConfig {
             cli: true,
             webhook: None,
             launchable: Default::default(),
-            launchable: Default::default(),
             message_timeout_secs: default_channel_message_timeout_secs(),
         }
     }
@@ -2488,15 +2486,6 @@ impl ChannelConfig for MatrixConfig {
     }
 }
 
-impl ChannelConfig for MatrixConfig {
-    fn name() -> &'static str {
-        "Matrix"
-    }
-    fn desc() -> &'static str {
-        "self-hosted chat"
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SignalConfig {
     /// Base URL for the signal-cli HTTP daemon (e.g. "http://127.0.0.1:8686").
@@ -2565,15 +2554,6 @@ pub struct WhatsAppConfig {
     /// Allowed phone numbers (E.164 format: +1234567890) or "*" for all
     #[serde(default)]
     pub allowed_numbers: Vec<String>,
-}
-
-impl ChannelConfig for WhatsAppConfig {
-    fn name() -> &'static str {
-        "WhatsApp"
-    }
-    fn desc() -> &'static str {
-        "Business Cloud API"
-    }
 }
 
 impl ChannelConfig for WhatsAppConfig {
@@ -2702,15 +2682,6 @@ impl ChannelConfig for IrcConfig {
     }
 }
 
-impl ChannelConfig for IrcConfig {
-    fn name() -> &'static str {
-        "IRC"
-    }
-    fn desc() -> &'static str {
-        "IRC over TLS"
-    }
-}
-
 fn default_irc_port() -> u16 {
     6697
 }
@@ -2754,15 +2725,6 @@ pub struct LarkConfig {
     /// Not required (and ignored) for websocket mode.
     #[serde(default)]
     pub port: Option<u16>,
-}
-
-impl ChannelConfig for LarkConfig {
-    fn name() -> &'static str {
-        "Lark/Feishu"
-    }
-    fn desc() -> &'static str {
-        "Lark/Feishu Bot"
-    }
 }
 
 impl ChannelConfig for LarkConfig {
@@ -2948,15 +2910,6 @@ impl ChannelConfig for DingTalkConfig {
     }
 }
 
-impl ChannelConfig for DingTalkConfig {
-    fn name() -> &'static str {
-        "DingTalk"
-    }
-    fn desc() -> &'static str {
-        "DingTalk Stream Mode"
-    }
-}
-
 /// QQ Official Bot configuration (Tencent QQ Bot SDK)
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct QQConfig {
@@ -2967,15 +2920,6 @@ pub struct QQConfig {
     /// Allowed user IDs. Empty = deny all, "*" = allow all
     #[serde(default)]
     pub allowed_users: Vec<String>,
-}
-
-impl ChannelConfig for QQConfig {
-    fn name() -> &'static str {
-        "QQ Official"
-    }
-    fn desc() -> &'static str {
-        "Tencent QQ Bot"
-    }
 }
 
 impl ChannelConfig for QQConfig {
@@ -4331,12 +4275,6 @@ default_temperature = 0.7
                 .telegram
                 .unwrap()
                 .bot_token,
-            parsed
-                .channels_config
-                .launchable
-                .telegram
-                .unwrap()
-                .bot_token,
             "123:ABC"
         );
     }
@@ -4834,34 +4772,10 @@ allowed_users = ["@ops:matrix.org"]
                 }),
                 ..Default::default()
             },
-            launchable: LaunchableChannelsConfig {
-                imessage: Some(IMessageConfig {
-                    allowed_contacts: vec!["+1".into()],
-                }),
-                matrix: Some(MatrixConfig {
-                    homeserver: "https://m.org".into(),
-                    access_token: "tok".into(),
-                    user_id: None,
-                    device_id: None,
-                    room_id: "!r:m".into(),
-                    allowed_users: vec!["@u:m".into()],
-                }),
-                ..Default::default()
-            },
             message_timeout_secs: 300,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
-        assert!(parsed.launchable.imessage.is_some());
-        assert!(parsed.launchable.matrix.is_some());
-        assert_eq!(
-            parsed.launchable.imessage.unwrap().allowed_contacts,
-            vec!["+1"]
-        );
-        assert_eq!(
-            parsed.launchable.matrix.unwrap().homeserver,
-            "https://m.org"
-        );
         assert!(parsed.launchable.imessage.is_some());
         assert!(parsed.launchable.matrix.is_some());
         assert_eq!(
@@ -4877,8 +4791,6 @@ allowed_users = ["@ops:matrix.org"]
     #[test]
     async fn channels_config_default_has_no_imessage_matrix() {
         let c = ChannelsConfig::default();
-        assert!(c.launchable.imessage.is_none());
-        assert!(c.launchable.matrix.is_none());
         assert!(c.launchable.imessage.is_none());
         assert!(c.launchable.matrix.is_none());
     }
