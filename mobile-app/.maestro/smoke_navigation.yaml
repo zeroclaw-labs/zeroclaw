@@ -10,8 +10,13 @@ appId: com.mobileclaw.app
 - tapOn:
     text: "OK"
     optional: true
+- tapOn:
+    text: "Allow"
+    optional: true
+# Wait for chat screen to be ready by checking for input field
 - extendedWaitUntil:
-    visible: "MobileClaw agent chat with voice mode."
+    visible:
+      id: "chat-input"
     timeout: 60000
 - tapOn:
     id: "dock-tab-settings"
@@ -47,5 +52,5 @@ appId: com.mobileclaw.app
     id: "dock-tab-chat"
 - extendedWaitUntil:
     visible:
-      id: "screen-chat"
+      id: "chat-input"
     timeout: 10000

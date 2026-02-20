@@ -46,7 +46,14 @@ async function postJson(url: string, body: unknown, headers: Record<string, stri
   const json = await readJsonResponse(res);
   if (!res.ok) {
     const detail = json?.error?.message || json?.error || json?.detail;
-    throw new Error(typeof detail === "string" ? detail : `HTTP ${res.status}`);
+    const errorMsg = typeof detail === "string" ? detail : `HTTP ${res.status}`;
+
+    // Handle common authentication errors
+    if (res.status === 401 || errorMsg.toLowerCase().includes("user not found")) {
+      throw new Error("Invalid or expired API key. Please update your credentials in Settings.");
+    }
+
+    throw new Error(errorMsg);
   }
   return json;
 }

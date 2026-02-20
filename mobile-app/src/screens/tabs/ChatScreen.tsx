@@ -328,27 +328,33 @@ export function ChatScreen() {
         >
 
           <View style={{ flex: 1 }}>
-            <Text testID="screen-chat" variant="display">Chat</Text>
-            <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginTop: theme.spacing.xs }}>
-              <Text variant="muted">MobileClaw agent chat with voice mode.</Text>
-              {!useSidebar ? (
-                <Pressable
-                  testID="chat-restart-agent"
-                  onPress={() => { void restartAgent(); }}
-                  style={{
-                    paddingHorizontal: 10,
-                    paddingVertical: 6,
-                    borderRadius: theme.radii.md,
-                    backgroundColor: theme.colors.surface.panel,
-                    borderWidth: 1,
-                    borderColor: theme.colors.stroke.subtle,
-                  }}
-                >
-                  <Text variant="label">Restart Agent</Text>
-                </Pressable>
-              ) : null}
-            </View>
-            <View style={{ marginBottom: theme.spacing.md }} />
+            {useSidebar ? (
+              // Automotive/tablet layout - no header to save space
+              <Text testID="screen-chat" variant="display" style={{ position: "absolute", opacity: 0, height: 0 }}>Chat</Text>
+            ) : (
+              // Phone layout - show header
+              <>
+                <Text testID="screen-chat" variant="display">Chat</Text>
+                <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginTop: theme.spacing.xs }}>
+                  <Text variant="muted">MobileClaw agent chat with voice mode.</Text>
+                  <Pressable
+                    testID="chat-restart-agent"
+                    onPress={() => { void restartAgent(); }}
+                    style={{
+                      paddingHorizontal: 10,
+                      paddingVertical: 6,
+                      borderRadius: theme.radii.md,
+                      backgroundColor: theme.colors.surface.panel,
+                      borderWidth: 1,
+                      borderColor: theme.colors.stroke.subtle,
+                    }}
+                  >
+                    <Text variant="label">Restart Agent</Text>
+                  </Pressable>
+                </View>
+                <View style={{ marginBottom: theme.spacing.md }} />
+              </>
+            )}
 
             <ScrollView
               ref={scrollRef}
