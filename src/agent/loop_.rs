@@ -382,11 +382,31 @@ fn is_xml_meta_tag(tag: &str) -> bool {
     )
 }
 
-static XML_TOOL_TAG_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?s)<([a-zA-Z_][a-zA-Z0-9_-]*)>\s*(.*?)\s*</\1>").unwrap());
+/// Match opening XML tags: `<tag_name>`.  Does NOT use backreferences.
+static XML_OPEN_TAG_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<([a-zA-Z_][a-zA-Z0-9_-]*)>").unwrap());
 
-static XML_ARG_TAG_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?s)<([a-zA-Z_][a-zA-Z0-9_-]*)>\s*([^<]+?)\s*</\1>").unwrap());
+/// Extracts all `<tag>…</tag>` pairs from `input`, returning `(tag_name, inner_content)`.
+/// Handles matching closing tags without regex backreferences.
+fn extract_xml_pairs(input: &str) -> Vec<(&str, &str)> {
+    let mut results = Vec::new();
+    let mut search_start = 0;
+    while let Some(open_cap) = XML_OPEN_TAG_RE.captures(&input[search_start..]) {
+        let full_open = open_cap.get(0).unwrap();
+        let tag_name = open_cap.get(1).unwrap().as_str();
+        let open_end = search_start + full_open.end();
+
+        let closing_tag = format!("</{tag_name}>");
+        if let Some(close_pos) = input[open_end..].find(&closing_tag) {
+            let inner = &input[open_end..open_end + close_pos];
+            results.push((tag_name, inner.trim()));
+            search_start = open_end + close_pos + closing_tag.len();
+        } else {
+            search_start = open_end;
+        }
+    }
+    results
+}
 
 /// Parse XML-style tool calls in `<tool_call>` bodies.
 /// Supports both nested argument tags and JSON argument payloads:
@@ -400,13 +420,12 @@ fn parse_xml_tool_calls(xml_content: &str) -> Option<Vec<ParsedToolCall>> {
         return None;
     }
 
-    for cap in XML_TOOL_TAG_RE.captures_iter(trimmed) {
-        let tool_name = cap[1].trim().to_string();
+    for (tool_name_str, inner_content) in extract_xml_pairs(trimmed) {
+        let tool_name = tool_name_str.to_string();
         if is_xml_meta_tag(&tool_name) {
             continue;
         }
 
-        let inner_content = cap[2].trim();
         if inner_content.is_empty() {
             continue;
         }
@@ -423,12 +442,11 @@ fn parse_xml_tool_calls(xml_content: &str) -> Option<Vec<ParsedToolCall>> {
                 }
             }
         } else {
-            for inner_cap in XML_ARG_TAG_RE.captures_iter(inner_content) {
-                let key = inner_cap[1].trim().to_string();
+            for (key_str, value) in extract_xml_pairs(inner_content) {
+                let key = key_str.to_string();
                 if is_xml_meta_tag(&key) {
                     continue;
                 }
-                let value = inner_cap[2].trim();
                 if !value.is_empty() {
                     args.insert(key, serde_json::Value::String(value.to_string()));
                 }

@@ -574,13 +574,19 @@ impl BedrockProvider {
         let mut blocks: Vec<ContentBlock> = Vec::new();
         let mut remaining = content;
         let has_image = content.contains("[IMAGE:");
-        tracing::info!("parse_user_content_blocks called, len={}, has_image={}", content.len(), has_image);
+        tracing::info!(
+            "parse_user_content_blocks called, len={}, has_image={}",
+            content.len(),
+            has_image
+        );
 
         while let Some(start) = remaining.find("[IMAGE:") {
             // Add any text before the marker
             let text_before = &remaining[..start];
             if !text_before.trim().is_empty() {
-                blocks.push(ContentBlock::Text(TextBlock { text: text_before.to_string() }));
+                blocks.push(ContentBlock::Text(TextBlock {
+                    text: text_before.to_string(),
+                }));
             }
 
             let after = &remaining[start + 7..]; // skip "[IMAGE:"
@@ -604,7 +610,9 @@ impl BedrockProvider {
                             blocks.push(ContentBlock::Image(ImageWrapper {
                                 image: ImageBlock {
                                     format: format.to_string(),
-                                    source: ImageSource { bytes: b64.to_string() },
+                                    source: ImageSource {
+                                        bytes: b64.to_string(),
+                                    },
                                 },
                             }));
                             continue;
@@ -612,21 +620,29 @@ impl BedrockProvider {
                     }
                 }
                 // Non-data-uri image: just include as text reference
-                blocks.push(ContentBlock::Text(TextBlock { text: format!("[image: {}]", src) }));
+                blocks.push(ContentBlock::Text(TextBlock {
+                    text: format!("[image: {}]", src),
+                }));
             } else {
                 // No closing bracket, treat rest as text
-                blocks.push(ContentBlock::Text(TextBlock { text: remaining.to_string() }));
+                blocks.push(ContentBlock::Text(TextBlock {
+                    text: remaining.to_string(),
+                }));
                 break;
             }
         }
 
         // Add any remaining text
         if !remaining.trim().is_empty() {
-            blocks.push(ContentBlock::Text(TextBlock { text: remaining.to_string() }));
+            blocks.push(ContentBlock::Text(TextBlock {
+                text: remaining.to_string(),
+            }));
         }
 
         if blocks.is_empty() {
-            blocks.push(ContentBlock::Text(TextBlock { text: content.to_string() }));
+            blocks.push(ContentBlock::Text(TextBlock {
+                text: content.to_string(),
+            }));
         }
 
         blocks
@@ -773,12 +789,18 @@ impl BedrockProvider {
                                     if let Some(src) = img.get_mut("source") {
                                         if let Some(bytes) = src.get_mut("bytes") {
                                             if let Some(s) = bytes.as_str() {
-                                                *bytes = serde_json::json!(format!("<base64 {} chars>", s.len()));
+                                                *bytes = serde_json::json!(format!(
+                                                    "<base64 {} chars>",
+                                                    s.len()
+                                                ));
                                             }
                                         }
                                     }
                                 }
-                                tracing::info!("Bedrock image block: {}", serde_json::to_string(&b).unwrap_or_default());
+                                tracing::info!(
+                                    "Bedrock image block: {}",
+                                    serde_json::to_string(&b).unwrap_or_default()
+                                );
                             }
                         }
                     }
