@@ -5,6 +5,15 @@
 //! - PDF ingestion (with `rag-pdf` feature)
 //! - Pin/alias tables (e.g. `red_led: 13`) for explicit lookup
 //! - Keyword retrieval (default) or semantic search via embeddings (optional)
+//! - PostgreSQL + pgvector vector store for semantic RAG ([`pgvector`])
+//! - NVIDIA NIM embedding client ([`embedding`])
+//! - Text chunking with heading context and overlap ([`text_chunker`])
+//! - Ingest pipeline with change-detection ([`ingest`])
+
+pub mod embedding;
+pub mod ingest;
+pub mod pgvector;
+pub mod text_chunker;
 
 use crate::memory::chunker;
 use std::collections::HashMap;
