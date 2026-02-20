@@ -1,10 +1,11 @@
 use crate::config::Config;
 use anyhow::Result;
 use chrono::Utc;
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use tokio::task::JoinHandle;
-use tokio::time::Duration;
+use tokio::time::{Duration, Instant};
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
 
@@ -173,6 +174,10 @@ where
     })
 }
 
+/// Maximum consecutive failures before a heartbeat task is auto-disabled
+/// for the remainder of this daemon lifetime.
+const HEARTBEAT_MAX_CONSECUTIVE_FAILURES: u32 = 3;
+
 async fn run_heartbeat_worker(config: Config) -> Result<()> {
     let observer: std::sync::Arc<dyn crate::observability::Observer> =
         std::sync::Arc::from(crate::observability::create_observer(&config.observability));
@@ -181,6 +186,15 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         config.workspace_dir.clone(),
         observer,
     );
+
+    let initial_backoff_secs = config.reliability.channel_initial_backoff_secs.max(1);
+    let max_backoff_secs = config
+        .reliability
+        .channel_max_backoff_secs
+        .max(initial_backoff_secs);
+
+    // Per-task failure tracking: task_description -> (consecutive_failures, last_failure_at)
+    let mut failure_map: HashMap<String, (u32, Instant)> = HashMap::new();
 
     let interval_mins = config.heartbeat.interval_minutes.max(5);
     let mut interval = tokio::time::interval(Duration::from_secs(u64::from(interval_mins) * 60));
@@ -194,6 +208,29 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         }
 
         for task in tasks {
+            // Check if task is permanently disabled (hit max failures)
+            if let Some(&(failures, _)) = failure_map.get(&task) {
+                if failures >= HEARTBEAT_MAX_CONSECUTIVE_FAILURES {
+                    tracing::debug!(
+                        "Heartbeat task disabled after {failures} consecutive failures, \
+                         skipping: {task}"
+                    );
+                    continue;
+                }
+
+                // Check exponential backoff cooldown
+                let backoff = initial_backoff_secs
+                    .saturating_mul(1u64.checked_shl(failures).unwrap_or(u64::MAX))
+                    .min(max_backoff_secs);
+                let (_, last_failure_at) = failure_map[&task];
+                if last_failure_at.elapsed() < Duration::from_secs(backoff) {
+                    tracing::debug!(
+                        "Heartbeat task in cooldown ({backoff}s), skipping: {task}"
+                    );
+                    continue;
+                }
+            }
+
             let prompt = format!("[Heartbeat Task] {task}");
             let temp = config.default_temperature;
             if let Err(e) = crate::agent::run(
@@ -207,9 +244,26 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             )
             .await
             {
+                let (failures, _) = failure_map
+                    .entry(task.clone())
+                    .or_insert((0, Instant::now()));
+                *failures += 1;
+                let f = *failures;
+                // Update last_failure_at
+                failure_map.get_mut(&task).unwrap().1 = Instant::now();
+
+                if f >= HEARTBEAT_MAX_CONSECUTIVE_FAILURES {
+                    tracing::error!(
+                        "Heartbeat task disabled after {f} consecutive failures. \
+                         Check HEARTBEAT.md configuration: {task} — error: {e}"
+                    );
+                } else {
+                    tracing::warn!("Heartbeat task failed ({f}/{HEARTBEAT_MAX_CONSECUTIVE_FAILURES}): {e}");
+                }
                 crate::health::mark_component_error("heartbeat", e.to_string());
-                tracing::warn!("Heartbeat task failed: {e}");
             } else {
+                // Success: reset failure tracking for this task
+                failure_map.remove(&task);
                 crate::health::mark_component_ok("heartbeat");
             }
         }
