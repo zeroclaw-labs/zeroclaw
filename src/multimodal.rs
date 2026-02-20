@@ -279,7 +279,7 @@ async fn normalize_remote_image(
     }
 
     if let Some(content_length) = response.content_length() {
-        let content_length = content_length as usize;
+        let content_length = usize::try_from(content_length).unwrap_or(usize::MAX);
         validate_size(source, content_length, max_bytes)?;
     }
 
@@ -328,7 +328,11 @@ async fn normalize_local_image(source: &str, max_bytes: usize) -> anyhow::Result
                 reason: error.to_string(),
             })?;
 
-    validate_size(source, metadata.len() as usize, max_bytes)?;
+    validate_size(
+        source,
+        usize::try_from(metadata.len()).unwrap_or(usize::MAX),
+        max_bytes,
+    )?;
 
     let bytes = tokio::fs::read(path)
         .await
@@ -364,10 +368,7 @@ fn validate_size(source: &str, size_bytes: usize, max_bytes: usize) -> anyhow::R
 }
 
 fn validate_mime(source: &str, mime: &str) -> anyhow::Result<()> {
-    if ALLOWED_IMAGE_MIME_TYPES
-        .iter()
-        .any(|allowed| *allowed == mime)
-    {
+    if ALLOWED_IMAGE_MIME_TYPES.contains(&mime) {
         return Ok(());
     }
 
