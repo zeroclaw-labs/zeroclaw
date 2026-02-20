@@ -5204,4 +5204,46 @@ Mon Feb 20
         assert!(join.is_ok(), "listener should stop after channel shutdown");
         assert!(calls.load(Ordering::SeqCst) >= 1);
     }
+
+    #[test]
+    fn normalize_merges_consecutive_user_turns() {
+        let turns = vec![ChatMessage::user("hello"), ChatMessage::user("world")];
+        let result = normalize_cached_channel_turns(turns);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].role, "user");
+        assert_eq!(result[0].content, "hello\n\nworld");
+    }
+
+    #[test]
+    fn normalize_preserves_strict_alternation() {
+        let turns = vec![
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("hi"),
+            ChatMessage::user("bye"),
+        ];
+        let result = normalize_cached_channel_turns(turns);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].content, "hello");
+        assert_eq!(result[1].content, "hi");
+        assert_eq!(result[2].content, "bye");
+    }
+
+    #[test]
+    fn normalize_merges_multiple_consecutive_user_turns() {
+        let turns = vec![
+            ChatMessage::user("a"),
+            ChatMessage::user("b"),
+            ChatMessage::user("c"),
+        ];
+        let result = normalize_cached_channel_turns(turns);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].role, "user");
+        assert_eq!(result[0].content, "a\n\nb\n\nc");
+    }
+
+    #[test]
+    fn normalize_empty_input() {
+        let result = normalize_cached_channel_turns(vec![]);
+        assert!(result.is_empty());
+    }
 }
