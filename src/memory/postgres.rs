@@ -39,9 +39,12 @@ impl PostgresMemory {
             config.connect_timeout(Duration::from_secs(bounded));
         }
 
-        let mut client = config
-            .connect(NoTls)
-            .context("failed to connect to PostgreSQL memory backend")?;
+        let mut client = if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::block_in_place(|| config.connect(NoTls))
+        } else {
+            config.connect(NoTls)
+        }
+        .context("failed to connect to PostgreSQL memory backend")?;
 
         let schema_ident = quote_identifier(schema);
         let table_ident = quote_identifier(table);
