@@ -1,4 +1,3 @@
-
 /// The trait for describing a channel
 pub trait ChannelConfig {
     /// human-readable name

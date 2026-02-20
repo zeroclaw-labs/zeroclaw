@@ -295,7 +295,6 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("delivery.to is required for announce mode"))?;
 
-
     // TODO: complete delivery
     //  There should be a method to convert `XXXConfig` to `XXXChannel`
     // to make it much easier...
@@ -320,7 +319,9 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
 
     match channel.to_ascii_lowercase().as_str() {
         "telegram" => {
-            let tg = telegram.as_ref().ok_or_else(|| anyhow::anyhow!("telegram channel not configured"))?;
+            let tg = telegram
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("telegram channel not configured"))?;
             let channel = TelegramChannel::new(
                 tg.bot_token.clone(),
                 tg.allowed_users.clone(),
@@ -329,7 +330,9 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
             channel.send(&SendMessage::new(output, target)).await?;
         }
         "discord" => {
-            let dc = discord.as_ref().ok_or_else(|| anyhow::anyhow!("discord channel not configured"))?;
+            let dc = discord
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("discord channel not configured"))?;
             let channel = DiscordChannel::new(
                 dc.bot_token.clone(),
                 dc.guild_id.clone(),
@@ -340,7 +343,9 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
             channel.send(&SendMessage::new(output, target)).await?;
         }
         "slack" => {
-            let sl = slack.as_ref().ok_or_else(|| anyhow::anyhow!("slack channel not configured"))?;
+            let sl = slack
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("slack channel not configured"))?;
             let channel = SlackChannel::new(
                 sl.bot_token.clone(),
                 sl.channel_id.clone(),
@@ -349,8 +354,9 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
             channel.send(&SendMessage::new(output, target)).await?;
         }
         "mattermost" => {
-            let mm =
-                mattermost.as_ref().ok_or_else(|| anyhow::anyhow!("mattermost channel not configured"))?;
+            let mm = mattermost
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("mattermost channel not configured"))?;
             let channel = MattermostChannel::new(
                 mm.url.clone(),
                 mm.bot_token.clone(),

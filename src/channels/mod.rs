@@ -2264,7 +2264,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         lark,
         dingtalk,
         qq,
-        nextcloud_talk
+        nextcloud_talk,
     } = &config.channels_config.launchable;
 
     if let Some(ref tg) = telegram {

@@ -375,8 +375,12 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         });
 
     // WhatsApp channel (if configured)
-    let whatsapp_channel: Option<Arc<WhatsAppChannel>> =
-        config.channels_config.launchable.whatsapp.as_ref().map(|wa| {
+    let whatsapp_channel: Option<Arc<WhatsAppChannel>> = config
+        .channels_config
+        .launchable
+        .whatsapp
+        .as_ref()
+        .map(|wa| {
             Arc::new(WhatsAppChannel::new(
                 wa.access_token.clone().unwrap_or_default(),
                 wa.phone_number_id.clone().unwrap_or_default(),
@@ -394,24 +398,30 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             (!secret.is_empty()).then(|| secret.to_owned())
         })
         .or_else(|| {
-            config.channels_config.launchable.whatsapp.as_ref().and_then(|wa| {
-                wa.app_secret
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|secret| !secret.is_empty())
-                    .map(ToOwned::to_owned)
-            })
+            config
+                .channels_config
+                .launchable
+                .whatsapp
+                .as_ref()
+                .and_then(|wa| {
+                    wa.app_secret
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|secret| !secret.is_empty())
+                        .map(ToOwned::to_owned)
+                })
         })
         .map(Arc::from);
 
     // Linq channel (if configured)
-    let linq_channel: Option<Arc<LinqChannel>> = config.channels_config.launchable.linq.as_ref().map(|lq| {
-        Arc::new(LinqChannel::new(
-            lq.api_token.clone(),
-            lq.from_phone.clone(),
-            lq.allowed_senders.clone(),
-        ))
-    });
+    let linq_channel: Option<Arc<LinqChannel>> =
+        config.channels_config.launchable.linq.as_ref().map(|lq| {
+            Arc::new(LinqChannel::new(
+                lq.api_token.clone(),
+                lq.from_phone.clone(),
+                lq.allowed_senders.clone(),
+            ))
+        });
 
     // Linq signing secret for webhook signature verification
     // Priority: environment variable > config file
@@ -422,19 +432,28 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             (!secret.is_empty()).then(|| secret.to_owned())
         })
         .or_else(|| {
-            config.channels_config.launchable.linq.as_ref().and_then(|lq| {
-                lq.signing_secret
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|secret| !secret.is_empty())
-                    .map(ToOwned::to_owned)
-            })
+            config
+                .channels_config
+                .launchable
+                .linq
+                .as_ref()
+                .and_then(|lq| {
+                    lq.signing_secret
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|secret| !secret.is_empty())
+                        .map(ToOwned::to_owned)
+                })
         })
         .map(Arc::from);
 
     // Nextcloud Talk channel (if configured)
-    let nextcloud_talk_channel: Option<Arc<NextcloudTalkChannel>> =
-        config.channels_config.launchable.nextcloud_talk.as_ref().map(|nc| {
+    let nextcloud_talk_channel: Option<Arc<NextcloudTalkChannel>> = config
+        .channels_config
+        .launchable
+        .nextcloud_talk
+        .as_ref()
+        .map(|nc| {
             Arc::new(NextcloudTalkChannel::new(
                 nc.base_url.clone(),
                 nc.app_token.clone(),

@@ -308,14 +308,15 @@ mod tests {
     #[test]
     fn detects_mattermost_as_supervised_channel() {
         let mut config = Config::default();
-        config.channels_config.launchable.mattermost = Some(crate::config::schema::MattermostConfig {
-            url: "https://mattermost.example.com".into(),
-            bot_token: "token".into(),
-            channel_id: Some("channel-id".into()),
-            allowed_users: vec!["*".into()],
-            thread_replies: Some(true),
-            mention_only: Some(false),
-        });
+        config.channels_config.launchable.mattermost =
+            Some(crate::config::schema::MattermostConfig {
+                url: "https://mattermost.example.com".into(),
+                bot_token: "token".into(),
+                channel_id: Some("channel-id".into()),
+                allowed_users: vec!["*".into()],
+                thread_replies: Some(true),
+                mention_only: Some(false),
+            });
         assert!(has_supervised_channels(&config));
     }
 
@@ -333,12 +334,13 @@ mod tests {
     #[test]
     fn detects_nextcloud_talk_as_supervised_channel() {
         let mut config = Config::default();
-        config.channels_config.launchable.nextcloud_talk = Some(crate::config::schema::NextcloudTalkConfig {
-            base_url: "https://cloud.example.com".into(),
-            app_token: "app-token".into(),
-            webhook_secret: None,
-            allowed_users: vec!["*".into()],
-        });
+        config.channels_config.launchable.nextcloud_talk =
+            Some(crate::config::schema::NextcloudTalkConfig {
+                base_url: "https://cloud.example.com".into(),
+                app_token: "app-token".into(),
+                webhook_secret: None,
+                allowed_users: vec!["*".into()],
+            });
         assert!(has_supervised_channels(&config));
     }
 }

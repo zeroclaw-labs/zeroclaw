@@ -222,9 +222,7 @@ fn restart_linux(init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
             run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
-            run_checked(
-                Command::new("systemctl").args(["--user", "restart", "zeroclaw.service"]),
-            )?;
+            run_checked(Command::new("systemctl").args(["--user", "restart", "zeroclaw.service"]))?;
         }
         InitSystem::Openrc => {
             run_checked(Command::new("rc-service").args(["zeroclaw", "restart"]))?;

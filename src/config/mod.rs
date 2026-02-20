@@ -7,15 +7,15 @@ pub use schema::{
     build_runtime_proxy_client_with_timeouts, runtime_proxy_config, set_runtime_proxy_config,
     AgentConfig, AuditConfig, AutonomyConfig, BrowserComputerUseConfig, BrowserConfig,
     ChannelsConfig, ClassificationRule, ComposioConfig, Config, CostConfig, CronConfig,
-    DelegateAgentConfig, DiscordConfig, DockerRuntimeConfig, GatewayConfig, HardwareConfig,
-    HardwareTransport, HeartbeatConfig, HttpRequestConfig, IMessageConfig, IdentityConfig,
-    LarkConfig, LaunchableChannelsConfig, MatrixConfig, MemoryConfig, ModelRouteConfig,
-    MultimodalConfig, NextcloudTalkConfig, ObservabilityConfig, PeripheralBoardConfig,
-    PeripheralsConfig, ProxyConfig, ProxyScope, QueryClassificationConfig, ReliabilityConfig,
-    ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig,
-    SecretsConfig, SecurityConfig, SkillsPromptInjectionMode, SlackConfig, StorageConfig,
-    StorageProviderConfig, StorageProviderSection, StreamMode, TelegramConfig, TunnelConfig,
-    WebSearchConfig, WebhookConfig, EmbeddingRouteConfig
+    DelegateAgentConfig, DiscordConfig, DockerRuntimeConfig, EmbeddingRouteConfig, GatewayConfig,
+    HardwareConfig, HardwareTransport, HeartbeatConfig, HttpRequestConfig, IMessageConfig,
+    IdentityConfig, LarkConfig, LaunchableChannelsConfig, MatrixConfig, MemoryConfig,
+    ModelRouteConfig, MultimodalConfig, NextcloudTalkConfig, ObservabilityConfig,
+    PeripheralBoardConfig, PeripheralsConfig, ProxyConfig, ProxyScope, QueryClassificationConfig,
+    ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig,
+    SchedulerConfig, SecretsConfig, SecurityConfig, SkillsPromptInjectionMode, SlackConfig,
+    StorageConfig, StorageProviderConfig, StorageProviderSection, StreamMode, TelegramConfig,
+    TunnelConfig, WebSearchConfig, WebhookConfig,
 };
 
 #[cfg(test)]
