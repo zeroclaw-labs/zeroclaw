@@ -353,6 +353,7 @@ function ChatComposerComponent({
   const modelSelectorRef = useRef<HTMLDivElement | null>(null)
   const composerWrapperRef = useRef<HTMLDivElement | null>(null)
   const focusFrameRef = useRef<number | null>(null)
+  const submitLockRef = useRef(false)
 
   // Phase 4.2: Pinned models
   const { pinned, togglePin, isPinned } = usePinnedModels()
@@ -823,8 +824,22 @@ function ChatComposerComponent({
 
   const handleSubmit = useCallback(() => {
     if (disabled) return
+
+    // Synchronous guard to prevent double-submit race
+    if (submitLockRef.current) return
+    submitLockRef.current = true
+
     const body = value.trim()
-    if (body.length === 0 && attachments.length === 0) return
+    if (body.length === 0 && attachments.length === 0) {
+      submitLockRef.current = false
+      return
+    }
+
+    // Release lock after short window
+    setTimeout(() => {
+      submitLockRef.current = false
+    }, 500)
+
     const attachmentPayload = attachments.map((attachment) => ({
       ...attachment,
     }))
