@@ -49,6 +49,76 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
+/// Token usage information from a provider response.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Usage {
+    /// Provider name (e.g., "openrouter", "anthropic").
+    pub provider: String,
+    /// Model name (e.g., "moonshot-intl/kimi-k2.5").
+    pub model: String,
+    /// Input/prompt tokens.
+    pub input_tokens: u64,
+    /// Output/completion tokens.
+    pub output_tokens: u64,
+    /// Cache read tokens (default 0).
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    /// Cache write tokens (default 0).
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+    /// Computed cost in USD (default 0.0).
+    #[serde(default)]
+    pub cost_usd: f64,
+}
+
+impl Usage {
+    /// Create a new usage with provider, model, and token counts.
+    pub fn new(provider: impl Into<String>, model: impl Into<String>, input: u64, output: u64) -> Self {
+        Self {
+            provider: provider.into(),
+            model: model.into(),
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            cost_usd: 0.0,
+        }
+    }
+
+    /// Add cache read tokens.
+    pub fn with_cache_read(mut self, tokens: u64) -> Self {
+        self.cache_read_tokens = tokens;
+        self
+    }
+
+    /// Add cache write tokens.
+    pub fn with_cache_write(mut self, tokens: u64) -> Self {
+        self.cache_write_tokens = tokens;
+        self
+    }
+
+    /// Set the computed cost.
+    pub fn with_cost(mut self, cost_usd: f64) -> Self {
+        self.cost_usd = cost_usd;
+        self
+    }
+
+    /// Total tokens (input + output).
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
+
+    /// Total cache tokens.
+    pub fn total_cache_tokens(&self) -> u64 {
+        self.cache_read_tokens.saturating_add(self.cache_write_tokens)
+    }
+
+    /// Check if usage has any tokens recorded.
+    pub fn is_empty(&self) -> bool {
+        self.input_tokens == 0 && self.output_tokens == 0
+    }
+}
+
 /// An LLM response that may contain text, tool calls, or both.
 #[derive(Debug, Clone)]
 pub struct ChatResponse {
@@ -56,9 +126,26 @@ pub struct ChatResponse {
     pub text: Option<String>,
     /// Tool calls requested by the LLM.
     pub tool_calls: Vec<ToolCall>,
+    /// Token usage information if available from provider.
+    pub usage: Option<Usage>,
 }
 
 impl ChatResponse {
+    /// Create a new ChatResponse with text only.
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: Some(text.into()),
+            tool_calls: Vec::new(),
+            usage: None,
+        }
+    }
+
+    /// Create a new ChatResponse with text and usage.
+    pub fn with_usage(mut self, usage: Usage) -> Self {
+        self.usage = Some(usage);
+        self
+    }
+
     /// True when the LLM wants to invoke at least one tool.
     pub fn has_tool_calls(&self) -> bool {
         !self.tool_calls.is_empty()
@@ -261,6 +348,19 @@ pub trait Provider: Send + Sync {
             .await
     }
 
+    /// Simple one-shot chat that returns full response with usage information.
+    ///
+    /// Use this when you need token counts from the provider.
+    async fn simple_chat_with_usage(
+        &self,
+        message: &str,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ChatResponse> {
+        let text = self.simple_chat(message, model, temperature).await?;
+        Ok(ChatResponse::text(text))
+    }
+
     /// One-shot chat with optional system prompt.
     ///
     /// Kept for compatibility and advanced one-shot prompting.
@@ -333,6 +433,7 @@ pub trait Provider: Send + Sync {
                 return Ok(ChatResponse {
                     text: Some(text),
                     tool_calls: Vec::new(),
+                    usage: None,
                 });
             }
         }
@@ -343,6 +444,7 @@ pub trait Provider: Send + Sync {
         Ok(ChatResponse {
             text: Some(text),
             tool_calls: Vec::new(),
+            usage: None,
         })
     }
 
@@ -371,6 +473,7 @@ pub trait Provider: Send + Sync {
         Ok(ChatResponse {
             text: Some(text),
             tool_calls: Vec::new(),
+            usage: None,
         })
     }
 
@@ -493,6 +596,7 @@ mod tests {
         let empty = ChatResponse {
             text: None,
             tool_calls: vec![],
+            usage: None,
         };
         assert!(!empty.has_tool_calls());
         assert_eq!(empty.text_or_empty(), "");
@@ -504,6 +608,7 @@ mod tests {
                 name: "shell".into(),
                 arguments: "{}".into(),
             }],
+            usage: None,
         };
         assert!(with_tools.has_tool_calls());
         assert_eq!(with_tools.text_or_empty(), "Let me check");

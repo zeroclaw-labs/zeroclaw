@@ -223,6 +223,20 @@ struct Message {
 #[derive(Debug, Deserialize)]
 struct ApiChatResponse {
     choices: Vec<Choice>,
+    /// Usage information from OpenAI-compatible API.
+    #[serde(default)]
+    usage: Option<OpenAiCompatibleUsage>,
+}
+
+/// Usage information in OpenAI-compatible API response format.
+#[derive(Debug, Deserialize)]
+struct OpenAiCompatibleUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
+    #[serde(default)]
+    total_tokens: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -717,7 +731,18 @@ impl OpenAiCompatibleProvider {
         modified_messages
     }
 
-    fn parse_native_response(message: ResponseMessage) -> ProviderChatResponse {
+    fn parse_native_response(response: ApiChatResponse, provider: &str, model: &str) -> ProviderChatResponse {
+        let message = match response.choices.into_iter().next() {
+            Some(c) => c.message,
+            None => {
+                return ProviderChatResponse {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }
+            }
+        };
+
         let tool_calls = message
             .tool_calls
             .unwrap_or_default()
@@ -734,9 +759,21 @@ impl OpenAiCompatibleProvider {
             })
             .collect::<Vec<_>>();
 
+        let usage = response.usage.map(|u| {
+            crate::pricing::compute_usage_with_cost(
+                provider,
+                model,
+                u.prompt_tokens,
+                u.completion_tokens,
+                0, // cache_read_tokens
+                0, // cache_write_tokens
+            )
+        });
+
         ProviderChatResponse {
             text: message.content,
             tool_calls,
+            usage,
         }
     }
 
@@ -1026,7 +1063,7 @@ impl Provider for OpenAiCompatibleProvider {
             })
             .collect::<Vec<_>>();
 
-        Ok(ProviderChatResponse { text, tool_calls })
+        Ok(ProviderChatResponse { text, tool_calls, usage: None })
     }
 
     async fn chat(
@@ -1072,6 +1109,7 @@ impl Provider for OpenAiCompatibleProvider {
                 return Ok(ProviderChatResponse {
                     text: Some(text),
                     tool_calls: vec![],
+                    usage: None,
                 });
             }
 
@@ -1090,6 +1128,7 @@ impl Provider for OpenAiCompatibleProvider {
                         .map(|text| ProviderChatResponse {
                             text: Some(text),
                             tool_calls: vec![],
+                            usage: None,
                         })
                         .map_err(|responses_err| {
                             anyhow::anyhow!(
@@ -1104,14 +1143,7 @@ impl Provider for OpenAiCompatibleProvider {
         }
 
         let native_response: ApiChatResponse = response.json().await?;
-        let message = native_response
-            .choices
-            .into_iter()
-            .next()
-            .map(|choice| choice.message)
-            .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))?;
-
-        Ok(Self::parse_native_response(message))
+        Ok(Self::parse_native_response(native_response, &self.name, model))
     }
 
     fn supports_native_tools(&self) -> bool {
@@ -1625,20 +1657,25 @@ mod tests {
 
     #[test]
     fn parse_native_response_preserves_tool_call_id() {
-        let message = ResponseMessage {
-            content: None,
-            tool_calls: Some(vec![ToolCall {
-                id: Some("call_123".to_string()),
-                kind: Some("function".to_string()),
-                function: Some(Function {
-                    name: Some("shell".to_string()),
-                    arguments: Some(r#"{"command":"pwd"}"#.to_string()),
-                }),
-            }]),
-            reasoning_content: None,
+        let response = ApiChatResponse {
+            choices: vec![Choice {
+                message: ResponseMessage {
+                    content: None,
+                    tool_calls: Some(vec![ToolCall {
+                        id: Some("call_123".to_string()),
+                        kind: Some("function".to_string()),
+                        function: Some(Function {
+                            name: Some("shell".to_string()),
+                            arguments: Some(r#"{"command":"pwd"}"#.to_string()),
+                        }),
+                    }]),
+                    reasoning_content: None,
+                },
+            }],
+            usage: None,
         };
 
-        let parsed = OpenAiCompatibleProvider::parse_native_response(message);
+        let parsed = OpenAiCompatibleProvider::parse_native_response(response, "test-provider", "test-model");
         assert_eq!(parsed.tool_calls.len(), 1);
         assert_eq!(parsed.tool_calls[0].id, "call_123");
         assert_eq!(parsed.tool_calls[0].name, "shell");

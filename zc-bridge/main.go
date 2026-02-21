@@ -43,6 +43,25 @@ type Session struct {
     CreatedAt time.Time `json:"createdAt"`
 }
 
+// Usage tracks token usage for a session
+type Usage struct {
+    InputTokens  uint64  `json:"inputTokens"`
+    OutputTokens uint64  `json:"outputTokens"`
+    Model        string  `json:"model"`
+    UpdatedAt    int64   `json:"updatedAt"`
+}
+
+// SessionUsage combines session info with usage data
+type SessionUsage struct {
+    Key           string  `json:"key"`
+    Model         string  `json:"model"`
+    Status        string  `json:"status"`
+    InputTokens   uint64  `json:"inputTokens"`
+    OutputTokens  uint64  `json:"outputTokens"`
+    TotalCostUsd  float64 `json:"totalCostUsd"`
+    MessageCount  int     `json:"messageCount"`
+}
+
 // ContentBlock represents a content block in ClawSuite message format
 type ContentBlock struct {
     Type string `json:"type"` // "text"
@@ -61,6 +80,9 @@ var (
     seq           int64
     chatHistory   = map[string][]ChatMessage{} // sessionKey -> messages
     chatHistoryMu sync.Mutex
+    sessionUsage  = map[string]*Usage{} // sessionKey -> usage
+    usageMu       sync.Mutex
+    totalUsage    = &Usage{} // global totals
 )
 
 func getenv(k, d string) string {
@@ -107,6 +129,73 @@ func getMessages(sessionKey string, limit int) []ChatMessage {
         return msgs[len(msgs)-limit:]
     }
     return msgs
+}
+
+// updateUsage adds tokens to session and global usage
+func updateUsage(sessionKey, model string, inputTokens, outputTokens uint64) {
+    usageMu.Lock()
+    defer usageMu.Unlock()
+
+    // Update session usage
+    if u, ok := sessionUsage[sessionKey]; ok {
+        u.InputTokens += inputTokens
+        u.OutputTokens += outputTokens
+        u.Model = model
+        u.UpdatedAt = time.Now().Unix()
+    } else {
+        sessionUsage[sessionKey] = &Usage{
+            InputTokens:  inputTokens,
+            OutputTokens: outputTokens,
+            Model:        model,
+            UpdatedAt:    time.Now().Unix(),
+        }
+    }
+
+    // Update global totals
+    totalUsage.InputTokens += inputTokens
+    totalUsage.OutputTokens += outputTokens
+}
+
+// getSessionUsage returns usage for a session
+func getSessionUsage(sessionKey string) *Usage {
+    usageMu.Lock()
+    defer usageMu.Unlock()
+    if u, ok := sessionUsage[sessionKey]; ok {
+        return u
+    }
+    return &Usage{}
+}
+
+// getAllSessionUsage returns all session usage data
+func getAllSessionUsage() []SessionUsage {
+    usageMu.Lock()
+    defer usageMu.Unlock()
+
+    result := make([]SessionUsage, 0, len(sessionUsage))
+    for key, u := range sessionUsage {
+        // Count messages for this session
+        chatHistoryMu.Lock()
+        msgCount := len(chatHistory[key])
+        chatHistoryMu.Unlock()
+
+        result = append(result, SessionUsage{
+            Key:          key,
+            Model:        u.Model,
+            Status:       "active",
+            InputTokens:  u.InputTokens,
+            OutputTokens: u.OutputTokens,
+            TotalCostUsd: 0.0, // Cost calculation would need pricing table
+            MessageCount: msgCount,
+        })
+    }
+    return result
+}
+
+// getTotalUsage returns global token totals
+func getTotalUsage() (inputTokens, outputTokens uint64) {
+    usageMu.Lock()
+    defer usageMu.Unlock()
+    return totalUsage.InputTokens, totalUsage.OutputTokens
 }
 
 func safeWriteJSON(ws *websocket.Conn, mu *sync.Mutex, v any) error {
@@ -260,7 +349,8 @@ func handleSessionsPatch(ws *websocket.Conn, writeMu *sync.Mutex, f Frame) {
 func handleSessionsResolve(ws *websocket.Conn, writeMu *sync.Mutex, f Frame) {
     // Parse params to get key
     var params struct {
-        Key string `json:"key"`
+        Key   string `json:"key"`
+        Model string `json:"model"`
     }
     key := "main"
     if len(f.Params) > 0 {
@@ -268,6 +358,20 @@ func handleSessionsResolve(ws *websocket.Conn, writeMu *sync.Mutex, f Frame) {
             key = params.Key
         }
     }
+
+    // Create or update session
+    sessionsMu.Lock()
+    if _, ok := sessions[key]; !ok {
+        sessions[key] = &Session{
+            Key:       key,
+            Status:    "active",
+            Model:     params.Model,
+            CreatedAt: time.Now(),
+        }
+    } else if params.Model != "" {
+        sessions[key].Model = params.Model
+    }
+    sessionsMu.Unlock()
 
     safeWriteJSON(ws, writeMu, Frame{
         Type:    "res",
@@ -300,29 +404,63 @@ func handleSessionStatus(ws *websocket.Conn, writeMu *sync.Mutex, f Frame) {
 }
 
 func handleSessionsUsage(ws *websocket.Conn, writeMu *sync.Mutex, f Frame) {
+    sessions := getAllSessionUsage()
+    inputTokens, outputTokens := getTotalUsage()
+
+    // Build response in ClawSuite expected format
+    sessionList := make([]map[string]any, 0, len(sessions))
+    for _, s := range sessions {
+        sessionList = append(sessionList, map[string]any{
+            "key":          s.Key,
+            "model":        s.Model,
+            "status":       s.Status,
+            "messageCount": s.MessageCount,
+            "usage": map[string]any{
+                "input":       s.InputTokens,
+                "output":      s.OutputTokens,
+                "totalTokens": s.InputTokens + s.OutputTokens,
+                "totalCost":   s.TotalCostUsd,
+            },
+        })
+    }
+
     safeWriteJSON(ws, writeMu, Frame{
         Type:    "res",
         ID:      f.ID,
         Ok:      true,
         Payload: mustJSON(map[string]any{
-            "sessions": []any{},
-            "totalInputTokens":  0,
-            "totalOutputTokens": 0,
-            "totalCostUsd":      0.0,
+            "sessions":           sessionList,
+            "totalInputTokens":   inputTokens,
+            "totalOutputTokens":  outputTokens,
+            "totalCostUsd":       0.0, // Would need pricing table
+            "totals": map[string]any{
+                "input":       inputTokens,
+                "output":      outputTokens,
+                "totalTokens": inputTokens + outputTokens,
+                "totalCost":   0.0,
+            },
         }),
     })
 }
 
 func handleUsageCost(ws *websocket.Conn, writeMu *sync.Mutex, f Frame) {
+    inputTokens, outputTokens := getTotalUsage()
+
     safeWriteJSON(ws, writeMu, Frame{
         Type:    "res",
         ID:      f.ID,
         Ok:      true,
         Payload: mustJSON(map[string]any{
-            "totalCostUsd":      0.0,
-            "totalInputTokens":  0,
-            "totalOutputTokens": 0,
-            "byModel":           map[string]any{},
+            "totalCostUsd":      0.0, // Would need pricing table
+            "totalInputTokens":  inputTokens,
+            "totalOutputTokens": outputTokens,
+            "totals": map[string]any{
+                "input":  inputTokens,
+                "output": outputTokens,
+                "cost":   0.0,
+            },
+            "byModel": map[string]any{},
+            "daily":   []any{},
         }),
     })
 }
@@ -500,9 +638,24 @@ func handleZeroClawForward(ws *websocket.Conn, writeMu *sync.Mutex, f Frame) {
 
     // Extract assistant text from response
     assistantText := ""
+    model := ""
+    var inputTokens, outputTokens uint64
     var m map[string]any
     if json.Unmarshal(b, &m) == nil {
-        // Try common keys
+        // Extract model
+        if v, ok := m["model"].(string); ok && v != "" {
+            model = v
+        }
+        // Extract usage
+        if u, ok := m["usage"].(map[string]any); ok {
+            if v, ok := u["input_tokens"].(float64); ok {
+                inputTokens = uint64(v)
+            }
+            if v, ok := u["output_tokens"].(float64); ok {
+                outputTokens = uint64(v)
+            }
+        }
+        // Try common keys for response text
         for _, key := range []string{"response", "message", "text", "output"} {
             if v, ok := m[key]; ok {
                 if s, ok := v.(string); ok && s != "" {
@@ -528,6 +681,14 @@ func handleZeroClawForward(ws *websocket.Conn, writeMu *sync.Mutex, f Frame) {
     }
     if assistantText == "" {
         assistantText = "(empty response)"
+    }
+
+    // Update usage tracking if we have tokens
+    if inputTokens > 0 || outputTokens > 0 {
+        updateUsage(sessionKey, model, inputTokens, outputTokens)
+        if os.Getenv("ZC_BRIDGE_DEBUG") == "1" {
+            log.Printf("[usage] session=%s model=%s input=%d output=%d", sessionKey, model, inputTokens, outputTokens)
+        }
     }
 
     // Store assistant message in history

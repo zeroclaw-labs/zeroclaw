@@ -10,7 +10,7 @@
 use crate::channels::{Channel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
-use crate::providers::{self, Provider};
+use crate::providers::{self, ChatMessage, ChatRequest, Provider};
 use crate::runtime;
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::security::SecurityPolicy;
@@ -732,13 +732,26 @@ async fn handle_webhook(
             messages_count: 1,
         });
 
+    // Use chat() method to get full response with usage information
+    let chat_request = ChatRequest {
+        messages: &[ChatMessage::user(message)],
+        tools: None,
+    };
+
     match state
         .provider
-        .simple_chat(message, &state.model, state.temperature)
+        .chat(chat_request, &state.model, state.temperature)
         .await
     {
         Ok(response) => {
             let duration = started_at.elapsed();
+            let tokens_used = response.usage.as_ref().map(|u| u.input_tokens + u.output_tokens);
+            let (input_tokens, output_tokens) = response
+                .usage
+                .as_ref()
+                .map(|u| (u.input_tokens, u.output_tokens))
+                .unwrap_or((0, 0));
+
             state
                 .observer
                 .record_event(&crate::observability::ObserverEvent::LlmResponse {
@@ -754,14 +767,22 @@ async fn handle_webhook(
             state
                 .observer
                 .record_event(&crate::observability::ObserverEvent::AgentEnd {
-                    provider: provider_label,
-                    model: model_label,
+                    provider: provider_label.clone(),
+                    model: model_label.clone(),
                     duration,
-                    tokens_used: None,
+                    tokens_used,
                     cost_usd: None,
                 });
 
-            let body = serde_json::json!({"response": response, "model": state.model});
+            let text = response.text_or_empty().to_string();
+            let body = serde_json::json!({
+                "response": text,
+                "model": state.model,
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens
+                }
+            });
             (StatusCode::OK, Json(body))
         }
         Err(e) => {

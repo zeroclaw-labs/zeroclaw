@@ -1,5 +1,5 @@
 # ZeroClaw Docker Compose Example
-# 
+#
 # Quick start:
 #   1. Copy this file and set your API key
 #   2. Run: docker compose up -d
@@ -14,31 +14,31 @@ services:
     # build: .
     container_name: zeroclaw
     restart: unless-stopped
-    
+
     environment:
       # Required: Your LLM provider API key
       - API_KEY=${API_KEY:-}
       # Or use the prefixed version:
       # - ZEROCLAW_API_KEY=${ZEROCLAW_API_KEY:-}
-      
+
       # Optional: LLM provider (default: openrouter)
       # Options: openrouter, openai, anthropic, ollama
       - PROVIDER=${PROVIDER:-openrouter}
-      
+
       # Allow public bind inside Docker (required for container networking)
       - ZEROCLAW_ALLOW_PUBLIC_BIND=true
-      
+
       # Optional: Model override
       # - ZEROCLAW_MODEL=anthropic/claude-sonnet-4-20250514
-      
+
     volumes:
       # Persist workspace and config (must match WORKDIR/HOME in Dockerfile)
       - zeroclaw-data:/zeroclaw-data
-      
+
     ports:
       # Gateway API port (override HOST_PORT if 3000 is taken)
       - "${HOST_PORT:-3000}:3000"
-    
+
     # Resource limits
     deploy:
       resources:

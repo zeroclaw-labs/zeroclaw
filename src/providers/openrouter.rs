@@ -93,6 +93,14 @@ struct NativeFunctionCall {
 #[derive(Debug, Deserialize)]
 struct NativeChatResponse {
     choices: Vec<NativeChoice>,
+    #[serde(default)]
+    usage: Option<NativeUsage>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct NativeUsage {
+    prompt_tokens: u64,
+    completion_tokens: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -202,7 +210,7 @@ impl OpenRouterProvider {
             .collect()
     }
 
-    fn parse_native_response(message: NativeResponseMessage) -> ProviderChatResponse {
+    fn parse_native_response(message: NativeResponseMessage, usage: Option<NativeUsage>, model: &str) -> ProviderChatResponse {
         let tool_calls = message
             .tool_calls
             .unwrap_or_default()
@@ -214,9 +222,21 @@ impl OpenRouterProvider {
             })
             .collect::<Vec<_>>();
 
+        let usage = usage.map(|u| {
+            crate::pricing::compute_usage_with_cost(
+                "openrouter",
+                model,
+                u.prompt_tokens,
+                u.completion_tokens,
+                0, // cache_read_tokens
+                0, // cache_write_tokens
+            )
+        });
+
         ProviderChatResponse {
             text: message.content,
             tool_calls,
+            usage,
         }
     }
 
@@ -387,13 +407,14 @@ impl Provider for OpenRouterProvider {
         }
 
         let native_response: NativeChatResponse = response.json().await?;
+        let usage = native_response.usage.clone();
         let message = native_response
             .choices
             .into_iter()
             .next()
             .map(|c| c.message)
             .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))?;
-        Ok(Self::parse_native_response(message))
+        Ok(Self::parse_native_response(message, usage, model))
     }
 
     fn supports_native_tools(&self) -> bool {
@@ -475,13 +496,14 @@ impl Provider for OpenRouterProvider {
         }
 
         let native_response: NativeChatResponse = response.json().await?;
+        let usage = native_response.usage.clone();
         let message = native_response
             .choices
             .into_iter()
             .next()
             .map(|c| c.message)
             .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))?;
-        Ok(Self::parse_native_response(message))
+        Ok(Self::parse_native_response(message, usage, model))
     }
 }
 
@@ -706,7 +728,7 @@ mod tests {
             }]),
         };
 
-        let response = OpenRouterProvider::parse_native_response(message);
+        let response = OpenRouterProvider::parse_native_response(message, None, "test-model");
 
         assert_eq!(response.text.as_deref(), Some("Here you go."));
         assert_eq!(response.tool_calls.len(), 1);

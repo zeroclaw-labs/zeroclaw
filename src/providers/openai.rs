@@ -107,6 +107,20 @@ struct NativeFunctionCall {
 #[derive(Debug, Deserialize)]
 struct NativeChatResponse {
     choices: Vec<NativeChoice>,
+    /// Usage information from OpenAI API.
+    #[serde(default)]
+    usage: Option<OpenAiUsage>,
+}
+
+/// Usage information in OpenAI API response format.
+#[derive(Debug, Deserialize)]
+struct OpenAiUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
+    #[serde(default)]
+    total_tokens: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -233,7 +247,18 @@ impl OpenAiProvider {
             .collect()
     }
 
-    fn parse_native_response(message: NativeResponseMessage) -> ProviderChatResponse {
+    fn parse_native_response(response: NativeChatResponse, model: &str) -> ProviderChatResponse {
+        let message = match response.choices.into_iter().next() {
+            Some(c) => c.message,
+            None => {
+                return ProviderChatResponse {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }
+            }
+        };
+
         let text = message.effective_content();
         let tool_calls = message
             .tool_calls
@@ -246,7 +271,18 @@ impl OpenAiProvider {
             })
             .collect::<Vec<_>>();
 
-        ProviderChatResponse { text, tool_calls }
+        let usage = response.usage.map(|u| {
+            crate::pricing::compute_usage_with_cost(
+                "openai",
+                model,
+                u.prompt_tokens,
+                u.completion_tokens,
+                0, // cache_read_tokens
+                0, // cache_write_tokens
+            )
+        });
+
+        ProviderChatResponse { text, tool_calls, usage }
     }
 
     fn http_client(&self) -> Client {
@@ -341,13 +377,7 @@ impl Provider for OpenAiProvider {
         }
 
         let native_response: NativeChatResponse = response.json().await?;
-        let message = native_response
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| c.message)
-            .ok_or_else(|| anyhow::anyhow!("No response from OpenAI"))?;
-        Ok(Self::parse_native_response(message))
+        Ok(Self::parse_native_response(native_response, model))
     }
 
     fn supports_native_tools(&self) -> bool {

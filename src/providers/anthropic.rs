@@ -128,6 +128,18 @@ struct SystemBlock {
 struct NativeChatResponse {
     #[serde(default)]
     content: Vec<NativeContentIn>,
+    /// Usage information from Anthropic API.
+    #[serde(default)]
+    usage: Option<AnthropicUsage>,
+}
+
+/// Usage information in Anthropic API response format.
+#[derive(Debug, Deserialize)]
+struct AnthropicUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -358,7 +370,7 @@ impl AnthropicProvider {
             .ok_or_else(|| anyhow::anyhow!("No response from Anthropic"))
     }
 
-    fn parse_native_response(response: NativeChatResponse) -> ProviderChatResponse {
+    fn parse_native_response(response: NativeChatResponse, model: &str) -> ProviderChatResponse {
         let mut text_parts = Vec::new();
         let mut tool_calls = Vec::new();
 
@@ -396,6 +408,16 @@ impl AnthropicProvider {
                 Some(text_parts.join("\n"))
             },
             tool_calls,
+            usage: response.usage.map(|u| {
+                crate::pricing::compute_usage_with_cost(
+                    "anthropic",
+                    model,
+                    u.input_tokens,
+                    u.output_tokens,
+                    0, // cache_read_tokens
+                    0, // cache_write_tokens
+                )
+            }),
         }
     }
 
@@ -490,7 +512,7 @@ impl Provider for AnthropicProvider {
         }
 
         let native_response: NativeChatResponse = response.json().await?;
-        Ok(Self::parse_native_response(native_response))
+        Ok(Self::parse_native_response(native_response, model))
     }
 
     fn supports_native_tools(&self) -> bool {
