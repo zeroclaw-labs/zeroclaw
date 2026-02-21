@@ -532,6 +532,21 @@ enum DoctorCommands {
         #[arg(long)]
         use_cache: bool,
     },
+    /// Query runtime trace events (tool diagnostics and model replies)
+    Traces {
+        /// Show a specific trace event by id
+        #[arg(long)]
+        id: Option<String>,
+        /// Filter list output by event type
+        #[arg(long)]
+        event: Option<String>,
+        /// Case-insensitive text match across message/payload
+        #[arg(long)]
+        contains: Option<String>,
+        /// Maximum number of events to display
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -657,6 +672,7 @@ async fn main() -> Result<()> {
     // All other commands need config loaded first
     let mut config = Config::load_or_init().await?;
     config.apply_env_overrides();
+    observability::runtime_trace::init_from_config(&config.observability, &config.workspace_dir);
 
     match cli.command {
         Commands::Onboard { .. } => unreachable!(),
@@ -718,6 +734,10 @@ async fn main() -> Result<()> {
                 config.default_model.as_deref().unwrap_or("(default)")
             );
             println!("📊 Observability:  {}", config.observability.backend);
+            println!(
+                "🧾 Trace storage:  {} ({})",
+                config.observability.runtime_trace_mode, config.observability.runtime_trace_path
+            );
             println!("🛡️  Autonomy:      {:?}", config.autonomy.level);
             println!("⚙️  Runtime:       {}", config.runtime.kind);
             let effective_memory_backend = memory::effective_memory_backend_name(
@@ -841,6 +861,18 @@ async fn main() -> Result<()> {
                 provider,
                 use_cache,
             }) => doctor::run_models(&config, provider.as_deref(), use_cache).await,
+            Some(DoctorCommands::Traces {
+                id,
+                event,
+                contains,
+                limit,
+            }) => doctor::run_traces(
+                &config,
+                id.as_deref(),
+                event.as_deref(),
+                contains.as_deref(),
+                limit,
+            ),
             None => doctor::run(&config),
         },
 

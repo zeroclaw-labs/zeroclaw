@@ -1758,6 +1758,19 @@ pub struct ObservabilityConfig {
     /// Service name reported to the OTel collector. Defaults to "zeroclaw".
     #[serde(default)]
     pub otel_service_name: Option<String>,
+
+    /// Runtime trace storage mode: "none" | "rolling" | "full".
+    /// Controls whether model replies and tool-call diagnostics are persisted.
+    #[serde(default = "default_runtime_trace_mode")]
+    pub runtime_trace_mode: String,
+
+    /// Runtime trace file path. Relative paths are resolved under workspace_dir.
+    #[serde(default = "default_runtime_trace_path")]
+    pub runtime_trace_path: String,
+
+    /// Maximum entries retained when runtime_trace_mode = "rolling".
+    #[serde(default = "default_runtime_trace_max_entries")]
+    pub runtime_trace_max_entries: usize,
 }
 
 impl Default for ObservabilityConfig {
@@ -1766,8 +1779,23 @@ impl Default for ObservabilityConfig {
             backend: "none".into(),
             otel_endpoint: None,
             otel_service_name: None,
+            runtime_trace_mode: default_runtime_trace_mode(),
+            runtime_trace_path: default_runtime_trace_path(),
+            runtime_trace_max_entries: default_runtime_trace_max_entries(),
         }
     }
+}
+
+fn default_runtime_trace_mode() -> String {
+    "none".to_string()
+}
+
+fn default_runtime_trace_path() -> String {
+    "state/runtime-trace.jsonl".to_string()
+}
+
+fn default_runtime_trace_max_entries() -> usize {
+    200
 }
 
 // ── Hooks ────────────────────────────────────────────────────────
@@ -4042,6 +4070,9 @@ mod tests {
     async fn observability_config_default() {
         let o = ObservabilityConfig::default();
         assert_eq!(o.backend, "none");
+        assert_eq!(o.runtime_trace_mode, "none");
+        assert_eq!(o.runtime_trace_path, "state/runtime-trace.jsonl");
+        assert_eq!(o.runtime_trace_max_entries, 200);
     }
 
     #[test]
@@ -4243,6 +4274,7 @@ default_temperature = 0.7
         assert_eq!(parsed.default_model, config.default_model);
         assert!((parsed.default_temperature - config.default_temperature).abs() < f64::EPSILON);
         assert_eq!(parsed.observability.backend, "log");
+        assert_eq!(parsed.observability.runtime_trace_mode, "none");
         assert_eq!(parsed.autonomy.level, AutonomyLevel::Full);
         assert!(!parsed.autonomy.workspace_only);
         assert_eq!(parsed.runtime.kind, "docker");
@@ -4266,6 +4298,7 @@ default_temperature = 0.7
         assert!(parsed.api_key.is_none());
         assert!(parsed.default_provider.is_none());
         assert_eq!(parsed.observability.backend, "none");
+        assert_eq!(parsed.observability.runtime_trace_mode, "none");
         assert_eq!(parsed.autonomy.level, AutonomyLevel::Supervised);
         assert_eq!(parsed.runtime.kind, "native");
         assert!(!parsed.heartbeat.enabled);

@@ -63,11 +63,11 @@ pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
 
-use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
+use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop, scrub_credentials};
 use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
-use crate::observability::{self, Observer};
+use crate::observability::{self, runtime_trace, Observer};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
 use crate::security::SecurityPolicy;
@@ -385,7 +385,7 @@ fn strip_tool_call_tags(message: &str) -> String {
 fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
     match channel_name {
         "telegram" => Some(
-            "When responding on Telegram:\n\
+            "When responding on Telegram, include media markers for files or URLs that should be sent as attachments.\n\
              - Use **bold** for key terms, section titles, and important info (renders as <b>)\n\
              - Use *italic* for emphasis (renders as <i>)\n\
              - Use `backticks` for inline code, commands, or technical terms\n\
@@ -1457,6 +1457,21 @@ async fn process_channel_message(
         msg.sender,
         truncate_with_ellipsis(&msg.content, 80)
     );
+    runtime_trace::record_event(
+        "channel_message_inbound",
+        Some(msg.channel.as_str()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        serde_json::json!({
+            "sender": msg.sender,
+            "message_id": msg.id,
+            "reply_target": msg.reply_target,
+            "content_preview": truncate_with_ellipsis(&msg.content, 160),
+        }),
+    );
 
     // ── Hook: on_message_received (modifying) ────────────
     let msg = if let Some(hooks) = &ctx.hooks {
@@ -1556,6 +1571,14 @@ async fn process_channel_message(
         .as_ref()
         .is_some_and(|ch| ch.supports_draft_updates());
 
+    tracing::debug!(
+        channel = %msg.channel,
+        has_target_channel = target_channel.is_some(),
+        use_streaming,
+        supports_draft = target_channel.as_ref().map_or(false, |ch| ch.supports_draft_updates()),
+        "Draft streaming decision"
+    );
+
     let (delta_tx, delta_rx) = if use_streaming {
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
         (Some(tx), Some(rx))
@@ -1595,6 +1618,10 @@ async fn process_channel_message(
         Some(tokio::spawn(async move {
             let mut accumulated = String::new();
             while let Some(delta) = rx.recv().await {
+                if delta == crate::agent::loop_::DRAFT_CLEAR_SENTINEL {
+                    accumulated.clear();
+                    continue;
+                }
                 accumulated.push_str(&delta);
                 if let Err(e) = channel
                     .update_draft(&reply_target, &draft_id, &accumulated)
@@ -1690,6 +1717,19 @@ async fn process_channel_message(
                 sender = %msg.sender,
                 "Cancelled in-flight channel request due to newer message"
             );
+            runtime_trace::record_event(
+                "channel_message_cancelled",
+                Some(msg.channel.as_str()),
+                Some(route.provider.as_str()),
+                Some(route.model.as_str()),
+                None,
+                Some(false),
+                Some("cancelled due to newer inbound message"),
+                serde_json::json!({
+                    "sender": msg.sender,
+                    "elapsed_ms": started_at.elapsed().as_millis(),
+                }),
+            );
             if let (Some(channel), Some(draft_id)) =
                 (target_channel.as_ref(), draft_message_id.as_deref())
             {
@@ -1766,6 +1806,20 @@ async fn process_channel_message(
             } else {
                 sanitized_response
             };
+            runtime_trace::record_event(
+                "channel_message_outbound",
+                Some(msg.channel.as_str()),
+                Some(route.provider.as_str()),
+                Some(route.model.as_str()),
+                None,
+                Some(true),
+                None,
+                serde_json::json!({
+                    "sender": msg.sender,
+                    "elapsed_ms": started_at.elapsed().as_millis(),
+                    "response": scrub_credentials(&delivered_response),
+                }),
+            );
 
             // Extract condensed tool-use context from the history messages
             // added during run_tool_call_loop, so the LLM retains awareness
@@ -1820,6 +1874,19 @@ async fn process_channel_message(
                     sender = %msg.sender,
                     "Cancelled in-flight channel request due to newer message"
                 );
+                runtime_trace::record_event(
+                    "channel_message_cancelled",
+                    Some(msg.channel.as_str()),
+                    Some(route.provider.as_str()),
+                    Some(route.model.as_str()),
+                    None,
+                    Some(false),
+                    Some("cancelled during tool-call loop"),
+                    serde_json::json!({
+                        "sender": msg.sender,
+                        "elapsed_ms": started_at.elapsed().as_millis(),
+                    }),
+                );
                 if let (Some(channel), Some(draft_id)) =
                     (target_channel.as_ref(), draft_message_id.as_deref())
                 {
@@ -1839,6 +1906,20 @@ async fn process_channel_message(
                     started_at.elapsed().as_millis(),
                     compacted
                 );
+                runtime_trace::record_event(
+                    "channel_message_error",
+                    Some(msg.channel.as_str()),
+                    Some(route.provider.as_str()),
+                    Some(route.model.as_str()),
+                    None,
+                    Some(false),
+                    Some("context window exceeded"),
+                    serde_json::json!({
+                        "sender": msg.sender,
+                        "elapsed_ms": started_at.elapsed().as_millis(),
+                        "history_compacted": compacted,
+                    }),
+                );
                 if let Some(channel) = target_channel.as_ref() {
                     if let Some(ref draft_id) = draft_message_id {
                         let _ = channel
@@ -1857,6 +1938,20 @@ async fn process_channel_message(
                 eprintln!(
                     "  ❌ LLM error after {}ms: {e}",
                     started_at.elapsed().as_millis()
+                );
+                let safe_error = providers::sanitize_api_error(&e.to_string());
+                runtime_trace::record_event(
+                    "channel_message_error",
+                    Some(msg.channel.as_str()),
+                    Some(route.provider.as_str()),
+                    Some(route.model.as_str()),
+                    None,
+                    Some(false),
+                    Some(&safe_error),
+                    serde_json::json!({
+                        "sender": msg.sender,
+                        "elapsed_ms": started_at.elapsed().as_millis(),
+                    }),
                 );
                 // Close the orphan user turn so subsequent messages don't
                 // inherit this failed request as unfinished context.
@@ -1885,6 +1980,19 @@ async fn process_channel_message(
             let timeout_msg = format!(
                 "LLM response timed out after {}s (base={}s, max_tool_iterations={})",
                 timeout_budget_secs, ctx.message_timeout_secs, ctx.max_tool_iterations
+            );
+            runtime_trace::record_event(
+                "channel_message_timeout",
+                Some(msg.channel.as_str()),
+                Some(route.provider.as_str()),
+                Some(route.model.as_str()),
+                None,
+                Some(false),
+                Some(&timeout_msg),
+                serde_json::json!({
+                    "sender": msg.sender,
+                    "elapsed_ms": started_at.elapsed().as_millis(),
+                }),
             );
             eprintln!(
                 "  ❌ {} (elapsed: {}ms)",
@@ -2594,13 +2702,14 @@ fn collect_configured_channels(
     if let Some(ref mx) = config.channels_config.matrix {
         channels.push(ConfiguredChannel {
             display_name: "Matrix",
-            channel: Arc::new(MatrixChannel::new_with_session_hint(
+            channel: Arc::new(MatrixChannel::new_with_session_hint_and_zeroclaw_dir(
                 mx.homeserver.clone(),
                 mx.access_token.clone(),
                 mx.room_id.clone(),
                 mx.allowed_users.clone(),
                 mx.user_id.clone(),
                 mx.device_id.clone(),
+                config.config_path.parent().map(|path| path.to_path_buf()),
             )),
         });
     }
@@ -3329,10 +3438,10 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         };
 
@@ -3869,6 +3978,7 @@ BTC is currently around $65,000 based on latest tool output."#
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),

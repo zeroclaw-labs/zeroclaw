@@ -1,6 +1,6 @@
 use crate::config::schema::{
     default_nostr_relays, DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig, NostrConfig,
-    QQConfig, StreamMode, WhatsAppConfig,
+    QQConfig, SignalConfig, StreamMode, WhatsAppConfig,
 };
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
@@ -100,6 +100,12 @@ fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
 
 // ── Main wizard entry point ──────────────────────────────────────
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteractiveOnboardingMode {
+    FullOnboarding,
+    UpdateProviderOnly,
+}
+
 pub async fn run_wizard(force: bool) -> Result<Config> {
     println!("{}", style(BANNER).cyan().bold());
 
@@ -117,7 +123,12 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
 
     print_step(1, 9, "Workspace Setup");
     let (workspace_dir, config_path) = setup_workspace().await?;
-    ensure_onboard_overwrite_allowed(&config_path, force)?;
+    match resolve_interactive_onboarding_mode(&config_path, force)? {
+        InteractiveOnboardingMode::FullOnboarding => {}
+        InteractiveOnboardingMode::UpdateProviderOnly => {
+            return run_provider_update_wizard(&workspace_dir, &config_path).await;
+        }
+    }
 
     print_step(2, 9, "AI Provider & API Key");
     let (provider, api_key, model, provider_api_url) = setup_provider(&workspace_dir).await?;
@@ -286,6 +297,85 @@ pub async fn run_channels_repair_wizard() -> Result<Config> {
     }
 
     Ok(config)
+}
+
+/// Interactive flow: update only provider/model/api key while preserving existing config.
+async fn run_provider_update_wizard(workspace_dir: &Path, config_path: &Path) -> Result<Config> {
+    println!();
+    println!(
+        "  {} Existing config detected. Running provider-only update mode (preserving channels, memory, tunnel, hooks, and other settings).",
+        style("↻").cyan().bold()
+    );
+
+    let raw = fs::read_to_string(config_path).await.with_context(|| {
+        format!(
+            "Failed to read existing config at {}",
+            config_path.display()
+        )
+    })?;
+    let mut config: Config = toml::from_str(&raw).with_context(|| {
+        format!(
+            "Failed to parse existing config at {}",
+            config_path.display()
+        )
+    })?;
+    config.workspace_dir = workspace_dir.to_path_buf();
+    config.config_path = config_path.to_path_buf();
+
+    print_step(1, 1, "AI Provider & API Key");
+    let (provider, api_key, model, provider_api_url) = setup_provider(workspace_dir).await?;
+    apply_provider_update(&mut config, provider, api_key, model, provider_api_url);
+
+    config.save().await?;
+    persist_workspace_selection(&config.config_path).await?;
+
+    println!(
+        "  {} Provider settings updated at {}",
+        style("✓").green().bold(),
+        style(config.config_path.display()).green()
+    );
+    print_summary(&config);
+
+    let has_channels = has_launchable_channels(&config.channels_config);
+    if has_channels && config.api_key.is_some() {
+        let launch: bool = Confirm::new()
+            .with_prompt(format!(
+                "  {} Launch channels now? (connected channels → AI → reply)",
+                style("🚀").cyan()
+            ))
+            .default(true)
+            .interact()?;
+
+        if launch {
+            println!();
+            println!(
+                "  {} {}",
+                style("⚡").cyan(),
+                style("Starting channel server...").white().bold()
+            );
+            println!();
+            std::env::set_var("ZEROCLAW_AUTOSTART_CHANNELS", "1");
+        }
+    }
+
+    Ok(config)
+}
+
+fn apply_provider_update(
+    config: &mut Config,
+    provider: String,
+    api_key: String,
+    model: String,
+    provider_api_url: Option<String>,
+) {
+    config.default_provider = Some(provider);
+    config.default_model = Some(model);
+    config.api_url = provider_api_url;
+    config.api_key = if api_key.trim().is_empty() {
+        None
+    } else {
+        Some(api_key)
+    };
 }
 
 // ── Quick setup (zero prompts) ───────────────────────────────────
@@ -1667,6 +1757,52 @@ fn print_bullet(text: &str) {
     println!("  {} {}", style("›").cyan(), text);
 }
 
+fn resolve_interactive_onboarding_mode(
+    config_path: &Path,
+    force: bool,
+) -> Result<InteractiveOnboardingMode> {
+    if !config_path.exists() {
+        return Ok(InteractiveOnboardingMode::FullOnboarding);
+    }
+
+    if force {
+        println!(
+            "  {} Existing config detected at {}. Proceeding with full onboarding because --force was provided.",
+            style("!").yellow().bold(),
+            style(config_path.display()).yellow()
+        );
+        return Ok(InteractiveOnboardingMode::FullOnboarding);
+    }
+
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        bail!(
+            "Refusing to overwrite existing config at {} in non-interactive mode. Re-run with --force if overwrite is intentional.",
+            config_path.display()
+        );
+    }
+
+    let options = [
+        "Full onboarding (overwrite config.toml)",
+        "Update AI provider/model/API key only (preserve existing configuration)",
+        "Cancel",
+    ];
+
+    let mode = Select::new()
+        .with_prompt(format!(
+            "  Existing config found at {}. Select setup mode",
+            config_path.display()
+        ))
+        .items(&options)
+        .default(1)
+        .interact()?;
+
+    match mode {
+        0 => Ok(InteractiveOnboardingMode::FullOnboarding),
+        1 => Ok(InteractiveOnboardingMode::UpdateProviderOnly),
+        _ => bail!("Onboarding canceled: existing configuration was left unchanged."),
+    }
+}
+
 fn ensure_onboard_overwrite_allowed(config_path: &Path, force: bool) -> Result<()> {
     if !config_path.exists() {
         return Ok(());
@@ -2923,6 +3059,47 @@ fn setup_memory() -> Result<MemoryConfig> {
 
 // ── Step 3: Channels ────────────────────────────────────────────
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChannelMenuChoice {
+    Telegram,
+    Discord,
+    Slack,
+    IMessage,
+    Matrix,
+    Signal,
+    WhatsApp,
+    Linq,
+    Irc,
+    Webhook,
+    DingTalk,
+    QqOfficial,
+    LarkFeishu,
+    Nostr,
+    Done,
+}
+
+const CHANNEL_MENU_CHOICES: &[ChannelMenuChoice] = &[
+    ChannelMenuChoice::Telegram,
+    ChannelMenuChoice::Discord,
+    ChannelMenuChoice::Slack,
+    ChannelMenuChoice::IMessage,
+    ChannelMenuChoice::Matrix,
+    ChannelMenuChoice::Signal,
+    ChannelMenuChoice::WhatsApp,
+    ChannelMenuChoice::Linq,
+    ChannelMenuChoice::Irc,
+    ChannelMenuChoice::Webhook,
+    ChannelMenuChoice::DingTalk,
+    ChannelMenuChoice::QqOfficial,
+    ChannelMenuChoice::LarkFeishu,
+    ChannelMenuChoice::Nostr,
+    ChannelMenuChoice::Done,
+];
+
+fn channel_menu_choices() -> &'static [ChannelMenuChoice] {
+    CHANNEL_MENU_CHOICES
+}
+
 #[allow(clippy::too_many_lines)]
 fn setup_channels() -> Result<ChannelsConfig> {
     print_bullet("Channels let you talk to ZeroClaw from anywhere.");
@@ -2930,39 +3107,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
     println!();
 
     let mut config = ChannelsConfig::default();
-    #[derive(Clone, Copy)]
-    enum ChannelMenuChoice {
-        Telegram,
-        Discord,
-        Slack,
-        IMessage,
-        Matrix,
-        WhatsApp,
-        Linq,
-        Irc,
-        Webhook,
-        DingTalk,
-        QqOfficial,
-        LarkFeishu,
-        Nostr,
-        Done,
-    }
-    let menu_choices = [
-        ChannelMenuChoice::Telegram,
-        ChannelMenuChoice::Discord,
-        ChannelMenuChoice::Slack,
-        ChannelMenuChoice::IMessage,
-        ChannelMenuChoice::Matrix,
-        ChannelMenuChoice::WhatsApp,
-        ChannelMenuChoice::Linq,
-        ChannelMenuChoice::Irc,
-        ChannelMenuChoice::Webhook,
-        ChannelMenuChoice::DingTalk,
-        ChannelMenuChoice::QqOfficial,
-        ChannelMenuChoice::LarkFeishu,
-        ChannelMenuChoice::Nostr,
-        ChannelMenuChoice::Done,
-    ];
+    let menu_choices = channel_menu_choices();
 
     loop {
         let options: Vec<String> = menu_choices
@@ -3006,6 +3151,14 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         "✅ connected"
                     } else {
                         "— self-hosted chat"
+                    }
+                ),
+                ChannelMenuChoice::Signal => format!(
+                    "Signal     {}",
+                    if config.signal.is_some() {
+                        "✅ connected"
+                    } else {
+                        "— signal-cli daemon bridge"
                     }
                 ),
                 ChannelMenuChoice::WhatsApp => format!(
@@ -3567,6 +3720,102 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     room_id,
                     allowed_users,
                 });
+            }
+            ChannelMenuChoice::Signal => {
+                // ── Signal ──
+                println!();
+                println!(
+                    "  {} {}",
+                    style("Signal Setup").white().bold(),
+                    style("— signal-cli daemon bridge").dim()
+                );
+                print_bullet("1. Run signal-cli daemon with HTTP enabled (default port 8686).");
+                print_bullet("2. Ensure your Signal account is registered in signal-cli.");
+                print_bullet("3. Optionally scope to DMs only or to a specific group.");
+                println!();
+
+                let http_url: String = Input::new()
+                    .with_prompt("  signal-cli HTTP URL")
+                    .default("http://127.0.0.1:8686".into())
+                    .interact_text()?;
+
+                if http_url.trim().is_empty() {
+                    println!("  {} Skipped — HTTP URL required", style("→").dim());
+                    continue;
+                }
+
+                let account: String = Input::new()
+                    .with_prompt("  Account number (E.164, e.g. +1234567890)")
+                    .interact_text()?;
+
+                if account.trim().is_empty() {
+                    println!("  {} Skipped — account number required", style("→").dim());
+                    continue;
+                }
+
+                let scope_options = [
+                    "All messages (DMs + groups)",
+                    "DM only",
+                    "Specific group ID",
+                ];
+                let scope_choice = Select::new()
+                    .with_prompt("  Message scope")
+                    .items(scope_options)
+                    .default(0)
+                    .interact()?;
+
+                let group_id = match scope_choice {
+                    1 => Some("dm".to_string()),
+                    2 => {
+                        let group_input: String =
+                            Input::new().with_prompt("  Group ID").interact_text()?;
+                        let group_input = group_input.trim().to_string();
+                        if group_input.is_empty() {
+                            println!("  {} Skipped — group ID required", style("→").dim());
+                            continue;
+                        }
+                        Some(group_input)
+                    }
+                    _ => None,
+                };
+
+                let allowed_from_raw: String = Input::new()
+                    .with_prompt(
+                        "  Allowed sender numbers (comma-separated +1234567890, or * for all)",
+                    )
+                    .default("*".into())
+                    .interact_text()?;
+
+                let allowed_from = if allowed_from_raw.trim() == "*" {
+                    vec!["*".into()]
+                } else {
+                    allowed_from_raw
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                };
+
+                let ignore_attachments = Confirm::new()
+                    .with_prompt("  Ignore attachment-only messages?")
+                    .default(false)
+                    .interact()?;
+
+                let ignore_stories = Confirm::new()
+                    .with_prompt("  Ignore incoming stories?")
+                    .default(true)
+                    .interact()?;
+
+                config.signal = Some(SignalConfig {
+                    http_url: http_url.trim_end_matches('/').to_string(),
+                    account: account.trim().to_string(),
+                    group_id,
+                    allowed_from,
+                    ignore_attachments,
+                    ignore_stories,
+                });
+
+                println!("  {} Signal configured", style("✅").green().bold());
             }
             ChannelMenuChoice::WhatsApp => {
                 // ── WhatsApp ──
@@ -4454,6 +4703,9 @@ fn setup_channels() -> Result<ChannelsConfig> {
     if config.matrix.is_some() {
         active.push("Matrix");
     }
+    if config.signal.is_some() {
+        active.push("Signal");
+    }
     if config.whatsapp.is_some() {
         active.push("WhatsApp");
     }
@@ -4984,20 +5236,47 @@ fn print_summary(config: &Config) {
     if config.channels_config.slack.is_some() {
         channels.push("Slack");
     }
+    if config.channels_config.mattermost.is_some() {
+        channels.push("Mattermost");
+    }
     if config.channels_config.imessage.is_some() {
         channels.push("iMessage");
     }
     if config.channels_config.matrix.is_some() {
         channels.push("Matrix");
     }
+    if config.channels_config.signal.is_some() {
+        channels.push("Signal");
+    }
+    if config.channels_config.whatsapp.is_some() {
+        channels.push("WhatsApp");
+    }
+    if config.channels_config.linq.is_some() {
+        channels.push("Linq");
+    }
+    if config.channels_config.nextcloud_talk.is_some() {
+        channels.push("Nextcloud Talk");
+    }
     if config.channels_config.email.is_some() {
         channels.push("Email");
+    }
+    if config.channels_config.irc.is_some() {
+        channels.push("IRC");
     }
     if config.channels_config.webhook.is_some() {
         channels.push("Webhook");
     }
     if config.channels_config.lark.is_some() {
         channels.push("Lark");
+    }
+    if config.channels_config.dingtalk.is_some() {
+        channels.push("DingTalk");
+    }
+    if config.channels_config.qq.is_some() {
+        channels.push("QQ");
+    }
+    if config.channels_config.nostr.is_some() {
+        channels.push("Nostr");
     }
     println!(
         "    {} Channels:      {}",
@@ -5196,6 +5475,57 @@ mod tests {
         assert!(ctx.timezone.is_empty());
         assert!(ctx.agent_name.is_empty());
         assert!(ctx.communication_style.is_empty());
+    }
+
+    #[test]
+    fn apply_provider_update_preserves_non_provider_settings() {
+        let mut config = Config::default();
+        config.default_temperature = 1.23;
+        config.memory.backend = "markdown".to_string();
+        config.skills.open_skills_enabled = true;
+        config.channels_config.cli = false;
+
+        apply_provider_update(
+            &mut config,
+            "openrouter".to_string(),
+            "sk-updated".to_string(),
+            "openai/gpt-5.2".to_string(),
+            Some("https://openrouter.ai/api/v1".to_string()),
+        );
+
+        assert_eq!(config.default_provider.as_deref(), Some("openrouter"));
+        assert_eq!(config.default_model.as_deref(), Some("openai/gpt-5.2"));
+        assert_eq!(config.api_key.as_deref(), Some("sk-updated"));
+        assert_eq!(
+            config.api_url.as_deref(),
+            Some("https://openrouter.ai/api/v1")
+        );
+        assert_eq!(config.default_temperature, 1.23);
+        assert_eq!(config.memory.backend, "markdown");
+        assert!(config.skills.open_skills_enabled);
+        assert!(!config.channels_config.cli);
+    }
+
+    #[test]
+    fn apply_provider_update_clears_api_key_when_empty() {
+        let mut config = Config::default();
+        config.api_key = Some("sk-old".to_string());
+
+        apply_provider_update(
+            &mut config,
+            "anthropic".to_string(),
+            "".to_string(),
+            "claude-sonnet-4-5-20250929".to_string(),
+            None,
+        );
+
+        assert_eq!(config.default_provider.as_deref(), Some("anthropic"));
+        assert_eq!(
+            config.default_model.as_deref(),
+            Some("claude-sonnet-4-5-20250929")
+        );
+        assert!(config.api_key.is_none());
+        assert!(config.api_url.is_none());
     }
 
     #[tokio::test]
@@ -6405,10 +6735,26 @@ mod tests {
     }
 
     #[test]
-    fn launchable_channels_include_mattermost_and_qq() {
+    fn channel_menu_choices_include_signal() {
+        assert!(channel_menu_choices().contains(&ChannelMenuChoice::Signal));
+    }
+
+    #[test]
+    fn launchable_channels_include_signal_mattermost_and_qq() {
         let mut channels = ChannelsConfig::default();
         assert!(!has_launchable_channels(&channels));
 
+        channels.signal = Some(crate::config::schema::SignalConfig {
+            http_url: "http://127.0.0.1:8686".into(),
+            account: "+1234567890".into(),
+            group_id: None,
+            allowed_from: vec!["*".into()],
+            ignore_attachments: false,
+            ignore_stories: true,
+        });
+        assert!(has_launchable_channels(&channels));
+
+        channels.signal = None;
         channels.mattermost = Some(crate::config::schema::MattermostConfig {
             url: "https://mattermost.example.com".into(),
             bot_token: "token".into(),

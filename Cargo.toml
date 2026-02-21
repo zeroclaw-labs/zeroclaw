@@ -29,7 +29,7 @@ tokio-stream = { version = "0.1.18", default-features = false, features = ["fs",
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "multipart", "stream", "socks"] }
 
 # Matrix client + E2EE decryption
-matrix-sdk = { version = "0.16", optional = true, default-features = false, features = ["e2e-encryption", "rustls-tls", "markdown"] }
+matrix-sdk = { version = "0.16", optional = true, default-features = false, features = ["e2e-encryption", "rustls-tls", "markdown", "sqlite"] }
 
 # Serialization
 serde = { version = "1.0", default-features = false, features = ["derive"] }

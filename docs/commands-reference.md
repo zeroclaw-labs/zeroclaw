@@ -41,7 +41,9 @@ Last verified: **February 20, 2026**.
 
 `onboard` safety behavior:
 
-- If `config.toml` already exists, `onboard` asks for explicit confirmation before overwrite.
+- If `config.toml` already exists and you run `--interactive`, onboarding now offers two modes:
+  - Full onboarding (overwrite `config.toml`)
+  - Provider-only update (update provider/model/API key while preserving existing channels, tunnel, memory, hooks, and other settings)
 - In non-interactive environments, existing `config.toml` causes a safe refusal unless `--force` is passed.
 - Use `zeroclaw onboard --channels-only` when you only need to rotate channel tokens/allowlists.
 
@@ -89,6 +91,15 @@ Notes:
 - `zeroclaw models refresh --force`
 
 `models refresh` currently supports live catalog refresh for provider IDs: `openrouter`, `openai`, `anthropic`, `groq`, `mistral`, `deepseek`, `xai`, `together-ai`, `gemini`, `ollama`, `llamacpp`, `vllm`, `astrai`, `venice`, `fireworks`, `cohere`, `moonshot`, `glm`, `zai`, `qwen`, and `nvidia`.
+
+### `doctor`
+
+- `zeroclaw doctor`
+- `zeroclaw doctor models [--provider <ID>] [--use-cache]`
+- `zeroclaw doctor traces [--limit <N>] [--event <TYPE>] [--contains <TEXT>]`
+- `zeroclaw doctor traces --id <TRACE_ID>`
+
+`doctor traces` reads runtime tool/model diagnostics from `observability.runtime_trace_path`.
 
 ### `channel`
 

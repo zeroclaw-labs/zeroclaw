@@ -33,11 +33,19 @@ Schema export command:
 | `backend` | `none` | Observability backend: `none`, `noop`, `log`, `prometheus`, `otel`, `opentelemetry`, or `otlp` |
 | `otel_endpoint` | `http://localhost:4318` | OTLP HTTP endpoint used when backend is `otel` |
 | `otel_service_name` | `zeroclaw` | Service name emitted to OTLP collector |
+| `runtime_trace_mode` | `none` | Runtime trace storage mode: `none`, `rolling`, or `full` |
+| `runtime_trace_path` | `state/runtime-trace.jsonl` | Runtime trace JSONL path (relative to workspace unless absolute) |
+| `runtime_trace_max_entries` | `200` | Maximum retained events when `runtime_trace_mode = "rolling"` |
 
 Notes:
 
 - `backend = "otel"` uses OTLP HTTP export with a blocking exporter client so spans and metrics can be emitted safely from non-Tokio contexts.
 - Alias values `opentelemetry` and `otlp` map to the same OTel backend.
+- Runtime traces are intended for debugging tool-call failures and malformed model tool payloads. They can contain model output text, so keep this disabled by default on shared hosts.
+- Query runtime traces with:
+  - `zeroclaw doctor traces --limit 20`
+  - `zeroclaw doctor traces --event tool_call_result --contains \"error\"`
+  - `zeroclaw doctor traces --id <trace-id>`
 
 Example:
 
@@ -46,6 +54,9 @@ Example:
 backend = "otel"
 otel_endpoint = "http://localhost:4318"
 otel_service_name = "zeroclaw"
+runtime_trace_mode = "rolling"
+runtime_trace_path = "state/runtime-trace.jsonl"
+runtime_trace_max_entries = 200
 ```
 
 ## Environment Provider Overrides
@@ -214,7 +225,7 @@ Notes:
 | Key | Default | Purpose |
 |---|---|---|
 | `enabled` | `false` | Enable `browser_open` tool (opens URLs without scraping) |
-| `allowed_domains` | `[]` | Allowed domains for `browser_open` (exact or subdomain match) |
+| `allowed_domains` | `[]` | Allowed domains for `browser_open` (exact/subdomain match, or `"*"` for all public domains) |
 | `session_name` | unset | Browser session name (for agent-browser automation) |
 | `backend` | `agent_browser` | Browser automation backend: `"agent_browser"`, `"rust_native"`, `"computer_use"`, or `"auto"` |
 | `native_headless` | `true` | Headless mode for rust-native backend |
@@ -244,14 +255,15 @@ Notes:
 | Key | Default | Purpose |
 |---|---|---|
 | `enabled` | `false` | Enable `http_request` tool for API interactions |
-| `allowed_domains` | `[]` | Allowed domains for HTTP requests (exact or subdomain match) |
+| `allowed_domains` | `[]` | Allowed domains for HTTP requests (exact/subdomain match, or `"*"` for all public domains) |
 | `max_response_size` | `1000000` | Maximum response size in bytes (default: 1 MB) |
 | `timeout_secs` | `30` | Request timeout in seconds |
 
 Notes:
 
 - Deny-by-default: if `allowed_domains` is empty, all HTTP requests are rejected.
-- Use exact domain or subdomain matching (e.g. `"api.example.com"`, `"example.com"`).
+- Use exact domain or subdomain matching (e.g. `"api.example.com"`, `"example.com"`), or `"*"` to allow any public domain.
+- Local/private targets are still blocked even when `"*"` is configured.
 
 ## `[gateway]`
 
