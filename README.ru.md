@@ -294,7 +294,7 @@ allow_public_bind = false
 - Contribution guide: [`CONTRIBUTING.md`](CONTRIBUTING.md)
 - PR workflow: [`docs/pr-workflow.md`](docs/pr-workflow.md)
 - Reviewer playbook: [`docs/reviewer-playbook.md`](docs/reviewer-playbook.md)
-- License: MIT or Apache 2.0 ([`LICENSE`](LICENSE), [`LICENSE-APACHE`](LICENSE-APACHE), [`NOTICE`](NOTICE))
+- License: MIT or Apache 2.0 ([`LICENSE-MIT`](LICENSE-MIT), [`LICENSE-APACHE`](LICENSE-APACHE), [`NOTICE`](NOTICE))
 
 ---
 

@@ -18,7 +18,7 @@ module.exports = async ({ github, context, core }) => {
     return;
   }
 
-  const protectedFiles = new Set(["LICENSE", "LICENSE-APACHE"]);
+  const protectedFiles = new Set(["LICENSE", "LICENSE-APACHE", "LICENSE-MIT"]);
   const files = await github.paginate(github.rest.pulls.listFiles, {
     owner,
     repo,

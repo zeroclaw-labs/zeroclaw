@@ -301,12 +301,13 @@ jobs:
               run: |
                   cp LICENSE artifacts/LICENSE
                   cp LICENSE-APACHE artifacts/LICENSE-APACHE
+                  cp LICENSE-MIT artifacts/LICENSE-MIT
                   cp NOTICE artifacts/NOTICE
 
             - name: Generate SHA256 checksums
               run: |
                   cd artifacts
-                  find . -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.cdx.json' -o -name '*.spdx.json' -o -name 'LICENSE' -o -name 'LICENSE-APACHE' -o -name 'NOTICE' \) -exec sha256sum {} + | sed 's|  \./[^/]*/|  |' > SHA256SUMS
+                  find . -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.cdx.json' -o -name '*.spdx.json' -o -name 'LICENSE' -o -name 'LICENSE-APACHE' -o -name 'LICENSE-MIT' -o -name 'NOTICE' \) -exec sha256sum {} + | sed 's|  \./[^/]*/|  |' > SHA256SUMS
                   echo "Generated checksums:"
                   cat SHA256SUMS
 
