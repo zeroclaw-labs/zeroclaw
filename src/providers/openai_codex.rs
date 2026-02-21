@@ -46,12 +46,7 @@ struct ResponsesInputContent {
     #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    image_url: Option<ImageUrlContent>,
-}
-
-#[derive(Debug, Serialize)]
-struct ImageUrlContent {
-    url: String,
+    image_url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -158,7 +153,7 @@ fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<ResponsesInpu
                     content_items.push(ResponsesInputContent {
                         kind: "input_image".to_string(),
                         text: None,
-                        image_url: Some(ImageUrlContent { url: image_ref }),
+                        image_url: Some(image_ref),
                     });
                 }
 
@@ -508,39 +503,19 @@ impl Provider for OpenAiCodexProvider {
         model: &str,
         _temperature: f64,
     ) -> anyhow::Result<String> {
-        let (cleaned_text, image_refs) = multimodal::parse_image_markers(message);
-
-        let mut content_items = Vec::new();
-
-        if !cleaned_text.trim().is_empty() {
-            content_items.push(ResponsesInputContent {
-                kind: "input_text".to_string(),
-                text: Some(cleaned_text),
-                image_url: None,
-            });
+        // Build temporary messages array
+        let mut messages = Vec::new();
+        if let Some(sys) = system_prompt {
+            messages.push(ChatMessage::system(sys));
         }
+        messages.push(ChatMessage::user(message));
 
-        for image_ref in image_refs {
-            content_items.push(ResponsesInputContent {
-                kind: "input_image".to_string(),
-                text: None,
-                image_url: Some(ImageUrlContent { url: image_ref }),
-            });
-        }
+        // Normalize images: convert file paths to data URIs
+        let config = crate::config::MultimodalConfig::default();
+        let prepared = crate::multimodal::prepare_messages_for_provider(&messages, &config).await?;
 
-        if content_items.is_empty() {
-            content_items.push(ResponsesInputContent {
-                kind: "input_text".to_string(),
-                text: Some(message.to_string()),
-                image_url: None,
-            });
-        }
-
-        let input = vec![ResponsesInput {
-            role: "user".to_string(),
-            content: content_items,
-        }];
-        self.send_responses_request(input, resolve_instructions(system_prompt), model)
+        let (instructions, input) = build_responses_input(&prepared.messages);
+        self.send_responses_request(input, instructions, model)
             .await
     }
 
@@ -550,7 +525,11 @@ impl Provider for OpenAiCodexProvider {
         model: &str,
         _temperature: f64,
     ) -> anyhow::Result<String> {
-        let (instructions, input) = build_responses_input(messages);
+        // Normalize image markers: convert file paths to data URIs
+        let config = crate::config::MultimodalConfig::default();
+        let prepared = crate::multimodal::prepare_messages_for_provider(messages, &config).await?;
+
+        let (instructions, input) = build_responses_input(&prepared.messages);
         self.send_responses_request(input, instructions, model)
             .await
     }
@@ -767,7 +746,7 @@ data: [DONE]
 
         // Second content = image
         assert_eq!(json[1]["type"], "input_image");
-        assert_eq!(json[1]["image_url"]["url"], "data:image/png;base64,abc");
+        assert_eq!(json[1]["image_url"], "data:image/png;base64,abc");
     }
 
     #[test]
