@@ -1261,9 +1261,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let mut result_lines: Vec<String> = Vec::new();
 
         for line in &lines {
-            // Preserve fenced code block delimiters for second-pass block parsing.
-            if line.trim().starts_with("```") {
-                result_lines.push((*line).to_string());
+            let trimmed_line = line.trim_start();
+            if trimmed_line.starts_with("```") {
+                // Preserve fence lines so the second-pass block parser can consume them
+                // without interference from inline backtick handling.
+                result_lines.push(trimmed_line.to_string());
                 continue;
             }
 

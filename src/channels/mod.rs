@@ -5759,10 +5759,12 @@ BTC is currently around $65,000 based on latest tool output."#
             .collect::<Vec<_>>();
         assert_eq!(roles, vec!["system", "user", "assistant", "user"]);
         assert!(
-            calls[0][0]
-                .1
-                .contains("When responding on Telegram, include media markers"),
-            "telegram delivery instruction should live in the system prompt"
+            calls[0][0].1.contains("When responding on Telegram:"),
+            "telegram channel instructions should be embedded into the system prompt"
+        );
+        assert!(
+            calls[0][0].1.contains("For media attachments use markers:"),
+            "telegram media marker guidance should live in the system prompt"
         );
         assert!(!calls[0].iter().skip(1).any(|(role, _)| role == "system"));
     }
