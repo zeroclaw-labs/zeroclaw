@@ -26,8 +26,8 @@ pub mod linq;
 #[cfg(feature = "channel-matrix")]
 pub mod matrix;
 pub mod mattermost;
-pub mod nostr;
 pub mod nextcloud_talk;
+pub mod nostr;
 pub mod qq;
 pub mod signal;
 pub mod slack;
@@ -52,8 +52,8 @@ pub use linq::LinqChannel;
 #[cfg(feature = "channel-matrix")]
 pub use matrix::MatrixChannel;
 pub use mattermost::MattermostChannel;
-pub use nostr::NostrChannel;
 pub use nextcloud_talk::NextcloudTalkChannel;
+pub use nostr::NostrChannel;
 pub use qq::QQChannel;
 pub use signal::SignalChannel;
 pub use slack::SlackChannel;
@@ -2886,9 +2886,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
     // Collect active channels from a shared builder to keep startup and doctor parity.
     let mut channels: Vec<Arc<dyn Channel>> =
         collect_configured_channels(&config, "runtime startup")
-        .into_iter()
-        .map(|configured| configured.channel)
-        .collect();
+            .into_iter()
+            .map(|configured| configured.channel)
+            .collect();
 
     if let Some(ref ns) = config.channels_config.nostr {
         channels.push(Arc::new(
