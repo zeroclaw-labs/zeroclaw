@@ -712,6 +712,7 @@ impl Provider for OllamaProvider {
         Ok(ChatResponse {
             text: Some(text),
             tool_calls: vec![],
+            usage: None,
         })
     }
 }
