@@ -2,7 +2,7 @@
 
 This document maps provider IDs, aliases, and credential environment variables.
 
-Last verified: **February 20, 2026**.
+Last verified: **February 21, 2026**.
 
 ## How to List Providers
 
@@ -59,6 +59,14 @@ credential is not reused for fallback providers.
 | `vllm` | — | Yes | `VLLM_API_KEY` (optional) |
 | `osaurus` | — | Yes | `OSAURUS_API_KEY` (optional; defaults to `"osaurus"`) |
 | `nvidia` | `nvidia-nim`, `build.nvidia.com` | No | `NVIDIA_API_KEY` |
+
+### Vercel AI Gateway Notes
+
+- Provider ID: `vercel` (alias: `vercel-ai`)
+- Base API URL: `https://ai-gateway.vercel.sh/v1`
+- Authentication: `VERCEL_API_KEY`
+- Vercel AI Gateway usage does not require a project deployment.
+- If you see `DEPLOYMENT_NOT_FOUND`, verify the provider is targeting the gateway endpoint above instead of `https://api.vercel.ai`.
 
 ### Gemini Notes
 

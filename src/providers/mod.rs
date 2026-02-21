@@ -72,6 +72,7 @@ const QWEN_OAUTH_DEFAULT_CLIENT_ID: &str = "f0304373b74a44d2b584a3fb70ca9e56";
 const QWEN_OAUTH_CREDENTIAL_FILE: &str = ".qwen/oauth_creds.json";
 const ZAI_GLOBAL_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
 const ZAI_CN_BASE_URL: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
+const VERCEL_AI_GATEWAY_BASE_URL: &str = "https://ai-gateway.vercel.sh/v1";
 
 pub(crate) fn is_minimax_intl_alias(name: &str) -> bool {
     matches!(
@@ -969,7 +970,10 @@ fn create_provider_with_url_and_options(
             "Venice", "https://api.venice.ai", key, AuthStyle::Bearer,
         ))),
         "vercel" | "vercel-ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Vercel AI Gateway", "https://api.vercel.ai", key, AuthStyle::Bearer,
+            "Vercel AI Gateway",
+            VERCEL_AI_GATEWAY_BASE_URL,
+            key,
+            AuthStyle::Bearer,
         ))),
         "cloudflare" | "cloudflare-ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Cloudflare AI Gateway",
@@ -1968,6 +1972,14 @@ mod tests {
     fn factory_vercel() {
         assert!(create_provider("vercel", Some("key")).is_ok());
         assert!(create_provider("vercel-ai", Some("key")).is_ok());
+    }
+
+    #[test]
+    fn vercel_gateway_base_url_matches_public_gateway_endpoint() {
+        assert_eq!(
+            VERCEL_AI_GATEWAY_BASE_URL,
+            "https://ai-gateway.vercel.sh/v1"
+        );
     }
 
     #[test]
