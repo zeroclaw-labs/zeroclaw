@@ -23,6 +23,7 @@ clap_complete = "4.5"
 # Async runtime - feature-optimized for size
 tokio = { version = "1.42", default-features = false, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync", "process", "io-std", "fs", "signal"] }
 tokio-util = { version = "0.7", default-features = false }
+tokio-stream = { version = "0.1.18", default-features = false, features = ["fs", "sync"] }
 
 # HTTP client - minimal features
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "multipart", "stream", "socks"] }
@@ -132,7 +133,7 @@ tower-http = { version = "0.6", default-features = false, features = ["limit", "
 http-body-util = "0.1"
 
 # Embed frontend assets into binary (web dashboard)
-rust-embed = { version = "8", features = ["compression"] }
+rust-embed = "8"
 mime_guess = "2"
 
 # OpenTelemetry — OTLP trace + metrics export.
@@ -223,7 +224,6 @@ panic = "abort"
 [dev-dependencies]
 tempfile = "3.14"
 criterion = { version = "0.8", features = ["async_tokio"] }
-tokio-stream = { version = "0.1.18", default-features = false, features = ["fs"] }
 wiremock = "0.6"
 
 [[bench]]

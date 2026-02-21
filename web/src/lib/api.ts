@@ -9,24 +9,7 @@ import type {
   CliTool,
   HealthSnapshot,
 } from '../types/api';
-
-const TOKEN_KEY = 'zeroclaw_token';
-
-// ---------------------------------------------------------------------------
-// Token helpers
-// ---------------------------------------------------------------------------
-
-export function getToken(): string | null {
-  return localStorage.getItem(TOKEN_KEY);
-}
-
-export function setToken(token: string): void {
-  localStorage.setItem(TOKEN_KEY, token);
-}
-
-export function clearToken(): void {
-  localStorage.removeItem(TOKEN_KEY);
-}
+import { clearToken, getToken, setToken } from './auth';
 
 // ---------------------------------------------------------------------------
 // Base fetch wrapper
@@ -62,6 +45,7 @@ export async function apiFetch<T = unknown>(
 
   if (response.status === 401) {
     clearToken();
+    window.dispatchEvent(new Event('zeroclaw-unauthorized'));
     throw new UnauthorizedError();
   }
 
@@ -76,6 +60,16 @@ export async function apiFetch<T = unknown>(
   }
 
   return response.json() as Promise<T>;
+}
+
+function unwrapField<T>(value: T | Record<string, T>, key: string): T {
+  if (value !== null && typeof value === 'object' && !Array.isArray(value) && key in value) {
+    const unwrapped = (value as Record<string, T | undefined>)[key];
+    if (unwrapped !== undefined) {
+      return unwrapped;
+    }
+  }
+  return value as T;
 }
 
 // ---------------------------------------------------------------------------
@@ -107,7 +101,9 @@ export function getStatus(): Promise<StatusResponse> {
 }
 
 export function getHealth(): Promise<HealthSnapshot> {
-  return apiFetch<HealthSnapshot>('/api/health');
+  return apiFetch<HealthSnapshot | { health: HealthSnapshot }>('/api/health').then((data) =>
+    unwrapField(data, 'health'),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -115,7 +111,9 @@ export function getHealth(): Promise<HealthSnapshot> {
 // ---------------------------------------------------------------------------
 
 export function getConfig(): Promise<string> {
-  return apiFetch<string>('/api/config');
+  return apiFetch<string | { format?: string; content: string }>('/api/config').then((data) =>
+    typeof data === 'string' ? data : data.content,
+  );
 }
 
 export function putConfig(toml: string): Promise<void> {
@@ -131,7 +129,9 @@ export function putConfig(toml: string): Promise<void> {
 // ---------------------------------------------------------------------------
 
 export function getTools(): Promise<ToolSpec[]> {
-  return apiFetch<ToolSpec[]>('/api/tools');
+  return apiFetch<ToolSpec[] | { tools: ToolSpec[] }>('/api/tools').then((data) =>
+    unwrapField(data, 'tools'),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -139,7 +139,9 @@ export function getTools(): Promise<ToolSpec[]> {
 // ---------------------------------------------------------------------------
 
 export function getCronJobs(): Promise<CronJob[]> {
-  return apiFetch<CronJob[]>('/api/cron');
+  return apiFetch<CronJob[] | { jobs: CronJob[] }>('/api/cron').then((data) =>
+    unwrapField(data, 'jobs'),
+  );
 }
 
 export function addCronJob(body: {
@@ -148,10 +150,10 @@ export function addCronJob(body: {
   schedule: string;
   enabled?: boolean;
 }): Promise<CronJob> {
-  return apiFetch<CronJob>('/api/cron', {
+  return apiFetch<CronJob | { status: string; job: CronJob }>('/api/cron', {
     method: 'POST',
     body: JSON.stringify(body),
-  });
+  }).then((data) => (typeof (data as { job?: CronJob }).job === 'object' ? (data as { job: CronJob }).job : (data as CronJob)));
 }
 
 export function deleteCronJob(id: string): Promise<void> {
@@ -165,7 +167,9 @@ export function deleteCronJob(id: string): Promise<void> {
 // ---------------------------------------------------------------------------
 
 export function getIntegrations(): Promise<Integration[]> {
-  return apiFetch<Integration[]>('/api/integrations');
+  return apiFetch<Integration[] | { integrations: Integration[] }>('/api/integrations').then(
+    (data) => unwrapField(data, 'integrations'),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -173,7 +177,9 @@ export function getIntegrations(): Promise<Integration[]> {
 // ---------------------------------------------------------------------------
 
 export function runDoctor(): Promise<DiagResult[]> {
-  return apiFetch<DiagResult[]>('/api/doctor');
+  return apiFetch<DiagResult[] | { results: DiagResult[]; summary?: unknown }>('/api/doctor').then(
+    (data) => (Array.isArray(data) ? data : data.results),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -185,21 +191,23 @@ export function getMemory(
   category?: string,
 ): Promise<MemoryEntry[]> {
   const params = new URLSearchParams();
-  if (query) params.set('q', query);
+  if (query) params.set('query', query);
   if (category) params.set('category', category);
   const qs = params.toString();
-  return apiFetch<MemoryEntry[]>(`/api/memory${qs ? `?${qs}` : ''}`);
+  return apiFetch<MemoryEntry[] | { entries: MemoryEntry[] }>(`/api/memory${qs ? `?${qs}` : ''}`).then(
+    (data) => unwrapField(data, 'entries'),
+  );
 }
 
 export function storeMemory(
   key: string,
   content: string,
   category?: string,
-): Promise<MemoryEntry> {
-  return apiFetch<MemoryEntry>('/api/memory', {
+): Promise<void> {
+  return apiFetch<unknown>('/api/memory', {
     method: 'POST',
     body: JSON.stringify({ key, content, category }),
-  });
+  }).then(() => undefined);
 }
 
 export function deleteMemory(key: string): Promise<void> {
@@ -213,7 +221,9 @@ export function deleteMemory(key: string): Promise<void> {
 // ---------------------------------------------------------------------------
 
 export function getCost(): Promise<CostSummary> {
-  return apiFetch<CostSummary>('/api/cost');
+  return apiFetch<CostSummary | { cost: CostSummary }>('/api/cost').then((data) =>
+    unwrapField(data, 'cost'),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -221,5 +231,7 @@ export function getCost(): Promise<CostSummary> {
 // ---------------------------------------------------------------------------
 
 export function getCliTools(): Promise<CliTool[]> {
-  return apiFetch<CliTool[]>('/api/cli-tools');
+  return apiFetch<CliTool[] | { cli_tools: CliTool[] }>('/api/cli-tools').then((data) =>
+    unwrapField(data, 'cli_tools'),
+  );
 }

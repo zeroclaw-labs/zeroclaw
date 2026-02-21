@@ -11,7 +11,6 @@ use axum::{
         IntoResponse,
     },
 };
-use futures_util::stream::Stream;
 use std::convert::Infallible;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
@@ -39,12 +38,19 @@ pub async fn handle_sse_events(
     }
 
     let rx = state.event_tx.subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(|result| match result {
-        Ok(value) => Some(Ok::<_, Infallible>(
-            Event::default().data(value.to_string()),
-        )),
-        Err(_) => None, // Skip lagged messages
-    });
+    let stream = BroadcastStream::new(rx).filter_map(
+        |result: Result<
+            serde_json::Value,
+            tokio_stream::wrappers::errors::BroadcastStreamRecvError,
+        >| {
+            match result {
+                Ok(value) => Some(Ok::<_, Infallible>(
+                    Event::default().data(value.to_string()),
+                )),
+                Err(_) => None, // Skip lagged messages
+            }
+        },
+    );
 
     Sse::new(stream)
         .keep_alive(KeepAlive::default())

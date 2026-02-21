@@ -108,10 +108,7 @@ const KNOWN_CLIS: &[KnownCli] = &[
 
 /// Discover available CLI tools on the system.
 /// Scans PATH for known tools and returns metadata for each found.
-pub fn discover_cli_tools(
-    additional: &[String],
-    excluded: &[String],
-) -> Vec<DiscoveredCli> {
+pub fn discover_cli_tools(additional: &[String], excluded: &[String]) -> Vec<DiscoveredCli> {
     let mut results = Vec::new();
 
     for known in KNOWN_CLIS {

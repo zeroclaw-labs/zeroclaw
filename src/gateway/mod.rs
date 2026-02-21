@@ -384,9 +384,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         config.api_key.as_deref(),
         &config,
     );
-    let tools_registry: Arc<Vec<ToolSpec>> = Arc::new(
-        tools_registry_raw.iter().map(|t| t.spec()).collect(),
-    );
+    let tools_registry: Arc<Vec<ToolSpec>> =
+        Arc::new(tools_registry_raw.iter().map(|t| t.spec()).collect());
 
     // Cost tracker (optional)
     let cost_tracker = if config.cost.enabled {
@@ -593,12 +592,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     }
 
     // Wrap observer with broadcast capability for SSE
-    let broadcast_observer: Arc<dyn crate::observability::Observer> = Arc::new(
-        sse::BroadcastObserver::new(
-            Box::new(crate::observability::create_observer(&config.observability)),
+    let broadcast_observer: Arc<dyn crate::observability::Observer> =
+        Arc::new(sse::BroadcastObserver::new(
+            crate::observability::create_observer(&config.observability),
             event_tx.clone(),
-        ),
-    );
+        ));
 
     let state = AppState {
         config: config_state,
@@ -799,11 +797,7 @@ async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGua
 }
 
 /// Simple chat for webhook endpoint (no tools, for backward compatibility and testing).
-async fn run_gateway_chat_simple(
-    state: &AppState,
-    provider_label: &str,
-    message: &str,
-) -> anyhow::Result<String> {
+async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Result<String> {
     let user_messages = vec![ChatMessage::user(message)];
 
     // Keep webhook/gateway prompts aligned with channel behavior by injecting
@@ -961,7 +955,7 @@ async fn handle_webhook(
             messages_count: 1,
         });
 
-    match run_gateway_chat_simple(&state, &provider_label, message).await {
+    match run_gateway_chat_simple(&state, message).await {
         Ok(response) => {
             let duration = started_at.elapsed();
             state
@@ -1361,13 +1355,6 @@ async fn handle_nextcloud_talk_webhook(
         // Acknowledge webhook even if payload does not contain actionable user messages.
         return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
     }
-
-    let provider_label = state
-        .config
-        .lock()
-        .default_provider
-        .clone()
-        .unwrap_or_else(|| "unknown".to_string());
 
     for msg in &messages {
         tracing::info!(
@@ -2193,6 +2180,9 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -2243,6 +2233,9 @@ mod tests {
             nextcloud_talk: Some(channel),
             nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
             observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
         };
 
         let mut headers = HeaderMap::new();
