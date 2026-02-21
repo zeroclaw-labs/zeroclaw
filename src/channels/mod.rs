@@ -387,7 +387,8 @@ fn strip_tool_call_tags(message: &str) -> String {
 fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
     match channel_name {
         "telegram" => Some(
-            "When responding on Telegram, include media markers for files or URLs that should be sent as attachments.\n\
+            "When responding on Telegram:\n\
+             - Include media markers for files or URLs that should be sent as attachments\n\
              - Use **bold** for key terms, section titles, and important info (renders as <b>)\n\
              - Use *italic* for emphasis (renders as <i>)\n\
              - Use `backticks` for inline code, commands, or technical terms\n\
@@ -3928,9 +3929,9 @@ BTC is currently around $65,000 based on latest tool output."#
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
         process_channel_message(
