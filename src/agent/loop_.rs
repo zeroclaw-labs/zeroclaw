@@ -615,6 +615,15 @@ const TOOL_CALL_OPEN_TAGS: [&str; 6] = [
     "<minimax:toolcall>",
 ];
 
+const TOOL_CALL_CLOSE_TAGS: [&str; 6] = [
+    "</tool_call>",
+    "</toolcall>",
+    "</tool-call>",
+    "</invoke>",
+    "</minimax:tool_call>",
+    "</minimax:toolcall>",
+];
+
 fn find_first_tag<'a>(haystack: &str, tags: &'a [&'a str]) -> Option<(usize, &'a str)> {
     tags.iter()
         .filter_map(|tag| haystack.find(tag).map(|idx| (idx, *tag)))
@@ -938,8 +947,9 @@ fn parse_function_call_tool_calls(response: &str) -> Vec<ParsedToolCall> {
 /// This handles variations like "fileread" -> "file_read", "bash" -> "shell", etc.
 fn map_tool_name_alias(tool_name: &str) -> &str {
     match tool_name {
-        // Shell variations
-        "shell" | "bash" | "sh" | "exec" | "command" | "cmd" => "shell",
+        // Shell variations (including GLM aliases that map to shell)
+        "shell" | "bash" | "sh" | "exec" | "command" | "cmd" | "browser_open" | "browser"
+        | "web_search" => "shell",
         // File tool variations
         "fileread" | "file_read" | "readfile" | "read_file" | "file" => "file_read",
         "filewrite" | "file_write" | "writefile" | "write_file" => "file_write",
@@ -950,8 +960,6 @@ fn map_tool_name_alias(tool_name: &str) -> &str {
         "memoryforget" | "memory_forget" | "forget" | "memforget" => "memory_forget",
         // HTTP variations
         "http_request" | "http" | "fetch" | "curl" | "wget" => "http_request",
-        // GLM aliases
-        "browser_open" | "browser" | "web_search" => "shell",
         _ => tool_name,
     }
 }
@@ -1037,6 +1045,169 @@ fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value, Opt
     }
 
     calls
+}
+
+/// Return the canonical default parameter name for a tool.
+///
+/// When a model emits a shortened call like `shell>uname -a` (without an
+/// explicit `/param_name`), we need to infer which parameter the value maps
+/// to. This function encodes the mapping for known ZeroClaw tools.
+fn default_param_for_tool(tool: &str) -> &'static str {
+    match tool {
+        "shell" | "bash" | "sh" | "exec" | "command" | "cmd" => "command",
+        // All file tools default to "path"
+        "file_read" | "fileread" | "readfile" | "read_file" | "file" | "file_write"
+        | "filewrite" | "writefile" | "write_file" | "file_edit" | "fileedit" | "editfile"
+        | "edit_file" | "file_list" | "filelist" | "listfiles" | "list_files" => "path",
+        // Memory recall and forget both default to "query"
+        "memory_recall" | "memoryrecall" | "recall" | "memrecall" | "memory_forget"
+        | "memoryforget" | "forget" | "memforget" => "query",
+        "memory_store" | "memorystore" | "store" | "memstore" => "content",
+        // HTTP and browser tools default to "url"
+        "http_request" | "http" | "fetch" | "curl" | "wget" | "browser_open" | "browser"
+        | "web_search" => "url",
+        _ => "input",
+    }
+}
+
+/// Parse GLM-style shortened tool call bodies found inside `<tool_call>` tags.
+///
+/// Handles three sub-formats that GLM-4.7 emits:
+///
+/// 1. **Shortened**: `tool_name>value` — single value mapped via
+///    [`default_param_for_tool`].
+/// 2. **YAML-like multi-line**: `tool_name>\nkey: value\nkey: value` — each
+///    subsequent `key: value` line becomes a parameter.
+/// 3. **Attribute-style**: `tool_name key="value" [/]>` — XML-like attributes.
+///
+/// Returns `None` if the body does not match any of these formats.
+fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
+    let body = body.trim();
+    if body.is_empty() {
+        return None;
+    }
+
+    // Check attribute-style FIRST: `tool_name key="value" />`
+    // Must come before `>` check because `/>` contains `>` and would
+    // misparse the tool name in the first branch.
+    let (tool_raw, value_part) = if body.contains("=\"") {
+        // Attribute-style: split at first whitespace to get tool name
+        let split_pos = body.find(|c: char| c.is_whitespace()).unwrap_or(body.len());
+        let tool = body[..split_pos].trim();
+        let attrs = body[split_pos..]
+            .trim()
+            .trim_end_matches("/>")
+            .trim_end_matches('>')
+            .trim_end_matches('/')
+            .trim();
+        (tool, attrs)
+    } else if let Some(gt_pos) = body.find('>') {
+        // GLM shortened: `tool_name>value`
+        let tool = body[..gt_pos].trim();
+        let value = body[gt_pos + 1..].trim();
+        // Strip trailing self-close markers that some models emit
+        let value = value.trim_end_matches("/>").trim_end_matches('/').trim();
+        (tool, value)
+    } else {
+        return None;
+    };
+
+    // Validate tool name: must be alphanumeric + underscore only
+    let tool_raw = tool_raw.trim_end_matches(|c: char| c.is_whitespace());
+    if tool_raw.is_empty() || !tool_raw.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+
+    let tool_name = map_tool_name_alias(tool_raw);
+
+    // Try attribute-style: `key="value" key2="value2"`
+    if value_part.contains("=\"") {
+        let mut args = serde_json::Map::new();
+        // Simple attribute parser: key="value" pairs
+        let mut rest = value_part;
+        while let Some(eq_pos) = rest.find("=\"") {
+            let key_start = rest[..eq_pos]
+                .rfind(|c: char| c.is_whitespace())
+                .map(|p| p + 1)
+                .unwrap_or(0);
+            let key = rest[key_start..eq_pos].trim();
+            let after_quote = &rest[eq_pos + 2..];
+            if let Some(end_quote) = after_quote.find('"') {
+                let value = &after_quote[..end_quote];
+                if !key.is_empty() {
+                    args.insert(
+                        key.to_string(),
+                        serde_json::Value::String(value.to_string()),
+                    );
+                }
+                rest = &after_quote[end_quote + 1..];
+            } else {
+                break;
+            }
+        }
+        if !args.is_empty() {
+            return Some(ParsedToolCall {
+                name: tool_name.to_string(),
+                arguments: serde_json::Value::Object(args),
+            });
+        }
+    }
+
+    // Try YAML-style multi-line: each line is `key: value`
+    if value_part.contains('\n') {
+        let mut args = serde_json::Map::new();
+        for line in value_part.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(colon_pos) = line.find(':') {
+                let key = line[..colon_pos].trim();
+                let value = line[colon_pos + 1..].trim();
+                if !key.is_empty() && !value.is_empty() {
+                    // Normalize boolean-like values
+                    let json_value = match value {
+                        "true" | "yes" => serde_json::Value::Bool(true),
+                        "false" | "no" => serde_json::Value::Bool(false),
+                        _ => serde_json::Value::String(value.to_string()),
+                    };
+                    args.insert(key.to_string(), json_value);
+                }
+            }
+        }
+        if !args.is_empty() {
+            return Some(ParsedToolCall {
+                name: tool_name.to_string(),
+                arguments: serde_json::Value::Object(args),
+            });
+        }
+    }
+
+    // Single-value shortened: `tool>value`
+    if !value_part.is_empty() {
+        let param = default_param_for_tool(tool_raw);
+        let arguments = match tool_name {
+            "shell" => {
+                if value_part.starts_with("http://") || value_part.starts_with("https://") {
+                    if let Some(cmd) = build_curl_command(value_part) {
+                        serde_json::json!({param: cmd})
+                    } else {
+                        serde_json::json!({param: value_part})
+                    }
+                } else {
+                    serde_json::json!({param: value_part})
+                }
+            }
+            "http_request" => serde_json::json!({"url": value_part, "method": "GET"}),
+            _ => serde_json::json!({param: value_part}),
+        };
+        return Some(ParsedToolCall {
+            name: tool_name.to_string(),
+            arguments,
+        });
+    }
+
+    None
 }
 
 // ── Tool-Call Parsing ─────────────────────────────────────────────────────
@@ -1125,13 +1296,67 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
             }
 
             if !parsed_any {
+                // GLM-style shortened body: `shell>uname -a` or `shell\ncommand: date`
+                if let Some(glm_call) = parse_glm_shortened_body(inner) {
+                    calls.push(glm_call);
+                    parsed_any = true;
+                }
+            }
+
+            if !parsed_any {
                 tracing::warn!(
-                    "Malformed <tool_call>: expected tool-call object in tag body (JSON/XML)"
+                    "Malformed <tool_call>: expected tool-call object in tag body (JSON/XML/GLM)"
                 );
             }
 
             remaining = &after_open[close_idx + close_tag.len()..];
         } else {
+            // Matching close tag not found — try cross-alias close tags first.
+            // Models sometimes mix open/close tag aliases (e.g. <tool_call>...</invoke>).
+            let mut resolved = false;
+            if let Some((cross_idx, cross_tag)) = find_first_tag(after_open, &TOOL_CALL_CLOSE_TAGS)
+            {
+                let inner = &after_open[..cross_idx];
+                let mut parsed_any = false;
+
+                // Try JSON
+                let json_values = extract_json_values(inner);
+                for value in json_values {
+                    let parsed_calls = parse_tool_calls_from_json_value(&value);
+                    if !parsed_calls.is_empty() {
+                        parsed_any = true;
+                        calls.extend(parsed_calls);
+                    }
+                }
+
+                // Try XML
+                if !parsed_any {
+                    if let Some(xml_calls) = parse_xml_tool_calls(inner) {
+                        calls.extend(xml_calls);
+                        parsed_any = true;
+                    }
+                }
+
+                // Try GLM shortened body
+                if !parsed_any {
+                    if let Some(glm_call) = parse_glm_shortened_body(inner) {
+                        calls.push(glm_call);
+                        parsed_any = true;
+                    }
+                }
+
+                if parsed_any {
+                    remaining = &after_open[cross_idx + cross_tag.len()..];
+                    resolved = true;
+                }
+            }
+
+            if resolved {
+                continue;
+            }
+
+            // No cross-alias close tag resolved — fall back to JSON recovery
+            // from unclosed tags (brace-balancing).
             if let Some(json_end) = find_json_end(after_open) {
                 if let Ok(value) =
                     serde_json::from_str::<serde_json::Value>(&after_open[..json_end])
@@ -1152,6 +1377,15 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                     remaining = strip_leading_close_tags(&after_open[consumed_end..]);
                     continue;
                 }
+            }
+
+            // Last resort: try GLM shortened body on everything after the open tag.
+            // The model may have emitted `<tool_call>shell>ls` with no close tag at all.
+            let glm_input = after_open.trim();
+            if let Some(glm_call) = parse_glm_shortened_body(glm_input) {
+                calls.push(glm_call);
+                remaining = "";
+                continue;
             }
 
             remaining = &remaining[start..];
@@ -4528,5 +4762,140 @@ Let me check the result."#;
             system_prompt.contains("## Your Task"),
             "Native prompt should contain task instructions"
         );
+    }
+
+    // ── Cross-Alias & GLM Shortened Body Tests ──────────────────────────
+
+    #[test]
+    fn parse_tool_calls_cross_alias_close_tag_with_json() {
+        // <tool_call> opened but closed with </invoke> — JSON body
+        let input = r#"<tool_call>{"name": "shell", "arguments": {"command": "ls"}}</invoke>"#;
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "ls");
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_cross_alias_close_tag_with_glm_shortened() {
+        // <tool_call>shell>uname -a</invoke> — GLM shortened inside cross-alias tags
+        let input = "<tool_call>shell>uname -a</invoke>";
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "uname -a");
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_glm_shortened_body_in_matched_tags() {
+        // <tool_call>shell>pwd</tool_call> — GLM shortened in matched tags
+        let input = "<tool_call>shell>pwd</tool_call>";
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "pwd");
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_glm_yaml_style_in_tags() {
+        // <tool_call>shell>\ncommand: date\napproved: true</invoke>
+        let input = "<tool_call>shell>\ncommand: date\napproved: true</invoke>";
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "date");
+        assert_eq!(calls[0].arguments["approved"], true);
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_attribute_style_in_tags() {
+        // <tool_call>shell command="date" /></tool_call>
+        let input = r#"<tool_call>shell command="date" /></tool_call>"#;
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "date");
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_file_read_shortened_in_cross_alias() {
+        // <tool_call>file_read path=".env" /></invoke>
+        let input = r#"<tool_call>file_read path=".env" /></invoke>"#;
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "file_read");
+        assert_eq!(calls[0].arguments["path"], ".env");
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_unclosed_glm_shortened_no_close_tag() {
+        // <tool_call>shell>ls -la (no close tag at all)
+        let input = "<tool_call>shell>ls -la";
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "ls -la");
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_text_before_cross_alias() {
+        // Text before and after cross-alias tool call
+        let input = "Let me check that.\n<tool_call>shell>uname -a</invoke>\nDone.";
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "uname -a");
+        assert!(text.contains("Let me check that."));
+        assert!(text.contains("Done."));
+    }
+
+    #[test]
+    fn parse_glm_shortened_body_url_to_curl() {
+        // URL values for shell should be wrapped in curl
+        let call = parse_glm_shortened_body("shell>https://example.com/api").unwrap();
+        assert_eq!(call.name, "shell");
+        let cmd = call.arguments["command"].as_str().unwrap();
+        assert!(cmd.contains("curl"));
+        assert!(cmd.contains("example.com"));
+    }
+
+    #[test]
+    fn parse_glm_shortened_body_memory_recall() {
+        // memory_recall>some query — default param is "query"
+        let call = parse_glm_shortened_body("memory_recall>recent meetings").unwrap();
+        assert_eq!(call.name, "memory_recall");
+        assert_eq!(call.arguments["query"], "recent meetings");
+    }
+
+    #[test]
+    fn default_param_for_tool_coverage() {
+        assert_eq!(default_param_for_tool("shell"), "command");
+        assert_eq!(default_param_for_tool("bash"), "command");
+        assert_eq!(default_param_for_tool("file_read"), "path");
+        assert_eq!(default_param_for_tool("memory_recall"), "query");
+        assert_eq!(default_param_for_tool("memory_store"), "content");
+        assert_eq!(default_param_for_tool("http_request"), "url");
+        assert_eq!(default_param_for_tool("browser_open"), "url");
+        assert_eq!(default_param_for_tool("unknown_tool"), "input");
+    }
+
+    #[test]
+    fn parse_glm_shortened_body_rejects_empty() {
+        assert!(parse_glm_shortened_body("").is_none());
+        assert!(parse_glm_shortened_body("   ").is_none());
+    }
+
+    #[test]
+    fn parse_glm_shortened_body_rejects_invalid_tool_name() {
+        // Tool names with special characters should be rejected
+        assert!(parse_glm_shortened_body("not-a-tool>value").is_none());
+        assert!(parse_glm_shortened_body("tool name>value").is_none());
     }
 }
