@@ -98,9 +98,9 @@ COPY --from=builder /zeroclaw-data /zeroclaw-data
 # Environment setup
 ENV ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace
 ENV HOME=/zeroclaw-data
-# Default provider (model is set in config.toml, not here,
-# so config file edits are not silently overridden)
-ENV PROVIDER="openrouter"
+# Default provider and model are set in config.toml, not here,
+# so config file edits are not silently overridden
+#ENV PROVIDER=
 ENV ZEROCLAW_GATEWAY_PORT=3000
 
 # API_KEY must be provided at runtime!
