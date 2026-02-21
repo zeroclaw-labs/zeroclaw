@@ -116,6 +116,7 @@ If `[channels_config.matrix]` or `[channels_config.lark]` is present but the cor
 | Lark/Feishu | websocket (default) or webhook | Webhook mode only |
 | DingTalk | stream mode | No |
 | QQ | bot gateway | No |
+| Linq | webhook (`/linq`) | Yes (public HTTPS callback) |
 | iMessage | local integration | No |
 
 ---
@@ -133,7 +134,7 @@ Field names differ by channel:
 - `allowed_users` (Telegram/Discord/Slack/Mattermost/Matrix/IRC/Lark/DingTalk/QQ/Nextcloud Talk)
 - `allowed_from` (Signal)
 - `allowed_numbers` (WhatsApp)
-- `allowed_senders` (Email)
+- `allowed_senders` (Email/Linq)
 - `allowed_contacts` (iMessage)
 
 ---
@@ -362,7 +363,26 @@ Notes:
 - `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET` overrides config secret.
 - See [nextcloud-talk-setup.md](./nextcloud-talk-setup.md) for a full runbook.
 
-### 4.15 iMessage
+### 4.15 Linq
+
+```toml
+[channels_config.linq]
+api_token = "linq-partner-api-token"
+from_phone = "+15551234567"
+signing_secret = "optional-webhook-signing-secret"  # optional but recommended
+allowed_senders = ["*"]
+```
+
+Notes:
+
+- Linq uses the Partner V3 API for iMessage, RCS, and SMS.
+- Inbound webhook endpoint: `POST /linq`.
+- Signature verification uses `X-Webhook-Signature` (HMAC-SHA256) and `X-Webhook-Timestamp`.
+- If `signing_secret` is set, invalid or stale (>300s) signatures are rejected.
+- `ZEROCLAW_LINQ_SIGNING_SECRET` overrides config secret.
+- `allowed_senders` uses E.164 phone number format (e.g. `+1234567890`).
+
+### 4.16 iMessage
 
 ```toml
 [channels_config.imessage]

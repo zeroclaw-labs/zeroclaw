@@ -394,6 +394,7 @@ Examples:
 - `[channels_config.telegram]`
 - `[channels_config.discord]`
 - `[channels_config.whatsapp]`
+- `[channels_config.linq]`
 - `[channels_config.nextcloud_talk]`
 - `[channels_config.email]`
 
@@ -438,6 +439,24 @@ Notes:
 
 - WhatsApp Web requires build flag `whatsapp-web`.
 - If both Cloud and Web fields are present, Cloud mode wins for backward compatibility.
+
+### `[channels_config.linq]`
+
+Linq Partner V3 API integration for iMessage, RCS, and SMS.
+
+| Key | Required | Purpose |
+|---|---|---|
+| `api_token` | Yes | Linq Partner API bearer token |
+| `from_phone` | Yes | Phone number to send from (E.164 format) |
+| `signing_secret` | Optional | Webhook signing secret for HMAC-SHA256 signature verification |
+| `allowed_senders` | Recommended | Allowed inbound phone numbers (`[]` = deny all, `"*"` = allow all) |
+
+Notes:
+
+- Webhook endpoint is `POST /linq`.
+- `ZEROCLAW_LINQ_SIGNING_SECRET` overrides `signing_secret` when set.
+- Signatures use `X-Webhook-Signature` and `X-Webhook-Timestamp` headers; stale timestamps (>300s) are rejected.
+- See [channels-reference.md](channels-reference.md) for full config examples.
 
 ### `[channels_config.nextcloud_talk]`
 
