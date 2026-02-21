@@ -557,7 +557,7 @@ fn canonical_provider_name(provider_name: &str) -> &str {
 fn allows_unauthenticated_model_fetch(provider_name: &str) -> bool {
     matches!(
         canonical_provider_name(provider_name),
-        "openrouter" | "ollama" | "llamacpp" | "vllm" | "venice" | "astrai" | "nvidia"
+        "openrouter" | "ollama" | "llamacpp" | "vllm" | "osaurus" | "venice" | "astrai" | "nvidia"
     )
 }
 
@@ -591,7 +591,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "qwen-code" => "qwen3-coder-plus".into(),
         "ollama" => "llama3.2".into(),
         "llamacpp" => "ggml-org/gpt-oss-20b-GGUF".into(),
-        "vllm" => "default".into(),
+        "vllm" | "osaurus" => "default".into(),
         "gemini" => "gemini-2.5-pro".into(),
         "kimi-code" => "kimi-for-coding".into(),
         "bedrock" => "anthropic.claude-sonnet-4-5-20250929-v1:0".into(),
@@ -953,6 +953,20 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "Qwen2.5 Coder 7B Instruct (coding-focused)".to_string(),
             ),
         ],
+        "osaurus" => vec![
+            (
+                "qwen3-30b-a3b-8bit".to_string(),
+                "Qwen3 30B A3B (local, balanced)".to_string(),
+            ),
+            (
+                "gemma-3n-e4b-it-lm-4bit".to_string(),
+                "Gemma 3N E4B (local, efficient)".to_string(),
+            ),
+            (
+                "phi-4-mini-reasoning-mlx-4bit".to_string(),
+                "Phi-4 Mini Reasoning (local, fast reasoning)".to_string(),
+            ),
+        ],
         "bedrock" => vec![
             (
                 "anthropic.claude-sonnet-4-6".to_string(),
@@ -1008,6 +1022,7 @@ fn supports_live_model_fetch(provider_name: &str) -> bool {
             | "ollama"
             | "llamacpp"
             | "vllm"
+            | "osaurus"
             | "astrai"
             | "venice"
             | "fireworks"
@@ -1045,6 +1060,7 @@ fn models_endpoint_for_provider(provider_name: &str) -> Option<&'static str> {
             "astrai" => Some("https://as-trai.com/v1/models"),
             "llamacpp" => Some("http://localhost:8080/v1/models"),
             "vllm" => Some("http://localhost:8000/v1/models"),
+            "osaurus" => Some("http://localhost:1337/v1/models"),
             _ => None,
         },
     }
@@ -1275,7 +1291,10 @@ fn resolve_live_models_endpoint(
     provider_name: &str,
     provider_api_url: Option<&str>,
 ) -> Option<String> {
-    if matches!(canonical_provider_name(provider_name), "llamacpp" | "vllm") {
+    if matches!(
+        canonical_provider_name(provider_name),
+        "llamacpp" | "vllm" | "osaurus"
+    ) {
         if let Some(url) = provider_api_url
             .map(str::trim)
             .filter(|url| !url.is_empty())
@@ -1837,6 +1856,10 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                 "llama.cpp server — local OpenAI-compatible endpoint",
             ),
             ("vllm", "vLLM — high-performance local inference engine"),
+            (
+                "osaurus",
+                "Osaurus — unified AI edge runtime (local MLX + cloud proxy + MCP)",
+            ),
         ],
         _ => vec![], // Custom — handled below
     };
@@ -2007,6 +2030,37 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             print_bullet(&format!(
                 "No API key provided. Set {} later only if your server requires authentication.",
                 style("VLLM_API_KEY").yellow()
+            ));
+        }
+
+        key
+    } else if provider_name == "osaurus" {
+        let raw_url: String = Input::new()
+            .with_prompt("  Osaurus server endpoint URL")
+            .default("http://localhost:1337/v1".into())
+            .interact_text()?;
+
+        let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
+        if normalized_url.is_empty() {
+            anyhow::bail!("Osaurus endpoint URL cannot be empty.");
+        }
+        provider_api_url = Some(normalized_url.clone());
+
+        print_bullet(&format!(
+            "Using Osaurus server endpoint: {}",
+            style(&normalized_url).cyan()
+        ));
+        print_bullet("No API key needed unless your Osaurus server requires authentication.");
+
+        let key: String = Input::new()
+            .with_prompt("  API key for Osaurus server (or Enter to skip)")
+            .allow_empty(true)
+            .interact_text()?;
+
+        if key.trim().is_empty() {
+            print_bullet(&format!(
+                "No API key provided. Set {} later only if your server requires authentication.",
+                style("OSAURUS_API_KEY").yellow()
             ));
         }
 
@@ -2416,6 +2470,7 @@ fn provider_env_var(name: &str) -> &'static str {
         "ollama" => "OLLAMA_API_KEY",
         "llamacpp" => "LLAMACPP_API_KEY",
         "vllm" => "VLLM_API_KEY",
+        "osaurus" => "OSAURUS_API_KEY",
         "venice" => "VENICE_API_KEY",
         "groq" => "GROQ_API_KEY",
         "mistral" => "MISTRAL_API_KEY",
@@ -2447,7 +2502,7 @@ fn provider_env_var(name: &str) -> &'static str {
 fn provider_supports_keyless_local_usage(provider_name: &str) -> bool {
     matches!(
         canonical_provider_name(provider_name),
-        "ollama" | "llamacpp" | "vllm"
+        "ollama" | "llamacpp" | "vllm" | "osaurus"
     )
 }
 

@@ -839,6 +839,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "astrai" => vec!["ASTRAI_API_KEY"],
         "llamacpp" | "llama.cpp" => vec!["LLAMACPP_API_KEY"],
         "vllm" => vec!["VLLM_API_KEY"],
+        "osaurus" => vec!["OSAURUS_API_KEY"],
         _ => vec![],
     };
 
@@ -1112,6 +1113,22 @@ fn create_provider_with_url_and_options(
                 "vLLM",
                 base_url,
                 key,
+                AuthStyle::Bearer,
+            )))
+        }
+        "osaurus" => {
+            let base_url = api_url
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("http://localhost:1337/v1");
+            let osaurus_key = key
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("osaurus");
+            Ok(Box::new(OpenAiCompatibleProvider::new(
+                "Osaurus",
+                base_url,
+                Some(osaurus_key),
                 AuthStyle::Bearer,
             )))
         }
@@ -1602,6 +1619,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             local: true,
         },
         ProviderInfo {
+            name: "osaurus",
+            display_name: "Osaurus",
+            aliases: &[],
+            local: true,
+        },
+        ProviderInfo {
             name: "nvidia",
             display_name: "NVIDIA NIM",
             aliases: &["nvidia-nim", "build.nvidia.com"],
@@ -2062,6 +2085,44 @@ mod tests {
         assert!(create_provider("vllm", Some("key")).is_ok());
     }
 
+    #[test]
+    fn factory_osaurus() {
+        // Osaurus works without an explicit key (defaults to "osaurus").
+        assert!(create_provider("osaurus", None).is_ok());
+        // Osaurus also works with an explicit key.
+        assert!(create_provider("osaurus", Some("custom-key")).is_ok());
+    }
+
+    #[test]
+    fn factory_osaurus_uses_default_key_when_none() {
+        // Verify that create_provider_with_url_and_options succeeds even
+        // without an API key — the match arm provides a default placeholder.
+        let options = ProviderRuntimeOptions::default();
+        let p = create_provider_with_url_and_options("osaurus", None, None, &options);
+        assert!(p.is_ok());
+    }
+
+    #[test]
+    fn factory_osaurus_custom_url() {
+        // Verify that a custom api_url overrides the default localhost endpoint.
+        let options = ProviderRuntimeOptions::default();
+        let p = create_provider_with_url_and_options(
+            "osaurus",
+            Some("key"),
+            Some("http://192.168.1.100:1337/v1"),
+            &options,
+        );
+        assert!(p.is_ok());
+    }
+
+    #[test]
+    fn resolve_provider_credential_osaurus_env() {
+        let _env_lock = env_lock();
+        let _guard = EnvGuard::set("OSAURUS_API_KEY", Some("osaurus-test-key"));
+        let resolved = resolve_provider_credential("osaurus", None);
+        assert_eq!(resolved, Some("osaurus-test-key".to_string()));
+    }
+
     // ── Extended ecosystem ───────────────────────────────────
 
     #[test]
@@ -2378,6 +2439,25 @@ mod tests {
         assert!(provider.is_ok());
     }
 
+    /// Osaurus works as a fallback provider alongside other named providers.
+    #[test]
+    fn resilient_fallback_includes_osaurus() {
+        let reliability = crate::config::ReliabilityConfig {
+            provider_retries: 1,
+            provider_backoff_ms: 100,
+            fallback_providers: vec!["osaurus".into(), "lmstudio".into()],
+            api_keys: Vec::new(),
+            model_fallbacks: std::collections::HashMap::new(),
+            channel_initial_backoff_secs: 2,
+            channel_max_backoff_secs: 60,
+            scheduler_poll_secs: 15,
+            scheduler_retries: 2,
+        };
+
+        let provider = create_resilient_provider("zai", Some("zai-test-key"), None, &reliability);
+        assert!(provider.is_ok());
+    }
+
     #[test]
     fn factory_all_providers_create_successfully() {
         let providers = [
@@ -2413,6 +2493,7 @@ mod tests {
             "lmstudio",
             "llamacpp",
             "vllm",
+            "osaurus",
             "groq",
             "mistral",
             "xai",

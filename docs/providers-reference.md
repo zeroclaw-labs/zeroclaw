@@ -57,6 +57,7 @@ credential is not reused for fallback providers.
 | `lmstudio` | `lm-studio` | Yes | (optional; local by default) |
 | `llamacpp` | `llama.cpp` | Yes | `LLAMACPP_API_KEY` (optional; only if server auth is enabled) |
 | `vllm` | — | Yes | `VLLM_API_KEY` (optional) |
+| `osaurus` | — | Yes | `OSAURUS_API_KEY` (optional; defaults to `"osaurus"`) |
 | `nvidia` | `nvidia-nim`, `build.nvidia.com` | No | `NVIDIA_API_KEY` |
 
 ### Gemini Notes
@@ -95,6 +96,17 @@ credential is not reused for fallback providers.
 - Default endpoint: `http://localhost:8000/v1`
 - API key is optional by default; set `VLLM_API_KEY` only when the server requires authentication.
 - Model discovery: `zeroclaw models refresh --provider vllm`
+
+### Osaurus Server Notes
+
+- Provider ID: `osaurus`
+- Default endpoint: `http://localhost:1337/v1`
+- API key defaults to `"osaurus"` but is optional; set `OSAURUS_API_KEY` to override or leave unset for keyless access.
+- Model discovery: `zeroclaw models refresh --provider osaurus`
+- [Osaurus](https://github.com/dinoki-ai/osaurus) is a unified AI edge runtime for macOS (Apple Silicon) that combines local MLX inference with cloud provider proxying through a single endpoint.
+- Supports multiple API formats simultaneously: OpenAI-compatible (`/v1/chat/completions`), Anthropic (`/messages`), Ollama (`/chat`), and Open Responses (`/v1/responses`).
+- Built-in MCP (Model Context Protocol) support for tool and context server connectivity.
+- Local models run via MLX (Llama, Qwen, Gemma, GLM, Phi, Nemotron, and others); cloud models are proxied transparently.
 
 ### Bedrock Notes
 

@@ -782,6 +782,21 @@ default_provider = "vllm"
 default_model = "meta-llama/Llama-3.1-8B-Instruct"
 ```
 
+### Osaurus Server Endpoint
+
+ZeroClaw supports [Osaurus](https://github.com/dinoki-ai/osaurus) as a first-class local provider — a unified AI edge runtime for macOS that combines local MLX inference with cloud provider proxying and MCP support through a single endpoint:
+
+- Provider ID: `osaurus`
+- Default endpoint: `http://localhost:1337/v1`
+- API key defaults to `"osaurus"` but is optional
+
+Example setup:
+
+```toml
+default_provider = "osaurus"
+default_model = "qwen3-30b-a3b-8bit"
+```
+
 ### Custom Provider Endpoints
 
 For detailed configuration of custom OpenAI-compatible and Anthropic-compatible endpoints, see [docs/custom-providers.md](docs/custom-providers.md).
