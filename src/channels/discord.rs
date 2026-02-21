@@ -2,6 +2,7 @@ use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
+use rand::Rng;
 use serde_json::json;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
@@ -50,6 +51,36 @@ impl DiscordChannel {
         let part = token.split('.').next()?;
         base64_decode(part)
     }
+
+    fn spawn_inbound_ack_reaction(&self, channel_id: &str, message_id: &str) {
+        if channel_id.is_empty() || message_id.is_empty() {
+            return;
+        }
+
+        let client = self.http_client();
+        let token = self.bot_token.clone();
+        let url = build_discord_reaction_url(channel_id, message_id, random_discord_ack_reaction());
+
+        tokio::spawn(async move {
+            let resp = match client
+                .put(&url)
+                .header("Authorization", format!("Bot {token}"))
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(err) => {
+                    tracing::debug!("Discord reaction ack request failed: {err}");
+                    return;
+                }
+            };
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let err = resp.text().await.unwrap_or_default();
+                tracing::debug!("Discord reaction ack failed ({status}): {err}");
+            }
+        });
+    }
 }
 
 const BASE64_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -58,6 +89,17 @@ const BASE64_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstu
 ///
 /// Discord rejects longer payloads with `50035 Invalid Form Body`.
 const DISCORD_MAX_MESSAGE_LENGTH: usize = 2000;
+const DISCORD_ACK_REACTIONS: [&str; 7] = ["⚡️", "🦀", "🙌", "💪", "👌", "👀", "👣"];
+
+fn random_discord_ack_reaction() -> &'static str {
+    let idx = rand::rng().random_range(0..DISCORD_ACK_REACTIONS.len());
+    DISCORD_ACK_REACTIONS[idx]
+}
+
+fn build_discord_reaction_url(channel_id: &str, message_id: &str, emoji: &str) -> String {
+    let encoded = urlencoding::encode(emoji).into_owned();
+    format!("https://discord.com/api/v10/channels/{channel_id}/messages/{message_id}/reactions/{encoded}/@me")
+}
 
 /// Split a message into chunks that respect Discord's 2000-character limit.
 /// Tries to split at word boundaries when possible.
@@ -395,6 +437,8 @@ impl Channel for DiscordChannel {
                     let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
                     let channel_id = d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("").to_string();
 
+                    self.spawn_inbound_ack_reaction(&channel_id, message_id);
+
                     let channel_msg = ChannelMessage {
                         id: if message_id.is_empty() {
                             Uuid::new_v4().to_string()
@@ -477,6 +521,22 @@ mod tests {
     fn discord_channel_name() {
         let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
         assert_eq!(ch.name(), "discord");
+    }
+
+    #[test]
+    fn random_discord_ack_reaction_is_from_pool() {
+        for _ in 0..256 {
+            let reaction = random_discord_ack_reaction();
+            assert!(DISCORD_ACK_REACTIONS.contains(&reaction));
+        }
+    }
+
+    #[test]
+    fn build_discord_reaction_url_encodes_emoji() {
+        let url = build_discord_reaction_url("123", "456", "⚡️");
+        assert!(url.starts_with("https://discord.com/api/v10/channels/123/messages/456/reactions/"));
+        assert!(url.ends_with("/@me"));
+        assert!(!url.contains("⚡️"));
     }
 
     #[test]

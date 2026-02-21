@@ -13,13 +13,20 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" /></a>
   <a href="NOTICE"><img src="https://img.shields.io/badge/contributors-27+-green.svg" alt="Contributors" /></a>
   <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=flat&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
+  <a href="https://zeroclawlabs.cn/group.jpg"><img src="https://img.shields.io/badge/WeChat-Group-B7D7A8?logo=wechat&logoColor=white" alt="WeChat Group" /></a>
+  <a href="https://x.com/zeroclawlabs?s=21"><img src="https://img.shields.io/badge/X-%40zeroclawlabs-000000?style=flat&logo=x&logoColor=white" alt="X: @zeroclawlabs" /></a>
+  <a href="https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search"><img src="https://img.shields.io/badge/Xiaohongshu-Official-FF2442?style=flat" alt="Xiaohongshu: Official" /></a>
+  <a href="https://t.me/zeroclawlabs"><img src="https://img.shields.io/badge/Telegram-%40zeroclawlabs-26A5E4?style=flat&logo=telegram&logoColor=white" alt="Telegram: @zeroclawlabs" /></a>
+  <a href="https://t.me/zeroclawlabs_cn"><img src="https://img.shields.io/badge/Telegram%20CN-%40zeroclawlabs__cn-26A5E4?style=flat&logo=telegram&logoColor=white" alt="Telegram CN: @zeroclawlabs_cn" /></a>
+  <a href="https://t.me/zeroclawlabs_ru"><img src="https://img.shields.io/badge/Telegram%20RU-%40zeroclawlabs__ru-26A5E4?style=flat&logo=telegram&logoColor=white" alt="Telegram RU: @zeroclawlabs_ru" /></a>
+  <a href="https://www.reddit.com/r/zeroclawlabs/"><img src="https://img.shields.io/badge/Reddit-r%2Fzeroclawlabs-FF4500?style=flat&logo=reddit&logoColor=white" alt="Reddit: r/zeroclawlabs" /></a>
 </p>
 <p align="center">
 Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 </p>
 
 <p align="center">
-  🌐 <strong>Languages:</strong> <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.ru.md">Русский</a>
+  🌐 <strong>Languages:</strong> <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.ru.md">Русский</a> · <a href="README.fr.md">Français</a> · <a href="README.vi.md">Tiếng Việt</a>
 </p>
 
 <p align="center">
@@ -52,7 +59,8 @@ Use this board for important notices (breaking changes, security advisories, mai
 
 | Date (UTC) | Level | Notice | Action |
 |---|---|---|---|
-| 2026-02-19 | _Important_ | We have **not** launched an official website yet, and we are seeing impersonation attempts. Do **not** join any investment or fundraising activity claiming the ZeroClaw name. | Use this repository as the single source of truth. Follow [X (@zeroclawlabs)](https://x.com/zeroclawlabs?s=21) and [Xiaohongshu](https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search) for official updates. |
+| 2026-02-19 | _Critical_ | We are **not affiliated** with `openagen/zeroclaw` or `zeroclaw.org`. The `zeroclaw.org` domain currently points to the `openagen/zeroclaw` fork, and that domain/repository are impersonating our official website/project. | Do not trust information, binaries, fundraising, or announcements from those sources. Use only this repository and our verified social accounts. |
+| 2026-02-21 | _Important_ | Our official website is now live: [zeroclawlabs.ai](https://zeroclawlabs.ai). Thanks for your patience while we prepared the launch. We are still seeing impersonation attempts, so do **not** join any investment or fundraising activity claiming the ZeroClaw name unless it is published through our official channels. | Use this repository and our verified social accounts as the source of truth for announcements and verification. |
 | 2026-02-19 | _Important_ | Anthropic updated the Authentication and Credential Use terms on 2026-02-19. OAuth authentication (Free, Pro, Max) is intended exclusively for Claude Code and Claude.ai; using OAuth tokens from Claude Free/Pro/Max in any other product, tool, or service (including Agent SDK) is not permitted and may violate the Consumer Terms of Service. | Please temporarily avoid Claude Code OAuth integrations to prevent potential loss. Original clause: [Authentication and Credential Use](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use). |
 
 ### ✨ Features
@@ -212,8 +220,38 @@ export PATH="$HOME/.cargo/bin:$PATH"
 # Quick setup (no prompts)
 zeroclaw onboard --api-key sk-... --provider openrouter
 
+# Quick setup with a non-strict security profile (explicit consent required)
+zeroclaw onboard --security-profile flexible --yes-security-risk
+
+# Inspect and tune policy after onboarding
+zeroclaw security show
+zeroclaw security profile recommend "need unattended browser automation"
+zeroclaw security profile recommend "hardened deployment" --from-preset hardened-linux --remove-pack tools-update
+zeroclaw security profile set balanced --dry-run --json
+zeroclaw security profile set strict --non-cli-approval manual
+# Higher risk: allows non-CLI channels to auto-approve approval-gated tool calls
+zeroclaw security profile set strict --non-cli-approval auto --yes-risk
+zeroclaw security profile set strict
+
+# Quick setup with official preset + extra packs
+zeroclaw onboard --preset automation --pack rag-pdf
+
+# Post-onboard: plan composition from natural-language intent
+zeroclaw preset intent "need browser automation but no update" --dry-run
+zeroclaw preset intent "need unattended browser automation" --json
+zeroclaw preset intent "need unattended browser automation" --emit-shell ./scripts/preset-plan.sh
+
+# Apply + optional rebuild (explicit confirmations required)
+zeroclaw preset intent "need embedded debug with datasheets" --apply --yes-risky --rebuild --yes-rebuild
+
 # Or interactive wizard
 zeroclaw onboard --interactive
+# Interactive flow includes security profile selection
+# (default: Strict supervised; weaker profiles require explicit risk acknowledgment)
+# After preset/pack selection, onboarding also proposes a preset-aware security profile adjustment.
+# The wizard keeps the default view concise and can expand detailed rationale on demand.
+# If tool execution is blocked by security policy, agent responses now include
+# graded remediation options (L0-L4) and explicit risk warnings before policy relaxation.
 
 # Or quickly repair channels/allowlists only
 zeroclaw onboard --channels-only
@@ -305,6 +343,20 @@ zeroclaw agent --provider openai-codex --auth-profile openai-codex:work -m "hell
 # ANTHROPIC_AUTH_TOKEN, ANTHROPIC_OAUTH_TOKEN, ANTHROPIC_API_KEY
 zeroclaw agent --provider anthropic -m "hello"
 ```
+
+OpenAI Codex OAuth + custom backend proxy:
+
+```toml
+# ~/.zeroclaw/config.toml
+default_provider = "openai-codex"
+default_model = "gpt-5-codex"
+api_url = "https://your-proxy.example.com/v1" # runtime sends /v1/responses
+```
+
+Optional env overrides:
+
+- `ZEROCLAW_CODEX_BASE_URL` (base URL, `/responses` auto-appended)
+- `ZEROCLAW_CODEX_RESPONSES_URL` (full endpoint URL)
 
 ## Architecture
 
@@ -771,6 +823,7 @@ See [aieos.org](https://aieos.org) for the full schema and live examples.
 |---------|-------------|
 | `onboard` | Quick setup (default) |
 | `agent` | Interactive or single-message chat mode |
+| `update` | Check/apply binary self-update from GitHub Releases |
 | `gateway` | Start webhook server (default: `127.0.0.1:3000`) |
 | `daemon` | Start long-running autonomous runtime |
 | `service` | Manage user-level background service |
@@ -778,6 +831,8 @@ See [aieos.org](https://aieos.org) for the full schema and live examples.
 | `status` | Show full system status |
 | `cron` | Manage scheduled tasks (`list/add/add-at/add-every/once/remove/update/pause/resume`) |
 | `models` | Refresh provider model catalogs (`models refresh`) |
+| `preset` | Manage preset composition/import/export/intent planning |
+| `security` | Inspect/change security profile (`show`, `profile set`) |
 | `providers` | List supported providers and aliases |
 | `channel` | List/start/doctor channels and bind Telegram identities |
 | `integrations` | Inspect integration setup details |
@@ -835,6 +890,8 @@ Start from the docs hub for a task-based map:
 - Documentation hub: [`docs/README.md`](docs/README.md)
 - Unified docs TOC: [`docs/SUMMARY.md`](docs/SUMMARY.md)
 - Commands reference: [`docs/commands-reference.md`](docs/commands-reference.md)
+- Presets guide: [`docs/presets-guide.md`](docs/presets-guide.md)
+- Preset recommendation matrix: [`docs/preset-recommendation-matrix.md`](docs/preset-recommendation-matrix.md)
 - Config reference: [`docs/config-reference.md`](docs/config-reference.md)
 - Providers reference: [`docs/providers-reference.md`](docs/providers-reference.md)
 - Channels reference: [`docs/channels-reference.md`](docs/channels-reference.md)

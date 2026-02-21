@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "merge_mode": "append",
+  "capabilities": [
+    {
+      "id": "team-webhook",
+      "rationale": "Prioritize webhook-first automation workflows",
+      "keywords": ["webhook", "callback", "event push"],
+      "add_packs": ["browser-native"],
+      "remove_packs": [],
+      "preset_biases": {
+        "automation": 0.8,
+        "default": 0.3
+      },
+      "base_weight": 0.7,
+      "enabled": true
+    },
+    {
+      "id": "strict-no-update",
+      "rationale": "Disallow self-update flows in controlled environments",
+      "keywords": ["no update", "without update", "不要更新"],
+      "add_packs": [],
+      "remove_packs": ["tools-update"],
+      "preset_biases": {
+        "minimal": 0.4
+      },
+      "base_weight": 0.66,
+      "enabled": true
+    }
+  ]
+}

@@ -423,7 +423,7 @@ impl SecurityPolicy {
             }
 
             // Validate arguments for the command
-            let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
+            let args: Vec<String> = words.map(|w| w.to_string()).collect();
             if !self.is_args_safe(base_cmd, &args) {
                 return false;
             }
@@ -444,16 +444,22 @@ impl SecurityPolicy {
         match base.as_str() {
             "find" => {
                 // find -exec and find -ok allow arbitrary command execution
-                !args.iter().any(|arg| arg == "-exec" || arg == "-ok")
+                !args.iter().any(|arg| {
+                    let lower = arg.to_ascii_lowercase();
+                    lower == "-exec" || lower == "-ok"
+                })
             }
             "git" => {
                 // git config, alias, and -c can be used to set dangerous options
                 // (e.g. git config core.editor "rm -rf /")
                 !args.iter().any(|arg| {
-                    arg == "config"
-                        || arg.starts_with("config.")
-                        || arg == "alias"
-                        || arg.starts_with("alias.")
+                    let lower = arg.to_ascii_lowercase();
+                    lower == "config"
+                        || lower.starts_with("config.")
+                        || lower == "alias"
+                        || lower.starts_with("alias.")
+                        // Keep this case-sensitive so safe `-C <path>` is not
+                        // conflated with dangerous `-c key=value`.
                         || arg == "-c"
                 })
             }
@@ -1100,6 +1106,13 @@ mod tests {
         assert!(p.is_command_allowed("find . -name '*.txt'"));
         assert!(p.is_command_allowed("git status"));
         assert!(p.is_command_allowed("git add ."));
+    }
+
+    #[test]
+    fn git_uppercase_c_is_allowed_but_lowercase_c_is_blocked() {
+        let p = default_policy();
+        assert!(p.is_command_allowed("git -C /tmp status"));
+        assert!(!p.is_command_allowed("git -c core.editor=vim status"));
     }
 
     #[test]

@@ -76,6 +76,153 @@ fn scrub_credentials(input: &str) -> String {
         .to_string()
 }
 
+fn strip_untrusted_approval_argument(arguments: &mut serde_json::Value) {
+    if let serde_json::Value::Object(map) = arguments {
+        map.remove("approved");
+    }
+}
+
+fn apply_explicit_approval_argument(arguments: &mut serde_json::Value) {
+    if let serde_json::Value::Object(map) = arguments {
+        map.insert("approved".to_string(), serde_json::Value::Bool(true));
+    }
+}
+
+fn is_security_restriction_error(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    [
+        "security policy",
+        "read-only mode",
+        "read-only",
+        "requires explicit approval",
+        "high-risk command",
+        "higher autonomy level",
+        "path not allowed by security policy",
+        "rate limit exceeded",
+        "action budget exhausted",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+fn infer_security_risk_level(reason: &str) -> &'static str {
+    let normalized = reason.to_ascii_lowercase();
+    if normalized.contains("high-risk")
+        || normalized.contains("read-only mode")
+        || normalized.contains("higher autonomy")
+    {
+        "high"
+    } else if normalized.contains("requires explicit approval")
+        || normalized.contains("security policy")
+        || normalized.contains("path not allowed")
+    {
+        "medium"
+    } else {
+        "low"
+    }
+}
+
+fn requires_typed_confirmation(reason: &str) -> bool {
+    infer_security_risk_level(reason) == "high"
+}
+
+fn build_security_restriction_metadata(
+    tool_name: &str,
+    reason: &str,
+    channel: Option<&str>,
+) -> serde_json::Value {
+    let risk_level = infer_security_risk_level(reason);
+    serde_json::json!({
+        "schema_version": 1,
+        "blocked": true,
+        "tool": tool_name,
+        "channel": channel,
+        "reason": reason,
+        "risk_level": risk_level,
+        "requires_typed_confirmation": requires_typed_confirmation(reason),
+        "recommended_commands": {
+            "inspect": "zeroclaw security show",
+            "recommend": "zeroclaw security profile recommend \"<your intent>\"",
+            "balanced": "zeroclaw security profile set balanced --yes-risk",
+            "flexible": "zeroclaw security profile set flexible --yes-risk",
+            "full": "zeroclaw security profile set full --yes-risk",
+            "rollback": "zeroclaw security profile set strict"
+        },
+        "levels": [
+            {"id":"L0", "description":"keep current policy and ask for safer alternative", "risk":"low"},
+            {"id":"L1", "description":"one-time explicit approval in trusted interactive context", "risk":"medium"},
+            {"id":"L2", "description":"balanced profile", "risk":"medium"},
+            {"id":"L3", "description":"flexible profile", "risk":"medium_high"},
+            {"id":"L4", "description":"full autonomy profile", "risk":"high"}
+        ]
+    })
+}
+
+fn security_restriction_guidance(tool_name: &str, reason: &str) -> String {
+    let risk_level = infer_security_risk_level(reason);
+    let typed_confirmation = requires_typed_confirmation(reason);
+    let mut lines = vec![
+        "Security guardrail blocked this operation.".to_string(),
+        format!("Reason: {reason}"),
+        format!(
+            "Metadata: risk_level={risk_level}, requires_typed_confirmation={typed_confirmation}"
+        ),
+        "Guardrail levels (choose the minimum needed):".to_string(),
+        "L0 (recommended): keep current policy and ask for a safer alternative.".to_string(),
+    ];
+
+    if tool_name == "shell" && reason.contains("requires explicit approval") {
+        lines.push(
+            "L1: one-time shell approval in supervised mode (ask the agent to retry this shell call with `approved=true`).".to_string(),
+        );
+    } else {
+        lines.push(
+            "L1: keep current policy and adjust workflow to stay within allowlist/workspace scope."
+                .to_string(),
+        );
+    }
+
+    lines.extend([
+        "L2: `zeroclaw security profile set balanced --yes-risk`".to_string(),
+        "L3: `zeroclaw security profile set flexible --yes-risk`".to_string(),
+        "L4 (highest risk): `zeroclaw security profile set full --yes-risk`".to_string(),
+        "Inspect before changing: `zeroclaw security show`".to_string(),
+        "Intent-aware recommendation: `zeroclaw security profile recommend \"<your intent>\"`"
+            .to_string(),
+        "Risk warning: relaxing guardrails can allow wider filesystem/network side effects and destructive operations. Review carefully before enabling."
+            .to_string(),
+        "Rollback to safest defaults: `zeroclaw security profile set strict`".to_string(),
+    ]);
+
+    lines.join("\n")
+}
+
+fn augment_security_restriction_output(tool_name: &str, raw_output: &str) -> String {
+    if !is_security_restriction_error(raw_output) {
+        return raw_output.to_string();
+    }
+    let metadata = build_security_restriction_metadata(tool_name, raw_output, None);
+    let metadata_text = serde_json::to_string_pretty(&metadata)
+        .unwrap_or_else(|_| "{\"schema_version\":1,\"blocked\":true}".to_string());
+    format!(
+        "{raw_output}\n\n[Security Remediation]\n{}\n\n[Security Remediation Metadata]\n{}",
+        security_restriction_guidance(tool_name, raw_output),
+        metadata_text
+    )
+}
+
+fn build_non_cli_approval_denied_message(tool_name: &str, channel_name: &str) -> String {
+    let reason = format!(
+        "Tool requires explicit approval, but channel '{channel_name}' has non-CLI auto-approval disabled."
+    );
+    let mut message = augment_security_restriction_output(tool_name, &reason);
+    message.push_str("\n\n[Channel Approval]");
+    message.push_str(
+        "\nUse CLI for per-call approval prompts, or (higher risk) set `[autonomy] allow_non_cli_auto_approval = true` in config.toml.",
+    );
+    message
+}
+
 /// Default trigger for auto-compaction when non-system message count exceeds this threshold.
 /// Prefer passing the config-driven value via `run_tool_call_loop`; this constant is only
 /// used when callers omit the parameter.
@@ -89,6 +236,9 @@ const COMPACTION_MAX_SOURCE_CHARS: usize = 12_000;
 
 /// Max characters retained in stored compaction summary.
 const COMPACTION_MAX_SUMMARY_CHARS: usize = 2_000;
+
+/// Cap per-tool output persisted into conversation history to avoid context blow-up.
+const TOOL_RESULT_HISTORY_MAX_CHARS: usize = 4_000;
 
 /// Convert a tool registry to OpenAI function-calling format for native tool support.
 fn tools_to_openai_format(tools_registry: &[Box<dyn Tool>]) -> Vec<serde_json::Value> {
@@ -286,32 +436,58 @@ fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
     }
 }
 
+fn normalize_tool_name(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        // Common aliases returned by some OpenAI-compatible models.
+        "bash" | "sh" | "zsh" | "terminal" | "cmd" => "shell".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn parse_tool_arguments_with_fallback(value: &serde_json::Value) -> serde_json::Value {
+    let mut arguments = parse_arguments_value(
+        value
+            .get("arguments")
+            .or_else(|| value.get("input"))
+            .or_else(|| value.get("params")),
+    );
+
+    let needs_command_fallback =
+        matches!(&arguments, serde_json::Value::Object(map) if map.is_empty());
+
+    if needs_command_fallback {
+        if let Some(command) = value.get("command").and_then(|v| v.as_str()) {
+            arguments = serde_json::json!({ "command": command });
+        }
+    }
+
+    arguments
+}
+
 fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
     if let Some(function) = value.get("function") {
-        let name = function
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
+        let name = normalize_tool_name(function.get("name").and_then(|v| v.as_str()).unwrap_or(""));
         if !name.is_empty() {
             let arguments = parse_arguments_value(function.get("arguments"));
             return Some(ParsedToolCall { name, arguments });
         }
     }
 
-    let name = value
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
+    if let Some(tool_name) = value.get("tool").and_then(|v| v.as_str()) {
+        let name = normalize_tool_name(tool_name);
+        if !name.is_empty() {
+            let arguments = parse_tool_arguments_with_fallback(value);
+            return Some(ParsedToolCall { name, arguments });
+        }
+    }
+
+    let name = normalize_tool_name(value.get("name").and_then(|v| v.as_str()).unwrap_or(""));
 
     if name.is_empty() {
         return None;
     }
 
-    let arguments = parse_arguments_value(value.get("arguments"));
+    let arguments = parse_tool_arguments_with_fallback(value);
     Some(ParsedToolCall { name, arguments })
 }
 
@@ -993,6 +1169,12 @@ pub(crate) async fn run_tool_call_loop(
         let mut tool_results = String::new();
         let mut individual_results: Vec<String> = Vec::new();
         for call in &tool_calls {
+            // Never trust model-provided "approved=true" by default.
+            // We only pass approval through when it comes from actual approval policy/user confirmation.
+            let mut execution_arguments = call.arguments.clone();
+            strip_untrusted_approval_argument(&mut execution_arguments);
+            let mut explicit_approval_granted = false;
+
             // ── Approval hook ────────────────────────────────
             if let Some(mgr) = approval {
                 if mgr.needs_approval(&call.name) {
@@ -1001,17 +1183,24 @@ pub(crate) async fn run_tool_call_loop(
                         arguments: call.arguments.clone(),
                     };
 
-                    // Only prompt interactively on CLI; auto-approve on other channels.
+                    // Only prompt interactively on CLI.
+                    // Non-CLI channels follow `allow_non_cli_auto_approval`.
                     let decision = if channel_name == "cli" {
                         mgr.prompt_cli(&request)
-                    } else {
+                    } else if mgr.allow_non_cli_auto_approval() {
                         ApprovalResponse::Yes
+                    } else {
+                        ApprovalResponse::No
                     };
 
                     mgr.record_decision(&call.name, &call.arguments, decision, channel_name);
 
                     if decision == ApprovalResponse::No {
-                        let denied = "Denied by user.".to_string();
+                        let denied = if channel_name == "cli" {
+                            "Denied by user.".to_string()
+                        } else {
+                            build_non_cli_approval_denied_message(&call.name, channel_name)
+                        };
                         individual_results.push(denied.clone());
                         let _ = writeln!(
                             tool_results,
@@ -1020,7 +1209,14 @@ pub(crate) async fn run_tool_call_loop(
                         );
                         continue;
                     }
+                    explicit_approval_granted = true;
+                } else {
+                    // Approved by policy/session allowlist.
+                    explicit_approval_granted = true;
                 }
+            }
+            if explicit_approval_granted {
+                apply_explicit_approval_argument(&mut execution_arguments);
             }
 
             observer.record_event(&ObserverEvent::ToolCallStart {
@@ -1028,7 +1224,7 @@ pub(crate) async fn run_tool_call_loop(
             });
             let start = Instant::now();
             let result = if let Some(tool) = find_tool(tools_registry, &call.name) {
-                match tool.execute(call.arguments.clone()).await {
+                match tool.execute(execution_arguments).await {
                     Ok(r) => {
                         observer.record_event(&ObserverEvent::ToolCall {
                             tool: call.name.clone(),
@@ -1038,7 +1234,10 @@ pub(crate) async fn run_tool_call_loop(
                         if r.success {
                             scrub_credentials(&r.output)
                         } else {
-                            format!("Error: {}", r.error.unwrap_or_else(|| r.output))
+                            let reason = r.error.unwrap_or(r.output);
+                            let annotated =
+                                augment_security_restriction_output(&call.name, &reason);
+                            format!("Error: {annotated}")
                         }
                     }
                     Err(e) => {
@@ -1047,18 +1246,25 @@ pub(crate) async fn run_tool_call_loop(
                             duration: start.elapsed(),
                             success: false,
                         });
-                        format!("Error executing {}: {e}", call.name)
+                        let raw = format!("Error executing {}: {e}", call.name);
+                        augment_security_restriction_output(&call.name, &raw)
                     }
                 }
             } else {
                 format!("Unknown tool: {}", call.name)
             };
 
-            individual_results.push(result.clone());
+            let result_for_history = if result.chars().count() > TOOL_RESULT_HISTORY_MAX_CHARS {
+                truncate_with_ellipsis(&result, TOOL_RESULT_HISTORY_MAX_CHARS)
+            } else {
+                result
+            };
+
+            individual_results.push(result_for_history.clone());
             let _ = writeln!(
                 tool_results,
                 "<tool_result name=\"{}\">\n{}\n</tool_result>",
-                call.name, result
+                call.name, result_for_history
             );
         }
 
@@ -1098,6 +1304,7 @@ pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> Strin
     instructions.push_str("After tool execution, results appear in <tool_result> tags. ");
     instructions
         .push_str("Continue reasoning with the results until you can give a final answer.\n\n");
+    instructions.push_str("If a tool result reports a security guardrail block, do NOT invent bypasses. Explain the block, provide least-privilege options first, and include risk warnings before suggesting policy relaxation.\n\n");
     instructions.push_str("### Available Tools\n\n");
 
     for tool in tools_registry {
@@ -1769,6 +1976,43 @@ mod tests {
         assert!(scrubbed.contains("\"api_key\": \"sk-1*[REDACTED]\""));
         assert!(scrubbed.contains("public"));
     }
+
+    #[test]
+    fn approval_argument_must_be_explicitly_managed() {
+        let mut args = serde_json::json!({"command":"touch file.txt", "approved": true});
+        strip_untrusted_approval_argument(&mut args);
+        assert!(args.get("approved").is_none());
+
+        apply_explicit_approval_argument(&mut args);
+        assert_eq!(args.get("approved"), Some(&serde_json::Value::Bool(true)));
+    }
+
+    #[test]
+    fn security_restriction_output_includes_remediation_plan() {
+        let raw = "Command requires explicit approval (approved=true): medium-risk operation";
+        let annotated = augment_security_restriction_output("shell", raw);
+        assert!(annotated.contains("Security guardrail blocked this operation."));
+        assert!(annotated.contains("L0 (recommended)"));
+        assert!(annotated.contains("\"risk_level\": \"medium\""));
+        assert!(annotated.contains("\"requires_typed_confirmation\": false"));
+        assert!(annotated.contains("zeroclaw security show"));
+        assert!(annotated.contains("zeroclaw security profile set full --yes-risk"));
+    }
+
+    #[test]
+    fn non_security_errors_are_not_rewritten() {
+        let raw = "Failed to execute command: No such file or directory";
+        let annotated = augment_security_restriction_output("shell", raw);
+        assert_eq!(annotated, raw);
+    }
+
+    #[test]
+    fn non_cli_approval_denial_includes_channel_guidance() {
+        let denied = build_non_cli_approval_denied_message("shell", "telegram");
+        assert!(denied.contains("channel 'telegram'"));
+        assert!(denied.contains("allow_non_cli_auto_approval = true"));
+        assert!(denied.contains("[Security Remediation Metadata]"));
+    }
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use tempfile::TempDir;
 
@@ -2396,6 +2640,23 @@ Done."#;
     }
 
     #[test]
+    fn parse_tool_call_value_maps_bash_alias_with_command_field() {
+        // Compatibility: Some models emit {"tool":"Bash","command":"..."}.
+        let value = serde_json::json!({"tool": "Bash", "command": "pwd"});
+        let result = parse_tool_call_value(&value).expect("tool call should parse");
+        assert_eq!(result.name, "shell");
+        assert_eq!(result.arguments["command"], "pwd");
+    }
+
+    #[test]
+    fn parse_tool_call_value_maps_top_level_bash_name_alias() {
+        let value = serde_json::json!({"name": "Bash", "command": "echo hi"});
+        let result = parse_tool_call_value(&value).expect("tool call should parse");
+        assert_eq!(result.name, "shell");
+        assert_eq!(result.arguments["command"], "echo hi");
+    }
+
+    #[test]
     fn parse_tool_calls_from_json_value_handles_empty_array() {
         // Recovery: Empty tool_calls array should return empty vec
         let value = serde_json::json!({"tool_calls": []});
@@ -2510,5 +2771,15 @@ browser_open/url>https://example.com"#;
         assert_eq!(calls[0].name, "shell");
         assert_eq!(calls[0].arguments["command"], "pwd");
         assert_eq!(text, "Done");
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_bash_alias_payload_inside_tool_call() {
+        let response = r#"<tool_call>{"tool":"Bash","command":"pwd"}</tool_call>"#;
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "pwd");
     }
 }

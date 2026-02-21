@@ -2,7 +2,7 @@
 
 这是文档系统的中文入口页。
 
-最后对齐：**2026-02-18**。
+最后对齐：**2026-02-21**。
 
 > 说明：命令、配置键、API 路径保持英文；实现细节以英文文档为准。
 
@@ -87,3 +87,5 @@
 - English: [README.md](README.md)
 - 日本語: [README.ja.md](README.ja.md)
 - Русский: [README.ru.md](README.ru.md)
+- Français: [README.fr.md](README.fr.md)
+- Tiếng Việt: [i18n/vi/README.md](i18n/vi/README.md)

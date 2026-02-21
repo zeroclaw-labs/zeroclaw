@@ -25,6 +25,7 @@ Runtime resolution order is:
 | `openrouter` | — | No | `OPENROUTER_API_KEY` |
 | `anthropic` | — | No | `ANTHROPIC_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` |
 | `openai` | — | No | `OPENAI_API_KEY` |
+| `openai-codex` | `openai_codex`, `codex` | No | OAuth profile via `zeroclaw auth` |
 | `ollama` | — | Yes | `OLLAMA_API_KEY` (optional) |
 | `gemini` | `google`, `google-gemini` | No | `GEMINI_API_KEY`, `GOOGLE_API_KEY` |
 | `venice` | — | No | `VENICE_API_KEY` |
@@ -72,6 +73,22 @@ Recommended starter model IDs (verified against NVIDIA API catalog on February 1
 - `deepseek-ai/deepseek-v3.2`
 - `nvidia/llama-3.3-nemotron-super-49b-v1.5`
 - `nvidia/llama-3.1-nemotron-ultra-253b-v1`
+
+## OpenAI Codex OAuth Custom Backend
+
+When using `openai-codex`, you can keep OAuth auth while routing requests to a custom backend:
+
+```toml
+default_provider = "openai-codex"
+api_url = "https://your-proxy.example.com/v1"
+```
+
+Runtime appends `/responses` automatically for this provider.
+
+Optional env overrides:
+
+- `ZEROCLAW_CODEX_BASE_URL` (base URL)
+- `ZEROCLAW_CODEX_RESPONSES_URL` (full endpoint URL)
 
 ## Custom Endpoints
 

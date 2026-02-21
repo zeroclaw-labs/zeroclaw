@@ -352,6 +352,7 @@ pub struct ProviderRuntimeOptions {
     pub auth_profile_override: Option<String>,
     pub zeroclaw_dir: Option<PathBuf>,
     pub secrets_encrypt: bool,
+    pub provider_api_url: Option<String>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -360,6 +361,7 @@ impl Default for ProviderRuntimeOptions {
             auth_profile_override: None,
             zeroclaw_dir: None,
             secrets_encrypt: true,
+            provider_api_url: None,
         }
     }
 }
@@ -582,7 +584,13 @@ pub fn create_provider_with_options(
 ) -> anyhow::Result<Box<dyn Provider>> {
     match name {
         "openai-codex" | "openai_codex" | "codex" => {
-            Ok(Box::new(openai_codex::OpenAiCodexProvider::new(options)))
+            let resolved_credential = resolve_provider_credential(name, api_key)
+                .map(|v| String::from_utf8(v.into_bytes()).unwrap_or_default());
+            #[allow(clippy::option_as_ref_deref)]
+            let key = resolved_credential.as_ref().map(String::as_str);
+            Ok(Box::new(openai_codex::OpenAiCodexProvider::new(
+                options, key,
+            )?))
         }
         _ => create_provider_with_url(name, api_key, None),
     }
@@ -807,7 +815,9 @@ pub fn create_resilient_provider_with_options(
 
     let primary_provider = match primary_name {
         "openai-codex" | "openai_codex" | "codex" => {
-            create_provider_with_options(primary_name, api_key, options)?
+            let mut primary_options = options.clone();
+            primary_options.provider_api_url = api_url.map(ToString::to_string);
+            create_provider_with_options(primary_name, api_key, &primary_options)?
         }
         _ => create_provider_with_url(primary_name, api_key, api_url)?,
     };

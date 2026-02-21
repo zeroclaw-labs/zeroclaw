@@ -2,7 +2,7 @@
 
 This file is the canonical table of contents for the documentation system.
 
-Last refreshed: **February 18, 2026**.
+Last refreshed: **February 21, 2026**.
 
 ## Language Entry
 
@@ -10,10 +10,20 @@ Last refreshed: **February 18, 2026**.
 - Chinese README: [../README.zh-CN.md](../README.zh-CN.md)
 - Japanese README: [../README.ja.md](../README.ja.md)
 - Russian README: [../README.ru.md](../README.ru.md)
+- French README: [../README.fr.md](../README.fr.md)
+- Vietnamese README: [../README.vi.md](../README.vi.md)
 - English Docs Hub: [README.md](README.md)
 - Chinese Docs Hub: [README.zh-CN.md](README.zh-CN.md)
 - Japanese Docs Hub: [README.ja.md](README.ja.md)
 - Russian Docs Hub: [README.ru.md](README.ru.md)
+- French Docs Hub: [README.fr.md](README.fr.md)
+- Vietnamese Docs Hub: [i18n/vi/README.md](i18n/vi/README.md)
+- Vietnamese Docs TOC: [i18n/vi/SUMMARY.md](i18n/vi/SUMMARY.md)
+- French Commands Reference: [commands-reference.fr.md](commands-reference.fr.md)
+- French Config Reference: [config-reference.fr.md](config-reference.fr.md)
+- French Troubleshooting: [troubleshooting.fr.md](troubleshooting.fr.md)
+- i18n Docs Index: [i18n/README.md](i18n/README.md)
+- i18n Coverage Map: [i18n-coverage.md](i18n-coverage.md)
 
 ## Collections
 
@@ -26,6 +36,8 @@ Last refreshed: **February 18, 2026**.
 
 - [reference/README.md](reference/README.md)
 - [commands-reference.md](commands-reference.md)
+- [presets-guide.md](presets-guide.md)
+- [preset-recommendation-matrix.md](preset-recommendation-matrix.md)
 - [providers-reference.md](providers-reference.md)
 - [channels-reference.md](channels-reference.md)
 - [config-reference.md](config-reference.md)

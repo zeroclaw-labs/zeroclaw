@@ -54,7 +54,7 @@ pub struct Config {
     #[serde(skip)]
     pub config_path: PathBuf,
     pub api_key: Option<String>,
-    /// Base URL override for provider API (e.g. "http://10.0.0.1:11434" for remote Ollama)
+    /// Base URL override for provider API (e.g. remote Ollama endpoint or OpenAI Codex OAuth proxy backend)
     pub api_url: Option<String>,
     pub default_provider: Option<String>,
     pub default_model: Option<String>,
@@ -1512,6 +1512,13 @@ impl Default for ObservabilityConfig {
 pub struct AutonomyConfig {
     pub level: AutonomyLevel,
     pub workspace_only: bool,
+    /// When true, non-CLI channels may auto-approve tool calls that would
+    /// otherwise require interactive confirmation.
+    ///
+    /// Default is false for safety. This should only be enabled in trusted
+    /// environments because it removes per-call human confirmation on channels.
+    #[serde(default)]
+    pub allow_non_cli_auto_approval: bool,
     pub allowed_commands: Vec<String>,
     pub forbidden_paths: Vec<String>,
     pub max_actions_per_hour: u32,
@@ -1547,6 +1554,7 @@ impl Default for AutonomyConfig {
         Self {
             level: AutonomyLevel::Supervised,
             workspace_only: true,
+            allow_non_cli_auto_approval: false,
             allowed_commands: vec![
                 "git".into(),
                 "npm".into(),
@@ -3114,6 +3122,7 @@ mod tests {
         let a = AutonomyConfig::default();
         assert_eq!(a.level, AutonomyLevel::Supervised);
         assert!(a.workspace_only);
+        assert!(!a.allow_non_cli_auto_approval);
         assert!(a.allowed_commands.contains(&"git".to_string()));
         assert!(a.allowed_commands.contains(&"cargo".to_string()));
         assert!(a.forbidden_paths.contains(&"/etc".to_string()));
@@ -3223,6 +3232,7 @@ default_temperature = 0.7
             autonomy: AutonomyConfig {
                 level: AutonomyLevel::Full,
                 workspace_only: false,
+                allow_non_cli_auto_approval: false,
                 allowed_commands: vec!["docker".into()],
                 forbidden_paths: vec!["/secret".into()],
                 max_actions_per_hour: 50,

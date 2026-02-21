@@ -2,7 +2,7 @@
 
 このページは日本語のドキュメント入口です。
 
-最終同期日: **2026-02-18**。
+最終同期日: **2026-02-21**。
 
 > 注: コマンド名・設定キー・API パスは英語のまま記載します。実装の一次情報は英語版ドキュメントを優先してください。
 
@@ -87,3 +87,5 @@
 - English: [README.md](README.md)
 - 简体中文: [README.zh-CN.md](README.zh-CN.md)
 - Русский: [README.ru.md](README.ru.md)
+- Français: [README.fr.md](README.fr.md)
+- Tiếng Việt: [i18n/vi/README.md](i18n/vi/README.md)

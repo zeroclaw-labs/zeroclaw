@@ -32,7 +32,7 @@
     dead_code
 )]
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use dialoguer::{Input, Password};
 use serde::{Deserialize, Serialize};
@@ -61,6 +61,7 @@ mod migration;
 mod observability;
 mod onboard;
 mod peripherals;
+mod presets;
 mod providers;
 mod runtime;
 mod security;
@@ -69,6 +70,7 @@ mod skillforge;
 mod skills;
 mod tools;
 mod tunnel;
+mod updater;
 mod util;
 
 use config::Config;
@@ -124,6 +126,22 @@ enum Commands {
         /// Memory backend (sqlite, lucid, markdown, none) - used in quick mode, default: sqlite
         #[arg(long)]
         memory: Option<String>,
+
+        /// Official preset ID (used in quick mode, default: default)
+        #[arg(long)]
+        preset: Option<String>,
+
+        /// Extra pack ID to add on top of selected preset (repeatable)
+        #[arg(long = "pack")]
+        pack: Vec<String>,
+
+        /// Security profile for quick onboarding (default: strict)
+        #[arg(long = "security-profile", value_enum)]
+        security_profile: Option<SecurityProfileArg>,
+
+        /// Confirm using a non-strict security profile in quick onboarding
+        #[arg(long = "yes-security-risk")]
+        yes_security_risk: bool,
     },
 
     /// Start the AI agent loop
@@ -147,6 +165,29 @@ enum Commands {
         /// Attach a peripheral (board:path, e.g. nucleo-f401re:/dev/ttyACM0)
         #[arg(long)]
         peripheral: Vec<String>,
+    },
+
+    /// Check and apply `zeroclaw` binary updates from GitHub Releases
+    Update {
+        /// Apply update (default action is check-only when this flag is omitted)
+        #[arg(long)]
+        apply: bool,
+
+        /// Specific release version to target (e.g. 0.1.0 or v0.1.0); defaults to latest release
+        #[arg(long)]
+        version: Option<String>,
+
+        /// Install path for updated binary (defaults to the currently running executable path)
+        #[arg(long)]
+        install_path: Option<std::path::PathBuf>,
+
+        /// Preview update steps without downloading/installing
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Confirm binary replacement for update apply
+        #[arg(long)]
+        yes: bool,
     },
 
     /// Start the gateway server (webhooks, websockets)
@@ -196,6 +237,18 @@ enum Commands {
     Models {
         #[command(subcommand)]
         model_command: ModelCommands,
+    },
+
+    /// Manage preset compositions, import/export, and intent-driven planning
+    Preset {
+        #[command(subcommand)]
+        preset_command: PresetCommands,
+    },
+
+    /// Inspect and change security/autonomy profile
+    Security {
+        #[command(subcommand)]
+        security_command: SecurityCommands,
     },
 
     /// List supported AI providers
@@ -425,6 +478,244 @@ enum ModelCommands {
 }
 
 #[derive(Subcommand, Debug)]
+enum PresetCommands {
+    /// List official presets and available packs
+    List,
+    /// Show details for an official preset
+    Show {
+        /// Official preset id
+        id: String,
+    },
+    /// Show current workspace preset selection
+    Current,
+    /// Apply preset and pack changes to current workspace
+    Apply {
+        /// Base preset id (if omitted, starts from current selection or default)
+        #[arg(long)]
+        preset: Option<String>,
+
+        /// Add a pack (repeatable)
+        #[arg(long = "pack")]
+        pack: Vec<String>,
+
+        /// Remove a pack (repeatable)
+        #[arg(long = "remove-pack")]
+        remove_pack: Vec<String>,
+
+        /// Preview changes without writing
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Approve applying risky packs
+        #[arg(long)]
+        yes_risky: bool,
+
+        /// Rebuild binary after applying selection
+        #[arg(long)]
+        rebuild: bool,
+
+        /// Confirm rebuild execution
+        #[arg(long)]
+        yes_rebuild: bool,
+    },
+    /// Build a preset plan from natural language intent
+    Intent {
+        /// Natural language intent text
+        text: String,
+
+        /// Extra capability graph file(s) to merge (repeatable)
+        #[arg(long = "capabilities-file")]
+        capabilities_file: Vec<std::path::PathBuf>,
+
+        /// Apply the planned selection to workspace
+        #[arg(long)]
+        apply: bool,
+
+        /// Preview changes without writing
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Approve applying risky packs
+        #[arg(long)]
+        yes_risky: bool,
+
+        /// Rebuild binary after applying selection
+        #[arg(long)]
+        rebuild: bool,
+
+        /// Confirm rebuild execution
+        #[arg(long)]
+        yes_rebuild: bool,
+
+        /// Print orchestration-friendly JSON report (plan + security recommendation + generated next commands)
+        #[arg(long)]
+        json: bool,
+
+        /// Write a shell orchestration script (template only, not executed)
+        #[arg(long = "emit-shell")]
+        emit_shell: Option<std::path::PathBuf>,
+    },
+    /// Export preset payload JSON (share/import format)
+    Export {
+        /// Output file path
+        path: std::path::PathBuf,
+
+        /// Export an official preset id instead of current workspace selection
+        #[arg(long)]
+        preset: Option<String>,
+    },
+    /// Import preset payload JSON into current workspace selection
+    Import {
+        /// Input file path
+        path: std::path::PathBuf,
+
+        /// Import mode: overwrite, merge, or fill
+        #[arg(long, value_enum, default_value_t = presets::PresetImportMode::Merge)]
+        mode: presets::PresetImportMode,
+
+        /// Preview changes without writing
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Approve applying risky packs
+        #[arg(long)]
+        yes_risky: bool,
+
+        /// Rebuild binary after applying selection
+        #[arg(long)]
+        rebuild: bool,
+
+        /// Confirm rebuild execution
+        #[arg(long)]
+        yes_rebuild: bool,
+    },
+    /// Validate preset payload JSON files/directories
+    Validate {
+        /// Input file or directory path (repeatable)
+        paths: Vec<std::path::PathBuf>,
+
+        /// Allow unknown pack IDs (useful for external/private registries)
+        #[arg(long)]
+        allow_unknown_packs: bool,
+
+        /// Print machine-readable JSON report
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rebuild binary from current workspace preset selection
+    Rebuild {
+        /// Preview command only
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Confirm rebuild execution
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+enum SecurityProfileArg {
+    Strict,
+    Balanced,
+    Flexible,
+    Full,
+}
+
+impl SecurityProfileArg {
+    fn as_profile_id(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Balanced => "balanced",
+            Self::Flexible => "flexible",
+            Self::Full => "full",
+        }
+    }
+
+    fn is_non_strict(self) -> bool {
+        !matches!(self, Self::Strict)
+    }
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+enum NonCliApprovalArg {
+    Manual,
+    Auto,
+}
+
+impl NonCliApprovalArg {
+    fn allows_auto_approval(self) -> bool {
+        matches!(self, Self::Auto)
+    }
+}
+
+#[derive(Subcommand, Debug)]
+enum SecurityCommands {
+    /// Show current security profile and guardrails
+    Show,
+    /// Manage named security profiles
+    Profile {
+        #[command(subcommand)]
+        profile_command: SecurityProfileCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SecurityProfileCommands {
+    /// Set workspace security profile
+    Set {
+        /// Target profile: strict, balanced, flexible, full
+        #[arg(value_enum)]
+        level: SecurityProfileArg,
+
+        /// Non-CLI approval mode override: manual (default) or auto
+        #[arg(long = "non-cli-approval", value_enum)]
+        non_cli_approval: Option<NonCliApprovalArg>,
+
+        /// Preview changes without writing
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Confirm setting a non-strict profile
+        #[arg(long = "yes-risk")]
+        yes_risk: bool,
+
+        /// Print structured JSON change report
+        #[arg(long)]
+        json: bool,
+
+        /// Export change report to a JSON file
+        #[arg(long = "export-diff")]
+        export_diff: Option<std::path::PathBuf>,
+    },
+    /// Recommend a security profile from natural-language intent
+    Recommend {
+        /// Natural language intent text
+        intent: String,
+
+        /// Extra capability graph file(s) to merge (repeatable)
+        #[arg(long = "capabilities-file")]
+        capabilities_file: Vec<std::path::PathBuf>,
+
+        /// Evaluate recommendation as if this preset were the base (does not write)
+        #[arg(long = "from-preset")]
+        from_preset: Option<String>,
+
+        /// Add pack(s) on top of the planned selection (repeatable, does not write)
+        #[arg(long = "pack")]
+        pack: Vec<String>,
+
+        /// Remove pack(s) from the planned selection (repeatable, does not write)
+        #[arg(long = "remove-pack")]
+        remove_pack: Vec<String>,
+
+        /// Print structured JSON recommendation report
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum DoctorCommands {
     /// Probe model catalogs across providers and report availability
     Models {
@@ -490,6 +781,1108 @@ enum IntegrationCommands {
     },
 }
 
+fn print_selection(selection: &presets::WorkspacePresetSelection) {
+    println!("Preset: {}", selection.preset_id);
+    println!("Packs:  {}", selection.packs.join(", "));
+    if !selection.added_packs.is_empty() {
+        println!("Added:  {}", selection.added_packs.join(", "));
+    }
+}
+
+fn print_selection_diff(diff: &presets::SelectionDiff) {
+    if let Some(before) = &diff.before_preset_id {
+        if before != &diff.after_preset_id {
+            println!("Preset: {before} -> {}", diff.after_preset_id);
+        } else {
+            println!("Preset: {}", diff.after_preset_id);
+        }
+    } else {
+        println!("Preset: {}", diff.after_preset_id);
+    }
+
+    if diff.added_packs.is_empty() && diff.removed_packs.is_empty() {
+        println!("Packs:  no changes");
+        return;
+    }
+
+    if !diff.added_packs.is_empty() {
+        println!("Add:    {}", diff.added_packs.join(", "));
+    }
+    if !diff.removed_packs.is_empty() {
+        println!("Remove: {}", diff.removed_packs.join(", "));
+    }
+}
+
+async fn maybe_rebuild_selection(
+    selection: &presets::WorkspacePresetSelection,
+    rebuild: bool,
+    dry_run: bool,
+    approved: bool,
+) -> Result<()> {
+    if !rebuild {
+        return Ok(());
+    }
+    if !dry_run && !approved {
+        bail!(
+            "Refusing to run rebuild without confirmation. Re-run with `--yes-rebuild`, or use `--dry-run`."
+        );
+    }
+
+    let cwd = std::env::current_dir()?;
+    let plan = presets::rebuild_plan_for_selection(selection, &cwd)?;
+    println!();
+    println!("Rebuild command:");
+    println!("  cargo {}", plan.args.join(" "));
+    println!("  (working directory: {})", plan.manifest_dir.display());
+
+    if dry_run {
+        println!("Rebuild dry-run: no command executed.");
+        return Ok(());
+    }
+
+    let plan_clone = plan.clone();
+    tokio::task::spawn_blocking(move || presets::execute_rebuild_plan(&plan_clone))
+        .await
+        .map_err(|error| anyhow::anyhow!("rebuild task failed: {error}"))??;
+    println!("Rebuild completed.");
+    Ok(())
+}
+
+fn print_security_profile_summary(config: &Config) {
+    let label = onboard::security_profile_label(&config.autonomy);
+    println!("Security profile: {label}");
+    println!(
+        "Guardrails: workspace_only={}, medium_approval={}, high_risk_block={}, non_cli_approval={}",
+        config.autonomy.workspace_only,
+        config.autonomy.require_approval_for_medium_risk,
+        config.autonomy.block_high_risk_commands,
+        non_cli_approval_mode(config.autonomy.allow_non_cli_auto_approval)
+    );
+    println!(
+        "Limits: max_actions_per_hour={}, max_cost_per_day=${:.2}",
+        config.autonomy.max_actions_per_hour,
+        config.autonomy.max_cost_per_day_cents as f32 / 100.0
+    );
+}
+
+#[derive(Debug, Serialize)]
+struct SecurityProfileSnapshot {
+    profile_id: String,
+    label: String,
+    level: String,
+    workspace_only: bool,
+    require_approval_for_medium_risk: bool,
+    block_high_risk_commands: bool,
+    allow_non_cli_auto_approval: bool,
+    non_cli_approval_mode: String,
+    max_actions_per_hour: u32,
+    max_cost_per_day_cents: u32,
+    max_cost_per_day_usd: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SecurityFieldChange {
+    field: String,
+    from: String,
+    to: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SecurityProfileChangeReport {
+    current: SecurityProfileSnapshot,
+    target: SecurityProfileSnapshot,
+    changes: Vec<SecurityFieldChange>,
+    requires_explicit_risk_consent: bool,
+    dry_run: bool,
+    rollback_command: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SecurityProfileIntentRecommendationReport {
+    intent: String,
+    current_profile: SecurityProfileSnapshot,
+    recommended_profile: onboard::SecurityProfileRecommendation,
+    base_override_preset: Option<String>,
+    manual_add_packs: Vec<String>,
+    manual_remove_packs: Vec<String>,
+    current_selection: Option<presets::WorkspacePresetSelection>,
+    planned_selection: presets::WorkspacePresetSelection,
+    risky_packs: Vec<String>,
+    capability_sources: Vec<String>,
+    plan_confidence: f32,
+    plan_reasons: Vec<String>,
+    apply_command: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct GeneratedNextCommand {
+    id: String,
+    description: String,
+    command: String,
+    requires_explicit_consent: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    consent_reasons: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PresetIntentOrchestrationReport {
+    intent: String,
+    capability_sources: Vec<String>,
+    plan: presets::IntentPlan,
+    planned_selection: presets::WorkspacePresetSelection,
+    risky_packs: Vec<String>,
+    security_recommendation: onboard::SecurityProfileRecommendation,
+    security_apply_command: String,
+    next_commands: Vec<GeneratedNextCommand>,
+}
+
+fn shell_quote(raw: &str) -> String {
+    let escaped = raw.replace('\'', "'\"'\"'");
+    format!("'{escaped}'")
+}
+
+fn build_preset_intent_command(
+    text: &str,
+    capabilities_file: &[std::path::PathBuf],
+    apply: bool,
+    dry_run: bool,
+    yes_risky: bool,
+    rebuild: bool,
+    yes_rebuild: bool,
+) -> String {
+    let mut parts = vec![
+        "zeroclaw".to_string(),
+        "preset".to_string(),
+        "intent".to_string(),
+    ];
+    parts.push(shell_quote(text));
+    for path in capabilities_file {
+        parts.push("--capabilities-file".to_string());
+        parts.push(shell_quote(&path.display().to_string()));
+    }
+    if apply {
+        parts.push("--apply".to_string());
+    }
+    if dry_run {
+        parts.push("--dry-run".to_string());
+    }
+    if yes_risky {
+        parts.push("--yes-risky".to_string());
+    }
+    if rebuild {
+        parts.push("--rebuild".to_string());
+    }
+    if yes_rebuild {
+        parts.push("--yes-rebuild".to_string());
+    }
+    parts.join(" ")
+}
+
+fn build_security_apply_command(recommendation: &onboard::SecurityProfileRecommendation) -> String {
+    if recommendation.requires_explicit_consent {
+        format!(
+            "zeroclaw security profile set {} --yes-risk",
+            recommendation.profile_id
+        )
+    } else {
+        format!(
+            "zeroclaw security profile set {}",
+            recommendation.profile_id
+        )
+    }
+}
+
+fn build_preset_apply_consent_reasons(
+    risky_packs: &[String],
+    dry_run: bool,
+    yes_risky: bool,
+    rebuild: bool,
+    yes_rebuild: bool,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if !risky_packs.is_empty() && !dry_run && !yes_risky {
+        reasons.push("risky_pack".to_string());
+    }
+    if rebuild && !dry_run && !yes_rebuild {
+        reasons.push("rebuild".to_string());
+    }
+    reasons
+}
+
+fn build_security_apply_consent_reasons(
+    recommendation: &onboard::SecurityProfileRecommendation,
+) -> Vec<String> {
+    if recommendation.requires_explicit_consent {
+        vec!["security_non_strict".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+fn build_orchestration_shell_script(report: &PresetIntentOrchestrationReport) -> String {
+    let mut lines = vec![
+        "#!/usr/bin/env bash".to_string(),
+        "set -euo pipefail".to_string(),
+        "".to_string(),
+        format!(
+            "# Generated by: zeroclaw preset intent {} --json",
+            shell_quote(&report.intent)
+        ),
+        "# This script is generated only. It is not executed automatically.".to_string(),
+        "".to_string(),
+        "confirm() {".to_string(),
+        "  local prompt=\"$1\"".to_string(),
+        "  local reply".to_string(),
+        "  read -r -p \"$prompt [y/N]: \" reply".to_string(),
+        "  case \"$reply\" in".to_string(),
+        "    [yY]|[yY][eE][sS]) return 0 ;;".to_string(),
+        "    *) return 1 ;;".to_string(),
+        "  esac".to_string(),
+        "}".to_string(),
+        "".to_string(),
+    ];
+
+    for command in &report.next_commands {
+        lines.push(format!("# {}: {}", command.id, command.description));
+        if command.requires_explicit_consent {
+            let reason_label = if command.consent_reasons.is_empty() {
+                "manual_confirmation".to_string()
+            } else {
+                command.consent_reasons.join(",")
+            };
+            lines.push(format!(
+                "if confirm \"Run {} (reasons: {})?\"; then",
+                command.id, reason_label
+            ));
+            lines.push(format!("  {}", command.command));
+            lines.push("else".to_string());
+            lines.push(format!("  echo \"Skipped {}\"", command.id));
+            lines.push("fi".to_string());
+        } else {
+            lines.push(command.command.clone());
+        }
+        lines.push("".to_string());
+    }
+
+    lines.join("\n")
+}
+
+fn emit_orchestration_shell_script(
+    path: &std::path::Path,
+    report: &PresetIntentOrchestrationReport,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create {}", parent.display()))?;
+        }
+    }
+
+    let script = build_orchestration_shell_script(report);
+    std::fs::write(path, script).with_context(|| format!("Failed to write {}", path.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(path)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms)
+            .with_context(|| format!("Failed to set executable bit on {}", path.display()))?;
+    }
+
+    Ok(())
+}
+
+fn autonomy_level_id(level: security::AutonomyLevel) -> &'static str {
+    match level {
+        security::AutonomyLevel::ReadOnly => "read_only",
+        security::AutonomyLevel::Supervised => "supervised",
+        security::AutonomyLevel::Full => "full",
+    }
+}
+
+fn non_cli_approval_mode(auto_enabled: bool) -> &'static str {
+    if auto_enabled {
+        "auto"
+    } else {
+        "manual"
+    }
+}
+
+fn cents_to_usd_string(cents: u32) -> String {
+    format!("{:.2}", cents as f64 / 100.0)
+}
+
+fn build_security_profile_snapshot(
+    autonomy: &config::AutonomyConfig,
+    profile_id_override: Option<&str>,
+) -> SecurityProfileSnapshot {
+    let label = onboard::security_profile_label(autonomy).to_string();
+    let profile_id = profile_id_override
+        .map(str::to_string)
+        .unwrap_or_else(|| onboard::security_profile_id_from_autonomy(autonomy).to_string());
+
+    SecurityProfileSnapshot {
+        profile_id,
+        label,
+        level: autonomy_level_id(autonomy.level).to_string(),
+        workspace_only: autonomy.workspace_only,
+        require_approval_for_medium_risk: autonomy.require_approval_for_medium_risk,
+        block_high_risk_commands: autonomy.block_high_risk_commands,
+        allow_non_cli_auto_approval: autonomy.allow_non_cli_auto_approval,
+        non_cli_approval_mode: non_cli_approval_mode(autonomy.allow_non_cli_auto_approval)
+            .to_string(),
+        max_actions_per_hour: autonomy.max_actions_per_hour,
+        max_cost_per_day_cents: autonomy.max_cost_per_day_cents,
+        max_cost_per_day_usd: cents_to_usd_string(autonomy.max_cost_per_day_cents),
+    }
+}
+
+fn build_security_profile_change_report(
+    current: &config::AutonomyConfig,
+    target: &config::AutonomyConfig,
+    target_profile_id: &str,
+    requires_explicit_risk_consent: bool,
+    dry_run: bool,
+) -> SecurityProfileChangeReport {
+    let current_snapshot = build_security_profile_snapshot(current, None);
+    let target_snapshot = build_security_profile_snapshot(target, Some(target_profile_id));
+    let mut changes = Vec::new();
+
+    if current_snapshot.profile_id != target_snapshot.profile_id {
+        changes.push(SecurityFieldChange {
+            field: "profile_id".to_string(),
+            from: current_snapshot.profile_id.clone(),
+            to: target_snapshot.profile_id.clone(),
+        });
+    }
+    if current_snapshot.level != target_snapshot.level {
+        changes.push(SecurityFieldChange {
+            field: "level".to_string(),
+            from: current_snapshot.level.clone(),
+            to: target_snapshot.level.clone(),
+        });
+    }
+    if current.workspace_only != target.workspace_only {
+        changes.push(SecurityFieldChange {
+            field: "workspace_only".to_string(),
+            from: current.workspace_only.to_string(),
+            to: target.workspace_only.to_string(),
+        });
+    }
+    if current.require_approval_for_medium_risk != target.require_approval_for_medium_risk {
+        changes.push(SecurityFieldChange {
+            field: "require_approval_for_medium_risk".to_string(),
+            from: current.require_approval_for_medium_risk.to_string(),
+            to: target.require_approval_for_medium_risk.to_string(),
+        });
+    }
+    if current.block_high_risk_commands != target.block_high_risk_commands {
+        changes.push(SecurityFieldChange {
+            field: "block_high_risk_commands".to_string(),
+            from: current.block_high_risk_commands.to_string(),
+            to: target.block_high_risk_commands.to_string(),
+        });
+    }
+    if current.allow_non_cli_auto_approval != target.allow_non_cli_auto_approval {
+        changes.push(SecurityFieldChange {
+            field: "allow_non_cli_auto_approval".to_string(),
+            from: current.allow_non_cli_auto_approval.to_string(),
+            to: target.allow_non_cli_auto_approval.to_string(),
+        });
+        changes.push(SecurityFieldChange {
+            field: "non_cli_approval_mode".to_string(),
+            from: non_cli_approval_mode(current.allow_non_cli_auto_approval).to_string(),
+            to: non_cli_approval_mode(target.allow_non_cli_auto_approval).to_string(),
+        });
+    }
+    if current.max_actions_per_hour != target.max_actions_per_hour {
+        changes.push(SecurityFieldChange {
+            field: "max_actions_per_hour".to_string(),
+            from: current.max_actions_per_hour.to_string(),
+            to: target.max_actions_per_hour.to_string(),
+        });
+    }
+    if current.max_cost_per_day_cents != target.max_cost_per_day_cents {
+        changes.push(SecurityFieldChange {
+            field: "max_cost_per_day_cents".to_string(),
+            from: current.max_cost_per_day_cents.to_string(),
+            to: target.max_cost_per_day_cents.to_string(),
+        });
+        changes.push(SecurityFieldChange {
+            field: "max_cost_per_day_usd".to_string(),
+            from: cents_to_usd_string(current.max_cost_per_day_cents),
+            to: cents_to_usd_string(target.max_cost_per_day_cents),
+        });
+    }
+
+    SecurityProfileChangeReport {
+        current: current_snapshot,
+        target: target_snapshot,
+        changes,
+        requires_explicit_risk_consent,
+        dry_run,
+        rollback_command: "zeroclaw security profile set strict".to_string(),
+    }
+}
+
+fn print_security_profile_change_report(report: &SecurityProfileChangeReport) {
+    println!("Security profile change:");
+    println!("- current: {}", report.current.label);
+    println!(
+        "  guardrails: workspace_only={}, medium_approval={}, high_risk_block={}, non_cli_approval={}, max_actions_per_hour={}, max_cost_per_day=${}",
+        report.current.workspace_only,
+        report.current.require_approval_for_medium_risk,
+        report.current.block_high_risk_commands,
+        report.current.non_cli_approval_mode,
+        report.current.max_actions_per_hour,
+        report.current.max_cost_per_day_usd
+    );
+    println!("- target: {}", report.target.label);
+    println!(
+        "  guardrails: workspace_only={}, medium_approval={}, high_risk_block={}, non_cli_approval={}, max_actions_per_hour={}, max_cost_per_day=${}",
+        report.target.workspace_only,
+        report.target.require_approval_for_medium_risk,
+        report.target.block_high_risk_commands,
+        report.target.non_cli_approval_mode,
+        report.target.max_actions_per_hour,
+        report.target.max_cost_per_day_usd
+    );
+
+    if report.changes.is_empty() {
+        println!("- delta: no effective policy changes");
+    } else {
+        println!("- delta:");
+        for change in &report.changes {
+            println!("  {}: {} -> {}", change.field, change.from, change.to);
+        }
+    }
+}
+
+fn handle_security_command(command: SecurityCommands, config: &mut Config) -> Result<()> {
+    match command {
+        SecurityCommands::Show => {
+            print_security_profile_summary(config);
+            Ok(())
+        }
+        SecurityCommands::Profile { profile_command } => match profile_command {
+            SecurityProfileCommands::Set {
+                level,
+                non_cli_approval,
+                dry_run,
+                yes_risk,
+                json,
+                export_diff,
+            } => {
+                let profile_id = level.as_profile_id();
+                let current = config.autonomy.clone();
+                let mut next = onboard::autonomy_config_for_security_profile_id(profile_id)?;
+                if let Some(mode) = non_cli_approval {
+                    next.allow_non_cli_auto_approval = mode.allows_auto_approval();
+                }
+
+                let enabling_non_cli_auto_approval =
+                    !current.allow_non_cli_auto_approval && next.allow_non_cli_auto_approval;
+                let requires_explicit_risk_consent =
+                    level.is_non_strict() || enabling_non_cli_auto_approval;
+                let report = build_security_profile_change_report(
+                    &current,
+                    &next,
+                    profile_id,
+                    requires_explicit_risk_consent,
+                    dry_run,
+                );
+
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print_security_profile_change_report(&report);
+                }
+
+                if let Some(path) = export_diff {
+                    let payload = serde_json::to_string_pretty(&report)?;
+                    std::fs::write(&path, payload)
+                        .with_context(|| format!("Failed to write {}", path.display()))?;
+                    println!("Exported security diff: {}", path.display());
+                }
+
+                if requires_explicit_risk_consent && !yes_risk && !dry_run {
+                    let mut risk_reasons = Vec::new();
+                    if level.is_non_strict() {
+                        risk_reasons.push(format!("profile '{}' is non-strict", profile_id));
+                    }
+                    if enabling_non_cli_auto_approval {
+                        risk_reasons.push(
+                            "non-CLI auto approval removes per-call confirmation on non-CLI channels"
+                                .to_string(),
+                        );
+                    }
+                    bail!(
+                        "Refusing to apply risk-elevating security changes without explicit consent ({}). Re-run with `--yes-risk`, or use `--dry-run`.",
+                        risk_reasons.join("; ")
+                    );
+                }
+
+                if dry_run {
+                    println!("Security profile dry-run: no changes written.");
+                    println!("Rollback command: {}", report.rollback_command);
+                    return Ok(());
+                }
+
+                config.autonomy = next;
+                config.save()?;
+                println!("Saved config: {}", config.config_path.display());
+                println!("Rollback command: {}", report.rollback_command);
+                Ok(())
+            }
+            SecurityProfileCommands::Recommend {
+                intent,
+                capabilities_file,
+                from_preset,
+                pack,
+                remove_pack,
+                json,
+            } => {
+                let current_selection = presets::load_workspace_selection(config)?;
+                let resolved_capabilities =
+                    presets::resolve_intent_capabilities(config, &capabilities_file)?;
+                let plan = presets::plan_from_intent_with_rules(
+                    &intent,
+                    current_selection.as_ref(),
+                    &resolved_capabilities.rules,
+                );
+                let planned_selection = if let Some(base_preset_id) = from_preset.as_deref() {
+                    let base = presets::from_preset_id(base_preset_id)?;
+                    presets::compose_selection(base, &plan.add_packs, &plan.remove_packs)?
+                } else {
+                    presets::selection_from_plan(&plan, current_selection.as_ref())?
+                };
+                let planned_selection =
+                    presets::compose_selection(planned_selection, &pack, &remove_pack)?;
+                let risky_packs = presets::risky_pack_ids(&planned_selection);
+                let recommendation =
+                    onboard::recommend_security_profile(Some(&intent), &planned_selection.packs);
+                let apply_command = build_security_apply_command(&recommendation);
+
+                let report = SecurityProfileIntentRecommendationReport {
+                    intent: intent.clone(),
+                    current_profile: build_security_profile_snapshot(&config.autonomy, None),
+                    recommended_profile: recommendation,
+                    base_override_preset: from_preset.clone(),
+                    manual_add_packs: pack.clone(),
+                    manual_remove_packs: remove_pack.clone(),
+                    current_selection,
+                    planned_selection,
+                    risky_packs,
+                    capability_sources: resolved_capabilities.sources,
+                    plan_confidence: plan.confidence,
+                    plan_reasons: plan.reasons,
+                    apply_command,
+                };
+
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                    return Ok(());
+                }
+
+                println!("Intent: {}", report.intent);
+                println!(
+                    "Current profile: {} ({})",
+                    report.current_profile.label, report.current_profile.profile_id
+                );
+                if let Some(base) = report.base_override_preset.as_deref() {
+                    println!("Planning base override: {base}");
+                }
+                println!(
+                    "Recommended profile: {} ({})",
+                    report.recommended_profile.label, report.recommended_profile.profile_id
+                );
+                println!("Risk tier: {}", report.recommended_profile.risk_tier);
+                println!("Recommendation reasons:");
+                for reason in &report.recommended_profile.reasons {
+                    println!("- {reason}");
+                }
+                println!();
+                println!("Preset/pack plan used for recommendation:");
+                println!("- preset: {}", report.planned_selection.preset_id);
+                println!("- packs: {}", report.planned_selection.packs.join(", "));
+                if !report.manual_add_packs.is_empty() {
+                    println!("- manual add packs: {}", report.manual_add_packs.join(", "));
+                }
+                if !report.manual_remove_packs.is_empty() {
+                    println!(
+                        "- manual remove packs: {}",
+                        report.manual_remove_packs.join(", ")
+                    );
+                }
+                if report.risky_packs.is_empty() {
+                    println!("- risky packs: (none)");
+                } else {
+                    println!("- risky packs: {}", report.risky_packs.join(", "));
+                }
+                println!("- plan confidence: {:.2}", report.plan_confidence);
+                if !report.capability_sources.is_empty() {
+                    println!(
+                        "- capability sources: {}",
+                        report.capability_sources.join(" -> ")
+                    );
+                }
+                println!();
+                println!("No config changes were applied.");
+                println!("Apply recommendation:");
+                println!("  {}", report.apply_command);
+                Ok(())
+            }
+        },
+    }
+}
+
+async fn handle_preset_command(command: PresetCommands, config: &Config) -> Result<()> {
+    match command {
+        PresetCommands::List => {
+            println!("Official presets:");
+            for preset in onboard::PRESETS {
+                println!("- {}: {}", preset.id, preset.description);
+                println!("  packs: {}", preset.packs.join(", "));
+            }
+            println!();
+            println!("Available packs:");
+            for pack in onboard::FEATURE_PACKS {
+                let risk = if pack.requires_confirmation {
+                    " [requires confirmation]"
+                } else {
+                    ""
+                };
+                let features = if pack.cargo_features.is_empty() {
+                    "(no extra cargo features)".to_string()
+                } else {
+                    pack.cargo_features.join(", ")
+                };
+                println!("- {}{}: {}", pack.id, risk, pack.description);
+                println!("  cargo features: {features}");
+            }
+            Ok(())
+        }
+        PresetCommands::Show { id } => {
+            let preset =
+                onboard::preset_by_id(&id).with_context(|| format!("Unknown preset id '{id}'"))?;
+            println!("Preset: {}", preset.id);
+            println!("Description: {}", preset.description);
+            println!("Packs:");
+            for pack_id in preset.packs {
+                if let Some(pack) = onboard::feature_pack_by_id(pack_id) {
+                    let risk = if pack.requires_confirmation {
+                        " [requires confirmation]"
+                    } else {
+                        ""
+                    };
+                    println!("- {}{}: {}", pack.id, risk, pack.description);
+                } else {
+                    println!("- {} (unknown pack reference)", pack_id);
+                }
+            }
+            Ok(())
+        }
+        PresetCommands::Current => {
+            let path = presets::workspace_preset_path(config);
+            let current = presets::load_workspace_selection(config)?;
+            println!("Workspace preset file: {}", path.display());
+            if let Some(selection) = current {
+                print_selection(&selection);
+            } else {
+                println!("No workspace preset selection found yet.");
+            }
+            Ok(())
+        }
+        PresetCommands::Apply {
+            preset,
+            pack,
+            remove_pack,
+            dry_run,
+            yes_risky,
+            rebuild,
+            yes_rebuild,
+        } => {
+            let before = presets::load_workspace_selection(config)?;
+            let base = if let Some(preset_id) = preset {
+                presets::from_preset_id(&preset_id)?
+            } else if let Some(current) = before.clone() {
+                current
+            } else {
+                presets::default_selection()?
+            };
+            let after = presets::compose_selection(base, &pack, &remove_pack)?;
+            let diff = presets::selection_diff(before.as_ref(), &after);
+
+            println!("Preset plan:");
+            print_selection_diff(&diff);
+
+            let risky = presets::risky_pack_ids(&after);
+            if !risky.is_empty() && !yes_risky && !dry_run {
+                bail!(
+                    "Selection includes risky packs [{}]. Re-run with `--yes-risky`, or use `--dry-run`.",
+                    risky.join(", ")
+                );
+            }
+            if !risky.is_empty() {
+                println!("Risky packs: {}", risky.join(", "));
+            }
+
+            if dry_run {
+                println!("Apply dry-run: no changes written.");
+                maybe_rebuild_selection(&after, rebuild, true, true).await?;
+                return Ok(());
+            }
+
+            let path = presets::save_workspace_selection(config, &after)?;
+            println!("Saved workspace preset selection: {}", path.display());
+            maybe_rebuild_selection(&after, rebuild, false, yes_rebuild).await?;
+            Ok(())
+        }
+        PresetCommands::Intent {
+            text,
+            capabilities_file,
+            apply,
+            dry_run,
+            yes_risky,
+            rebuild,
+            yes_rebuild,
+            json,
+            emit_shell,
+        } => {
+            if json && apply {
+                bail!("`preset intent --json` is plan-only and cannot be combined with `--apply`.");
+            }
+            if emit_shell.is_some() && apply {
+                bail!("`preset intent --emit-shell` is plan-only and cannot be combined with `--apply`.");
+            }
+
+            let before = presets::load_workspace_selection(config)?;
+            let resolved_capabilities =
+                presets::resolve_intent_capabilities(config, &capabilities_file)?;
+            let plan = presets::plan_from_intent_with_rules(
+                &text,
+                before.as_ref(),
+                &resolved_capabilities.rules,
+            );
+            let after = presets::selection_from_plan(&plan, before.as_ref())?;
+            let diff = presets::selection_diff(before.as_ref(), &after);
+            let risky = presets::risky_pack_ids(&after);
+            let security_recommendation =
+                onboard::recommend_security_profile(Some(&text), &after.packs);
+            let security_apply_command = build_security_apply_command(&security_recommendation);
+
+            let preview_apply_command = build_preset_intent_command(
+                &text,
+                &capabilities_file,
+                true,
+                true,
+                false,
+                rebuild,
+                false,
+            );
+            let apply_command = build_preset_intent_command(
+                &text,
+                &capabilities_file,
+                true,
+                dry_run,
+                yes_risky,
+                rebuild,
+                yes_rebuild,
+            );
+            let preset_apply_consent_reasons = build_preset_apply_consent_reasons(
+                &risky,
+                dry_run,
+                yes_risky,
+                rebuild,
+                yes_rebuild,
+            );
+            let security_apply_consent_reasons =
+                build_security_apply_consent_reasons(&security_recommendation);
+
+            let mut next_commands = vec![
+                GeneratedNextCommand {
+                    id: "preset.apply.preview".to_string(),
+                    description:
+                        "Preview applying this intent plan without mutating workspace state"
+                            .to_string(),
+                    command: preview_apply_command.clone(),
+                    requires_explicit_consent: false,
+                    consent_reasons: Vec::new(),
+                },
+                GeneratedNextCommand {
+                    id: "preset.apply".to_string(),
+                    description: "Apply this preset composition plan to workspace selection"
+                        .to_string(),
+                    command: apply_command,
+                    requires_explicit_consent: !preset_apply_consent_reasons.is_empty(),
+                    consent_reasons: preset_apply_consent_reasons,
+                },
+                GeneratedNextCommand {
+                    id: "security.profile.set".to_string(),
+                    description:
+                        "Align security profile with the recommended guardrails (manual step)"
+                            .to_string(),
+                    command: security_apply_command.clone(),
+                    requires_explicit_consent: !security_apply_consent_reasons.is_empty(),
+                    consent_reasons: security_apply_consent_reasons,
+                },
+            ];
+            if next_commands[0].command == next_commands[1].command {
+                next_commands.remove(0);
+            }
+
+            let orchestration_report = PresetIntentOrchestrationReport {
+                intent: text.clone(),
+                capability_sources: resolved_capabilities.sources.clone(),
+                plan: plan.clone(),
+                planned_selection: after.clone(),
+                risky_packs: risky.clone(),
+                security_recommendation: security_recommendation.clone(),
+                security_apply_command: security_apply_command.clone(),
+                next_commands: next_commands.clone(),
+            };
+
+            if let Some(path) = emit_shell.as_ref() {
+                emit_orchestration_shell_script(path, &orchestration_report)?;
+                if json {
+                    eprintln!("Wrote orchestration shell script: {}", path.display());
+                } else {
+                    println!("Wrote orchestration shell script: {}", path.display());
+                }
+            }
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&orchestration_report)?);
+                return Ok(());
+            }
+
+            println!("Intent: {}", plan.intent);
+            if let Some(base) = plan.base_preset_id.as_deref() {
+                println!("Base preset: {base}");
+            } else {
+                println!("Base preset: current selection/default fallback");
+            }
+            println!("Confidence: {:.2}", plan.confidence);
+            if !resolved_capabilities.sources.is_empty() {
+                println!(
+                    "Capability sources: {}",
+                    resolved_capabilities.sources.join(" -> ")
+                );
+            }
+            println!("Reasons:");
+            for reason in &plan.reasons {
+                println!("- {reason}");
+            }
+            if !plan.capability_signals.is_empty() {
+                println!();
+                println!("Capability graph matches:");
+                for signal in &plan.capability_signals {
+                    println!(
+                        "- {} ({:.2}) — {}",
+                        signal.capability_id, signal.weight, signal.rationale
+                    );
+                    println!("  terms: {}", signal.matched_terms.join(", "));
+                }
+            }
+            if !plan.preset_ranking.is_empty() {
+                println!();
+                println!("Preset ranking:");
+                for rank in plan.preset_ranking.iter().take(3) {
+                    println!("- {} ({:.2})", rank.preset_id, rank.score);
+                    if !rank.reasons.is_empty() {
+                        println!("  signals: {}", rank.reasons.join("; "));
+                    }
+                }
+            }
+            println!();
+            println!(
+                "Confidence breakdown: base {:.2} + signal {:.2} + ranking {:.2} - penalty {:.2} = {:.2}",
+                plan.confidence_breakdown.base,
+                plan.confidence_breakdown.signal_bonus,
+                plan.confidence_breakdown.ranking_bonus,
+                plan.confidence_breakdown.contradiction_penalty,
+                plan.confidence_breakdown.final_score
+            );
+            println!();
+            println!("Intent directives:");
+            if plan.add_packs.is_empty() {
+                println!("- add packs: (none)");
+            } else {
+                println!("- add packs: {}", plan.add_packs.join(", "));
+            }
+            if plan.remove_packs.is_empty() {
+                println!("- remove packs: (none)");
+            } else {
+                println!("- remove packs: {}", plan.remove_packs.join(", "));
+            }
+            println!();
+            println!("Planned selection:");
+            print_selection_diff(&diff);
+            println!("Resolved packs: {}", after.packs.join(", "));
+            if before.is_none() {
+                println!("Current workspace selection: none (first composition run)");
+            }
+            println!();
+            println!(
+                "Security recommendation: {} ({})",
+                security_recommendation.label, security_recommendation.profile_id
+            );
+            println!("Risk tier: {}", security_recommendation.risk_tier);
+            if let Some(primary_reason) = security_recommendation.reasons.first() {
+                println!("Why: {primary_reason}");
+            }
+
+            if !apply {
+                println!();
+                println!("Generated next commands (not executed):");
+                for entry in &orchestration_report.next_commands {
+                    println!("- {}: {}", entry.id, entry.description);
+                    println!(
+                        "  consent required: {}",
+                        if entry.requires_explicit_consent {
+                            "yes"
+                        } else {
+                            "no"
+                        }
+                    );
+                    if !entry.consent_reasons.is_empty() {
+                        println!("  consent reasons: {}", entry.consent_reasons.join(", "));
+                    }
+                    println!("  {}", entry.command);
+                }
+                println!();
+                println!("Plan only. Re-run with `--apply` to persist this selection.");
+                return Ok(());
+            }
+
+            if !risky.is_empty() && !yes_risky && !dry_run {
+                bail!(
+                    "Selection includes risky packs [{}]. Re-run with `--yes-risky`, or use `--dry-run`.",
+                    risky.join(", ")
+                );
+            }
+            if !risky.is_empty() {
+                println!("Risky packs: {}", risky.join(", "));
+            }
+
+            if dry_run {
+                println!("Intent apply dry-run: no changes written.");
+                maybe_rebuild_selection(&after, rebuild, true, true).await?;
+                return Ok(());
+            }
+
+            let path = presets::save_workspace_selection(config, &after)?;
+            println!("Saved workspace preset selection: {}", path.display());
+            maybe_rebuild_selection(&after, rebuild, false, yes_rebuild).await?;
+            println!("Recommended follow-up security command:");
+            println!("  {security_apply_command}");
+            Ok(())
+        }
+        PresetCommands::Export { path, preset } => {
+            let selection = if let Some(preset_id) = preset {
+                presets::from_preset_id(&preset_id)?
+            } else if let Some(current) = presets::load_workspace_selection(config)? {
+                current
+            } else {
+                presets::default_selection()?
+            };
+            let document = presets::selection_to_document(&selection);
+            presets::export_document_to_path(&path, &document)?;
+            println!("Exported preset payload to {}", path.display());
+            Ok(())
+        }
+        PresetCommands::Import {
+            path,
+            mode,
+            dry_run,
+            yes_risky,
+            rebuild,
+            yes_rebuild,
+        } => {
+            let result = presets::import_selection_from_path(config, &path, mode)?;
+            println!("Import mode: {}", result.mode);
+            print_selection_diff(&presets::selection_diff(
+                result.before.as_ref(),
+                &result.after,
+            ));
+
+            let risky = presets::risky_pack_ids(&result.after);
+            if !risky.is_empty() && !yes_risky && !dry_run {
+                bail!(
+                    "Selection includes risky packs [{}]. Re-run with `--yes-risky`, or use `--dry-run`.",
+                    risky.join(", ")
+                );
+            }
+            if !risky.is_empty() {
+                println!("Risky packs: {}", risky.join(", "));
+            }
+
+            if dry_run {
+                println!("Import dry-run: no changes written.");
+                maybe_rebuild_selection(&result.after, rebuild, true, true).await?;
+                return Ok(());
+            }
+
+            let saved = presets::save_workspace_selection(config, &result.after)?;
+            println!("Saved workspace preset selection: {}", saved.display());
+            maybe_rebuild_selection(&result.after, rebuild, false, yes_rebuild).await?;
+            Ok(())
+        }
+        PresetCommands::Validate {
+            paths,
+            allow_unknown_packs,
+            json,
+        } => {
+            let report = presets::validate_preset_paths(&paths, allow_unknown_packs)?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "Preset validation summary: {} checked, {} failed",
+                    report.files_checked, report.files_failed
+                );
+                println!(
+                    "Unknown packs allowed: {}",
+                    if report.allow_unknown_packs {
+                        "yes"
+                    } else {
+                        "no"
+                    }
+                );
+                for result in &report.results {
+                    if result.ok {
+                        println!("- [ok] {} ({})", result.path, result.format);
+                    } else {
+                        println!("- [failed] {} ({})", result.path, result.format);
+                        for error in &result.errors {
+                            println!("  - {error}");
+                        }
+                    }
+                }
+            }
+
+            if report.files_failed > 0 {
+                bail!(
+                    "Preset validation failed for {} of {} files.",
+                    report.files_failed,
+                    report.files_checked
+                );
+            }
+            Ok(())
+        }
+        PresetCommands::Rebuild { dry_run, yes } => {
+            let selection = if let Some(current) = presets::load_workspace_selection(config)? {
+                current
+            } else {
+                presets::default_selection()?
+            };
+            maybe_rebuild_selection(&selection, true, dry_run, yes).await
+        }
+    }
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
@@ -521,6 +1914,10 @@ async fn main() -> Result<()> {
         api_key,
         provider,
         memory,
+        preset,
+        pack,
+        security_profile,
+        yes_security_risk,
     } = &cli.command
     {
         let interactive = *interactive;
@@ -528,12 +1925,39 @@ async fn main() -> Result<()> {
         let api_key = api_key.clone();
         let provider = provider.clone();
         let memory = memory.clone();
+        let preset = preset.clone();
+        let pack = pack.clone();
+        let security_profile = *security_profile;
+        let yes_security_risk = *yes_security_risk;
 
         if interactive && channels_only {
             bail!("Use either --interactive or --channels-only, not both");
         }
-        if channels_only && (api_key.is_some() || provider.is_some() || memory.is_some()) {
-            bail!("--channels-only does not accept --api-key, --provider, or --memory");
+        if interactive && (security_profile.is_some() || yes_security_risk) {
+            bail!(
+                "--interactive does not accept `--security-profile` or `--yes-security-risk`; pick profile in the wizard."
+            );
+        }
+        if channels_only
+            && (api_key.is_some()
+                || provider.is_some()
+                || memory.is_some()
+                || preset.is_some()
+                || !pack.is_empty()
+                || security_profile.is_some()
+                || yes_security_risk)
+        {
+            bail!("--channels-only does not accept quick-setup override flags");
+        }
+        if !interactive
+            && !channels_only
+            && security_profile.is_some_and(SecurityProfileArg::is_non_strict)
+            && !yes_security_risk
+        {
+            bail!(
+                "Refusing non-strict quick onboarding profile without explicit consent. \
+                 Re-run with `--yes-security-risk`, or use `--interactive` to confirm in wizard."
+            );
         }
 
         let config = tokio::task::spawn_blocking(move || {
@@ -542,7 +1966,14 @@ async fn main() -> Result<()> {
             } else if interactive {
                 onboard::run_wizard()
             } else {
-                onboard::run_quick_setup(api_key.as_deref(), provider.as_deref(), memory.as_deref())
+                onboard::run_quick_setup(
+                    api_key.as_deref(),
+                    provider.as_deref(),
+                    memory.as_deref(),
+                    preset.as_deref(),
+                    &pack,
+                    security_profile.map(SecurityProfileArg::as_profile_id),
+                )
             }
         })
         .await??;
@@ -569,6 +2000,67 @@ async fn main() -> Result<()> {
         } => agent::run(config, message, provider, model, temperature, peripheral)
             .await
             .map(|_| ()),
+
+        Commands::Update {
+            apply,
+            version,
+            install_path,
+            dry_run,
+            yes,
+        } => {
+            if apply {
+                if !yes && !dry_run {
+                    bail!(
+                        "Refusing to replace the running binary without explicit confirmation. \
+                         Re-run with `--yes`, or add `--dry-run` to preview."
+                    );
+                }
+
+                let result = updater::apply_update(updater::UpdateApplyOptions {
+                    target_version: version,
+                    install_path,
+                    dry_run,
+                })
+                .await?;
+
+                if result.dry_run {
+                    println!("Update dry-run complete.");
+                    println!("  from:          {}", result.from_version);
+                    println!("  to:            {}", result.to_version);
+                    println!("  target:        {}", result.target);
+                    println!("  release asset: {}", result.asset_name);
+                    println!("  install path:  {}", result.install_path.display());
+                    if let Some(url) = result.release_url {
+                        println!("  release:       {url}");
+                    }
+                } else {
+                    println!(
+                        "Updated zeroclaw from {} to {}",
+                        result.from_version, result.to_version
+                    );
+                    println!("Installed binary: {}", result.install_path.display());
+                }
+                Ok(())
+            } else {
+                let result =
+                    updater::check_for_updates(env!("CARGO_PKG_VERSION"), version.as_deref())
+                        .await?;
+
+                println!("Current version: {}", result.current_version);
+                println!("Latest version:  {}", result.latest_version);
+                if result.update_available {
+                    println!("Update available: yes");
+                    if let Some(url) = &result.release.html_url {
+                        println!("Release URL:      {url}");
+                    }
+                    println!("Run: zeroclaw update --apply --yes");
+                } else {
+                    println!("Update available: no");
+                }
+
+                Ok(())
+            }
+        }
 
         Commands::Gateway { port, host } => {
             let port = port.unwrap_or(config.gateway.port);
@@ -632,6 +2124,10 @@ async fn main() -> Result<()> {
             println!("Security:");
             println!("  Workspace only:    {}", config.autonomy.workspace_only);
             println!(
+                "  Non-CLI approval:  {}",
+                non_cli_approval_mode(config.autonomy.allow_non_cli_auto_approval)
+            );
+            println!(
                 "  Allowed commands:  {}",
                 config.autonomy.allowed_commands.join(", ")
             );
@@ -688,6 +2184,12 @@ async fn main() -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("models refresh task failed: {e}"))?
             }
         },
+
+        Commands::Preset { preset_command } => handle_preset_command(preset_command, &config).await,
+
+        Commands::Security { security_command } => {
+            handle_security_command(security_command, &mut config)
+        }
 
         Commands::Providers => {
             let providers = providers::list_providers();
@@ -1206,10 +2708,150 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::CommandFactory;
+    use clap::{CommandFactory, Parser};
 
     #[test]
     fn cli_definition_has_no_flag_conflicts() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn security_profile_set_parses_non_cli_approval_override() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "security",
+            "profile",
+            "set",
+            "strict",
+            "--non-cli-approval",
+            "auto",
+            "--yes-risk",
+        ])
+        .expect("cli parse should succeed");
+
+        match cli.command {
+            Commands::Security { security_command } => match security_command {
+                SecurityCommands::Profile { profile_command } => match profile_command {
+                    SecurityProfileCommands::Set {
+                        non_cli_approval, ..
+                    } => {
+                        assert_eq!(non_cli_approval, Some(NonCliApprovalArg::Auto));
+                    }
+                    _ => panic!("expected security profile set command"),
+                },
+                _ => panic!("expected security profile command"),
+            },
+            _ => panic!("expected security command"),
+        }
+    }
+
+    #[test]
+    fn security_change_report_includes_non_cli_approval_delta() {
+        let mut current = config::AutonomyConfig::default();
+        current.allow_non_cli_auto_approval = false;
+        let mut target = current.clone();
+        target.allow_non_cli_auto_approval = true;
+        let report = build_security_profile_change_report(&current, &target, "strict", true, true);
+
+        assert!(report
+            .changes
+            .iter()
+            .any(|change| change.field == "allow_non_cli_auto_approval"));
+        assert!(report
+            .changes
+            .iter()
+            .any(|change| change.field == "non_cli_approval_mode"));
+        assert_eq!(report.current.non_cli_approval_mode, "manual");
+        assert_eq!(report.target.non_cli_approval_mode, "auto");
+    }
+
+    #[test]
+    fn non_cli_approval_mode_labels_are_stable() {
+        assert_eq!(non_cli_approval_mode(false), "manual");
+        assert_eq!(non_cli_approval_mode(true), "auto");
+    }
+
+    #[test]
+    fn preset_apply_consent_reasons_capture_risky_and_rebuild() {
+        let risky = vec!["tools-update".to_string()];
+        let reasons = build_preset_apply_consent_reasons(&risky, false, false, true, false);
+        assert_eq!(
+            reasons,
+            vec!["risky_pack".to_string(), "rebuild".to_string()]
+        );
+    }
+
+    #[test]
+    fn security_apply_consent_reasons_for_non_strict_profile() {
+        let recommendation = onboard::SecurityProfileRecommendation {
+            profile_id: "balanced".to_string(),
+            label: "Balanced supervised".to_string(),
+            risk_tier: "medium".to_string(),
+            requires_explicit_consent: true,
+            reasons: vec!["test".to_string()],
+        };
+        let reasons = build_security_apply_consent_reasons(&recommendation);
+        assert_eq!(reasons, vec!["security_non_strict".to_string()]);
+    }
+
+    #[test]
+    fn orchestration_shell_script_includes_confirmation_for_guarded_commands() {
+        let report = PresetIntentOrchestrationReport {
+            intent: "need unattended browser automation".to_string(),
+            capability_sources: vec!["builtin".to_string()],
+            plan: presets::IntentPlan {
+                intent: "need unattended browser automation".to_string(),
+                base_preset_id: Some("automation".to_string()),
+                add_packs: vec!["browser-native".to_string()],
+                remove_packs: Vec::new(),
+                confidence: 0.7,
+                reasons: vec!["test".to_string()],
+                capability_signals: Vec::new(),
+                preset_ranking: Vec::new(),
+                confidence_breakdown: presets::ConfidenceBreakdown {
+                    base: 0.42,
+                    signal_bonus: 0.08,
+                    ranking_bonus: 0.1,
+                    contradiction_penalty: 0.0,
+                    final_score: 0.6,
+                },
+            },
+            planned_selection: presets::WorkspacePresetSelection {
+                schema_version: 1,
+                preset_id: "automation".to_string(),
+                packs: vec!["core-agent".to_string(), "tools-update".to_string()],
+                added_packs: Vec::new(),
+            },
+            risky_packs: vec!["tools-update".to_string()],
+            security_recommendation: onboard::SecurityProfileRecommendation {
+                profile_id: "balanced".to_string(),
+                label: "Balanced supervised".to_string(),
+                risk_tier: "medium".to_string(),
+                requires_explicit_consent: true,
+                reasons: vec!["test".to_string()],
+            },
+            security_apply_command: "zeroclaw security profile set balanced --yes-risk".to_string(),
+            next_commands: vec![
+                GeneratedNextCommand {
+                    id: "preset.apply.preview".to_string(),
+                    description: "preview".to_string(),
+                    command: "zeroclaw preset intent 'x' --apply --dry-run".to_string(),
+                    requires_explicit_consent: false,
+                    consent_reasons: Vec::new(),
+                },
+                GeneratedNextCommand {
+                    id: "preset.apply".to_string(),
+                    description: "apply".to_string(),
+                    command: "zeroclaw preset intent 'x' --apply".to_string(),
+                    requires_explicit_consent: true,
+                    consent_reasons: vec!["risky_pack".to_string()],
+                },
+            ],
+        };
+
+        let script = build_orchestration_shell_script(&report);
+        assert!(script.contains("confirm()"));
+        assert!(script.contains("zeroclaw preset intent 'x' --apply --dry-run"));
+        assert!(script.contains("Run preset.apply (reasons: risky_pack)?"));
     }
 }

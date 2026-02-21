@@ -56,6 +56,8 @@ pub struct ApprovalManager {
     always_ask: HashSet<String>,
     /// Autonomy level from config.
     autonomy_level: AutonomyLevel,
+    /// Whether non-CLI channels are allowed to auto-approve guarded tools.
+    allow_non_cli_auto_approval: bool,
     /// Session-scoped allowlist built from "Always" responses.
     session_allowlist: Mutex<HashSet<String>>,
     /// Audit trail of approval decisions.
@@ -69,6 +71,7 @@ impl ApprovalManager {
             auto_approve: config.auto_approve.iter().cloned().collect(),
             always_ask: config.always_ask.iter().cloned().collect(),
             autonomy_level: config.level,
+            allow_non_cli_auto_approval: config.allow_non_cli_auto_approval,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
         }
@@ -145,10 +148,12 @@ impl ApprovalManager {
         self.session_allowlist.lock().clone()
     }
 
+    /// Whether non-CLI channels may bypass interactive approval prompts.
+    pub fn allow_non_cli_auto_approval(&self) -> bool {
+        self.allow_non_cli_auto_approval
+    }
+
     /// Prompt the user on the CLI and return their decision.
-    ///
-    /// For non-CLI channels, returns `Yes` automatically (interactive
-    /// approval is only supported on CLI for now).
     pub fn prompt_cli(&self, request: &ApprovalRequest) -> ApprovalResponse {
         prompt_cli_interactive(request)
     }
@@ -275,6 +280,22 @@ mod tests {
         };
         let mgr = ApprovalManager::from_config(&config);
         assert!(!mgr.needs_approval("shell"));
+    }
+
+    #[test]
+    fn non_cli_auto_approval_defaults_to_disabled() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        assert!(!mgr.allow_non_cli_auto_approval());
+    }
+
+    #[test]
+    fn non_cli_auto_approval_can_be_enabled() {
+        let config = AutonomyConfig {
+            allow_non_cli_auto_approval: true,
+            ..supervised_config()
+        };
+        let mgr = ApprovalManager::from_config(&config);
+        assert!(mgr.allow_non_cli_auto_approval());
     }
 
     // ── session allowlist ────────────────────────────────────

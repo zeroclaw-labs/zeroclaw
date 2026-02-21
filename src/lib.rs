@@ -58,6 +58,7 @@ pub mod migration;
 pub mod observability;
 pub mod onboard;
 pub mod peripherals;
+pub mod presets;
 pub mod providers;
 pub mod rag;
 pub mod runtime;
@@ -66,6 +67,7 @@ pub mod service;
 pub mod skills;
 pub mod tools;
 pub mod tunnel;
+pub mod updater;
 pub mod util;
 
 pub use config::Config;

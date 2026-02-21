@@ -2,9 +2,9 @@
 
 This page is the primary entry point for the documentation system.
 
-Last refreshed: **February 18, 2026**.
+Last refreshed: **February 21, 2026**.
 
-Localized hubs: [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Русский](README.ru.md).
+Localized hubs: [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Русский](README.ru.md) · [Français](README.fr.md) · [Tiếng Việt](i18n/vi/README.md).
 
 ## Start Here
 
@@ -13,6 +13,8 @@ Localized hubs: [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · 
 | Install and run ZeroClaw quickly | [README.md (Quick Start)](../README.md#quick-start) |
 | Bootstrap in one command | [one-click-bootstrap.md](one-click-bootstrap.md) |
 | Find commands by task | [commands-reference.md](commands-reference.md) |
+| Understand preset composition/import/export/share flows | [presets-guide.md](presets-guide.md) |
+| Pick the right official preset quickly | [preset-recommendation-matrix.md](preset-recommendation-matrix.md) |
 | Check config defaults and keys quickly | [config-reference.md](config-reference.md) |
 | Configure custom providers/endpoints | [custom-providers.md](custom-providers.md) |
 | Configure Z.AI / GLM provider | [zai-glm-setup.md](zai-glm-setup.md) |
@@ -49,6 +51,8 @@ Localized hubs: [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · 
 ### Users / Operators
 
 - [commands-reference.md](commands-reference.md) — command lookup by workflow
+- [presets-guide.md](presets-guide.md) — presets architecture, import/export modes, and contribution workflow
+- [preset-recommendation-matrix.md](preset-recommendation-matrix.md) — official scenario-to-preset recommendation matrix
 - [providers-reference.md](providers-reference.md) — provider IDs, aliases, credential env vars
 - [channels-reference.md](channels-reference.md) — channel capabilities and setup paths
 - [matrix-e2ee-guide.md](matrix-e2ee-guide.md) — Matrix encrypted-room (E2EE) setup and no-response diagnostics
@@ -83,4 +87,6 @@ Localized hubs: [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · 
 
 - Unified TOC: [SUMMARY.md](SUMMARY.md)
 - Documentation inventory/classification: [docs-inventory.md](docs-inventory.md)
+- i18n docs index: [i18n/README.md](i18n/README.md)
+- i18n coverage map: [i18n-coverage.md](i18n-coverage.md)
 - Project triage snapshot: [project-triage-snapshot-2026-02-18.md](project-triage-snapshot-2026-02-18.md)

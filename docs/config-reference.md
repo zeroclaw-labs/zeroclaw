@@ -2,7 +2,7 @@
 
 This is a high-signal reference for common config sections and defaults.
 
-Last verified: **February 18, 2026**.
+Last verified: **February 21, 2026**.
 
 Config file path:
 
@@ -15,6 +15,7 @@ Config file path:
 | `default_provider` | `openrouter` | provider ID or alias |
 | `default_model` | `anthropic/claude-sonnet-4-6` | model routed through selected provider |
 | `default_temperature` | `0.7` | model temperature |
+| `api_url` | unset | provider base URL override (e.g. remote Ollama endpoint, or OpenAI Codex OAuth proxy base URL) |
 
 ## `[agent]`
 
@@ -35,6 +36,25 @@ Notes:
 | `port` | `3000` | gateway listen port |
 | `require_pairing` | `true` | require pairing before bearer auth |
 | `allow_public_bind` | `false` | block accidental public exposure |
+
+## `[autonomy]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `level` | `supervised` | autonomy posture (`read_only`, `supervised`, `full`) |
+| `workspace_only` | `true` | deny filesystem operations outside workspace |
+| `allow_non_cli_auto_approval` | `false` | when `true`, non-CLI channels can auto-approve approval-gated tool calls |
+| `require_approval_for_medium_risk` | `true` | force approval on medium-risk shell/tool actions |
+| `block_high_risk_commands` | `true` | hard-block high-risk actions |
+| `max_actions_per_hour` | `20` | budget guardrail |
+| `max_cost_per_day_cents` | `500` | daily model/tool budget guardrail |
+
+Notes:
+
+- Keep `allow_non_cli_auto_approval = false` unless you intentionally accept reduced human-in-the-loop guarantees.
+- Equivalent CLI controls:
+  - `zeroclaw security profile set strict --non-cli-approval manual`
+  - `zeroclaw security profile set strict --non-cli-approval auto --yes-risk`
 
 ## `[memory]`
 

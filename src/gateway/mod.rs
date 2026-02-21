@@ -313,6 +313,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             auth_profile_override: None,
             zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
             secrets_encrypt: config.secrets.encrypt,
+            provider_api_url: None,
         },
     )?);
     let model = config
@@ -1194,6 +1195,8 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
         };
 
@@ -1235,6 +1238,8 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
             observer,
         };
 
@@ -1809,10 +1814,7 @@ mod tests {
         };
 
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "X-Webhook-Secret",
-            HeaderValue::from_str(&secret).unwrap(),
-        );
+        headers.insert("X-Webhook-Secret", HeaderValue::from_str(&secret).unwrap());
 
         let response = handle_webhook(
             State(state),
@@ -1984,7 +1986,11 @@ mod tests {
 
         // Correct prefix should pass
         let correct_prefix = format!("sha256={hex_sig}");
-        assert!(verify_whatsapp_signature(&app_secret, body, &correct_prefix));
+        assert!(verify_whatsapp_signature(
+            &app_secret,
+            body,
+            &correct_prefix
+        ));
     }
 
     #[test]

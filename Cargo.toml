@@ -142,8 +142,9 @@ rppal = { version = "0.22", optional = true }
 landlock = { version = "0.4", optional = true }
 
 [features]
-default = ["hardware"]
+default = ["hardware", "tool-update"]
 hardware = ["nusb", "tokio-serial"]
+tool-update = []
 peripheral-rpi = ["rppal"]
 # Browser backend feature alias used by cfg(feature = "browser-native")
 browser-native = ["dep:fantoccini"]

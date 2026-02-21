@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "id": "team-automation-lite",
+  "title": "Team Automation Lite",
+  "description": "Browser automation workflow with minimal optional surface.",
+  "packs": [
+    "core-agent",
+    "browser-native"
+  ],
+  "config_overrides": {
+    "autonomy": {
+      "level": "supervised"
+    }
+  },
+  "metadata": {
+    "author": "team-platform",
+    "maintainers": [
+      "@example"
+    ],
+    "tags": [
+      "automation",
+      "browser"
+    ],
+    "compatibility": {
+      "min_zeroclaw_version": "0.1.0"
+    },
+    "created_at": "2026-02-21T00:00:00Z"
+  }
+}

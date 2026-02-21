@@ -13,7 +13,9 @@ const QQ_AUTH_URL: &str = "https://bots.qq.com/app/getAppAccessToken";
 
 fn ensure_https(url: &str) -> anyhow::Result<()> {
     if !url.starts_with("https://") {
-        anyhow::bail!("Refusing to transmit sensitive data over non-HTTPS URL: URL scheme must be https");
+        anyhow::bail!(
+            "Refusing to transmit sensitive data over non-HTTPS URL: URL scheme must be https"
+        );
     }
     Ok(())
 }

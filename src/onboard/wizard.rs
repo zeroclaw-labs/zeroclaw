@@ -10,13 +10,17 @@ use crate::hardware::{self, HardwareConfig};
 use crate::memory::{
     default_memory_backend_key, memory_backend_profile, selectable_memory_backends,
 };
+use crate::onboard::feature_packs::{
+    feature_pack_by_id, preset_by_id, FeaturePack, FEATURE_PACKS, PRESETS,
+};
 use crate::providers::{
     canonical_china_provider_name, is_glm_alias, is_glm_cn_alias, is_minimax_alias,
     is_moonshot_alias, is_qianfan_alias, is_qwen_alias, is_zai_alias, is_zai_cn_alias,
 };
+use crate::security::AutonomyLevel;
 use anyhow::{bail, Context, Result};
 use console::style;
-use dialoguer::{Confirm, Input, Select};
+use dialoguer::{Confirm, Input, MultiSelect, Select};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -57,6 +61,633 @@ const MODEL_PREVIEW_LIMIT: usize = 20;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_TTL_SECS: u64 = 12 * 60 * 60;
 const CUSTOM_MODEL_SENTINEL: &str = "__custom_model__";
+const PRESET_SELECTION_FILE: &str = ".zeroclaw-preset.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct OnboardPresetSelection {
+    schema_version: u8,
+    preset_id: String,
+    packs: Vec<String>,
+    added_packs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SecurityProfileRecommendation {
+    pub profile_id: String,
+    pub label: String,
+    pub risk_tier: String,
+    pub requires_explicit_consent: bool,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecurityProfile {
+    Strict,
+    Balanced,
+    Flexible,
+    FullAutonomy,
+}
+
+fn autonomy_config_for_security_profile(profile: SecurityProfile) -> AutonomyConfig {
+    let mut config = AutonomyConfig::default();
+    match profile {
+        SecurityProfile::Strict => {
+            config.level = AutonomyLevel::Supervised;
+            config.workspace_only = true;
+            config.max_actions_per_hour = 12;
+            config.max_cost_per_day_cents = 300;
+            config.require_approval_for_medium_risk = true;
+            config.block_high_risk_commands = true;
+        }
+        SecurityProfile::Balanced => {
+            config.level = AutonomyLevel::Supervised;
+            config.workspace_only = true;
+            config.max_actions_per_hour = 20;
+            config.max_cost_per_day_cents = 500;
+            config.require_approval_for_medium_risk = true;
+            config.block_high_risk_commands = true;
+        }
+        SecurityProfile::Flexible => {
+            config.level = AutonomyLevel::Supervised;
+            config.workspace_only = false;
+            config.max_actions_per_hour = 50;
+            config.max_cost_per_day_cents = 1_500;
+            config.require_approval_for_medium_risk = true;
+            config.block_high_risk_commands = true;
+        }
+        SecurityProfile::FullAutonomy => {
+            config.level = AutonomyLevel::Full;
+            config.workspace_only = false;
+            config.max_actions_per_hour = 100;
+            config.max_cost_per_day_cents = 3_000;
+            config.require_approval_for_medium_risk = false;
+            config.block_high_risk_commands = false;
+        }
+    }
+    config
+}
+
+fn security_profile_from_id(profile_id: &str) -> Option<SecurityProfile> {
+    match profile_id.trim().to_ascii_lowercase().as_str() {
+        "strict" => Some(SecurityProfile::Strict),
+        "balanced" => Some(SecurityProfile::Balanced),
+        "flexible" => Some(SecurityProfile::Flexible),
+        "full" | "full_autonomy" | "full-autonomy" => Some(SecurityProfile::FullAutonomy),
+        _ => None,
+    }
+}
+
+fn security_profile_id(profile: SecurityProfile) -> &'static str {
+    match profile {
+        SecurityProfile::Strict => "strict",
+        SecurityProfile::Balanced => "balanced",
+        SecurityProfile::Flexible => "flexible",
+        SecurityProfile::FullAutonomy => "full",
+    }
+}
+
+pub fn autonomy_config_for_security_profile_id(profile_id: &str) -> Result<AutonomyConfig> {
+    let profile = security_profile_from_id(profile_id).with_context(|| {
+        format!(
+            "Unknown security profile '{profile_id}'. Supported values: strict, balanced, flexible, full."
+        )
+    })?;
+    Ok(autonomy_config_for_security_profile(profile))
+}
+
+pub fn security_profile_label(autonomy: &AutonomyConfig) -> &'static str {
+    if autonomy.level == AutonomyLevel::Full
+        && !autonomy.require_approval_for_medium_risk
+        && !autonomy.block_high_risk_commands
+    {
+        return "Full autonomy (high risk)";
+    }
+
+    if autonomy.level == AutonomyLevel::Supervised && autonomy.workspace_only {
+        if autonomy.max_actions_per_hour <= 12 && autonomy.max_cost_per_day_cents <= 300 {
+            return "Strict supervised (default)";
+        }
+        return "Balanced supervised";
+    }
+
+    if autonomy.level == AutonomyLevel::Supervised && !autonomy.workspace_only {
+        return "Flexible supervised";
+    }
+
+    "Custom policy"
+}
+
+pub fn security_profile_id_from_autonomy(autonomy: &AutonomyConfig) -> &'static str {
+    match security_profile_label(autonomy) {
+        "Strict supervised (default)" => "strict",
+        "Balanced supervised" => "balanced",
+        "Flexible supervised" => "flexible",
+        "Full autonomy (high risk)" => "full",
+        _ => "custom",
+    }
+}
+
+fn push_unique_reason(reasons: &mut Vec<String>, reason: impl Into<String>) {
+    let reason = reason.into();
+    if !reasons.iter().any(|existing| existing == &reason) {
+        reasons.push(reason);
+    }
+}
+
+fn intent_contains_any(intent: &str, keywords: &[&str]) -> bool {
+    keywords.iter().any(|keyword| intent.contains(keyword))
+}
+
+pub fn recommend_security_profile(
+    intent: Option<&str>,
+    selected_packs: &[String],
+) -> SecurityProfileRecommendation {
+    let normalized_intent = intent.unwrap_or("").trim().to_lowercase();
+    let pack_set: BTreeSet<&str> = selected_packs.iter().map(String::as_str).collect();
+    let risky_packs: Vec<String> = selected_packs
+        .iter()
+        .filter_map(|pack_id| {
+            feature_pack_by_id(pack_id)
+                .filter(|pack| pack.requires_confirmation)
+                .map(|_| pack_id.clone())
+        })
+        .collect();
+
+    let full_intent_keywords = [
+        "full autonomy",
+        "unattended",
+        "hands-free",
+        "no approval",
+        "without approval",
+        "auto execute",
+        "run everything",
+        "不需要审批",
+        "无人值守",
+        "全自动",
+        "自动执行",
+    ];
+    let flexible_intent_keywords = [
+        "outside workspace",
+        "cross project",
+        "cross-workspace",
+        "system level",
+        "deploy",
+        "remote host",
+        "kubernetes",
+        "k8s",
+        "docker",
+        "infra",
+        "跨目录",
+        "跨工作区",
+        "系统级",
+        "部署",
+    ];
+    let strict_intent_keywords = [
+        "strict",
+        "safe",
+        "security first",
+        "harden",
+        "least privilege",
+        "compliance",
+        "audit",
+        "production safety",
+        "严格",
+        "安全优先",
+        "合规",
+        "审计",
+        "保守",
+    ];
+    let throughput_intent_keywords = [
+        "fast",
+        "faster",
+        "throughput",
+        "high velocity",
+        "as fast as possible",
+        "低延迟",
+        "高吞吐",
+        "尽快",
+        "快速",
+    ];
+
+    let asks_for_full = intent_contains_any(&normalized_intent, &full_intent_keywords);
+    let asks_for_flexible_scope =
+        intent_contains_any(&normalized_intent, &flexible_intent_keywords);
+    let asks_for_strict = intent_contains_any(&normalized_intent, &strict_intent_keywords);
+    let asks_for_throughput = intent_contains_any(&normalized_intent, &throughput_intent_keywords);
+
+    let mut strict_score: i32 = 2;
+    let mut balanced_score: i32 = 1;
+    let mut flexible_score: i32 = 0;
+    let mut full_score: i32 = if asks_for_full { 2 } else { -100 };
+    let mut reasons = Vec::new();
+
+    if pack_set.contains("sandbox-landlock") {
+        strict_score += 6;
+        balanced_score += 1;
+        push_unique_reason(
+            &mut reasons,
+            "Selected packs include Linux sandbox hardening; stricter guardrails align with that goal.",
+        );
+    }
+
+    if pack_set.contains("tools-update") {
+        balanced_score += 3;
+        flexible_score += 1;
+        push_unique_reason(
+            &mut reasons,
+            "Selected packs include self-update capability; balanced supervision is safer than strict while preserving velocity.",
+        );
+    }
+
+    if pack_set.contains("browser-native") {
+        balanced_score += 2;
+        flexible_score += 2;
+        push_unique_reason(
+            &mut reasons,
+            "Selected packs include browser automation; medium-throughput supervised profile is a practical default.",
+        );
+    }
+
+    if pack_set.contains("hardware-core")
+        || pack_set.contains("probe-rs")
+        || pack_set.contains("peripheral-rpi")
+    {
+        balanced_score += 2;
+        push_unique_reason(
+            &mut reasons,
+            "Selected packs include hardware/peripheral workflows; balanced profile keeps approvals while reducing friction.",
+        );
+    }
+
+    if selected_packs.len() <= 1 {
+        strict_score += 2;
+        push_unique_reason(
+            &mut reasons,
+            "Current composition is minimal; strict profile minimizes exposure with little downside.",
+        );
+    }
+
+    if selected_packs.len() >= 4 {
+        balanced_score += 1;
+        flexible_score += 1;
+        push_unique_reason(
+            &mut reasons,
+            "Composition spans multiple capabilities; a slightly higher-throughput profile is usually more practical.",
+        );
+    }
+
+    if !risky_packs.is_empty() {
+        balanced_score += 1;
+        push_unique_reason(
+            &mut reasons,
+            format!(
+                "Risk-gated packs are present [{}]; recommendation stays supervised unless intent explicitly asks for full autonomy.",
+                risky_packs.join(", ")
+            ),
+        );
+    }
+
+    if asks_for_full {
+        full_score += 8;
+        flexible_score += 3;
+        push_unique_reason(
+            &mut reasons,
+            "Intent explicitly asks for unattended or approval-free execution.",
+        );
+    }
+
+    if asks_for_flexible_scope {
+        flexible_score += 6;
+        balanced_score += 2;
+        push_unique_reason(
+            &mut reasons,
+            "Intent implies broader execution scope (outside workspace/infrastructure actions).",
+        );
+    }
+
+    if asks_for_strict {
+        strict_score += 6;
+        balanced_score += 2;
+        push_unique_reason(
+            &mut reasons,
+            "Intent prioritizes safety/compliance; stricter guardrails are favored.",
+        );
+    }
+
+    if asks_for_strict && !asks_for_full && !asks_for_flexible_scope {
+        strict_score += 4;
+        push_unique_reason(
+            &mut reasons,
+            "Intent explicitly asks for strict operation; recommendation keeps strict unless broader autonomy is explicitly requested.",
+        );
+    }
+
+    if asks_for_throughput {
+        balanced_score += 2;
+        flexible_score += 2;
+        if asks_for_full {
+            full_score += 2;
+        }
+        push_unique_reason(
+            &mut reasons,
+            "Intent emphasizes throughput/speed, which benefits from reduced interaction overhead.",
+        );
+    }
+
+    let mut best = (SecurityProfile::Strict, strict_score);
+    for candidate in [
+        (SecurityProfile::Balanced, balanced_score),
+        (SecurityProfile::Flexible, flexible_score),
+        (SecurityProfile::FullAutonomy, full_score),
+    ] {
+        if candidate.1 > best.1 {
+            best = candidate;
+        }
+    }
+
+    let recommended = best.0;
+    let autonomy = autonomy_config_for_security_profile(recommended);
+    let profile_id = security_profile_id(recommended).to_string();
+    let label = security_profile_label(&autonomy).to_string();
+    let risk_tier = match recommended {
+        SecurityProfile::Strict => "low".to_string(),
+        SecurityProfile::Balanced => "medium".to_string(),
+        SecurityProfile::Flexible => "medium-high".to_string(),
+        SecurityProfile::FullAutonomy => "high".to_string(),
+    };
+
+    if reasons.is_empty() {
+        reasons.push(
+            "No strong intent/preset signals detected; strict remains the safest default."
+                .to_string(),
+        );
+    }
+
+    SecurityProfileRecommendation {
+        profile_id: profile_id.clone(),
+        label,
+        risk_tier,
+        requires_explicit_consent: profile_id != "strict",
+        reasons,
+    }
+}
+
+fn build_preset_selection(
+    preset_id: &str,
+    extra_pack_ids: &[String],
+) -> Result<OnboardPresetSelection> {
+    let preset = preset_by_id(preset_id).with_context(|| {
+        format!(
+            "Unknown preset '{preset_id}'. Run interactive onboard to inspect official presets."
+        )
+    })?;
+
+    let mut packs: BTreeSet<String> = preset
+        .packs
+        .iter()
+        .map(|pack| (*pack).to_string())
+        .collect();
+    let mut added_packs: BTreeSet<String> = BTreeSet::new();
+
+    for raw_pack in extra_pack_ids {
+        let pack_id = raw_pack.trim();
+        if pack_id.is_empty() {
+            continue;
+        }
+
+        if feature_pack_by_id(pack_id).is_none() {
+            bail!("Unknown pack id '{pack_id}'");
+        }
+
+        if packs.insert(pack_id.to_string()) {
+            added_packs.insert(pack_id.to_string());
+        }
+    }
+
+    Ok(OnboardPresetSelection {
+        schema_version: 1,
+        preset_id: preset.id.to_string(),
+        packs: packs.into_iter().collect(),
+        added_packs: added_packs.into_iter().collect(),
+    })
+}
+
+fn risky_pack_ids(selection: &OnboardPresetSelection) -> Vec<String> {
+    selection
+        .packs
+        .iter()
+        .filter_map(|pack_id| {
+            feature_pack_by_id(pack_id)
+                .filter(|pack| pack.requires_confirmation)
+                .map(|_| pack_id.clone())
+        })
+        .collect()
+}
+
+fn drop_pack_ids(selection: &mut OnboardPresetSelection, to_remove: &BTreeSet<String>) {
+    selection.packs.retain(|pack| !to_remove.contains(pack));
+    selection
+        .added_packs
+        .retain(|pack| !to_remove.contains(pack));
+}
+
+fn persist_preset_selection(
+    workspace_dir: &Path,
+    selection: &OnboardPresetSelection,
+) -> Result<PathBuf> {
+    let path = workspace_dir.join(PRESET_SELECTION_FILE);
+    let payload = serde_json::to_string_pretty(selection)?;
+    fs::write(&path, payload).with_context(|| format!("Failed to write {}", path.display()))?;
+    Ok(path)
+}
+
+fn describe_pack(pack: &FeaturePack) -> String {
+    let mut line = format!("{} — {}", pack.id, pack.description);
+    if pack.requires_confirmation {
+        line.push_str(" [requires confirmation]");
+    }
+    line
+}
+
+fn setup_preset_selection_interactive() -> Result<OnboardPresetSelection> {
+    let preset_items: Vec<String> = PRESETS
+        .iter()
+        .map(|preset| format!("{} — {}", preset.id, preset.description))
+        .collect();
+
+    let default_index = PRESETS
+        .iter()
+        .position(|preset| preset.id == "default")
+        .unwrap_or(0);
+
+    let preset_index = Select::new()
+        .with_prompt("  Select official preset")
+        .items(&preset_items)
+        .default(default_index)
+        .interact()?;
+    let selected_preset = PRESETS[preset_index];
+
+    let mut extra_pack_ids: Vec<String> = Vec::new();
+    let add_extras = Confirm::new()
+        .with_prompt("  Add optional packs on top of this preset?")
+        .default(false)
+        .interact()?;
+
+    if add_extras {
+        let extra_candidates: Vec<&FeaturePack> = FEATURE_PACKS
+            .iter()
+            .filter(|pack| !selected_preset.packs.iter().any(|base| *base == pack.id))
+            .collect();
+
+        if !extra_candidates.is_empty() {
+            let extra_items: Vec<String> = extra_candidates
+                .iter()
+                .map(|pack| describe_pack(pack))
+                .collect();
+            let selected_indices = MultiSelect::new()
+                .with_prompt("  Select extra packs")
+                .items(&extra_items)
+                .interact()?;
+
+            for idx in selected_indices {
+                extra_pack_ids.push(extra_candidates[idx].id.to_string());
+            }
+        }
+    }
+
+    let mut selection = build_preset_selection(selected_preset.id, &extra_pack_ids)?;
+    let risky = risky_pack_ids(&selection);
+
+    if !risky.is_empty() {
+        let keep_risky = Confirm::new()
+            .with_prompt(format!(
+                "  Keep risky packs [{}]? (requires explicit consent)",
+                risky.join(", ")
+            ))
+            .default(false)
+            .interact()?;
+
+        if !keep_risky {
+            drop_pack_ids(&mut selection, &risky.into_iter().collect());
+        }
+    }
+
+    Ok(selection)
+}
+
+fn align_security_profile_with_preset_selection(
+    preset_selection: &OnboardPresetSelection,
+    current_autonomy: AutonomyConfig,
+) -> Result<AutonomyConfig> {
+    let recommendation = recommend_security_profile(None, &preset_selection.packs);
+    let current_profile_id = security_profile_id_from_autonomy(&current_autonomy);
+
+    if recommendation.profile_id == current_profile_id {
+        return Ok(current_autonomy);
+    }
+
+    println!();
+    println!(
+        "  {} Preset-aware security recommendation: {} ({})",
+        style("ℹ").cyan().bold(),
+        style(&recommendation.label).cyan(),
+        recommendation.profile_id
+    );
+    println!(
+        "  {} Risk tier: {}",
+        style("↳").dim(),
+        recommendation.risk_tier
+    );
+    if let Some(primary_reason) = recommendation.reasons.first() {
+        println!("  {} Why: {}", style("↳").dim(), primary_reason);
+    }
+    println!(
+        "  {} Current profile: {} ({})",
+        style("↳").dim(),
+        security_profile_label(&current_autonomy),
+        current_profile_id
+    );
+    let show_details = Confirm::new()
+        .with_prompt("  Show detailed recommendation rationale?")
+        .default(false)
+        .interact()?;
+    if show_details {
+        println!("  {} Detailed reasons:", style("↳").dim());
+        for reason in &recommendation.reasons {
+            println!("    - {reason}");
+        }
+        println!(
+            "  {} Selected packs: {}",
+            style("↳").dim(),
+            preset_selection.packs.join(", ")
+        );
+    } else {
+        println!(
+            "  {} Details hidden for brevity. You can inspect policy anytime with `zeroclaw security show`.",
+            style("↳").dim()
+        );
+    }
+
+    let lowering_guardrails =
+        current_profile_id == "strict" && recommendation.requires_explicit_consent;
+    let adopt = Confirm::new()
+        .with_prompt(format!(
+            "  Switch security profile to '{}'?",
+            recommendation.profile_id
+        ))
+        .default(!lowering_guardrails)
+        .interact()?;
+
+    if !adopt {
+        println!("  {} Keeping current security profile.", style("↳").dim());
+        return Ok(current_autonomy);
+    }
+
+    if recommendation.requires_explicit_consent {
+        let acknowledge = Confirm::new()
+            .with_prompt(
+                "  This lowers safeguards compared to strict. I understand the risk and want to continue",
+            )
+            .default(false)
+            .interact()?;
+
+        if !acknowledge {
+            println!(
+                "  {} Risk not acknowledged. Keeping current profile.",
+                style("↳").dim()
+            );
+            return Ok(current_autonomy);
+        }
+    }
+
+    if recommendation.profile_id == "full" {
+        let token: String = Input::new()
+            .with_prompt("  Type FULL-RISK to confirm full autonomy")
+            .allow_empty(true)
+            .interact_text()?;
+
+        if token.trim() != "FULL-RISK" {
+            println!(
+                "  {} Confirmation mismatch. Keeping current profile.",
+                style("↳").dim()
+            );
+            return Ok(current_autonomy);
+        }
+    }
+
+    let updated = autonomy_config_for_security_profile_id(&recommendation.profile_id)?;
+    println!(
+        "  {} Security profile updated: {}",
+        style("✓").green().bold(),
+        style(security_profile_label(&updated)).green()
+    );
+    println!(
+        "  {} Rollback: {}",
+        style("↳").dim(),
+        style("zeroclaw security profile set strict").dim()
+    );
+    Ok(updated)
+}
 
 fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
     let ChannelsConfig {
@@ -110,35 +741,41 @@ pub fn run_wizard() -> Result<Config> {
     );
     println!();
 
-    print_step(1, 9, "Workspace Setup");
+    print_step(1, 10, "Workspace Setup");
     let (workspace_dir, config_path) = setup_workspace()?;
 
-    print_step(2, 9, "AI Provider & API Key");
+    print_step(2, 10, "AI Provider & API Key");
     let (provider, api_key, model, provider_api_url) = setup_provider(&workspace_dir)?;
 
-    print_step(3, 9, "Channels (How You Talk to ZeroClaw)");
+    print_step(3, 10, "Channels (How You Talk to ZeroClaw)");
     let channels_config = setup_channels()?;
 
-    print_step(4, 9, "Tunnel (Expose to Internet)");
+    print_step(4, 10, "Tunnel (Expose to Internet)");
     let tunnel_config = setup_tunnel()?;
 
-    print_step(5, 9, "Tool Mode & Security");
-    let (composio_config, secrets_config) = setup_tool_mode()?;
+    print_step(5, 10, "Tool Mode, Secrets & Security");
+    let (composio_config, secrets_config, mut autonomy_config) = setup_tool_mode()?;
 
-    print_step(6, 9, "Hardware (Physical World)");
+    print_step(6, 10, "Hardware (Physical World)");
     let hardware_config = setup_hardware()?;
 
-    print_step(7, 9, "Memory Configuration");
+    print_step(7, 10, "Memory Configuration");
     let memory_config = setup_memory()?;
 
-    print_step(8, 9, "Project Context (Personalize Your Agent)");
+    print_step(8, 10, "Preset & Optional Packs");
+    let preset_selection = setup_preset_selection_interactive()?;
+    autonomy_config =
+        align_security_profile_with_preset_selection(&preset_selection, autonomy_config)?;
+
+    print_step(9, 10, "Project Context (Personalize Your Agent)");
     let project_ctx = setup_project_context()?;
 
-    print_step(9, 9, "Workspace Files");
+    print_step(10, 10, "Workspace Files");
     scaffold_workspace(&workspace_dir, &project_ctx)?;
+    let preset_file = persist_preset_selection(&workspace_dir, &preset_selection)?;
 
     // ── Build config ──
-    // Defaults: SQLite memory, supervised autonomy, workspace-scoped, native runtime
+    // Defaults: SQLite memory, strict autonomy profile (unless user relaxes), workspace-scoped runtime
     let config = Config {
         workspace_dir: workspace_dir.clone(),
         config_path: config_path.clone(),
@@ -152,7 +789,7 @@ pub fn run_wizard() -> Result<Config> {
         default_model: Some(model),
         default_temperature: 0.7,
         observability: ObservabilityConfig::default(),
-        autonomy: AutonomyConfig::default(),
+        autonomy: autonomy_config,
         runtime: RuntimeConfig::default(),
         reliability: crate::config::ReliabilityConfig::default(),
         scheduler: crate::config::schema::SchedulerConfig::default(),
@@ -179,16 +816,39 @@ pub fn run_wizard() -> Result<Config> {
         query_classification: crate::config::QueryClassificationConfig::default(),
     };
 
+    let security_label = security_profile_label(&config.autonomy);
+    let security_badge = if security_label.contains("high risk") {
+        style(security_label).red().bold()
+    } else if security_label.contains("Strict") {
+        style(security_label).green()
+    } else {
+        style(security_label).yellow()
+    };
     println!(
-        "  {} Security: {} | workspace-scoped",
+        "  {} Security: {}",
         style("✓").green().bold(),
-        style("Supervised").green()
+        security_badge
     );
     println!(
         "  {} Memory: {} (auto-save: {})",
         style("✓").green().bold(),
         style(&config.memory.backend).green(),
         if config.memory.auto_save { "on" } else { "off" }
+    );
+    println!(
+        "  {} Preset: {}",
+        style("✓").green().bold(),
+        style(&preset_selection.preset_id).green()
+    );
+    println!(
+        "  {} Packs: {}",
+        style("✓").green().bold(),
+        style(preset_selection.packs.join(", ")).green()
+    );
+    println!(
+        "  {} Preset file: {}",
+        style("✓").green().bold(),
+        style(preset_file.display()).green()
     );
 
     config.save()?;
@@ -280,7 +940,8 @@ pub fn run_channels_repair_wizard() -> Result<Config> {
 // ── Quick setup (zero prompts) ───────────────────────────────────
 
 /// Non-interactive setup: generates a sensible default config instantly.
-/// Use `zeroclaw onboard` or `zeroclaw onboard --api-key sk-... --provider openrouter --memory sqlite|lucid`.
+/// Use `zeroclaw onboard` or
+/// `zeroclaw onboard --api-key sk-... --provider openrouter --memory sqlite|lucid --preset default --pack browser-native --security-profile strict|balanced|flexible|full --yes-security-risk`.
 /// Use `zeroclaw onboard --interactive` for the full wizard.
 fn backend_key_from_choice(choice: usize) -> &'static str {
     selectable_memory_backends()
@@ -325,6 +986,9 @@ pub fn run_quick_setup(
     credential_override: Option<&str>,
     provider: Option<&str>,
     memory_backend: Option<&str>,
+    preset: Option<&str>,
+    extra_pack_ids: &[String],
+    security_profile: Option<&str>,
 ) -> Result<Config> {
     println!("{}", style(BANNER).cyan().bold());
     println!(
@@ -349,6 +1013,27 @@ pub fn run_quick_setup(
     let memory_backend_name = memory_backend
         .unwrap_or(default_memory_backend_key())
         .to_string();
+    let mut preset_selection = build_preset_selection(preset.unwrap_or("default"), extra_pack_ids)?;
+    let risky = risky_pack_ids(&preset_selection);
+    if !risky.is_empty() {
+        let risky_set: BTreeSet<String> = risky.iter().cloned().collect();
+        drop_pack_ids(&mut preset_selection, &risky_set);
+        println!(
+            "  {} Skipped risky packs in quick mode: {}",
+            style("!").yellow().bold(),
+            style(risky.join(", ")).yellow()
+        );
+        println!(
+            "  {} Use `zeroclaw onboard --interactive` to approve risky packs explicitly.",
+            style("↳").dim()
+        );
+    }
+
+    let autonomy_config = if let Some(profile_id) = security_profile {
+        autonomy_config_for_security_profile_id(profile_id)?
+    } else {
+        autonomy_config_for_security_profile(SecurityProfile::Strict)
+    };
 
     // Create memory config based on backend choice
     let memory_config = memory_config_defaults_for_backend(&memory_backend_name);
@@ -366,7 +1051,7 @@ pub fn run_quick_setup(
         default_model: Some(model.clone()),
         default_temperature: 0.7,
         observability: ObservabilityConfig::default(),
-        autonomy: AutonomyConfig::default(),
+        autonomy: autonomy_config,
         runtime: RuntimeConfig::default(),
         reliability: crate::config::ReliabilityConfig::default(),
         scheduler: crate::config::schema::SchedulerConfig::default(),
@@ -406,6 +1091,7 @@ pub fn run_quick_setup(
                 .into(),
     };
     scaffold_workspace(&workspace_dir, &default_ctx)?;
+    let preset_file = persist_preset_selection(&workspace_dir, &preset_selection)?;
 
     println!(
         "  {} Workspace:  {}",
@@ -434,7 +1120,30 @@ pub fn run_quick_setup(
     println!(
         "  {} Security:   {}",
         style("✓").green().bold(),
-        style("Supervised (workspace-scoped)").green()
+        if security_profile_label(&config.autonomy).contains("high risk") {
+            style(security_profile_label(&config.autonomy))
+                .red()
+                .bold()
+                .to_string()
+        } else if security_profile_label(&config.autonomy).contains("Strict") {
+            style(security_profile_label(&config.autonomy))
+                .green()
+                .to_string()
+        } else {
+            style(security_profile_label(&config.autonomy))
+                .yellow()
+                .to_string()
+        }
+    );
+    println!(
+        "  {} Preset:     {}",
+        style("✓").green().bold(),
+        style(&preset_selection.preset_id).green()
+    );
+    println!(
+        "  {} Packs:      {}",
+        style("✓").green().bold(),
+        style(preset_selection.packs.join(", ")).green()
     );
     println!(
         "  {} Memory:     {} (auto-save: {})",
@@ -466,6 +1175,11 @@ pub fn run_quick_setup(
         style("✓").green().bold(),
         style("disabled (sovereign mode)").dim()
     );
+    println!(
+        "  {} PresetFile: {}",
+        style("✓").green().bold(),
+        style(preset_file.display()).green()
+    );
     println!();
     println!(
         "  {} {}",
@@ -475,7 +1189,8 @@ pub fn run_quick_setup(
     println!();
     println!("  {}", style("Next steps:").white().bold());
     if credential_override.is_none() {
-        println!("    1. Set your API key:  export OPENROUTER_API_KEY=\"sk-...\"");
+        let env_var = provider_env_var(&provider_name);
+        println!("    1. Set your API key:  export {env_var}=\"sk-...\"");
         println!("    2. Or edit:           ~/.zeroclaw/config.toml");
         println!("    3. Chat:              zeroclaw agent -m \"Hello!\"");
         println!("    4. Gateway:           zeroclaw gateway");
@@ -2050,7 +2765,7 @@ fn provider_env_var(name: &str) -> &'static str {
 
 // ── Step 5: Tool Mode & Security ────────────────────────────────
 
-fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
+fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig, AutonomyConfig)> {
     print_bullet("Choose how ZeroClaw connects to external apps.");
     print_bullet("You can always change this later in config.toml.");
     println!();
@@ -2135,7 +2850,146 @@ fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
         );
     }
 
-    Ok((composio_config, secrets_config))
+    let autonomy_config = setup_security_profile()?;
+    Ok((composio_config, secrets_config, autonomy_config))
+}
+
+fn setup_security_profile() -> Result<AutonomyConfig> {
+    println!();
+    print_bullet("Choose an execution safety profile.");
+    print_bullet("Default is strict. Lower safeguards require explicit risk acknowledgment.");
+    print_bullet("You can adjust anytime with `zeroclaw security profile set <strict|balanced|flexible|full>`.");
+    println!();
+
+    println!("  Security profile cards:");
+    println!(
+        "  - Strict (recommended): low risk, workspace-only, approval for medium risk, block high risk"
+    );
+    println!(
+        "  - Balanced: medium risk, workspace-only, higher throughput, still blocks high-risk commands"
+    );
+    println!(
+        "  - Flexible: medium-high risk, broader scope outside workspace, still requires medium-risk approval"
+    );
+    println!(
+        "  - Full autonomy: high risk, no medium-risk approval and no high-risk command block (controlled env only)"
+    );
+    println!();
+
+    let options = vec![
+        "Strict (recommended)",
+        "Balanced",
+        "Flexible",
+        "Full autonomy (high risk)",
+    ];
+
+    let choice = Select::new()
+        .with_prompt("  Select security profile")
+        .items(&options)
+        .default(0)
+        .interact()?;
+
+    let mut profile = match choice {
+        1 => SecurityProfile::Balanced,
+        2 => SecurityProfile::Flexible,
+        3 => SecurityProfile::FullAutonomy,
+        _ => SecurityProfile::Strict,
+    };
+
+    if profile != SecurityProfile::Strict {
+        println!();
+        println!(
+            "  {} {}",
+            style("Risk notice:").yellow().bold(),
+            style("You are lowering security safeguards.").yellow()
+        );
+        println!(
+            "  {} Operations may execute with broader permissions and less friction.",
+            style("!").yellow().bold()
+        );
+        println!(
+            "  {} Review your policy after onboarding in [autonomy] before production use.",
+            style("!").yellow().bold()
+        );
+
+        let acknowledge = Confirm::new()
+            .with_prompt("  I understand the risk and want to continue")
+            .default(false)
+            .interact()?;
+
+        if !acknowledge {
+            println!("  {} Reverting to strict profile.", style("↳").dim());
+            profile = SecurityProfile::Strict;
+        }
+    }
+
+    if profile == SecurityProfile::FullAutonomy {
+        println!();
+        println!(
+            "  {} Full autonomy disables medium-risk approvals and high-risk command blocking.",
+            style("Critical warning:").red().bold()
+        );
+        println!(
+            "  {} Use only in controlled environments.",
+            style("!").red().bold()
+        );
+
+        let token: String = Input::new()
+            .with_prompt("  Type FULL-RISK to confirm full autonomy")
+            .allow_empty(true)
+            .interact_text()?;
+
+        if token.trim() != "FULL-RISK" {
+            println!(
+                "  {} Confirmation mismatch. Reverting to strict profile.",
+                style("↳").dim()
+            );
+            profile = SecurityProfile::Strict;
+        }
+    }
+
+    let autonomy = autonomy_config_for_security_profile(profile);
+    let label = security_profile_label(&autonomy);
+    let label_style = if profile == SecurityProfile::FullAutonomy {
+        style(label).red().bold()
+    } else if profile == SecurityProfile::Strict {
+        style(label).green().bold()
+    } else {
+        style(label).yellow()
+    };
+
+    println!(
+        "  {} Security profile: {label_style}",
+        style("✓").green().bold()
+    );
+    println!(
+        "  {} Profile id: {}",
+        style("↳").dim(),
+        security_profile_id(profile)
+    );
+    println!(
+        "  {} Policy: workspace_only={}, require_medium_approval={}, block_high_risk={}, max_actions_per_hour={}, max_cost_per_day=${:.2}",
+        style("↳").dim(),
+        autonomy.workspace_only,
+        autonomy.require_approval_for_medium_risk,
+        autonomy.block_high_risk_commands,
+        autonomy.max_actions_per_hour,
+        autonomy.max_cost_per_day_cents as f32 / 100.0
+    );
+    println!(
+        "  {} Inspect policy later: {}",
+        style("↳").dim(),
+        style("zeroclaw security show").dim()
+    );
+    if profile != SecurityProfile::Strict {
+        println!(
+            "  {} Quick rollback: {}",
+            style("↳").dim(),
+            style("zeroclaw security profile set strict").dim()
+        );
+    }
+
+    Ok(autonomy)
 }
 
 // ── Step 6: Hardware (Physical World) ───────────────────────────
@@ -2577,7 +3431,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
         let choice = Select::new()
             .with_prompt("  Connect a channel (or Done to continue)")
             .items(&options)
-            .default(11)
+            .default(12)
             .interact()?;
 
         match choice {
@@ -3562,7 +4416,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     allowed_users,
                 });
             }
-            10 => {
+            11 => {
                 // ── Lark/Feishu ──
                 println!();
                 println!(
@@ -4276,9 +5130,16 @@ fn print_summary(config: &Config) {
         config.default_model.as_deref().unwrap_or("(default)")
     );
     println!(
-        "    {} Autonomy:      {:?}",
+        "    {} Security:      {}",
         style("🛡️").cyan(),
-        config.autonomy.level
+        security_profile_label(&config.autonomy)
+    );
+    println!(
+        "    {} Guardrails:    workspace_only={} | medium_approval={} | high_risk_block={}",
+        style("🧱").cyan(),
+        config.autonomy.workspace_only,
+        config.autonomy.require_approval_for_medium_risk,
+        config.autonomy.block_high_risk_commands
     );
     println!(
         "    {} Memory:        {} (auto-save: {})",
@@ -5354,7 +6215,7 @@ mod tests {
 
         let config = Config {
             workspace_dir: tmp.path().to_path_buf(),
-            default_provider: Some("venice".to_string()),
+            default_provider: Some("not-a-real-provider".to_string()),
             ..Config::default()
         };
 
@@ -5362,6 +6223,47 @@ mod tests {
         assert!(err
             .to_string()
             .contains("does not support live model discovery"));
+    }
+
+    #[test]
+    fn build_preset_selection_uses_official_default() {
+        let selection = build_preset_selection("default", &[]).unwrap();
+        assert_eq!(selection.schema_version, 1);
+        assert_eq!(selection.preset_id, "default");
+        assert!(selection.packs.contains(&"core-agent".to_string()));
+        assert!(selection.packs.contains(&"hardware-core".to_string()));
+    }
+
+    #[test]
+    fn build_preset_selection_merges_extra_packs() {
+        let extra = vec!["browser-native".to_string()];
+        let selection = build_preset_selection("minimal", &extra).unwrap();
+        assert_eq!(selection.preset_id, "minimal");
+        assert_eq!(selection.added_packs, vec!["browser-native".to_string()]);
+        assert!(selection.packs.contains(&"core-agent".to_string()));
+        assert!(selection.packs.contains(&"browser-native".to_string()));
+    }
+
+    #[test]
+    fn build_preset_selection_rejects_unknown_pack() {
+        let extra = vec!["pack-that-does-not-exist".to_string()];
+        let err = build_preset_selection("minimal", &extra).unwrap_err();
+        assert!(err.to_string().contains("Unknown pack id"));
+    }
+
+    #[test]
+    fn persist_preset_selection_writes_json_file() {
+        let tmp = TempDir::new().unwrap();
+        let selection = build_preset_selection("minimal", &[]).unwrap();
+        let path = persist_preset_selection(tmp.path(), &selection).unwrap();
+        assert_eq!(
+            path.file_name().and_then(std::ffi::OsStr::to_str),
+            Some(PRESET_SELECTION_FILE)
+        );
+        let raw = fs::read_to_string(&path).unwrap();
+        let parsed: OnboardPresetSelection = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed.preset_id, "minimal");
+        assert_eq!(parsed.schema_version, 1);
     }
 
     // ── provider_env_var ────────────────────────────────────────
@@ -5452,6 +6354,90 @@ mod tests {
         assert_eq!(config.archive_after_days, 0);
         assert_eq!(config.purge_after_days, 0);
         assert_eq!(config.embedding_cache_size, 0);
+    }
+
+    #[test]
+    fn strict_security_profile_keeps_strong_guardrails() {
+        let autonomy = autonomy_config_for_security_profile(SecurityProfile::Strict);
+        assert_eq!(autonomy.level, AutonomyLevel::Supervised);
+        assert!(autonomy.workspace_only);
+        assert!(autonomy.require_approval_for_medium_risk);
+        assert!(autonomy.block_high_risk_commands);
+        assert_eq!(autonomy.max_actions_per_hour, 12);
+        assert_eq!(autonomy.max_cost_per_day_cents, 300);
+        assert_eq!(
+            security_profile_label(&autonomy),
+            "Strict supervised (default)"
+        );
+    }
+
+    #[test]
+    fn flexible_security_profile_relaxes_scope_but_keeps_high_risk_block() {
+        let autonomy = autonomy_config_for_security_profile(SecurityProfile::Flexible);
+        assert_eq!(autonomy.level, AutonomyLevel::Supervised);
+        assert!(!autonomy.workspace_only);
+        assert!(autonomy.require_approval_for_medium_risk);
+        assert!(autonomy.block_high_risk_commands);
+        assert_eq!(security_profile_label(&autonomy), "Flexible supervised");
+    }
+
+    #[test]
+    fn full_autonomy_profile_is_explicitly_high_risk() {
+        let autonomy = autonomy_config_for_security_profile(SecurityProfile::FullAutonomy);
+        assert_eq!(autonomy.level, AutonomyLevel::Full);
+        assert!(!autonomy.workspace_only);
+        assert!(!autonomy.require_approval_for_medium_risk);
+        assert!(!autonomy.block_high_risk_commands);
+        assert_eq!(
+            security_profile_label(&autonomy),
+            "Full autonomy (high risk)"
+        );
+    }
+
+    #[test]
+    fn recommendation_prefers_strict_for_hardening_pack() {
+        let packs = vec![
+            "core-agent".to_string(),
+            "sandbox-landlock".to_string(),
+            "tools-update".to_string(),
+        ];
+        let recommendation = recommend_security_profile(None, &packs);
+        assert_eq!(recommendation.profile_id, "strict");
+        assert_eq!(recommendation.risk_tier, "low");
+        assert!(!recommendation.requires_explicit_consent);
+    }
+
+    #[test]
+    fn recommendation_prefers_balanced_for_update_without_explicit_full_intent() {
+        let packs = vec!["core-agent".to_string(), "tools-update".to_string()];
+        let recommendation = recommend_security_profile(None, &packs);
+        assert_eq!(recommendation.profile_id, "balanced");
+        assert_eq!(recommendation.risk_tier, "medium");
+        assert!(recommendation.requires_explicit_consent);
+    }
+
+    #[test]
+    fn recommendation_prefers_full_when_intent_is_unattended() {
+        let packs = vec!["core-agent".to_string(), "browser-native".to_string()];
+        let recommendation =
+            recommend_security_profile(Some("need unattended run with no approval"), &packs);
+        assert_eq!(recommendation.profile_id, "full");
+        assert_eq!(recommendation.risk_tier, "high");
+        assert!(recommendation.requires_explicit_consent);
+    }
+
+    #[test]
+    fn recommendation_prefers_strict_when_intent_explicitly_demands_compliance() {
+        let packs = vec![
+            "core-agent".to_string(),
+            "hardware-core".to_string(),
+            "tools-update".to_string(),
+        ];
+        let recommendation =
+            recommend_security_profile(Some("strict security first with audit compliance"), &packs);
+        assert_eq!(recommendation.profile_id, "strict");
+        assert_eq!(recommendation.risk_tier, "low");
+        assert!(!recommendation.requires_explicit_consent);
     }
 
     #[test]
