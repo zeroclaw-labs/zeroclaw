@@ -56,6 +56,7 @@ credential is not reused for fallback providers.
 | `copilot` | `github-copilot` | No | (use config/`API_KEY` fallback with GitHub token) |
 | `lmstudio` | `lm-studio` | Yes | (optional; local by default) |
 | `llamacpp` | `llama.cpp` | Yes | `LLAMACPP_API_KEY` (optional; only if server auth is enabled) |
+| `sglang` | — | Yes | `SGLANG_API_KEY` (optional) |
 | `vllm` | — | Yes | `VLLM_API_KEY` (optional) |
 | `osaurus` | — | Yes | `OSAURUS_API_KEY` (optional; defaults to `"osaurus"`) |
 | `nvidia` | `nvidia-nim`, `build.nvidia.com` | No | `NVIDIA_API_KEY` |
@@ -89,6 +90,14 @@ credential is not reused for fallback providers.
 - Default endpoint: `http://localhost:8080/v1`
 - API key is optional by default; set `LLAMACPP_API_KEY` only when `llama-server` is started with `--api-key`.
 - Model discovery: `zeroclaw models refresh --provider llamacpp`
+
+### SGLang Server Notes
+
+- Provider ID: `sglang`
+- Default endpoint: `http://localhost:30000/v1`
+- API key is optional by default; set `SGLANG_API_KEY` only when the server requires authentication.
+- Tool calling requires launching SGLang with `--tool-call-parser` (e.g. `hermes`, `llama3`, `qwen25`).
+- Model discovery: `zeroclaw models refresh --provider sglang`
 
 ### vLLM Server Notes
 

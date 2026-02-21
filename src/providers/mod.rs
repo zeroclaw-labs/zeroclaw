@@ -27,7 +27,6 @@ pub mod openai_codex;
 pub mod openrouter;
 pub mod reliable;
 pub mod router;
-pub mod telnyx;
 pub mod traits;
 
 #[allow(unused_imports)]
@@ -839,9 +838,9 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "ovhcloud" | "ovh" => vec!["OVH_AI_ENDPOINTS_ACCESS_TOKEN"],
         "astrai" => vec!["ASTRAI_API_KEY"],
         "llamacpp" | "llama.cpp" => vec!["LLAMACPP_API_KEY"],
+        "sglang" => vec!["SGLANG_API_KEY"],
         "vllm" => vec!["VLLM_API_KEY"],
         "osaurus" => vec!["OSAURUS_API_KEY"],
-        "telnyx" => vec!["TELNYX_API_KEY"],
         _ => vec![],
     };
 
@@ -962,7 +961,6 @@ fn create_provider_with_url_and_options(
         "gemini" | "google" | "google-gemini" => {
             Ok(Box::new(gemini::GeminiProvider::new(key)))
         }
-        "telnyx" => Ok(Box::new(telnyx::TelnyxProvider::new(key))),
 
         // ── OpenAI-compatible providers ──────────────────────
         "venice" => Ok(Box::new(OpenAiCompatibleProvider::new(
@@ -1107,6 +1105,18 @@ fn create_provider_with_url_and_options(
                 "llama.cpp",
                 base_url,
                 Some(llama_cpp_key),
+                AuthStyle::Bearer,
+            )))
+        }
+        "sglang" => {
+            let base_url = api_url
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("http://localhost:30000/v1");
+            Ok(Box::new(OpenAiCompatibleProvider::new(
+                "SGLang",
+                base_url,
+                key,
                 AuthStyle::Bearer,
             )))
         }
@@ -1619,6 +1629,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             local: true,
         },
         ProviderInfo {
+            name: "sglang",
+            display_name: "SGLang",
+            aliases: &[],
+            local: true,
+        },
+        ProviderInfo {
             name: "vllm",
             display_name: "vLLM",
             aliases: &[],
@@ -1951,12 +1967,6 @@ mod tests {
         assert!(create_provider("gemini", None).is_ok());
     }
 
-    #[test]
-    fn factory_telnyx() {
-        assert!(create_provider("telnyx", Some("test-key")).is_ok());
-        assert!(create_provider("telnyx", None).is_ok());
-    }
-
     // ── OpenAI-compatible providers ──────────────────────────
 
     #[test]
@@ -2099,6 +2109,12 @@ mod tests {
         assert!(create_provider("llamacpp", Some("key")).is_ok());
         assert!(create_provider("llama.cpp", Some("key")).is_ok());
         assert!(create_provider("llamacpp", None).is_ok());
+    }
+
+    #[test]
+    fn factory_sglang() {
+        assert!(create_provider("sglang", None).is_ok());
+        assert!(create_provider("sglang", Some("key")).is_ok());
     }
 
     #[test]
@@ -2521,9 +2537,9 @@ mod tests {
             "qwen-code",
             "lmstudio",
             "llamacpp",
+            "sglang",
             "vllm",
             "osaurus",
-            "telnyx",
             "groq",
             "mistral",
             "xai",

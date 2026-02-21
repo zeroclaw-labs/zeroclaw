@@ -647,7 +647,15 @@ fn canonical_provider_name(provider_name: &str) -> &str {
 fn allows_unauthenticated_model_fetch(provider_name: &str) -> bool {
     matches!(
         canonical_provider_name(provider_name),
-        "openrouter" | "ollama" | "llamacpp" | "vllm" | "osaurus" | "venice" | "astrai" | "nvidia"
+        "openrouter"
+            | "ollama"
+            | "llamacpp"
+            | "sglang"
+            | "vllm"
+            | "osaurus"
+            | "venice"
+            | "astrai"
+            | "nvidia"
     )
 }
 
@@ -681,7 +689,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "qwen-code" => "qwen3-coder-plus".into(),
         "ollama" => "llama3.2".into(),
         "llamacpp" => "ggml-org/gpt-oss-20b-GGUF".into(),
-        "vllm" | "osaurus" => "default".into(),
+        "sglang" | "vllm" | "osaurus" => "default".into(),
         "gemini" => "gemini-2.5-pro".into(),
         "kimi-code" => "kimi-for-coding".into(),
         "bedrock" => "anthropic.claude-sonnet-4-5-20250929-v1:0".into(),
@@ -1029,7 +1037,7 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "Qwen2.5 Coder 7B GGUF (coding-focused)".to_string(),
             ),
         ],
-        "vllm" => vec![
+        "sglang" | "vllm" => vec![
             (
                 "meta-llama/Llama-3.1-8B-Instruct".to_string(),
                 "Llama 3.1 8B Instruct (popular, fast)".to_string(),
@@ -1111,6 +1119,7 @@ fn supports_live_model_fetch(provider_name: &str) -> bool {
             | "gemini"
             | "ollama"
             | "llamacpp"
+            | "sglang"
             | "vllm"
             | "osaurus"
             | "astrai"
@@ -1149,6 +1158,7 @@ fn models_endpoint_for_provider(provider_name: &str) -> Option<&'static str> {
             "nvidia" => Some("https://integrate.api.nvidia.com/v1/models"),
             "astrai" => Some("https://as-trai.com/v1/models"),
             "llamacpp" => Some("http://localhost:8080/v1/models"),
+            "sglang" => Some("http://localhost:30000/v1/models"),
             "vllm" => Some("http://localhost:8000/v1/models"),
             "osaurus" => Some("http://localhost:1337/v1/models"),
             _ => None,
@@ -1383,7 +1393,7 @@ fn resolve_live_models_endpoint(
 ) -> Option<String> {
     if matches!(
         canonical_provider_name(provider_name),
-        "llamacpp" | "vllm" | "osaurus"
+        "llamacpp" | "sglang" | "vllm" | "osaurus"
     ) {
         if let Some(url) = provider_api_url
             .map(str::trim)
@@ -1991,6 +2001,10 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                 "llamacpp",
                 "llama.cpp server — local OpenAI-compatible endpoint",
             ),
+            (
+                "sglang",
+                "SGLang — high-performance local serving framework",
+            ),
             ("vllm", "vLLM — high-performance local inference engine"),
             (
                 "osaurus",
@@ -2135,6 +2149,37 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             print_bullet(&format!(
                 "No API key provided. Set {} later only if your server requires authentication.",
                 style("LLAMACPP_API_KEY").yellow()
+            ));
+        }
+
+        key
+    } else if provider_name == "sglang" {
+        let raw_url: String = Input::new()
+            .with_prompt("  SGLang server endpoint URL")
+            .default("http://localhost:30000/v1".into())
+            .interact_text()?;
+
+        let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
+        if normalized_url.is_empty() {
+            anyhow::bail!("SGLang endpoint URL cannot be empty.");
+        }
+        provider_api_url = Some(normalized_url.clone());
+
+        print_bullet(&format!(
+            "Using SGLang server endpoint: {}",
+            style(&normalized_url).cyan()
+        ));
+        print_bullet("No API key needed unless your SGLang server requires authentication.");
+
+        let key: String = Input::new()
+            .with_prompt("  API key for SGLang server (or Enter to skip)")
+            .allow_empty(true)
+            .interact_text()?;
+
+        if key.trim().is_empty() {
+            print_bullet(&format!(
+                "No API key provided. Set {} later only if your server requires authentication.",
+                style("SGLANG_API_KEY").yellow()
             ));
         }
 
@@ -2605,6 +2650,7 @@ fn provider_env_var(name: &str) -> &'static str {
         "openai" => "OPENAI_API_KEY",
         "ollama" => "OLLAMA_API_KEY",
         "llamacpp" => "LLAMACPP_API_KEY",
+        "sglang" => "SGLANG_API_KEY",
         "vllm" => "VLLM_API_KEY",
         "osaurus" => "OSAURUS_API_KEY",
         "venice" => "VENICE_API_KEY",
@@ -2638,7 +2684,7 @@ fn provider_env_var(name: &str) -> &'static str {
 fn provider_supports_keyless_local_usage(provider_name: &str) -> bool {
     matches!(
         canonical_provider_name(provider_name),
-        "ollama" | "llamacpp" | "vllm" | "osaurus"
+        "ollama" | "llamacpp" | "sglang" | "vllm" | "osaurus"
     )
 }
 
@@ -6142,6 +6188,7 @@ mod tests {
             default_model_for_provider("llamacpp"),
             "ggml-org/gpt-oss-20b-GGUF"
         );
+        assert_eq!(default_model_for_provider("sglang"), "default");
         assert_eq!(default_model_for_provider("vllm"), "default");
         assert_eq!(
             default_model_for_provider("astrai"),
@@ -6253,6 +6300,7 @@ mod tests {
         assert!(allows_unauthenticated_model_fetch("ollama"));
         assert!(allows_unauthenticated_model_fetch("llamacpp"));
         assert!(allows_unauthenticated_model_fetch("llama.cpp"));
+        assert!(allows_unauthenticated_model_fetch("sglang"));
         assert!(allows_unauthenticated_model_fetch("vllm"));
         assert!(!allows_unauthenticated_model_fetch("openai"));
         assert!(!allows_unauthenticated_model_fetch("deepseek"));
@@ -6295,6 +6343,7 @@ mod tests {
         assert!(supports_live_model_fetch("ollama"));
         assert!(supports_live_model_fetch("llamacpp"));
         assert!(supports_live_model_fetch("llama.cpp"));
+        assert!(supports_live_model_fetch("sglang"));
         assert!(supports_live_model_fetch("vllm"));
         assert!(supports_live_model_fetch("astrai"));
         assert!(supports_live_model_fetch("venice"));
@@ -6407,6 +6456,10 @@ mod tests {
             Some("http://localhost:8080/v1/models")
         );
         assert_eq!(
+            models_endpoint_for_provider("sglang"),
+            Some("http://localhost:30000/v1/models")
+        );
+        assert_eq!(
             models_endpoint_for_provider("vllm"),
             Some("http://localhost:8000/v1/models")
         );
@@ -6435,6 +6488,10 @@ mod tests {
         assert_eq!(
             resolve_live_models_endpoint("llamacpp", None),
             Some("http://localhost:8080/v1/models".to_string())
+        );
+        assert_eq!(
+            resolve_live_models_endpoint("sglang", None),
+            Some("http://localhost:30000/v1/models".to_string())
         );
         assert_eq!(
             resolve_live_models_endpoint("vllm", None),
@@ -6640,6 +6697,7 @@ mod tests {
         assert_eq!(provider_env_var("ollama"), "OLLAMA_API_KEY");
         assert_eq!(provider_env_var("llamacpp"), "LLAMACPP_API_KEY");
         assert_eq!(provider_env_var("llama.cpp"), "LLAMACPP_API_KEY");
+        assert_eq!(provider_env_var("sglang"), "SGLANG_API_KEY");
         assert_eq!(provider_env_var("vllm"), "VLLM_API_KEY");
         assert_eq!(provider_env_var("xai"), "XAI_API_KEY");
         assert_eq!(provider_env_var("grok"), "XAI_API_KEY"); // alias
@@ -6673,6 +6731,7 @@ mod tests {
         assert!(provider_supports_keyless_local_usage("ollama"));
         assert!(provider_supports_keyless_local_usage("llamacpp"));
         assert!(provider_supports_keyless_local_usage("llama.cpp"));
+        assert!(provider_supports_keyless_local_usage("sglang"));
         assert!(provider_supports_keyless_local_usage("vllm"));
         assert!(!provider_supports_keyless_local_usage("openai"));
     }

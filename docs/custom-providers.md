@@ -78,6 +78,37 @@ zeroclaw agent -m "hello"
 
 You do not need to export `ZEROCLAW_API_KEY=dummy` for this flow.
 
+## SGLang Server
+
+ZeroClaw includes a first-class local provider for [SGLang](https://github.com/sgl-project/sglang):
+
+- Provider ID: `sglang`
+- Default endpoint: `http://localhost:30000/v1`
+- API key is optional unless the server requires authentication
+
+Start a local server (example):
+
+```bash
+python -m sglang.launch_server --model meta-llama/Llama-3.1-8B-Instruct --port 30000
+```
+
+Then configure ZeroClaw:
+
+```toml
+default_provider = "sglang"
+default_model = "meta-llama/Llama-3.1-8B-Instruct"
+default_temperature = 0.7
+```
+
+Quick validation:
+
+```bash
+zeroclaw models refresh --provider sglang
+zeroclaw agent -m "hello"
+```
+
+You do not need to export `ZEROCLAW_API_KEY=dummy` for this flow.
+
 ## vLLM Server
 
 ZeroClaw includes a first-class local provider for [vLLM](https://docs.vllm.ai/):
