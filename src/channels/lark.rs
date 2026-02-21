@@ -1,6 +1,7 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
+use parking_lot::Mutex;
 use prost::Message as ProstMessage;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -258,6 +259,14 @@ pub struct LarkChannel {
     tenant_token: Arc<RwLock<Option<CachedTenantToken>>>,
     /// Dedup set: WS message_ids seen in last ~30 min to prevent double-dispatch
     ws_seen_ids: Arc<RwLock<HashMap<String, Instant>>>,
+    /// Rate-limit tracking for draft edits per chat
+    last_draft_edit: Mutex<HashMap<String, Instant>>,
+    /// Minimum interval between draft edits (ms)
+    draft_update_interval_ms: u64,
+    /// Maximum number of edits per draft message before stopping updates
+    max_draft_edits: u32,
+    /// Per-message edit count tracker
+    draft_edit_counts: Mutex<HashMap<String, u32>>,
 }
 
 impl LarkChannel {
@@ -278,6 +287,10 @@ impl LarkChannel {
             receive_mode: crate::config::schema::LarkReceiveMode::default(),
             tenant_token: Arc::new(RwLock::new(None)),
             ws_seen_ids: Arc::new(RwLock::new(HashMap::new())),
+            last_draft_edit: Mutex::new(HashMap::new()),
+            draft_update_interval_ms: 3000,
+            max_draft_edits: 20,
+            draft_edit_counts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -292,6 +305,8 @@ impl LarkChannel {
         );
         ch.use_feishu = config.use_feishu;
         ch.receive_mode = config.receive_mode.clone();
+        ch.draft_update_interval_ms = config.draft_update_interval_ms;
+        ch.max_draft_edits = config.max_draft_edits;
         ch
     }
 
@@ -321,6 +336,64 @@ impl LarkChannel {
 
     fn send_message_url(&self) -> String {
         format!("{}/im/v1/messages?receive_id_type=chat_id", self.api_base())
+    }
+
+    fn edit_message_url(&self, message_id: &str) -> String {
+        format!("{}/im/v1/messages/{message_id}", self.api_base())
+    }
+
+    /// PUT (edit) a post/text message by ID, retrying once on 401.
+    /// Feishu uses PUT for text/post edits, PATCH is only for interactive cards.
+    /// Returns `Ok(true)` on success, `Ok(false)` on API failure, or
+    /// `Err` only on transport-level errors.
+    async fn edit_message(
+        &self,
+        message_id: &str,
+        body: &serde_json::Value,
+    ) -> anyhow::Result<bool> {
+        let url = self.edit_message_url(message_id);
+        let mut token = self.get_tenant_access_token().await?;
+
+        let resp = self
+            .http_client()
+            .put(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json; charset=utf-8")
+            .json(body)
+            .send()
+            .await?;
+
+        if resp.status().as_u16() == 401 {
+            self.invalidate_token().await;
+            token = self.get_tenant_access_token().await?;
+            let retry_resp = self
+                .http_client()
+                .put(&url)
+                .header("Authorization", format!("Bearer {token}"))
+                .header("Content-Type", "application/json; charset=utf-8")
+                .json(body)
+                .send()
+                .await?;
+
+            if !retry_resp.status().is_success() {
+                let status = retry_resp.status();
+                let err = retry_resp.text().await.unwrap_or_default();
+                tracing::debug!(
+                    "Lark PUT edit {message_id} failed after token refresh ({status}): {err}"
+                );
+                return Ok(false);
+            }
+            return Ok(true);
+        }
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp.text().await.unwrap_or_default();
+            tracing::debug!("Lark PUT edit {message_id} failed ({status}): {err}");
+            return Ok(false);
+        }
+
+        Ok(true)
     }
 
     fn message_reaction_url(&self, message_id: &str) -> String {
@@ -960,9 +1033,263 @@ impl Channel for LarkChannel {
     async fn health_check(&self) -> bool {
         self.get_tenant_access_token().await.is_ok()
     }
+
+    fn supports_draft_updates(&self) -> bool {
+        true
+    }
+
+    async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+        let token = self.get_tenant_access_token().await?;
+        let url = self.send_message_url();
+
+        let initial_text = if message.content.is_empty() {
+            "..."
+        } else {
+            &message.content
+        };
+        let post = markdown_to_lark_post(initial_text);
+        let content = post.to_string();
+
+        let body = serde_json::json!({
+            "receive_id": message.recipient,
+            "msg_type": "post",
+            "content": content,
+        });
+
+        let resp = self
+            .http_client()
+            .post(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json; charset=utf-8")
+            .json(&body)
+            .send()
+            .await?;
+
+        if resp.status().as_u16() == 401 {
+            self.invalidate_token().await;
+            let new_token = self.get_tenant_access_token().await?;
+            let retry_resp = self
+                .http_client()
+                .post(&url)
+                .header("Authorization", format!("Bearer {new_token}"))
+                .header("Content-Type", "application/json; charset=utf-8")
+                .json(&body)
+                .send()
+                .await?;
+
+            if !retry_resp.status().is_success() {
+                let err = retry_resp.text().await.unwrap_or_default();
+                anyhow::bail!("Lark send_draft failed after token refresh: {err}");
+            }
+
+            let resp_json: serde_json::Value = retry_resp.json().await?;
+            let message_id = resp_json
+                .pointer("/data/message_id")
+                .and_then(|id| id.as_str())
+                .map(String::from);
+
+            if let Some(ref id) = message_id {
+                self.last_draft_edit
+                    .lock()
+                    .insert(id.clone(), Instant::now());
+                self.draft_edit_counts.lock().insert(id.clone(), 0);
+            }
+            return Ok(message_id);
+        }
+
+        if !resp.status().is_success() {
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Lark send_draft failed: {err}");
+        }
+
+        let resp_json: serde_json::Value = resp.json().await?;
+        let message_id = resp_json
+            .pointer("/data/message_id")
+            .and_then(|id| id.as_str())
+            .map(String::from);
+
+        if let Some(ref id) = message_id {
+            self.last_draft_edit
+                .lock()
+                .insert(id.clone(), Instant::now());
+            self.draft_edit_counts.lock().insert(id.clone(), 0);
+        }
+
+        Ok(message_id)
+    }
+
+    async fn update_draft(
+        &self,
+        _recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        // Rate-limit edits per message
+        {
+            let last_edits = self.last_draft_edit.lock();
+            if let Some(last_time) = last_edits.get(message_id) {
+                let elapsed = u64::try_from(last_time.elapsed().as_millis()).unwrap_or(u64::MAX);
+                if elapsed < self.draft_update_interval_ms {
+                    return Ok(());
+                }
+            }
+        }
+
+        // Enforce max edits per draft message (Feishu platform cap)
+        {
+            let counts = self.draft_edit_counts.lock();
+            if let Some(&count) = counts.get(message_id) {
+                if count >= self.max_draft_edits {
+                    tracing::debug!(
+                        "Lark update_draft skipped for {message_id}: reached max edits ({count}/{})",
+                        self.max_draft_edits
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
+        let cleaned = strip_tool_blocks(text);
+        let post = markdown_to_lark_post(&cleaned);
+        let content = post.to_string();
+
+        let body = serde_json::json!({
+            "msg_type": "post",
+            "content": content,
+        });
+
+        match self.edit_message(message_id, &body).await {
+            Ok(_) => {
+                self.last_draft_edit
+                    .lock()
+                    .insert(message_id.to_string(), Instant::now());
+                *self
+                    .draft_edit_counts
+                    .lock()
+                    .entry(message_id.to_string())
+                    .or_insert(0) += 1;
+            }
+            Err(e) => {
+                tracing::debug!("Lark update_draft failed for {message_id}: {e}");
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn finalize_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        self.last_draft_edit.lock().remove(message_id);
+        self.draft_edit_counts.lock().remove(message_id);
+
+        let cleaned = strip_tool_blocks(text);
+        let post = markdown_to_lark_post(&cleaned);
+        let content = post.to_string();
+
+        let body = serde_json::json!({
+            "msg_type": "post",
+            "content": content,
+        });
+
+        match self.edit_message(message_id, &body).await {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                tracing::warn!("Lark finalize_draft edit returned false; falling back to send");
+                self.send(&SendMessage::new(text, recipient).in_thread(None))
+                    .await
+            }
+            Err(e) => {
+                tracing::warn!("Lark finalize_draft edit error: {e}; falling back to send");
+                self.send(&SendMessage::new(text, recipient).in_thread(None))
+                    .await
+            }
+        }
+    }
+
+    async fn cancel_draft(&self, _recipient: &str, message_id: &str) -> anyhow::Result<()> {
+        self.last_draft_edit.lock().remove(message_id);
+        self.draft_edit_counts.lock().remove(message_id);
+
+        let post = markdown_to_lark_post("\u{26a0}\u{fe0f} Cancelled");
+        let content = post.to_string();
+
+        let body = serde_json::json!({
+            "msg_type": "post",
+            "content": content,
+        });
+
+        // Best-effort — ignore failures
+        let _ = self.edit_message(message_id, &body).await;
+
+        Ok(())
+    }
 }
 
 impl LarkChannel {
+    /// Send an interactive card message (Lark-specific, not part of Channel trait).
+    pub async fn send_card(
+        &self,
+        recipient: &str,
+        title: &str,
+        markdown_body: &str,
+    ) -> anyhow::Result<()> {
+        let token = self.get_tenant_access_token().await?;
+        let url = self.send_message_url();
+
+        let card = serde_json::json!({
+            "config": { "wide_screen_mode": true },
+            "header": {
+                "title": { "tag": "plain_text", "content": title },
+                "template": "turquoise"
+            },
+            "elements": markdown_to_card_elements(markdown_body)
+        });
+
+        let body = serde_json::json!({
+            "receive_id": recipient,
+            "msg_type": "interactive",
+            "content": card.to_string(),
+        });
+
+        let resp = self
+            .http_client()
+            .post(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json; charset=utf-8")
+            .json(&body)
+            .send()
+            .await?;
+
+        if resp.status().as_u16() == 401 {
+            self.invalidate_token().await;
+            let new_token = self.get_tenant_access_token().await?;
+            let retry_resp = self
+                .http_client()
+                .post(&url)
+                .header("Authorization", format!("Bearer {new_token}"))
+                .header("Content-Type", "application/json; charset=utf-8")
+                .json(&body)
+                .send()
+                .await?;
+            if !retry_resp.status().is_success() {
+                let err = retry_resp.text().await.unwrap_or_default();
+                anyhow::bail!("Lark card send failed after token refresh: {err}");
+            }
+            return Ok(());
+        }
+
+        if !resp.status().is_success() {
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Lark card send failed: {err}");
+        }
+
+        Ok(())
+    }
+
     /// HTTP callback server (legacy — requires a public endpoint).
     /// Use `listen()` (WS long-connection) for new deployments.
     pub async fn listen_http(
@@ -1369,6 +1696,138 @@ fn should_respond_in_group(mentions: &[serde_json::Value]) -> bool {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Markdown → Lark card elements converter (for interactive cards)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Convert a markdown string (potentially containing tables) into a `Vec` of
+/// Lark interactive-card element JSON values.
+///
+/// - Non-table paragraphs → `{ "tag": "markdown", "content": "..." }`
+/// - Tables → each data row becomes `{ "tag": "div", "fields": [...] }` where
+///   each field is `{ "is_short": true, "text": { "tag": "lark_md", "content": "**col**\nval" }}`
+/// - An `{ "tag": "hr" }` separator is inserted between adjacent blocks.
+fn markdown_to_card_elements(md: &str) -> Vec<serde_json::Value> {
+    let mut elements: Vec<serde_json::Value> = Vec::new();
+    let mut text_buf = String::new();
+
+    // Flush accumulated non-table text as a markdown element.
+    let flush_text = |buf: &mut String, elems: &mut Vec<serde_json::Value>| {
+        let trimmed = buf.trim();
+        if !trimmed.is_empty() {
+            if !elems.is_empty() {
+                elems.push(serde_json::json!({ "tag": "hr" }));
+            }
+            elems.push(serde_json::json!({
+                "tag": "markdown",
+                "content": trimmed
+            }));
+        }
+        buf.clear();
+    };
+
+    let lines: Vec<&str> = md.lines().collect();
+    let len = lines.len();
+    let mut i = 0;
+
+    while i < len {
+        let line = lines[i];
+        let trimmed = line.trim();
+
+        // Detect start of a table: line starts with '|' and next line is a separator
+        if trimmed.starts_with('|') && i + 1 < len && is_table_separator(lines[i + 1].trim()) {
+            // Flush any accumulated text first
+            flush_text(&mut text_buf, &mut elements);
+
+            // Parse header row
+            let headers = parse_table_row(trimmed);
+            // Skip separator line
+            i += 2;
+
+            if !elements.is_empty() {
+                elements.push(serde_json::json!({ "tag": "hr" }));
+            }
+
+            // Parse data rows
+            while i < len {
+                let row_trimmed = lines[i].trim();
+                if !row_trimmed.starts_with('|') {
+                    break;
+                }
+                if is_table_separator(row_trimmed) {
+                    i += 1;
+                    continue;
+                }
+                let cells = parse_table_row(row_trimmed);
+                let mut fields: Vec<serde_json::Value> = Vec::new();
+                for (col_idx, header) in headers.iter().enumerate() {
+                    let value = cells.get(col_idx).map(|s| s.as_str()).unwrap_or("");
+                    fields.push(serde_json::json!({
+                        "is_short": true,
+                        "text": {
+                            "tag": "lark_md",
+                            "content": format!("**{}**\n{}", header, value)
+                        }
+                    }));
+                }
+                // If column count > 2 and odd, pad with an empty field for alignment
+                if headers.len() > 2 && !fields.len().is_multiple_of(2) {
+                    fields.push(serde_json::json!({
+                        "is_short": true,
+                        "text": { "tag": "lark_md", "content": "" }
+                    }));
+                }
+                elements.push(serde_json::json!({
+                    "tag": "div",
+                    "fields": fields
+                }));
+                i += 1;
+            }
+            continue;
+        }
+
+        // Non-table line: accumulate
+        if !text_buf.is_empty() {
+            text_buf.push('\n');
+        }
+        text_buf.push_str(line);
+        i += 1;
+    }
+
+    // Flush remaining text
+    flush_text(&mut text_buf, &mut elements);
+
+    // Fallback: if nothing was produced, return a single empty markdown element
+    if elements.is_empty() {
+        elements.push(serde_json::json!({
+            "tag": "markdown",
+            "content": ""
+        }));
+    }
+
+    elements
+}
+
+/// Check if a line is a markdown table separator (e.g. `|---|---|---|`).
+fn is_table_separator(line: &str) -> bool {
+    if !line.starts_with('|') {
+        return false;
+    }
+    // All non-pipe characters should be '-', ':', or whitespace
+    line.chars()
+        .all(|c| c == '|' || c == '-' || c == ':' || c == ' ')
+}
+
+/// Parse a markdown table row into cells, trimming whitespace.
+/// `| A | B | C |` → `["A", "B", "C"]`
+fn parse_table_row(line: &str) -> Vec<String> {
+    let stripped = line.trim().trim_matches('|');
+    stripped
+        .split('|')
+        .map(|cell| cell.trim().to_string())
+        .collect()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Markdown → Lark post (rich-text) converter
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1432,7 +1891,10 @@ fn markdown_to_lark_post(md: &str) -> serde_json::Value {
         }
 
         // ── unordered list items ────────────────────────────────────
-        if let Some(rest) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+        if let Some(rest) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        {
             let mut elems = vec![serde_json::json!({"tag": "text", "text": "  \u{2022} "})];
             elems.extend(parse_inline(rest));
             lines_out.push(elems);
@@ -1441,8 +1903,7 @@ fn markdown_to_lark_post(md: &str) -> serde_json::Value {
 
         // ── ordered list items ──────────────────────────────────────
         if let Some((num, rest)) = strip_ordered_prefix(trimmed) {
-            let mut elems =
-                vec![serde_json::json!({"tag": "text", "text": format!("  {num}. ")})];
+            let mut elems = vec![serde_json::json!({"tag": "text", "text": format!("  {num}. ")})];
             elems.extend(parse_inline(rest));
             lines_out.push(elems);
             continue;
@@ -1535,9 +1996,7 @@ fn parse_inline(text: &str) -> Vec<serde_json::Value> {
         if chars[i] == '*' && i + 1 < len && chars[i + 1] == '*' {
             if let Some((inner, end)) = try_parse_delimited(&chars, i, "**") {
                 flush_text(&mut buf, &mut elems);
-                elems.push(
-                    serde_json::json!({"tag": "text", "text": inner, "style": ["bold"]}),
-                );
+                elems.push(serde_json::json!({"tag": "text", "text": inner, "style": ["bold"]}));
                 i = end;
                 continue;
             }
@@ -1547,9 +2006,7 @@ fn parse_inline(text: &str) -> Vec<serde_json::Value> {
         if chars[i] == '*' && !(i + 1 < len && chars[i + 1] == '*') {
             if let Some((inner, end)) = try_parse_delimited(&chars, i, "*") {
                 flush_text(&mut buf, &mut elems);
-                elems.push(
-                    serde_json::json!({"tag": "text", "text": inner, "style": ["italic"]}),
-                );
+                elems.push(serde_json::json!({"tag": "text", "text": inner, "style": ["italic"]}));
                 i = end;
                 continue;
             }
@@ -1977,6 +2434,8 @@ mod tests {
             use_feishu: false,
             receive_mode: LarkReceiveMode::default(),
             port: None,
+            draft_update_interval_ms: 3000,
+            max_draft_edits: 20,
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -1998,6 +2457,8 @@ mod tests {
             use_feishu: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
+            draft_update_interval_ms: 3000,
+            max_draft_edits: 20,
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
@@ -2030,6 +2491,8 @@ mod tests {
             use_feishu: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
+            draft_update_interval_ms: 5000,
+            max_draft_edits: 10,
         };
 
         let ch = LarkChannel::from_config(&cfg);
@@ -2038,6 +2501,8 @@ mod tests {
         assert_eq!(ch.ws_base(), LARK_WS_BASE_URL);
         assert_eq!(ch.receive_mode, LarkReceiveMode::Webhook);
         assert_eq!(ch.port, Some(9898));
+        assert_eq!(ch.draft_update_interval_ms, 5000);
+        assert_eq!(ch.max_draft_edits, 10);
     }
 
     #[test]
@@ -2334,5 +2799,148 @@ mod tests {
     fn strip_tool_blocks_preserves_clean_text() {
         let input = "No tool calls here.";
         assert_eq!(strip_tool_blocks(input), input);
+    }
+
+    // ── draft support tests ─────────────────────────────────────────
+
+    #[test]
+    fn lark_supports_draft_updates() {
+        let ch = make_channel();
+        assert!(ch.supports_draft_updates());
+    }
+
+    #[test]
+    fn lark_edit_message_url_matches_region() {
+        let ch_cn = make_channel();
+        assert_eq!(
+            ch_cn.edit_message_url("om_draft_123"),
+            "https://open.feishu.cn/open-apis/im/v1/messages/om_draft_123"
+        );
+
+        let mut ch_intl = make_channel();
+        ch_intl.use_feishu = false;
+        assert_eq!(
+            ch_intl.edit_message_url("om_draft_123"),
+            "https://open.larksuite.com/open-apis/im/v1/messages/om_draft_123"
+        );
+    }
+
+    #[tokio::test]
+    async fn lark_update_draft_rate_limit_short_circuits() {
+        let ch = make_channel();
+        // Insert a recent edit timestamp to trigger rate-limit
+        ch.last_draft_edit
+            .lock()
+            .insert("om_msg_1".to_string(), Instant::now());
+
+        // Should return Ok without network call since we edited < 3s ago
+        let result = ch.update_draft("oc_chat_1", "om_msg_1", "new text").await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn lark_draft_update_interval_default() {
+        let ch = make_channel();
+        assert_eq!(ch.draft_update_interval_ms, 3000);
+        assert_eq!(ch.max_draft_edits, 20);
+        assert!(ch.draft_edit_counts.lock().is_empty());
+    }
+
+    // ── markdown_to_card_elements tests ──────────────────────────────
+
+    #[test]
+    fn card_elements_plain_text() {
+        let elems = markdown_to_card_elements("Hello world\n\nNo tables here.");
+        assert_eq!(elems.len(), 1);
+        assert_eq!(elems[0]["tag"], "markdown");
+        assert_eq!(elems[0]["content"], "Hello world\n\nNo tables here.");
+    }
+
+    #[test]
+    fn card_elements_table_only() {
+        let md = "| Component | Status | Note |\n|---|---|---|\n| Memory | OK | SQLite |\n| Agent | OK | Running |";
+        let elems = markdown_to_card_elements(md);
+        // Two data rows → two div elements
+        assert_eq!(elems.len(), 2);
+        for elem in &elems {
+            assert_eq!(elem["tag"], "div");
+            let fields = elem["fields"].as_array().unwrap();
+            // 3 columns (odd, >2) → padded to 4 fields
+            assert_eq!(fields.len(), 4);
+            assert_eq!(fields[0]["is_short"], true);
+            assert_eq!(fields[0]["text"]["tag"], "lark_md");
+        }
+        // Check first row content
+        let first_fields = elems[0]["fields"].as_array().unwrap();
+        assert_eq!(first_fields[0]["text"]["content"], "**Component**\nMemory");
+        assert_eq!(first_fields[1]["text"]["content"], "**Status**\nOK");
+        assert_eq!(first_fields[2]["text"]["content"], "**Note**\nSQLite");
+        // Padding field
+        assert_eq!(first_fields[3]["text"]["content"], "");
+    }
+
+    #[test]
+    fn card_elements_mixed() {
+        let md = "## System Status\n\n| Col | Val |\n|---|---|\n| A | 1 |\n\nAll good.";
+        let elems = markdown_to_card_elements(md);
+        // markdown("## System Status") + hr + div(A|1) + hr + markdown("All good.")
+        assert_eq!(elems.len(), 5);
+        assert_eq!(elems[0]["tag"], "markdown");
+        assert!(elems[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("System Status"));
+        assert_eq!(elems[1]["tag"], "hr");
+        assert_eq!(elems[2]["tag"], "div");
+        assert_eq!(elems[3]["tag"], "hr");
+        assert_eq!(elems[4]["tag"], "markdown");
+        assert_eq!(elems[4]["content"], "All good.");
+    }
+
+    #[test]
+    fn card_elements_multi_table() {
+        let md = "## Table 1\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\n## Table 2\n\n| X | Y |\n|---|---|\n| 3 | 4 |";
+        let elems = markdown_to_card_elements(md);
+        // markdown("## Table 1") + hr + div(1|2) + hr + markdown("## Table 2") + hr + div(3|4)
+        assert_eq!(elems.len(), 7);
+        assert_eq!(elems[0]["tag"], "markdown");
+        assert_eq!(elems[1]["tag"], "hr");
+        assert_eq!(elems[2]["tag"], "div");
+        assert_eq!(elems[3]["tag"], "hr");
+        assert_eq!(elems[4]["tag"], "markdown");
+        assert_eq!(elems[5]["tag"], "hr");
+        assert_eq!(elems[6]["tag"], "div");
+    }
+
+    #[test]
+    fn card_elements_even_columns_no_padding() {
+        let md = "| A | B |\n|---|---|\n| 1 | 2 |";
+        let elems = markdown_to_card_elements(md);
+        assert_eq!(elems.len(), 1);
+        let fields = elems[0]["fields"].as_array().unwrap();
+        // 2 columns (even) → no padding
+        assert_eq!(fields.len(), 2);
+    }
+
+    #[test]
+    fn card_elements_empty_input() {
+        let elems = markdown_to_card_elements("");
+        assert_eq!(elems.len(), 1);
+        assert_eq!(elems[0]["tag"], "markdown");
+    }
+
+    #[test]
+    fn table_separator_detection() {
+        assert!(is_table_separator("|---|---|---|"));
+        assert!(is_table_separator("| --- | --- |"));
+        assert!(is_table_separator("|:---:|:---|---:|"));
+        assert!(!is_table_separator("| data | here |"));
+        assert!(!is_table_separator("not a table"));
+    }
+
+    #[test]
+    fn table_row_parsing() {
+        let cells = parse_table_row("| Component | Status | Note |");
+        assert_eq!(cells, vec!["Component", "Status", "Note"]);
     }
 }

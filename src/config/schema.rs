@@ -2990,6 +2990,14 @@ pub enum LarkReceiveMode {
     Webhook,
 }
 
+fn default_lark_draft_update_interval_ms() -> u64 {
+    3000
+}
+
+fn default_lark_max_draft_edits() -> u32 {
+    20
+}
+
 /// Lark/Feishu configuration for messaging integration.
 /// Lark is the international version; Feishu is the Chinese version.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -3017,6 +3025,14 @@ pub struct LarkConfig {
     /// Not required (and ignored) for websocket mode.
     #[serde(default)]
     pub port: Option<u16>,
+    /// Minimum interval (ms) between draft message edits. Default: 3000.
+    #[serde(default = "default_lark_draft_update_interval_ms")]
+    pub draft_update_interval_ms: u64,
+    /// Maximum number of edits per draft message before stopping updates.
+    /// Feishu limits edits per message; set this below the platform cap.
+    /// Default: 20.
+    #[serde(default = "default_lark_max_draft_edits")]
+    pub max_draft_edits: u32,
 }
 
 impl ChannelConfig for LarkConfig {
@@ -6717,6 +6733,8 @@ default_model = "legacy-model"
             use_feishu: true,
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
+            draft_update_interval_ms: 3000,
+            max_draft_edits: 20,
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -6726,6 +6744,8 @@ default_model = "legacy-model"
         assert_eq!(parsed.verification_token.as_deref(), Some("verify_token"));
         assert_eq!(parsed.allowed_users.len(), 2);
         assert!(parsed.use_feishu);
+        assert_eq!(parsed.draft_update_interval_ms, 3000);
+        assert_eq!(parsed.max_draft_edits, 20);
     }
 
     #[test]
@@ -6739,12 +6759,16 @@ default_model = "legacy-model"
             use_feishu: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
+            draft_update_interval_ms: 5000,
+            max_draft_edits: 10,
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.app_id, "cli_123456");
         assert_eq!(parsed.app_secret, "secret_abc");
         assert!(!parsed.use_feishu);
+        assert_eq!(parsed.draft_update_interval_ms, 5000);
+        assert_eq!(parsed.max_draft_edits, 10);
     }
 
     #[test]
@@ -6755,6 +6779,8 @@ default_model = "legacy-model"
         assert!(parsed.verification_token.is_none());
         assert!(parsed.allowed_users.is_empty());
         assert!(!parsed.use_feishu);
+        assert_eq!(parsed.draft_update_interval_ms, 3000);
+        assert_eq!(parsed.max_draft_edits, 20);
     }
 
     #[test]
