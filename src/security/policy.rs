@@ -404,6 +404,79 @@ fn contains_unquoted_char(command: &str, target: char) -> bool {
     false
 }
 
+/// Detect unquoted shell variable expansions like `$HOME`, `$1`, `$?`.
+///
+/// Escaped dollars (`\$`) are ignored. Variables inside single quotes are
+/// treated as literals and therefore ignored.
+fn contains_unquoted_shell_variable_expansion(command: &str) -> bool {
+    let mut quote = QuoteState::None;
+    let mut escaped = false;
+    let chars: Vec<char> = command.chars().collect();
+
+    for i in 0..chars.len() {
+        let ch = chars[i];
+
+        match quote {
+            QuoteState::Single => {
+                if ch == '\'' {
+                    quote = QuoteState::None;
+                }
+                continue;
+            }
+            QuoteState::Double => {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                if ch == '"' {
+                    quote = QuoteState::None;
+                    continue;
+                }
+            }
+            QuoteState::None => {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                if ch == '\'' {
+                    quote = QuoteState::Single;
+                    continue;
+                }
+                if ch == '"' {
+                    quote = QuoteState::Double;
+                    continue;
+                }
+            }
+        }
+
+        if ch != '$' {
+            continue;
+        }
+
+        let Some(next) = chars.get(i + 1).copied() else {
+            continue;
+        };
+        if next.is_ascii_alphanumeric()
+            || matches!(
+                next,
+                '_' | '{' | '(' | '#' | '?' | '!' | '$' | '*' | '@' | '-'
+            )
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
 impl SecurityPolicy {
     // ── Risk Classification ──────────────────────────────────────────────
     // Risk is assessed per-segment (split on shell operators), and the
@@ -583,10 +656,12 @@ impl SecurityPolicy {
         }
 
         // Block subshell/expansion operators — these allow hiding arbitrary
-        // commands inside an allowed command (e.g. `echo $(rm -rf /)`)
+        // commands inside an allowed command (e.g. `echo $(rm -rf /)`) and
+        // bypassing path checks through variable indirection.
         if command.contains('`')
             || command.contains("$(")
             || command.contains("${")
+            || contains_unquoted_shell_variable_expansion(command)
             || command.contains("<(")
             || command.contains(">(")
         {
@@ -1429,6 +1504,13 @@ mod tests {
     fn command_injection_dollar_brace_blocked() {
         let p = default_policy();
         assert!(!p.is_command_allowed("echo ${IFS}cat${IFS}/etc/passwd"));
+    }
+
+    #[test]
+    fn command_injection_plain_dollar_var_blocked() {
+        let p = default_policy();
+        assert!(!p.is_command_allowed("cat $HOME/.ssh/id_rsa"));
+        assert!(!p.is_command_allowed("cat $SECRET_FILE"));
     }
 
     #[test]
