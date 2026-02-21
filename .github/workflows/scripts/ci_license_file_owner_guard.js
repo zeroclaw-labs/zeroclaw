@@ -11,12 +11,7 @@ module.exports = async ({ github, context, core }) => {
     return;
   }
 
-  const baseOwners = ["willsarg"];
-  const configuredOwners = (process.env.LICENSE_FILE_OWNER_LOGINS || "")
-    .split(",")
-    .map((login) => login.trim().toLowerCase())
-    .filter(Boolean);
-  const ownerAllowlist = [...new Set([...baseOwners, ...configuredOwners])];
+  const ownerAllowlist = ["willsarg"];
 
   if (ownerAllowlist.length === 0) {
     core.setFailed("License owner allowlist is empty.");
