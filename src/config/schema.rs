@@ -991,7 +991,7 @@ pub struct HttpRequestConfig {
     /// Allowed domains for HTTP requests (exact or subdomain match)
     #[serde(default)]
     pub allowed_domains: Vec<String>,
-    /// Maximum response size in bytes (default: 1MB)
+    /// Maximum response size in bytes (default: 1MB, 0 = unlimited)
     #[serde(default = "default_http_max_response_size")]
     pub max_response_size: usize,
     /// Request timeout in seconds (default: 30)
