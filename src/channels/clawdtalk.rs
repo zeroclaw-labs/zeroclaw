@@ -3,6 +3,8 @@
 //! ClawdTalk (https://clawdtalk.com) provides AI-powered voice conversations
 //! using Telnyx's global SIP network for low-latency, high-quality calls.
 
+use crate::config::traits::ChannelConfig;
+
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use reqwest::Client;
@@ -41,6 +43,15 @@ pub struct ClawdTalkConfig {
     /// Webhook secret for signature verification
     #[serde(default)]
     pub webhook_secret: Option<String>,
+}
+
+impl ChannelConfig for ClawdTalkConfig {
+    fn name() -> &'static str {
+        "ClawdTalk"
+    }
+    fn desc() -> &'static str {
+        "ClawdTalk Channel"
+    }
 }
 
 impl ClawdTalkChannel {
