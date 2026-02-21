@@ -1825,10 +1825,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
                 "llamacpp",
                 "llama.cpp server — local OpenAI-compatible endpoint",
             ),
-            (
-                "vllm",
-                "vLLM — high-performance local inference engine",
-            ),
+            ("vllm", "vLLM — high-performance local inference engine"),
         ],
         _ => vec![], // Custom — handled below
     };
