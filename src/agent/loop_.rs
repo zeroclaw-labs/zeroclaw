@@ -1190,12 +1190,12 @@ fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
             "shell" => {
                 if value_part.starts_with("http://") || value_part.starts_with("https://") {
                     if let Some(cmd) = build_curl_command(value_part) {
-                        serde_json::json!({param: cmd})
+                        serde_json::json!({"command": cmd})
                     } else {
-                        serde_json::json!({param: value_part})
+                        serde_json::json!({"command": value_part})
                     }
                 } else {
-                    serde_json::json!({param: value_part})
+                    serde_json::json!({"command": value_part})
                 }
             }
             "http_request" => serde_json::json!({"url": value_part, "method": "GET"}),
@@ -4860,6 +4860,17 @@ Let me check the result."#;
     fn parse_glm_shortened_body_url_to_curl() {
         // URL values for shell should be wrapped in curl
         let call = parse_glm_shortened_body("shell>https://example.com/api").unwrap();
+        assert_eq!(call.name, "shell");
+        let cmd = call.arguments["command"].as_str().unwrap();
+        assert!(cmd.contains("curl"));
+        assert!(cmd.contains("example.com"));
+    }
+
+    #[test]
+    fn parse_glm_shortened_body_browser_open_maps_to_shell_command() {
+        // browser_open aliases to shell, and shortened calls must still emit
+        // shell's canonical "command" argument.
+        let call = parse_glm_shortened_body("browser_open>https://example.com").unwrap();
         assert_eq!(call.name, "shell");
         let cmd = call.arguments["command"].as_str().unwrap();
         assert!(cmd.contains("curl"));
