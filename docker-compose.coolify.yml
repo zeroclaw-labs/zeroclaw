@@ -29,6 +29,12 @@ services:
       - ZEROCLAW_ALLOW_PUBLIC_BIND=true
 
       # OpenTelemetry configuration
+      # NOTE: zeroclaw ignores OTEL_EXPORTER_OTLP_ENDPOINT — endpoint is config-file only.
+      # The volume (zeroclaw-data) must have config.toml with:
+      #   [observability]
+      #   backend = "opentelemetry"
+      #   otel_endpoint = "http://otel-collector-ek4ck8gkoscs4884os8cwgkc:4318"
+      # This was set manually on the volume on 2026-02-21.
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector-ek4ck8gkoscs4884os8cwgkc:4318
       - OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
       - OTEL_SERVICE_NAME=zeroclaw
