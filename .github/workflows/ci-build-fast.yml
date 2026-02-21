@@ -63,23 +63,46 @@ jobs:
                   cache-targets: true
 
             - name: Install cargo-slicer
+              id: install_slicer
+              shell: bash
               run: |
-                  cargo install cargo-slicer --locked 2>/dev/null \
-                    || cargo install cargo-slicer
-                  cargo +nightly install cargo-slicer --profile release-rustc \
+                  set -euo pipefail
+
+                  if cargo install cargo-slicer --version "$CARGO_SLICER_VERSION" --locked 2>/dev/null \
+                    || cargo install cargo-slicer --version "$CARGO_SLICER_VERSION"; then
+                    echo "slicer_ready=true" >> "$GITHUB_OUTPUT"
+                  else
+                    echo "::warning::Unable to install cargo-slicer CLI; using fallback nightly release build."
+                    echo "slicer_ready=false" >> "$GITHUB_OUTPUT"
+                    echo "driver_ready=false" >> "$GITHUB_OUTPUT"
+                    exit 0
+                  fi
+
+                  if cargo +nightly install cargo-slicer --version "$CARGO_SLICER_VERSION" --profile release-rustc \
                     --bin cargo-slicer-rustc --bin cargo_slicer_dispatch \
                     --features rustc-driver --locked 2>/dev/null \
-                    || cargo +nightly install cargo-slicer --profile release-rustc \
+                    || cargo +nightly install cargo-slicer --version "$CARGO_SLICER_VERSION" --profile release-rustc \
                       --bin cargo-slicer-rustc --bin cargo_slicer_dispatch \
-                      --features rustc-driver
+                      --features rustc-driver; then
+                    echo "driver_ready=true" >> "$GITHUB_OUTPUT"
+                  else
+                    echo "::warning::cargo-slicer rustc-driver install failed (nightly rustc API drift); using fallback nightly release build."
+                    echo "driver_ready=false" >> "$GITHUB_OUTPUT"
+                  fi
 
             - name: Pre-analyze workspace
+              if: steps.install_slicer.outputs.slicer_ready == 'true'
               run: cargo-slicer pre-analyze
 
             - name: Build release binary (virtual slicing + MIR-precise)
+              if: steps.install_slicer.outputs.driver_ready == 'true'
               run: |
                   CARGO_SLICER_MIR_PRECISE=1 \
                     CARGO_SLICER_WORKSPACE_CRATES=zeroclaw,zeroclaw_robot_kit \
                     CARGO_SLICER_VIRTUAL=1 CARGO_SLICER_CODEGEN_FILTER=1 \
                     RUSTC_WRAPPER=$(which cargo_slicer_dispatch) \
                     cargo +nightly build --release --verbose
+
+            - name: Fallback release build (no slicer wrapper)
+              if: steps.install_slicer.outputs.driver_ready != 'true'
+              run: cargo +nightly build --release --verbose
