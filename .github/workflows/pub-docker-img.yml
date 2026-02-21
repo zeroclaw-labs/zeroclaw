@@ -4,7 +4,7 @@ on:
     push:
         tags: ["v*"]
     pull_request:
-        branches: [main]
+        branches: [dev, main]
         paths:
             - "Dockerfile"
             - ".dockerignore"

@@ -21,11 +21,13 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
     - Recommended for workflow-changing PRs
 - `.github/workflows/pr-intake-checks.yml` (`PR Intake Checks`)
     - Purpose: safe pre-CI PR checks (template completeness, added-line tabs/trailing-whitespace/conflict markers) with immediate sticky feedback comment
+- `.github/workflows/main-promotion-gate.yml` (`Main Promotion Gate`)
+    - Purpose: enforce stable-branch policy by allowing only `dev` -> `main` PR promotion
 
 ### Non-Blocking but Important
 
 - `.github/workflows/pub-docker-img.yml` (`Docker`)
-    - Purpose: PR Docker smoke check and publish images on tag pushes (`v*`) only
+    - Purpose: PR Docker smoke check on `dev`/`main` PRs and publish images on tag pushes (`v*`) only
 - `.github/workflows/sec-audit.yml` (`Security Audit`)
     - Purpose: dependency advisories (`rustsec/audit-check`, pinned SHA) and policy/license checks (`cargo deny`)
 - `.github/workflows/sec-codeql.yml` (`CodeQL Analysis`)
@@ -69,12 +71,13 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 
 ## Trigger Map
 
-- `CI`: push to `main`, PRs to `main`
-- `Docker`: tag push (`v*`) for publish, matching PRs for smoke build, manual dispatch for smoke only
+- `CI`: push to `dev` and `main`, PRs to `dev` and `main`
+- `Docker`: tag push (`v*`) for publish, matching PRs to `dev`/`main` for smoke build, manual dispatch for smoke only
 - `Release`: tag push (`v*`), weekly schedule (verification-only), manual dispatch (verification or publish)
-- `Security Audit`: push to `main`, PRs to `main`, weekly schedule
+- `Security Audit`: push to `dev` and `main`, PRs to `dev` and `main`, weekly schedule
 - `Sec Vorpal Reviewdog`: manual dispatch only
 - `Workflow Sanity`: PR/push when `.github/workflows/**`, `.github/*.yml`, or `.github/*.yaml` change
+- `Main Promotion Gate`: PRs to `main` only; requires head branch `dev` in the same repository
 - `PR Intake Checks`: `pull_request_target` on opened/reopened/synchronize/edited/ready_for_review
 - `Label Policy Sanity`: PR/push when `.github/label-policy.json`, `.github/workflows/pr-labeler.yml`, or `.github/workflows/pr-auto-response.yml` changes
 - `PR Labeler`: `pull_request_target` lifecycle events

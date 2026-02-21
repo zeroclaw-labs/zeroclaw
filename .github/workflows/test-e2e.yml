@@ -2,7 +2,7 @@ name: Test E2E
 
 on:
     push:
-        branches: [main]
+        branches: [dev, main]
     workflow_dispatch:
 
 concurrency:
