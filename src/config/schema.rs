@@ -167,6 +167,10 @@ pub struct Config {
     #[serde(default)]
     pub multimodal: MultimodalConfig,
 
+    /// Web fetch tool configuration (`[web_fetch]`).
+    #[serde(default)]
+    pub web_fetch: WebFetchConfig,
+
     /// Web search tool configuration (`[web_search]`).
     #[serde(default)]
     pub web_search: WebSearchConfig,
@@ -1012,6 +1016,53 @@ fn default_http_max_response_size() -> usize {
 
 fn default_http_timeout_secs() -> u64 {
     30
+}
+
+// ── Web fetch ────────────────────────────────────────────────────
+
+/// Web fetch tool configuration (`[web_fetch]` section).
+///
+/// Fetches web pages and converts HTML to plain text for LLM consumption.
+/// Domain filtering: `allowed_domains` controls which hosts are reachable (use `["*"]`
+/// for all public hosts). `blocked_domains` takes priority over `allowed_domains`.
+/// If `allowed_domains` is empty, all requests are rejected (deny-by-default).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WebFetchConfig {
+    /// Enable `web_fetch` tool for fetching web page content
+    #[serde(default)]
+    pub enabled: bool,
+    /// Allowed domains for web fetch (exact or subdomain match; `["*"]` = all public hosts)
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+    /// Blocked domains (exact or subdomain match; always takes priority over allowed_domains)
+    #[serde(default)]
+    pub blocked_domains: Vec<String>,
+    /// Maximum response size in bytes (default: 500KB, plain text is much smaller than raw HTML)
+    #[serde(default = "default_web_fetch_max_response_size")]
+    pub max_response_size: usize,
+    /// Request timeout in seconds (default: 30)
+    #[serde(default = "default_web_fetch_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_web_fetch_max_response_size() -> usize {
+    500_000 // 500KB
+}
+
+fn default_web_fetch_timeout_secs() -> u64 {
+    30
+}
+
+impl Default for WebFetchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_domains: vec!["*".into()],
+            blocked_domains: vec![],
+            max_response_size: default_web_fetch_max_response_size(),
+            timeout_secs: default_web_fetch_timeout_secs(),
+        }
+    }
 }
 
 // ── Web search ───────────────────────────────────────────────────
@@ -3287,6 +3338,7 @@ impl Default for Config {
             browser: BrowserConfig::default(),
             http_request: HttpRequestConfig::default(),
             multimodal: MultimodalConfig::default(),
+            web_fetch: WebFetchConfig::default(),
             web_search: WebSearchConfig::default(),
             proxy: ProxyConfig::default(),
             identity: IdentityConfig::default(),
@@ -4519,6 +4571,7 @@ default_temperature = 0.7
             browser: BrowserConfig::default(),
             http_request: HttpRequestConfig::default(),
             multimodal: MultimodalConfig::default(),
+            web_fetch: WebFetchConfig::default(),
             web_search: WebSearchConfig::default(),
             proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
@@ -4692,6 +4745,7 @@ tool_dispatcher = "xml"
             browser: BrowserConfig::default(),
             http_request: HttpRequestConfig::default(),
             multimodal: MultimodalConfig::default(),
+            web_fetch: WebFetchConfig::default(),
             web_search: WebSearchConfig::default(),
             proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
