@@ -208,7 +208,7 @@ jobs:
 
             - name: Check binary size (Unix)
               if: runner.os != 'Windows'
-              run: ./scripts/ci/check_binary_size.sh "target/${{ matrix.target }}/release-fast/${{ matrix.artifact }}" "${{ matrix.target }}"
+              run: bash scripts/ci/check_binary_size.sh "target/${{ matrix.target }}/release-fast/${{ matrix.artifact }}" "${{ matrix.target }}"
 
             - name: Package (Unix)
               if: runner.os != 'Windows'
