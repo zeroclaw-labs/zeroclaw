@@ -707,15 +707,26 @@ MSG
     fi
   fi
 
-  "$CONTAINER_CLI" run --rm -it \
-    "${container_run_namespace_args[@]}" \
-    "${container_run_user_args[@]}" \
-    -e HOME=/zeroclaw-data \
-    -e ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace \
-    -v "$config_mount" \
-    -v "$workspace_mount" \
-    "$docker_image" \
-    "${onboard_cmd[@]}"
+  if [[ "$CONTAINER_CLI" == "podman" ]]; then
+    "$CONTAINER_CLI" run --rm -it \
+      "${container_run_namespace_args[@]}" \
+      "${container_run_user_args[@]}" \
+      -e HOME=/zeroclaw-data \
+      -e ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace \
+      -v "$config_mount" \
+      -v "$workspace_mount" \
+      "$docker_image" \
+      "${onboard_cmd[@]}"
+  else
+    "$CONTAINER_CLI" run --rm -it \
+      "${container_run_user_args[@]}" \
+      -e HOME=/zeroclaw-data \
+      -e ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace \
+      -v "$config_mount" \
+      -v "$workspace_mount" \
+      "$docker_image" \
+      "${onboard_cmd[@]}"
+  fi
 }
 
 SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"

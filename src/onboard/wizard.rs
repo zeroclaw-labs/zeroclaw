@@ -6,7 +6,7 @@ use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
     HeartbeatConfig, HttpRequestConfig, IMessageConfig, LarkConfig, MatrixConfig, MemoryConfig,
     ObservabilityConfig, RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig, TelegramConfig,
-    WebhookConfig,
+    WebSearchConfig, WebhookConfig,
 };
 use crate::hardware::{self, HardwareConfig};
 use crate::memory::{
@@ -108,7 +108,8 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
     let tunnel_config = setup_tunnel()?;
 
     print_step(5, 9, "Tool Mode & Security");
-    let (composio_config, secrets_config, browser_config, http_request_config) = setup_tool_mode()?;
+    let (composio_config, secrets_config, browser_config, http_request_config, web_search_config) =
+        setup_tool_mode()?;
 
     print_step(6, 9, "Hardware (Physical World)");
     let hardware_config = setup_hardware()?;
@@ -158,7 +159,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         browser: browser_config,
         http_request: http_request_config,
         multimodal: crate::config::MultimodalConfig::default(),
-        web_search: crate::config::WebSearchConfig::default(),
+        web_search: web_search_config,
         proxy: crate::config::ProxyConfig::default(),
         identity: crate::config::IdentityConfig::default(),
         cost: crate::config::CostConfig::default(),
@@ -2687,6 +2688,7 @@ fn setup_tool_mode() -> Result<(
     SecretsConfig,
     BrowserConfig,
     HttpRequestConfig,
+    WebSearchConfig,
 )> {
     print_bullet("Choose how ZeroClaw connects to external apps.");
     print_bullet("You can always change this later in config.toml.");
@@ -2816,6 +2818,63 @@ fn setup_tool_mode() -> Result<(
         );
     }
 
+    let mut web_search_config = WebSearchConfig::default();
+    let enable_web_search = Confirm::new()
+        .with_prompt("  Enable web_search_tool?")
+        .default(false)
+        .interact()?;
+
+    if enable_web_search {
+        web_search_config.enabled = true;
+
+        let provider_options = vec![
+            "DuckDuckGo (free, no API key)",
+            "Brave Search (requires API key)",
+        ];
+        let provider_choice = Select::new()
+            .with_prompt("  web_search provider")
+            .items(&provider_options)
+            .default(0)
+            .interact()?;
+
+        if provider_choice == 1 {
+            web_search_config.provider = "brave".to_string();
+            let brave_api_key: String = Input::new()
+                .with_prompt("  Brave API key (or Enter to skip)")
+                .allow_empty(true)
+                .interact_text()?;
+            if brave_api_key.trim().is_empty() {
+                println!(
+                    "  {} Brave key skipped — set web_search.brave_api_key in config.toml later",
+                    style("→").dim()
+                );
+            } else {
+                web_search_config.brave_api_key = Some(brave_api_key);
+                println!(
+                    "  {} Brave API key: {}",
+                    style("✓").green().bold(),
+                    style("configured").green()
+                );
+            }
+        } else {
+            web_search_config.provider = "duckduckgo".to_string();
+        }
+
+        web_search_config.max_results = prompt_optional_max_results(web_search_config.max_results)?;
+        println!(
+            "  {} web_search: {} (max_results: {})",
+            style("✓").green().bold(),
+            style(web_search_config.provider.as_str()).green(),
+            web_search_config.max_results
+        );
+    } else {
+        println!(
+            "  {} web_search_tool: {}",
+            style("✓").green().bold(),
+            style("disabled").dim()
+        );
+    }
+
     // ── Encrypted secrets ──
     println!();
     print_bullet("ZeroClaw can encrypt API keys stored in config.toml.");
@@ -2847,6 +2906,7 @@ fn setup_tool_mode() -> Result<(
         secrets_config,
         browser_config,
         http_request_config,
+        web_search_config,
     ))
 }
 
@@ -2933,6 +2993,34 @@ fn normalize_domain_entry(raw: &str) -> Option<String> {
     }
 
     Some(domain)
+}
+
+fn prompt_optional_max_results(default_value: usize) -> Result<usize> {
+    loop {
+        let raw: String = Input::new()
+            .with_prompt(format!(
+                "  web_search max results (1-10, Enter for default {default_value})"
+            ))
+            .allow_empty(true)
+            .interact_text()?;
+
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Ok(default_value);
+        }
+
+        if let Ok(parsed) = trimmed.parse::<usize>() {
+            if (1..=10).contains(&parsed) {
+                return Ok(parsed);
+            }
+        }
+
+        println!(
+            "  {} {}",
+            style("✗").red().bold(),
+            style("Enter a number between 1 and 10.").yellow()
+        );
+    }
 }
 
 // ── Step 6: Hardware (Physical World) ───────────────────────────
@@ -5539,6 +5627,19 @@ fn print_summary(config: &Config) {
                     config.http_request.allowed_domains.join(", ")
                 )
             }
+        } else {
+            "disabled".to_string()
+        }
+    );
+
+    println!(
+        "    {} Web search:    {}",
+        style("🔎").cyan(),
+        if config.web_search.enabled {
+            format!(
+                "enabled ({}, max_results: {})",
+                config.web_search.provider, config.web_search.max_results
+            )
         } else {
             "disabled".to_string()
         }
