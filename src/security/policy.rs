@@ -735,6 +735,10 @@ impl SecurityPolicy {
             return false;
         }
 
+        // Check if wildcard "*" is present in allowed_commands — if so, skip
+        // per-command allowlist matching (but all other security gates still apply).
+        let wildcard_commands = self.allowed_commands.iter().any(|c| c == "*");
+
         // Split on unquoted command separators and validate each sub-command.
         let segments = split_unquoted_segments(command);
         for segment in &segments {
@@ -749,10 +753,11 @@ impl SecurityPolicy {
                 continue;
             }
 
-            if !self
-                .allowed_commands
-                .iter()
-                .any(|allowed| allowed == base_cmd)
+            if !wildcard_commands
+                && !self
+                    .allowed_commands
+                    .iter()
+                    .any(|allowed| allowed == base_cmd)
             {
                 return false;
             }
@@ -1203,6 +1208,75 @@ mod tests {
         };
         assert!(!p.is_command_allowed("ls"));
         assert!(!p.is_command_allowed("echo hello"));
+    }
+
+    #[test]
+    fn wildcard_allows_any_command() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_command_allowed("ls"));
+        assert!(p.is_command_allowed("curl https://example.com"));
+        assert!(p.is_command_allowed("some_random_command --flag"));
+    }
+
+    #[test]
+    fn wildcard_still_blocks_subshell_operators() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(!p.is_command_allowed("echo $(whoami)"));
+        assert!(!p.is_command_allowed("echo `whoami`"));
+    }
+
+    #[test]
+    fn wildcard_still_blocks_redirects() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(!p.is_command_allowed("echo secret > /etc/passwd"));
+        assert!(!p.is_command_allowed("cat < /etc/shadow"));
+    }
+
+    #[test]
+    fn wildcard_still_blocks_tee() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(!p.is_command_allowed("echo secret | tee /etc/crontab"));
+    }
+
+    #[test]
+    fn wildcard_still_blocks_background() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(!p.is_command_allowed("sleep 999 &"));
+    }
+
+    #[test]
+    fn wildcard_still_blocks_dangerous_args() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(!p.is_command_allowed("find / -exec rm -rf {} +"));
+        assert!(!p.is_command_allowed("git config --global user.name attacker"));
+    }
+
+    #[test]
+    fn wildcard_blocked_in_readonly_mode() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            allowed_commands: vec!["*".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(!p.is_command_allowed("ls"));
     }
 
     #[test]
