@@ -59,6 +59,9 @@ services:
     labels:
       - coolify.managed=true
       - autoheal=true
+    networks:
+      - aoc4gscoo0kwkggskg4skgok
+      - ek4ck8gkoscs4884os8cwgkc
 
   zc-bridge:
     build: ./zc-bridge
@@ -71,6 +74,9 @@ services:
       - zeroclaw
     labels:
       - coolify.managed=true
+    networks:
+      - aoc4gscoo0kwkggskg4skgok
+      - ek4ck8gkoscs4884os8cwgkc
 
   clawsuite:
     build: ./clawsuite
@@ -85,6 +91,15 @@ services:
       - zc-bridge
     labels:
       - coolify.managed=true
+    networks:
+      - aoc4gscoo0kwkggskg4skgok
+      - ek4ck8gkoscs4884os8cwgkc
 
 volumes:
-  zeroclaw-data:
+  zeroclaw-data: null
+
+networks:
+  aoc4gscoo0kwkggskg4skgok:
+    external: true
+  ek4ck8gkoscs4884os8cwgkc:
+    external: true
