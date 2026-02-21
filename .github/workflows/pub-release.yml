@@ -373,6 +373,5 @@ jobs:
                   generate_release_notes: true
                   files: |
                       artifacts/**/*
-                      artifacts/SHA256SUMS
               env:
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
