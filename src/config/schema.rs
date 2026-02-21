@@ -4248,6 +4248,7 @@ default_temperature = 0.7
                 dingtalk: None,
                 qq: None,
                 nostr: None,
+                clawdtalk: None,
                 message_timeout_secs: 300,
             },
             memory: MemoryConfig::default(),
@@ -4799,6 +4800,7 @@ allowed_users = ["@ops:matrix.org"]
             dingtalk: None,
             qq: None,
             nostr: None,
+            clawdtalk: None,
             message_timeout_secs: 300,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
@@ -5010,6 +5012,7 @@ channel_id = "C123"
             dingtalk: None,
             qq: None,
             nostr: None,
+            clawdtalk: None,
             message_timeout_secs: 300,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
