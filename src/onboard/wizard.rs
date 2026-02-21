@@ -3306,7 +3306,9 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     .interact_text()?;
 
                 let channel: String = Input::new()
-                    .with_prompt("  Default channel ID (optional, Enter to skip)")
+                    .with_prompt(
+                        "  Default channel ID (optional, Enter to skip for all accessible channels; '*' also means all)",
+                    )
                     .allow_empty(true)
                     .interact_text()?;
 

@@ -2466,6 +2466,7 @@ pub struct SlackConfig {
     /// Slack app-level token for Socket Mode (xapp-...).
     pub app_token: Option<String>,
     /// Optional channel ID to restrict the bot to a single channel.
+    /// Omit (or set `"*"`) to listen across all accessible channels.
     pub channel_id: Option<String>,
     /// Allowed Slack user IDs. Empty = deny all.
     #[serde(default)]
