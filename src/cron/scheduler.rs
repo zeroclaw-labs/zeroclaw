@@ -1,5 +1,6 @@
 use crate::channels::{
-    Channel, DiscordChannel, MattermostChannel, SendMessage, SlackChannel, TelegramChannel,
+    Channel, DiscordChannel, LarkChannel, MattermostChannel, SendMessage, SlackChannel,
+    TelegramChannel,
 };
 use crate::config::Config;
 use crate::cron::{
@@ -352,6 +353,15 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 mm.thread_replies.unwrap_or(true),
                 mm.mention_only.unwrap_or(false),
             );
+            channel.send(&SendMessage::new(output, target)).await?;
+        }
+        "lark" => {
+            let lk = config
+                .channels_config
+                .lark
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("lark channel not configured"))?;
+            let channel = LarkChannel::from_config(lk);
             channel.send(&SendMessage::new(output, target)).await?;
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
@@ -864,5 +874,22 @@ mod tests {
         };
         let err = deliver_if_configured(&config, &job, "x").await.unwrap_err();
         assert!(err.to_string().contains("unsupported delivery channel"));
+    }
+
+    #[tokio::test]
+    async fn deliver_if_configured_lark_not_configured_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let mut job = test_job("echo ok");
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("lark".into()),
+            to: Some("oc_abc123".into()),
+            best_effort: false,
+        };
+        let err = deliver_if_configured(&config, &job, "hello")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("lark channel not configured"));
     }
 }

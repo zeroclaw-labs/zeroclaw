@@ -224,16 +224,14 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                     .min(max_backoff_secs);
                 let (_, last_failure_at) = failure_map[&task];
                 if last_failure_at.elapsed() < Duration::from_secs(backoff) {
-                    tracing::debug!(
-                        "Heartbeat task in cooldown ({backoff}s), skipping: {task}"
-                    );
+                    tracing::debug!("Heartbeat task in cooldown ({backoff}s), skipping: {task}");
                     continue;
                 }
             }
 
             let prompt = format!("[Heartbeat Task] {task}");
             let temp = config.default_temperature;
-            if let Err(e) = crate::agent::run(
+            match crate::agent::run(
                 config.clone(),
                 Some(prompt),
                 None,
@@ -244,30 +242,124 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             )
             .await
             {
-                let (failures, _) = failure_map
-                    .entry(task.clone())
-                    .or_insert((0, Instant::now()));
-                *failures += 1;
-                let f = *failures;
-                // Update last_failure_at
-                failure_map.get_mut(&task).unwrap().1 = Instant::now();
-
-                if f >= HEARTBEAT_MAX_CONSECUTIVE_FAILURES {
-                    tracing::error!(
-                        "Heartbeat task disabled after {f} consecutive failures. \
-                         Check HEARTBEAT.md configuration: {task} — error: {e}"
-                    );
-                } else {
-                    tracing::warn!("Heartbeat task failed ({f}/{HEARTBEAT_MAX_CONSECUTIVE_FAILURES}): {e}");
+                Ok(output) => {
+                    // Success: reset failure tracking for this task
+                    failure_map.remove(&task);
+                    crate::health::mark_component_ok("heartbeat");
+                    // Deliver to configured channel (best-effort)
+                    if let (Some(ch_name), Some(target)) =
+                        (&config.heartbeat.channel, &config.heartbeat.target)
+                    {
+                        if let Err(e) = deliver_heartbeat(&config, ch_name, target, &output).await {
+                            tracing::warn!("Heartbeat delivery to {ch_name} failed: {e}");
+                        }
+                    }
                 }
-                crate::health::mark_component_error("heartbeat", e.to_string());
-            } else {
-                // Success: reset failure tracking for this task
-                failure_map.remove(&task);
-                crate::health::mark_component_ok("heartbeat");
+                Err(e) => {
+                    let (failures, _) = failure_map
+                        .entry(task.clone())
+                        .or_insert((0, Instant::now()));
+                    *failures += 1;
+                    let f = *failures;
+                    // Update last_failure_at
+                    failure_map.get_mut(&task).unwrap().1 = Instant::now();
+
+                    if f >= HEARTBEAT_MAX_CONSECUTIVE_FAILURES {
+                        tracing::error!(
+                            "Heartbeat task disabled after {f} consecutive failures. \
+                             Check HEARTBEAT.md configuration: {task} — error: {e}"
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Heartbeat task failed ({f}/{HEARTBEAT_MAX_CONSECUTIVE_FAILURES}): {e}"
+                        );
+                    }
+                    crate::health::mark_component_error("heartbeat", e.to_string());
+                }
             }
         }
     }
+}
+
+async fn deliver_heartbeat(
+    config: &Config,
+    channel_name: &str,
+    target: &str,
+    output: &str,
+) -> Result<()> {
+    use crate::channels::{Channel, SendMessage};
+
+    match channel_name.to_ascii_lowercase().as_str() {
+        "lark" => {
+            let lk = config
+                .channels_config
+                .lark
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("lark channel not configured"))?;
+            let channel = crate::channels::LarkChannel::from_config(lk);
+            channel.send(&SendMessage::new(output, target)).await?;
+        }
+        "telegram" => {
+            let tg = config
+                .channels_config
+                .telegram
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("telegram channel not configured"))?;
+            let channel = crate::channels::TelegramChannel::new(
+                tg.bot_token.clone(),
+                tg.allowed_users.clone(),
+                tg.mention_only,
+            );
+            channel.send(&SendMessage::new(output, target)).await?;
+        }
+        "discord" => {
+            let dc = config
+                .channels_config
+                .discord
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("discord channel not configured"))?;
+            let channel = crate::channels::DiscordChannel::new(
+                dc.bot_token.clone(),
+                dc.guild_id.clone(),
+                dc.allowed_users.clone(),
+                dc.listen_to_bots,
+                dc.mention_only,
+            );
+            channel.send(&SendMessage::new(output, target)).await?;
+        }
+        "slack" => {
+            let sl = config
+                .channels_config
+                .slack
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("slack channel not configured"))?;
+            let channel = crate::channels::SlackChannel::new(
+                sl.bot_token.clone(),
+                sl.channel_id.clone(),
+                sl.allowed_users.clone(),
+            );
+            channel.send(&SendMessage::new(output, target)).await?;
+        }
+        "mattermost" => {
+            let mm = config
+                .channels_config
+                .mattermost
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("mattermost channel not configured"))?;
+            let channel = crate::channels::MattermostChannel::new(
+                mm.url.clone(),
+                mm.bot_token.clone(),
+                mm.channel_id.clone(),
+                mm.allowed_users.clone(),
+                mm.thread_replies.unwrap_or(true),
+                mm.mention_only.unwrap_or(false),
+            );
+            channel.send(&SendMessage::new(output, target)).await?;
+        }
+        other => anyhow::bail!("unsupported heartbeat delivery channel: {other}"),
+    }
+
+    Ok(())
 }
 
 fn has_supervised_channels(config: &Config) -> bool {
@@ -406,5 +498,44 @@ mod tests {
             allowed_users: vec!["*".into()],
         });
         assert!(has_supervised_channels(&config));
+    }
+
+    #[tokio::test]
+    async fn deliver_heartbeat_unsupported_channel_returns_error() {
+        let config = Config::default();
+        let err = deliver_heartbeat(&config, "carrier_pigeon", "target", "hello")
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("unsupported heartbeat delivery channel"));
+    }
+
+    #[tokio::test]
+    async fn deliver_heartbeat_lark_not_configured_returns_error() {
+        let config = Config::default();
+        let err = deliver_heartbeat(&config, "lark", "oc_abc123", "report")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("lark channel not configured"));
+    }
+
+    #[tokio::test]
+    async fn deliver_heartbeat_telegram_not_configured_returns_error() {
+        let config = Config::default();
+        let err = deliver_heartbeat(&config, "telegram", "12345", "report")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("telegram channel not configured"));
+    }
+
+    #[tokio::test]
+    async fn deliver_heartbeat_case_insensitive_channel_name() {
+        let config = Config::default();
+        // "LARK" should match as "lark" (case insensitive), then fail because not configured
+        let err = deliver_heartbeat(&config, "LARK", "oc_abc123", "report")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("lark channel not configured"))
     }
 }

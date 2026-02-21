@@ -2286,6 +2286,13 @@ pub struct HeartbeatConfig {
     pub enabled: bool,
     /// Interval in minutes between heartbeat pings. Default: `30`.
     pub interval_minutes: u32,
+    /// Optional channel to deliver heartbeat results to (e.g. "lark", "telegram").
+    /// If not set, results are only logged.
+    #[serde(default)]
+    pub channel: Option<String>,
+    /// Optional recipient/chat_id for delivery.
+    #[serde(default)]
+    pub target: Option<String>,
 }
 
 impl Default for HeartbeatConfig {
@@ -2293,6 +2300,8 @@ impl Default for HeartbeatConfig {
         Self {
             enabled: false,
             interval_minutes: 30,
+            channel: None,
+            target: None,
         }
     }
 }
@@ -4530,6 +4539,34 @@ mod tests {
         let h = HeartbeatConfig::default();
         assert!(!h.enabled);
         assert_eq!(h.interval_minutes, 30);
+        assert!(h.channel.is_none());
+        assert!(h.target.is_none());
+    }
+
+    #[test]
+    async fn heartbeat_config_serde_with_delivery() {
+        let toml_str = r#"
+            enabled = true
+            interval_minutes = 15
+            channel = "lark"
+            target = "oc_abc123"
+        "#;
+        let h: HeartbeatConfig = toml::from_str(toml_str).unwrap();
+        assert!(h.enabled);
+        assert_eq!(h.interval_minutes, 15);
+        assert_eq!(h.channel.as_deref(), Some("lark"));
+        assert_eq!(h.target.as_deref(), Some("oc_abc123"));
+    }
+
+    #[test]
+    async fn heartbeat_config_serde_without_delivery_fields() {
+        let toml_str = r#"
+            enabled = true
+            interval_minutes = 30
+        "#;
+        let h: HeartbeatConfig = toml::from_str(toml_str).unwrap();
+        assert!(h.channel.is_none());
+        assert!(h.target.is_none());
     }
 
     #[test]
@@ -4639,6 +4676,7 @@ default_temperature = 0.7
             heartbeat: HeartbeatConfig {
                 enabled: true,
                 interval_minutes: 15,
+                ..HeartbeatConfig::default()
             },
             cron: CronConfig::default(),
             channels_config: ChannelsConfig {
