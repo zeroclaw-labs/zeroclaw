@@ -5103,15 +5103,6 @@ dependencies = [
 
 [[package]]
 name = "rppal"
-version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b37e992f3222e304708025de77c9e395068a347449d0d7164f52d3beccdbd8d"
-dependencies = [
- "libc",
-]
-
-[[package]]
-name = "rppal"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1ce3b019009cff02cb6b0e96e7cc2e5c5b90187dc1a490f8ef1521d0596b026"
@@ -8032,7 +8023,7 @@ dependencies = [
  "regex",
  "reqwest",
  "ring",
- "rppal 0.22.1",
+ "rppal",
  "rusqlite",
  "rust-embed",
  "rustls",
@@ -8079,7 +8070,7 @@ dependencies = [
  "chrono",
  "directories",
  "reqwest",
- "rppal 0.19.0",
+ "rppal",
  "serde",
  "serde_json",
  "tempfile",
