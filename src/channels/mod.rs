@@ -262,7 +262,16 @@ fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
 fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
     match channel_name {
         "telegram" => Some(
-            "When responding on Telegram, include media markers for files or URLs that should be sent as attachments. Use one marker per attachment with this exact syntax: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]. Keep normal user-facing text outside markers and never wrap markers in code fences.",
+            "When responding on Telegram:\n\
+             - Use **bold** for key terms, section titles, and important info (renders as <b>)\n\
+             - Use *italic* for emphasis (renders as <i>)\n\
+             - Use `backticks` for inline code, commands, or technical terms\n\
+             - Use triple backticks for code blocks\n\
+             - Use emoji naturally to add personality — but don't overdo it\n\
+             - Be concise and direct. Skip filler phrases like 'Great question!' or 'Certainly!'\n\
+             - Structure longer answers with bold headers, not raw markdown ## headers\n\
+             - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]\n\
+             - Keep normal text outside markers and never wrap markers in code fences.",
         ),
         _ => None,
     }

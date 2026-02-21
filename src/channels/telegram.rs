@@ -911,6 +911,153 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         Ok(format!("data:image/jpeg;base64,{}", b64))
     }
 
+    /// Convert Markdown to Telegram HTML format.
+    /// Telegram HTML supports: <b>, <i>, <u>, <s>, <code>, <pre>, <a href="...">
+    /// This mirrors OpenClaw's markdownToTelegramHtml approach.
+    fn markdown_to_telegram_html(text: &str) -> String {
+        let lines: Vec<&str> = text.split('\n').collect();
+        let mut result_lines: Vec<String> = Vec::new();
+
+        for line in &lines {
+            let mut line_out = String::new();
+
+            // Handle code blocks (``` ... ```) - handled at text level below
+            // Handle headers: ## Title → <b>Title</b>
+            let stripped = line.trim_start_matches('#');
+            let header_level = line.len() - stripped.len();
+            if header_level > 0 && line.starts_with('#') && stripped.starts_with(' ') {
+                let title = Self::escape_html(stripped.trim());
+                result_lines.push(format!("<b>{title}</b>"));
+                continue;
+            }
+
+            // Inline formatting
+            let mut i = 0;
+            let bytes = line.as_bytes();
+            let len = bytes.len();
+            while i < len {
+                // Bold: **text** or __text__
+                if i + 1 < len && bytes[i] == b'*' && bytes[i+1] == b'*' {
+                    if let Some(end) = line[i+2..].find("**") {
+                        let inner = Self::escape_html(&line[i+2..i+2+end]);
+                        line_out.push_str(&format!("<b>{inner}</b>"));
+                        i += 4 + end;
+                        continue;
+                    }
+                }
+                if i + 1 < len && bytes[i] == b'_' && bytes[i+1] == b'_' {
+                    if let Some(end) = line[i+2..].find("__") {
+                        let inner = Self::escape_html(&line[i+2..i+2+end]);
+                        line_out.push_str(&format!("<b>{inner}</b>"));
+                        i += 4 + end;
+                        continue;
+                    }
+                }
+                // Italic: *text* or _text_ (single)
+                if bytes[i] == b'*' && (i == 0 || bytes[i-1] != b'*') {
+                    if let Some(end) = line[i+1..].find('*') {
+                        if end > 0 {
+                            let inner = Self::escape_html(&line[i+1..i+1+end]);
+                            line_out.push_str(&format!("<i>{inner}</i>"));
+                            i += 2 + end;
+                            continue;
+                        }
+                    }
+                }
+                // Inline code: `code`
+                if bytes[i] == b'`' && (i == 0 || bytes[i-1] != b'`') {
+                    if let Some(end) = line[i+1..].find('`') {
+                        let inner = Self::escape_html(&line[i+1..i+1+end]);
+                        line_out.push_str(&format!("<code>{inner}</code>"));
+                        i += 2 + end;
+                        continue;
+                    }
+                }
+                // Markdown link: [text](url)
+                if bytes[i] == b'[' {
+                    if let Some(bracket_end) = line[i+1..].find(']') {
+                        let text_part = &line[i+1..i+1+bracket_end];
+                        let after_bracket = i + 1 + bracket_end + 1; // position after ']'
+                        if after_bracket < len && bytes[after_bracket] == b'(' {
+                            if let Some(paren_end) = line[after_bracket+1..].find(')') {
+                                let url = &line[after_bracket+1..after_bracket+1+paren_end];
+                                if url.starts_with("http://") || url.starts_with("https://") {
+                                    let text_html = Self::escape_html(text_part);
+                                    let url_html = Self::escape_html(url);
+                                    line_out.push_str(&format!("<a href=\"{url_html}\">{text_html}</a>"));
+                                    i = after_bracket + 1 + paren_end + 1;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+                // Strikethrough: ~~text~~
+                if i + 1 < len && bytes[i] == b'~' && bytes[i+1] == b'~' {
+                    if let Some(end) = line[i+2..].find("~~") {
+                        let inner = Self::escape_html(&line[i+2..i+2+end]);
+                        line_out.push_str(&format!("<s>{inner}</s>"));
+                        i += 4 + end;
+                        continue;
+                    }
+                }
+                // Default: escape HTML entities
+                let ch = line[i..].chars().next().unwrap();
+                match ch {
+                    '<' => line_out.push_str("&lt;"),
+                    '>' => line_out.push_str("&gt;"),
+                    '&' => line_out.push_str("&amp;"),
+                    _ => line_out.push(ch),
+                }
+                i += ch.len_utf8();
+            }
+            result_lines.push(line_out);
+        }
+
+        // Second pass: handle ``` code blocks across lines
+        let joined = result_lines.join("\n");
+        let mut final_out = String::with_capacity(joined.len());
+        let mut in_code_block = false;
+        let mut code_lang = String::new();
+        let mut code_buf = String::new();
+
+        for line in joined.split('\n') {
+            let trimmed = line.trim();
+            if trimmed.starts_with("```") {
+                if !in_code_block {
+                    in_code_block = true;
+                    code_lang = trimmed.trim_start_matches('`').to_string();
+                    code_buf.clear();
+                } else {
+                    in_code_block = false;
+                    let escaped = code_buf.trim_end_matches('\n');
+                    if !code_lang.is_empty() {
+                        final_out.push_str(&format!("<pre><code class=\"language-{code_lang}\">{escaped}</code></pre>\n"));
+                    } else {
+                        final_out.push_str(&format!("<pre>{escaped}</pre>\n"));
+                    }
+                    code_lang.clear();
+                    code_buf.clear();
+                }
+            } else if in_code_block {
+                code_buf.push_str(line);
+                code_buf.push('\n');
+            } else {
+                final_out.push_str(line);
+                final_out.push('\n');
+            }
+        }
+        if in_code_block && !code_buf.is_empty() {
+            final_out.push_str(&format!("<pre>{}</pre>\n", code_buf.trim_end()));
+        }
+
+        final_out.trim_end_matches('\n').to_string()
+    }
+
+    fn escape_html(s: &str) -> String {
+        s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    }
+
     async fn send_text_chunks(
         &self,
         message: &str,
@@ -934,8 +1081,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
             let mut markdown_body = serde_json::json!({
                 "chat_id": chat_id,
-                "text": text,
-                "parse_mode": "Markdown"
+                "text": Self::markdown_to_telegram_html(&text),
+                "parse_mode": "HTML"
             });
 
             // Add message_thread_id for forum topic support
@@ -1671,12 +1818,12 @@ impl Channel for TelegramChannel {
             }
         };
 
-        // Try editing with Markdown formatting
+        // Try editing with HTML formatting
         let body = serde_json::json!({
             "chat_id": chat_id,
             "message_id": msg_id,
-            "text": text,
-            "parse_mode": "Markdown",
+            "text": Self::markdown_to_telegram_html(text),
+            "parse_mode": "HTML",
         });
 
         let resp = self

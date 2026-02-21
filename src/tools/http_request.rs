@@ -371,6 +371,10 @@ fn extract_host(url: &str) -> anyhow::Result<String> {
 }
 
 fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
+    // "*" means allow all domains
+    if allowed_domains.iter().any(|d| d == "*") {
+        return true;
+    }
     allowed_domains.iter().any(|domain| {
         host == domain
             || host
