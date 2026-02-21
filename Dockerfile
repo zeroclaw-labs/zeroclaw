@@ -73,18 +73,28 @@ host = "0.0.0.0"
 allow_public_bind = true
 EOF
 
-# ── Stage 3: Production Runtime (Distroless) ─────────────────
-FROM gcr.io/distroless/cc-debian12:nonroot AS release
+# ── Stage 3: Production Runtime (Debian Trixie) ──────────────
+# 使用 Trixie 版本以匹配 GLIBC 2.39
+FROM debian:trixie-slim AS release
 
+# 安装运行时必要的库（如 SSL 和 CA 证书）
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# 从编译阶段拷贝二进制文件
 COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
 COPY --from=builder /zeroclaw-data /zeroclaw-data
 
+# 环境配置
 ENV ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace
 ENV HOME=/zeroclaw-data
 ENV ZEROCLAW_GATEWAY_PORT=8080
 
-WORKDIR /zeroclaw-data
+# 切换到非 root 用户以保证安全
 USER 65534:65534
+WORKDIR /zeroclaw-data
 EXPOSE 8080
 ENTRYPOINT ["zeroclaw"]
 CMD ["gateway"]
