@@ -374,7 +374,7 @@ Voir [Référence des Commandes](docs/commands-reference.md) pour les options et
 - Le runtime abstrait l'exécution de code (natif ou Docker)
 - Aucun verrouillage de fournisseur — échangez Anthropic ↔ OpenAI ↔ Gemini ↔ Ollama sans changement de code
 
-Voir [documentation architecture](docs/architecture.md) pour les diagrammes détaillés et les détails d'implémentation.
+Voir [documentation architecture](docs/architecture.svg) pour les diagrammes détaillés et les détails d'implémentation.
 
 ## Exemples
 
@@ -710,7 +710,7 @@ Utilisateur : Utilise la compétence recherche-web pour trouver les dernières a
 Bot : [charge la compétence recherche-web, exécute web_fetch, résume les résultats]
 ```
 
-Voir [Guide des Compétences](docs/skills-guide.md) pour les instructions de création de compétences complètes.
+Voir la section [Compétences (Skills)](#compétences-skills) pour les instructions de création de compétences complètes.
 
 ## Open Skills
 
