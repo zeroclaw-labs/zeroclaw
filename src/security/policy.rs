@@ -477,6 +477,51 @@ fn contains_unquoted_shell_variable_expansion(command: &str) -> bool {
     false
 }
 
+fn strip_wrapping_quotes(token: &str) -> &str {
+    token.trim_matches(|c| c == '"' || c == '\'')
+}
+
+fn looks_like_path(candidate: &str) -> bool {
+    candidate.starts_with('/')
+        || candidate.starts_with("./")
+        || candidate.starts_with("../")
+        || candidate.starts_with('~')
+        || candidate == "."
+        || candidate == ".."
+        || candidate.contains('/')
+}
+
+fn attached_short_option_value(token: &str) -> Option<&str> {
+    // Examples:
+    // -f/etc/passwd   -> /etc/passwd
+    // -C../outside    -> ../outside
+    // -I./include     -> ./include
+    let body = token.strip_prefix('-')?;
+    if body.starts_with('-') || body.len() < 2 {
+        return None;
+    }
+    let value = body[1..].trim_start_matches('=').trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn redirection_target(token: &str) -> Option<&str> {
+    let marker_idx = token.find(['<', '>'])?;
+    let mut rest = &token[marker_idx + 1..];
+    rest = rest.trim_start_matches(['<', '>']);
+    rest = rest.trim_start_matches('&');
+    rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+    let trimmed = rest.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
 impl SecurityPolicy {
     // ── Risk Classification ──────────────────────────────────────────────
     // Risk is assessed per-segment (split on shell operators), and the
@@ -648,7 +693,7 @@ impl SecurityPolicy {
     /// - Splits on command separators (`|`, `&&`, `||`, `;`, newlines) and
     ///   validates each sub-command against the allowlist
     /// - Blocks single `&` background chaining (`&&` remains supported)
-    /// - Blocks output redirections (`>`, `>>`) that could write outside workspace
+    /// - Blocks shell redirections (`<`, `>`, `>>`) that can bypass path policy
     /// - Blocks dangerous arguments (e.g. `find -exec`, `git config`)
     pub fn is_command_allowed(&self, command: &str) -> bool {
         if self.autonomy == AutonomyLevel::ReadOnly {
@@ -668,9 +713,10 @@ impl SecurityPolicy {
             return false;
         }
 
-        // Block output redirections (`>`, `>>`) — they can write to arbitrary paths.
-        // Ignore quoted literals, e.g. `echo "a>b"`.
-        if contains_unquoted_char(command, '>') {
+        // Block shell redirections (`<`, `>`, `>>`) — they can read/write
+        // arbitrary paths and bypass path checks.
+        // Ignore quoted literals, e.g. `echo "a>b"` and `echo "a<b"`.
+        if contains_unquoted_char(command, '>') || contains_unquoted_char(command, '<') {
             return false;
         }
 
@@ -750,6 +796,73 @@ impl SecurityPolicy {
         }
     }
 
+    /// Return the first path-like argument blocked by path policy.
+    ///
+    /// This is best-effort token parsing for shell commands and is intended
+    /// as a safety gate before command execution.
+    pub fn forbidden_path_argument(&self, command: &str) -> Option<String> {
+        let forbidden_candidate = |raw: &str| {
+            let candidate = strip_wrapping_quotes(raw).trim();
+            if candidate.is_empty() || candidate.contains("://") {
+                return None;
+            }
+            if looks_like_path(candidate) && !self.is_path_allowed(candidate) {
+                Some(candidate.to_string())
+            } else {
+                None
+            }
+        };
+
+        for segment in split_unquoted_segments(command) {
+            let cmd_part = skip_env_assignments(&segment);
+            let mut words = cmd_part.split_whitespace();
+            let Some(executable) = words.next() else {
+                continue;
+            };
+
+            // Cover inline forms like `cat</etc/passwd`.
+            if let Some(target) = redirection_target(strip_wrapping_quotes(executable)) {
+                if let Some(blocked) = forbidden_candidate(target) {
+                    return Some(blocked);
+                }
+            }
+
+            for token in words {
+                let candidate = strip_wrapping_quotes(token).trim();
+                if candidate.is_empty() || candidate.contains("://") {
+                    continue;
+                }
+
+                if let Some(target) = redirection_target(candidate) {
+                    if let Some(blocked) = forbidden_candidate(target) {
+                        return Some(blocked);
+                    }
+                }
+
+                // Handle option assignment forms like `--file=/etc/passwd`.
+                if candidate.starts_with('-') {
+                    if let Some((_, value)) = candidate.split_once('=') {
+                        if let Some(blocked) = forbidden_candidate(value) {
+                            return Some(blocked);
+                        }
+                    }
+                    if let Some(value) = attached_short_option_value(candidate) {
+                        if let Some(blocked) = forbidden_candidate(value) {
+                            return Some(blocked);
+                        }
+                    }
+                    continue;
+                }
+
+                if let Some(blocked) = forbidden_candidate(candidate) {
+                    return Some(blocked);
+                }
+            }
+        }
+
+        None
+    }
+
     // ── Path Validation ────────────────────────────────────────────────
     // Layered checks: null-byte injection → component-level traversal →
     // URL-encoded traversal → tilde expansion → absolute-path block →
@@ -774,6 +887,12 @@ impl SecurityPolicy {
         // Block URL-encoded traversal attempts (e.g. ..%2f)
         let lower = path.to_lowercase();
         if lower.contains("..%2f") || lower.contains("%2f..") {
+            return false;
+        }
+
+        // Reject "~user" forms because the shell expands them at runtime and
+        // they can escape workspace policy.
+        if path.starts_with('~') && path != "~" && !path.starts_with("~/") {
             return false;
         }
 
@@ -1475,6 +1594,8 @@ mod tests {
         let p = default_policy();
         assert!(!p.is_command_allowed("echo secret > /etc/crontab"));
         assert!(!p.is_command_allowed("ls >> /tmp/exfil.txt"));
+        assert!(!p.is_command_allowed("cat </etc/passwd"));
+        assert!(!p.is_command_allowed("cat</etc/passwd"));
     }
 
     #[test]
@@ -1482,6 +1603,7 @@ mod tests {
         let p = default_policy();
         assert!(p.is_command_allowed("echo \"A&B\""));
         assert!(p.is_command_allowed("echo \"A>B\""));
+        assert!(p.is_command_allowed("echo \"A<B\""));
     }
 
     #[test]
@@ -1538,6 +1660,106 @@ mod tests {
         assert!(!p.is_command_allowed("FOO=bar rm -rf /"));
     }
 
+    #[test]
+    fn forbidden_path_argument_detects_absolute_path() {
+        let p = default_policy();
+        assert_eq!(
+            p.forbidden_path_argument("cat /etc/passwd"),
+            Some("/etc/passwd".into())
+        );
+    }
+
+    #[test]
+    fn forbidden_path_argument_detects_parent_dir_reference() {
+        let p = default_policy();
+        assert_eq!(
+            p.forbidden_path_argument("cat ../secret.txt"),
+            Some("../secret.txt".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("find .. -name '*.rs'"),
+            Some("..".into())
+        );
+    }
+
+    #[test]
+    fn forbidden_path_argument_allows_workspace_relative_paths() {
+        let p = default_policy();
+        assert_eq!(p.forbidden_path_argument("cat src/main.rs"), None);
+        assert_eq!(p.forbidden_path_argument("grep -r todo ./src"), None);
+    }
+
+    #[test]
+    fn forbidden_path_argument_detects_option_assignment_paths() {
+        let p = default_policy();
+        assert_eq!(
+            p.forbidden_path_argument("grep --file=/etc/passwd root ./src"),
+            Some("/etc/passwd".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("cat --input=../secret.txt"),
+            Some("../secret.txt".into())
+        );
+    }
+
+    #[test]
+    fn forbidden_path_argument_allows_safe_option_assignment_paths() {
+        let p = default_policy();
+        assert_eq!(
+            p.forbidden_path_argument("grep --file=./patterns.txt root ./src"),
+            None
+        );
+    }
+
+    #[test]
+    fn forbidden_path_argument_detects_short_option_attached_paths() {
+        let p = default_policy();
+        assert_eq!(
+            p.forbidden_path_argument("grep -f/etc/passwd root ./src"),
+            Some("/etc/passwd".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("git -C../outside status"),
+            Some("../outside".into())
+        );
+    }
+
+    #[test]
+    fn forbidden_path_argument_allows_safe_short_option_attached_paths() {
+        let p = default_policy();
+        assert_eq!(
+            p.forbidden_path_argument("grep -f./patterns.txt root ./src"),
+            None
+        );
+        assert_eq!(p.forbidden_path_argument("git -C./repo status"), None);
+    }
+
+    #[test]
+    fn forbidden_path_argument_detects_tilde_user_paths() {
+        let p = default_policy();
+        assert_eq!(
+            p.forbidden_path_argument("cat ~root/.ssh/id_rsa"),
+            Some("~root/.ssh/id_rsa".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("ls ~nobody"),
+            Some("~nobody".into())
+        );
+    }
+
+    #[test]
+    fn forbidden_path_argument_detects_input_redirection_paths() {
+        let p = default_policy();
+        assert_eq!(
+            p.forbidden_path_argument("cat </etc/passwd"),
+            Some("/etc/passwd".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("cat</etc/passwd"),
+            Some("/etc/passwd".into())
+        );
+    }
+
     // ── Edge cases: path traversal ──────────────────────────
 
     #[test]
@@ -1577,6 +1799,8 @@ mod tests {
         };
         assert!(!p.is_path_allowed("~/.ssh/id_rsa"));
         assert!(!p.is_path_allowed("~/.gnupg/secring.gpg"));
+        assert!(!p.is_path_allowed("~root/.ssh/id_rsa"));
+        assert!(!p.is_path_allowed("~nobody"));
     }
 
     #[test]

@@ -23,64 +23,6 @@ pub struct ShellTool {
     runtime: Arc<dyn RuntimeAdapter>,
 }
 
-fn is_env_assignment(word: &str) -> bool {
-    word.contains('=')
-        && word
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-}
-
-fn strip_wrapping_quotes(token: &str) -> &str {
-    token.trim_matches(|c| c == '"' || c == '\'')
-}
-
-fn forbidden_path_argument(security: &SecurityPolicy, command: &str) -> Option<String> {
-    let mut normalized = command.to_string();
-    for sep in ["&&", "||"] {
-        normalized = normalized.replace(sep, "\x00");
-    }
-    for sep in ['\n', ';', '|'] {
-        normalized = normalized.replace(sep, "\x00");
-    }
-
-    for segment in normalized.split('\x00') {
-        let tokens: Vec<&str> = segment.split_whitespace().collect();
-        if tokens.is_empty() {
-            continue;
-        }
-
-        // Skip leading env assignments and executable token.
-        let mut idx = 0;
-        while idx < tokens.len() && is_env_assignment(tokens[idx]) {
-            idx += 1;
-        }
-        if idx >= tokens.len() {
-            continue;
-        }
-        idx += 1;
-
-        for token in &tokens[idx..] {
-            let candidate = strip_wrapping_quotes(token);
-            if candidate.is_empty() || candidate.starts_with('-') || candidate.contains("://") {
-                continue;
-            }
-
-            let looks_like_path = candidate.starts_with('/')
-                || candidate.starts_with("./")
-                || candidate.starts_with("../")
-                || candidate.starts_with("~/")
-                || candidate.contains('/');
-
-            if looks_like_path && !security.is_path_allowed(candidate) {
-                return Some(candidate.to_string());
-            }
-        }
-    }
-
-    None
-}
-
 impl ShellTool {
     pub fn new(security: Arc<SecurityPolicy>, runtime: Arc<dyn RuntimeAdapter>) -> Self {
         Self { security, runtime }
@@ -172,7 +114,7 @@ impl Tool for ShellTool {
             }
         }
 
-        if let Some(path) = forbidden_path_argument(&self.security, command) {
+        if let Some(path) = self.security.forbidden_path_argument(command) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -375,6 +317,66 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("Path blocked"));
+    }
+
+    #[tokio::test]
+    async fn shell_blocks_option_assignment_path_argument() {
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let result = tool
+            .execute(json!({"command": "grep --file=/etc/passwd root ./src"}))
+            .await
+            .expect("option-assigned forbidden path should be blocked");
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Path blocked"));
+    }
+
+    #[tokio::test]
+    async fn shell_blocks_short_option_attached_path_argument() {
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let result = tool
+            .execute(json!({"command": "grep -f/etc/passwd root ./src"}))
+            .await
+            .expect("short option attached forbidden path should be blocked");
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Path blocked"));
+    }
+
+    #[tokio::test]
+    async fn shell_blocks_tilde_user_path_argument() {
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let result = tool
+            .execute(json!({"command": "cat ~root/.ssh/id_rsa"}))
+            .await
+            .expect("tilde-user path should be blocked");
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Path blocked"));
+    }
+
+    #[tokio::test]
+    async fn shell_blocks_input_redirection_path_bypass() {
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let result = tool
+            .execute(json!({"command": "cat </etc/passwd"}))
+            .await
+            .expect("input redirection bypass should be blocked");
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("not allowed"));
     }
 
     fn test_security_with_env_cmd() -> Arc<SecurityPolicy> {

@@ -360,64 +360,6 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
     Ok(())
 }
 
-fn is_env_assignment(word: &str) -> bool {
-    word.contains('=')
-        && word
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-}
-
-fn strip_wrapping_quotes(token: &str) -> &str {
-    token.trim_matches(|c| c == '"' || c == '\'')
-}
-
-fn forbidden_path_argument(security: &SecurityPolicy, command: &str) -> Option<String> {
-    let mut normalized = command.to_string();
-    for sep in ["&&", "||"] {
-        normalized = normalized.replace(sep, "\x00");
-    }
-    for sep in ['\n', ';', '|'] {
-        normalized = normalized.replace(sep, "\x00");
-    }
-
-    for segment in normalized.split('\x00') {
-        let tokens: Vec<&str> = segment.split_whitespace().collect();
-        if tokens.is_empty() {
-            continue;
-        }
-
-        // Skip leading env assignments and executable token.
-        let mut idx = 0;
-        while idx < tokens.len() && is_env_assignment(tokens[idx]) {
-            idx += 1;
-        }
-        if idx >= tokens.len() {
-            continue;
-        }
-        idx += 1;
-
-        for token in &tokens[idx..] {
-            let candidate = strip_wrapping_quotes(token);
-            if candidate.is_empty() || candidate.starts_with('-') || candidate.contains("://") {
-                continue;
-            }
-
-            let looks_like_path = candidate.starts_with('/')
-                || candidate.starts_with("./")
-                || candidate.starts_with("../")
-                || candidate.starts_with("~/")
-                || candidate.contains('/');
-
-            if looks_like_path && !security.is_path_allowed(candidate) {
-                return Some(candidate.to_string());
-            }
-        }
-    }
-
-    None
-}
-
 async fn run_job_command(
     config: &Config,
     security: &SecurityPolicy,
@@ -462,7 +404,7 @@ async fn run_job_command_with_timeout(
         );
     }
 
-    if let Some(path) = forbidden_path_argument(security, &job.command) {
+    if let Some(path) = security.forbidden_path_argument(&job.command) {
         return (
             false,
             format!("blocked by security policy: forbidden path argument: {path}"),
@@ -627,6 +569,65 @@ mod tests {
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("forbidden path argument"));
         assert!(output.contains("/etc/passwd"));
+    }
+
+    #[tokio::test]
+    async fn run_job_command_blocks_forbidden_option_assignment_path_argument() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.allowed_commands = vec!["grep".into()];
+        let job = test_job("grep --file=/etc/passwd root ./src");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(!success);
+        assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("forbidden path argument"));
+        assert!(output.contains("/etc/passwd"));
+    }
+
+    #[tokio::test]
+    async fn run_job_command_blocks_forbidden_short_option_attached_path_argument() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.allowed_commands = vec!["grep".into()];
+        let job = test_job("grep -f/etc/passwd root ./src");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(!success);
+        assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("forbidden path argument"));
+        assert!(output.contains("/etc/passwd"));
+    }
+
+    #[tokio::test]
+    async fn run_job_command_blocks_tilde_user_path_argument() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.allowed_commands = vec!["cat".into()];
+        let job = test_job("cat ~root/.ssh/id_rsa");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(!success);
+        assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("forbidden path argument"));
+        assert!(output.contains("~root/.ssh/id_rsa"));
+    }
+
+    #[tokio::test]
+    async fn run_job_command_blocks_input_redirection_path_bypass() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.allowed_commands = vec!["cat".into()];
+        let job = test_job("cat </etc/passwd");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(!success);
+        assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("command not allowed"));
     }
 
     #[tokio::test]
