@@ -11,7 +11,7 @@ pub struct ClawHubSkill {
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default)]
-    pub stars: i32,
+    pub stars: u32,
     pub version: String,
     #[serde(default)]
     pub github_url: Option<String>,
@@ -23,7 +23,7 @@ pub struct ClawHubSkill {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     pub skills: Vec<ClawHubSkill>,
-    pub total: i32,
+    pub total: u32,
 }
 
 /// Local registry entry for installed clawhub skill
