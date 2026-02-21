@@ -1226,26 +1226,50 @@ impl Provider for GeminiProvider {
 
     async fn warmup(&self) -> anyhow::Result<()> {
         if let Some(auth) = self.auth.as_ref() {
-            // cloudcode-pa does not expose a lightweight model-list probe like the public API.
-            // Avoid false negatives for valid Gemini CLI OAuth credentials.
-            if auth.is_oauth() {
-                return Ok(());
+            match auth {
+                GeminiAuth::ManagedOAuth => {
+                    // For ManagedOAuth, verify and refresh the token if needed.
+                    // This ensures fallback works even if tokens expired during daemon uptime.
+                    let auth_service = self
+                        .auth_service
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("ManagedOAuth requires auth_service"))?;
+
+                    let _token = auth_service
+                        .get_valid_gemini_access_token(self.auth_profile_override.as_deref())
+                        .await?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Gemini auth profile not found or expired. Run: zeroclaw auth login --provider gemini"
+                            )
+                        })?;
+
+                    // Token refresh happens in get_valid_gemini_access_token().
+                    // We don't call resolve_oauth_project() here to keep warmup fast.
+                    // OAuth project will be resolved lazily on first real request.
+                }
+                GeminiAuth::OAuthToken(_) => {
+                    // CLI OAuth — cloudcode-pa does not expose a lightweight model-list probe.
+                    // Token will be validated on first real request.
+                }
+                _ => {
+                    // API key path — verify with public API models endpoint.
+                    let url = if auth.is_api_key() {
+                        format!(
+                            "https://generativelanguage.googleapis.com/v1beta/models?key={}",
+                            auth.api_key_credential()
+                        )
+                    } else {
+                        "https://generativelanguage.googleapis.com/v1beta/models".to_string()
+                    };
+
+                    self.http_client()
+                        .get(&url)
+                        .send()
+                        .await?
+                        .error_for_status()?;
+                }
             }
-
-            let url = if auth.is_api_key() {
-                format!(
-                    "https://generativelanguage.googleapis.com/v1beta/models?key={}",
-                    auth.api_key_credential()
-                )
-            } else {
-                "https://generativelanguage.googleapis.com/v1beta/models".to_string()
-            };
-
-            self.http_client()
-                .get(&url)
-                .send()
-                .await?
-                .error_for_status()?;
         }
         Ok(())
     }
@@ -1940,5 +1964,34 @@ mod tests {
         let json = r#"{"candidates": [{"content": {"parts": [{"text": "Hello"}]}}]}"#;
         let resp: GenerateContentResponse = serde_json::from_str(json).unwrap();
         assert!(resp.usage_metadata.is_none());
+    }
+
+    /// Validates that warmup() for ManagedOAuth requires auth_service.
+    #[tokio::test]
+    async fn warmup_managed_oauth_requires_auth_service() {
+        let provider = GeminiProvider {
+            auth: Some(GeminiAuth::ManagedOAuth),
+            oauth_project: Arc::new(tokio::sync::Mutex::new(None)),
+            oauth_cred_paths: Vec::new(),
+            oauth_index: Arc::new(tokio::sync::Mutex::new(0)),
+            auth_service: None, // Missing auth_service
+            auth_profile_override: None,
+        };
+
+        let result = provider.warmup().await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("ManagedOAuth requires auth_service"));
+    }
+
+    /// Validates that warmup() for CLI OAuth skips validation (existing behavior).
+    #[tokio::test]
+    async fn warmup_cli_oauth_skips_validation() {
+        let provider = test_provider(Some(test_oauth_auth("fake_token")));
+        let result = provider.warmup().await;
+        // Should succeed without making HTTP requests
+        assert!(result.is_ok());
     }
 }
