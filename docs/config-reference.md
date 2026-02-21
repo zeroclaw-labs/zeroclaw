@@ -123,6 +123,13 @@ gated_domain_categories = ["banking"]
 | `enabled` | `false` | Enable emergency-stop state machine and CLI |
 | `state_file` | `~/.zeroclaw/estop-state.json` | Persistent estop state path |
 | `require_otp_to_resume` | `true` | Require OTP validation before resume operations |
+| `auto_triggers.enabled` | `true` | Enable runtime auto-trigger evaluation for estop engagement |
+| `auto_triggers.failed_gated_attempts_threshold` | `3` | More than this many denied OTP-gated attempts in the window auto-engages domain-block |
+| `auto_triggers.failed_gated_attempts_window_secs` | `60` | Sliding window size for denied OTP-gated attempts |
+| `auto_triggers.tool_call_rate_limit` | `30` | More than this many tool calls in the window auto-engages tool-freeze |
+| `auto_triggers.tool_call_rate_window_secs` | `60` | Sliding window size for tool-call-rate trigger |
+| `auto_triggers.block_on_unknown_domain` | `false` | Auto-engage network-kill when a requested domain is outside known allowlists |
+| `auto_triggers.notify_on_auto_trigger` | `true` | Include operator-facing notification metadata (reason, targets, resume hint) when trigger fires |
 
 Notes:
 
@@ -132,6 +139,78 @@ Notes:
 - During tool execution, estop checks run before approval prompts and OTP checks.
 - `network-kill` blocks known network tools and `shell` commands that match network-oriented patterns (for example `curl`, `wget`, `ssh`, `scp`, `ftp`, `ping`).
 - `domain-block` is enforced on browser target domains after URL validation/allowlist checks.
+- Auto-trigger counters are in-memory only (reset on daemon restart); estop engagement state remains file-persisted.
+- Auto-trigger decisions emit structured security events (`estop.auto_trigger`, `estop.engaged`) through the observer pipeline and security audit log.
+- Manual CLI estop actions emit structured security events (`estop.engaged`, `estop.resumed`, `estop.resume_denied`) to observability and audit logs.
+
+Example:
+
+```toml
+[security.estop]
+enabled = true
+state_file = "~/.zeroclaw/estop-state.json"
+require_otp_to_resume = true
+
+[security.estop.auto_triggers]
+enabled = true
+failed_gated_attempts_threshold = 3
+failed_gated_attempts_window_secs = 60
+tool_call_rate_limit = 30
+tool_call_rate_window_secs = 60
+block_on_unknown_domain = false
+notify_on_auto_trigger = true
+```
+
+## `[security.estop.auto_triggers]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `true` | Enable automatic estop engagement based on runtime thresholds |
+| `failed_gated_attempts_threshold` | `3` | Failed OTP-gated attempts required before domain auto-block |
+| `failed_gated_attempts_window_secs` | `60` | Sliding window for failed OTP-gated attempts |
+| `tool_call_rate_limit` | `30` | Tool calls allowed before auto `tool-freeze` triggers |
+| `tool_call_rate_window_secs` | `60` | Sliding window for tool-call-rate protection |
+| `block_on_unknown_domain` | `false` | When true, unknown domains auto-engage `network-kill` |
+| `notify_on_auto_trigger` | `true` | Include operator-facing resume hint in trigger payloads/messages |
+
+Notes:
+
+- Thresholds are edge-triggered: estop is engaged when the observed count becomes greater than the threshold inside the configured window.
+- Trigger mappings are fixed:
+  - Failed gated attempts -> `domain-block` (offending domain)
+  - Tool-call burst -> `tool-freeze` (normalized gated tool set)
+  - Unknown domain (opt-in) -> `network-kill`
+- Auto-trigger counters are in-memory only and reset on daemon restart.
+- Estop engagement state remains persisted in `[security.estop].state_file`.
+- Unknown-domain evaluation uses known domains from `browser.allowed_domains` plus `security.otp` domain settings.
+
+Example:
+
+```toml
+[security.estop.auto_triggers]
+enabled = true
+failed_gated_attempts_threshold = 3
+failed_gated_attempts_window_secs = 60
+tool_call_rate_limit = 30
+tool_call_rate_window_secs = 60
+block_on_unknown_domain = false
+notify_on_auto_trigger = true
+```
+
+## `[security.audit]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `true` | Enable JSONL security/runtime audit logging |
+| `log_path` | `audit.log` | Audit log path (resolved relative to config directory unless absolute) |
+| `max_size_mb` | `100` | Rotation threshold in MB |
+| `sign_events` | `false` | Reserved tamper-evidence toggle |
+
+Notes:
+
+- Audit entries are written as one JSON object per line.
+- Rotation files are named `audit.log.1.log` ... `audit.log.10.log`.
+- `zeroclaw security log` reads both the active file and rotated files.
 
 ## `[agents.<name>]`
 

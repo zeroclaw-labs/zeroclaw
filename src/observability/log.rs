@@ -83,6 +83,13 @@ impl Observer for LogObserver {
                     "llm.response"
                 );
             }
+            ObserverEvent::SecurityEvent(security_event) => {
+                info!(
+                    event = %security_event.name,
+                    payload = %security_event.payload,
+                    "security.event"
+                );
+            }
         }
     }
 
@@ -176,6 +183,12 @@ mod tests {
             component: "provider".into(),
             message: "timeout".into(),
         });
+        obs.record_event(&ObserverEvent::SecurityEvent(
+            crate::observability::SecurityEvent {
+                name: "estop.auto_trigger".into(),
+                payload: serde_json::json!({"trigger_type": "tool_call_rate"}),
+            },
+        ));
     }
 
     #[test]

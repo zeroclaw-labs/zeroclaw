@@ -1,5 +1,14 @@
 use std::time::Duration;
 
+/// Structured security event emitted by OTP/estop flows.
+#[derive(Debug, Clone)]
+pub struct SecurityEvent {
+    /// Canonical event name, for example: `otp.prompt_sent`.
+    pub name: String,
+    /// Event payload (must never include OTP codes or secrets).
+    pub payload: serde_json::Value,
+}
+
 /// Discrete events emitted by the agent runtime for observability.
 ///
 /// Each variant represents a lifecycle event that observers can record,
@@ -65,6 +74,8 @@ pub enum ObserverEvent {
         /// Human-readable error description. Must not contain secrets or tokens.
         message: String,
     },
+    /// Security signal from OTP/estop runtime.
+    SecurityEvent(SecurityEvent),
 }
 
 /// Numeric metrics emitted by the agent runtime.
@@ -167,9 +178,13 @@ mod tests {
             component: "test".into(),
             message: "boom".into(),
         });
+        observer.record_event(&ObserverEvent::SecurityEvent(SecurityEvent {
+            name: "otp.prompt_sent".into(),
+            payload: serde_json::json!({"tool": "shell"}),
+        }));
         observer.record_metric(&ObserverMetric::TokensUsed(42));
 
-        assert_eq!(*observer.events.lock(), 2);
+        assert_eq!(*observer.events.lock(), 3);
         assert_eq!(*observer.metrics.lock(), 1);
     }
 
@@ -189,12 +204,18 @@ mod tests {
             duration: Duration::from_millis(10),
             success: true,
         };
+        let security_event = ObserverEvent::SecurityEvent(SecurityEvent {
+            name: "estop.auto_trigger".into(),
+            payload: serde_json::json!({"trigger_type": "tool_call_rate"}),
+        });
         let metric = ObserverMetric::RequestLatency(Duration::from_millis(8));
 
         let cloned_event = event.clone();
+        let cloned_security = security_event.clone();
         let cloned_metric = metric.clone();
 
         assert!(matches!(cloned_event, ObserverEvent::ToolCall { .. }));
+        assert!(matches!(cloned_security, ObserverEvent::SecurityEvent(_)));
         assert!(matches!(cloned_metric, ObserverMetric::RequestLatency(_)));
     }
 }

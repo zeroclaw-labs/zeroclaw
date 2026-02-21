@@ -36,7 +36,8 @@ use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use dialoguer::{Input, Password};
 use serde::{Deserialize, Serialize};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -115,6 +116,14 @@ enum EstopLevelArg {
     DomainBlock,
     #[value(name = "tool-freeze")]
     ToolFreeze,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum SecurityLogTypeArg {
+    #[value(name = "estop")]
+    Estop,
+    #[value(name = "otp")]
+    Otp,
 }
 
 /// `ZeroClaw` - Zero overhead. Zero compromise. 100% Rust.
@@ -292,6 +301,12 @@ Examples:
         tools: Vec<String>,
     },
 
+    /// Inspect OTP/estop security audit events.
+    Security {
+        #[command(subcommand)]
+        security_command: SecurityCommands,
+    },
+
     /// Configure and manage scheduled tasks
     #[command(long_about = "\
 Configure and manage scheduled tasks.
@@ -461,6 +476,25 @@ Examples:
 enum ConfigCommands {
     /// Dump the full configuration JSON Schema to stdout
     Schema,
+}
+
+#[derive(Subcommand, Debug)]
+enum SecurityCommands {
+    /// Show recent security events from the audit log.
+    Log {
+        /// Maximum number of entries to print (most recent first after filtering).
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Filter event family (`otp` or `estop`).
+        #[arg(long = "type", value_enum)]
+        event_type: Option<SecurityLogTypeArg>,
+        /// Time window filter (for example: `15m`, `1h`, `2d`).
+        #[arg(long)]
+        since: Option<String>,
+        /// Print JSON array output instead of human-readable lines.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -870,6 +904,10 @@ async fn main() -> Result<()> {
             tools,
         } => handle_estop_command(&config, estop_command, level, domains, tools),
 
+        Commands::Security { security_command } => {
+            handle_security_command(&config, security_command)
+        }
+
         Commands::Cron { cron_command } => cron::handle_command(cron_command, &config),
 
         Commands::Models { model_command } => match model_command {
@@ -986,6 +1024,9 @@ fn handle_estop_command(
         .parent()
         .context("Config path must have a parent directory")?;
     let mut manager = security::EstopManager::load(&config.security.estop, config_dir)?;
+    let observer = observability::create_observer(&config.observability);
+    let audit_logger =
+        security::AuditLogger::new(config.security.audit.clone(), config_dir.into())?;
 
     match estop_command {
         Some(EstopSubcommands::Status) => {
@@ -999,6 +1040,7 @@ fn handle_estop_command(
             otp,
         }) => {
             let selector = build_resume_selector(network, domains, tools)?;
+            let selector_for_event = selector.clone();
             let mut otp_code = otp;
             let otp_validator = if config.security.estop.require_otp_to_resume {
                 if !config.security.otp.enabled {
@@ -1026,18 +1068,356 @@ fn handle_estop_command(
                 None
             };
 
-            manager.resume(selector, otp_code.as_deref(), otp_validator.as_ref())?;
+            if let Err(err) = manager.resume(selector, otp_code.as_deref(), otp_validator.as_ref())
+            {
+                let reason = err.to_string();
+                emit_security_event_for_command(
+                    observer.as_ref(),
+                    Some(&audit_logger),
+                    "estop.resume_denied",
+                    serde_json::json!({
+                        "source": "cli",
+                        "level": resume_selector_name(&selector_for_event),
+                        "targets": resume_selector_targets(&selector_for_event),
+                        "operator_id": serde_json::Value::Null,
+                        "reason": reason,
+                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                    }),
+                );
+                return Err(err);
+            }
+            emit_security_event_for_command(
+                observer.as_ref(),
+                Some(&audit_logger),
+                "estop.resumed",
+                serde_json::json!({
+                    "source": "cli",
+                    "level": resume_selector_name(&selector_for_event),
+                    "targets": resume_selector_targets(&selector_for_event),
+                    "operator_id": serde_json::Value::Null,
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                }),
+            );
             println!("Estop resume completed.");
             print_estop_status(&manager.status());
             Ok(())
         }
         None => {
             let engage_level = build_engage_level(level, domains, tools)?;
+            let engage_level_for_event = engage_level.clone();
             manager.engage(engage_level)?;
+            emit_security_event_for_command(
+                observer.as_ref(),
+                Some(&audit_logger),
+                "estop.engaged",
+                serde_json::json!({
+                    "source": "cli",
+                    "level": estop_level_name(&engage_level_for_event),
+                    "targets": estop_level_targets(&engage_level_for_event),
+                    "reason": "manual_cli",
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                }),
+            );
             println!("Estop engaged.");
             print_estop_status(&manager.status());
             Ok(())
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct SecurityAuditRecord {
+    timestamp: chrono::DateTime<chrono::Utc>,
+    event_name: String,
+    category: String,
+    payload: serde_json::Value,
+}
+
+fn handle_security_command(config: &Config, security_command: SecurityCommands) -> Result<()> {
+    match security_command {
+        SecurityCommands::Log {
+            limit,
+            event_type,
+            since,
+            json,
+        } => handle_security_log_command(config, limit, event_type, since.as_deref(), json),
+    }
+}
+
+fn handle_security_log_command(
+    config: &Config,
+    limit: usize,
+    event_type: Option<SecurityLogTypeArg>,
+    since: Option<&str>,
+    json_output: bool,
+) -> Result<()> {
+    let config_dir = config
+        .config_path
+        .parent()
+        .context("Config path must have a parent directory")?;
+    let cutoff = since.map(parse_since_cutoff).transpose()?;
+    let base_path = resolve_audit_log_path(config_dir, &config.security.audit.log_path);
+    let audit_paths = collect_audit_log_paths(&base_path);
+    let mut rows = load_security_audit_rows(&audit_paths, cutoff.as_ref(), event_type);
+
+    rows.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+    let limit = limit.max(1);
+    if rows.len() > limit {
+        rows = rows.split_off(rows.len() - limit);
+    }
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&rows).context("Failed to serialize security logs")?
+        );
+        return Ok(());
+    }
+
+    if rows.is_empty() {
+        println!("No matching security events found.");
+        return Ok(());
+    }
+
+    for row in rows {
+        let summary = summarize_security_payload(&row.payload);
+        println!(
+            "{} {} [{}] {}",
+            row.timestamp.to_rfc3339(),
+            row.event_name,
+            row.category,
+            summary
+        );
+    }
+    Ok(())
+}
+
+fn load_security_audit_rows(
+    audit_paths: &[PathBuf],
+    cutoff: Option<&chrono::DateTime<chrono::Utc>>,
+    event_type: Option<SecurityLogTypeArg>,
+) -> Vec<SecurityAuditRecord> {
+    let mut rows = Vec::new();
+    for path in audit_paths {
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(_) => continue,
+        };
+        let reader = BufReader::new(file);
+        for line in reader.lines() {
+            let line = match line {
+                Ok(line) => line,
+                Err(_) => continue,
+            };
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let event = match serde_json::from_str::<security::AuditEvent>(trimmed) {
+                Ok(event) => event,
+                Err(_) => continue,
+            };
+            if !matches!(event.event_type, security::AuditEventType::SecurityEvent) {
+                continue;
+            }
+            if let Some(cutoff) = cutoff {
+                if event.timestamp < *cutoff {
+                    continue;
+                }
+            }
+            let details = event.details.unwrap_or_else(|| serde_json::json!({}));
+            let event_name = details
+                .get("event_name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("security.unknown")
+                .to_string();
+            let category = details
+                .get("category")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string)
+                .unwrap_or_else(|| infer_security_category(&event_name).to_string());
+            if let Some(filter) = event_type {
+                let include = match filter {
+                    SecurityLogTypeArg::Estop => {
+                        category == "estop" || event_name.starts_with("estop.")
+                    }
+                    SecurityLogTypeArg::Otp => category == "otp" || event_name.starts_with("otp."),
+                };
+                if !include {
+                    continue;
+                }
+            }
+            rows.push(SecurityAuditRecord {
+                timestamp: event.timestamp,
+                event_name,
+                category,
+                payload: details
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({})),
+            });
+        }
+    }
+    rows
+}
+
+fn resolve_audit_log_path(config_dir: &Path, raw_path: &str) -> PathBuf {
+    let expanded = shellexpand::tilde(raw_path).into_owned();
+    let candidate = PathBuf::from(expanded);
+    if candidate.is_absolute() {
+        candidate
+    } else {
+        config_dir.join(candidate)
+    }
+}
+
+fn collect_audit_log_paths(base_path: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for i in (1..=10).rev() {
+        let rotated = PathBuf::from(format!("{}.{}.log", base_path.display(), i));
+        if rotated.exists() {
+            paths.push(rotated);
+        }
+    }
+    if base_path.exists() {
+        paths.push(base_path.to_path_buf());
+    }
+    paths
+}
+
+fn infer_security_category(event_name: &str) -> &'static str {
+    if event_name.starts_with("otp.") {
+        "otp"
+    } else if event_name.starts_with("estop.") {
+        "estop"
+    } else {
+        "security"
+    }
+}
+
+fn parse_since_cutoff(raw: &str) -> Result<chrono::DateTime<chrono::Utc>> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        bail!("--since must not be empty");
+    }
+    if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return Ok(ts.with_timezone(&chrono::Utc));
+    }
+
+    let split = raw
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(raw.len());
+    let (num, unit) = raw.split_at(split);
+    let amount: i64 = num
+        .parse()
+        .with_context(|| format!("Invalid --since value '{raw}'"))?;
+    if amount <= 0 {
+        bail!("--since must be greater than 0");
+    }
+    let unit = if unit.is_empty() {
+        "m".to_string()
+    } else {
+        unit.to_ascii_lowercase()
+    };
+
+    let duration = match unit.as_str() {
+        "s" => chrono::Duration::seconds(amount),
+        "m" => chrono::Duration::minutes(amount),
+        "h" => chrono::Duration::hours(amount),
+        "d" => chrono::Duration::days(amount),
+        _ => bail!("Unsupported --since unit '{unit}'. Use s/m/h/d or RFC3339 timestamp."),
+    };
+    Ok(chrono::Utc::now() - duration)
+}
+
+fn summarize_security_payload(payload: &serde_json::Value) -> String {
+    if let Some(map) = payload.as_object() {
+        let mut parts = Vec::new();
+        for key in [
+            "tool",
+            "scope",
+            "domain",
+            "source",
+            "level",
+            "selector",
+            "trigger_type",
+            "reason",
+            "channel",
+        ] {
+            if let Some(value) = map.get(key) {
+                if !value.is_null() {
+                    parts.push(format!("{key}={value}"));
+                }
+            }
+        }
+        if let Some(targets) = map.get("targets").and_then(serde_json::Value::as_array) {
+            if !targets.is_empty() {
+                parts.push(format!(
+                    "targets={}",
+                    serde_json::Value::Array(targets.clone())
+                ));
+            }
+        }
+        if parts.is_empty() {
+            "{}".to_string()
+        } else {
+            parts.join(" ")
+        }
+    } else {
+        payload.to_string()
+    }
+}
+
+fn emit_security_event_for_command(
+    observer: &dyn observability::Observer,
+    audit_logger: Option<&security::AuditLogger>,
+    event_name: &str,
+    payload: serde_json::Value,
+) {
+    observer.record_event(&observability::ObserverEvent::SecurityEvent(
+        observability::SecurityEvent {
+            name: event_name.to_string(),
+            payload: payload.clone(),
+        },
+    ));
+    if let Some(logger) = audit_logger {
+        if let Err(err) = logger.log_security_event(event_name, payload) {
+            warn!("Failed to write security audit event: {err}");
+        }
+    }
+}
+
+fn estop_level_name(level: &security::EstopLevel) -> &'static str {
+    match level {
+        security::EstopLevel::KillAll => "kill_all",
+        security::EstopLevel::NetworkKill => "network_kill",
+        security::EstopLevel::DomainBlock(_) => "domain_block",
+        security::EstopLevel::ToolFreeze(_) => "tool_freeze",
+    }
+}
+
+fn estop_level_targets(level: &security::EstopLevel) -> Vec<String> {
+    match level {
+        security::EstopLevel::KillAll | security::EstopLevel::NetworkKill => Vec::new(),
+        security::EstopLevel::DomainBlock(domains) => domains.clone(),
+        security::EstopLevel::ToolFreeze(tools) => tools.clone(),
+    }
+}
+
+fn resume_selector_name(selector: &security::ResumeSelector) -> &'static str {
+    match selector {
+        security::ResumeSelector::KillAll => "kill_all",
+        security::ResumeSelector::Network => "network_kill",
+        security::ResumeSelector::Domains(_) => "domain_block",
+        security::ResumeSelector::Tools(_) => "tool_freeze",
+    }
+}
+
+fn resume_selector_targets(selector: &security::ResumeSelector) -> Vec<String> {
+    match selector {
+        security::ResumeSelector::KillAll | security::ResumeSelector::Network => Vec::new(),
+        security::ResumeSelector::Domains(domains) => domains.clone(),
+        security::ResumeSelector::Tools(tools) => tools.clone(),
     }
 }
 
@@ -1731,5 +2111,178 @@ mod tests {
             } => assert_eq!(domains, vec!["*.chase.com".to_string()]),
             other => panic!("expected estop resume command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cli_parses_security_log_command() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw", "security", "log", "--type", "estop", "--since", "1h", "--json", "--limit",
+            "25",
+        ])
+        .expect("security log command should parse");
+
+        match cli.command {
+            Commands::Security {
+                security_command:
+                    SecurityCommands::Log {
+                        limit,
+                        event_type,
+                        since,
+                        json,
+                    },
+            } => {
+                assert_eq!(limit, 25);
+                assert_eq!(event_type, Some(SecurityLogTypeArg::Estop));
+                assert_eq!(since.as_deref(), Some("1h"));
+                assert!(json);
+            }
+            other => panic!("expected security log command, got {other:?}"),
+        }
+    }
+
+    fn append_json_line(path: &std::path::Path, value: serde_json::Value) {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("log file should open");
+        writeln!(file, "{value}").expect("line write should succeed");
+    }
+
+    fn security_event_line(
+        timestamp: &str,
+        event_id: &str,
+        event_name: &str,
+        category: Option<&str>,
+        payload: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "timestamp": timestamp,
+            "event_id": event_id,
+            "event_type": "security_event",
+            "actor": serde_json::Value::Null,
+            "action": serde_json::Value::Null,
+            "result": serde_json::Value::Null,
+            "security": {
+                "policy_violation": false,
+                "rate_limit_remaining": serde_json::Value::Null,
+                "sandbox_backend": serde_json::Value::Null
+            },
+            "details": {
+                "event_name": event_name,
+                "category": category,
+                "payload": payload
+            }
+        })
+    }
+
+    #[test]
+    fn load_security_audit_rows_filters_by_type_and_since() {
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        let log_path = temp.path().join("audit.log");
+
+        append_json_line(
+            &log_path,
+            security_event_line(
+                "2026-02-21T00:00:00Z",
+                "evt-old-otp",
+                "otp.prompt_sent",
+                Some("otp"),
+                serde_json::json!({"tool":"shell"}),
+            ),
+        );
+        append_json_line(
+            &log_path,
+            security_event_line(
+                "2026-02-21T01:30:00Z",
+                "evt-estop",
+                "estop.engaged",
+                Some("estop"),
+                serde_json::json!({"level":"network_kill"}),
+            ),
+        );
+        append_json_line(
+            &log_path,
+            security_event_line(
+                "2026-02-21T02:00:00Z",
+                "evt-new-otp",
+                "otp.approved",
+                Some("otp"),
+                serde_json::json!({"tool":"browser_open"}),
+            ),
+        );
+
+        let cutoff = chrono::DateTime::parse_from_rfc3339("2026-02-21T01:00:00Z")
+            .expect("cutoff timestamp should parse")
+            .with_timezone(&chrono::Utc);
+        let rows =
+            load_security_audit_rows(&[log_path], Some(&cutoff), Some(SecurityLogTypeArg::Estop));
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event_name, "estop.engaged");
+        assert_eq!(rows[0].category, "estop");
+    }
+
+    #[test]
+    fn load_security_audit_rows_skips_invalid_and_non_security_events() {
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        let log_path = temp.path().join("audit.log");
+
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .expect("log file should open");
+        writeln!(file, "not-json").expect("invalid fixture should write");
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "timestamp": "2026-02-21T00:00:00Z",
+                "event_id": "evt-command",
+                "event_type": "command_execution",
+                "actor": serde_json::Value::Null,
+                "action": serde_json::Value::Null,
+                "result": serde_json::Value::Null,
+                "security": {
+                    "policy_violation": false,
+                    "rate_limit_remaining": serde_json::Value::Null,
+                    "sandbox_backend": serde_json::Value::Null
+                }
+            })
+        )
+        .expect("non-security fixture should write");
+        drop(file);
+        append_json_line(
+            &log_path,
+            security_event_line(
+                "2026-02-21T00:10:00Z",
+                "evt-auto",
+                "estop.auto_trigger",
+                None,
+                serde_json::json!({"trigger_type":"tool_call_rate"}),
+            ),
+        );
+
+        let rows = load_security_audit_rows(&[log_path], None, None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event_name, "estop.auto_trigger");
+        assert_eq!(rows[0].category, "estop");
+    }
+
+    #[test]
+    fn parse_since_cutoff_accepts_supported_units() {
+        assert!(parse_since_cutoff("15m").is_ok());
+        assert!(parse_since_cutoff("1h").is_ok());
+        assert!(parse_since_cutoff("2d").is_ok());
+        assert!(parse_since_cutoff("30s").is_ok());
+    }
+
+    #[test]
+    fn parse_since_cutoff_rejects_invalid_inputs() {
+        assert!(parse_since_cutoff("0h").is_err());
+        assert!(parse_since_cutoff("15x").is_err());
+        assert!(parse_since_cutoff("abc").is_err());
+        assert!(parse_since_cutoff("").is_err());
     }
 }

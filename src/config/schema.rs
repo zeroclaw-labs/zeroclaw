@@ -2911,6 +2911,10 @@ pub struct EstopConfig {
     /// Require a valid OTP before resume operations.
     #[serde(default = "default_true")]
     pub require_otp_to_resume: bool,
+
+    /// Automatic estop trigger thresholds and behavior.
+    #[serde(default)]
+    pub auto_triggers: EstopAutoTriggersConfig,
 }
 
 fn default_estop_state_file() -> String {
@@ -2923,6 +2927,70 @@ impl Default for EstopConfig {
             enabled: false,
             state_file: default_estop_state_file(),
             require_otp_to_resume: true,
+            auto_triggers: EstopAutoTriggersConfig::default(),
+        }
+    }
+}
+
+/// Automatic estop trigger thresholds and behavior.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EstopAutoTriggersConfig {
+    /// Enable automatic estop triggers.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// More than this many failed OTP-gated attempts inside the window triggers domain-block.
+    #[serde(default = "default_failed_gated_attempts_threshold")]
+    pub failed_gated_attempts_threshold: u32,
+
+    /// Sliding window for failed OTP-gated attempts.
+    #[serde(default = "default_failed_gated_attempts_window_secs")]
+    pub failed_gated_attempts_window_secs: u64,
+
+    /// More than this many tool calls inside the window triggers tool-freeze.
+    #[serde(default = "default_tool_call_rate_limit")]
+    pub tool_call_rate_limit: u32,
+
+    /// Sliding window for tool-call-rate trigger.
+    #[serde(default = "default_tool_call_rate_window_secs")]
+    pub tool_call_rate_window_secs: u64,
+
+    /// Engage network-kill when an unknown domain is requested.
+    #[serde(default)]
+    pub block_on_unknown_domain: bool,
+
+    /// Emit operator-facing notification payload when an auto-trigger fires.
+    #[serde(default = "default_true")]
+    pub notify_on_auto_trigger: bool,
+}
+
+fn default_failed_gated_attempts_threshold() -> u32 {
+    3
+}
+
+fn default_failed_gated_attempts_window_secs() -> u64 {
+    60
+}
+
+fn default_tool_call_rate_limit() -> u32 {
+    30
+}
+
+fn default_tool_call_rate_window_secs() -> u64 {
+    60
+}
+
+impl Default for EstopAutoTriggersConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            failed_gated_attempts_threshold: default_failed_gated_attempts_threshold(),
+            failed_gated_attempts_window_secs: default_failed_gated_attempts_window_secs(),
+            tool_call_rate_limit: default_tool_call_rate_limit(),
+            tool_call_rate_window_secs: default_tool_call_rate_window_secs(),
+            block_on_unknown_domain: false,
+            notify_on_auto_trigger: true,
         }
     }
 }
@@ -3652,6 +3720,38 @@ impl Config {
         })?;
         if self.security.estop.state_file.trim().is_empty() {
             anyhow::bail!("security.estop.state_file must not be empty");
+        }
+        if self
+            .security
+            .estop
+            .auto_triggers
+            .failed_gated_attempts_threshold
+            == 0
+        {
+            anyhow::bail!(
+                "security.estop.auto_triggers.failed_gated_attempts_threshold must be greater than 0"
+            );
+        }
+        if self
+            .security
+            .estop
+            .auto_triggers
+            .failed_gated_attempts_window_secs
+            == 0
+        {
+            anyhow::bail!(
+                "security.estop.auto_triggers.failed_gated_attempts_window_secs must be greater than 0"
+            );
+        }
+        if self.security.estop.auto_triggers.tool_call_rate_limit == 0 {
+            anyhow::bail!(
+                "security.estop.auto_triggers.tool_call_rate_limit must be greater than 0"
+            );
+        }
+        if self.security.estop.auto_triggers.tool_call_rate_window_secs == 0 {
+            anyhow::bail!(
+                "security.estop.auto_triggers.tool_call_rate_window_secs must be greater than 0"
+            );
         }
 
         // Scheduler
@@ -6620,6 +6720,16 @@ default_temperature = 0.7
         assert_eq!(parsed.security.otp.method, OtpMethod::Totp);
         assert!(!parsed.security.estop.enabled);
         assert!(parsed.security.estop.require_otp_to_resume);
+        assert!(parsed.security.estop.auto_triggers.enabled);
+        assert_eq!(
+            parsed
+                .security
+                .estop
+                .auto_triggers
+                .failed_gated_attempts_threshold,
+            3
+        );
+        assert_eq!(parsed.security.estop.auto_triggers.tool_call_rate_limit, 30);
     }
 
     #[test]
@@ -6643,6 +6753,15 @@ gated_domain_categories = ["banking"]
 enabled = true
 state_file = "~/.zeroclaw/estop-state.json"
 require_otp_to_resume = true
+
+[security.estop.auto_triggers]
+enabled = true
+failed_gated_attempts_threshold = 4
+failed_gated_attempts_window_secs = 90
+tool_call_rate_limit = 40
+tool_call_rate_window_secs = 75
+block_on_unknown_domain = false
+notify_on_auto_trigger = true
 "#,
         )
         .unwrap();
@@ -6651,6 +6770,22 @@ require_otp_to_resume = true
         assert!(parsed.security.estop.enabled);
         assert_eq!(parsed.security.otp.gated_actions.len(), 2);
         assert_eq!(parsed.security.otp.gated_domains.len(), 2);
+        assert_eq!(
+            parsed
+                .security
+                .estop
+                .auto_triggers
+                .failed_gated_attempts_threshold,
+            4
+        );
+        assert_eq!(
+            parsed
+                .security
+                .estop
+                .auto_triggers
+                .tool_call_rate_window_secs,
+            75
+        );
         parsed.validate().unwrap();
     }
 
@@ -6683,5 +6818,16 @@ require_otp_to_resume = true
             .validate()
             .expect_err("expected ttl validation failure");
         assert!(err.to_string().contains("token_ttl_secs"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_invalid_auto_trigger_thresholds() {
+        let mut config = Config::default();
+        config.security.estop.auto_triggers.tool_call_rate_limit = 0;
+
+        let err = config
+            .validate()
+            .expect_err("expected auto trigger validation failure");
+        assert!(err.to_string().contains("tool_call_rate_limit"));
     }
 }

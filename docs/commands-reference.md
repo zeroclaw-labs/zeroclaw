@@ -16,6 +16,7 @@ Last verified: **February 21, 2026**.
 | `doctor` | Run diagnostics and freshness checks |
 | `status` | Print current configuration and system summary |
 | `estop` | Engage/resume emergency stop levels and inspect estop state |
+| `security` | Inspect OTP/estop security audit events |
 | `cron` | Manage scheduled tasks |
 | `models` | Refresh provider model catalogs |
 | `providers` | List provider IDs, aliases, and active provider |
@@ -96,6 +97,26 @@ Notes:
 - `estop` commands require `[security.estop].enabled = true`.
 - When `[security.estop].require_otp_to_resume = true`, `resume` requires OTP validation.
 - OTP prompt appears automatically if `--otp` is omitted.
+- CLI estop actions emit structured security events to observer backends and audit logs:
+  `estop.engaged`, `estop.resumed`, and `estop.resume_denied`.
+
+### `security`
+
+- `zeroclaw security log`
+- `zeroclaw security log --limit 100`
+- `zeroclaw security log --type estop`
+- `zeroclaw security log --type otp`
+- `zeroclaw security log --since 30m`
+- `zeroclaw security log --since 2026-02-21T18:00:00Z`
+- `zeroclaw security log --json`
+
+Notes:
+
+- `--since` accepts relative windows (`s`, `m`, `h`, `d`) or an RFC3339 timestamp.
+- The command scans `security.audit.log_path` plus rotated files (`*.1.log` ... `*.10.log`).
+- `--type` filters event families emitted by OTP/estop (`otp.*` and `estop.*`).
+- Event payloads are structured JSON (for example trigger type, level, targets, source, reason).
+- Empty match sets are reported as `No matching security events found.`.
 
 ### `service`
 

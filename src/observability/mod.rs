@@ -15,7 +15,7 @@ pub use noop::NoopObserver;
 #[cfg(feature = "observability-otel")]
 pub use otel::OtelObserver;
 pub use prometheus::PrometheusObserver;
-pub use traits::{Observer, ObserverEvent};
+pub use traits::{Observer, ObserverEvent, SecurityEvent};
 #[allow(unused_imports)]
 pub use verbose::VerboseObserver;
 

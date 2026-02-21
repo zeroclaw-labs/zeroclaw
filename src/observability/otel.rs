@@ -20,6 +20,7 @@ pub struct OtelObserver {
     llm_duration: Histogram<f64>,
     tool_calls: Counter<u64>,
     tool_duration: Histogram<f64>,
+    security_events: Counter<u64>,
     channel_messages: Counter<u64>,
     heartbeat_ticks: Counter<u64>,
     errors: Counter<u64>,
@@ -114,6 +115,11 @@ impl OtelObserver {
             .with_unit("s")
             .build();
 
+        let security_events = meter
+            .u64_counter("zeroclaw.security.events")
+            .with_description("Total security events")
+            .build();
+
         let channel_messages = meter
             .u64_counter("zeroclaw.channel.messages")
             .with_description("Total channel messages")
@@ -159,6 +165,7 @@ impl OtelObserver {
             llm_duration,
             tool_calls,
             tool_duration,
+            security_events,
             channel_messages,
             heartbeat_ticks,
             errors,
@@ -313,6 +320,21 @@ impl Observer for OtelObserver {
                         KeyValue::new("direction", direction.clone()),
                     ],
                 );
+            }
+            ObserverEvent::SecurityEvent(security_event) => {
+                self.security_events
+                    .add(1, &[KeyValue::new("event", security_event.name.clone())]);
+
+                let mut span = tracer.build(
+                    opentelemetry::trace::SpanBuilder::from_name("security.event")
+                        .with_kind(SpanKind::Internal)
+                        .with_attributes(vec![
+                            KeyValue::new("security.event", security_event.name.clone()),
+                            KeyValue::new("security.payload", security_event.payload.to_string()),
+                        ]),
+                );
+                span.set_status(Status::Ok);
+                span.end();
             }
             ObserverEvent::HeartbeatTick => {
                 self.heartbeat_ticks.add(1, &[]);

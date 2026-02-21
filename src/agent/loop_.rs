@@ -8,12 +8,14 @@ use crate::providers::{
 };
 use crate::runtime;
 use crate::security::{
-    DomainMatcher, EstopLevel, EstopManager, EstopState, OtpApprovalCache, OtpRequired,
-    OtpRequiredScope, OtpValidator, ResumeSelector, SecretStore, SecurityPolicy,
+    AuditLogger, AutoTriggerDecision, AutoTriggerEngine, DomainMatcher, EstopLevel,
+    EstopLoadStatus, EstopManager, EstopState, OtpApprovalCache, OtpRequired, OtpRequiredScope,
+    OtpValidator, ResumeSelector, SecretStore, SecurityPolicy,
 };
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
+use parking_lot::Mutex;
 use regex::{Regex, RegexSet};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -58,6 +60,8 @@ static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 pub(crate) struct ToolSecurityRuntime {
     otp: Option<Arc<OtpRuntime>>,
     estop: Option<Arc<EstopRuntime>>,
+    auto_trigger: Option<Arc<AutoTriggerRuntime>>,
+    audit_logger: Option<Arc<AuditLogger>>,
 }
 
 #[derive(Debug)]
@@ -74,15 +78,35 @@ struct EstopRuntime {
     config: crate::config::EstopConfig,
     config_dir: PathBuf,
     was_engaged: AtomicBool,
+    load_event_reported: AtomicBool,
+    approval_cache: Option<Arc<OtpApprovalCache>>,
+}
+
+#[derive(Debug)]
+struct AutoTriggerRuntime {
+    engine: Mutex<AutoTriggerEngine>,
+    known_domain_matcher: Option<DomainMatcher>,
+    estop_config: crate::config::EstopConfig,
+    config_dir: PathBuf,
     approval_cache: Option<Arc<OtpApprovalCache>>,
 }
 
 enum OtpGateDecision {
     Allow,
-    Denied(String),
+    Approved {
+        scope: OtpRequiredScope,
+        domain: Option<String>,
+    },
+    Denied {
+        reason: String,
+        scope: OtpRequiredScope,
+        domain: Option<String>,
+        timeout: bool,
+    },
     Required(OtpRequired),
 }
 
+#[derive(Clone)]
 struct PendingOtpGate {
     key: String,
     scope: OtpRequiredScope,
@@ -104,11 +128,20 @@ impl ToolSecurityRuntime {
         tool_name: &str,
         args: &Value,
         domain: Option<&str>,
+        observer: &dyn Observer,
+        channel_name: &str,
     ) -> std::result::Result<(), String> {
         let Some(estop) = &self.estop else {
             return Ok(());
         };
-        estop.enforce(tool_name, args, domain)
+        estop.enforce(
+            tool_name,
+            args,
+            domain,
+            observer,
+            self.audit_logger.as_deref(),
+            channel_name,
+        )
     }
 
     fn enforce_otp(
@@ -163,6 +196,49 @@ impl ToolSecurityRuntime {
         let otp_validator = self.otp.as_ref().map(|otp| otp.validator.as_ref());
         estop.resume(selector, otp_code, otp_validator)
     }
+
+    fn record_tool_call_for_auto_trigger(
+        &self,
+    ) -> std::result::Result<Option<AutoTriggerDecision>, String> {
+        let Some(auto_trigger) = &self.auto_trigger else {
+            return Ok(None);
+        };
+        auto_trigger.record_tool_call(now_unix_timestamp())
+    }
+
+    fn record_failed_gated_attempt_for_auto_trigger(
+        &self,
+        domain: Option<&str>,
+    ) -> std::result::Result<Option<AutoTriggerDecision>, String> {
+        let Some(auto_trigger) = &self.auto_trigger else {
+            return Ok(None);
+        };
+        auto_trigger.record_failed_gated_attempt(domain, now_unix_timestamp())
+    }
+
+    fn record_unknown_domain_for_auto_trigger(
+        &self,
+        domain: &str,
+    ) -> std::result::Result<Option<AutoTriggerDecision>, String> {
+        let Some(auto_trigger) = &self.auto_trigger else {
+            return Ok(None);
+        };
+        auto_trigger.record_unknown_domain(domain)
+    }
+
+    fn notify_on_auto_trigger(&self) -> bool {
+        self.auto_trigger
+            .as_ref()
+            .is_some_and(|runtime| runtime.notify_on_auto_trigger())
+    }
+
+    fn audit_logger(&self) -> Option<&AuditLogger> {
+        self.audit_logger.as_deref()
+    }
+
+    fn extract_requested_domain(&self, tool_name: &str, args: &Value) -> Option<String> {
+        extract_requested_domain(tool_name, args)
+    }
 }
 
 impl EstopRuntime {
@@ -171,9 +247,39 @@ impl EstopRuntime {
         tool_name: &str,
         args: &Value,
         domain: Option<&str>,
+        observer: &dyn Observer,
+        audit_logger: Option<&AuditLogger>,
+        channel_name: &str,
     ) -> std::result::Result<(), String> {
-        let manager = EstopManager::load(&self.config, &self.config_dir)
+        let (manager, report) = EstopManager::load_with_report(&self.config, &self.config_dir)
             .map_err(|err| format!("Failed to load estop state: {err}"))?;
+
+        if !self.load_event_reported.swap(true, Ordering::SeqCst) {
+            match report.status {
+                EstopLoadStatus::Corrupted => emit_security_event(
+                    observer,
+                    audit_logger,
+                    "estop.state_corrupted",
+                    serde_json::json!({
+                        "state_file": report.state_file,
+                        "error": report.error.unwrap_or_else(|| "unknown".to_string()),
+                        "channel": channel_name,
+                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                    }),
+                ),
+                EstopLoadStatus::Loaded | EstopLoadStatus::Missing => emit_security_event(
+                    observer,
+                    audit_logger,
+                    "estop.state_loaded",
+                    serde_json::json!({
+                        "state_file": report.state_file,
+                        "active_levels": report.active_levels,
+                        "channel": channel_name,
+                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                    }),
+                ),
+            }
+        }
 
         let engaged = manager.status().is_engaged();
         let previous = self.was_engaged.swap(engaged, Ordering::SeqCst);
@@ -275,6 +381,7 @@ impl OtpRuntime {
             return OtpGateDecision::Allow;
         }
 
+        let first = pending[0].clone();
         let summary = summarize_tool_arguments(args);
         if prompt_inline {
             match prompt_for_otp_code(tool_name, &summary, domain) {
@@ -284,28 +391,37 @@ impl OtpRuntime {
                             self.approval_cache
                                 .approve(&gate.key, self.cache_valid_secs);
                         }
-                        OtpGateDecision::Allow
+                        OtpGateDecision::Approved {
+                            scope: first.scope,
+                            domain: first.domain,
+                        }
                     }
-                    Ok(false) => {
-                        OtpGateDecision::Denied("Invalid OTP code; tool call denied".to_string())
-                    }
-                    Err(err) => OtpGateDecision::Denied(format!(
-                        "OTP validation failed; tool call denied: {err}"
-                    )),
+                    Ok(false) => OtpGateDecision::Denied {
+                        reason: "Invalid OTP code; tool call denied".to_string(),
+                        scope: first.scope,
+                        domain: first.domain,
+                        timeout: false,
+                    },
+                    Err(err) => OtpGateDecision::Denied {
+                        reason: format!("OTP validation failed; tool call denied: {err}"),
+                        scope: first.scope,
+                        domain: first.domain,
+                        timeout: false,
+                    },
                 },
-                None => {
-                    OtpGateDecision::Denied("OTP code was not provided; tool call denied".into())
-                }
+                None => OtpGateDecision::Denied {
+                    reason: "OTP code was not provided; tool call denied".into(),
+                    scope: first.scope,
+                    domain: first.domain,
+                    timeout: true,
+                },
             }
         } else {
-            let first = &pending[0];
             let payload = match first.scope {
                 OtpRequiredScope::Tool => OtpRequired::for_tool(tool_name, &summary),
-                OtpRequiredScope::Domain => OtpRequired::for_domain(
-                    tool_name,
-                    first.domain.clone().unwrap_or_default(),
-                    &summary,
-                ),
+                OtpRequiredScope::Domain => {
+                    OtpRequired::for_domain(tool_name, first.domain.unwrap_or_default(), &summary)
+                }
             };
             OtpGateDecision::Required(payload)
         }
@@ -334,6 +450,89 @@ impl OtpRuntime {
                 .approve(&domain_key, self.cache_valid_secs);
         }
 
+        Ok(())
+    }
+}
+
+impl AutoTriggerRuntime {
+    fn notify_on_auto_trigger(&self) -> bool {
+        self.engine.lock().notify_on_auto_trigger()
+    }
+
+    fn record_tool_call(
+        &self,
+        now_secs: u64,
+    ) -> std::result::Result<Option<AutoTriggerDecision>, String> {
+        let decision = {
+            let mut engine = self.engine.lock();
+            engine.record_tool_call(now_secs)
+        };
+        if let Some(decision) = decision {
+            self.engage(&decision)?;
+            Ok(Some(decision))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn record_failed_gated_attempt(
+        &self,
+        domain: Option<&str>,
+        now_secs: u64,
+    ) -> std::result::Result<Option<AutoTriggerDecision>, String> {
+        let Some(domain) = domain else {
+            return Ok(None);
+        };
+        let decision = {
+            let mut engine = self.engine.lock();
+            engine.record_failed_gated_attempt(domain, now_secs)
+        };
+        if let Some(decision) = decision {
+            self.engage(&decision)?;
+            Ok(Some(decision))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn record_unknown_domain(
+        &self,
+        domain: &str,
+    ) -> std::result::Result<Option<AutoTriggerDecision>, String> {
+        let normalized = normalize_gate_key(domain);
+        if normalized.is_empty() {
+            return Ok(None);
+        }
+
+        if self
+            .known_domain_matcher
+            .as_ref()
+            .is_some_and(|matcher| matcher.is_gated(&normalized))
+        {
+            return Ok(None);
+        }
+
+        let decision = {
+            let mut engine = self.engine.lock();
+            engine.record_unknown_domain(&normalized)
+        };
+        if let Some(decision) = decision {
+            self.engage(&decision)?;
+            Ok(Some(decision))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn engage(&self, decision: &AutoTriggerDecision) -> std::result::Result<(), String> {
+        let mut manager = EstopManager::load(&self.estop_config, &self.config_dir)
+            .map_err(|err| format!("Failed to load estop state for auto-trigger: {err}"))?;
+        manager
+            .engage(decision.engaged_level.clone())
+            .map_err(|err| format!("Failed to engage estop from auto-trigger: {err}"))?;
+        if let Some(cache) = &self.approval_cache {
+            cache.clear();
+        }
         Ok(())
     }
 }
@@ -388,6 +587,107 @@ fn prompt_for_otp_code(
     }
 }
 
+fn now_unix_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn extract_requested_domain(tool_name: &str, args: &Value) -> Option<String> {
+    match normalize_gate_key(tool_name).as_str() {
+        "browser" | "browser_open" | "http_request" => args
+            .get("url")
+            .and_then(Value::as_str)
+            .and_then(extract_host_from_url),
+        _ => None,
+    }
+}
+
+fn extract_host_from_url(raw_url: &str) -> Option<String> {
+    reqwest::Url::parse(raw_url.trim())
+        .ok()
+        .and_then(|url| url.host_str().map(normalize_gate_key))
+}
+
+fn emit_security_event(
+    observer: &dyn Observer,
+    audit_logger: Option<&AuditLogger>,
+    event_name: &str,
+    payload: Value,
+) {
+    observer.record_event(&ObserverEvent::SecurityEvent(
+        observability::SecurityEvent {
+            name: event_name.to_string(),
+            payload: payload.clone(),
+        },
+    ));
+    if let Some(logger) = audit_logger {
+        if let Err(err) = logger.log_security_event(event_name, payload) {
+            tracing::warn!(
+                event = event_name,
+                "Failed to write security audit event: {err}"
+            );
+        }
+    }
+}
+
+fn estop_level_name(level: &crate::security::EstopLevel) -> &'static str {
+    match level {
+        crate::security::EstopLevel::KillAll => "kill_all",
+        crate::security::EstopLevel::NetworkKill => "network_kill",
+        crate::security::EstopLevel::DomainBlock(_) => "domain_block",
+        crate::security::EstopLevel::ToolFreeze(_) => "tool_freeze",
+    }
+}
+
+fn handle_auto_trigger_fired(
+    observer: &dyn Observer,
+    audit_logger: Option<&AuditLogger>,
+    channel_name: &str,
+    decision: &AutoTriggerDecision,
+    notify_on_auto_trigger: bool,
+) -> String {
+    let resume_hint = "zeroclaw estop resume --otp <CODE>";
+    let payload = serde_json::json!({
+        "trigger_type": decision.trigger_type.as_str(),
+        "threshold": decision.threshold,
+        "actual_count": decision.actual_count,
+        "window_secs": decision.window_secs,
+        "engaged_level": estop_level_name(&decision.engaged_level),
+        "targets": decision.targets,
+        "channel": channel_name,
+        "notify_on_auto_trigger": notify_on_auto_trigger,
+        "resume_hint": resume_hint,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    });
+    emit_security_event(
+        observer,
+        audit_logger,
+        "estop.auto_trigger",
+        payload.clone(),
+    );
+    emit_security_event(
+        observer,
+        audit_logger,
+        "estop.engaged",
+        serde_json::json!({
+            "source": "auto",
+            "level": estop_level_name(&decision.engaged_level),
+            "targets": decision.targets,
+            "channel": channel_name,
+            "reason": decision.trigger_type.as_str(),
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        }),
+    );
+    format!(
+        "Error: emergency stop auto-trigger engaged ({}) at level '{}' for targets [{}]. Resume with `{resume_hint}`.",
+        decision.trigger_type.as_str(),
+        estop_level_name(&decision.engaged_level),
+        decision.targets.join(", ")
+    )
+}
+
 pub(crate) fn build_tool_security_runtime(
     config: &Config,
 ) -> Result<Option<Arc<ToolSecurityRuntime>>> {
@@ -399,6 +699,14 @@ pub(crate) fn build_tool_security_runtime(
 
     let mut otp: Option<Arc<OtpRuntime>> = None;
     let mut shared_cache: Option<Arc<OtpApprovalCache>> = None;
+    let normalized_gated_actions = config
+        .security
+        .otp
+        .gated_actions
+        .iter()
+        .map(|action| action.trim().to_ascii_lowercase())
+        .filter(|action| !action.is_empty())
+        .collect::<Vec<_>>();
 
     if config.security.otp.enabled {
         let store = SecretStore::new(&config_dir, config.secrets.encrypt);
@@ -411,13 +719,9 @@ pub(crate) fn build_tool_security_runtime(
         )?;
 
         let cache = Arc::new(OtpApprovalCache::new());
-        let gated_actions = config
-            .security
-            .otp
-            .gated_actions
+        let gated_actions = normalized_gated_actions
             .iter()
-            .map(|action| action.trim().to_ascii_lowercase())
-            .filter(|action| !action.is_empty())
+            .cloned()
             .collect::<HashSet<_>>();
 
         otp = Some(Arc::new(OtpRuntime {
@@ -433,18 +737,62 @@ pub(crate) fn build_tool_security_runtime(
     let estop = if config.security.estop.enabled {
         Some(Arc::new(EstopRuntime {
             config: config.security.estop.clone(),
-            config_dir,
+            config_dir: config_dir.clone(),
             was_engaged: AtomicBool::new(false),
-            approval_cache: shared_cache,
+            load_event_reported: AtomicBool::new(false),
+            approval_cache: shared_cache.clone(),
         }))
     } else {
         None
     };
 
-    if otp.is_none() && estop.is_none() {
+    let auto_trigger = if config.security.estop.enabled
+        && config.security.estop.auto_triggers.enabled
+    {
+        let mut known_domains = config.browser.allowed_domains.clone();
+        known_domains.extend(config.security.otp.gated_domains.clone());
+        let known_domain_matcher =
+            if known_domains.is_empty() && config.security.otp.gated_domain_categories.is_empty() {
+                None
+            } else {
+                Some(DomainMatcher::new(
+                    &known_domains,
+                    &config.security.otp.gated_domain_categories,
+                )?)
+            };
+        let engine = AutoTriggerEngine::new(
+            config.security.estop.auto_triggers.clone(),
+            normalized_gated_actions,
+        );
+        Some(Arc::new(AutoTriggerRuntime {
+            engine: Mutex::new(engine),
+            known_domain_matcher,
+            estop_config: config.security.estop.clone(),
+            config_dir: config_dir.clone(),
+            approval_cache: shared_cache.clone(),
+        }))
+    } else {
+        None
+    };
+
+    let audit_logger = if otp.is_some() || estop.is_some() || auto_trigger.is_some() {
+        Some(Arc::new(AuditLogger::new(
+            config.security.audit.clone(),
+            config_dir,
+        )?))
+    } else {
+        None
+    };
+
+    if otp.is_none() && estop.is_none() && auto_trigger.is_none() {
         Ok(None)
     } else {
-        Ok(Some(Arc::new(ToolSecurityRuntime { otp, estop })))
+        Ok(Some(Arc::new(ToolSecurityRuntime {
+            otp,
+            estop,
+            auto_trigger,
+            audit_logger,
+        })))
     }
 }
 
@@ -2253,6 +2601,43 @@ pub(crate) async fn run_tool_call_loop(
                     match runtime.resolve_target_domain(tool, &tool_args) {
                         Ok(domain) => domain,
                         Err(reason) => {
+                            if let Some(requested_domain) =
+                                runtime.extract_requested_domain(&tool_name, &tool_args)
+                            {
+                                match runtime
+                                    .record_unknown_domain_for_auto_trigger(&requested_domain)
+                                {
+                                    Ok(Some(decision)) => {
+                                        let blocked = handle_auto_trigger_fired(
+                                            observer,
+                                            runtime.audit_logger(),
+                                            channel_name,
+                                            &decision,
+                                            runtime.notify_on_auto_trigger(),
+                                        );
+                                        individual_results.push(blocked.clone());
+                                        let _ = writeln!(
+                                            tool_results,
+                                            "<tool_result name=\"{}\">\n{}\n</tool_result>",
+                                            tool_name, blocked
+                                        );
+                                        continue;
+                                    }
+                                    Ok(None) => {}
+                                    Err(auto_err) => {
+                                        let blocked = format!(
+                                            "Error: failed to evaluate unknown-domain trigger: {auto_err}"
+                                        );
+                                        individual_results.push(blocked.clone());
+                                        let _ = writeln!(
+                                            tool_results,
+                                            "<tool_result name=\"{}\">\n{}\n</tool_result>",
+                                            tool_name, blocked
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
                             let blocked = format!("Error: {reason}");
                             individual_results.push(blocked.clone());
                             let _ = writeln!(
@@ -2268,9 +2653,47 @@ pub(crate) async fn run_tool_call_loop(
                 };
 
                 if let Some(runtime) = tool_security {
-                    if let Err(reason) =
-                        runtime.enforce_estop(&tool_name, &tool_args, target_domain.as_deref())
-                    {
+                    if let Some(domain) = target_domain.as_deref() {
+                        match runtime.record_unknown_domain_for_auto_trigger(domain) {
+                            Ok(Some(decision)) => {
+                                let blocked = handle_auto_trigger_fired(
+                                    observer,
+                                    runtime.audit_logger(),
+                                    channel_name,
+                                    &decision,
+                                    runtime.notify_on_auto_trigger(),
+                                );
+                                individual_results.push(blocked.clone());
+                                let _ = writeln!(
+                                    tool_results,
+                                    "<tool_result name=\"{}\">\n{}\n</tool_result>",
+                                    tool_name, blocked
+                                );
+                                continue;
+                            }
+                            Ok(None) => {}
+                            Err(auto_err) => {
+                                let blocked = format!(
+                                    "Error: failed to evaluate unknown-domain trigger: {auto_err}"
+                                );
+                                individual_results.push(blocked.clone());
+                                let _ = writeln!(
+                                    tool_results,
+                                    "<tool_result name=\"{}\">\n{}\n</tool_result>",
+                                    tool_name, blocked
+                                );
+                                continue;
+                            }
+                        }
+                    }
+
+                    if let Err(reason) = runtime.enforce_estop(
+                        &tool_name,
+                        &tool_args,
+                        target_domain.as_deref(),
+                        observer,
+                        channel_name,
+                    ) {
                         let blocked = format!("Error: {reason}");
                         individual_results.push(blocked.clone());
                         let _ = writeln!(
@@ -2313,6 +2736,39 @@ pub(crate) async fn run_tool_call_loop(
                 }
 
                 if let Some(runtime) = tool_security {
+                    match runtime.record_tool_call_for_auto_trigger() {
+                        Ok(Some(decision)) => {
+                            let blocked = handle_auto_trigger_fired(
+                                observer,
+                                runtime.audit_logger(),
+                                channel_name,
+                                &decision,
+                                runtime.notify_on_auto_trigger(),
+                            );
+                            individual_results.push(blocked.clone());
+                            let _ = writeln!(
+                                tool_results,
+                                "<tool_result name=\"{}\">\n{}\n</tool_result>",
+                                tool_name, blocked
+                            );
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(auto_err) => {
+                            let blocked =
+                                format!("Error: failed to evaluate tool-rate trigger: {auto_err}");
+                            individual_results.push(blocked.clone());
+                            let _ = writeln!(
+                                tool_results,
+                                "<tool_result name=\"{}\">\n{}\n</tool_result>",
+                                tool_name, blocked
+                            );
+                            continue;
+                        }
+                    }
+                }
+
+                if let Some(runtime) = tool_security {
                     match runtime.enforce_otp(
                         &tool_name,
                         &tool_args,
@@ -2320,8 +2776,111 @@ pub(crate) async fn run_tool_call_loop(
                         otp_prompt_inline,
                     ) {
                         OtpGateDecision::Allow => {}
-                        OtpGateDecision::Denied(reason) => {
-                            let blocked = format!("Error: {reason}");
+                        OtpGateDecision::Approved { scope, domain } => {
+                            let scope_label = match scope {
+                                OtpRequiredScope::Tool => "tool",
+                                OtpRequiredScope::Domain => "domain",
+                            };
+                            emit_security_event(
+                                observer,
+                                runtime.audit_logger(),
+                                "otp.prompt_sent",
+                                serde_json::json!({
+                                    "tool": tool_name,
+                                    "scope": scope_label,
+                                    "domain": domain.clone(),
+                                    "channel": channel_name,
+                                    "operator_id": serde_json::Value::Null,
+                                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                                }),
+                            );
+                            emit_security_event(
+                                observer,
+                                runtime.audit_logger(),
+                                "otp.approved",
+                                serde_json::json!({
+                                    "tool": tool_name,
+                                    "scope": scope_label,
+                                    "domain": domain,
+                                    "channel": channel_name,
+                                    "operator_id": serde_json::Value::Null,
+                                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                                }),
+                            );
+                        }
+                        OtpGateDecision::Denied {
+                            reason,
+                            scope,
+                            domain,
+                            timeout,
+                        } => {
+                            let scope_label = match scope {
+                                OtpRequiredScope::Tool => "tool",
+                                OtpRequiredScope::Domain => "domain",
+                            };
+                            emit_security_event(
+                                observer,
+                                runtime.audit_logger(),
+                                "otp.prompt_sent",
+                                serde_json::json!({
+                                    "tool": tool_name,
+                                    "scope": scope_label,
+                                    "domain": domain.clone(),
+                                    "channel": channel_name,
+                                    "operator_id": serde_json::Value::Null,
+                                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                                }),
+                            );
+                            if timeout {
+                                emit_security_event(
+                                    observer,
+                                    runtime.audit_logger(),
+                                    "otp.timeout",
+                                    serde_json::json!({
+                                        "tool": tool_name,
+                                        "scope": scope_label,
+                                        "domain": domain.clone(),
+                                        "channel": channel_name,
+                                        "operator_id": serde_json::Value::Null,
+                                        "timeout_secs": 0,
+                                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                                    }),
+                                );
+                            } else {
+                                emit_security_event(
+                                    observer,
+                                    runtime.audit_logger(),
+                                    "otp.denied",
+                                    serde_json::json!({
+                                        "tool": tool_name,
+                                        "scope": scope_label,
+                                        "domain": domain.clone(),
+                                        "channel": channel_name,
+                                        "operator_id": serde_json::Value::Null,
+                                        "reason": reason.clone(),
+                                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                                    }),
+                                );
+                            }
+
+                            let auto_trigger_block = match runtime
+                                .record_failed_gated_attempt_for_auto_trigger(domain.as_deref())
+                            {
+                                Ok(Some(decision)) => Some(handle_auto_trigger_fired(
+                                    observer,
+                                    runtime.audit_logger(),
+                                    channel_name,
+                                    &decision,
+                                    runtime.notify_on_auto_trigger(),
+                                )),
+                                Ok(None) => None,
+                                Err(auto_err) => Some(format!(
+                                    "Error: failed to evaluate OTP trigger: {auto_err}"
+                                )),
+                            };
+
+                            let blocked =
+                                auto_trigger_block.unwrap_or_else(|| format!("Error: {reason}"));
                             individual_results.push(blocked.clone());
                             let _ = writeln!(
                                 tool_results,
@@ -2331,6 +2890,24 @@ pub(crate) async fn run_tool_call_loop(
                             continue;
                         }
                         OtpGateDecision::Required(payload) => {
+                            let domain_for_event = payload.domain.clone();
+                            emit_security_event(
+                                observer,
+                                runtime.audit_logger(),
+                                "otp.prompt_sent",
+                                serde_json::json!({
+                                    "tool": tool_name,
+                                    "scope": match payload.scope {
+                                        OtpRequiredScope::Tool => "tool",
+                                        OtpRequiredScope::Domain => "domain",
+                                    },
+                                    "domain": domain_for_event,
+                                    "channel": channel_name,
+                                    "operator_id": serde_json::Value::Null,
+                                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                                }),
+                            );
+
                             let structured = serde_json::to_string_pretty(&payload)
                                 .unwrap_or_else(|_| "{\"type\":\"otp_required\"}".to_string());
                             individual_results.push(structured.clone());
@@ -3404,6 +3981,65 @@ mod tests {
         }
     }
 
+    struct DomainCountingTool {
+        name: String,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl DomainCountingTool {
+        fn new(name: &str, calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                name: name.to_string(),
+                calls,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for DomainCountingTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            "Domain-aware counting tool for auto-trigger tests"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string" }
+                },
+                "required": ["url"]
+            })
+        }
+
+        fn security_target_domain(
+            &self,
+            args: &serde_json::Value,
+        ) -> anyhow::Result<Option<String>> {
+            let Some(url) = args.get("url").and_then(serde_json::Value::as_str) else {
+                return Ok(None);
+            };
+            let parsed = reqwest::Url::parse(url)
+                .map_err(|err| anyhow::anyhow!("invalid url for test tool: {err}"))?;
+            Ok(parsed.host_str().map(|host| host.to_ascii_lowercase()))
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "ok".to_string(),
+                error: None,
+            })
+        }
+    }
+
     fn security_config_with_runtime(temp: &tempfile::TempDir) -> Config {
         let mut config = Config::default();
         config.config_path = temp.path().join("config.toml");
@@ -3628,6 +4264,8 @@ mod tests {
                 "file_read",
                 &serde_json::json!({"path": "Cargo.toml"}),
                 None,
+                &crate::observability::NoopObserver,
+                "test",
             )
             .expect_err("kill-all should block tool");
         assert!(err.contains("kill-all"));
@@ -3635,6 +4273,162 @@ mod tests {
             !cache.is_approved("tool:count_tool"),
             "estop engagement must clear cached approvals"
         );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_auto_trigger_tool_rate_engages_tool_freeze() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"A"}}
+</tool_call>
+<tool_call>
+{"name":"count_tool","arguments":{"value":"B"}}
+</tool_call>"#,
+            "done",
+        ]);
+        let observer = NoopObserver;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&calls),
+        ))];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run count tool twice"),
+        ];
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = security_config_with_runtime(&temp);
+        config.security.otp.enabled = false;
+        config.security.otp.gated_actions = vec!["count_tool".into()];
+        config.security.otp.gated_domains.clear();
+        config.security.estop.auto_triggers.enabled = true;
+        config.security.estop.auto_triggers.tool_call_rate_limit = 1;
+        config
+            .security
+            .estop
+            .auto_triggers
+            .tool_call_rate_window_secs = 60;
+        config.security.estop.auto_triggers.block_on_unknown_domain = false;
+        let runtime = build_tool_security_runtime(&config)
+            .unwrap()
+            .expect("security runtime should be enabled");
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli-single",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            Some(&runtime),
+            false,
+            &[],
+        )
+        .await
+        .expect("tool-rate auto-trigger run should complete");
+
+        assert_eq!(result, "done");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let state = EstopManager::load(&config.security.estop, temp.path())
+            .expect("estop state should load")
+            .status();
+        assert_eq!(state.frozen_tools, vec!["count_tool".to_string()]);
+        let tool_results_message = history
+            .iter()
+            .find(|msg| {
+                msg.role == "user"
+                    && msg
+                        .content
+                        .contains("emergency stop auto-trigger engaged (tool_call_rate)")
+            })
+            .expect("history should include tool-rate auto-trigger feedback");
+        assert!(tool_results_message.content.contains("tool_freeze"));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_auto_trigger_unknown_domain_engages_network_kill() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"browser_open","arguments":{"url":"https://evil.example/login"}}
+</tool_call>"#,
+            "done",
+        ]);
+        let observer = NoopObserver;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(DomainCountingTool::new(
+            "browser_open",
+            Arc::clone(&calls),
+        ))];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("open unknown domain"),
+        ];
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = security_config_with_runtime(&temp);
+        config.security.otp.enabled = false;
+        config.security.otp.gated_actions = vec!["browser_open".into()];
+        config.security.otp.gated_domains = vec!["*.trusted.example".into()];
+        config.browser.allowed_domains = vec!["*.trusted.example".into()];
+        config.security.estop.auto_triggers.enabled = true;
+        config.security.estop.auto_triggers.block_on_unknown_domain = true;
+        config.security.estop.auto_triggers.tool_call_rate_limit = 30;
+        let runtime = build_tool_security_runtime(&config)
+            .unwrap()
+            .expect("security runtime should be enabled");
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli-single",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            Some(&runtime),
+            false,
+            &[],
+        )
+        .await
+        .expect("unknown-domain auto-trigger run should complete");
+
+        assert_eq!(result, "done");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let state = EstopManager::load(&config.security.estop, temp.path())
+            .expect("estop state should load")
+            .status();
+        assert!(
+            state.network_kill,
+            "unknown domain should engage network-kill"
+        );
+        let tool_results_message = history
+            .iter()
+            .find(|msg| {
+                msg.role == "user"
+                    && msg
+                        .content
+                        .contains("emergency stop auto-trigger engaged (unknown_domain)")
+            })
+            .expect("history should include unknown-domain auto-trigger feedback");
+        assert!(tool_results_message.content.contains("network_kill"));
     }
 
     #[test]

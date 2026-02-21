@@ -5,6 +5,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
@@ -67,6 +68,8 @@ pub struct AuditEvent {
     pub action: Option<Action>,
     pub result: Option<ExecutionResult>,
     pub security: SecurityContext,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
 }
 
 impl AuditEvent {
@@ -84,6 +87,7 @@ impl AuditEvent {
                 rate_limit_remaining: None,
                 sandbox_backend: None,
             },
+            details: None,
         }
     }
 
@@ -139,6 +143,12 @@ impl AuditEvent {
     /// Set security context
     pub fn with_security(mut self, sandbox_backend: Option<String>) -> Self {
         self.security.sandbox_backend = sandbox_backend;
+        self
+    }
+
+    /// Attach structured details for event-specific payloads.
+    pub fn with_details(mut self, details: Value) -> Self {
+        self.details = Some(details);
         self
     }
 }
@@ -210,6 +220,18 @@ impl AuditLogger {
         self.log(&event)
     }
 
+    /// Log a structured OTP/estop security event.
+    pub fn log_security_event(&self, event_name: &str, details: Value) -> Result<()> {
+        let event = AuditEvent::new(AuditEventType::SecurityEvent)
+            .with_actor("runtime".to_string(), None, None)
+            .with_details(serde_json::json!({
+                "event_name": event_name,
+                "category": security_event_category(event_name),
+                "payload": details,
+            }));
+        self.log(&event)
+    }
+
     /// Backward-compatible helper to log a command execution event.
     #[allow(clippy::too_many_arguments)]
     pub fn log_command(
@@ -255,6 +277,16 @@ impl AuditLogger {
         let rotated = format!("{}.1.log", self.log_path.display());
         std::fs::rename(&self.log_path, &rotated)?;
         Ok(())
+    }
+}
+
+fn security_event_category(event_name: &str) -> &'static str {
+    if event_name.starts_with("otp.") {
+        "otp"
+    } else if event_name.starts_with("estop.") {
+        "estop"
+    } else {
+        "security"
     }
 }
 
@@ -393,6 +425,35 @@ mod tests {
         let result = parsed.result.unwrap();
         assert!(result.success);
         assert_eq!(result.duration_ms, Some(42));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn audit_log_security_event_writes_structured_entry() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+
+        logger.log_security_event(
+            "otp.prompt_sent",
+            serde_json::json!({
+                "tool": "browser_open",
+                "domain": "secure.chase.com",
+            }),
+        )?;
+
+        let log_path = tmp.path().join("audit.log");
+        let content = tokio::fs::read_to_string(&log_path).await?;
+        let parsed: AuditEvent = serde_json::from_str(content.trim())?;
+        assert!(matches!(parsed.event_type, AuditEventType::SecurityEvent));
+        let details = parsed.details.expect("details must be present");
+        assert_eq!(details["event_name"], "otp.prompt_sent");
+        assert_eq!(details["category"], "otp");
+        assert_eq!(details["payload"]["tool"], "browser_open");
         Ok(())
     }
 

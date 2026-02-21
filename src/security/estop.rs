@@ -8,6 +8,21 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EstopLoadStatus {
+    Loaded,
+    Missing,
+    Corrupted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EstopLoadReport {
+    pub status: EstopLoadStatus,
+    pub state_file: String,
+    pub active_levels: Vec<String>,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EstopLevel {
     KillAll,
@@ -67,13 +82,26 @@ pub struct EstopManager {
     config: EstopConfig,
     state_path: PathBuf,
     state: EstopState,
+    load_status: EstopLoadStatus,
+    load_error: Option<String>,
 }
 
 impl EstopManager {
     pub fn load(config: &EstopConfig, config_dir: &Path) -> Result<Self> {
+        let (manager, _) = Self::load_with_report(config, config_dir)?;
+        Ok(manager)
+    }
+
+    pub fn load_with_report(
+        config: &EstopConfig,
+        config_dir: &Path,
+    ) -> Result<(Self, EstopLoadReport)> {
         let state_path = resolve_state_file_path(config_dir, &config.state_file);
         let mut should_fail_closed = false;
+        let mut load_error = None;
+        let mut load_status = EstopLoadStatus::Missing;
         let mut state = if state_path.exists() {
+            load_status = EstopLoadStatus::Loaded;
             match fs::read_to_string(&state_path) {
                 Ok(raw) => match serde_json::from_str::<EstopState>(&raw) {
                     Ok(mut parsed) => {
@@ -81,20 +109,26 @@ impl EstopManager {
                         parsed
                     }
                     Err(error) => {
+                        let message = error.to_string();
                         tracing::warn!(
                             path = %state_path.display(),
                             "Failed to parse estop state file; entering fail-closed mode: {error}"
                         );
                         should_fail_closed = true;
+                        load_status = EstopLoadStatus::Corrupted;
+                        load_error = Some(message);
                         EstopState::fail_closed()
                     }
                 },
                 Err(error) => {
+                    let message = error.to_string();
                     tracing::warn!(
                         path = %state_path.display(),
                         "Failed to read estop state file; entering fail-closed mode: {error}"
                     );
                     should_fail_closed = true;
+                    load_status = EstopLoadStatus::Corrupted;
+                    load_error = Some(message);
                     EstopState::fail_closed()
                 }
             }
@@ -108,13 +142,17 @@ impl EstopManager {
             config: config.clone(),
             state_path,
             state,
+            load_status,
+            load_error,
         };
 
         if should_fail_closed {
             let _ = manager.persist_state();
         }
 
-        Ok(manager)
+        let report = manager.load_report();
+
+        Ok((manager, report))
     }
 
     pub fn state_path(&self) -> &Path {
@@ -123,6 +161,19 @@ impl EstopManager {
 
     pub fn status(&self) -> EstopState {
         self.state.clone()
+    }
+
+    pub fn load_status(&self) -> EstopLoadStatus {
+        self.load_status
+    }
+
+    pub fn load_report(&self) -> EstopLoadReport {
+        EstopLoadReport {
+            status: self.load_status,
+            state_file: self.state_path.display().to_string(),
+            active_levels: active_levels(&self.state),
+            error: self.load_error.clone(),
+        }
     }
 
     pub fn engage(&mut self, level: EstopLevel) -> Result<()> {
@@ -354,6 +405,23 @@ fn is_network_tool_call(tool_name: &str, args: &Value) -> bool {
     }
 }
 
+fn active_levels(state: &EstopState) -> Vec<String> {
+    let mut levels = Vec::new();
+    if state.kill_all {
+        levels.push("kill_all".to_string());
+    }
+    if state.network_kill {
+        levels.push("network_kill".to_string());
+    }
+    if !state.blocked_domains.is_empty() {
+        levels.push("domain_block".to_string());
+    }
+    if !state.frozen_tools.is_empty() {
+        levels.push("tool_freeze".to_string());
+    }
+    levels
+}
+
 fn shell_command_uses_network(command: &str) -> bool {
     let normalized = command.to_ascii_lowercase();
     [
@@ -390,6 +458,7 @@ mod tests {
             enabled: true,
             state_file: path.display().to_string(),
             require_otp_to_resume: false,
+            auto_triggers: crate::config::EstopAutoTriggersConfig::default(),
         }
     }
 

@@ -47,6 +47,12 @@ impl Observer for VerboseObserver {
             ObserverEvent::TurnComplete => {
                 eprintln!("< Complete");
             }
+            ObserverEvent::SecurityEvent(security_event) => {
+                eprintln!(
+                    "! Security {} {}",
+                    security_event.name, security_event.payload
+                );
+            }
             _ => {}
         }
     }
@@ -99,5 +105,11 @@ mod tests {
             success: true,
         });
         obs.record_event(&ObserverEvent::TurnComplete);
+        obs.record_event(&ObserverEvent::SecurityEvent(
+            crate::observability::SecurityEvent {
+                name: "otp.prompt_sent".into(),
+                payload: serde_json::json!({"tool":"shell"}),
+            },
+        ));
     }
 }

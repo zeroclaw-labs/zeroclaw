@@ -13,6 +13,7 @@ pub struct PrometheusObserver {
     tokens_input_total: IntCounterVec,
     tokens_output_total: IntCounterVec,
     tool_calls: IntCounterVec,
+    security_events: IntCounterVec,
     channel_messages: IntCounterVec,
     heartbeat_ticks: prometheus::IntCounter,
     errors: IntCounterVec,
@@ -62,6 +63,12 @@ impl PrometheusObserver {
         let tool_calls = IntCounterVec::new(
             prometheus::Opts::new("zeroclaw_tool_calls_total", "Total tool calls"),
             &["tool", "success"],
+        )
+        .expect("valid metric");
+
+        let security_events = IntCounterVec::new(
+            prometheus::Opts::new("zeroclaw_security_events_total", "Total security events"),
+            &["event"],
         )
         .expect("valid metric");
 
@@ -136,6 +143,7 @@ impl PrometheusObserver {
             .register(Box::new(tokens_output_total.clone()))
             .ok();
         registry.register(Box::new(tool_calls.clone())).ok();
+        registry.register(Box::new(security_events.clone())).ok();
         registry.register(Box::new(channel_messages.clone())).ok();
         registry.register(Box::new(heartbeat_ticks.clone())).ok();
         registry.register(Box::new(errors.clone())).ok();
@@ -153,6 +161,7 @@ impl PrometheusObserver {
             tokens_input_total,
             tokens_output_total,
             tool_calls,
+            security_events,
             channel_messages,
             heartbeat_ticks,
             errors,
@@ -240,6 +249,11 @@ impl Observer for PrometheusObserver {
             ObserverEvent::ChannelMessage { channel, direction } => {
                 self.channel_messages
                     .with_label_values(&[channel, direction])
+                    .inc();
+            }
+            ObserverEvent::SecurityEvent(security_event) => {
+                self.security_events
+                    .with_label_values(&[security_event.name.as_str()])
                     .inc();
             }
             ObserverEvent::HeartbeatTick => {

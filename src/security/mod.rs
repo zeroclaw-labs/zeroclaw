@@ -19,6 +19,7 @@
 //! change guidelines.
 
 pub mod audit;
+pub mod auto_trigger;
 #[cfg(feature = "sandbox-bubblewrap")]
 pub mod bubblewrap;
 pub mod detect;
@@ -41,10 +42,12 @@ use serde::{Deserialize, Serialize};
 #[allow(unused_imports)]
 pub use audit::{AuditEvent, AuditEventType, AuditLogger};
 #[allow(unused_imports)]
+pub use auto_trigger::{AutoTriggerDecision, AutoTriggerEngine, AutoTriggerType};
+#[allow(unused_imports)]
 pub use detect::create_sandbox;
 pub use domain_matcher::DomainMatcher;
 #[allow(unused_imports)]
-pub use estop::{EstopLevel, EstopManager, EstopState, ResumeSelector};
+pub use estop::{EstopLevel, EstopLoadStatus, EstopManager, EstopState, ResumeSelector};
 #[allow(unused_imports)]
 pub use otp::{OtpApprovalCache, OtpValidator};
 #[allow(unused_imports)]
