@@ -53,6 +53,54 @@ impl DiscordChannel {
     }
 }
 
+/// Process Discord message attachments and return a string to append to the
+/// agent message context.
+///
+/// Only `text/*` MIME types are fetched and inlined. All other types are
+/// silently skipped. Fetch errors are logged as warnings.
+async fn process_attachments(
+    attachments: &[serde_json::Value],
+    client: &reqwest::Client,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for att in attachments {
+        let ct = att
+            .get("content_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let name = att
+            .get("filename")
+            .and_then(|v| v.as_str())
+            .unwrap_or("file");
+        let Some(url) = att.get("url").and_then(|v| v.as_str()) else {
+            tracing::warn!(name, "discord: attachment has no url, skipping");
+            continue;
+        };
+        if ct.starts_with("text/") {
+            match client.get(url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    if let Ok(text) = resp.text().await {
+                        parts.push(format!("[{name}]\n{text}"));
+                    }
+                }
+                Ok(resp) => {
+                    tracing::warn!(name, status = %resp.status(), "discord attachment fetch failed");
+                }
+                Err(e) => {
+                    tracing::warn!(name, error = %e, "discord attachment fetch error");
+                }
+            }
+        } else {
+            tracing::debug!(
+                name,
+                content_type = ct,
+                "discord: skipping unsupported attachment type"
+            );
+        }
+    }
+    parts.join("\n---\n")
+}
+
 const BASE64_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Discord's maximum message length for regular messages.
@@ -413,6 +461,20 @@ impl Channel for DiscordChannel {
                         continue;
                     };
 
+                    let attachment_text = {
+                        let atts = d
+                            .get("attachments")
+                            .and_then(|a| a.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        process_attachments(&atts, &self.http_client()).await
+                    };
+                    let final_content = if attachment_text.is_empty() {
+                        clean_content
+                    } else {
+                        format!("{clean_content}\n\n[Attachments]\n{attachment_text}")
+                    };
+
                     let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
                     let channel_id = d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("").to_string();
 
@@ -428,7 +490,7 @@ impl Channel for DiscordChannel {
                         } else {
                             channel_id.clone()
                         },
-                        content: clean_content,
+                        content: final_content,
                         channel: "discord".to_string(),
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -1068,5 +1130,26 @@ mod tests {
         for part in &parts {
             assert!(part.len() <= DISCORD_MAX_MESSAGE_LENGTH);
         }
+    }
+
+    // process_attachments tests
+
+    #[tokio::test]
+    async fn process_attachments_empty_list_returns_empty() {
+        let client = reqwest::Client::new();
+        let result = process_attachments(&[], &client).await;
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn process_attachments_skips_unsupported_types() {
+        let client = reqwest::Client::new();
+        let attachments = vec![serde_json::json!({
+            "url": "https://cdn.discordapp.com/attachments/123/456/doc.pdf",
+            "filename": "doc.pdf",
+            "content_type": "application/pdf"
+        })];
+        let result = process_attachments(&attachments, &client).await;
+        assert!(result.is_empty());
     }
 }
