@@ -90,6 +90,15 @@ Notes:
 
 `models refresh` currently supports live catalog refresh for provider IDs: `openrouter`, `openai`, `anthropic`, `groq`, `mistral`, `deepseek`, `xai`, `together-ai`, `gemini`, `ollama`, `llamacpp`, `vllm`, `astrai`, `venice`, `fireworks`, `cohere`, `moonshot`, `glm`, `zai`, `qwen`, and `nvidia`.
 
+### `doctor`
+
+- `zeroclaw doctor`
+- `zeroclaw doctor models [--provider <ID>] [--use-cache]`
+- `zeroclaw doctor traces [--limit <N>] [--event <TYPE>] [--contains <TEXT>]`
+- `zeroclaw doctor traces --id <TRACE_ID>`
+
+`doctor traces` reads runtime tool/model diagnostics from `observability.runtime_trace_path`.
+
 ### `channel`
 
 - `zeroclaw channel list`
