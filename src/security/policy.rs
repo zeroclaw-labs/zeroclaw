@@ -148,6 +148,26 @@ impl Default for SecurityPolicy {
     }
 }
 
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+fn expand_user_path(path: &str) -> PathBuf {
+    if path == "~" {
+        if let Some(home) = home_dir() {
+            return home;
+        }
+    }
+
+    if let Some(stripped) = path.strip_prefix("~/") {
+        if let Some(home) = home_dir() {
+            return home.join(stripped);
+        }
+    }
+
+    PathBuf::from(path)
+}
+
 // ── Shell Command Parsing Utilities ───────────────────────────────────────
 // These helpers implement a minimal quote-aware shell lexer. They exist
 // because security validation must reason about the *structure* of a
@@ -682,35 +702,17 @@ impl SecurityPolicy {
             return false;
         }
 
-        // Expand tilde for comparison
-        let expanded = if let Some(stripped) = path.strip_prefix("~/") {
-            if let Some(home) = std::env::var("HOME").ok().map(PathBuf::from) {
-                home.join(stripped).to_string_lossy().to_string()
-            } else {
-                path.to_string()
-            }
-        } else {
-            path.to_string()
-        };
+        // Expand "~" for consistent matching with forbidden paths and allowlists.
+        let expanded_path = expand_user_path(path);
 
         // Block absolute paths when workspace_only is set
-        if self.workspace_only && Path::new(&expanded).is_absolute() {
+        if self.workspace_only && expanded_path.is_absolute() {
             return false;
         }
 
         // Block forbidden paths using path-component-aware matching
-        let expanded_path = Path::new(&expanded);
         for forbidden in &self.forbidden_paths {
-            let forbidden_expanded = if let Some(stripped) = forbidden.strip_prefix("~/") {
-                if let Some(home) = std::env::var("HOME").ok().map(PathBuf::from) {
-                    home.join(stripped).to_string_lossy().to_string()
-                } else {
-                    forbidden.clone()
-                }
-            } else {
-                forbidden.clone()
-            };
-            let forbidden_path = Path::new(&forbidden_expanded);
+            let forbidden_path = expand_user_path(forbidden);
             if expanded_path.starts_with(forbidden_path) {
                 return false;
             }
@@ -742,6 +744,20 @@ impl SecurityPolicy {
         }
 
         false
+    }
+
+    pub fn resolved_path_violation_message(&self, resolved: &Path) -> String {
+        let guidance = if self.allowed_roots.is_empty() {
+            "Add the directory to [autonomy].allowed_roots (for example: allowed_roots = [\"/absolute/path\"]), or move the file into the workspace."
+        } else {
+            "Add a matching parent directory to [autonomy].allowed_roots, or move the file into the workspace."
+        };
+
+        format!(
+            "Resolved path escapes workspace allowlist: {}. {}",
+            resolved.display(),
+            guidance
+        )
     }
 
     /// Check if autonomy level permits any action at all
@@ -807,7 +823,14 @@ impl SecurityPolicy {
             allowed_roots: autonomy_config
                 .allowed_roots
                 .iter()
-                .map(PathBuf::from)
+                .map(|root| {
+                    let expanded = expand_user_path(root);
+                    if expanded.is_absolute() {
+                        expanded
+                    } else {
+                        workspace_dir.join(expanded)
+                    }
+                })
                 .collect(),
             max_actions_per_hour: autonomy_config.max_actions_per_hour,
             max_cost_per_day_cents: autonomy_config.max_cost_per_day_cents,
@@ -1165,6 +1188,33 @@ mod tests {
         assert!(!policy.block_high_risk_commands);
         assert_eq!(policy.shell_env_passthrough, vec!["DATABASE_URL"]);
         assert_eq!(policy.workspace_dir, PathBuf::from("/tmp/test-workspace"));
+    }
+
+    #[test]
+    fn from_config_normalizes_allowed_roots() {
+        let autonomy_config = crate::config::AutonomyConfig {
+            allowed_roots: vec!["~/Desktop".into(), "shared-data".into()],
+            ..crate::config::AutonomyConfig::default()
+        };
+        let workspace = PathBuf::from("/tmp/test-workspace");
+        let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
+
+        let expected_home_root = if let Some(home) = std::env::var_os("HOME") {
+            PathBuf::from(home).join("Desktop")
+        } else {
+            PathBuf::from("~/Desktop")
+        };
+
+        assert_eq!(policy.allowed_roots[0], expected_home_root);
+        assert_eq!(policy.allowed_roots[1], workspace.join("shared-data"));
+    }
+
+    #[test]
+    fn resolved_path_violation_message_includes_allowed_roots_guidance() {
+        let p = default_policy();
+        let msg = p.resolved_path_violation_message(Path::new("/tmp/outside.txt"));
+        assert!(msg.contains("escapes workspace"));
+        assert!(msg.contains("allowed_roots"));
     }
 
     // ── Default policy ──────────────────────────────────────

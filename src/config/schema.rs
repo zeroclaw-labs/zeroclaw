@@ -1816,11 +1816,12 @@ impl Default for BuiltinHooksConfig {
 pub struct AutonomyConfig {
     /// Autonomy level: `read_only`, `supervised` (default), or `full`.
     pub level: AutonomyLevel,
-    /// Restrict file writes and command paths to the workspace directory. Default: `true`.
+    /// Restrict absolute filesystem paths to workspace-relative references. Default: `true`.
+    /// Resolved paths outside the workspace still require `allowed_roots`.
     pub workspace_only: bool,
     /// Allowlist of executable names permitted for shell execution.
     pub allowed_commands: Vec<String>,
-    /// Explicit path denylist. Default includes system-critical paths.
+    /// Explicit path denylist. Default includes system-critical paths and sensitive dotdirs.
     pub forbidden_paths: Vec<String>,
     /// Maximum actions allowed per hour per policy. Default: `100`.
     pub max_actions_per_hour: u32,
@@ -1851,6 +1852,7 @@ pub struct AutonomyConfig {
     pub always_ask: Vec<String>,
 
     /// Extra directory roots the agent may read/write outside the workspace.
+    /// Supports absolute, `~/...`, and workspace-relative entries.
     /// Resolved paths under any of these roots pass `is_resolved_path_allowed`.
     #[serde(default)]
     pub allowed_roots: Vec<String>,

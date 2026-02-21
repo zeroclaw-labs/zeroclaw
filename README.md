@@ -656,9 +656,13 @@ allow_public_bind = false      # refuse 0.0.0.0 without tunnel
 
 [autonomy]
 level = "supervised"           # "readonly", "supervised", "full" (default: supervised)
-workspace_only = true          # default: true — scoped to workspace
+workspace_only = true          # default: true — reject absolute path inputs
 allowed_commands = ["git", "npm", "cargo", "ls", "cat", "grep"]
 forbidden_paths = ["/etc", "/root", "/proc", "/sys", "~/.ssh", "~/.gnupg", "~/.aws"]
+allowed_roots = []             # optional allowlist for directories outside workspace (supports "~/...")
+# Example outside-workspace access:
+# workspace_only = false
+# allowed_roots = ["~/Desktop/projects", "/opt/shared-repo"]
 
 [runtime]
 kind = "native"                # "native" or "docker"

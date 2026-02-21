@@ -742,6 +742,14 @@ async fn main() -> Result<()> {
             println!("Security:");
             println!("  Workspace only:    {}", config.autonomy.workspace_only);
             println!(
+                "  Allowed roots:     {}",
+                if config.autonomy.allowed_roots.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    config.autonomy.allowed_roots.join(", ")
+                }
+            );
+            println!(
                 "  Allowed commands:  {}",
                 config.autonomy.allowed_commands.join(", ")
             );

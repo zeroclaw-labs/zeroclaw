@@ -267,11 +267,12 @@ Notes:
 | Key | Default | Purpose |
 |---|---|---|
 | `level` | `supervised` | `read_only`, `supervised`, or `full` |
-| `workspace_only` | `true` | restrict writes/command paths to workspace scope |
+| `workspace_only` | `true` | reject absolute path inputs unless explicitly disabled |
 | `allowed_commands` | _required for shell execution_ | allowlist of executable names |
-| `forbidden_paths` | `[]` | explicit path denylist |
-| `max_actions_per_hour` | `100` | per-policy action budget |
-| `max_cost_per_day_cents` | `1000` | per-policy spend guardrail |
+| `forbidden_paths` | built-in protected list | explicit path denylist (system paths + sensitive dotdirs by default) |
+| `allowed_roots` | `[]` | additional roots allowed outside workspace after canonicalization |
+| `max_actions_per_hour` | `20` | per-policy action budget |
+| `max_cost_per_day_cents` | `500` | per-policy spend guardrail |
 | `require_approval_for_medium_risk` | `true` | approval gate for medium-risk commands |
 | `block_high_risk_commands` | `true` | hard block for high-risk commands |
 | `auto_approve` | `[]` | tool operations always auto-approved |
@@ -280,8 +281,17 @@ Notes:
 Notes:
 
 - `level = "full"` skips medium-risk approval gating for shell execution, while still enforcing configured guardrails.
+- Access outside the workspace requires `allowed_roots`, even when `workspace_only = false`.
+- `allowed_roots` supports absolute paths, `~/...`, and workspace-relative paths.
 - Shell separator/operator parsing is quote-aware. Characters like `;` inside quoted arguments are treated as literals, not command separators.
 - Unquoted shell chaining/operators are still enforced by policy checks (`;`, `|`, `&&`, `||`, background chaining, and redirects).
+
+```toml
+[autonomy]
+workspace_only = false
+forbidden_paths = ["/etc", "/root", "/proc", "/sys", "~/.ssh", "~/.gnupg", "~/.aws"]
+allowed_roots = ["~/Desktop/projects", "/opt/shared-repo"]
+```
 
 ## `[memory]`
 
