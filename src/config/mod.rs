@@ -12,7 +12,7 @@ pub use schema::{
     HttpRequestConfig, IMessageConfig, IdentityConfig, LarkConfig, MatrixConfig, MemoryConfig,
     ModelRouteConfig, MultimodalConfig, NextcloudTalkConfig, ObservabilityConfig, OtpConfig,
     OtpMethod, PeripheralBoardConfig, PeripheralsConfig, ProxyConfig, ProxyScope,
-    QueryClassificationConfig, ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig,
+    QdrantConfig, QueryClassificationConfig, ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig,
     SandboxBackend, SandboxConfig, SchedulerConfig, SecretsConfig, SecurityConfig, SkillsConfig,
     SkillsPromptInjectionMode, SlackConfig, StorageConfig, StorageProviderConfig,
     StorageProviderSection, StreamMode, TelegramConfig, TranscriptionConfig, TunnelConfig,
