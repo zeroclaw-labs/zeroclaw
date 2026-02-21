@@ -12,6 +12,7 @@ use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use regex::{Regex, RegexSet};
+use std::collections::HashSet;
 use std::fmt::Write;
 use std::io::Write as _;
 use std::sync::{Arc, LazyLock};
@@ -324,8 +325,53 @@ fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
     }
 }
 
+fn parse_tool_call_id(
+    root: &serde_json::Value,
+    function: Option<&serde_json::Value>,
+) -> Option<String> {
+    function
+        .and_then(|func| func.get("id"))
+        .or_else(|| root.get("id"))
+        .or_else(|| root.get("tool_call_id"))
+        .or_else(|| root.get("call_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(ToString::to_string)
+}
+
+fn canonicalize_json_for_tool_signature(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<String> = map.keys().cloned().collect();
+            keys.sort_unstable();
+            let mut ordered = serde_json::Map::new();
+            for key in keys {
+                if let Some(child) = map.get(&key) {
+                    ordered.insert(key, canonicalize_json_for_tool_signature(child));
+                }
+            }
+            serde_json::Value::Object(ordered)
+        }
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .iter()
+                .map(canonicalize_json_for_tool_signature)
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+fn tool_call_signature(name: &str, arguments: &serde_json::Value) -> (String, String) {
+    let canonical_args = canonicalize_json_for_tool_signature(arguments);
+    let args_json = serde_json::to_string(&canonical_args).unwrap_or_else(|_| "{}".to_string());
+    (name.trim().to_ascii_lowercase(), args_json)
+}
+
 fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
     if let Some(function) = value.get("function") {
+        let tool_call_id = parse_tool_call_id(value, Some(function));
         let name = function
             .get("name")
             .and_then(|v| v.as_str())
@@ -338,10 +384,15 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
                     .get("arguments")
                     .or_else(|| function.get("parameters")),
             );
-            return Some(ParsedToolCall { name, arguments });
+            return Some(ParsedToolCall {
+                name,
+                arguments,
+                tool_call_id: tool_call_id,
+            });
         }
     }
 
+    let tool_call_id = parse_tool_call_id(value, None);
     let name = value
         .get("name")
         .and_then(|v| v.as_str())
@@ -355,7 +406,11 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
 
     let arguments =
         parse_arguments_value(value.get("arguments").or_else(|| value.get("parameters")));
-    Some(ParsedToolCall { name, arguments })
+    Some(ParsedToolCall {
+        name,
+        arguments,
+        tool_call_id: tool_call_id,
+    })
 }
 
 fn parse_tool_calls_from_json_value(value: &serde_json::Value) -> Vec<ParsedToolCall> {
@@ -500,6 +555,7 @@ fn parse_xml_tool_calls(xml_content: &str) -> Option<Vec<ParsedToolCall>> {
         calls.push(ParsedToolCall {
             name: tool_name,
             arguments: serde_json::Value::Object(args),
+            tool_call_id: None,
         });
     }
 
@@ -582,6 +638,7 @@ fn parse_minimax_invoke_calls(response: &str) -> Option<(String, Vec<ParsedToolC
         calls.push(ParsedToolCall {
             name: name.to_string(),
             arguments: serde_json::Value::Object(args),
+            tool_call_id: None,
         });
     }
 
@@ -809,6 +866,7 @@ fn parse_xml_attribute_tool_calls(response: &str) -> Vec<ParsedToolCall> {
             calls.push(ParsedToolCall {
                 name: map_tool_name_alias(tool_name).to_string(),
                 arguments: serde_json::Value::Object(arguments),
+                tool_call_id: None,
             });
         }
     }
@@ -884,6 +942,7 @@ fn parse_perl_style_tool_calls(response: &str) -> Vec<ParsedToolCall> {
             calls.push(ParsedToolCall {
                 name: map_tool_name_alias(tool_name).to_string(),
                 arguments: serde_json::Value::Object(arguments),
+                tool_call_id: None,
             });
         }
     }
@@ -935,6 +994,7 @@ fn parse_function_call_tool_calls(response: &str) -> Vec<ParsedToolCall> {
             calls.push(ParsedToolCall {
                 name: map_tool_name_alias(tool_name).to_string(),
                 arguments: serde_json::Value::Object(arguments),
+                tool_call_id: None,
             });
         }
     }
@@ -1149,6 +1209,7 @@ fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
             return Some(ParsedToolCall {
                 name: tool_name.to_string(),
                 arguments: serde_json::Value::Object(args),
+                tool_call_id: None,
             });
         }
     }
@@ -1179,6 +1240,7 @@ fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
             return Some(ParsedToolCall {
                 name: tool_name.to_string(),
                 arguments: serde_json::Value::Object(args),
+                tool_call_id: None,
             });
         }
     }
@@ -1204,6 +1266,7 @@ fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
         return Some(ParsedToolCall {
             name: tool_name.to_string(),
             arguments,
+            tool_call_id: None,
         });
     }
 
@@ -1533,6 +1596,7 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                 calls.push(ParsedToolCall {
                     name: name.clone(),
                     arguments: args.clone(),
+                    tool_call_id: None,
                 });
                 if let Some(r) = raw {
                     cleaned_text = cleaned_text.replace(r, "");
@@ -1597,6 +1661,7 @@ fn parse_structured_tool_calls(tool_calls: &[ToolCall]) -> Vec<ParsedToolCall> {
             name: call.name.clone(),
             arguments: serde_json::from_str::<serde_json::Value>(&call.arguments)
                 .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
+            tool_call_id: Some(call.id.clone()),
         })
         .collect()
 }
@@ -1629,6 +1694,36 @@ fn build_native_assistant_history(text: &str, tool_calls: &[ToolCall]) -> String
     .to_string()
 }
 
+fn build_native_assistant_history_from_parsed_calls(
+    text: &str,
+    tool_calls: &[ParsedToolCall],
+) -> Option<String> {
+    let calls_json = tool_calls
+        .iter()
+        .map(|tc| {
+            Some(serde_json::json!({
+                "id": tc.tool_call_id.clone()?,
+                "name": tc.name,
+                "arguments": serde_json::to_string(&tc.arguments).unwrap_or_else(|_| "{}".to_string()),
+            }))
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    let content = if text.trim().is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::String(text.trim().to_string())
+    };
+
+    Some(
+        serde_json::json!({
+            "content": content,
+            "tool_calls": calls_json,
+        })
+        .to_string(),
+    )
+}
+
 fn build_assistant_history_with_tool_calls(text: &str, tool_calls: &[ToolCall]) -> String {
     let mut parts = Vec::new();
 
@@ -1650,10 +1745,11 @@ fn build_assistant_history_with_tool_calls(text: &str, tool_calls: &[ToolCall]) 
     parts.join("\n")
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ParsedToolCall {
     name: String,
     arguments: serde_json::Value,
+    tool_call_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1908,6 +2004,7 @@ pub(crate) async fn run_tool_call_loop(
         .collect();
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
     let turn_id = Uuid::new_v4().to_string();
+    let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
 
     for iteration in 0..max_iterations {
         if cancellation_token
@@ -2071,7 +2168,12 @@ pub(crate) async fn run_tool_call_loop(
                     // Preserve native tool call IDs in assistant history so role=tool
                     // follow-up messages can reference the exact call id.
                     let assistant_history_content = if resp.tool_calls.is_empty() {
-                        response_text.clone()
+                        if use_native_tools {
+                            build_native_assistant_history_from_parsed_calls(&response_text, &calls)
+                                .unwrap_or_else(|| response_text.clone())
+                        } else {
+                            response_text.clone()
+                        }
                     } else {
                         build_native_assistant_history(&response_text, &resp.tool_calls)
                     };
@@ -2189,8 +2291,8 @@ pub(crate) async fn run_tool_call_loop(
         // When multiple tool calls are present and interactive CLI approval is not needed, run
         // tool executions concurrently for lower wall-clock latency.
         let mut tool_results = String::new();
-        let mut individual_results: Vec<String> = Vec::new();
-        let mut ordered_results: Vec<Option<(String, ToolExecutionOutcome)>> =
+        let mut individual_results: Vec<(Option<String>, String)> = Vec::new();
+        let mut ordered_results: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>> =
             (0..tool_calls.len()).map(|_| None).collect();
         let allow_parallel_execution = should_execute_tools_in_parallel(&tool_calls, approval);
         let mut executable_indices: Vec<usize> = Vec::new();
@@ -2224,6 +2326,7 @@ pub(crate) async fn run_tool_call_loop(
                         );
                         ordered_results[idx] = Some((
                             call.name.clone(),
+                            call.tool_call_id.clone(),
                             ToolExecutionOutcome {
                                 output: cancelled,
                                 success: false,
@@ -2275,6 +2378,7 @@ pub(crate) async fn run_tool_call_loop(
                         );
                         ordered_results[idx] = Some((
                             tool_name.clone(),
+                            call.tool_call_id.clone(),
                             ToolExecutionOutcome {
                                 output: denied.clone(),
                                 success: false,
@@ -2285,6 +2389,39 @@ pub(crate) async fn run_tool_call_loop(
                         continue;
                     }
                 }
+            }
+
+            let signature = tool_call_signature(&tool_name, &tool_args);
+            if !seen_tool_signatures.insert(signature) {
+                let duplicate = format!(
+                    "Skipped duplicate tool call '{tool_name}' with identical arguments in this turn."
+                );
+                runtime_trace::record_event(
+                    "tool_call_result",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(false),
+                    Some(&duplicate),
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "tool": tool_name.clone(),
+                        "arguments": scrub_credentials(&tool_args.to_string()),
+                        "deduplicated": true,
+                    }),
+                );
+                ordered_results[idx] = Some((
+                    tool_name.clone(),
+                    call.tool_call_id.clone(),
+                    ToolExecutionOutcome {
+                        output: duplicate.clone(),
+                        success: false,
+                        error_reason: Some(duplicate),
+                        duration: Duration::ZERO,
+                    },
+                ));
+                continue;
             }
 
             runtime_trace::record_event(
@@ -2318,6 +2455,7 @@ pub(crate) async fn run_tool_call_loop(
             executable_calls.push(ParsedToolCall {
                 name: tool_name,
                 arguments: tool_args,
+                tool_call_id: call.tool_call_id.clone(),
             });
         }
 
@@ -2384,12 +2522,12 @@ pub(crate) async fn run_tool_call_loop(
                 let _ = tx.send(format!("{icon} {} ({secs}s)\n", call.name)).await;
             }
 
-            ordered_results[*idx] = Some((call.name.clone(), outcome));
+            ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
         }
 
         for entry in ordered_results {
-            if let Some((tool_name, outcome)) = entry {
-                individual_results.push(outcome.output.clone());
+            if let Some((tool_name, tool_call_id, outcome)) = entry {
+                individual_results.push((tool_call_id, outcome.output.clone()));
                 let _ = writeln!(
                     tool_results,
                     "<tool_result name=\"{}\">\n{}\n</tool_result>",
@@ -2404,9 +2542,26 @@ pub(crate) async fn run_tool_call_loop(
         // Prompt mode: use XML-based text format as before.
         history.push(ChatMessage::assistant(assistant_history_content));
         if native_tool_calls.is_empty() {
-            history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
+            let all_results_have_ids = use_native_tools
+                && !individual_results.is_empty()
+                && individual_results
+                    .iter()
+                    .all(|(tool_call_id, _)| tool_call_id.is_some());
+            if all_results_have_ids {
+                for (tool_call_id, result) in &individual_results {
+                    let tool_msg = serde_json::json!({
+                        "tool_call_id": tool_call_id,
+                        "content": result,
+                    });
+                    history.push(ChatMessage::tool(tool_msg.to_string()));
+                }
+            } else {
+                history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
+            }
         } else {
-            for (native_call, result) in native_tool_calls.iter().zip(individual_results.iter()) {
+            for (native_call, (_, result)) in
+                native_tool_calls.iter().zip(individual_results.iter())
+            {
                 let tool_msg = serde_json::json!({
                     "tool_call_id": native_call.id,
                     "content": result,
@@ -2657,6 +2812,10 @@ pub async fn run(
     tool_descs.push((
         "schedule",
         "Manage scheduled tasks (create/list/get/cancel/pause/resume). Supports recurring cron and one-shot delays.",
+    ));
+    tool_descs.push((
+        "model_routing_config",
+        "Configure default model, scenario routing, and delegate agents. Use for natural-language requests like: 'set conversation to kimi and coding to gpt-5.3-codex'.",
     ));
     if !config.agents.is_empty() {
         tool_descs.push((
@@ -3035,6 +3194,10 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         ("memory_store", "Save to memory."),
         ("memory_recall", "Search memory."),
         ("memory_forget", "Delete a memory entry."),
+        (
+            "model_routing_config",
+            "Configure default model, scenario routing, and delegate agents.",
+        ),
         ("screenshot", "Capture a screenshot."),
         ("image_info", "Read image metadata."),
     ];
@@ -3226,6 +3389,7 @@ mod tests {
 
     struct ScriptedProvider {
         responses: Arc<Mutex<VecDeque<ChatResponse>>>,
+        capabilities: ProviderCapabilities,
     }
 
     impl ScriptedProvider {
@@ -3240,12 +3404,22 @@ mod tests {
                 .collect();
             Self {
                 responses: Arc::new(Mutex::new(scripted)),
+                capabilities: ProviderCapabilities::default(),
             }
+        }
+
+        fn with_native_tool_support(mut self) -> Self {
+            self.capabilities.native_tool_calling = true;
+            self
         }
     }
 
     #[async_trait]
     impl Provider for ScriptedProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            self.capabilities.clone()
+        }
+
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -3269,6 +3443,56 @@ mod tests {
             responses
                 .pop_front()
                 .ok_or_else(|| anyhow::anyhow!("scripted provider exhausted responses"))
+        }
+    }
+
+    struct CountingTool {
+        name: String,
+        invocations: Arc<AtomicUsize>,
+    }
+
+    impl CountingTool {
+        fn new(name: &str, invocations: Arc<AtomicUsize>) -> Self {
+            Self {
+                name: name.to_string(),
+                invocations,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for CountingTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            "Counts executions for loop-stability tests"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "value": { "type": "string" }
+                }
+            })
+        }
+
+        async fn execute(
+            &self,
+            args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            self.invocations.fetch_add(1, Ordering::SeqCst);
+            let value = args
+                .get("value")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: format!("counted:{value}"),
+                error: None,
+            })
         }
     }
 
@@ -3469,6 +3693,7 @@ mod tests {
         let calls = vec![ParsedToolCall {
             name: "file_read".to_string(),
             arguments: serde_json::json!({"path": "a.txt"}),
+            tool_call_id: None,
         }];
 
         assert!(!should_execute_tools_in_parallel(&calls, None));
@@ -3480,10 +3705,12 @@ mod tests {
             ParsedToolCall {
                 name: "shell".to_string(),
                 arguments: serde_json::json!({"command": "pwd"}),
+                tool_call_id: None,
             },
             ParsedToolCall {
                 name: "http_request".to_string(),
                 arguments: serde_json::json!({"url": "https://example.com"}),
+                tool_call_id: None,
             },
         ];
         let approval_cfg = crate::config::AutonomyConfig::default();
@@ -3501,10 +3728,12 @@ mod tests {
             ParsedToolCall {
                 name: "shell".to_string(),
                 arguments: serde_json::json!({"command": "pwd"}),
+                tool_call_id: None,
             },
             ParsedToolCall {
                 name: "http_request".to_string(),
                 arguments: serde_json::json!({"url": "https://example.com"}),
+                tool_call_id: None,
             },
         ];
         let approval_cfg = crate::config::AutonomyConfig {
@@ -3602,6 +3831,123 @@ mod tests {
         assert!(
             idx_a < idx_b,
             "tool results should preserve input order for tool call mapping"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_deduplicates_repeated_tool_calls() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"A"}}
+</tool_call>
+<tool_call>
+{"name":"count_tool","arguments":{"value":"A"}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run tool calls"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("loop should finish after deduplicating repeated calls");
+
+        assert_eq!(result, "done");
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            1,
+            "duplicate tool call with same args should not execute twice"
+        );
+
+        let tool_results = history
+            .iter()
+            .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
+            .expect("prompt-mode tool result payload should be present");
+        assert!(tool_results.content.contains("counted:A"));
+        assert!(tool_results.content.contains("Skipped duplicate tool call"));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_native_mode_preserves_fallback_tool_call_ids() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"{"content":"Need to call tool","tool_calls":[{"id":"call_abc","name":"count_tool","arguments":"{\"value\":\"X\"}"}]}"#,
+            "done",
+        ])
+        .with_native_tool_support();
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run tool calls"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("native fallback id flow should complete");
+
+        assert_eq!(result, "done");
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        assert!(
+            history.iter().any(|msg| {
+                msg.role == "tool" && msg.content.contains("\"tool_call_id\":\"call_abc\"")
+            }),
+            "tool result should preserve parsed fallback tool_call_id in native mode"
+        );
+        assert!(
+            history
+                .iter()
+                .all(|msg| !(msg.role == "user" && msg.content.starts_with("[Tool results]"))),
+            "native mode should use role=tool history instead of prompt fallback wrapper"
         );
     }
 
@@ -3705,6 +4051,14 @@ After text."#;
         assert!(text.is_empty()); // No content field
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "memory_recall");
+    }
+
+    #[test]
+    fn parse_tool_calls_preserves_openai_tool_call_ids() {
+        let response = r#"{"tool_calls":[{"id":"call_42","function":{"name":"shell","arguments":"{\"command\":\"pwd\"}"}}]}"#;
+        let (_, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tool_call_id.as_deref(), Some("call_42"));
     }
 
     #[test]
@@ -4397,6 +4751,19 @@ Done."#;
             result.arguments.get("command").and_then(|v| v.as_str()),
             Some("date")
         );
+    }
+
+    #[test]
+    fn parse_tool_call_value_preserves_tool_call_id_aliases() {
+        let value = serde_json::json!({
+            "call_id": "legacy_1",
+            "function": {
+                "name": "shell",
+                "arguments": {"command": "date"}
+            }
+        });
+        let result = parse_tool_call_value(&value).expect("tool call should parse");
+        assert_eq!(result.tool_call_id.as_deref(), Some("legacy_1"));
     }
 
     #[test]

@@ -549,6 +549,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rate_limit_blocks_create_action() {
+        let tmp = TempDir::new().unwrap();
+        let config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            autonomy: crate::config::AutonomyConfig {
+                level: AutonomyLevel::Full,
+                max_actions_per_hour: 0,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        tokio::fs::create_dir_all(&config.workspace_dir)
+            .await
+            .unwrap();
+        let security = Arc::new(SecurityPolicy::from_config(
+            &config.autonomy,
+            &config.workspace_dir,
+        ));
+        let tool = ScheduleTool::new(security, config);
+
+        let blocked = tool
+            .execute(json!({
+                "action": "create",
+                "expression": "*/5 * * * *",
+                "command": "echo blocked-by-rate-limit"
+            }))
+            .await
+            .unwrap();
+        assert!(!blocked.success);
+        assert!(blocked
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Rate limit exceeded"));
+
+        let list = tool.execute(json!({"action": "list"})).await.unwrap();
+        assert!(list.success);
+        assert!(list.output.contains("No scheduled jobs"));
+    }
+
+    #[tokio::test]
+    async fn rate_limit_blocks_cancel_and_keeps_job() {
+        let tmp = TempDir::new().unwrap();
+        let config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            autonomy: crate::config::AutonomyConfig {
+                level: AutonomyLevel::Full,
+                max_actions_per_hour: 1,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        tokio::fs::create_dir_all(&config.workspace_dir)
+            .await
+            .unwrap();
+        let security = Arc::new(SecurityPolicy::from_config(
+            &config.autonomy,
+            &config.workspace_dir,
+        ));
+        let tool = ScheduleTool::new(security, config);
+
+        let create = tool
+            .execute(json!({
+                "action": "create",
+                "expression": "*/5 * * * *",
+                "command": "echo keep-me"
+            }))
+            .await
+            .unwrap();
+        assert!(create.success);
+        let id = create.output.split_whitespace().nth(3).unwrap();
+
+        let cancel = tool
+            .execute(json!({"action": "cancel", "id": id}))
+            .await
+            .unwrap();
+        assert!(!cancel.success);
+        assert!(cancel
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Rate limit exceeded"));
+
+        let get = tool
+            .execute(json!({"action": "get", "id": id}))
+            .await
+            .unwrap();
+        assert!(get.success);
+        assert!(get.output.contains("echo keep-me"));
+    }
+
+    #[tokio::test]
     async fn unknown_action_returns_failure() {
         let (_tmp, config, security) = test_setup().await;
         let tool = ScheduleTool::new(security, config);

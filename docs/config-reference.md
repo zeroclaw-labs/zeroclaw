@@ -366,6 +366,17 @@ Upgrade strategy:
 2. Update only `model = "...new-version..."` in the route entries.
 3. Validate with `zeroclaw doctor` before restart/rollout.
 
+Natural-language config path:
+
+- During normal agent chat, ask the assistant to rewire routes in plain language.
+- The runtime can persist these updates via tool `model_routing_config` (defaults, scenarios, and delegate sub-agents) without manual TOML editing.
+
+Example requests:
+
+- `Set conversation to provider kimi, model moonshot-v1-8k.`
+- `Set coding to provider openai, model gpt-5.3-codex, and auto-route when message contains code blocks.`
+- `Create a coder sub-agent using openai/gpt-5.3-codex with tools file_read,file_write,shell.`
+
 ## `[query_classification]`
 
 Automatic model hint routing — maps user messages to `[[model_routes]]` hints based on content patterns.

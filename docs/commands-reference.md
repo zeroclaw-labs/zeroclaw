@@ -54,6 +54,10 @@ Last verified: **February 20, 2026**.
 - `zeroclaw agent --provider <ID> --model <MODEL> --temperature <0.0-2.0>`
 - `zeroclaw agent --peripheral <board:path>`
 
+Tip:
+
+- In interactive chat, you can ask for route changes in natural language (for example “conversation uses kimi, coding uses gpt-5.3-codex”); the assistant can persist this via tool `model_routing_config`.
+
 ### `gateway` / `daemon`
 
 - `zeroclaw gateway [--host <HOST>] [--port <PORT>]`
