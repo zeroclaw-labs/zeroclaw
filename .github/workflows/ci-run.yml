@@ -234,7 +234,7 @@ jobs:
 
                   if [ "${{ needs.changes.outputs.docs_only }}" = "true" ]; then
                     echo "workflow_owner_approval=${workflow_owner_result}"
-                    if [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
+                    if [ "$event_name" = "pull_request" ] && [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
                       echo "Workflow files changed but workflow owner approval gate did not pass."
                       exit 1
                     fi
@@ -249,7 +249,7 @@ jobs:
                   if [ "$rust_changed" != "true" ]; then
                     echo "rust_changed=false (non-rust fast path)"
                     echo "workflow_owner_approval=${workflow_owner_result}"
-                    if [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
+                    if [ "$event_name" = "pull_request" ] && [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
                       echo "Workflow files changed but workflow owner approval gate did not pass."
                       exit 1
                     fi
@@ -273,7 +273,7 @@ jobs:
                   echo "docs=${docs_result}"
                   echo "workflow_owner_approval=${workflow_owner_result}"
 
-                  if [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
+                  if [ "$event_name" = "pull_request" ] && [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
                     echo "Workflow files changed but workflow owner approval gate did not pass."
                     exit 1
                   fi
