@@ -32,8 +32,11 @@ pub mod file_read;
 pub mod file_write;
 pub mod git_operations;
 pub mod glob_search;
+#[cfg(feature = "hardware")]
 pub mod hardware_board_info;
+#[cfg(feature = "hardware")]
 pub mod hardware_memory_map;
+#[cfg(feature = "hardware")]
 pub mod hardware_memory_read;
 pub mod http_request;
 pub mod image_info;
@@ -67,8 +70,11 @@ pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
 pub use git_operations::GitOperationsTool;
 pub use glob_search::GlobSearchTool;
+#[cfg(feature = "hardware")]
 pub use hardware_board_info::HardwareBoardInfoTool;
+#[cfg(feature = "hardware")]
 pub use hardware_memory_map::HardwareMemoryMapTool;
+#[cfg(feature = "hardware")]
 pub use hardware_memory_read::HardwareMemoryReadTool;
 pub use http_request::HttpRequestTool;
 pub use image_info::ImageInfoTool;
