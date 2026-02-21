@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use futures::{future::join_all, FutureExt};
+use futures_util::{future::join_all, FutureExt};
 use serde_json::Value;
 use std::panic::AssertUnwindSafe;
 use tracing::info;
@@ -195,7 +195,10 @@ impl HookRunner {
                     model = mdl;
                 }
                 Ok(HookResult::Cancel(reason)) => {
-                    info!(hook = hook_name, reason, "before_llm_call cancelled by hook");
+                    info!(
+                        hook = hook_name,
+                        reason, "before_llm_call cancelled by hook"
+                    );
                     return HookResult::Cancel(reason);
                 }
                 Err(_) => {
@@ -279,9 +282,11 @@ impl HookRunner {
     ) -> HookResult<(String, String, String)> {
         for h in &self.handlers {
             let hook_name = h.name();
-            match AssertUnwindSafe(
-                h.on_message_sending(channel.clone(), recipient.clone(), content.clone()),
-            )
+            match AssertUnwindSafe(h.on_message_sending(
+                channel.clone(),
+                recipient.clone(),
+                content.clone(),
+            ))
             .catch_unwind()
             .await
             {

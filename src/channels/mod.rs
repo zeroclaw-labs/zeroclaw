@@ -1743,12 +1743,13 @@ async fn process_channel_message(
 
             let sanitized_response =
                 sanitize_channel_response(&outbound_response, ctx.tools_registry.as_ref());
-            let delivered_response =
-                if sanitized_response.is_empty() && !outbound_response.trim().is_empty() {
-                    "I encountered malformed tool-call output and could not produce a safe reply. Please try again.".to_string()
-                } else {
-                    sanitized_response
-                };
+            let delivered_response = if sanitized_response.is_empty()
+                && !outbound_response.trim().is_empty()
+            {
+                "I encountered malformed tool-call output and could not produce a safe reply. Please try again.".to_string()
+            } else {
+                sanitized_response
+            };
 
             // Extract condensed tool-use context from the history messages
             // added during run_tool_call_loop, so the LLM retains awareness
