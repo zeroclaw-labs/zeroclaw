@@ -140,6 +140,11 @@ impl ShellTool {
             bg_registry,
         }
     }
+
+    /// Return a handle to the background task registry.
+    pub fn registry(&self) -> &Arc<BackgroundTaskRegistry> {
+        &self.bg_registry
+    }
 }
 
 fn is_valid_env_var_name(name: &str) -> bool {

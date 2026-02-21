@@ -48,6 +48,7 @@ pub mod schedule;
 pub mod schema;
 pub mod screenshot;
 pub mod shell;
+pub mod shell_status;
 pub mod traits;
 pub mod web_search_tool;
 
@@ -198,8 +199,14 @@ pub fn all_tools_with_runtime(
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
 ) -> Vec<Box<dyn Tool>> {
+    let bg_registry = Arc::new(shell::BackgroundTaskRegistry::default());
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(ShellTool::new(security.clone(), runtime)),
+        Arc::new(ShellTool::with_registry(
+            security.clone(),
+            runtime,
+            Arc::clone(&bg_registry),
+        )),
+        Arc::new(shell_status::ShellStatusTool::new(Arc::clone(&bg_registry))),
         Arc::new(FileReadTool::new(security.clone())),
         Arc::new(FileWriteTool::new(security.clone())),
         Arc::new(FileEditTool::new(security.clone())),
