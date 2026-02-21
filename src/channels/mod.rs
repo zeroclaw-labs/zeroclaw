@@ -218,6 +218,7 @@ struct ChannelRuntimeContext {
     interrupt_on_new_message: bool,
     multimodal: crate::config::MultimodalConfig,
     hooks: Option<Arc<crate::hooks::HookRunner>>,
+    non_cli_excluded_tools: Arc<Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -1657,6 +1658,11 @@ async fn process_channel_message(
                 Some(cancellation_token.clone()),
                 delta_tx,
                 ctx.hooks.as_deref(),
+                if msg.channel == "cli" {
+                    &[]
+                } else {
+                    ctx.non_cli_excluded_tools.as_ref()
+                },
             ),
         ) => LlmExecutionResult::Completed(result),
     };
@@ -2956,6 +2962,13 @@ pub async fn start_channels(config: Config) -> Result<()> {
         ));
     }
 
+    // Filter out tools excluded for non-CLI channels so the system prompt
+    // does not advertise them for channel-driven runs.
+    let excluded = &config.autonomy.non_cli_excluded_tools;
+    if !excluded.is_empty() {
+        tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
+    }
+
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
     } else {
@@ -3107,6 +3120,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         } else {
             None
         },
+        non_cli_excluded_tools: Arc::new(config.autonomy.non_cli_excluded_tools.clone()),
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -3319,6 +3333,7 @@ mod tests {
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -3797,6 +3812,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -3927,6 +3943,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -3985,6 +4002,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -4052,6 +4070,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -4140,6 +4159,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -4210,6 +4230,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -4295,6 +4316,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -4365,6 +4387,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -4424,6 +4447,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -4594,6 +4618,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -4673,6 +4698,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: true,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -4764,6 +4790,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: true,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -4837,6 +4864,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -4895,6 +4923,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -5410,6 +5439,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -5494,6 +5524,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -5578,6 +5609,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -6124,6 +6156,7 @@ This is an example JSON object for profile settings."#;
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.

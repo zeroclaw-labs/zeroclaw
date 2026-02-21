@@ -1419,6 +1419,7 @@ pub(crate) async fn agent_turn(
         None,
         None,
         None,
+        &[],
     )
     .await
 }
@@ -1593,6 +1594,7 @@ pub(crate) async fn run_tool_call_loop(
     cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     hooks: Option<&crate::hooks::HookRunner>,
+    excluded_tools: &[String],
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -1600,8 +1602,11 @@ pub(crate) async fn run_tool_call_loop(
         max_tool_iterations
     };
 
-    let tool_specs: Vec<crate::tools::ToolSpec> =
-        tools_registry.iter().map(|tool| tool.spec()).collect();
+    let tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
+        .iter()
+        .filter(|tool| !excluded_tools.iter().any(|ex| ex == tool.name()))
+        .map(|tool| tool.spec())
+        .collect();
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
 
     for _iteration in 0..max_iterations {
@@ -2252,6 +2257,7 @@ pub async fn run(
             None,
             None,
             None,
+            &[],
         )
         .await?;
         final_output = response.clone();
@@ -2372,6 +2378,7 @@ pub async fn run(
                 None,
                 None,
                 None,
+                &[],
             )
             .await
             {
@@ -2845,6 +2852,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -2890,6 +2898,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         )
         .await
         .expect_err("oversized payload must fail");
@@ -2929,6 +2938,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -3050,6 +3060,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         )
         .await
         .expect("parallel execution should complete");

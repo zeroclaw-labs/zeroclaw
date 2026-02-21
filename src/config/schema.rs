@@ -1843,6 +1843,13 @@ pub struct AutonomyConfig {
     /// Resolved paths under any of these roots pass `is_resolved_path_allowed`.
     #[serde(default)]
     pub allowed_roots: Vec<String>,
+
+    /// Tools to exclude from non-CLI channels (e.g. Telegram, Discord).
+    ///
+    /// When a tool is listed here, non-CLI channels will not expose it to the
+    /// model in tool specs.
+    #[serde(default)]
+    pub non_cli_excluded_tools: Vec<String>,
 }
 
 fn default_auto_approve() -> Vec<String> {
@@ -1910,6 +1917,7 @@ impl Default for AutonomyConfig {
             auto_approve: default_auto_approve(),
             always_ask: default_always_ask(),
             allowed_roots: Vec::new(),
+            non_cli_excluded_tools: Vec::new(),
         }
     }
 }
@@ -4141,6 +4149,7 @@ default_temperature = 0.7
                 auto_approve: vec!["file_read".into()],
                 always_ask: vec![],
                 allowed_roots: vec![],
+                non_cli_excluded_tools: vec![],
             },
             runtime: RuntimeConfig {
                 kind: "docker".into(),
