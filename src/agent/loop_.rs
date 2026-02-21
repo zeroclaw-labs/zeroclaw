@@ -2809,6 +2809,18 @@ pub async fn run(
             "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover, 'execute' to run (optionally with connected_account_id), 'connect' to OAuth.",
         ));
     }
+    if config.web_search.enabled {
+        tool_descs.push((
+            "web_search",
+            "Search the web for current information. Use when: user asks about recent events, live data, prices, locations, recommendations, or anything requiring up-to-date knowledge beyond training data.",
+        ));
+    }
+    if config.http_request.enabled {
+        tool_descs.push((
+            "http_request",
+            "Make HTTP requests to APIs and websites. Use when: fetching data from URLs, calling REST APIs, retrieving web page content. Params: url (required), method (GET/POST/etc), headers, body.",
+        ));
+    }
     tool_descs.push((
         "schedule",
         "Manage scheduled tasks (create/list/get/cancel/pause/resume). Supports recurring cron and one-shot delays.",

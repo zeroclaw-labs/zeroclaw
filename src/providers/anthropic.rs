@@ -279,7 +279,9 @@ impl AnthropicProvider {
         let result = value
             .get("content")
             .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("(no output)")
             .to_string();
         Some(NativeMessage {
             role: "user".to_string(),
@@ -308,7 +310,7 @@ impl AnthropicProvider {
                             role: "assistant".to_string(),
                             content: blocks,
                         });
-                    } else {
+                    } else if !msg.content.trim().is_empty() {
                         native_messages.push(NativeMessage {
                             role: "assistant".to_string(),
                             content: vec![NativeContentOut::Text {
@@ -321,7 +323,7 @@ impl AnthropicProvider {
                 "tool" => {
                     if let Some(tool_result) = Self::parse_tool_result_message(&msg.content) {
                         native_messages.push(tool_result);
-                    } else {
+                    } else if !msg.content.trim().is_empty() {
                         native_messages.push(NativeMessage {
                             role: "user".to_string(),
                             content: vec![NativeContentOut::Text {
@@ -332,13 +334,15 @@ impl AnthropicProvider {
                     }
                 }
                 _ => {
-                    native_messages.push(NativeMessage {
-                        role: "user".to_string(),
-                        content: vec![NativeContentOut::Text {
-                            text: msg.content.clone(),
-                            cache_control: None,
-                        }],
-                    });
+                    if !msg.content.trim().is_empty() {
+                        native_messages.push(NativeMessage {
+                            role: "user".to_string(),
+                            content: vec![NativeContentOut::Text {
+                                text: msg.content.clone(),
+                                cache_control: None,
+                            }],
+                        });
+                    }
                 }
             }
         }
@@ -1351,5 +1355,105 @@ mod tests {
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
         let result = AnthropicProvider::parse_native_response(resp);
         assert!(result.usage.is_none());
+    }
+
+    #[test]
+    fn tool_result_empty_content_gets_placeholder() {
+        let json = r#"{"tool_call_id": "abc123", "content": ""}"#;
+        let msg = AnthropicProvider::parse_tool_result_message(json).unwrap();
+        match &msg.content[0] {
+            NativeContentOut::ToolResult { content, .. } => {
+                assert_eq!(content, "(no output)");
+            }
+            _ => panic!("Expected ToolResult variant"),
+        }
+    }
+
+    #[test]
+    fn tool_result_null_content_gets_placeholder() {
+        let json = r#"{"tool_call_id": "abc123", "content": null}"#;
+        let msg = AnthropicProvider::parse_tool_result_message(json).unwrap();
+        match &msg.content[0] {
+            NativeContentOut::ToolResult { content, .. } => {
+                assert_eq!(content, "(no output)");
+            }
+            _ => panic!("Expected ToolResult variant"),
+        }
+    }
+
+    #[test]
+    fn tool_result_missing_content_gets_placeholder() {
+        let json = r#"{"tool_call_id": "abc123"}"#;
+        let msg = AnthropicProvider::parse_tool_result_message(json).unwrap();
+        match &msg.content[0] {
+            NativeContentOut::ToolResult { content, .. } => {
+                assert_eq!(content, "(no output)");
+            }
+            _ => panic!("Expected ToolResult variant"),
+        }
+    }
+
+    #[test]
+    fn tool_result_whitespace_content_gets_placeholder() {
+        let json = r#"{"tool_call_id": "abc123", "content": "   "}"#;
+        let msg = AnthropicProvider::parse_tool_result_message(json).unwrap();
+        match &msg.content[0] {
+            NativeContentOut::ToolResult { content, .. } => {
+                assert_eq!(content, "(no output)");
+            }
+            _ => panic!("Expected ToolResult variant"),
+        }
+    }
+
+    #[test]
+    fn tool_result_valid_content_preserved() {
+        let json = r#"{"tool_call_id": "abc123", "content": "file created"}"#;
+        let msg = AnthropicProvider::parse_tool_result_message(json).unwrap();
+        match &msg.content[0] {
+            NativeContentOut::ToolResult { content, .. } => {
+                assert_eq!(content, "file created");
+            }
+            _ => panic!("Expected ToolResult variant"),
+        }
+    }
+
+    #[test]
+    fn convert_messages_skips_empty_user_message() {
+        let messages = vec![
+            ChatMessage {
+                role: "user".to_string(),
+                content: "Hello".to_string(),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: "".to_string(),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: "World".to_string(),
+            },
+        ];
+        let (_, native) = AnthropicProvider::convert_messages(&messages);
+        assert_eq!(native.len(), 2);
+    }
+
+    #[test]
+    fn convert_messages_skips_empty_assistant_message() {
+        let messages = vec![
+            ChatMessage {
+                role: "user".to_string(),
+                content: "Hello".to_string(),
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "  ".to_string(),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: "World".to_string(),
+            },
+        ];
+        let (_, native) = AnthropicProvider::convert_messages(&messages);
+        assert_eq!(native.len(), 2);
     }
 }
