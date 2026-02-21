@@ -2594,13 +2594,14 @@ fn collect_configured_channels(
     if let Some(ref mx) = config.channels_config.matrix {
         channels.push(ConfiguredChannel {
             display_name: "Matrix",
-            channel: Arc::new(MatrixChannel::new_with_session_hint(
+            channel: Arc::new(MatrixChannel::new_with_session_hint_and_zeroclaw_dir(
                 mx.homeserver.clone(),
                 mx.access_token.clone(),
                 mx.room_id.clone(),
                 mx.allowed_users.clone(),
                 mx.user_id.clone(),
                 mx.device_id.clone(),
+                config.config_path.parent().map(|path| path.to_path_buf()),
             )),
         });
     }
@@ -3869,6 +3870,7 @@ BTC is currently around $65,000 based on latest tool output."#
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
         });
