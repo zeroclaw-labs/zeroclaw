@@ -23,6 +23,9 @@ permissions:
     pull-requests: write
     issues: write
 
+env:
+    LABEL_POLICY_PATH: .github/label-policy.json
+
 jobs:
     label:
         runs-on: ubuntu-latest

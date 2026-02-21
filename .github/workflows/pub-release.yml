@@ -109,10 +109,12 @@ jobs:
                     fi
                   fi
 
-                  echo "release_ref=${release_ref}" >> "$GITHUB_OUTPUT"
-                  echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
-                  echo "publish_release=${publish_release}" >> "$GITHUB_OUTPUT"
-                  echo "draft_release=${draft_release}" >> "$GITHUB_OUTPUT"
+                  {
+                    echo "release_ref=${release_ref}"
+                    echo "release_tag=${release_tag}"
+                    echo "publish_release=${publish_release}"
+                    echo "draft_release=${draft_release}"
+                  } >> "$GITHUB_OUTPUT"
 
                   {
                     echo "### Release Context"
@@ -202,42 +204,22 @@ jobs:
                     echo "Using linker override: $LINKER_ENV=$LINKER"
                     export "$LINKER_ENV=$LINKER"
                   fi
-                  cargo build --release --locked --target ${{ matrix.target }}
+                  cargo build --profile release-fast --locked --target ${{ matrix.target }}
 
             - name: Check binary size (Unix)
               if: runner.os != 'Windows'
-              run: |
-                  BIN="target/${{ matrix.target }}/release/${{ matrix.artifact }}"
-                  if [ ! -f "$BIN" ]; then
-                    echo "::error::Expected binary not found: $BIN"
-                    exit 1
-                  fi
-                  SIZE=$(stat -f%z "$BIN" 2>/dev/null || stat -c%s "$BIN")
-                  SIZE_MB=$((SIZE / 1024 / 1024))
-                  echo "Binary size: ${SIZE_MB}MB ($SIZE bytes)"
-                  echo "### Binary Size: ${{ matrix.target }}" >> "$GITHUB_STEP_SUMMARY"
-                  echo "- Size: ${SIZE_MB}MB ($SIZE bytes)" >> "$GITHUB_STEP_SUMMARY"
-                  if [ "$SIZE" -gt 41943040 ]; then
-                    echo "::error::Binary exceeds 40MB safeguard (${SIZE_MB}MB)"
-                    exit 1
-                  elif [ "$SIZE" -gt 15728640 ]; then
-                    echo "::warning::Binary exceeds 15MB advisory target (${SIZE_MB}MB)"
-                  elif [ "$SIZE" -gt 5242880 ]; then
-                    echo "::warning::Binary exceeds 5MB target (${SIZE_MB}MB)"
-                  else
-                    echo "Binary size within target."
-                  fi
+              run: bash scripts/ci/check_binary_size.sh "target/${{ matrix.target }}/release-fast/${{ matrix.artifact }}" "${{ matrix.target }}"
 
             - name: Package (Unix)
               if: runner.os != 'Windows'
               run: |
-                  cd target/${{ matrix.target }}/release
+                  cd target/${{ matrix.target }}/release-fast
                   tar czf ../../../zeroclaw-${{ matrix.target }}.${{ matrix.archive_ext }} ${{ matrix.artifact }}
 
             - name: Package (Windows)
               if: runner.os == 'Windows'
               run: |
-                  cd target/${{ matrix.target }}/release
+                  cd target/${{ matrix.target }}/release-fast
                   7z a ../../../zeroclaw-${{ matrix.target }}.${{ matrix.archive_ext }} ${{ matrix.artifact }}
 
             - name: Upload artifact

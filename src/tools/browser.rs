@@ -34,13 +34,12 @@ impl std::fmt::Debug for ComputerUseConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ComputerUseConfig")
             .field("endpoint", &self.endpoint)
-            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
             .field("timeout_ms", &self.timeout_ms)
             .field("allow_remote_endpoint", &self.allow_remote_endpoint)
             .field("window_allowlist", &self.window_allowlist)
             .field("max_coordinate_x", &self.max_coordinate_x)
             .field("max_coordinate_y", &self.max_coordinate_y)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

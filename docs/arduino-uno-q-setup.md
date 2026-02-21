@@ -15,7 +15,7 @@ ZeroClaw includes everything needed for Arduino Uno Q. **Clone the repo and foll
 | Setup command | `src/peripherals/uno_q_setup.rs` | `zeroclaw peripheral setup-uno-q` deploys the Bridge via scp + arduino-app-cli |
 | Config schema | `board = "arduino-uno-q"`, `transport = "bridge"` | Supported in `config.toml` |
 
-Build with `--features hardware` (or the default features) to include Uno Q support.
+Build with `--features hardware` to include Uno Q support.
 
 ---
 
@@ -70,7 +70,7 @@ git clone https://github.com/theonlyhennygod/zeroclaw.git
 cd zeroclaw
 
 # Build (takes ~15–30 min on Uno Q)
-cargo build --release
+cargo build --release --features hardware
 
 # Install
 sudo cp target/release/zeroclaw /usr/local/bin/
@@ -87,7 +87,7 @@ brew tap messense/macos-cross-toolchains
 brew install aarch64-unknown-linux-gnu
 
 # Build
-CC_aarch64_unknown_linux_gnu=aarch64-unknown-linux-gnu-gcc cargo build --release --target aarch64-unknown-linux-gnu
+CC_aarch64_unknown_linux_gnu=aarch64-unknown-linux-gnu-gcc cargo build --release --target aarch64-unknown-linux-gnu --features hardware
 
 # Copy to Uno Q
 scp target/aarch64-unknown-linux-gnu/release/zeroclaw arduino@<UNO_Q_IP>:~/
@@ -200,7 +200,7 @@ Now when you message your Telegram bot *"Turn on the LED"* or *"Set pin 13 high"
 | 3 | `curl -sSf https://sh.rustup.rs \| sh -s -- -y && source ~/.cargo/env` |
 | 4 | `sudo apt-get install -y pkg-config libssl-dev` |
 | 5 | `git clone https://github.com/theonlyhennygod/zeroclaw.git && cd zeroclaw` |
-| 6 | `cargo build --release --no-default-features` |
+| 6 | `cargo build --release --features hardware` |
 | 7 | `zeroclaw onboard --api-key KEY --provider openrouter` |
 | 8 | Edit `~/.zeroclaw/config.toml` (add Telegram bot_token) |
 | 9 | `zeroclaw daemon --host 127.0.0.1 --port 3000` |
@@ -212,6 +212,6 @@ Now when you message your Telegram bot *"Turn on the LED"* or *"Set pin 13 high"
 
 - **"command not found: zeroclaw"** — Use full path: `/usr/local/bin/zeroclaw` or ensure `~/.cargo/bin` is in PATH.
 - **Telegram not responding** — Check bot_token, allowed_users, and that the Uno Q has internet (WiFi).
-- **Out of memory** — Use `--no-default-features` to reduce binary size; consider `compact_context = true`.
+- **Out of memory** — Keep features minimal (`--features hardware` for Uno Q); consider `compact_context = true`.
 - **GPIO commands ignored** — Ensure Bridge app is running (`zeroclaw peripheral setup-uno-q` deploys and starts it). Config must have `board = "arduino-uno-q"` and `transport = "bridge"`.
 - **LLM provider (GLM/Zhipu)** — Use `default_provider = "glm"` or `"zhipu"` with `GLM_API_KEY` in env or config. ZeroClaw uses the correct v4 endpoint.

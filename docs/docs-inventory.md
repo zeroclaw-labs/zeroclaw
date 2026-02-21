@@ -19,10 +19,12 @@ Last reviewed: **February 18, 2026**.
 | `README.zh-CN.md` | Current Guide (localized) | Chinese readers |
 | `README.ja.md` | Current Guide (localized) | Japanese readers |
 | `README.ru.md` | Current Guide (localized) | Russian readers |
+| `README.vi.md` | Current Guide (localized) | Vietnamese readers |
 | `docs/README.md` | Current Guide (hub) | all readers |
 | `docs/README.zh-CN.md` | Current Guide (localized hub) | Chinese readers |
 | `docs/README.ja.md` | Current Guide (localized hub) | Japanese readers |
 | `docs/README.ru.md` | Current Guide (localized hub) | Russian readers |
+| `docs/README.vi.md` | Current Guide (localized hub) | Vietnamese readers |
 | `docs/SUMMARY.md` | Current Guide (unified TOC) | all readers |
 
 ## Collection Index Docs

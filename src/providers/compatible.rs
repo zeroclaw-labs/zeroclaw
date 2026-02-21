@@ -4,7 +4,8 @@
 
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, StreamChunk, StreamError, StreamOptions, StreamResult, ToolCall as ProviderToolCall,
+    Provider, StreamChunk, StreamError, StreamOptions, StreamResult, TokenUsage,
+    ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
@@ -272,6 +273,16 @@ struct Message {
 #[derive(Debug, Deserialize)]
 struct ApiChatResponse {
     choices: Vec<Choice>,
+    #[serde(default)]
+    usage: Option<UsageInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UsageInfo {
+    #[serde(default)]
+    prompt_tokens: Option<u64>,
+    #[serde(default)]
+    completion_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -356,13 +367,60 @@ struct ToolCall {
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<String>,
     #[serde(rename = "type")]
+    #[serde(default)]
     kind: Option<String>,
+    #[serde(default)]
     function: Option<Function>,
+
+    // Compatibility: Some providers (e.g., older GLM) may use 'name' directly
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+
+    // Compatibility: DeepSeek sometimes wraps arguments differently
+    #[serde(rename = "parameters", default)]
+    parameters: Option<serde_json::Value>,
+}
+
+impl ToolCall {
+    /// Extract function name with fallback logic for various provider formats
+    fn function_name(&self) -> Option<String> {
+        // Standard OpenAI format: tool_calls[].function.name
+        if let Some(ref func) = self.function {
+            if let Some(ref name) = func.name {
+                return Some(name.clone());
+            }
+        }
+        // Fallback: direct name field
+        self.name.clone()
+    }
+
+    /// Extract arguments with fallback logic and type conversion
+    fn function_arguments(&self) -> Option<String> {
+        // Standard OpenAI format: tool_calls[].function.arguments (string)
+        if let Some(ref func) = self.function {
+            if let Some(ref args) = func.arguments {
+                return Some(args.clone());
+            }
+        }
+        // Fallback: direct arguments field
+        if let Some(ref args) = self.arguments {
+            return Some(args.clone());
+        }
+        // Compatibility: Some providers return parameters as object instead of string
+        if let Some(ref params) = self.parameters {
+            return serde_json::to_string(params).ok();
+        }
+        None
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Function {
+    #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
     arguments: Option<String>,
 }
 
@@ -587,8 +645,7 @@ fn first_nonempty(text: Option<&str>) -> Option<String> {
 
 fn normalize_responses_role(role: &str) -> &'static str {
     match role {
-        "assistant" => "assistant",
-        "tool" => "assistant",
+        "assistant" | "tool" => "assistant",
         _ => "user",
     }
 }
@@ -771,6 +828,9 @@ impl OpenAiCompatibleProvider {
                                             name: Some(tc.name),
                                             arguments: Some(tc.arguments),
                                         }),
+                                        name: None,
+                                        arguments: None,
+                                        parameters: None,
                                     })
                                     .collect::<Vec<_>>();
 
@@ -849,25 +909,37 @@ impl OpenAiCompatibleProvider {
     }
 
     fn parse_native_response(message: ResponseMessage) -> ProviderChatResponse {
+        let text = message.effective_content_optional();
         let tool_calls = message
             .tool_calls
             .unwrap_or_default()
             .into_iter()
             .filter_map(|tc| {
-                let function = tc.function?;
-                let name = function.name?;
-                let arguments = function.arguments.unwrap_or_else(|| "{}".to_string());
+                let name = tc.function_name()?;
+                let arguments = tc.function_arguments().unwrap_or_else(|| "{}".to_string());
+                let normalized_arguments =
+                    if serde_json::from_str::<serde_json::Value>(&arguments).is_ok() {
+                        arguments
+                    } else {
+                        tracing::warn!(
+                            function = %name,
+                            arguments = %arguments,
+                            "Invalid JSON in native tool-call arguments, using empty object"
+                        );
+                        "{}".to_string()
+                    };
                 Some(ProviderToolCall {
                     id: tc.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                     name,
-                    arguments,
+                    arguments: normalized_arguments,
                 })
             })
             .collect::<Vec<_>>();
 
         ProviderChatResponse {
-            text: message.content,
+            text,
             tool_calls,
+            usage: None,
         }
     }
 
@@ -1197,6 +1269,7 @@ impl Provider for OpenAiCompatibleProvider {
                 return Ok(ProviderChatResponse {
                     text: Some(text),
                     tool_calls: vec![],
+                    usage: None,
                 });
             }
         };
@@ -1207,6 +1280,10 @@ impl Provider for OpenAiCompatibleProvider {
 
         let body = response.text().await?;
         let chat_response = parse_chat_response_body(&self.name, &body)?;
+        let usage = chat_response.usage.map(|u| TokenUsage {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+        });
         let choice = chat_response
             .choices
             .into_iter()
@@ -1231,7 +1308,11 @@ impl Provider for OpenAiCompatibleProvider {
             })
             .collect::<Vec<_>>();
 
-        Ok(ProviderChatResponse { text, tool_calls })
+        Ok(ProviderChatResponse {
+            text,
+            tool_calls,
+            usage,
+        })
     }
 
     async fn chat(
@@ -1281,6 +1362,7 @@ impl Provider for OpenAiCompatibleProvider {
                         .map(|text| ProviderChatResponse {
                             text: Some(text),
                             tool_calls: vec![],
+                            usage: None,
                         })
                         .map_err(|responses_err| {
                             anyhow::anyhow!(
@@ -1308,6 +1390,7 @@ impl Provider for OpenAiCompatibleProvider {
                 return Ok(ProviderChatResponse {
                     text: Some(text),
                     tool_calls: vec![],
+                    usage: None,
                 });
             }
 
@@ -1318,6 +1401,7 @@ impl Provider for OpenAiCompatibleProvider {
                     .map(|text| ProviderChatResponse {
                         text: Some(text),
                         tool_calls: vec![],
+                        usage: None,
                     })
                     .map_err(|responses_err| {
                         anyhow::anyhow!(
@@ -1331,6 +1415,10 @@ impl Provider for OpenAiCompatibleProvider {
         }
 
         let native_response: ApiChatResponse = response.json().await?;
+        let usage = native_response.usage.map(|u| TokenUsage {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+        });
         let message = native_response
             .choices
             .into_iter()
@@ -1338,7 +1426,9 @@ impl Provider for OpenAiCompatibleProvider {
             .map(|choice| choice.message)
             .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))?;
 
-        Ok(Self::parse_native_response(message))
+        let mut result = Self::parse_native_response(message);
+        result.usage = usage;
+        Ok(result)
     }
 
     fn supports_native_tools(&self) -> bool {
@@ -1696,6 +1786,50 @@ mod tests {
             .contains("requires at least one non-system message"));
     }
 
+    #[test]
+    fn tool_call_function_name_falls_back_to_top_level_name() {
+        let call: ToolCall = serde_json::from_value(serde_json::json!({
+            "name": "memory_recall",
+            "arguments": "{\"query\":\"latest roadmap\"}"
+        }))
+        .unwrap();
+
+        assert_eq!(call.function_name().as_deref(), Some("memory_recall"));
+    }
+
+    #[test]
+    fn tool_call_function_arguments_falls_back_to_parameters_object() {
+        let call: ToolCall = serde_json::from_value(serde_json::json!({
+            "name": "shell",
+            "parameters": {"command": "pwd"}
+        }))
+        .unwrap();
+
+        assert_eq!(
+            call.function_arguments().as_deref(),
+            Some("{\"command\":\"pwd\"}")
+        );
+    }
+
+    #[test]
+    fn tool_call_function_arguments_prefers_nested_function_field() {
+        let call: ToolCall = serde_json::from_value(serde_json::json!({
+            "name": "ignored_name",
+            "arguments": "{\"query\":\"ignored\"}",
+            "function": {
+                "name": "memory_recall",
+                "arguments": "{\"query\":\"preferred\"}"
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(call.function_name().as_deref(), Some("memory_recall"));
+        assert_eq!(
+            call.function_arguments().as_deref(),
+            Some("{\"query\":\"preferred\"}")
+        );
+    }
+
     // ----------------------------------------------------------
     // Custom endpoint path tests (Issue #114)
     // ----------------------------------------------------------
@@ -1898,6 +2032,9 @@ mod tests {
                     name: Some("shell".to_string()),
                     arguments: Some(r#"{"command":"pwd"}"#.to_string()),
                 }),
+                name: None,
+                arguments: None,
+                parameters: None,
             }]),
             reasoning_content: None,
         };
@@ -2342,5 +2479,24 @@ mod tests {
         let line = "data: [DONE]";
         let result = parse_sse_line(line).unwrap();
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn api_response_parses_usage() {
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {"prompt_tokens": 150, "completion_tokens": 60}
+        }"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, Some(150));
+        assert_eq!(usage.completion_tokens, Some(60));
+    }
+
+    #[test]
+    fn api_response_parses_without_usage() {
+        let json = r#"{"choices": [{"message": {"content": "Hello"}}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.usage.is_none());
     }
 }

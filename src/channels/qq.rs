@@ -192,10 +192,14 @@ impl Channel for QQChannel {
                 }),
             )
         } else {
-            let user_id = message
+            let raw_uid = message
                 .recipient
                 .strip_prefix("user:")
                 .unwrap_or(&message.recipient);
+            let user_id: String = raw_uid
+                .chars()
+                .filter(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
             (
                 format!("{QQ_API_BASE}/v2/users/{user_id}/messages"),
                 json!({

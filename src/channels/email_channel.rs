@@ -13,7 +13,7 @@ use async_imap::extensions::idle::IdleResponse;
 use async_imap::types::Fetch;
 use async_imap::Session;
 use async_trait::async_trait;
-use futures::TryStreamExt;
+use futures_util::TryStreamExt;
 use lettre::message::SinglePart;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};

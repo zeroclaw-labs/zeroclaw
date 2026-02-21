@@ -2,9 +2,9 @@
 
 This page is the primary entry point for the documentation system.
 
-Last refreshed: **February 18, 2026**.
+Last refreshed: **February 21, 2026**.
 
-Localized hubs: [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Русский](README.ru.md).
+Localized hubs: [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Русский](README.ru.md) · [Français](README.fr.md) · [Tiếng Việt](i18n/vi/README.md).
 
 ## Start Here
 
@@ -83,4 +83,6 @@ Localized hubs: [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · 
 
 - Unified TOC: [SUMMARY.md](SUMMARY.md)
 - Documentation inventory/classification: [docs-inventory.md](docs-inventory.md)
+- i18n docs index: [i18n/README.md](i18n/README.md)
+- i18n coverage map: [i18n-coverage.md](i18n-coverage.md)
 - Project triage snapshot: [project-triage-snapshot-2026-02-18.md](project-triage-snapshot-2026-02-18.md)

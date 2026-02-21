@@ -10,10 +10,16 @@ Last refreshed: **February 18, 2026**.
 - Chinese README: [../README.zh-CN.md](../README.zh-CN.md)
 - Japanese README: [../README.ja.md](../README.ja.md)
 - Russian README: [../README.ru.md](../README.ru.md)
+- French README: [../README.fr.md](../README.fr.md)
+- Vietnamese README: [../README.vi.md](../README.vi.md)
 - English Docs Hub: [README.md](README.md)
 - Chinese Docs Hub: [README.zh-CN.md](README.zh-CN.md)
 - Japanese Docs Hub: [README.ja.md](README.ja.md)
 - Russian Docs Hub: [README.ru.md](README.ru.md)
+- French Docs Hub: [README.fr.md](README.fr.md)
+- Vietnamese Docs Hub: [i18n/vi/README.md](i18n/vi/README.md)
+- i18n Docs Index: [i18n/README.md](i18n/README.md)
+- i18n Coverage Map: [i18n-coverage.md](i18n-coverage.md)
 
 ## Collections
 

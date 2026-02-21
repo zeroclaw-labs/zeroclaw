@@ -25,13 +25,13 @@
 </p>
 
 <p align="center">
-  🌐 <strong>Ngôn ngữ:</strong> <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.ru.md">Русский</a> · <a href="README.vi.md">Tiếng Việt</a>
+  🌐 <strong>Ngôn ngữ:</strong> <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.ru.md">Русский</a> · <a href="README.fr.md">Français</a> · <a href="README.vi.md">Tiếng Việt</a>
 </p>
 
 <p align="center">
   <a href="#quick-start">Bắt đầu</a> |
   <a href="bootstrap.sh">Cài đặt một lần bấm</a> |
-  <a href="docs/README.md">Trung tâm tài liệu</a> |
+  <a href="docs/i18n/vi/README.md">Trung tâm tài liệu</a> |
   <a href="docs/SUMMARY.md">Mục lục tài liệu</a>
 </p>
 
@@ -39,7 +39,7 @@
   <strong>Truy cập nhanh:</strong>
   <a href="docs/reference/README.md">Tài liệu tham khảo</a> ·
   <a href="docs/operations/README.md">Vận hành</a> ·
-  <a href="docs/troubleshooting.md">Khắc phục sự cố</a> ·
+  <a href="docs/i18n/vi/troubleshooting.md">Khắc phục sự cố</a> ·
   <a href="docs/security/README.md">Bảo mật</a> ·
   <a href="docs/hardware/README.md">Phần cứng</a> ·
   <a href="docs/contributing/README.md">Đóng góp</a>
@@ -50,6 +50,10 @@
   Triển khai ở đâu cũng được. Thay thế gì cũng được.
 </p>
 
+<p align="center">
+  ZeroClaw là <strong>hệ điều hành runtime</strong> cho các quy trình làm việc của tác tử — cơ sở hạ tầng trừu tượng hóa mô hình, công cụ, bộ nhớ và thực thi để xây dựng tác tử một lần và chạy ở mọi nơi.
+</p>
+
 <p align="center"><code>Kiến trúc trait-driven · mặc định bảo mật · provider/channel/tool hoán đổi tự do · mọi thứ đều dễ mở rộng</code></p>
 
 ### 📢 Thông báo
@@ -58,8 +62,8 @@ Bảng này dành cho các thông báo quan trọng (thay đổi không tương 
 
 | Ngày (UTC) | Mức độ | Thông báo | Hành động |
 |---|---|---|---|
-| 2026-02-19 | _Nghiêm trọng_ | Chúng tôi **không có liên kết** với `openagen/zeroclaw` hoặc `zeroclaw.org`. Tên miền `zeroclaw.org` hiện đang trỏ đến fork `openagen/zeroclaw`, và tên miền/repository đó đang mạo danh website/dự án chính thức của chúng tôi. | Không tin tưởng thông tin, binary, gây quỹ, hay thông báo từ các nguồn đó. Chỉ sử dụng repository này và các tài khoản mạng xã hội đã được xác minh của chúng tôi. |
-| 2026-02-19 | _Quan trọng_ | Chúng tôi **chưa** ra mắt website chính thức, và chúng tôi đang ghi nhận các nỗ lực mạo danh. **Không** tham gia bất kỳ hoạt động đầu tư hoặc gây quỹ nào tuyên bố mang tên ZeroClaw. | Sử dụng repository này làm nguồn thông tin duy nhất đáng tin cậy. Theo dõi [X (@zeroclawlabs)](https://x.com/zeroclawlabs?s=21), [Reddit (r/zeroclawlabs)](https://www.reddit.com/r/zeroclawlabs/), [Telegram (@zeroclawlabs)](https://t.me/zeroclawlabs), [Telegram CN (@zeroclawlabs_cn)](https://t.me/zeroclawlabs_cn), [Telegram RU (@zeroclawlabs_ru)](https://t.me/zeroclawlabs_ru), và [Xiaohongshu](https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search) để nhận cập nhật chính thức. |
+| 2026-02-19 | _Nghiêm trọng_ | Chúng tôi **không có liên kết** với `openagen/zeroclaw` hoặc `zeroclaw.org`. Tên miền `zeroclaw.org` hiện đang trỏ đến fork `openagen/zeroclaw`, và tên miền/repository đó đang mạo danh website/dự án chính thức của chúng tôi. | Không tin tưởng thông tin, binary, gây quỹ, hay thông báo từ các nguồn đó. Chỉ sử dụng [repository này](https://github.com/zeroclaw-labs/zeroclaw) và các tài khoản mạng xã hội đã được xác minh của chúng tôi. |
+| 2026-02-21 | _Quan trọng_ | Website chính thức của chúng tôi đã ra mắt: [zeroclawlabs.ai](https://zeroclawlabs.ai). Cảm ơn mọi người đã kiên nhẫn chờ đợi. Chúng tôi vẫn đang ghi nhận các nỗ lực mạo danh, vì vậy **không** tham gia bất kỳ hoạt động đầu tư hoặc gây quỹ nào nhân danh ZeroClaw nếu thông tin đó không được công bố qua các kênh chính thức của chúng tôi. | Sử dụng [repository này](https://github.com/zeroclaw-labs/zeroclaw) làm nguồn thông tin duy nhất đáng tin cậy. Theo dõi [X (@zeroclawlabs)](https://x.com/zeroclawlabs?s=21), [Reddit (r/zeroclawlabs)](https://www.reddit.com/r/zeroclawlabs/), [Telegram (@zeroclawlabs)](https://t.me/zeroclawlabs), [Telegram CN (@zeroclawlabs_cn)](https://t.me/zeroclawlabs_cn), [Telegram RU (@zeroclawlabs_ru)](https://t.me/zeroclawlabs_ru), và [Xiaohongshu](https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search) để nhận cập nhật chính thức. |
 | 2026-02-19 | _Quan trọng_ | Anthropic đã cập nhật điều khoản Xác thực và Sử dụng Thông tin xác thực vào ngày 2026-02-19. Xác thực OAuth (Free, Pro, Max) được dành riêng cho Claude Code và Claude.ai; việc sử dụng OAuth token từ Claude Free/Pro/Max trong bất kỳ sản phẩm, công cụ hay dịch vụ nào khác (bao gồm Agent SDK) đều không được phép và có thể vi phạm Điều khoản Dịch vụ cho Người tiêu dùng. | Vui lòng tạm thời tránh tích hợp Claude Code OAuth để ngăn ngừa khả năng mất mát. Điều khoản gốc: [Authentication and Credential Use](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use). |
 
 ### ✨ Tính năng
@@ -117,7 +121,7 @@ Ví dụ mẫu (macOS arm64, đo ngày 18 tháng 2 năm 2026):
 <details>
 <summary><strong>Windows</strong></summary>
 
-#### Bắt buộc
+### Bắt buộc (Windows)
 
 1. **Visual Studio Build Tools** (cung cấp MSVC linker và Windows SDK):
    ```powershell
@@ -137,16 +141,16 @@ Ví dụ mẫu (macOS arm64, đo ngày 18 tháng 2 năm 2026):
    cargo --version
    ```
 
-#### Tùy chọn
+### Tùy chọn (Windows)
 
-- **Docker Desktop** — chỉ cần thiết nếu dùng [Docker sandboxed runtime](#runtime-support-current) (`runtime.kind = "docker"`). Cài đặt qua `winget install Docker.DockerDesktop`.
+- **Docker Desktop** — chỉ cần thiết nếu dùng mục `### Hỗ trợ runtime (hiện tại)` (`runtime.kind = "docker"`). Cài đặt qua `winget install Docker.DockerDesktop`.
 
 </details>
 
 <details>
 <summary><strong>Linux / macOS</strong></summary>
 
-#### Bắt buộc
+### Bắt buộc (Linux/macOS)
 
 1. **Công cụ build cơ bản:**
    - **Linux (Debian/Ubuntu):** `sudo apt install build-essential pkg-config`
@@ -194,14 +198,13 @@ Chỉ cài từ binary, không quay lại build từ source:
 ./bootstrap.sh --prebuilt-only
 ```
 
-#### Tùy chọn
+### Tùy chọn (Linux/macOS)
 
-- **Docker** — chỉ cần thiết nếu dùng [Docker sandboxed runtime](#runtime-support-current) (`runtime.kind = "docker"`). Cài đặt qua package manager hoặc [docker.com](https://docs.docker.com/engine/install/).
+- **Docker** — chỉ cần thiết nếu dùng mục `### Hỗ trợ runtime (hiện tại)` (`runtime.kind = "docker"`). Cài đặt qua package manager hoặc [docker.com](https://docs.docker.com/engine/install/).
 
 > **Lưu ý:** Lệnh `cargo build --release` mặc định dùng `codegen-units=1` để giảm áp lực biên dịch đỉnh. Để build nhanh hơn trên máy mạnh, dùng `cargo build --profile release-fast`.
 
 </details>
-
 
 ## Bắt đầu nhanh
 
@@ -231,8 +234,14 @@ cd zeroclaw
 # Tùy chọn: chạy onboarding trong cùng luồng
 ./bootstrap.sh --onboard --api-key "sk-..." --provider openrouter [--model "openrouter/auto"]
 
-# Tùy chọn: chạy bootstrap + onboarding hoàn toàn trong Docker
+# Tùy chọn: chạy bootstrap + onboarding hoàn toàn ở chế độ tương thích với Docker
 ./bootstrap.sh --docker
+
+# Tùy chọn: ép dùng Podman làm container CLI
+ZEROCLAW_CONTAINER_CLI=podman ./bootstrap.sh --docker
+
+# Tùy chọn: ở chế độ --docker, bỏ qua build image local và dùng tag local hoặc pull image fallback
+./bootstrap.sh --docker --skip-build
 ```
 
 Cài từ xa bằng một lệnh (nên xem trước nếu môi trường nhạy cảm về bảo mật):
@@ -380,7 +389,7 @@ Mọi hệ thống con đều là **trait** — chỉ cần đổi cấu hình, 
 | Hệ thống con | Trait | Đi kèm sẵn | Mở rộng |
 |-----------|-------|------------|--------|
 | **Mô hình AI** | `Provider` | Danh mục provider qua `zeroclaw providers` (hiện có 28 built-in + alias, cộng endpoint tùy chỉnh) | `custom:https://your-api.com` (tương thích OpenAI) hoặc `anthropic-custom:https://your-api.com` |
-| **Channel** | `Channel` | CLI, Telegram, Discord, Slack, Mattermost, iMessage, Matrix, Signal, WhatsApp, Email, IRC, Lark, DingTalk, QQ, Webhook | Bất kỳ messaging API nào |
+| **Channel** | `Channel` | CLI, Telegram, Discord, Slack, Mattermost, iMessage, Matrix, Signal, WhatsApp, Linq, Email, IRC, Lark, DingTalk, QQ, Webhook | Bất kỳ messaging API nào |
 | **Memory** | `Memory` | SQLite hybrid search, PostgreSQL backend (storage provider có thể cấu hình), Lucid bridge, Markdown files, backend `none` tường minh, snapshot/hydrate, response cache tùy chọn | Bất kỳ persistence backend nào |
 | **Tool** | `Tool` | shell/file/memory, cron/schedule, git, pushover, browser, http_request, screenshot/image_info, composio (opt-in), delegate, hardware tools | Bất kỳ khả năng nào |
 | **Observability** | `Observer` | Noop, Log, Multi | Prometheus, OTel |
@@ -943,20 +952,20 @@ git push --no-verify
 
 Bắt đầu từ trung tâm tài liệu để có bản đồ theo tác vụ:
 
-- Trung tâm tài liệu: [`docs/README.md`](docs/README.md)
+- Trung tâm tài liệu: [`docs/i18n/vi/README.md`](docs/i18n/vi/README.md)
 - Mục lục tài liệu thống nhất: [`docs/SUMMARY.md`](docs/SUMMARY.md)
-- Tài liệu tham khảo lệnh: [`docs/commands-reference.md`](docs/commands-reference.md)
-- Tài liệu tham khảo cấu hình: [`docs/config-reference.md`](docs/config-reference.md)
+- Tài liệu tham khảo lệnh: [`docs/i18n/vi/commands-reference.md`](docs/i18n/vi/commands-reference.md)
+- Tài liệu tham khảo cấu hình: [`docs/i18n/vi/config-reference.md`](docs/i18n/vi/config-reference.md)
 - Tài liệu tham khảo provider: [`docs/providers-reference.md`](docs/providers-reference.md)
 - Tài liệu tham khảo channel: [`docs/channels-reference.md`](docs/channels-reference.md)
 - Sổ tay vận hành: [`docs/operations-runbook.md`](docs/operations-runbook.md)
-- Khắc phục sự cố: [`docs/troubleshooting.md`](docs/troubleshooting.md)
+- Khắc phục sự cố: [`docs/i18n/vi/troubleshooting.md`](docs/i18n/vi/troubleshooting.md)
 - Kiểm kê/phân loại tài liệu: [`docs/docs-inventory.md`](docs/docs-inventory.md)
 - Tổng hợp phân loại PR/Issue (tính đến 18/2/2026): [`docs/project-triage-snapshot-2026-02-18.md`](docs/project-triage-snapshot-2026-02-18.md)
 
 Tài liệu tham khảo cộng tác cốt lõi:
 
-- Trung tâm tài liệu: [docs/README.md](docs/README.md)
+- Trung tâm tài liệu: [docs/i18n/vi/README.md](docs/i18n/vi/README.md)
 - Template tài liệu: [docs/doc-template.md](docs/doc-template.md)
 - Danh sách kiểm tra thay đổi tài liệu: [docs/README.md#4-documentation-change-checklist](docs/README.md#4-documentation-change-checklist)
 - Tài liệu tham khảo cấu hình channel: [docs/channels-reference.md](docs/channels-reference.md)
@@ -992,7 +1001,7 @@ Chúng tôi xây dựng công khai vì ý tưởng hay đến từ khắp nơi. 
 ## ⚠️ Repository Chính thức & Cảnh báo Mạo danh
 
 **Đây là repository ZeroClaw chính thức duy nhất:**
-> https://github.com/zeroclaw-labs/zeroclaw
+> <https://github.com/zeroclaw-labs/zeroclaw>
 
 Bất kỳ repository, tổ chức, tên miền hay gói nào khác tuyên bố là "ZeroClaw" hoặc ngụ ý liên kết với ZeroClaw Labs đều là **không được ủy quyền và không liên kết với dự án này**. Các fork không được ủy quyền đã biết sẽ được liệt kê trong [TRADEMARK.md](TRADEMARK.md).
 

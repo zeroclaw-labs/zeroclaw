@@ -52,7 +52,7 @@ const POSTGRES_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     auto_save_default: true,
     uses_sqlite_hygiene: false,
     sqlite_based: false,
-    optional_dependency: false,
+    optional_dependency: true,
 };
 
 const NONE_PROFILE: MemoryBackendProfile = MemoryBackendProfile {

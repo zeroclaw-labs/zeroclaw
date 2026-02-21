@@ -68,6 +68,8 @@ impl Observer for LogObserver {
                 duration,
                 success,
                 error_message,
+                input_tokens,
+                output_tokens,
             } => {
                 let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
                 info!(
@@ -76,6 +78,8 @@ impl Observer for LogObserver {
                     duration_ms = ms,
                     success = success,
                     error = ?error_message,
+                    input_tokens = ?input_tokens,
+                    output_tokens = ?output_tokens,
                     "llm.response"
                 );
             }
@@ -139,6 +143,24 @@ mod tests {
             duration: Duration::ZERO,
             tokens_used: None,
             cost_usd: None,
+        });
+        obs.record_event(&ObserverEvent::LlmResponse {
+            provider: "openrouter".into(),
+            model: "claude-sonnet".into(),
+            duration: Duration::from_millis(150),
+            success: true,
+            error_message: None,
+            input_tokens: Some(100),
+            output_tokens: Some(50),
+        });
+        obs.record_event(&ObserverEvent::LlmResponse {
+            provider: "openrouter".into(),
+            model: "claude-sonnet".into(),
+            duration: Duration::from_millis(200),
+            success: false,
+            error_message: Some("rate limited".into()),
+            input_tokens: None,
+            output_tokens: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),

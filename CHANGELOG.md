@@ -27,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Legacy values are still decrypted for backward compatibility but should be migrated.
 
 ### Fixed
+- **Gemini thinking model support** — Responses from thinking models (e.g. `gemini-3-pro-preview`)
+  are now handled correctly. The provider skips internal reasoning parts (`thought: true`) and
+  signature parts (`thoughtSignature`), extracting only the final answer text. Falls back to
+  thinking content when no non-thinking response is available.
 - **Onboarding channel menu dispatch** now uses an enum-backed selector instead of hard-coded
   numeric match arms, preventing duplicated pattern arms and related `unreachable pattern`
   compiler warnings in `src/onboard/wizard.rs`.

@@ -38,10 +38,17 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "tool.pushover",
     "memory.embeddings",
     "tunnel.custom",
+    "transcription.groq",
 ];
 
-const SUPPORTED_PROXY_SERVICE_SELECTORS: &[&str] =
-    &["provider.*", "channel.*", "tool.*", "memory.*", "tunnel.*"];
+const SUPPORTED_PROXY_SERVICE_SELECTORS: &[&str] = &[
+    "provider.*",
+    "channel.*",
+    "tool.*",
+    "memory.*",
+    "tunnel.*",
+    "transcription.*",
+];
 
 static RUNTIME_PROXY_CONFIG: OnceLock<RwLock<ProxyConfig>> = OnceLock::new();
 static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Client>>> =
@@ -183,9 +190,17 @@ pub struct Config {
     #[serde(default)]
     pub agents: HashMap<String, DelegateAgentConfig>,
 
+    /// Hooks configuration (lifecycle hooks and built-in hook toggles).
+    #[serde(default)]
+    pub hooks: HooksConfig,
+
     /// Hardware configuration (wizard-driven physical world setup).
     #[serde(default)]
     pub hardware: HardwareConfig,
+
+    /// Voice transcription configuration (Whisper API via Groq).
+    #[serde(default)]
+    pub transcription: TranscriptionConfig,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -294,6 +309,52 @@ impl Default for HardwareConfig {
             baud_rate: default_baud_rate(),
             probe_target: None,
             workspace_datasheets: false,
+        }
+    }
+}
+
+// ── Transcription ────────────────────────────────────────────────
+
+fn default_transcription_api_url() -> String {
+    "https://api.groq.com/openai/v1/audio/transcriptions".into()
+}
+
+fn default_transcription_model() -> String {
+    "whisper-large-v3-turbo".into()
+}
+
+fn default_transcription_max_duration_secs() -> u64 {
+    120
+}
+
+/// Voice transcription configuration (Whisper API via Groq).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TranscriptionConfig {
+    /// Enable voice transcription for channels that support it.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Whisper API endpoint URL.
+    #[serde(default = "default_transcription_api_url")]
+    pub api_url: String,
+    /// Whisper model name.
+    #[serde(default = "default_transcription_model")]
+    pub model: String,
+    /// Optional language hint (ISO-639-1, e.g. "en", "ru").
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Maximum voice duration in seconds (messages longer than this are skipped).
+    #[serde(default = "default_transcription_max_duration_secs")]
+    pub max_duration_secs: u64,
+}
+
+impl Default for TranscriptionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_url: default_transcription_api_url(),
+            model: default_transcription_model(),
+            language: None,
+            max_duration_secs: default_transcription_max_duration_secs(),
         }
     }
 }
@@ -1698,6 +1759,42 @@ impl Default for ObservabilityConfig {
     }
 }
 
+// ── Hooks ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct HooksConfig {
+    /// Enable lifecycle hook execution.
+    ///
+    /// Hooks run in-process with the same privileges as the main runtime.
+    /// Keep enabled hook handlers narrowly scoped and auditable.
+    pub enabled: bool,
+    #[serde(default)]
+    pub builtin: BuiltinHooksConfig,
+}
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            builtin: BuiltinHooksConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BuiltinHooksConfig {
+    /// Enable the command-logger hook (logs tool calls for auditing).
+    pub command_logger: bool,
+}
+
+impl Default for BuiltinHooksConfig {
+    fn default() -> Self {
+        Self {
+            command_logger: false,
+        }
+    }
+}
+
 // ── Autonomy / Security ──────────────────────────────────────────
 
 /// Autonomy and security policy configuration (`[autonomy]` section).
@@ -1735,14 +1832,15 @@ pub struct AutonomyConfig {
     #[serde(default = "default_always_ask")]
     pub always_ask: Vec<String>,
 
+    /// Extra directory roots the agent may read/write outside the workspace.
+    /// Resolved paths under any of these roots pass `is_resolved_path_allowed`.
+    #[serde(default)]
+    pub allowed_roots: Vec<String>,
+
     /// Tools to exclude from non-CLI channels (e.g. Telegram, Discord).
     ///
     /// When a tool is listed here, non-CLI channels will not expose it to the
-    /// LLM — it will not appear in the tool specs and any calls will be
-    /// rejected. CLI channels are unaffected.
-    ///
-    /// Example: `["shell", "file_write"]` prevents the model from attempting
-    /// shell commands on Telegram, forcing it to use data already in context.
+    /// model in tool specs.
     #[serde(default)]
     pub non_cli_excluded_tools: Vec<String>,
 }
@@ -1773,6 +1871,7 @@ impl Default for AutonomyConfig {
                 "wc".into(),
                 "head".into(),
                 "tail".into(),
+                "date".into(),
             ],
             forbidden_paths: vec![
                 "/etc".into(),
@@ -1800,6 +1899,7 @@ impl Default for AutonomyConfig {
             block_high_risk_commands: true,
             auto_approve: default_auto_approve(),
             always_ask: default_always_ask(),
+            allowed_roots: Vec::new(),
             non_cli_excluded_tools: Vec::new(),
         }
     }
@@ -2275,6 +2375,7 @@ pub struct ChannelsConfig {
     pub dingtalk: Option<DingTalkConfig>,
     /// QQ Official Bot channel configuration.
     pub qq: Option<QQConfig>,
+    pub nostr: Option<NostrConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
     /// (up to 4x, capped) so one slow/retried model call does not consume the
@@ -2308,6 +2409,7 @@ impl Default for ChannelsConfig {
             lark: None,
             dingtalk: None,
             qq: None,
+            nostr: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
         }
     }
@@ -2816,6 +2918,28 @@ pub struct QQConfig {
     pub allowed_users: Vec<String>,
 }
 
+/// Nostr channel configuration (NIP-04 + NIP-17 private messages)
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct NostrConfig {
+    /// Private key in hex or nsec bech32 format
+    pub private_key: String,
+    /// Relay URLs (wss://). Defaults to popular public relays if omitted.
+    #[serde(default = "default_nostr_relays")]
+    pub relays: Vec<String>,
+    /// Allowed sender public keys (hex or npub). Empty = deny all, "*" = allow all
+    #[serde(default)]
+    pub allowed_pubkeys: Vec<String>,
+}
+
+pub fn default_nostr_relays() -> Vec<String> {
+    vec![
+        "wss://relay.damus.io".to_string(),
+        "wss://nos.lol".to_string(),
+        "wss://relay.primal.net".to_string(),
+        "wss://relay.snort.social".to_string(),
+    ]
+}
+
 // ── Config impl ──────────────────────────────────────────────────
 
 impl Default for Config {
@@ -2859,8 +2983,10 @@ impl Default for Config {
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
+            hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
+            transcription: TranscriptionConfig::default(),
         }
     }
 }
@@ -3102,6 +3228,19 @@ fn decrypt_optional_secret(
     Ok(())
 }
 
+fn decrypt_secret(
+    store: &crate::security::SecretStore,
+    value: &mut String,
+    field_name: &str,
+) -> Result<()> {
+    if crate::security::SecretStore::is_encrypted(value) {
+        *value = store
+            .decrypt(value)
+            .with_context(|| format!("Failed to decrypt {field_name}"))?;
+    }
+    Ok(())
+}
+
 fn encrypt_optional_secret(
     store: &crate::security::SecretStore,
     value: &mut Option<String>,
@@ -3115,6 +3254,19 @@ fn encrypt_optional_secret(
                     .with_context(|| format!("Failed to encrypt {field_name}"))?,
             );
         }
+    }
+    Ok(())
+}
+
+fn encrypt_secret(
+    store: &crate::security::SecretStore,
+    value: &mut String,
+    field_name: &str,
+) -> Result<()> {
+    if !crate::security::SecretStore::is_encrypted(value) {
+        *value = store
+            .encrypt(value)
+            .with_context(|| format!("Failed to encrypt {field_name}"))?;
     }
     Ok(())
 }
@@ -3226,6 +3378,15 @@ impl Config {
             for agent in config.agents.values_mut() {
                 decrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
             }
+
+            if let Some(ref mut ns) = config.channels_config.nostr {
+                decrypt_secret(
+                    &store,
+                    &mut ns.private_key,
+                    "config.channels_config.nostr.private_key",
+                )?;
+            }
+
             config.apply_env_overrides();
             config.validate()?;
             tracing::info!(
@@ -3659,6 +3820,14 @@ impl Config {
             encrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
         }
 
+        if let Some(ref mut ns) = config_to_save.channels_config.nostr {
+            encrypt_secret(
+                &store,
+                &mut ns.private_key,
+                "config.channels_config.nostr.private_key",
+            )?;
+        }
+
         let toml_str =
             toml::to_string_pretty(&config_to_save).context("Failed to serialize config")?;
 
@@ -3952,6 +4121,8 @@ default_temperature = 0.7
                 block_high_risk_commands: true,
                 auto_approve: vec!["file_read".into()],
                 always_ask: vec![],
+                allowed_roots: vec![],
+                non_cli_excluded_tools: vec![],
             },
             runtime: RuntimeConfig {
                 kind: "docker".into(),
@@ -3993,6 +4164,7 @@ default_temperature = 0.7
                 lark: None,
                 dingtalk: None,
                 qq: None,
+                nostr: None,
                 message_timeout_secs: 300,
             },
             memory: MemoryConfig::default(),
@@ -4011,7 +4183,9 @@ default_temperature = 0.7
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
+            hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
+            transcription: TranscriptionConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -4180,7 +4354,9 @@ tool_dispatcher = "xml"
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
+            hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
+            transcription: TranscriptionConfig::default(),
         };
 
         config.save().await.unwrap();
@@ -4537,6 +4713,7 @@ allowed_users = ["@ops:matrix.org"]
             lark: None,
             dingtalk: None,
             qq: None,
+            nostr: None,
             message_timeout_secs: 300,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
@@ -4747,6 +4924,7 @@ channel_id = "C123"
             lark: None,
             dingtalk: None,
             qq: None,
+            nostr: None,
             message_timeout_secs: 300,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
@@ -6157,5 +6335,41 @@ default_model = "legacy-model"
             mode & 0o004 != 0,
             "Test setup: file should be world-readable (mode {mode:o})"
         );
+    }
+
+    #[test]
+    async fn transcription_config_defaults() {
+        let tc = TranscriptionConfig::default();
+        assert!(!tc.enabled);
+        assert!(tc.api_url.contains("groq.com"));
+        assert_eq!(tc.model, "whisper-large-v3-turbo");
+        assert!(tc.language.is_none());
+        assert_eq!(tc.max_duration_secs, 120);
+    }
+
+    #[test]
+    async fn config_roundtrip_with_transcription() {
+        let mut config = Config::default();
+        config.transcription.enabled = true;
+        config.transcription.language = Some("en".into());
+
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&toml_str).unwrap();
+
+        assert!(parsed.transcription.enabled);
+        assert_eq!(parsed.transcription.language.as_deref(), Some("en"));
+        assert_eq!(parsed.transcription.model, "whisper-large-v3-turbo");
+    }
+
+    #[test]
+    async fn config_without_transcription_uses_defaults() {
+        let toml_str = r#"
+            default_provider = "openrouter"
+            default_model = "test-model"
+            default_temperature = 0.7
+        "#;
+        let parsed: Config = toml::from_str(toml_str).unwrap();
+        assert!(!parsed.transcription.enabled);
+        assert_eq!(parsed.transcription.max_duration_secs, 120);
     }
 }

@@ -10,7 +10,7 @@
 use crate::channels::{Channel, LinqChannel, NextcloudTalkChannel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
-use crate::providers::{self, ChatMessage, Provider, ProviderCapabilityError};
+use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::security::SecurityPolicy;
@@ -306,6 +306,13 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     }
     let config_state = Arc::new(Mutex::new(config.clone()));
 
+    // ── Hooks ──────────────────────────────────────────────────────
+    let hooks: Option<std::sync::Arc<crate::hooks::HookRunner>> = if config.hooks.enabled {
+        Some(std::sync::Arc::new(crate::hooks::HookRunner::new()))
+    } else {
+        None
+    };
+
     let addr: SocketAddr = format!("{host}:{port}").parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let actual_port = listener.local_addr()?.port();
@@ -545,6 +552,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     crate::health::mark_component_ok("gateway");
 
+    // Fire gateway start hook
+    if let Some(ref hooks) = hooks {
+        hooks.fire_gateway_start(host, actual_port).await;
+    }
+
     // Build shared state
     let observer: Arc<dyn crate::observability::Observer> =
         Arc::from(crate::observability::create_observer(&config.observability));
@@ -713,23 +725,13 @@ async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGua
     Ok(())
 }
 
-async fn run_gateway_chat_with_multimodal(
+/// Simple chat for webhook endpoint (no tools, for backward compatibility and testing).
+async fn run_gateway_chat_simple(
     state: &AppState,
     provider_label: &str,
     message: &str,
 ) -> anyhow::Result<String> {
     let user_messages = vec![ChatMessage::user(message)];
-    let image_marker_count = crate::multimodal::count_image_markers(&user_messages);
-    if image_marker_count > 0 && !state.provider.supports_vision() {
-        return Err(ProviderCapabilityError {
-            provider: provider_label.to_string(),
-            capability: "vision".to_string(),
-            message: format!(
-                "received {image_marker_count} image marker(s), but this provider does not support vision input"
-            ),
-        }
-        .into());
-    }
 
     // Keep webhook/gateway prompts aligned with channel behavior by injecting
     // workspace-aware system context before model invocation.
@@ -757,6 +759,12 @@ async fn run_gateway_chat_with_multimodal(
         .provider
         .chat_with_history(&prepared.messages, &state.model, state.temperature)
         .await
+}
+
+/// Full-featured chat with tools for channel handlers (WhatsApp, Linq, Nextcloud Talk).
+async fn run_gateway_chat_with_tools(state: &AppState, message: &str) -> anyhow::Result<String> {
+    let config = state.config.lock().clone();
+    crate::agent::process_message(config, message).await
 }
 
 /// Webhook request body
@@ -880,7 +888,7 @@ async fn handle_webhook(
             messages_count: 1,
         });
 
-    match run_gateway_chat_with_multimodal(&state, &provider_label, message).await {
+    match run_gateway_chat_simple(&state, &provider_label, message).await {
         Ok(response) => {
             let duration = started_at.elapsed();
             state
@@ -891,6 +899,8 @@ async fn handle_webhook(
                     duration,
                     success: true,
                     error_message: None,
+                    input_tokens: None,
+                    output_tokens: None,
                 });
             state.observer.record_metric(
                 &crate::observability::traits::ObserverMetric::RequestLatency(duration),
@@ -920,6 +930,8 @@ async fn handle_webhook(
                     duration,
                     success: false,
                     error_message: Some(sanitized.clone()),
+                    input_tokens: None,
+                    output_tokens: None,
                 });
             state.observer.record_metric(
                 &crate::observability::traits::ObserverMetric::RequestLatency(duration),
@@ -1064,12 +1076,6 @@ async fn handle_whatsapp_message(
     }
 
     // Process each message
-    let provider_label = state
-        .config
-        .lock()
-        .default_provider
-        .clone()
-        .unwrap_or_else(|| "unknown".to_string());
     for msg in &messages {
         tracing::info!(
             "WhatsApp message from {}: {}",
@@ -1086,7 +1092,7 @@ async fn handle_whatsapp_message(
                 .await;
         }
 
-        match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content).await {
+        match run_gateway_chat_with_tools(&state, &msg.content).await {
             Ok(response) => {
                 // Send reply via WhatsApp
                 if let Err(e) = wa
@@ -1177,12 +1183,6 @@ async fn handle_linq_webhook(
     }
 
     // Process each message
-    let provider_label = state
-        .config
-        .lock()
-        .default_provider
-        .clone()
-        .unwrap_or_else(|| "unknown".to_string());
     for msg in &messages {
         tracing::info!(
             "Linq message from {}: {}",
@@ -1200,7 +1200,7 @@ async fn handle_linq_webhook(
         }
 
         // Call the LLM
-        match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content).await {
+        match run_gateway_chat_with_tools(&state, &msg.content).await {
             Ok(response) => {
                 // Send reply via Linq
                 if let Err(e) = linq
@@ -1311,7 +1311,7 @@ async fn handle_nextcloud_talk_webhook(
                 .await;
         }
 
-        match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content).await {
+        match run_gateway_chat_with_tools(&state, &msg.content).await {
             Ok(response) => {
                 if let Err(e) = nextcloud_talk
                     .send(&SendMessage::new(response, &msg.reply_target))
@@ -2408,5 +2408,151 @@ mod tests {
         assert_eq!(keys.len(), 1);
         assert!(!keys.contains_key("old-key"));
         assert!(keys.contains_key("new-key"));
+    }
+
+    #[test]
+    fn rate_limiter_allows_after_window_expires() {
+        let window = Duration::from_millis(50);
+        let limiter = SlidingWindowRateLimiter::new(2, window, 100);
+        assert!(limiter.allow("ip-1"));
+        assert!(limiter.allow("ip-1"));
+        assert!(!limiter.allow("ip-1")); // blocked
+
+        // Wait for window to expire
+        std::thread::sleep(Duration::from_millis(60));
+
+        // Should be allowed again
+        assert!(limiter.allow("ip-1"));
+    }
+
+    #[test]
+    fn rate_limiter_independent_keys_tracked_separately() {
+        let limiter = SlidingWindowRateLimiter::new(2, Duration::from_secs(60), 100);
+        assert!(limiter.allow("ip-1"));
+        assert!(limiter.allow("ip-1"));
+        assert!(!limiter.allow("ip-1")); // ip-1 blocked
+
+        // ip-2 should still work
+        assert!(limiter.allow("ip-2"));
+        assert!(limiter.allow("ip-2"));
+        assert!(!limiter.allow("ip-2")); // ip-2 now blocked
+    }
+
+    #[test]
+    fn rate_limiter_exact_boundary_at_max_keys() {
+        let limiter = SlidingWindowRateLimiter::new(10, Duration::from_secs(60), 3);
+        assert!(limiter.allow("ip-1"));
+        assert!(limiter.allow("ip-2"));
+        assert!(limiter.allow("ip-3"));
+        // At capacity now
+        assert!(limiter.allow("ip-4")); // should evict ip-1
+
+        let guard = limiter.requests.lock();
+        assert_eq!(guard.0.len(), 3);
+        assert!(
+            !guard.0.contains_key("ip-1"),
+            "ip-1 should have been evicted"
+        );
+        assert!(guard.0.contains_key("ip-2"));
+        assert!(guard.0.contains_key("ip-3"));
+        assert!(guard.0.contains_key("ip-4"));
+    }
+
+    #[test]
+    fn gateway_rate_limiter_pair_and_webhook_are_independent() {
+        let limiter = GatewayRateLimiter::new(2, 3, 100);
+
+        // Exhaust pair limit
+        assert!(limiter.allow_pair("ip-1"));
+        assert!(limiter.allow_pair("ip-1"));
+        assert!(!limiter.allow_pair("ip-1")); // pair blocked
+
+        // Webhook should still work
+        assert!(limiter.allow_webhook("ip-1"));
+        assert!(limiter.allow_webhook("ip-1"));
+        assert!(limiter.allow_webhook("ip-1"));
+        assert!(!limiter.allow_webhook("ip-1")); // webhook now blocked
+    }
+
+    #[test]
+    fn rate_limiter_single_key_max_allows_one_request() {
+        let limiter = SlidingWindowRateLimiter::new(5, Duration::from_secs(60), 1);
+        assert!(limiter.allow("ip-1"));
+        assert!(limiter.allow("ip-2")); // evicts ip-1
+
+        let guard = limiter.requests.lock();
+        assert_eq!(guard.0.len(), 1);
+        assert!(guard.0.contains_key("ip-2"));
+        assert!(!guard.0.contains_key("ip-1"));
+    }
+
+    #[test]
+    fn rate_limiter_concurrent_access_safe() {
+        use std::sync::Arc;
+
+        let limiter = Arc::new(SlidingWindowRateLimiter::new(
+            1000,
+            Duration::from_secs(60),
+            1000,
+        ));
+        let mut handles = Vec::new();
+
+        for i in 0..10 {
+            let limiter = limiter.clone();
+            handles.push(std::thread::spawn(move || {
+                for j in 0..100 {
+                    limiter.allow(&format!("thread-{i}-req-{j}"));
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Should not panic or deadlock
+        let guard = limiter.requests.lock();
+        assert!(guard.0.len() <= 1000, "should respect max_keys");
+    }
+
+    #[test]
+    fn idempotency_store_concurrent_access_safe() {
+        use std::sync::Arc;
+
+        let store = Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000));
+        let mut handles = Vec::new();
+
+        for i in 0..10 {
+            let store = store.clone();
+            handles.push(std::thread::spawn(move || {
+                for j in 0..100 {
+                    store.record_if_new(&format!("thread-{i}-key-{j}"));
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let keys = store.keys.lock();
+        assert!(keys.len() <= 1000, "should respect max_keys");
+    }
+
+    #[test]
+    fn rate_limiter_rapid_burst_then_cooldown() {
+        let limiter = SlidingWindowRateLimiter::new(5, Duration::from_millis(50), 100);
+
+        // Burst: use all 5 requests
+        for _ in 0..5 {
+            assert!(limiter.allow("burst-ip"));
+        }
+        assert!(!limiter.allow("burst-ip")); // 6th should fail
+
+        // Cooldown
+        std::thread::sleep(Duration::from_millis(60));
+
+        // Should be allowed again
+        assert!(limiter.allow("burst-ip"));
     }
 }

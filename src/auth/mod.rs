@@ -39,11 +39,11 @@ impl AuthService {
         }
     }
 
-    pub fn load_profiles(&self) -> Result<AuthProfilesData> {
-        self.store.load()
+    pub async fn load_profiles(&self) -> Result<AuthProfilesData> {
+        self.store.load().await
     }
 
-    pub fn store_openai_tokens(
+    pub async fn store_openai_tokens(
         &self,
         profile_name: &str,
         token_set: crate::auth::profiles::TokenSet,
@@ -52,11 +52,13 @@ impl AuthService {
     ) -> Result<AuthProfile> {
         let mut profile = AuthProfile::new_oauth(OPENAI_CODEX_PROVIDER, profile_name, token_set);
         profile.account_id = account_id;
-        self.store.upsert_profile(profile.clone(), set_active)?;
+        self.store
+            .upsert_profile(profile.clone(), set_active)
+            .await?;
         Ok(profile)
     }
 
-    pub fn store_provider_token(
+    pub async fn store_provider_token(
         &self,
         provider: &str,
         profile_name: &str,
@@ -66,13 +68,19 @@ impl AuthService {
     ) -> Result<AuthProfile> {
         let mut profile = AuthProfile::new_token(provider, profile_name, token.to_string());
         profile.metadata.extend(metadata);
-        self.store.upsert_profile(profile.clone(), set_active)?;
+        self.store
+            .upsert_profile(profile.clone(), set_active)
+            .await?;
         Ok(profile)
     }
 
-    pub fn set_active_profile(&self, provider: &str, requested_profile: &str) -> Result<String> {
+    pub async fn set_active_profile(
+        &self,
+        provider: &str,
+        requested_profile: &str,
+    ) -> Result<String> {
         let provider = normalize_provider(provider)?;
-        let data = self.store.load()?;
+        let data = self.store.load().await?;
         let profile_id = resolve_requested_profile_id(&provider, requested_profile);
 
         let profile = data
@@ -88,35 +96,37 @@ impl AuthService {
             );
         }
 
-        self.store.set_active_profile(&provider, &profile_id)?;
+        self.store
+            .set_active_profile(&provider, &profile_id)
+            .await?;
         Ok(profile_id)
     }
 
-    pub fn remove_profile(&self, provider: &str, requested_profile: &str) -> Result<bool> {
+    pub async fn remove_profile(&self, provider: &str, requested_profile: &str) -> Result<bool> {
         let provider = normalize_provider(provider)?;
         let profile_id = resolve_requested_profile_id(&provider, requested_profile);
-        self.store.remove_profile(&profile_id)
+        self.store.remove_profile(&profile_id).await
     }
 
-    pub fn get_profile(
+    pub async fn get_profile(
         &self,
         provider: &str,
         profile_override: Option<&str>,
     ) -> Result<Option<AuthProfile>> {
         let provider = normalize_provider(provider)?;
-        let data = self.store.load()?;
+        let data = self.store.load().await?;
         let Some(profile_id) = select_profile_id(&data, &provider, profile_override) else {
             return Ok(None);
         };
         Ok(data.profiles.get(&profile_id).cloned())
     }
 
-    pub fn get_provider_bearer_token(
+    pub async fn get_provider_bearer_token(
         &self,
         provider: &str,
         profile_override: Option<&str>,
     ) -> Result<Option<String>> {
-        let profile = self.get_profile(provider, profile_override)?;
+        let profile = self.get_profile(provider, profile_override).await?;
         let Some(profile) = profile else {
             return Ok(None);
         };
@@ -133,12 +143,7 @@ impl AuthService {
         &self,
         profile_override: Option<&str>,
     ) -> Result<Option<String>> {
-        let data = tokio::task::spawn_blocking({
-            let store = self.store.clone();
-            move || store.load()
-        })
-        .await
-        .map_err(|err| anyhow::anyhow!("Auth profile load task failed: {err}"))??;
+        let data = self.store.load().await?;
         let Some(profile_id) = select_profile_id(&data, OPENAI_CODEX_PROVIDER, profile_override)
         else {
             return Ok(None);
@@ -164,12 +169,7 @@ impl AuthService {
         let _guard = refresh_lock.lock().await;
 
         // Re-load after waiting for lock to avoid duplicate refreshes.
-        let data = tokio::task::spawn_blocking({
-            let store = self.store.clone();
-            move || store.load()
-        })
-        .await
-        .map_err(|err| anyhow::anyhow!("Auth profile load task failed: {err}"))??;
+        let data = self.store.load().await?;
         let Some(latest_profile) = data.profiles.get(&profile_id) else {
             return Ok(None);
         };
@@ -212,22 +212,15 @@ impl AuthService {
         let account_id = openai_oauth::extract_account_id_from_jwt(&refreshed.access_token)
             .or_else(|| latest_profile.account_id.clone());
 
-        let updated = tokio::task::spawn_blocking({
-            let store = self.store.clone();
-            let profile_id = profile_id.clone();
-            let refreshed = refreshed.clone();
-            let account_id = account_id.clone();
-            move || {
-                store.update_profile(&profile_id, |profile| {
-                    profile.kind = AuthProfileKind::OAuth;
-                    profile.token_set = Some(refreshed.clone());
-                    profile.account_id.clone_from(&account_id);
-                    Ok(())
-                })
-            }
-        })
-        .await
-        .map_err(|err| anyhow::anyhow!("Auth profile update task failed: {err}"))??;
+        let updated = self
+            .store
+            .update_profile(&profile_id, |profile| {
+                profile.kind = AuthProfileKind::OAuth;
+                profile.token_set = Some(refreshed.clone());
+                profile.account_id.clone_from(&account_id);
+                Ok(())
+            })
+            .await?;
 
         Ok(updated.token_set.map(|t| t.access_token))
     }

@@ -87,3 +87,5 @@
 - English: [README.md](README.md)
 - 简体中文: [README.zh-CN.md](README.zh-CN.md)
 - Русский: [README.ru.md](README.ru.md)
+- Français: [README.fr.md](README.fr.md)
+- Tiếng Việt: [i18n/vi/README.md](i18n/vi/README.md)

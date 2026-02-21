@@ -12,8 +12,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-# 1. Copy manifests and toolchain pin to cache dependencies with the same compiler
-COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+# 1. Copy manifests to cache dependencies
+COPY Cargo.toml Cargo.lock ./
 COPY crates/robot-kit/Cargo.toml crates/robot-kit/Cargo.toml
 # Create dummy targets declared in Cargo.toml so manifest parsing succeeds.
 RUN mkdir -p src benches crates/robot-kit/src \
@@ -98,9 +98,9 @@ COPY --from=builder /zeroclaw-data /zeroclaw-data
 # Environment setup
 ENV ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace
 ENV HOME=/zeroclaw-data
-# Default provider (model is set in config.toml, not here,
-# so config file edits are not silently overridden)
-ENV PROVIDER="openrouter"
+# Default provider and model are set in config.toml, not here,
+# so config file edits are not silently overridden
+#ENV PROVIDER=
 ENV ZEROCLAW_GATEWAY_PORT=3000
 
 # API_KEY must be provided at runtime!

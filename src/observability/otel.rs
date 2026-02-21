@@ -193,6 +193,8 @@ impl Observer for OtelObserver {
                 duration,
                 success,
                 error_message: _,
+                input_tokens: _,
+                output_tokens: _,
             } => {
                 let secs = duration.as_secs_f64();
                 let attrs = [
@@ -411,6 +413,8 @@ mod tests {
             duration: Duration::from_millis(250),
             success: true,
             error_message: None,
+            input_tokens: Some(100),
+            output_tokens: Some(50),
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             provider: "openrouter".into(),
@@ -489,6 +493,8 @@ mod tests {
             duration: Duration::from_millis(0),
             success: false,
             error_message: Some("404 Not Found".into()),
+            input_tokens: None,
+            output_tokens: None,
         });
     }
 

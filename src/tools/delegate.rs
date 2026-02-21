@@ -409,6 +409,7 @@ impl DelegateTool {
                 agent_config.max_iterations,
                 None,
                 None,
+                None,
                 &[],
             ),
         )
@@ -599,6 +600,7 @@ mod tests {
                 Ok(ChatResponse {
                     text: Some("done".to_string()),
                     tool_calls: Vec::new(),
+                    usage: None,
                 })
             } else {
                 Ok(ChatResponse {
@@ -608,6 +610,7 @@ mod tests {
                         name: "echo_tool".to_string(),
                         arguments: "{\"value\":\"ping\"}".to_string(),
                     }],
+                    usage: None,
                 })
             }
         }
@@ -640,6 +643,7 @@ mod tests {
                     name: "echo_tool".to_string(),
                     arguments: "{\"value\":\"x\"}".to_string(),
                 }],
+                usage: None,
             })
         }
     }

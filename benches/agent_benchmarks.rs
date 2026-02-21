@@ -38,6 +38,7 @@ impl BenchProvider {
             responses: Mutex::new(vec![ChatResponse {
                 text: Some(text.into()),
                 tool_calls: vec![],
+                usage: None,
             }]),
         }
     }
@@ -52,10 +53,12 @@ impl BenchProvider {
                         name: "noop".into(),
                         arguments: "{}".into(),
                     }],
+                    usage: None,
                 },
                 ChatResponse {
                     text: Some("done".into()),
                     tool_calls: vec![],
+                    usage: None,
                 },
             ]),
         }
@@ -85,6 +88,7 @@ impl Provider for BenchProvider {
             return Ok(ChatResponse {
                 text: Some("done".into()),
                 tool_calls: vec![],
+                usage: None,
             });
         }
         Ok(guard.remove(0))
@@ -150,6 +154,7 @@ Let me know if you need more."#
                 .into(),
         ),
         tool_calls: vec![],
+        usage: None,
     };
 
     let multi_tool = ChatResponse {
@@ -166,6 +171,7 @@ Let me know if you need more."#
                 .into(),
         ),
         tool_calls: vec![],
+        usage: None,
     };
 
     c.bench_function("xml_parse_single_tool_call", |b| {
@@ -198,6 +204,7 @@ fn bench_native_parsing(c: &mut Criterion) {
                 arguments: r#"{"path": "src/main.rs"}"#.into(),
             },
         ],
+        usage: None,
     };
 
     c.bench_function("native_parse_tool_calls", |b| {

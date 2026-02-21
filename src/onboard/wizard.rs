@@ -1,5 +1,6 @@
 use crate::config::schema::{
-    DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig, QQConfig, StreamMode, WhatsAppConfig,
+    default_nostr_relays, DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig, NostrConfig,
+    QQConfig, StreamMode, WhatsAppConfig,
 };
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
@@ -21,9 +22,10 @@ use dialoguer::{Confirm, Input, Select};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
-use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tokio::fs;
 
 // ── Project context collected during wizard ──────────────────────
 
@@ -98,7 +100,7 @@ fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
 
 // ── Main wizard entry point ──────────────────────────────────────
 
-pub async fn run_wizard() -> Result<Config> {
+pub async fn run_wizard(force: bool) -> Result<Config> {
     println!("{}", style(BANNER).cyan().bold());
 
     println!(
@@ -114,10 +116,11 @@ pub async fn run_wizard() -> Result<Config> {
     println!();
 
     print_step(1, 9, "Workspace Setup");
-    let (workspace_dir, config_path) = setup_workspace()?;
+    let (workspace_dir, config_path) = setup_workspace().await?;
+    ensure_onboard_overwrite_allowed(&config_path, force)?;
 
     print_step(2, 9, "AI Provider & API Key");
-    let (provider, api_key, model, provider_api_url) = setup_provider(&workspace_dir)?;
+    let (provider, api_key, model, provider_api_url) = setup_provider(&workspace_dir).await?;
 
     print_step(3, 9, "Channels (How You Talk to ZeroClaw)");
     let channels_config = setup_channels()?;
@@ -138,7 +141,7 @@ pub async fn run_wizard() -> Result<Config> {
     let project_ctx = setup_project_context()?;
 
     print_step(9, 9, "Workspace Files");
-    scaffold_workspace(&workspace_dir, &project_ctx)?;
+    scaffold_workspace(&workspace_dir, &project_ctx).await?;
 
     // ── Build config ──
     // Defaults: SQLite memory, supervised autonomy, workspace-scoped, native runtime
@@ -181,8 +184,10 @@ pub async fn run_wizard() -> Result<Config> {
         cost: crate::config::CostConfig::default(),
         peripherals: crate::config::PeripheralsConfig::default(),
         agents: std::collections::HashMap::new(),
+        hooks: crate::config::HooksConfig::default(),
         hardware: hardware_config,
         query_classification: crate::config::QueryClassificationConfig::default(),
+        transcription: crate::config::TranscriptionConfig::default(),
     };
 
     println!(
@@ -332,6 +337,7 @@ pub async fn run_quick_setup(
     provider: Option<&str>,
     model_override: Option<&str>,
     memory_backend: Option<&str>,
+    force: bool,
 ) -> Result<Config> {
     let home = directories::UserDirs::new()
         .map(|u| u.home_dir().to_path_buf())
@@ -342,6 +348,7 @@ pub async fn run_quick_setup(
         provider,
         model_override,
         memory_backend,
+        force,
         &home,
     )
     .await
@@ -353,6 +360,7 @@ async fn run_quick_setup_with_home(
     provider: Option<&str>,
     model_override: Option<&str>,
     memory_backend: Option<&str>,
+    force: bool,
     home: &Path,
 ) -> Result<Config> {
     println!("{}", style(BANNER).cyan().bold());
@@ -368,7 +376,10 @@ async fn run_quick_setup_with_home(
     let workspace_dir = zeroclaw_dir.join("workspace");
     let config_path = zeroclaw_dir.join("config.toml");
 
-    fs::create_dir_all(&workspace_dir).context("Failed to create workspace directory")?;
+    ensure_onboard_overwrite_allowed(&config_path, force)?;
+    fs::create_dir_all(&workspace_dir)
+        .await
+        .context("Failed to create workspace directory")?;
 
     let provider_name = provider.unwrap_or("openrouter").to_string();
     let model = model_override
@@ -420,8 +431,10 @@ async fn run_quick_setup_with_home(
         cost: crate::config::CostConfig::default(),
         peripherals: crate::config::PeripheralsConfig::default(),
         agents: std::collections::HashMap::new(),
+        hooks: crate::config::HooksConfig::default(),
         hardware: crate::config::HardwareConfig::default(),
         query_classification: crate::config::QueryClassificationConfig::default(),
+        transcription: crate::config::TranscriptionConfig::default(),
     };
 
     config.save().await?;
@@ -436,7 +449,7 @@ async fn run_quick_setup_with_home(
             "Be warm, natural, and clear. Use occasional relevant emojis (1-2 max) and avoid robotic phrasing."
                 .into(),
     };
-    scaffold_workspace(&workspace_dir, &default_ctx)?;
+    scaffold_workspace(&workspace_dir, &default_ctx).await?;
 
     println!(
         "  {} Workspace:  {}",
@@ -544,7 +557,7 @@ fn canonical_provider_name(provider_name: &str) -> &str {
 fn allows_unauthenticated_model_fetch(provider_name: &str) -> bool {
     matches!(
         canonical_provider_name(provider_name),
-        "openrouter" | "ollama" | "llamacpp" | "venice" | "astrai" | "nvidia"
+        "openrouter" | "ollama" | "llamacpp" | "vllm" | "osaurus" | "venice" | "astrai" | "nvidia"
     )
 }
 
@@ -560,7 +573,6 @@ const MINIMAX_ONBOARD_MODELS: [(&str, &str); 5] = [
 fn default_model_for_provider(provider: &str) -> String {
     match canonical_provider_name(provider) {
         "anthropic" => "claude-sonnet-4-5-20250929".into(),
-        "openrouter" => "anthropic/claude-sonnet-4.6".into(),
         "openai" => "gpt-5.2".into(),
         "openai-codex" => "gpt-5-codex".into(),
         "venice" => "zai-org-glm-5".into(),
@@ -579,11 +591,11 @@ fn default_model_for_provider(provider: &str) -> String {
         "qwen-code" => "qwen3-coder-plus".into(),
         "ollama" => "llama3.2".into(),
         "llamacpp" => "ggml-org/gpt-oss-20b-GGUF".into(),
+        "vllm" | "osaurus" => "default".into(),
         "gemini" => "gemini-2.5-pro".into(),
         "kimi-code" => "kimi-for-coding".into(),
         "bedrock" => "anthropic.claude-sonnet-4-5-20250929-v1:0".into(),
         "nvidia" => "meta/llama-3.3-70b-instruct".into(),
-        "astrai" => "anthropic/claude-sonnet-4.6".into(),
         _ => "anthropic/claude-sonnet-4.6".into(),
     }
 }
@@ -927,6 +939,34 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "Qwen2.5 Coder 7B GGUF (coding-focused)".to_string(),
             ),
         ],
+        "vllm" => vec![
+            (
+                "meta-llama/Llama-3.1-8B-Instruct".to_string(),
+                "Llama 3.1 8B Instruct (popular, fast)".to_string(),
+            ),
+            (
+                "meta-llama/Llama-3.1-70B-Instruct".to_string(),
+                "Llama 3.1 70B Instruct (high quality)".to_string(),
+            ),
+            (
+                "Qwen/Qwen2.5-Coder-7B-Instruct".to_string(),
+                "Qwen2.5 Coder 7B Instruct (coding-focused)".to_string(),
+            ),
+        ],
+        "osaurus" => vec![
+            (
+                "qwen3-30b-a3b-8bit".to_string(),
+                "Qwen3 30B A3B (local, balanced)".to_string(),
+            ),
+            (
+                "gemma-3n-e4b-it-lm-4bit".to_string(),
+                "Gemma 3N E4B (local, efficient)".to_string(),
+            ),
+            (
+                "phi-4-mini-reasoning-mlx-4bit".to_string(),
+                "Phi-4 Mini Reasoning (local, fast reasoning)".to_string(),
+            ),
+        ],
         "bedrock" => vec![
             (
                 "anthropic.claude-sonnet-4-6".to_string(),
@@ -981,6 +1021,8 @@ fn supports_live_model_fetch(provider_name: &str) -> bool {
             | "gemini"
             | "ollama"
             | "llamacpp"
+            | "vllm"
+            | "osaurus"
             | "astrai"
             | "venice"
             | "fireworks"
@@ -1017,6 +1059,8 @@ fn models_endpoint_for_provider(provider_name: &str) -> Option<&'static str> {
             "nvidia" => Some("https://integrate.api.nvidia.com/v1/models"),
             "astrai" => Some("https://as-trai.com/v1/models"),
             "llamacpp" => Some("http://localhost:8080/v1/models"),
+            "vllm" => Some("http://localhost:8000/v1/models"),
+            "osaurus" => Some("http://localhost:1337/v1/models"),
             _ => None,
         },
     }
@@ -1247,7 +1291,10 @@ fn resolve_live_models_endpoint(
     provider_name: &str,
     provider_api_url: Option<&str>,
 ) -> Option<String> {
-    if canonical_provider_name(provider_name) == "llamacpp" {
+    if matches!(
+        canonical_provider_name(provider_name),
+        "llamacpp" | "vllm" | "osaurus"
+    ) {
         if let Some(url) = provider_api_url
             .map(str::trim)
             .filter(|url| !url.is_empty())
@@ -1370,13 +1417,14 @@ fn now_unix_secs() -> u64 {
         .map_or(0, |duration| duration.as_secs())
 }
 
-fn load_model_cache_state(workspace_dir: &Path) -> Result<ModelCacheState> {
+async fn load_model_cache_state(workspace_dir: &Path) -> Result<ModelCacheState> {
     let path = model_cache_path(workspace_dir);
     if !path.exists() {
         return Ok(ModelCacheState::default());
     }
 
     let raw = fs::read_to_string(&path)
+        .await
         .with_context(|| format!("failed to read model cache at {}", path.display()))?;
 
     match serde_json::from_str::<ModelCacheState>(&raw) {
@@ -1385,10 +1433,10 @@ fn load_model_cache_state(workspace_dir: &Path) -> Result<ModelCacheState> {
     }
 }
 
-fn save_model_cache_state(workspace_dir: &Path, state: &ModelCacheState) -> Result<()> {
+async fn save_model_cache_state(workspace_dir: &Path, state: &ModelCacheState) -> Result<()> {
     let path = model_cache_path(workspace_dir);
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
+        fs::create_dir_all(parent).await.with_context(|| {
             format!(
                 "failed to create model cache directory {}",
                 parent.display()
@@ -1398,12 +1446,13 @@ fn save_model_cache_state(workspace_dir: &Path, state: &ModelCacheState) -> Resu
 
     let json = serde_json::to_vec_pretty(state).context("failed to serialize model cache")?;
     fs::write(&path, json)
+        .await
         .with_context(|| format!("failed to write model cache at {}", path.display()))?;
 
     Ok(())
 }
 
-fn cache_live_models_for_provider(
+async fn cache_live_models_for_provider(
     workspace_dir: &Path,
     provider_name: &str,
     models: &[String],
@@ -1413,7 +1462,7 @@ fn cache_live_models_for_provider(
         return Ok(());
     }
 
-    let mut state = load_model_cache_state(workspace_dir)?;
+    let mut state = load_model_cache_state(workspace_dir).await?;
     let now = now_unix_secs();
 
     if let Some(entry) = state
@@ -1431,15 +1480,15 @@ fn cache_live_models_for_provider(
         });
     }
 
-    save_model_cache_state(workspace_dir, &state)
+    save_model_cache_state(workspace_dir, &state).await
 }
 
-fn load_cached_models_for_provider_internal(
+async fn load_cached_models_for_provider_internal(
     workspace_dir: &Path,
     provider_name: &str,
     ttl_secs: Option<u64>,
 ) -> Result<Option<CachedModels>> {
-    let state = load_model_cache_state(workspace_dir)?;
+    let state = load_model_cache_state(workspace_dir).await?;
     let now = now_unix_secs();
 
     let Some(entry) = state
@@ -1465,19 +1514,19 @@ fn load_cached_models_for_provider_internal(
     }))
 }
 
-fn load_cached_models_for_provider(
+async fn load_cached_models_for_provider(
     workspace_dir: &Path,
     provider_name: &str,
     ttl_secs: u64,
 ) -> Result<Option<CachedModels>> {
-    load_cached_models_for_provider_internal(workspace_dir, provider_name, Some(ttl_secs))
+    load_cached_models_for_provider_internal(workspace_dir, provider_name, Some(ttl_secs)).await
 }
 
-fn load_any_cached_models_for_provider(
+async fn load_any_cached_models_for_provider(
     workspace_dir: &Path,
     provider_name: &str,
 ) -> Result<Option<CachedModels>> {
-    load_cached_models_for_provider_internal(workspace_dir, provider_name, None)
+    load_cached_models_for_provider_internal(workspace_dir, provider_name, None).await
 }
 
 fn humanize_age(age_secs: u64) -> String {
@@ -1514,7 +1563,7 @@ fn print_model_preview(models: &[String]) {
     }
 }
 
-pub fn run_models_refresh(
+pub async fn run_models_refresh(
     config: &Config,
     provider_override: Option<&str>,
     force: bool,
@@ -1538,7 +1587,9 @@ pub fn run_models_refresh(
             &config.workspace_dir,
             &provider_name,
             MODEL_CACHE_TTL_SECS,
-        )? {
+        )
+        .await?
+        {
             println!(
                 "Using cached model list for '{}' (updated {} ago):",
                 provider_name,
@@ -1558,7 +1609,7 @@ pub fn run_models_refresh(
 
     match fetch_live_models_for_provider(&provider_name, &api_key, config.api_url.as_deref()) {
         Ok(models) if !models.is_empty() => {
-            cache_live_models_for_provider(&config.workspace_dir, &provider_name, &models)?;
+            cache_live_models_for_provider(&config.workspace_dir, &provider_name, &models).await?;
             println!(
                 "Refreshed '{}' model cache with {} models.",
                 provider_name,
@@ -1569,7 +1620,7 @@ pub fn run_models_refresh(
         }
         Ok(_) => {
             if let Some(stale_cache) =
-                load_any_cached_models_for_provider(&config.workspace_dir, &provider_name)?
+                load_any_cached_models_for_provider(&config.workspace_dir, &provider_name).await?
             {
                 println!(
                     "Provider returned no models; using stale cache (updated {} ago):",
@@ -1583,7 +1634,7 @@ pub fn run_models_refresh(
         }
         Err(error) => {
             if let Some(stale_cache) =
-                load_any_cached_models_for_provider(&config.workspace_dir, &provider_name)?
+                load_any_cached_models_for_provider(&config.workspace_dir, &provider_name).await?
             {
                 println!(
                     "Live refresh failed ({}). Falling back to stale cache (updated {} ago):",
@@ -1616,6 +1667,42 @@ fn print_bullet(text: &str) {
     println!("  {} {}", style("›").cyan(), text);
 }
 
+fn ensure_onboard_overwrite_allowed(config_path: &Path, force: bool) -> Result<()> {
+    if !config_path.exists() {
+        return Ok(());
+    }
+
+    if force {
+        println!(
+            "  {} Existing config detected at {}. Proceeding because --force was provided.",
+            style("!").yellow().bold(),
+            style(config_path.display()).yellow()
+        );
+        return Ok(());
+    }
+
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        bail!(
+            "Refusing to overwrite existing config at {} in non-interactive mode. Re-run with --force if overwrite is intentional.",
+            config_path.display()
+        );
+    }
+
+    let confirmed = Confirm::new()
+        .with_prompt(format!(
+            "  Existing config found at {}. Re-running onboarding will overwrite config.toml and may create missing workspace files (including BOOTSTRAP.md). Continue?",
+            config_path.display()
+        ))
+        .default(false)
+        .interact()?;
+
+    if !confirmed {
+        bail!("Onboarding canceled: existing configuration was left unchanged.");
+    }
+
+    Ok(())
+}
+
 async fn persist_workspace_selection(config_path: &Path) -> Result<()> {
     let config_dir = config_path
         .parent()
@@ -1632,7 +1719,7 @@ async fn persist_workspace_selection(config_path: &Path) -> Result<()> {
 
 // ── Step 1: Workspace ────────────────────────────────────────────
 
-fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
+async fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
     let home = directories::UserDirs::new()
         .map(|u| u.home_dir().to_path_buf())
         .context("Could not find home directory")?;
@@ -1661,7 +1748,9 @@ fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
     let workspace_dir = zeroclaw_dir.join("workspace");
     let config_path = zeroclaw_dir.join("config.toml");
 
-    fs::create_dir_all(&workspace_dir).context("Failed to create workspace directory")?;
+    fs::create_dir_all(&workspace_dir)
+        .await
+        .context("Failed to create workspace directory")?;
 
     println!(
         "  {} Workspace: {}",
@@ -1675,14 +1764,14 @@ fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
 // ── Step 2: Provider & API Key ───────────────────────────────────
 
 #[allow(clippy::too_many_lines)]
-fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Option<String>)> {
+async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Option<String>)> {
     // ── Tier selection ──
     let tiers = vec![
         "⭐ Recommended (OpenRouter, Venice, Anthropic, OpenAI, Gemini)",
         "⚡ Fast inference (Groq, Fireworks, Together AI, NVIDIA NIM)",
         "🌐 Gateway / proxy (Vercel AI, Cloudflare AI, Amazon Bedrock)",
         "🔬 Specialized (Moonshot/Kimi, GLM/Zhipu, MiniMax, Qwen/DashScope, Qianfan, Z.AI, Synthetic, OpenCode Zen, Cohere)",
-        "🏠 Local / private (Ollama, llama.cpp server — no API key needed)",
+        "🏠 Local / private (Ollama, llama.cpp server, vLLM — no API key needed)",
         "🔧 Custom — bring your own OpenAI-compatible API",
     ];
 
@@ -1765,6 +1854,11 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
             (
                 "llamacpp",
                 "llama.cpp server — local OpenAI-compatible endpoint",
+            ),
+            ("vllm", "vLLM — high-performance local inference engine"),
+            (
+                "osaurus",
+                "Osaurus — unified AI edge runtime (local MLX + cloud proxy + MCP)",
             ),
         ],
         _ => vec![], // Custom — handled below
@@ -1905,6 +1999,68 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
             print_bullet(&format!(
                 "No API key provided. Set {} later only if your server requires authentication.",
                 style("LLAMACPP_API_KEY").yellow()
+            ));
+        }
+
+        key
+    } else if provider_name == "vllm" {
+        let raw_url: String = Input::new()
+            .with_prompt("  vLLM server endpoint URL")
+            .default("http://localhost:8000/v1".into())
+            .interact_text()?;
+
+        let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
+        if normalized_url.is_empty() {
+            anyhow::bail!("vLLM endpoint URL cannot be empty.");
+        }
+        provider_api_url = Some(normalized_url.clone());
+
+        print_bullet(&format!(
+            "Using vLLM server endpoint: {}",
+            style(&normalized_url).cyan()
+        ));
+        print_bullet("No API key needed unless your vLLM server requires authentication.");
+
+        let key: String = Input::new()
+            .with_prompt("  API key for vLLM server (or Enter to skip)")
+            .allow_empty(true)
+            .interact_text()?;
+
+        if key.trim().is_empty() {
+            print_bullet(&format!(
+                "No API key provided. Set {} later only if your server requires authentication.",
+                style("VLLM_API_KEY").yellow()
+            ));
+        }
+
+        key
+    } else if provider_name == "osaurus" {
+        let raw_url: String = Input::new()
+            .with_prompt("  Osaurus server endpoint URL")
+            .default("http://localhost:1337/v1".into())
+            .interact_text()?;
+
+        let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
+        if normalized_url.is_empty() {
+            anyhow::bail!("Osaurus endpoint URL cannot be empty.");
+        }
+        provider_api_url = Some(normalized_url.clone());
+
+        print_bullet(&format!(
+            "Using Osaurus server endpoint: {}",
+            style(&normalized_url).cyan()
+        ));
+        print_bullet("No API key needed unless your Osaurus server requires authentication.");
+
+        let key: String = Input::new()
+            .with_prompt("  API key for Osaurus server (or Enter to skip)")
+            .allow_empty(true)
+            .interact_text()?;
+
+        if key.trim().is_empty() {
+            print_bullet(&format!(
+                "No API key provided. Set {} later only if your server requires authentication.",
+                style("OSAURUS_API_KEY").yellow()
             ));
         }
 
@@ -2144,7 +2300,8 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
 
         if can_fetch_without_key || has_api_key {
             if let Some(cached) =
-                load_cached_models_for_provider(workspace_dir, provider_name, MODEL_CACHE_TTL_SECS)?
+                load_cached_models_for_provider(workspace_dir, provider_name, MODEL_CACHE_TTL_SECS)
+                    .await?
             {
                 let shown_count = cached.models.len().min(LIVE_MODEL_MAX_OPTIONS);
                 print_bullet(&format!(
@@ -2182,7 +2339,8 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
                             workspace_dir,
                             provider_name,
                             &live_model_ids,
-                        )?;
+                        )
+                        .await?;
 
                         let fetched_count = live_model_ids.len();
                         let shown_count = fetched_count.min(LIVE_MODEL_MAX_OPTIONS);
@@ -2212,7 +2370,8 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
 
                         if live_options.is_none() {
                             if let Some(stale) =
-                                load_any_cached_models_for_provider(workspace_dir, provider_name)?
+                                load_any_cached_models_for_provider(workspace_dir, provider_name)
+                                    .await?
                             {
                                 print_bullet(&format!(
                                     "Loaded stale cache from {} ago.",
@@ -2310,6 +2469,8 @@ fn provider_env_var(name: &str) -> &'static str {
         "openai" => "OPENAI_API_KEY",
         "ollama" => "OLLAMA_API_KEY",
         "llamacpp" => "LLAMACPP_API_KEY",
+        "vllm" => "VLLM_API_KEY",
+        "osaurus" => "OSAURUS_API_KEY",
         "venice" => "VENICE_API_KEY",
         "groq" => "GROQ_API_KEY",
         "mistral" => "MISTRAL_API_KEY",
@@ -2341,7 +2502,7 @@ fn provider_env_var(name: &str) -> &'static str {
 fn provider_supports_keyless_local_usage(provider_name: &str) -> bool {
     matches!(
         canonical_provider_name(provider_name),
-        "ollama" | "llamacpp"
+        "ollama" | "llamacpp" | "vllm" | "osaurus"
     )
 }
 
@@ -2783,6 +2944,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
         DingTalk,
         QqOfficial,
         LarkFeishu,
+        Nostr,
         Done,
     }
     let menu_choices = [
@@ -2798,6 +2960,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
         ChannelMenuChoice::DingTalk,
         ChannelMenuChoice::QqOfficial,
         ChannelMenuChoice::LarkFeishu,
+        ChannelMenuChoice::Nostr,
         ChannelMenuChoice::Done,
     ];
 
@@ -2899,6 +3062,14 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         "✅ connected"
                     } else {
                         "— Lark/Feishu Bot"
+                    }
+                ),
+                ChannelMenuChoice::Nostr => format!(
+                    "Nostr {}",
+                    if config.nostr.is_some() {
+                        "✅ connected"
+                    } else {
+                        "     — Nostr DMs"
                     }
                 ),
                 ChannelMenuChoice::Done => "Done — finish setup".to_string(),
@@ -4171,6 +4342,94 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     port,
                 });
             }
+            ChannelMenuChoice::Nostr => {
+                // ── Nostr ──
+                println!();
+                println!(
+                    "  {} {}",
+                    style("Nostr Setup").white().bold(),
+                    style("— private messages via NIP-04 & NIP-17").dim()
+                );
+                print_bullet("ZeroClaw will listen for encrypted DMs on Nostr relays.");
+                print_bullet("You need a Nostr private key (hex or nsec) and at least one relay.");
+                println!();
+
+                let private_key: String = Input::new()
+                    .with_prompt("  Private key (hex or nsec1...)")
+                    .interact_text()?;
+
+                if private_key.trim().is_empty() {
+                    println!("  {} Skipped", style("→").dim());
+                    continue;
+                }
+
+                // Validate the key immediately
+                match nostr_sdk::Keys::parse(private_key.trim()) {
+                    Ok(keys) => {
+                        println!(
+                            "  {} Key valid — public key: {}",
+                            style("✅").green().bold(),
+                            style(keys.public_key().to_hex()).cyan()
+                        );
+                    }
+                    Err(_) => {
+                        println!(
+                            "  {} Invalid private key — check format and try again",
+                            style("❌").red().bold()
+                        );
+                        continue;
+                    }
+                }
+
+                let default_relays = default_nostr_relays().join(",");
+                let relays_str: String = Input::new()
+                    .with_prompt("  Relay URLs (comma-separated, Enter for defaults)")
+                    .default(default_relays)
+                    .interact_text()?;
+
+                let relays: Vec<String> = relays_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+
+                print_bullet("Allowlist pubkeys that can message the bot (hex or npub).");
+                print_bullet("Use '*' to allow anyone (not recommended for production).");
+
+                let pubkeys_str: String = Input::new()
+                    .with_prompt("  Allowed pubkeys (comma-separated, or * for all)")
+                    .allow_empty(true)
+                    .interact_text()?;
+
+                let allowed_pubkeys: Vec<String> = if pubkeys_str.trim() == "*" {
+                    vec!["*".into()]
+                } else {
+                    pubkeys_str
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                };
+
+                if allowed_pubkeys.is_empty() {
+                    println!(
+                        "  {} No pubkeys allowlisted — inbound messages will be denied until you add pubkeys or '*'.",
+                        style("⚠").yellow().bold()
+                    );
+                }
+
+                config.nostr = Some(NostrConfig {
+                    private_key: private_key.trim().to_string(),
+                    relays: relays.clone(),
+                    allowed_pubkeys,
+                });
+
+                println!(
+                    "  {} Nostr configured with {} relay(s)",
+                    style("✅").green().bold(),
+                    style(relays.len()).cyan()
+                );
+            }
             ChannelMenuChoice::Done => break,
         }
         println!();
@@ -4216,6 +4475,9 @@ fn setup_channels() -> Result<ChannelsConfig> {
     }
     if config.lark.is_some() {
         active.push("Lark");
+    }
+    if config.nostr.is_some() {
+        active.push("Nostr");
     }
 
     println!(
@@ -4385,7 +4647,7 @@ fn setup_tunnel() -> Result<crate::config::TunnelConfig> {
 // ── Step 6: Scaffold workspace files ─────────────────────────────
 
 #[allow(clippy::too_many_lines)]
-fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> {
+async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> {
     let agent = if ctx.agent_name.is_empty() {
         "ZeroClaw"
     } else {
@@ -4614,7 +4876,7 @@ fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> 
     // Create subdirectories
     let subdirs = ["sessions", "memory", "state", "cron", "skills"];
     for dir in &subdirs {
-        fs::create_dir_all(workspace_dir.join(dir))?;
+        fs::create_dir_all(workspace_dir.join(dir)).await?;
     }
 
     let mut created = 0;
@@ -4625,7 +4887,7 @@ fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> 
         if path.exists() {
             skipped += 1;
         } else {
-            fs::write(&path, content)?;
+            fs::write(&path, content).await?;
             created += 1;
         }
     }
@@ -4943,6 +5205,7 @@ mod tests {
             Some("openrouter"),
             Some("custom-model-946"),
             Some("sqlite"),
+            false,
             tmp.path(),
         )
         .await
@@ -4966,6 +5229,7 @@ mod tests {
             Some("anthropic"),
             None,
             Some("sqlite"),
+            false,
             tmp.path(),
         )
         .await
@@ -4976,13 +5240,74 @@ mod tests {
         assert_eq!(config.default_model.as_deref(), Some(expected.as_str()));
     }
 
+    #[tokio::test]
+    async fn quick_setup_existing_config_requires_force_when_non_interactive() {
+        let tmp = TempDir::new().unwrap();
+        let zeroclaw_dir = tmp.path().join(".zeroclaw");
+        let config_path = zeroclaw_dir.join("config.toml");
+
+        tokio::fs::create_dir_all(&zeroclaw_dir).await.unwrap();
+        tokio::fs::write(&config_path, "default_provider = \"openrouter\"\n")
+            .await
+            .unwrap();
+
+        let err = run_quick_setup_with_home(
+            Some("sk-existing"),
+            Some("openrouter"),
+            Some("custom-model"),
+            Some("sqlite"),
+            false,
+            tmp.path(),
+        )
+        .await
+        .expect_err("quick setup should refuse overwrite without --force");
+
+        let err_text = err.to_string();
+        assert!(err_text.contains("Refusing to overwrite existing config"));
+        assert!(err_text.contains("--force"));
+    }
+
+    #[tokio::test]
+    async fn quick_setup_existing_config_overwrites_with_force() {
+        let tmp = TempDir::new().unwrap();
+        let zeroclaw_dir = tmp.path().join(".zeroclaw");
+        let config_path = zeroclaw_dir.join("config.toml");
+
+        tokio::fs::create_dir_all(&zeroclaw_dir).await.unwrap();
+        tokio::fs::write(
+            &config_path,
+            "default_provider = \"anthropic\"\ndefault_model = \"stale-model\"\n",
+        )
+        .await
+        .unwrap();
+
+        let config = run_quick_setup_with_home(
+            Some("sk-force"),
+            Some("openrouter"),
+            Some("custom-model-fresh"),
+            Some("sqlite"),
+            true,
+            tmp.path(),
+        )
+        .await
+        .expect("quick setup should overwrite existing config with --force");
+
+        assert_eq!(config.default_provider.as_deref(), Some("openrouter"));
+        assert_eq!(config.default_model.as_deref(), Some("custom-model-fresh"));
+        assert_eq!(config.api_key.as_deref(), Some("sk-force"));
+
+        let config_raw = tokio::fs::read_to_string(config.config_path).await.unwrap();
+        assert!(config_raw.contains("default_provider = \"openrouter\""));
+        assert!(config_raw.contains("default_model = \"custom-model-fresh\""));
+    }
+
     // ── scaffold_workspace: basic file creation ─────────────────
 
-    #[test]
-    fn scaffold_creates_all_md_files() {
+    #[tokio::test]
+    async fn scaffold_creates_all_md_files() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         let expected = [
             "IDENTITY.md",
@@ -4999,11 +5324,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn scaffold_creates_all_subdirectories() {
+    #[tokio::test]
+    async fn scaffold_creates_all_subdirectories() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         for dir in &["sessions", "memory", "state", "cron", "skills"] {
             assert!(tmp.path().join(dir).is_dir(), "missing subdirectory: {dir}");
@@ -5019,7 +5344,7 @@ mod tests {
             user_name: "Alice".into(),
             ..Default::default()
         };
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
             .await
@@ -5045,7 +5370,7 @@ mod tests {
             timezone: "US/Pacific".into(),
             ..Default::default()
         };
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
             .await
@@ -5071,7 +5396,7 @@ mod tests {
             agent_name: "Crabby".into(),
             ..Default::default()
         };
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         let identity = tokio::fs::read_to_string(tmp.path().join("IDENTITY.md"))
             .await
@@ -5121,7 +5446,7 @@ mod tests {
             communication_style: "Be technical and detailed.".into(),
             ..Default::default()
         };
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
             .await
@@ -5154,7 +5479,7 @@ mod tests {
     async fn scaffold_uses_defaults_for_empty_context() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default(); // all empty
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         let identity = tokio::fs::read_to_string(tmp.path().join("IDENTITY.md"))
             .await
@@ -5197,9 +5522,11 @@ mod tests {
 
         // Pre-create SOUL.md with custom content
         let soul_path = tmp.path().join("SOUL.md");
-        fs::write(&soul_path, "# My Custom Soul\nDo not overwrite me.").unwrap();
+        fs::write(&soul_path, "# My Custom Soul\nDo not overwrite me.")
+            .await
+            .unwrap();
 
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         // SOUL.md should be untouched
         let soul = tokio::fs::read_to_string(&soul_path).await.unwrap();
@@ -5230,13 +5557,13 @@ mod tests {
             ..Default::default()
         };
 
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
         let soul_v1 = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
             .await
             .unwrap();
 
         // Run again — should not change anything
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
         let soul_v2 = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
             .await
             .unwrap();
@@ -5250,7 +5577,7 @@ mod tests {
     async fn scaffold_files_are_non_empty() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         for f in &[
             "IDENTITY.md",
@@ -5273,7 +5600,7 @@ mod tests {
     async fn agents_md_references_on_demand_memory() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         let agents = tokio::fs::read_to_string(tmp.path().join("AGENTS.md"))
             .await
@@ -5294,7 +5621,7 @@ mod tests {
     async fn memory_md_warns_about_token_cost() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         let memory = tokio::fs::read_to_string(tmp.path().join("MEMORY.md"))
             .await
@@ -5315,7 +5642,7 @@ mod tests {
     async fn tools_md_lists_all_builtin_tools() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         let tools = tokio::fs::read_to_string(tmp.path().join("TOOLS.md"))
             .await
@@ -5347,7 +5674,7 @@ mod tests {
     async fn soul_md_includes_emoji_awareness_guidance() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
             .await
@@ -5373,7 +5700,7 @@ mod tests {
             timezone: "Europe/Madrid".into(),
             communication_style: "Be direct.".into(),
         };
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
             .await
@@ -5399,7 +5726,7 @@ mod tests {
                 "Be friendly, human, and conversational. Show warmth and empathy while staying efficient. Use natural contractions."
                     .into(),
         };
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         // Verify every file got personalized
         let identity = tokio::fs::read_to_string(tmp.path().join("IDENTITY.md"))
@@ -5483,6 +5810,7 @@ mod tests {
             default_model_for_provider("llamacpp"),
             "ggml-org/gpt-oss-20b-GGUF"
         );
+        assert_eq!(default_model_for_provider("vllm"), "default");
         assert_eq!(
             default_model_for_provider("astrai"),
             "anthropic/claude-sonnet-4.6"
@@ -5593,6 +5921,7 @@ mod tests {
         assert!(allows_unauthenticated_model_fetch("ollama"));
         assert!(allows_unauthenticated_model_fetch("llamacpp"));
         assert!(allows_unauthenticated_model_fetch("llama.cpp"));
+        assert!(allows_unauthenticated_model_fetch("vllm"));
         assert!(!allows_unauthenticated_model_fetch("openai"));
         assert!(!allows_unauthenticated_model_fetch("deepseek"));
     }
@@ -5634,6 +5963,7 @@ mod tests {
         assert!(supports_live_model_fetch("ollama"));
         assert!(supports_live_model_fetch("llamacpp"));
         assert!(supports_live_model_fetch("llama.cpp"));
+        assert!(supports_live_model_fetch("vllm"));
         assert!(supports_live_model_fetch("astrai"));
         assert!(supports_live_model_fetch("venice"));
         assert!(supports_live_model_fetch("glm-cn"));
@@ -5744,6 +6074,10 @@ mod tests {
             models_endpoint_for_provider("llama.cpp"),
             Some("http://localhost:8080/v1/models")
         );
+        assert_eq!(
+            models_endpoint_for_provider("vllm"),
+            Some("http://localhost:8000/v1/models")
+        );
         assert_eq!(models_endpoint_for_provider("perplexity"), None);
         assert_eq!(models_endpoint_for_provider("unknown-provider"), None);
     }
@@ -5769,6 +6103,10 @@ mod tests {
         assert_eq!(
             resolve_live_models_endpoint("llamacpp", None),
             Some("http://localhost:8080/v1/models".to_string())
+        );
+        assert_eq!(
+            resolve_live_models_endpoint("vllm", None),
+            Some("http://localhost:8000/v1/models".to_string())
         );
         assert_eq!(
             resolve_live_models_endpoint("venice", Some("http://localhost:9999/v1")),
@@ -5799,6 +6137,18 @@ mod tests {
         )));
         assert!(ollama_uses_remote_endpoint(Some("https://ollama.com")));
         assert!(ollama_uses_remote_endpoint(Some("https://ollama.com/api")));
+    }
+
+    #[test]
+    fn resolve_live_models_endpoint_prefers_vllm_custom_url() {
+        assert_eq!(
+            resolve_live_models_endpoint("vllm", Some("http://127.0.0.1:9000/v1")),
+            Some("http://127.0.0.1:9000/v1/models".to_string())
+        );
+        assert_eq!(
+            resolve_live_models_endpoint("vllm", Some("http://127.0.0.1:9000/v1/models")),
+            Some("http://127.0.0.1:9000/v1/models".to_string())
+        );
     }
 
     #[test]
@@ -5871,15 +6221,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn model_cache_round_trip_returns_fresh_entry() {
+    #[tokio::test]
+    async fn model_cache_round_trip_returns_fresh_entry() {
         let tmp = TempDir::new().unwrap();
         let models = vec!["gpt-5.1".to_string(), "gpt-5-mini".to_string()];
 
-        cache_live_models_for_provider(tmp.path(), "openai", &models).unwrap();
+        cache_live_models_for_provider(tmp.path(), "openai", &models)
+            .await
+            .unwrap();
 
-        let cached =
-            load_cached_models_for_provider(tmp.path(), "openai", MODEL_CACHE_TTL_SECS).unwrap();
+        let cached = load_cached_models_for_provider(tmp.path(), "openai", MODEL_CACHE_TTL_SECS)
+            .await
+            .unwrap();
         let cached = cached.expect("expected fresh cached models");
 
         assert_eq!(cached.models.len(), 2);
@@ -5887,8 +6240,8 @@ mod tests {
         assert!(cached.models.contains(&"gpt-5-mini".to_string()));
     }
 
-    #[test]
-    fn model_cache_ttl_filters_stale_entries() {
+    #[tokio::test]
+    async fn model_cache_ttl_filters_stale_entries() {
         let tmp = TempDir::new().unwrap();
         let stale = ModelCacheState {
             entries: vec![ModelCacheEntry {
@@ -5898,21 +6251,26 @@ mod tests {
             }],
         };
 
-        save_model_cache_state(tmp.path(), &stale).unwrap();
+        save_model_cache_state(tmp.path(), &stale).await.unwrap();
 
-        let fresh =
-            load_cached_models_for_provider(tmp.path(), "openai", MODEL_CACHE_TTL_SECS).unwrap();
+        let fresh = load_cached_models_for_provider(tmp.path(), "openai", MODEL_CACHE_TTL_SECS)
+            .await
+            .unwrap();
         assert!(fresh.is_none());
 
-        let stale_any = load_any_cached_models_for_provider(tmp.path(), "openai").unwrap();
+        let stale_any = load_any_cached_models_for_provider(tmp.path(), "openai")
+            .await
+            .unwrap();
         assert!(stale_any.is_some());
     }
 
-    #[test]
-    fn run_models_refresh_uses_fresh_cache_without_network() {
+    #[tokio::test]
+    async fn run_models_refresh_uses_fresh_cache_without_network() {
         let tmp = TempDir::new().unwrap();
 
-        cache_live_models_for_provider(tmp.path(), "openai", &["gpt-5.1".to_string()]).unwrap();
+        cache_live_models_for_provider(tmp.path(), "openai", &["gpt-5.1".to_string()])
+            .await
+            .unwrap();
 
         let config = Config {
             workspace_dir: tmp.path().to_path_buf(),
@@ -5920,11 +6278,11 @@ mod tests {
             ..Config::default()
         };
 
-        run_models_refresh(&config, None, false).unwrap();
+        run_models_refresh(&config, None, false).await.unwrap();
     }
 
-    #[test]
-    fn run_models_refresh_rejects_unsupported_provider() {
+    #[tokio::test]
+    async fn run_models_refresh_rejects_unsupported_provider() {
         let tmp = TempDir::new().unwrap();
 
         let config = Config {
@@ -5934,7 +6292,7 @@ mod tests {
             ..Config::default()
         };
 
-        let err = run_models_refresh(&config, None, true).unwrap_err();
+        let err = run_models_refresh(&config, None, true).await.unwrap_err();
         assert!(err
             .to_string()
             .contains("does not support live model discovery"));
@@ -5950,6 +6308,7 @@ mod tests {
         assert_eq!(provider_env_var("ollama"), "OLLAMA_API_KEY");
         assert_eq!(provider_env_var("llamacpp"), "LLAMACPP_API_KEY");
         assert_eq!(provider_env_var("llama.cpp"), "LLAMACPP_API_KEY");
+        assert_eq!(provider_env_var("vllm"), "VLLM_API_KEY");
         assert_eq!(provider_env_var("xai"), "XAI_API_KEY");
         assert_eq!(provider_env_var("grok"), "XAI_API_KEY"); // alias
         assert_eq!(provider_env_var("together"), "TOGETHER_API_KEY"); // alias
@@ -5982,6 +6341,7 @@ mod tests {
         assert!(provider_supports_keyless_local_usage("ollama"));
         assert!(provider_supports_keyless_local_usage("llamacpp"));
         assert!(provider_supports_keyless_local_usage("llama.cpp"));
+        assert!(provider_supports_keyless_local_usage("vllm"));
         assert!(!provider_supports_keyless_local_usage("openai"));
     }
 

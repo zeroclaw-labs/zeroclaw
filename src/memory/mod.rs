@@ -1,10 +1,12 @@
 pub mod backend;
 pub mod chunker;
+pub mod cli;
 pub mod embeddings;
 pub mod hygiene;
 pub mod lucid;
 pub mod markdown;
 pub mod none;
+#[cfg(feature = "memory-postgres")]
 pub mod postgres;
 pub mod response_cache;
 pub mod snapshot;
@@ -20,6 +22,7 @@ pub use backend::{
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
+#[cfg(feature = "memory-postgres")]
 pub use postgres::PostgresMemory;
 pub use response_cache::ResponseCache;
 pub use sqlite::SqliteMemory;
@@ -28,6 +31,7 @@ pub use traits::Memory;
 pub use traits::{MemoryCategory, MemoryEntry};
 
 use crate::config::{EmbeddingRouteConfig, MemoryConfig, StorageProviderConfig};
+#[cfg(feature = "memory-postgres")]
 use anyhow::Context;
 use std::path::Path;
 use std::sync::Arc;
@@ -41,7 +45,7 @@ fn create_memory_with_builders<F, G>(
 ) -> anyhow::Result<Box<dyn Memory>>
 where
     F: FnMut() -> anyhow::Result<SqliteMemory>,
-    G: FnMut() -> anyhow::Result<PostgresMemory>,
+    G: FnMut() -> anyhow::Result<Box<dyn Memory>>,
 {
     match classify_memory_backend(backend_name) {
         MemoryBackendKind::Sqlite => Ok(Box::new(sqlite_builder()?)),
@@ -49,7 +53,7 @@ where
             let local = sqlite_builder()?;
             Ok(Box::new(LucidMemory::new(workspace_dir, local)))
         }
-        MemoryBackendKind::Postgres => Ok(Box::new(postgres_builder()?)),
+        MemoryBackendKind::Postgres => postgres_builder(),
         MemoryBackendKind::Markdown => Ok(Box::new(MarkdownMemory::new(workspace_dir))),
         MemoryBackendKind::None => Ok(Box::new(NoneMemory::new())),
         MemoryBackendKind::Unknown => {
@@ -96,8 +100,7 @@ impl std::fmt::Debug for ResolvedEmbeddingConfig {
             .field("provider", &self.provider)
             .field("model", &self.model)
             .field("dimensions", &self.dimensions)
-            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -259,9 +262,10 @@ pub fn create_memory_with_storage_and_routes(
         Ok(mem)
     }
 
+    #[cfg(feature = "memory-postgres")]
     fn build_postgres_memory(
         storage_provider: Option<&StorageProviderConfig>,
-    ) -> anyhow::Result<PostgresMemory> {
+    ) -> anyhow::Result<Box<dyn Memory>> {
         let storage_provider = storage_provider
             .context("memory backend 'postgres' requires [storage.provider.config] settings")?;
         let db_url = storage_provider
@@ -273,12 +277,22 @@ pub fn create_memory_with_storage_and_routes(
                 "memory backend 'postgres' requires [storage.provider.config].db_url (or dbURL)",
             )?;
 
-        PostgresMemory::new(
+        let memory = PostgresMemory::new(
             db_url,
             &storage_provider.schema,
             &storage_provider.table,
             storage_provider.connect_timeout_secs,
-        )
+        )?;
+        Ok(Box::new(memory))
+    }
+
+    #[cfg(not(feature = "memory-postgres"))]
+    fn build_postgres_memory(
+        _storage_provider: Option<&StorageProviderConfig>,
+    ) -> anyhow::Result<Box<dyn Memory>> {
+        anyhow::bail!(
+            "memory backend 'postgres' requested but this build was compiled without `memory-postgres`; rebuild with `--features memory-postgres`"
+        );
     }
 
     create_memory_with_builders(
@@ -460,7 +474,11 @@ mod tests {
         let error = create_memory_with_storage(&cfg, Some(&storage), tmp.path(), None)
             .err()
             .expect("postgres without db_url should be rejected");
-        assert!(error.to_string().contains("db_url"));
+        if cfg!(feature = "memory-postgres") {
+            assert!(error.to_string().contains("db_url"));
+        } else {
+            assert!(error.to_string().contains("memory-postgres"));
+        }
     }
 
     #[test]

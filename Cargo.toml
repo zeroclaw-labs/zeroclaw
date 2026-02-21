@@ -13,6 +13,7 @@ repository = "https://github.com/zeroclaw-labs/zeroclaw"
 readme = "README.md"
 keywords = ["ai", "agent", "cli", "assistant", "chatbot"]
 categories = ["command-line-utilities", "api-bindings"]
+rust-version = "1.87"
 
 [dependencies]
 # CLI - minimal and fast
@@ -50,6 +51,7 @@ prometheus = { version = "0.14", default-features = false }
 
 # Base64 encoding (screenshots, image data)
 base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 # URL encoding for web search
 urlencoding = "2.1"
@@ -87,12 +89,12 @@ async-trait = "0.1"
 # HMAC-SHA256 (Zhipu/GLM JWT auth)
 ring = "0.17"
 
-# Protobuf encode/decode (Feishu WS long-connection frame codec)
-prost = { version = "0.14", default-features = false }
+# Protobuf encode/decode (Lark WS frame codec, WhatsApp storage)
+prost = { version = "0.14", default-features = false, optional = true }
 
 # Memory / persistence
 rusqlite = { version = "0.37", features = ["bundled"] }
-postgres = { version = "0.19", features = ["with-chrono-0_4"] }
+postgres = { version = "0.19", features = ["with-chrono-0_4"], optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 chrono-tz = "0.10"
 cron = "0.15"
@@ -107,10 +109,10 @@ glob = "0.3"
 # Binary discovery (init system detection)
 which = "7.0"
 
-# WebSocket client channels (Discord/Lark/DingTalk)
+# WebSocket client channels (Discord/Lark/DingTalk/Nostr)
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
-futures = "0.3"
+nostr-sdk = { version = "0.44", default-features = false, features = ["nip04", "nip59"] }
 regex = "1.10"
 hostname = "0.4.2"
 rustls = "0.23"
@@ -133,9 +135,9 @@ http-body-util = "0.1"
 # Use the blocking HTTP exporter client to avoid Tokio-reactor panics in
 # OpenTelemetry background batch threads when ZeroClaw emits spans/metrics from
 # non-Tokio contexts.
-opentelemetry = { version = "0.31", default-features = false, features = ["trace", "metrics"] }
-opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "metrics"] }
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls-webpki-roots"] }
+opentelemetry = { version = "0.31", default-features = false, features = ["trace", "metrics"], optional = true }
+opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "metrics"], optional = true }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls-webpki-roots"], optional = true }
 
 # Serial port for peripheral communication (STM32, etc.)
 tokio-serial = { version = "5", default-features = false, optional = true }
@@ -150,7 +152,6 @@ probe-rs = { version = "0.31", optional = true }
 
 # PDF extraction for datasheet RAG (optional, enable with --features rag-pdf)
 pdf-extract = { version = "0.10", optional = true }
-tokio-stream = { version = "0.1.18", features = ["full"] }
 
 # WhatsApp Web client (wa-rs) — optional, enable with --features whatsapp-web
 # Uses wa-rs for Bot and Client, wa-rs-core for storage traits, custom rusqlite backend avoids Diesel conflict.
@@ -171,9 +172,12 @@ landlock = { version = "0.4", optional = true }
 libc = "0.2"
 
 [features]
-default = ["hardware", "channel-matrix"]
+default = []
 hardware = ["nusb", "tokio-serial"]
 channel-matrix = ["dep:matrix-sdk"]
+channel-lark = ["dep:prost"]
+memory-postgres = ["dep:postgres"]
+observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
 peripheral-rpi = ["rppal"]
 # Browser backend feature alias used by cfg(feature = "browser-native")
 browser-native = ["dep:fantoccini"]
@@ -189,11 +193,11 @@ probe = ["dep:probe-rs"]
 # rag-pdf = PDF ingestion for datasheet RAG
 rag-pdf = ["dep:pdf-extract"]
 # whatsapp-web = Native WhatsApp Web client with custom rusqlite storage backend
-whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "serde-big-array"]
+whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "dep:serde-big-array", "dep:prost"]
 
 [profile.release]
 opt-level = "z"      # Optimize for size
-lto = "thin"         # Lower memory use during release builds
+lto = "fat"          # Maximum cross-crate optimization for smaller binaries
 codegen-units = 1    # Serialized codegen for low-memory devices (e.g., Raspberry Pi 3 with 1GB RAM)
                      # Higher values (e.g., 8) compile faster but require more RAM during compilation
 strip = true          # Remove debug symbols
@@ -215,6 +219,8 @@ panic = "abort"
 [dev-dependencies]
 tempfile = "3.14"
 criterion = { version = "0.8", features = ["async_tokio"] }
+tokio-stream = { version = "0.1.18", default-features = false, features = ["fs"] }
+wiremock = "0.6"
 
 [[bench]]
 name = "agent_benchmarks"

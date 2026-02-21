@@ -440,4 +440,56 @@ mod tests {
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap_or("").contains("Rate limit"));
     }
+
+    #[tokio::test]
+    async fn shell_handles_nonexistent_command() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        });
+        let tool = ShellTool::new(security, test_runtime());
+        let result = tool
+            .execute(json!({"command": "nonexistent_binary_xyz_12345"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+    }
+
+    #[tokio::test]
+    async fn shell_captures_stderr_output() {
+        let tool = ShellTool::new(test_security(AutonomyLevel::Full), test_runtime());
+        let result = tool
+            .execute(json!({"command": "echo error_msg >&2"}))
+            .await
+            .unwrap();
+        assert!(result.error.as_deref().unwrap_or("").contains("error_msg"));
+    }
+
+    #[tokio::test]
+    async fn shell_record_action_budget_exhaustion() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            max_actions_per_hour: 1,
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        });
+        let tool = ShellTool::new(security, test_runtime());
+
+        let r1 = tool
+            .execute(json!({"command": "echo first"}))
+            .await
+            .unwrap();
+        assert!(r1.success);
+
+        let r2 = tool
+            .execute(json!({"command": "echo second"}))
+            .await
+            .unwrap();
+        assert!(!r2.success);
+        assert!(
+            r2.error.as_deref().unwrap_or("").contains("Rate limit")
+                || r2.error.as_deref().unwrap_or("").contains("budget")
+        );
+    }
 }

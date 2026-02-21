@@ -174,6 +174,7 @@ async fn run_agent_job(
                 model_override,
                 config.default_temperature,
                 vec![],
+                false,
             )
             .await
         }

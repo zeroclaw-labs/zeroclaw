@@ -6,7 +6,7 @@
 
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ProviderCapabilities, ToolCall as ProviderToolCall, ToolsPayload,
+    Provider, ProviderCapabilities, TokenUsage, ToolCall as ProviderToolCall, ToolsPayload,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -33,10 +33,7 @@ struct AwsCredentials {
 }
 
 impl AwsCredentials {
-    /// Resolve credentials from environment variables.
-    ///
-    /// Required: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`.
-    /// Optional: `AWS_SESSION_TOKEN`, `AWS_REGION` / `AWS_DEFAULT_REGION`.
+    /// Resolve credentials: first try environment variables, then EC2 IMDSv2.
     fn from_env() -> anyhow::Result<Self> {
         let access_key_id = env_required("AWS_ACCESS_KEY_ID")?;
         let secret_access_key = env_required("AWS_SECRET_ACCESS_KEY")?;
@@ -53,6 +50,94 @@ impl AwsCredentials {
             session_token,
             region,
         })
+    }
+
+    /// Fetch credentials from EC2 IMDSv2 instance metadata service.
+    async fn from_imds() -> anyhow::Result<Self> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()?;
+
+        // Step 1: get IMDSv2 token
+        let token = client
+            .put("http://169.254.169.254/latest/api/token")
+            .header("X-aws-ec2-metadata-token-ttl-seconds", "21600")
+            .send()
+            .await?
+            .text()
+            .await?;
+
+        // Step 2: get IAM role name
+        let role = client
+            .get("http://169.254.169.254/latest/meta-data/iam/security-credentials/")
+            .header("X-aws-ec2-metadata-token", &token)
+            .send()
+            .await?
+            .text()
+            .await?;
+        let role = role.trim().to_string();
+        anyhow::ensure!(!role.is_empty(), "No IAM role attached to this instance");
+
+        // Step 3: get credentials for that role
+        let creds_url = format!(
+            "http://169.254.169.254/latest/meta-data/iam/security-credentials/{}",
+            role
+        );
+        let creds_json: serde_json::Value = client
+            .get(&creds_url)
+            .header("X-aws-ec2-metadata-token", &token)
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        let access_key_id = creds_json["AccessKeyId"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing AccessKeyId in IMDS response"))?
+            .to_string();
+        let secret_access_key = creds_json["SecretAccessKey"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing SecretAccessKey in IMDS response"))?
+            .to_string();
+        let session_token = creds_json["Token"].as_str().map(|s| s.to_string());
+
+        // Step 4: get region from instance identity document
+        let region = match client
+            .get("http://169.254.169.254/latest/meta-data/placement/region")
+            .header("X-aws-ec2-metadata-token", &token)
+            .send()
+            .await
+        {
+            Ok(resp) => resp.text().await.unwrap_or_default(),
+            Err(_) => String::new(),
+        };
+        let region = if region.trim().is_empty() {
+            env_optional("AWS_REGION")
+                .or_else(|| env_optional("AWS_DEFAULT_REGION"))
+                .unwrap_or_else(|| DEFAULT_REGION.to_string())
+        } else {
+            region.trim().to_string()
+        };
+
+        tracing::info!(
+            "Loaded AWS credentials from EC2 instance metadata (role: {})",
+            role
+        );
+
+        Ok(Self {
+            access_key_id,
+            secret_access_key,
+            session_token,
+            region,
+        })
+    }
+
+    /// Resolve credentials: env vars first, then EC2 IMDS.
+    async fn resolve() -> anyhow::Result<Self> {
+        if let Ok(creds) = Self::from_env() {
+            return Ok(creds);
+        }
+        Self::from_imds().await
     }
 
     fn host(&self) -> String {
@@ -190,6 +275,24 @@ enum ContentBlock {
     ToolUse(ToolUseWrapper),
     ToolResult(ToolResultWrapper),
     CachePointBlock(CachePointWrapper),
+    Image(ImageWrapper),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ImageWrapper {
+    image: ImageBlock,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ImageBlock {
+    format: String,
+    source: ImageSource,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ImageSource {
+    bytes: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -300,6 +403,17 @@ struct ConverseResponse {
     #[serde(default)]
     #[allow(dead_code)]
     stop_reason: Option<String>,
+    #[serde(default)]
+    usage: Option<BedrockUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BedrockUsage {
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    #[serde(default)]
+    output_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -348,6 +462,11 @@ impl BedrockProvider {
         }
     }
 
+    pub async fn new_async() -> Self {
+        let credentials = AwsCredentials::resolve().await.ok();
+        Self { credentials }
+    }
+
     fn http_client(&self) -> Client {
         crate::config::build_runtime_proxy_client_with_timeouts("provider.bedrock", 120, 10)
     }
@@ -376,9 +495,18 @@ impl BedrockProvider {
         self.credentials.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "AWS Bedrock credentials not set. Set AWS_ACCESS_KEY_ID and \
-                 AWS_SECRET_ACCESS_KEY environment variables."
+                 AWS_SECRET_ACCESS_KEY environment variables, or run on an EC2 \
+                 instance with an IAM role attached."
             )
         })
+    }
+
+    /// Resolve credentials: use cached if available, otherwise fetch from IMDS.
+    async fn resolve_credentials(&self) -> anyhow::Result<AwsCredentials> {
+        if let Ok(creds) = AwsCredentials::from_env() {
+            return Ok(creds);
+        }
+        AwsCredentials::from_imds().await
     }
 
     // ── Cache heuristics (same thresholds as AnthropicProvider) ──
@@ -438,11 +566,10 @@ impl BedrockProvider {
                     }
                 }
                 _ => {
+                    let content_blocks = Self::parse_user_content_blocks(&msg.content);
                     converse_messages.push(ConverseMessage {
                         role: "user".to_string(),
-                        content: vec![ContentBlock::Text(TextBlock {
-                            text: msg.content.clone(),
-                        })],
+                        content: content_blocks,
                     });
                 }
             }
@@ -454,6 +581,85 @@ impl BedrockProvider {
             Some(system_blocks)
         };
         (system, converse_messages)
+    }
+
+    /// Parse user message content, extracting [IMAGE:data:...] markers into image blocks.
+    fn parse_user_content_blocks(content: &str) -> Vec<ContentBlock> {
+        let mut blocks: Vec<ContentBlock> = Vec::new();
+        let mut remaining = content;
+        let has_image = content.contains("[IMAGE:");
+        tracing::info!(
+            "parse_user_content_blocks called, len={}, has_image={}",
+            content.len(),
+            has_image
+        );
+
+        while let Some(start) = remaining.find("[IMAGE:") {
+            // Add any text before the marker
+            let text_before = &remaining[..start];
+            if !text_before.trim().is_empty() {
+                blocks.push(ContentBlock::Text(TextBlock {
+                    text: text_before.to_string(),
+                }));
+            }
+
+            let after = &remaining[start + 7..]; // skip "[IMAGE:"
+            if let Some(end) = after.find(']') {
+                let src = &after[..end];
+                remaining = &after[end + 1..];
+
+                // Only handle data URIs (base64 encoded images)
+                if let Some(rest) = src.strip_prefix("data:") {
+                    if let Some(semi) = rest.find(';') {
+                        let mime = &rest[..semi];
+                        let after_semi = &rest[semi + 1..];
+                        if let Some(b64) = after_semi.strip_prefix("base64,") {
+                            let format = match mime {
+                                "image/jpeg" | "image/jpg" => "jpeg",
+                                "image/png" => "png",
+                                "image/gif" => "gif",
+                                "image/webp" => "webp",
+                                _ => "jpeg",
+                            };
+                            blocks.push(ContentBlock::Image(ImageWrapper {
+                                image: ImageBlock {
+                                    format: format.to_string(),
+                                    source: ImageSource {
+                                        bytes: b64.to_string(),
+                                    },
+                                },
+                            }));
+                            continue;
+                        }
+                    }
+                }
+                // Non-data-uri image: just include as text reference
+                blocks.push(ContentBlock::Text(TextBlock {
+                    text: format!("[image: {}]", src),
+                }));
+            } else {
+                // No closing bracket, treat rest as text
+                blocks.push(ContentBlock::Text(TextBlock {
+                    text: remaining.to_string(),
+                }));
+                break;
+            }
+        }
+
+        // Add any remaining text
+        if !remaining.trim().is_empty() {
+            blocks.push(ContentBlock::Text(TextBlock {
+                text: remaining.to_string(),
+            }));
+        }
+
+        if blocks.is_empty() {
+            blocks.push(ContentBlock::Text(TextBlock {
+                text: content.to_string(),
+            }));
+        }
+
+        blocks
     }
 
     /// Parse assistant message containing structured tool calls.
@@ -540,6 +746,11 @@ impl BedrockProvider {
         let mut text_parts = Vec::new();
         let mut tool_calls = Vec::new();
 
+        let usage = response.usage.map(|u| TokenUsage {
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+        });
+
         if let Some(output) = response.output {
             if let Some(message) = output.message {
                 for block in message.content {
@@ -572,6 +783,7 @@ impl BedrockProvider {
                 Some(text_parts.join("\n"))
             },
             tool_calls,
+            usage,
         }
     }
 
@@ -584,6 +796,37 @@ impl BedrockProvider {
         request_body: &ConverseRequest,
     ) -> anyhow::Result<ConverseResponse> {
         let payload = serde_json::to_vec(request_body)?;
+
+        // Debug: log image blocks in payload (truncated)
+        if let Ok(debug_val) = serde_json::from_slice::<serde_json::Value>(&payload) {
+            if let Some(msgs) = debug_val.get("messages").and_then(|m| m.as_array()) {
+                for msg in msgs {
+                    if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
+                        for block in content {
+                            if block.get("image").is_some() {
+                                let mut b = block.clone();
+                                if let Some(img) = b.get_mut("image") {
+                                    if let Some(src) = img.get_mut("source") {
+                                        if let Some(bytes) = src.get_mut("bytes") {
+                                            if let Some(s) = bytes.as_str() {
+                                                *bytes = serde_json::json!(format!(
+                                                    "<base64 {} chars>",
+                                                    s.len()
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                                tracing::info!(
+                                    "Bedrock image block: {}",
+                                    serde_json::to_string(&b).unwrap_or_default()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let url = Self::endpoint_url(&credentials.region, model);
         let canonical_uri = Self::canonical_uri(model);
         let now = chrono::Utc::now();
@@ -639,7 +882,7 @@ impl Provider for BedrockProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             native_tool_calling: true,
-            vision: false,
+            vision: true,
         }
     }
 
@@ -670,7 +913,7 @@ impl Provider for BedrockProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let credentials = self.require_credentials()?;
+        let credentials = self.resolve_credentials().await?;
 
         let system = system_prompt.map(|text| {
             let mut blocks = vec![SystemBlock::Text(TextBlock {
@@ -688,9 +931,7 @@ impl Provider for BedrockProvider {
             system,
             messages: vec![ConverseMessage {
                 role: "user".to_string(),
-                content: vec![ContentBlock::Text(TextBlock {
-                    text: message.to_string(),
-                })],
+                content: Self::parse_user_content_blocks(message),
             }],
             inference_config: Some(InferenceConfig {
                 max_tokens: DEFAULT_MAX_TOKENS,
@@ -700,7 +941,7 @@ impl Provider for BedrockProvider {
         };
 
         let response = self
-            .send_converse_request(credentials, model, &request)
+            .send_converse_request(&credentials, model, &request)
             .await?;
 
         Self::parse_converse_response(response)
@@ -714,7 +955,7 @@ impl Provider for BedrockProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credentials = self.require_credentials()?;
+        let credentials = self.resolve_credentials().await?;
 
         let (system_blocks, mut converse_messages) = Self::convert_messages(request.messages);
 
@@ -755,7 +996,7 @@ impl Provider for BedrockProvider {
         };
 
         let response = self
-            .send_converse_request(credentials, model, &converse_request)
+            .send_converse_request(&credentials, model, &converse_request)
             .await?;
 
         Ok(Self::parse_converse_response(response))
@@ -1230,5 +1471,24 @@ mod tests {
         let provider = BedrockProvider { credentials: None };
         let caps = provider.capabilities();
         assert!(caps.native_tool_calling);
+    }
+
+    #[test]
+    fn converse_response_parses_usage() {
+        let json = r#"{
+            "output": {"message": {"role": "assistant", "content": [{"text": {"text": "Hello"}}]}},
+            "usage": {"inputTokens": 500, "outputTokens": 100}
+        }"#;
+        let resp: ConverseResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.unwrap();
+        assert_eq!(usage.input_tokens, Some(500));
+        assert_eq!(usage.output_tokens, Some(100));
+    }
+
+    #[test]
+    fn converse_response_parses_without_usage() {
+        let json = r#"{"output": {"message": {"role": "assistant", "content": []}}}"#;
+        let resp: ConverseResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.usage.is_none());
     }
 }
