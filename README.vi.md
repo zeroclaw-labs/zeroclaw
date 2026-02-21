@@ -636,6 +636,7 @@ keyword_weight = 0.3
 # schema = "public"
 # table = "memories"
 # connect_timeout_secs = 15
+# tls = true                  # true = bật TLS (bỏ qua cert), false = TCP thường (mặc định)
 
 [gateway]
 port = 42617                    # mặc định
