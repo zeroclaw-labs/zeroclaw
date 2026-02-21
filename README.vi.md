@@ -1016,7 +1016,7 @@ ZeroClaw được cấp phép kép để tối đa hóa tính mở và bảo v�
 
 | Giấy phép | Trường hợp sử dụng |
 |---|---|
-| [MIT](LICENSE) | Mã nguồn mở, nghiên cứu, học thuật, sử dụng cá nhân |
+| [MIT](LICENSE-MIT) | Mã nguồn mở, nghiên cứu, học thuật, sử dụng cá nhân |
 | [Apache 2.0](LICENSE-APACHE) | Bảo hộ bằng sáng chế, triển khai tổ chức, thương mại |
 
 Bạn có thể chọn một trong hai giấy phép. **Người đóng góp tự động cấp quyền theo cả hai** — xem [CLA.md](CLA.md) để biết thỏa thuận đóng góp đầy đủ.

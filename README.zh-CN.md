@@ -299,7 +299,7 @@ allow_public_bind = false
 - 贡献指南：[`CONTRIBUTING.md`](CONTRIBUTING.md)
 - PR 工作流：[`docs/pr-workflow.md`](docs/pr-workflow.md)
 - Reviewer 指南：[`docs/reviewer-playbook.md`](docs/reviewer-playbook.md)
-- 许可证：MIT 或 Apache 2.0（见 [`LICENSE`](LICENSE)、[`LICENSE-APACHE`](LICENSE-APACHE) 与 [`NOTICE`](NOTICE)）
+- 许可证：MIT 或 Apache 2.0（见 [`LICENSE-MIT`](LICENSE-MIT)、[`LICENSE-APACHE`](LICENSE-APACHE) 与 [`NOTICE`](NOTICE)）
 
 ---
 

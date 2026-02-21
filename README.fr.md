@@ -839,7 +839,7 @@ ZeroClaw est sous double licence pour une ouverture maximale et la protection de
 
 | Licence                      | Cas d'utilisation                                            |
 | ---------------------------- | ------------------------------------------------------------ |
-| [MIT](LICENSE)               | Open-source, recherche, académique, usage personnel          |
+| [MIT](LICENSE-MIT)               | Open-source, recherche, académique, usage personnel          |
 | [Apache 2.0](LICENSE-APACHE) | Protection de brevet, institutionnel, déploiement commercial |
 
 Vous pouvez choisir l'une ou l'autre licence. **Les contributeurs accordent automatiquement des droits sous les deux** — voir [CLA.md](CLA.md) pour l'accord de contributeur complet.
