@@ -399,6 +399,10 @@ pub struct Config {
     /// WASM plugin engine configuration (`[wasm]` section).
     #[serde(default)]
     pub wasm: WasmConfig,
+
+    /// ClawHub configuration (`[clawhub]`).
+    #[serde(default)]
+    pub clawhub: ClawHubConfig,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -1038,6 +1042,22 @@ impl Default for SubAgentsConfig {
             queue_poll_ms: default_subagents_queue_poll_ms(),
         }
     }
+}
+
+/// ClawHub configuration (`[clawhub]` section).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ClawHubConfig {
+    /// ClawHub API URL (default: https://clawhub.ai)
+    #[serde(default = "default_clawhub_url")]
+    pub api_url: String,
+
+    /// Auto-update installed clawhub skills on agent start
+    #[serde(default)]
+    pub auto_update: bool,
+}
+
+fn default_clawhub_url() -> String {
+    "https://clawhub.ai".to_string()
 }
 
 /// Agent orchestration configuration (`[agent]` section).
@@ -6588,6 +6608,7 @@ impl Default for Config {
             mcp: McpConfig::default(),
             model_support_vision: None,
             wasm: WasmConfig::default(),
+            clawhub: ClawHubConfig::default(),
         }
     }
 }
@@ -10510,6 +10531,7 @@ ws_url = "ws://127.0.0.1:3002"
             mcp: McpConfig::default(),
             model_support_vision: None,
             wasm: WasmConfig::default(),
+            clawhub: ClawHubConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -10898,6 +10920,7 @@ denied_tools = ["shell"]
             mcp: McpConfig::default(),
             model_support_vision: None,
             wasm: WasmConfig::default(),
+            clawhub: ClawHubConfig::default(),
         };
 
         config.save().await.unwrap();
