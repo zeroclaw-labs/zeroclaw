@@ -66,12 +66,12 @@ export default function Memory() {
     setSubmitting(true);
     setFormError(null);
     try {
-      const entry = await storeMemory(
+      await storeMemory(
         formKey.trim(),
         formContent.trim(),
         formCategory.trim() || undefined,
       );
-      setEntries((prev) => [entry, ...prev]);
+      fetchEntries(search, categoryFilter);
       setShowForm(false);
       setFormKey('');
       setFormContent('');

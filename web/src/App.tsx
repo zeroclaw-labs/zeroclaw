@@ -11,26 +11,8 @@ import Config from './pages/Config';
 import Cost from './pages/Cost';
 import Logs from './pages/Logs';
 import Doctor from './pages/Doctor';
-import { getToken, clearToken } from './lib/auth';
-import { pair } from './lib/api';
+import { AuthProvider, useAuth } from './hooks/useAuth';
 import { setLocale, type Locale } from './lib/i18n';
-
-// Auth context
-interface AuthContextType {
-  token: string | null;
-  isAuthenticated: boolean;
-  login: (code: string) => Promise<void>;
-  logout: () => void;
-}
-
-export const AuthContext = createContext<AuthContextType>({
-  token: null,
-  isAuthenticated: false,
-  login: async () => {},
-  logout: () => {},
-});
-
-export const useAuth = () => useContext(AuthContext);
 
 // Locale context
 interface LocaleContextType {
@@ -57,8 +39,8 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
     setError('');
     try {
       await onPair(code);
-    } catch (err: any) {
-      setError(err.message || 'Pairing failed');
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Pairing failed');
     } finally {
       setLoading(false);
     }
@@ -97,22 +79,9 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
   );
 }
 
-export default function App() {
-  const [token, setTokenState] = useState<string | null>(getToken());
+function AppContent() {
+  const { isAuthenticated, pair, logout } = useAuth();
   const [locale, setLocaleState] = useState('tr');
-
-  const isAuthenticated = !!token;
-
-  const login = async (code: string) => {
-    const result = await pair(code);
-    // pair() already stores the token in localStorage
-    setTokenState(result.token);
-  };
-
-  const logout = () => {
-    clearToken();
-    setTokenState(null);
-  };
 
   const setAppLocale = (newLocale: string) => {
     setLocaleState(newLocale);
@@ -122,36 +91,41 @@ export default function App() {
   // Listen for 401 events to force logout
   useEffect(() => {
     const handler = () => {
-      clearToken();
-      setTokenState(null);
+      logout();
     };
     window.addEventListener('zeroclaw-unauthorized', handler);
     return () => window.removeEventListener('zeroclaw-unauthorized', handler);
-  }, []);
+  }, [logout]);
 
   if (!isAuthenticated) {
-    return <PairingDialog onPair={login} />;
+    return <PairingDialog onPair={pair} />;
   }
 
   return (
-    <AuthContext.Provider value={{ token, isAuthenticated, login, logout }}>
-      <LocaleContext.Provider value={{ locale, setAppLocale }}>
-        <Routes>
-          <Route element={<Layout />}>
-            <Route path="/" element={<Dashboard />} />
-            <Route path="/agent" element={<AgentChat />} />
-            <Route path="/tools" element={<Tools />} />
-            <Route path="/cron" element={<Cron />} />
-            <Route path="/integrations" element={<Integrations />} />
-            <Route path="/memory" element={<Memory />} />
-            <Route path="/config" element={<Config />} />
-            <Route path="/cost" element={<Cost />} />
-            <Route path="/logs" element={<Logs />} />
-            <Route path="/doctor" element={<Doctor />} />
-            <Route path="*" element={<Navigate to="/" replace />} />
-          </Route>
-        </Routes>
-      </LocaleContext.Provider>
-    </AuthContext.Provider>
+    <LocaleContext.Provider value={{ locale, setAppLocale }}>
+      <Routes>
+        <Route element={<Layout />}>
+          <Route path="/" element={<Dashboard />} />
+          <Route path="/agent" element={<AgentChat />} />
+          <Route path="/tools" element={<Tools />} />
+          <Route path="/cron" element={<Cron />} />
+          <Route path="/integrations" element={<Integrations />} />
+          <Route path="/memory" element={<Memory />} />
+          <Route path="/config" element={<Config />} />
+          <Route path="/cost" element={<Cost />} />
+          <Route path="/logs" element={<Logs />} />
+          <Route path="/doctor" element={<Doctor />} />
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Route>
+      </Routes>
+    </LocaleContext.Provider>
+  );
+}
+
+export default function App() {
+  return (
+    <AuthProvider>
+      <AppContent />
+    </AuthProvider>
   );
 }

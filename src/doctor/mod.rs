@@ -83,7 +83,7 @@ pub fn diagnose(config: &Config) -> Vec<DiagResult> {
     check_workspace(config, &mut items);
     check_daemon_state(config, &mut items);
     check_environment(&mut items);
-    check_cli_tools(config, &mut items);
+    check_cli_tools(&mut items);
 
     items.into_iter().map(DiagItem::into_result).collect()
 }
@@ -92,10 +92,8 @@ pub fn diagnose(config: &Config) -> Vec<DiagResult> {
 pub fn run(config: &Config) -> Result<()> {
     let results = diagnose(config);
 
-    let locale = &config.locale;
-
     // Print report
-    println!("🩺 {}", crate::i18n::t(locale, "doctor.title"));
+    println!("🩺 ZeroClaw Doctor (enhanced)");
     println!();
 
     let mut current_cat = "";
@@ -120,16 +118,13 @@ pub fn run(config: &Config) -> Result<()> {
         .iter()
         .filter(|i| i.severity == Severity::Warn)
         .count();
-    let oks = results.iter().filter(|i| i.severity == Severity::Ok).count();
+    let oks = results
+        .iter()
+        .filter(|i| i.severity == Severity::Ok)
+        .count();
 
     println!();
-    println!(
-        "  {}: {oks} {}, {warns} {}, {errors} {}",
-        crate::i18n::t(locale, "doctor.summary"),
-        crate::i18n::t(locale, "doctor.ok"),
-        crate::i18n::t(locale, "doctor.warnings"),
-        crate::i18n::t(locale, "doctor.errors"),
-    );
+    println!("  Summary: {oks} ok, {warns} warnings, {errors} errors");
 
     if errors > 0 {
         println!("  💡 Fix the errors above, then run `zeroclaw doctor` again.");
@@ -794,18 +789,10 @@ fn check_environment(items: &mut Vec<DiagItem>) {
     check_command_available("curl", &["--version"], cat, items);
 }
 
-fn check_cli_tools(config: &Config, items: &mut Vec<DiagItem>) {
+fn check_cli_tools(items: &mut Vec<DiagItem>) {
     let cat = "cli-tools";
 
-    if !config.cli_discovery.enabled {
-        items.push(DiagItem::ok(cat, "CLI discovery disabled"));
-        return;
-    }
-
-    let discovered = crate::tools::cli_discovery::discover_cli_tools(
-        &config.cli_discovery.additional_tools,
-        &config.cli_discovery.excluded_tools,
-    );
+    let discovered = crate::tools::cli_discovery::discover_cli_tools(&[], &[]);
 
     if discovered.is_empty() {
         items.push(DiagItem::warn(cat, "No CLI tools found in PATH"));
@@ -818,10 +805,7 @@ fn check_cli_tools(config: &Config, items: &mut Vec<DiagItem>) {
                 .unwrap_or_else(|| "unknown version".to_string());
             items.push(DiagItem::ok(
                 cat,
-                format!(
-                    "{} ({}) — {}",
-                    cli.name, cli.category, version_info
-                ),
+                format!("{} ({}) — {}", cli.name, cli.category, version_info),
             ));
         }
         items.push(DiagItem::ok(

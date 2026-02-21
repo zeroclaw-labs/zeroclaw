@@ -21,7 +21,10 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// Verify bearer token against PairingGuard. Returns error response if unauthorized.
-fn require_auth(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+fn require_auth(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     if !state.pairing.require_pairing() {
         return Ok(());
     }
@@ -81,7 +84,7 @@ pub async fn handle_api_status(
         "temperature": state.temperature,
         "uptime_seconds": health.uptime_seconds,
         "gateway_port": config.gateway.port,
-        "locale": config.locale,
+        "locale": "en",
         "memory_backend": state.mem.name(),
         "paired": state.pairing.is_paired(),
         "channels": {
@@ -411,7 +414,11 @@ pub async fn handle_api_memory_store(
         })
         .unwrap_or(crate::memory::MemoryCategory::Core);
 
-    match state.mem.store(&body.key, &body.content, category, None).await {
+    match state
+        .mem
+        .store(&body.key, &body.content, category, None)
+        .await
+    {
         Ok(()) => Json(serde_json::json!({"status": "ok"})).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -432,7 +439,9 @@ pub async fn handle_api_memory_delete(
     }
 
     match state.mem.forget(&key).await {
-        Ok(deleted) => Json(serde_json::json!({"status": "ok", "deleted": deleted})).into_response(),
+        Ok(deleted) => {
+            Json(serde_json::json!({"status": "ok", "deleted": deleted})).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Memory forget failed: {e}")})),
@@ -483,11 +492,7 @@ pub async fn handle_api_cli_tools(
         return e.into_response();
     }
 
-    let config = state.config.lock().clone();
-    let tools = crate::tools::cli_discovery::discover_cli_tools(
-        &config.cli_discovery.additional_tools,
-        &config.cli_discovery.excluded_tools,
-    );
+    let tools = crate::tools::cli_discovery::discover_cli_tools(&[], &[]);
 
     Json(serde_json::json!({"cli_tools": tools})).into_response()
 }

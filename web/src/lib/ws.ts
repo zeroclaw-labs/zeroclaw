@@ -1,5 +1,5 @@
 import type { WsMessage } from '../types/api';
-import { getToken } from './api';
+import { getToken } from './auth';
 
 export type WsMessageHandler = (msg: WsMessage) => void;
 export type WsOpenHandler = () => void;

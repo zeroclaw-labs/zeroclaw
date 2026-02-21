@@ -1,5 +1,5 @@
 import type { SSEEvent } from '../types/api';
-import { getToken } from './api';
+import { getToken } from './auth';
 
 export type SSEEventHandler = (event: SSEEvent) => void;
 export type SSEErrorHandler = (error: Event | Error) => void;

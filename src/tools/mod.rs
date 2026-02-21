@@ -17,6 +17,7 @@
 
 pub mod browser;
 pub mod browser_open;
+pub mod cli_discovery;
 pub mod composio;
 pub mod cron_add;
 pub mod cron_list;
