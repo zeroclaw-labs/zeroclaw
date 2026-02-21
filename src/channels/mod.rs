@@ -3060,6 +3060,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         composio_entity_id,
         &config.browser,
         &config.http_request,
+        &config.web_fetch,
         &workspace,
         &config.agents,
         config.api_key.as_deref(),
