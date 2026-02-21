@@ -2394,6 +2394,23 @@ pub struct CustomTunnelConfig {
 
 // ── Channels ─────────────────────────────────────────────────────
 
+struct ConfigWrapper<T: ChannelConfig>(std::marker::PhantomData<T>);
+
+impl<T: ChannelConfig> ConfigWrapper<T> {
+    fn new(_: &Option<T>) -> Self {
+        Self(std::marker::PhantomData)
+    }
+}
+
+impl<T: ChannelConfig> crate::config::traits::ConfigHandle for ConfigWrapper<T> {
+    fn name(&self) -> &'static str {
+        T::name()
+    }
+    fn desc(&self) -> &'static str {
+        T::desc()
+    }
+}
+
 /// Top-level channel configurations (`[channels_config]` section).
 ///
 /// Each channel sub-section (e.g. `telegram`, `discord`) is optional;
@@ -2446,6 +2463,85 @@ pub struct ChannelsConfig {
     pub message_timeout_secs: u64,
 }
 
+impl ChannelsConfig {
+    /// get channels' metadata and `.is_some()`, except webhook
+    pub fn channels_except_webhook(&self) -> Vec<(Box<dyn super::traits::ConfigHandle>, bool)> {
+        vec![
+            (
+                Box::new(ConfigWrapper::new(&self.telegram)),
+                self.telegram.is_some(),
+            ),
+            (
+                Box::new(ConfigWrapper::new(&self.discord)),
+                self.discord.is_some(),
+            ),
+            (
+                Box::new(ConfigWrapper::new(&self.slack)),
+                self.slack.is_some(),
+            ),
+            (
+                Box::new(ConfigWrapper::new(&self.mattermost)),
+                self.mattermost.is_some(),
+            ),
+            (
+                Box::new(ConfigWrapper::new(&self.imessage)),
+                self.imessage.is_some(),
+            ),
+            (
+                Box::new(ConfigWrapper::new(&self.matrix)),
+                self.matrix.is_some(),
+            ),
+            (
+                Box::new(ConfigWrapper::new(&self.signal)),
+                self.signal.is_some(),
+            ),
+            (
+                Box::new(ConfigWrapper::new(&self.whatsapp)),
+                self.whatsapp.is_some(),
+            ),
+            (
+                Box::new(ConfigWrapper::new(&self.linq)),
+                self.linq.is_some(),
+            ),
+            (
+                Box::new(ConfigWrapper::new(&self.nextcloud_talk)),
+                self.nextcloud_talk.is_some(),
+            ),
+            (
+                Box::new(ConfigWrapper::new(&self.email)),
+                self.email.is_some(),
+            ),
+            (Box::new(ConfigWrapper::new(&self.irc)), self.irc.is_some()),
+            (
+                Box::new(ConfigWrapper::new(&self.lark)),
+                self.lark.is_some(),
+            ),
+            (
+                Box::new(ConfigWrapper::new(&self.dingtalk)),
+                self.dingtalk.is_some(),
+            ),
+            (Box::new(ConfigWrapper::new(&self.qq)), self.qq.is_some()),
+            (
+                Box::new(ConfigWrapper::new(&self.nostr)),
+                self.nostr.is_some(),
+            ),
+        ]
+    }
+
+    pub fn channels(&self) -> Vec<(Box<dyn super::traits::ConfigHandle>, bool)> {
+        let mut ret = self.channels_except_webhook();
+        ret.push((
+            Box::new(ConfigWrapper::new(&self.webhook)),
+            self.webhook.is_some(),
+        ));
+        ret
+    }
+}
+
+fn default_channel_message_timeout_secs() -> u64 {
+    300
+}
+
 impl Default for ChannelsConfig {
     fn default() -> Self {
         Self {
@@ -2471,10 +2567,6 @@ impl Default for ChannelsConfig {
             message_timeout_secs: default_channel_message_timeout_secs(),
         }
     }
-}
-
-fn default_channel_message_timeout_secs() -> u64 {
-    300
 }
 
 /// Streaming mode for channels that support progressive message updates.
@@ -2701,7 +2793,6 @@ impl ChannelConfig for SignalConfig {
         "An open-source, encrypted messaging service"
     }
 }
-
 
 /// WhatsApp channel configuration (Cloud API or Web mode).
 ///

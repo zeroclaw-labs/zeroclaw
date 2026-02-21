@@ -7,3 +7,8 @@ pub trait ChannelConfig {
 }
 
 // Maybe there should be a `&self` as parameter for custom channel/info or what...
+
+pub trait ConfigHandle {
+    fn name(&self) -> &'static str;
+    fn desc(&self) -> &'static str;
+}
