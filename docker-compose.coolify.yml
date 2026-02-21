@@ -104,6 +104,7 @@ services:
       - CLAWDBOT_GATEWAY_TOKEN=${ZEROCLAW_BEARER_TOKEN}
       - CLAWSUITE_ALLOWED_HOSTS
       - CLAWSUITE_PASSWORD
+      - NODE_OPTIONS=--require ./otel.js
       # OpenTelemetry configuration
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector-ek4ck8gkoscs4884os8cwgkc:4317
       - OTEL_EXPORTER_OTLP_PROTOCOL=grpc

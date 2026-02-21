@@ -1,26 +1,76 @@
 package main
 
 import (
-    "bytes"
-    "encoding/json"
-    "fmt"
-    "log"
-    "net/http"
-    "os"
-    "sync"
-    "time"
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"sync"
+	"time"
 
-    "github.com/gorilla/websocket"
+	"github.com/gorilla/websocket"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.24.0"
 )
 
 var (
-    addr        = ":18789"
-    zeroclawURL = getenv("ZEROCLAW_URL", "http://zeroclaw:3000/webhook")
-    upgrader    = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	addr        = ":18789"
+	zeroclawURL = getenv("ZEROCLAW_URL", "http://zeroclaw:3000/webhook")
+	upgrader    = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	tracer      = otel.Tracer("zc-bridge")
 )
 
-type Frame struct {
-    Type    string          `json:"type"`
+// initOTel initializes the OpenTelemetry pipeline.
+func initOTel() (func(), error) {
+	ctx := context.Background()
+
+	endpoint := getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "localhost:4317")
+	// Strip http:// prefix if present, as otlptracegrpc expects host:port
+	if len(endpoint) > 7 && endpoint[:7] == "http://" {
+		endpoint = endpoint[7:]
+	}
+
+	res, err := resource.Merge(
+		resource.Default(),
+		resource.NewWithAttributes(
+			semconv.SchemaURL,
+			semconv.ServiceNameKey.String("zc-bridge"),
+			semconv.ServiceVersionKey.String("1.0.0"),
+		),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create resource: %w", err)
+	}
+
+	exporter, err := otlptracegrpc.New(ctx,
+		otlptracegrpc.WithInsecure(),
+		otlptracegrpc.WithEndpoint(endpoint),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create trace exporter: %w", err)
+	}
+
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithResource(res),
+	)
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
+
+	return func() {
+		_ = tp.Shutdown(ctx)
+	}, nil
+}
+
+type Frame struct {    Type    string          `json:"type"`
     ID      string          `json:"id,omitempty"`
     Method  string          `json:"method,omitempty"`
     Params  json.RawMessage `json:"params,omitempty"`
@@ -211,13 +261,19 @@ func safeWriteControl(ws *websocket.Conn, mu *sync.Mutex, messageType int, data 
 }
 
 func main() {
-    http.HandleFunc("/", handleWS)
-    log.Println("zc-bridge listening on", addr)
-    log.Fatal(http.ListenAndServe(addr, nil))
+	shutdown, err := initOTel()
+	if err != nil {
+		log.Printf("failed to initialize OTel: %v", err)
+	} else {
+		defer shutdown()
+	}
+
+	http.HandleFunc("/", handleWS)
+	log.Println("zc-bridge listening on", addr)
+	log.Fatal(http.ListenAndServe(addr, nil))
 }
 
-func handleWS(w http.ResponseWriter, r *http.Request) {
-    ws, err := upgrader.Upgrade(w, r, nil)
+func handleWS(w http.ResponseWriter, r *http.Request) {    ws, err := upgrader.Upgrade(w, r, nil)
     if err != nil {
         log.Println(err)
         return
@@ -547,70 +603,75 @@ func handleChatHistory(ws *websocket.Conn, writeMu *sync.Mutex, f Frame) {
 }
 
 func handleZeroClawForward(ws *websocket.Conn, writeMu *sync.Mutex, f Frame) {
-    if os.Getenv("ZC_BRIDGE_DEBUG") == "1" {
-        log.Printf("[forward] method=%s id=%s", f.Method, f.ID)
-    }
+	ctx, span := tracer.Start(context.Background(), "bridge.forward")
+	defer span.End()
 
-    // Parse params
-    var params struct {
-        SessionKey     string `json:"sessionKey"`
-        Message        string `json:"message"`
-        IdempotencyKey string `json:"idempotencyKey"`
-    }
-    if len(f.Params) > 0 {
-        if err := json.Unmarshal(f.Params, &params); err != nil {
-            sendError(ws, writeMu, f.ID, "invalid params: "+err.Error())
-            return
-        }
-    }
-    if params.Message == "" {
-        sendError(ws, writeMu, f.ID, "missing params.message")
-        return
-    }
+	if os.Getenv("ZC_BRIDGE_DEBUG") == "1" {
+		log.Printf("[forward] method=%s id=%s", f.Method, f.ID)
+	}
 
-    // Determine sessionKey (fallback to "main")
-    sessionKey := params.SessionKey
-    if sessionKey == "" {
-        sessionKey = "main"
-    }
+	// Parse params
+	var params struct {
+		SessionKey     string `json:"sessionKey"`
+		Message        string `json:"message"`
+		IdempotencyKey string `json:"idempotencyKey"`
+	}
+	if len(f.Params) > 0 {
+		if err := json.Unmarshal(f.Params, &params); err != nil {
+			sendError(ws, writeMu, f.ID, "invalid params: "+err.Error())
+			return
+		}
+	}
+	if params.Message == "" {
+		sendError(ws, writeMu, f.ID, "missing params.message")
+		return
+	}
 
-    // Determine runId
-    runId := params.IdempotencyKey
-    if runId == "" {
-        runId = fmt.Sprintf("run_%d", time.Now().UnixNano())
-    }
+	// Determine sessionKey (fallback to "main")
+	sessionKey := params.SessionKey
+	if sessionKey == "" {
+		sessionKey = "main"
+	}
 
-    // Store user message in history
-    addMessage(sessionKey, "user", params.Message)
+	// Determine runId
+	runId := params.IdempotencyKey
+	if runId == "" {
+		runId = fmt.Sprintf("run_%d", time.Now().UnixNano())
+	}
 
-    // Build ZeroClaw webhook payload
-    body := map[string]any{
-        "message": params.Message,
-    }
+	// Store user message in history
+	addMessage(sessionKey, "user", params.Message)
 
-    j, _ := json.Marshal(body)
+	// Build ZeroClaw webhook payload
+	body := map[string]any{
+		"message": params.Message,
+	}
 
-    req, err := http.NewRequest("POST", zeroclawURL, bytes.NewReader(j))
-    if err != nil {
-        log.Printf("[forward] error: %s", err)
-        sendError(ws, writeMu, f.ID, err.Error())
-        return
-    }
-    req.Header.Set("Content-Type", "application/json")
+	j, _ := json.Marshal(body)
 
-    token := os.Getenv("ZEROCLAW_BEARER_TOKEN")
-    if token != "" {
-        req.Header.Set("Authorization", "Bearer "+token)
-    }
+	req, err := http.NewRequestWithContext(ctx, "POST", zeroclawURL, bytes.NewReader(j))
+	if err != nil {
+		log.Printf("[forward] error: %s", err)
+		sendError(ws, writeMu, f.ID, err.Error())
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
 
-    resp, err := http.DefaultClient.Do(req)
-    if err != nil {
-        log.Printf("[forward] error: %s", err)
-        sendError(ws, writeMu, f.ID, err.Error())
-        return
-    }
-    defer resp.Body.Close()
+	token := os.Getenv("ZEROCLAW_BEARER_TOKEN")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 
+	tracedClient := &http.Client{
+		Transport: otelhttp.NewTransport(http.DefaultTransport),
+	}
+	resp, err := tracedClient.Do(req)
+	if err != nil {
+		log.Printf("[forward] error: %s", err)
+		sendError(ws, writeMu, f.ID, err.Error())
+		return
+	}
+	defer resp.Body.Close()
     if os.Getenv("ZC_BRIDGE_DEBUG") == "1" {
         log.Printf("[forward] zeroclaw status=%d", resp.StatusCode)
     }
