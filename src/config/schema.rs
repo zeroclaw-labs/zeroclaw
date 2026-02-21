@@ -4222,6 +4222,13 @@ impl Config {
             anyhow::bail!("Failed to atomically replace config file: {e}");
         }
 
+        // Ensure config file is not world-readable (may contain API keys).
+        #[cfg(unix)]
+        {
+            use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+            let _ = fs::set_permissions(&self.config_path, Permissions::from_mode(0o600)).await;
+        }
+
         sync_directory(parent_dir).await?;
 
         if had_existing_config {
