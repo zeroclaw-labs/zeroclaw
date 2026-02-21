@@ -9,7 +9,6 @@ on:
             - ".dockerignore"
             - "Cargo.toml"
             - "Cargo.lock"
-            - "rust-toolchain.toml"
             - "src/**"
             - "crates/**"
             - "benches/**"
@@ -22,7 +21,6 @@ on:
             - "Dockerfile"
             - ".dockerignore"
             - "docker-compose.yml"
-            - "rust-toolchain.toml"
             - "dev/config.template.toml"
             - ".github/workflows/pub-docker-img.yml"
     workflow_dispatch:
