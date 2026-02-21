@@ -657,7 +657,7 @@ async fn e2e_empty_memory_context_passthrough() {
 /// Requires valid OAuth credentials in `~/.zeroclaw/`.
 /// Run manually: `cargo test e2e_live_openai_codex_multi_turn -- --ignored`
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live OpenAI Codex API key"]
 async fn e2e_live_openai_codex_multi_turn() {
     use zeroclaw::providers::openai_codex::OpenAiCodexProvider;
     use zeroclaw::providers::traits::Provider;
@@ -707,7 +707,7 @@ async fn e2e_live_openai_codex_multi_turn() {
 /// Requires valid credentials in `~/.zeroclaw/`.
 /// Run manually: `cargo test e2e_live_research_phase -- --ignored --nocapture`
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live provider API key"]
 async fn e2e_live_research_phase() {
     use std::sync::Arc;
     use zeroclaw::agent::research::{run_research_phase, should_trigger};
