@@ -667,7 +667,7 @@ async fn main() -> Result<()> {
             model,
             temperature,
             peripheral,
-        } => agent::run(config, message, provider, model, temperature, peripheral)
+        } => agent::run(config, message, provider, model, temperature, peripheral, true)
             .await
             .map(|_| ()),
 

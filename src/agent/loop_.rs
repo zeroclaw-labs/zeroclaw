@@ -1835,6 +1835,7 @@ pub async fn run(
     model_override: Option<String>,
     temperature: f64,
     peripheral_overrides: Vec<String>,
+    interactive: bool,
 ) -> Result<String> {
     // ── Wire up agnostic subsystems ──────────────────────────────
     let base_observer = observability::create_observer(&config.observability);
@@ -2076,7 +2077,12 @@ pub async fn run(
     }
 
     // ── Approval manager (supervised mode) ───────────────────────
-    let approval_manager = ApprovalManager::from_config(&config.autonomy);
+    let approval_manager = if interactive {
+        Some(ApprovalManager::from_config(&config.autonomy))
+    } else {
+        None
+    };
+    let channel_name = if interactive { "cli" } else { "daemon" };
 
     // ── Execute ──────────────────────────────────────────────────
     let start = Instant::now();
@@ -2121,8 +2127,8 @@ pub async fn run(
             model_name,
             temperature,
             false,
-            Some(&approval_manager),
-            "cli",
+            approval_manager.as_ref(),
+            channel_name,
             &config.multimodal,
             config.agent.max_tool_iterations,
             None,
@@ -2241,8 +2247,8 @@ pub async fn run(
                 model_name,
                 temperature,
                 false,
-                Some(&approval_manager),
-                "cli",
+                approval_manager.as_ref(),
+                channel_name,
                 &config.multimodal,
                 config.agent.max_tool_iterations,
                 None,
