@@ -48,6 +48,7 @@ pub(crate) mod cron;
 pub(crate) mod daemon;
 pub(crate) mod doctor;
 pub mod gateway;
+pub mod goals;
 pub(crate) mod hardware;
 pub(crate) mod health;
 pub(crate) mod heartbeat;
