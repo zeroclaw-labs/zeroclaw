@@ -1,6 +1,6 @@
 use crate::config::schema::{
-    default_nostr_relays, DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig, NostrConfig,
-    QQConfig, SignalConfig, StreamMode, WhatsAppConfig,
+    default_nostr_relays, DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig,
+    NextcloudTalkConfig, NostrConfig, QQConfig, SignalConfig, StreamMode, WhatsAppConfig,
 };
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
@@ -3071,6 +3071,7 @@ enum ChannelMenuChoice {
     Linq,
     Irc,
     Webhook,
+    NextcloudTalk,
     DingTalk,
     QqOfficial,
     LarkFeishu,
@@ -3089,6 +3090,7 @@ const CHANNEL_MENU_CHOICES: &[ChannelMenuChoice] = &[
     ChannelMenuChoice::Linq,
     ChannelMenuChoice::Irc,
     ChannelMenuChoice::Webhook,
+    ChannelMenuChoice::NextcloudTalk,
     ChannelMenuChoice::DingTalk,
     ChannelMenuChoice::QqOfficial,
     ChannelMenuChoice::LarkFeishu,
@@ -3191,6 +3193,14 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         "✅ configured"
                     } else {
                         "— HTTP endpoint"
+                    }
+                ),
+                ChannelMenuChoice::NextcloudTalk => format!(
+                    "Nextcloud  {}",
+                    if config.nextcloud_talk.is_some() {
+                        "✅ connected"
+                    } else {
+                        "— Talk webhook + OCS API"
                     }
                 ),
                 ChannelMenuChoice::DingTalk => format!(
@@ -4259,6 +4269,73 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     style("✅").green().bold(),
                     style(&port).cyan()
                 );
+            }
+            ChannelMenuChoice::NextcloudTalk => {
+                // ── Nextcloud Talk ──
+                println!();
+                println!(
+                    "  {} {}",
+                    style("Nextcloud Talk Setup").white().bold(),
+                    style("— Talk webhook receive + OCS API send").dim()
+                );
+                print_bullet("1. Configure your Nextcloud Talk bot app and app token.");
+                print_bullet("2. Set webhook URL to: https://<your-public-url>/nextcloud-talk");
+                print_bullet(
+                    "3. Keep webhook_secret aligned with Nextcloud signature headers if enabled.",
+                );
+                println!();
+
+                let base_url: String = Input::new()
+                    .with_prompt("  Nextcloud base URL (e.g. https://cloud.example.com)")
+                    .interact_text()?;
+
+                let base_url = base_url.trim().trim_end_matches('/').to_string();
+                if base_url.is_empty() {
+                    println!("  {} Skipped — base URL required", style("→").dim());
+                    continue;
+                }
+
+                let app_token: String = Input::new()
+                    .with_prompt("  App token (Talk bot token)")
+                    .interact_text()?;
+
+                if app_token.trim().is_empty() {
+                    println!("  {} Skipped — app token required", style("→").dim());
+                    continue;
+                }
+
+                let webhook_secret: String = Input::new()
+                    .with_prompt("  Webhook secret (optional, Enter to skip)")
+                    .allow_empty(true)
+                    .interact_text()?;
+
+                let allowed_users_raw: String = Input::new()
+                    .with_prompt("  Allowed Nextcloud actor IDs (comma-separated, or * for all)")
+                    .default("*".into())
+                    .interact_text()?;
+
+                let allowed_users = if allowed_users_raw.trim() == "*" {
+                    vec!["*".into()]
+                } else {
+                    allowed_users_raw
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                };
+
+                config.nextcloud_talk = Some(NextcloudTalkConfig {
+                    base_url,
+                    app_token: app_token.trim().to_string(),
+                    webhook_secret: if webhook_secret.trim().is_empty() {
+                        None
+                    } else {
+                        Some(webhook_secret.trim().to_string())
+                    },
+                    allowed_users,
+                });
+
+                println!("  {} Nextcloud Talk configured", style("✅").green().bold());
             }
             ChannelMenuChoice::DingTalk => {
                 // ── DingTalk ──
@@ -6737,6 +6814,11 @@ mod tests {
     #[test]
     fn channel_menu_choices_include_signal() {
         assert!(channel_menu_choices().contains(&ChannelMenuChoice::Signal));
+    }
+
+    #[test]
+    fn channel_menu_choices_include_nextcloud_talk() {
+        assert!(channel_menu_choices().contains(&ChannelMenuChoice::NextcloudTalk));
     }
 
     #[test]
