@@ -784,15 +784,10 @@ async fn main() -> Result<()> {
             println!();
             println!("Channels:");
             println!("  CLI:      ✅ always");
-            for (name, configured) in [
-                ("Telegram", config.channels_config.telegram.is_some()),
-                ("Discord", config.channels_config.discord.is_some()),
-                ("Slack", config.channels_config.slack.is_some()),
-                ("Webhook", config.channels_config.webhook.is_some()),
-                ("Nextcloud", config.channels_config.nextcloud_talk.is_some()),
-            ] {
+            for (channel, configured) in config.channels_config.channels() {
                 println!(
-                    "  {name:9} {}",
+                    "  {:9} {}",
+                    channel.name(),
                     if configured {
                         "✅ configured"
                     } else {

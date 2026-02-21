@@ -62,42 +62,10 @@ const MODEL_CACHE_TTL_SECS: u64 = 12 * 60 * 60;
 const CUSTOM_MODEL_SENTINEL: &str = "__custom_model__";
 
 fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
-    let ChannelsConfig {
-        cli: _,     // `cli` is always available and does not require channel server startup
-        webhook: _, // webhook traffic is handled by gateway, not `zeroclaw channel start`
-        telegram,
-        discord,
-        slack,
-        mattermost,
-        imessage,
-        matrix,
-        signal,
-        whatsapp,
-        email,
-        irc,
-        lark,
-        dingtalk,
-        linq,
-        qq,
-        nextcloud_talk,
-        ..
-    } = channels;
-
-    telegram.is_some()
-        || discord.is_some()
-        || slack.is_some()
-        || mattermost.is_some()
-        || imessage.is_some()
-        || matrix.is_some()
-        || signal.is_some()
-        || whatsapp.is_some()
-        || email.is_some()
-        || irc.is_some()
-        || lark.is_some()
-        || dingtalk.is_some()
-        || linq.is_some()
-        || qq.is_some()
-        || nextcloud_talk.is_some()
+    channels
+        .channels_except_webhook()
+        .iter()
+        .any(|(_, ok)| *ok)
 }
 
 // ── Main wizard entry point ──────────────────────────────────────
@@ -4834,57 +4802,17 @@ fn setup_channels() -> Result<ChannelsConfig> {
     }
 
     // Summary line
-    let mut active: Vec<&str> = vec!["CLI"];
-    if config.telegram.is_some() {
-        active.push("Telegram");
-    }
-    if config.discord.is_some() {
-        active.push("Discord");
-    }
-    if config.slack.is_some() {
-        active.push("Slack");
-    }
-    if config.imessage.is_some() {
-        active.push("iMessage");
-    }
-    if config.matrix.is_some() {
-        active.push("Matrix");
-    }
-    if config.signal.is_some() {
-        active.push("Signal");
-    }
-    if config.whatsapp.is_some() {
-        active.push("WhatsApp");
-    }
-    if config.linq.is_some() {
-        active.push("Linq");
-    }
-    if config.email.is_some() {
-        active.push("Email");
-    }
-    if config.irc.is_some() {
-        active.push("IRC");
-    }
-    if config.webhook.is_some() {
-        active.push("Webhook");
-    }
-    if config.dingtalk.is_some() {
-        active.push("DingTalk");
-    }
-    if config.qq.is_some() {
-        active.push("QQ");
-    }
-    if config.lark.is_some() {
-        active.push("Lark");
-    }
-    if config.nostr.is_some() {
-        active.push("Nostr");
-    }
+    let channels = config.channels();
+    let channels = channels.iter().filter_map(|(channel, ok)|{
+        ok.then_some(channel.name())
+    });
+    let channels: Vec<_> = std::iter::once("Cli").chain(channels).collect();
+    let active = channels.join(", ");
 
     println!(
         "  {} Channels: {}",
         style("✓").green().bold(),
-        style(active.join(", ")).green()
+        style(active).green()
     );
 
     Ok(config)
@@ -5373,58 +5301,12 @@ fn print_summary(config: &Config) {
     );
 
     // Channels summary
-    let mut channels: Vec<&str> = vec!["CLI"];
-    if config.channels_config.telegram.is_some() {
-        channels.push("Telegram");
-    }
-    if config.channels_config.discord.is_some() {
-        channels.push("Discord");
-    }
-    if config.channels_config.slack.is_some() {
-        channels.push("Slack");
-    }
-    if config.channels_config.mattermost.is_some() {
-        channels.push("Mattermost");
-    }
-    if config.channels_config.imessage.is_some() {
-        channels.push("iMessage");
-    }
-    if config.channels_config.matrix.is_some() {
-        channels.push("Matrix");
-    }
-    if config.channels_config.signal.is_some() {
-        channels.push("Signal");
-    }
-    if config.channels_config.whatsapp.is_some() {
-        channels.push("WhatsApp");
-    }
-    if config.channels_config.linq.is_some() {
-        channels.push("Linq");
-    }
-    if config.channels_config.nextcloud_talk.is_some() {
-        channels.push("Nextcloud Talk");
-    }
-    if config.channels_config.email.is_some() {
-        channels.push("Email");
-    }
-    if config.channels_config.irc.is_some() {
-        channels.push("IRC");
-    }
-    if config.channels_config.webhook.is_some() {
-        channels.push("Webhook");
-    }
-    if config.channels_config.lark.is_some() {
-        channels.push("Lark");
-    }
-    if config.channels_config.dingtalk.is_some() {
-        channels.push("DingTalk");
-    }
-    if config.channels_config.qq.is_some() {
-        channels.push("QQ");
-    }
-    if config.channels_config.nostr.is_some() {
-        channels.push("Nostr");
-    }
+    let channels = config.channels_config.channels();
+    let channels = channels.iter().filter_map(|(channel, ok)|{
+        ok.then_some(channel.name())
+    });
+    let channels: Vec<_> = std::iter::once("Cli").chain(channels).collect();
+
     println!(
         "    {} Channels:      {}",
         style("📡").cyan(),

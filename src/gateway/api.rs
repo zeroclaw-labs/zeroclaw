@@ -78,6 +78,12 @@ pub async fn handle_api_status(
     let config = state.config.lock().clone();
     let health = crate::health::snapshot();
 
+    let mut channels = serde_json::Map::new();
+
+    for (channel, present) in config.channels_config.channels() {
+        channels.insert(channel.name().to_string(), serde_json::Value::Bool(present));
+    }
+
     let body = serde_json::json!({
         "provider": config.default_provider,
         "model": state.model,
@@ -87,16 +93,7 @@ pub async fn handle_api_status(
         "locale": "en",
         "memory_backend": state.mem.name(),
         "paired": state.pairing.is_paired(),
-        "channels": {
-            "telegram": config.channels_config.telegram.is_some(),
-            "discord": config.channels_config.discord.is_some(),
-            "slack": config.channels_config.slack.is_some(),
-            "matrix": config.channels_config.matrix.is_some(),
-            "whatsapp": config.channels_config.whatsapp.is_some(),
-            "email": config.channels_config.email.is_some(),
-            "irc": config.channels_config.irc.is_some(),
-            "webhook": config.channels_config.webhook.is_some(),
-        },
+        "channels": channels,
         "health": health,
     });
 

@@ -518,17 +518,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
 
     // Channel: at least one configured
     let cc = &config.channels_config;
-    let has_channel = cc.telegram.is_some()
-        || cc.discord.is_some()
-        || cc.slack.is_some()
-        || cc.imessage.is_some()
-        || cc.matrix.is_some()
-        || cc.whatsapp.is_some()
-        || cc.nextcloud_talk.is_some()
-        || cc.email.is_some()
-        || cc.irc.is_some()
-        || cc.lark.is_some()
-        || cc.webhook.is_some();
+    let has_channel = cc.channels().iter().any(|(_, ok)| *ok);
 
     if has_channel {
         items.push(DiagItem::ok(cat, "at least one channel configured"));

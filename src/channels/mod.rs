@@ -2550,36 +2550,8 @@ pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Con
         crate::ChannelCommands::List => {
             println!("Channels:");
             println!("  ✅ CLI (always available)");
-            for (name, configured) in [
-                ("Telegram", config.channels_config.telegram.is_some()),
-                ("Discord", config.channels_config.discord.is_some()),
-                ("Slack", config.channels_config.slack.is_some()),
-                ("Mattermost", config.channels_config.mattermost.is_some()),
-                ("Webhook", config.channels_config.webhook.is_some()),
-                ("iMessage", config.channels_config.imessage.is_some()),
-                (
-                    "Matrix",
-                    cfg!(feature = "channel-matrix") && config.channels_config.matrix.is_some(),
-                ),
-                ("Signal", config.channels_config.signal.is_some()),
-                ("WhatsApp", config.channels_config.whatsapp.is_some()),
-                ("Linq", config.channels_config.linq.is_some()),
-                (
-                    "Nextcloud Talk",
-                    config.channels_config.nextcloud_talk.is_some(),
-                ),
-                ("Email", config.channels_config.email.is_some()),
-                ("IRC", config.channels_config.irc.is_some()),
-                (
-                    "Lark",
-                    cfg!(feature = "channel-lark") && config.channels_config.lark.is_some(),
-                ),
-                ("DingTalk", config.channels_config.dingtalk.is_some()),
-                ("QQ", config.channels_config.qq.is_some()),
-                ("Nostr", config.channels_config.nostr.is_some()),
-                ("ClawdTalk", config.channels_config.clawdtalk.is_some()),
-            ] {
-                println!("  {} {name}", if configured { "✅" } else { "❌" });
+            for (channel, configured) in config.channels_config.channels() {
+                println!("  {} {}", if configured { "✅" } else { "❌" }, channel.name());
             }
             if !cfg!(feature = "channel-matrix") {
                 println!(

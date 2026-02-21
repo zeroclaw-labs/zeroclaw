@@ -2465,6 +2465,7 @@ pub struct ChannelsConfig {
 
 impl ChannelsConfig {
     /// get channels' metadata and `.is_some()`, except webhook
+    #[rustfmt::skip]
     pub fn channels_except_webhook(&self) -> Vec<(Box<dyn super::traits::ConfigHandle>, bool)> {
         vec![
             (
@@ -2511,7 +2512,10 @@ impl ChannelsConfig {
                 Box::new(ConfigWrapper::new(&self.email)),
                 self.email.is_some(),
             ),
-            (Box::new(ConfigWrapper::new(&self.irc)), self.irc.is_some()),
+            (
+                Box::new(ConfigWrapper::new(&self.irc)),
+                self.irc.is_some()
+            ),
             (
                 Box::new(ConfigWrapper::new(&self.lark)),
                 self.lark.is_some(),
@@ -2520,10 +2524,17 @@ impl ChannelsConfig {
                 Box::new(ConfigWrapper::new(&self.dingtalk)),
                 self.dingtalk.is_some(),
             ),
-            (Box::new(ConfigWrapper::new(&self.qq)), self.qq.is_some()),
+            (
+                Box::new(ConfigWrapper::new(&self.qq)),
+                self.qq.is_some()
+            ),
             (
                 Box::new(ConfigWrapper::new(&self.nostr)),
                 self.nostr.is_some(),
+            ),
+            (
+                Box::new(ConfigWrapper::new(&self.clawdtalk)),
+                self.clawdtalk.is_some(),
             ),
         ]
     }
