@@ -3,7 +3,7 @@ use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 const MAX_RESULTS: usize = 1000;
 const MAX_OUTPUT_BYTES: usize = 1_048_576; // 1 MB
@@ -11,7 +11,7 @@ const TIMEOUT_SECS: u64 = 30;
 
 /// Search file contents by regex pattern within the workspace.
 ///
-/// Uses ripgrep (`rg --json`) when available, falling back to `grep -rn -E`.
+/// Uses ripgrep (`rg`) when available, falling back to `grep -rn -E`.
 /// All searches are confined to the workspace directory by security policy.
 pub struct ContentSearchTool {
     security: Arc<SecurityPolicy>,
@@ -119,6 +119,16 @@ impl Tool for ContentSearchTool {
             .and_then(|v| v.as_str())
             .unwrap_or("content");
 
+        if !matches!(output_mode, "content" | "files_with_matches" | "count") {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Invalid output_mode '{output_mode}'. Allowed values: content, files_with_matches, count."
+                )),
+            });
+        }
+
         let include = args.get("include").and_then(|v| v.as_str());
 
         let case_sensitive = args
@@ -161,7 +171,7 @@ impl Tool for ContentSearchTool {
         }
 
         // --- Path security checks ---
-        if search_path.starts_with('/') || search_path.starts_with('\\') {
+        if std::path::Path::new(search_path).is_absolute() {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -315,7 +325,7 @@ impl Tool for ContentSearchTool {
 
         // Truncate output if too large
         let final_output = if formatted.len() > MAX_OUTPUT_BYTES {
-            let mut truncated = formatted[..MAX_OUTPUT_BYTES].to_string();
+            let mut truncated = truncate_utf8(&formatted, MAX_OUTPUT_BYTES).to_string();
             truncated.push_str("\n\n[Output truncated: exceeded 1 MB limit]");
             truncated
         } else {
@@ -497,28 +507,38 @@ fn format_line_output(
             }
             "count" => {
                 // Format: path:count — filter out zero-count entries
-                if let Some((path, count_str)) = relativized.rsplit_once(':') {
-                    if let Ok(count) = count_str.trim().parse::<usize>() {
-                        if count > 0 {
-                            file_set.insert(path.to_string());
-                            total_matches += count;
-                            lines.push(format!("{path}:{count}"));
-                            if lines.len() >= max_results {
-                                truncated = true;
-                                break;
-                            }
+                if let Some((path, count)) = parse_count_line(&relativized) {
+                    if count > 0 {
+                        file_set.insert(path.to_string());
+                        total_matches += count;
+                        lines.push(format!("{path}:{count}"));
+                        if lines.len() >= max_results {
+                            truncated = true;
+                            break;
                         }
                     }
                 }
             }
             _ => {
                 // content mode: pass through with relativized paths
-                // Track files from match lines (format: path:linenum:content)
-                if let Some(colon_pos) = relativized.find(':') {
-                    let path = &relativized[..colon_pos];
-                    file_set.insert(path.to_string());
+                // Track files from both match and context lines.
+                if relativized == "--" {
+                    lines.push(relativized);
+                    if lines.len() >= max_results {
+                        truncated = true;
+                        break;
+                    }
+                    continue;
                 }
-                total_matches += 1;
+                if let Some((path, is_match)) = parse_content_line(&relativized) {
+                    file_set.insert(path.to_string());
+                    if is_match {
+                        total_matches += 1;
+                    }
+                } else {
+                    // Unknown line format: keep output visible and count conservatively as a match.
+                    total_matches += 1;
+                }
                 lines.push(relativized);
                 if lines.len() >= max_results {
                     truncated = true;
@@ -526,6 +546,10 @@ fn format_line_output(
                 }
             }
         }
+    }
+
+    if lines.is_empty() {
+        return "No matches found.".to_string();
     }
 
     use std::fmt::Write;
@@ -555,7 +579,7 @@ fn format_line_output(
             let _ = write!(
                 buf,
                 "\n\nTotal: {} matching lines in {} files",
-                lines.len(),
+                total_matches,
                 file_set.len()
             );
         }
@@ -575,6 +599,56 @@ fn relativize_path(line: &str, workspace_prefix: &str) -> String {
         return trimmed.to_string();
     }
     line.to_string()
+}
+
+/// Parse content output line and determine whether it is a real match line.
+///
+/// Supported formats:
+/// - Match line: `path:line:content`
+/// - Context line: `path-line-content`
+fn parse_content_line(line: &str) -> Option<(&str, bool)> {
+    static MATCH_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static CONTEXT_RE: OnceLock<regex::Regex> = OnceLock::new();
+
+    let match_re = MATCH_RE.get_or_init(|| {
+        regex::Regex::new(r"^(?P<path>.+?):\d+:").expect("match line regex must be valid")
+    });
+    if let Some(caps) = match_re.captures(line) {
+        return caps.name("path").map(|m| (m.as_str(), true));
+    }
+
+    let context_re = CONTEXT_RE.get_or_init(|| {
+        regex::Regex::new(r"^(?P<path>.+?)-\d+-").expect("context line regex must be valid")
+    });
+    if let Some(caps) = context_re.captures(line) {
+        return caps.name("path").map(|m| (m.as_str(), false));
+    }
+
+    None
+}
+
+/// Parse count output line in `path:count` format.
+fn parse_count_line(line: &str) -> Option<(&str, usize)> {
+    static COUNT_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let count_re = COUNT_RE.get_or_init(|| {
+        regex::Regex::new(r"^(?P<path>.+?):(?P<count>\d+)\s*$").expect("count line regex valid")
+    });
+
+    let caps = count_re.captures(line)?;
+    let path = caps.name("path")?.as_str();
+    let count = caps.name("count")?.as_str().parse::<usize>().ok()?;
+    Some((path, count))
+}
+
+fn truncate_utf8(input: &str, max_bytes: usize) -> &str {
+    if input.len() <= max_bytes {
+        return input;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !input.is_char_boundary(end) {
+        end -= 1;
+    }
+    &input[..end]
 }
 
 #[cfg(test)]
@@ -767,6 +841,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn content_search_invalid_output_mode_rejected() {
+        let dir = TempDir::new().unwrap();
+        create_test_files(&dir);
+
+        let tool = ContentSearchTool::new(test_security(dir.path().to_path_buf()));
+        let result = tool
+            .execute(json!({"pattern": "fn", "output_mode": "invalid_mode"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("Invalid output_mode"));
+    }
+
+    #[tokio::test]
     async fn content_search_subdirectory() {
         let dir = TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path().join("sub/deep")).unwrap();
@@ -882,5 +975,26 @@ mod tests {
     fn relativize_path_no_prefix() {
         let result = relativize_path("src/main.rs:42:fn main()", "/workspace");
         assert_eq!(result, "src/main.rs:42:fn main()");
+    }
+
+    #[test]
+    fn format_line_output_content_counts_match_lines_only() {
+        let raw = "src/main.rs-1-use std::fmt;\nsrc/main.rs:2:fn main() {}\n--\nsrc/lib.rs:10:pub fn f() {}";
+        let output = format_line_output(raw, std::path::Path::new("/workspace"), "content", 100);
+        assert!(output.contains("Total: 2 matching lines in 2 files"));
+    }
+
+    #[test]
+    fn parse_count_line_supports_colons_in_path() {
+        let parsed = parse_count_line("dir:with:colon/file.rs:12");
+        assert_eq!(parsed, Some(("dir:with:colon/file.rs", 12)));
+    }
+
+    #[test]
+    fn truncate_utf8_keeps_char_boundary() {
+        let text = "abc你好";
+        // Byte index 4 splits the first Chinese character.
+        let truncated = truncate_utf8(text, 4);
+        assert_eq!(truncated, "abc");
     }
 }

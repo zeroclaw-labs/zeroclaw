@@ -423,6 +423,7 @@ mod tests {
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"browser_open"));
+        assert!(names.contains(&"content_search"));
         assert!(names.contains(&"model_routing_config"));
         assert!(names.contains(&"pushover"));
         assert!(names.contains(&"proxy_config"));
@@ -438,6 +439,7 @@ mod tests {
         assert!(names.contains(&"file_write"));
         assert!(names.contains(&"file_edit"));
         assert!(names.contains(&"glob_search"));
+        assert!(names.contains(&"content_search"));
     }
 
     #[test]
