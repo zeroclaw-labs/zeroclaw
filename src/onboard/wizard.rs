@@ -4702,6 +4702,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     verification_token,
                     encrypt_key: None,
                     allowed_users,
+                    mention_only: false,
                     use_feishu,
                     receive_mode,
                     port,
