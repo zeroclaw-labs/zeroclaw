@@ -382,11 +382,8 @@ fn is_xml_meta_tag(tag: &str) -> bool {
     )
 }
 
-static XML_TOOL_TAG_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?s)<([a-zA-Z_][a-zA-Z0-9_-]*)>\s*(.*?)\s*</\1>").unwrap());
-
-static XML_ARG_TAG_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?s)<([a-zA-Z_][a-zA-Z0-9_-]*)>\s*([^<]+?)\s*</\1>").unwrap());
+static XML_TAG_OPEN_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<([a-zA-Z_][a-zA-Z0-9_-]*)>").unwrap());
 
 /// Parse XML-style tool calls in `<tool_call>` bodies.
 /// Supports both nested argument tags and JSON argument payloads:
@@ -400,52 +397,74 @@ fn parse_xml_tool_calls(xml_content: &str) -> Option<Vec<ParsedToolCall>> {
         return None;
     }
 
-    for cap in XML_TOOL_TAG_RE.captures_iter(trimmed) {
-        let tool_name = cap[1].trim().to_string();
-        if is_xml_meta_tag(&tool_name) {
-            continue;
-        }
+    let mut start_idx = 0;
+    while let Some(open_match) = XML_TAG_OPEN_RE.find_at(trimmed, start_idx) {
+        let caps = XML_TAG_OPEN_RE.captures(open_match.as_str()).unwrap();
+        let tool_name = caps[1].to_string();
 
-        let inner_content = cap[2].trim();
-        if inner_content.is_empty() {
-            continue;
-        }
+        let close_tag = format!("</{}>", tool_name);
 
-        let mut args = serde_json::Map::new();
+        if let Some(close_idx) = trimmed[open_match.end()..].find(&close_tag) {
+            let inner_content_start = open_match.end();
+            let inner_content_end = open_match.end() + close_idx;
+            let inner_content = trimmed[inner_content_start..inner_content_end].trim();
 
-        if let Some(first_json) = extract_json_values(inner_content).into_iter().next() {
-            match first_json {
-                serde_json::Value::Object(object_args) => {
-                    args = object_args;
+            start_idx = inner_content_end + close_tag.len();
+
+            if is_xml_meta_tag(&tool_name) || inner_content.is_empty() {
+                continue;
+            }
+
+            let mut args = serde_json::Map::new();
+
+            if let Some(first_json) = extract_json_values(inner_content).into_iter().next() {
+                match first_json {
+                    serde_json::Value::Object(object_args) => {
+                        args = object_args;
+                    }
+                    other => {
+                        args.insert("value".to_string(), other);
+                    }
                 }
-                other => {
-                    args.insert("value".to_string(), other);
+            } else {
+                let mut inner_start = 0;
+                while let Some(arg_open) = XML_TAG_OPEN_RE.find_at(inner_content, inner_start) {
+                    let arg_caps = XML_TAG_OPEN_RE.captures(arg_open.as_str()).unwrap();
+                    let key = arg_caps[1].to_string();
+                    let arg_close_tag = format!("</{}>", key);
+
+                    if let Some(arg_close_idx) =
+                        inner_content[arg_open.end()..].find(&arg_close_tag)
+                    {
+                        let val_start = arg_open.end();
+                        let val_end = arg_open.end() + arg_close_idx;
+                        let value = inner_content[val_start..val_end].trim();
+
+                        inner_start = val_end + arg_close_tag.len();
+
+                        if !is_xml_meta_tag(&key) && !value.is_empty() {
+                            args.insert(key, serde_json::Value::String(value.to_string()));
+                        }
+                    } else {
+                        inner_start = arg_open.end();
+                    }
+                }
+
+                if args.is_empty() {
+                    args.insert(
+                        "content".to_string(),
+                        serde_json::Value::String(inner_content.to_string()),
+                    );
                 }
             }
+
+            calls.push(ParsedToolCall {
+                name: tool_name,
+                arguments: serde_json::Value::Object(args),
+            });
         } else {
-            for inner_cap in XML_ARG_TAG_RE.captures_iter(inner_content) {
-                let key = inner_cap[1].trim().to_string();
-                if is_xml_meta_tag(&key) {
-                    continue;
-                }
-                let value = inner_cap[2].trim();
-                if !value.is_empty() {
-                    args.insert(key, serde_json::Value::String(value.to_string()));
-                }
-            }
-
-            if args.is_empty() {
-                args.insert(
-                    "content".to_string(),
-                    serde_json::Value::String(inner_content.to_string()),
-                );
-            }
+            start_idx = open_match.end();
         }
-
-        calls.push(ParsedToolCall {
-            name: tool_name,
-            arguments: serde_json::Value::Object(args),
-        });
     }
 
     if calls.is_empty() {
@@ -3608,6 +3627,7 @@ Let me check the result."#;
             None, // no identity config
             None, // no bootstrap_max_chars
             true, // native_tools
+            crate::config::SkillsPromptInjectionMode::default(),
         );
 
         // Must contain zero XML protocol artifacts

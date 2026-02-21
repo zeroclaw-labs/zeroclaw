@@ -146,7 +146,11 @@ impl Tool for FileReadTool {
                 let offset = args
                     .get("offset")
                     .and_then(|v| v.as_u64())
-                    .map(|v| usize::try_from(v.max(1)).unwrap_or(usize::MAX).saturating_sub(1))
+                    .map(|v| {
+                        usize::try_from(v.max(1))
+                            .unwrap_or(usize::MAX)
+                            .saturating_sub(1)
+                    })
                     .unwrap_or(0);
                 let start = offset.min(total);
 
@@ -502,10 +506,7 @@ mod tests {
         assert!(result.output.contains("[Lines 1-2 of 5]"));
 
         // Full read (no offset/limit) shows all lines
-        let result = tool
-            .execute(json!({"path": "lines.txt"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"path": "lines.txt"})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("1: aaa"));
         assert!(result.output.contains("5: eee"));
@@ -529,7 +530,9 @@ mod tests {
             .await
             .unwrap();
         assert!(result.success);
-        assert!(result.output.contains("[No lines in range, file has 2 lines]"));
+        assert!(result
+            .output
+            .contains("[No lines in range, file has 2 lines]"));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
@@ -551,5 +554,4 @@ mod tests {
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
-
 }

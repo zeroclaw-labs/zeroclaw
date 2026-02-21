@@ -917,7 +917,7 @@ impl Default for BrowserConfig {
 /// HTTP request tool configuration (`[http_request]` section).
 ///
 /// Deny-by-default: if `allowed_domains` is empty, all HTTP requests are rejected.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HttpRequestConfig {
     /// Enable `http_request` tool for API interactions
     #[serde(default)]
@@ -931,6 +931,17 @@ pub struct HttpRequestConfig {
     /// Request timeout in seconds (default: 30)
     #[serde(default = "default_http_timeout_secs")]
     pub timeout_secs: u64,
+}
+
+impl Default for HttpRequestConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_domains: Vec::new(),
+            max_response_size: default_http_max_response_size(),
+            timeout_secs: default_http_timeout_secs(),
+        }
+    }
 }
 
 fn default_http_max_response_size() -> usize {

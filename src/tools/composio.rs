@@ -1633,12 +1633,12 @@ mod tests {
     async fn connected_accounts_alias_dispatches_same_as_list_accounts() {
         // Both spellings should reach the same handler and return the same
         // shape of error (network failure in test, not a dispatch error).
-        let tool = ComposioTool::new("test-key", None, test_security());
-        let r1 = tool
+        let _tool = ComposioTool::new("test-key", None, test_security());
+        let r1 = _tool
             .execute(json!({"action": "list_accounts"}))
             .await
             .unwrap();
-        let r2 = tool
+        let r2 = _tool
             .execute(json!({"action": "connected_accounts"}))
             .await
             .unwrap();

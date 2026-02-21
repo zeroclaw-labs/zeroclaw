@@ -780,19 +780,36 @@ async fn main() -> Result<()> {
             bail!("--channels-only does not accept --force");
         }
         let config = if channels_only {
-            onboard::run_channels_repair_wizard().await
-        } else if interactive {
-            onboard::run_wizard(force).await
-        } else {
-            onboard::run_quick_setup(
-                api_key.as_deref(),
-                provider.as_deref(),
-                model.as_deref(),
-                memory.as_deref(),
-                force,
-            )
+            tokio::task::spawn_blocking(move || {
+                tokio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(onboard::run_channels_repair_wizard())
+            })
             .await
-        }?;
+            .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??
+        } else if interactive {
+            tokio::task::spawn_blocking(move || {
+                tokio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(onboard::run_wizard(force))
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??
+        } else {
+            tokio::task::spawn_blocking(move || {
+                tokio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(onboard::run_quick_setup(
+                        api_key.as_deref(),
+                        provider.as_deref(),
+                        model.as_deref(),
+                        memory.as_deref(),
+                        force,
+                    ))
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??
+        };
         // Auto-start channels if user said yes during wizard
         if std::env::var("ZEROCLAW_AUTOSTART_CHANNELS").as_deref() == Ok("1") {
             channels::start_channels(config).await?;
