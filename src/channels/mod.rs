@@ -14,8 +14,8 @@
 //! To add a new channel, implement [`Channel`] in a new submodule and wire it into
 //! [`start_channels`]. See `AGENTS.md` §7.2 for the full change playbook.
 
-pub mod cli;
 pub mod clawdtalk;
+pub mod cli;
 pub mod dingtalk;
 pub mod discord;
 pub mod email_channel;
@@ -41,8 +41,8 @@ pub mod whatsapp_storage;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_web;
 
-pub use cli::CliChannel;
 pub use clawdtalk::{ClawdTalkChannel, ClawdTalkConfig};
+pub use cli::CliChannel;
 pub use dingtalk::DingTalkChannel;
 pub use discord::DiscordChannel;
 pub use email_channel::EmailChannel;

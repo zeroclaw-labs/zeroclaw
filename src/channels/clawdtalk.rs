@@ -3,11 +3,11 @@
 //! ClawdTalk (https://clawdtalk.com) provides AI-powered voice conversations
 //! using Telnyx's global SIP network for low-latency, high-quality calls.
 
-use super::traits::{Channel, ChannelMessage};
+use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use reqwest::Client;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// ClawdTalk channel configuration
@@ -27,7 +27,7 @@ pub struct ClawdTalkChannel {
 }
 
 /// Configuration for ClawdTalk channel from config.toml
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ClawdTalkConfig {
     /// Telnyx API key
     pub api_key: String,
@@ -76,7 +76,7 @@ impl ClawdTalkChannel {
     pub async fn initiate_call(
         &self,
         to: &str,
-        prompt: Option<&str>,
+        _prompt: Option<&str>,
     ) -> anyhow::Result<CallSession> {
         if !self.is_destination_allowed(to) {
             anyhow::bail!("Destination {} is not in allowed list", to);
@@ -96,7 +96,7 @@ impl ClawdTalkChannel {
 
         let response = self
             .client
-            post(format!("{}/calls", Self::TELNYX_API_URL))
+            .post(format!("{}/calls", Self::TELNYX_API_URL))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
             .json(&request)
@@ -131,7 +131,8 @@ impl ClawdTalkChannel {
             .client
             .post(format!(
                 "{}/calls/{}/actions/speak",
-                Self::TELNYX_API_URL, call_control_id
+                Self::TELNYX_API_URL,
+                call_control_id
             ))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
@@ -153,7 +154,8 @@ impl ClawdTalkChannel {
             .client
             .post(format!(
                 "{}/calls/{}/actions/hangup",
-                Self::TELNYX_API_URL, call_control_id
+                Self::TELNYX_API_URL,
+                call_control_id
             ))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .send()
@@ -187,7 +189,8 @@ impl ClawdTalkChannel {
             .client
             .post(format!(
                 "{}/calls/{}/actions/ai_conversation",
-                Self::TELNYX_API_URL, call_control_id
+                Self::TELNYX_API_URL,
+                call_control_id
             ))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
@@ -269,14 +272,15 @@ impl Channel for ClawdTalkChannel {
         "ClawdTalk"
     }
 
-    async fn send(&self, message: &str, recipient: &str) -> anyhow::Result<()> {
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         // For ClawdTalk, "send" initiates a call with the message as TTS
-        let session = self.initiate_call(recipient, None).await?;
+        let session = self.initiate_call(&message.recipient, None).await?;
 
         // Wait for call to be answered, then speak
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-        self.speak(&session.call_control_id, message).await?;
+        self.speak(&session.call_control_id, &message.content)
+            .await?;
 
         // Give time for TTS to complete before hanging up
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -286,10 +290,7 @@ impl Channel for ClawdTalkChannel {
         Ok(())
     }
 
-    async fn listen(
-        &self,
-        tx: mpsc::Sender<ChannelMessage>,
-    ) -> anyhow::Result<()> {
+    async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         // ClawdTalk listens for incoming calls via webhooks
         // This would typically be handled by the gateway module
         // For now, we signal that this channel is ready and wait indefinitely
@@ -414,7 +415,10 @@ mod tests {
 
         let event: TelnyxWebhookEvent = serde_json::from_str(json).unwrap();
         assert_eq!(event.data.event_type, "call.initiated");
-        assert_eq!(event.data.payload.call_control_id, Some("call-123".to_string()));
+        assert_eq!(
+            event.data.payload.call_control_id,
+            Some("call-123".to_string())
+        );
         assert_eq!(event.data.payload.from, Some("+15551112222".to_string()));
     }
 }
