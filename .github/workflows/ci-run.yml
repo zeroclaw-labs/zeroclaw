@@ -229,8 +229,6 @@ jobs:
 
             - name: Enforce owner-only edits for root license files
               uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
-              env:
-                  LICENSE_FILE_OWNER_LOGINS: ${{ vars.LICENSE_FILE_OWNER_LOGINS }}
               with:
                   script: |
                     const script = require('./.github/workflows/scripts/ci_license_file_owner_guard.js');
