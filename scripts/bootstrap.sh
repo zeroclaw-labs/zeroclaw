@@ -313,6 +313,45 @@ bool_to_word() {
   fi
 }
 
+guided_input_stream() {
+  if [[ -t 0 ]]; then
+    echo "/dev/stdin"
+    return 0
+  fi
+
+  if (: </dev/tty) 2>/dev/null; then
+    echo "/dev/tty"
+    return 0
+  fi
+
+  return 1
+}
+
+guided_read() {
+  local __target_var="$1"
+  local __prompt="$2"
+  local __silent="${3:-false}"
+  local __input_source=""
+  local __value=""
+
+  if ! __input_source="$(guided_input_stream)"; then
+    return 1
+  fi
+
+  if [[ "$__silent" == true ]]; then
+    if ! read -r -s -p "$__prompt" __value <"$__input_source"; then
+      return 1
+    fi
+  else
+    if ! read -r -p "$__prompt" __value <"$__input_source"; then
+      return 1
+    fi
+  fi
+
+  printf -v "$__target_var" '%s' "$__value"
+  return 0
+}
+
 prompt_yes_no() {
   local question="$1"
   local default_answer="$2"
@@ -326,7 +365,7 @@ prompt_yes_no() {
   fi
 
   while true; do
-    if ! read -r -p "$question $prompt " answer; then
+    if ! guided_read answer "$question $prompt "; then
       error "guided installer input was interrupted."
       exit 1
     fi
@@ -438,6 +477,12 @@ run_guided_installer() {
   local model_input=""
   local api_key_input=""
 
+  if ! guided_input_stream >/dev/null; then
+    error "guided installer requires an interactive terminal."
+    error "Run from a terminal, or pass --no-guided with explicit flags."
+    exit 1
+  fi
+
   echo
   echo "ZeroClaw guided installer"
   echo "Answer a few questions, then the installer will run automatically."
@@ -479,7 +524,7 @@ run_guided_installer() {
       INTERACTIVE_ONBOARD=true
     else
       INTERACTIVE_ONBOARD=false
-      if ! read -r -p "Provider [$PROVIDER]: " provider_input; then
+      if ! guided_read provider_input "Provider [$PROVIDER]: "; then
         error "guided installer input was interrupted."
         exit 1
       fi
@@ -487,7 +532,7 @@ run_guided_installer() {
         PROVIDER="$provider_input"
       fi
 
-      if ! read -r -p "Model [${MODEL:-leave empty}]: " model_input; then
+      if ! guided_read model_input "Model [${MODEL:-leave empty}]: "; then
         error "guided installer input was interrupted."
         exit 1
       fi
@@ -496,7 +541,7 @@ run_guided_installer() {
       fi
 
       if [[ -z "$API_KEY" ]]; then
-        if ! read -r -s -p "API key (hidden, leave empty to switch to interactive onboarding): " api_key_input; then
+        if ! guided_read api_key_input "API key (hidden, leave empty to switch to interactive onboarding): " true; then
           echo
           error "guided installer input was interrupted."
           exit 1
