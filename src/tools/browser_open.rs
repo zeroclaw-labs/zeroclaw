@@ -356,13 +356,23 @@ mod tests {
     }
 
     #[test]
-    fn validate_accepts_star_allowlist() {
+    fn validate_accepts_wildcard_allowlist_for_public_host() {
         let tool = test_tool(vec!["*"]);
-        assert!(tool.validate_url("https://docs.rs").is_ok());
+        assert!(tool.validate_url("https://www.rust-lang.org").is_ok());
     }
 
     #[test]
-    fn validate_accepts_wildcard_allowlist() {
+    fn validate_wildcard_allowlist_still_rejects_private_host() {
+        let tool = test_tool(vec!["*"]);
+        let err = tool
+            .validate_url("https://localhost:8443")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("local/private"));
+    }
+
+    #[test]
+    fn validate_accepts_wildcard_subdomain_pattern() {
         let tool = test_tool(vec!["*.example.com"]);
         assert!(tool.validate_url("https://example.com").is_ok());
         assert!(tool.validate_url("https://sub.example.com").is_ok());

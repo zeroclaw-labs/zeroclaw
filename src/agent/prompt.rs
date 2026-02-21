@@ -14,6 +14,7 @@ pub struct PromptContext<'a> {
     pub model_name: &'a str,
     pub tools: &'a [Box<dyn Tool>],
     pub skills: &'a [Skill],
+    pub skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
     pub identity_config: Option<&'a IdentityConfig>,
     pub dispatcher_instructions: &'a str,
 }
@@ -153,9 +154,10 @@ impl PromptSection for SkillsSection {
     }
 
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
-        Ok(crate::skills::skills_to_prompt(
+        Ok(crate::skills::skills_to_prompt_with_mode(
             ctx.skills,
             ctx.workspace_dir,
+            ctx.skills_prompt_mode,
         ))
     }
 }
@@ -295,6 +297,7 @@ mod tests {
             model_name: "test-model",
             tools: &tools,
             skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: Some(&identity_config),
             dispatcher_instructions: "",
         };
@@ -322,6 +325,7 @@ mod tests {
             model_name: "test-model",
             tools: &tools,
             skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "instr",
         };
@@ -356,6 +360,7 @@ mod tests {
             model_name: "test-model",
             tools: &tools,
             skills: &skills,
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
         };
@@ -369,6 +374,44 @@ mod tests {
     }
 
     #[test]
+    fn skills_section_compact_mode_omits_instructions_and_tools() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let skills = vec![crate::skills::Skill {
+            name: "deploy".into(),
+            description: "Release safely".into(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: vec![],
+            tools: vec![crate::skills::SkillTool {
+                name: "release_checklist".into(),
+                description: "Validate release readiness".into(),
+                kind: "shell".into(),
+                command: "echo ok".into(),
+                args: std::collections::HashMap::new(),
+            }],
+            prompts: vec!["Run smoke tests before deploy.".into()],
+            location: Some(Path::new("/tmp/workspace/skills/deploy/SKILL.md").to_path_buf()),
+        }];
+
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp/workspace"),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &skills,
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Compact,
+            identity_config: None,
+            dispatcher_instructions: "",
+        };
+
+        let output = SkillsSection.build(&ctx).unwrap();
+        assert!(output.contains("<available_skills>"));
+        assert!(output.contains("<name>deploy</name>"));
+        assert!(output.contains("<location>skills/deploy/SKILL.md</location>"));
+        assert!(!output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
+        assert!(!output.contains("<tools>"));
+    }
+
+    #[test]
     fn datetime_section_includes_timestamp_and_timezone() {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let ctx = PromptContext {
@@ -376,6 +419,7 @@ mod tests {
             model_name: "test-model",
             tools: &tools,
             skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "instr",
         };
@@ -413,6 +457,7 @@ mod tests {
             model_name: "test-model",
             tools: &tools,
             skills: &skills,
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
         };

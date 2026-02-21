@@ -21,6 +21,9 @@ const PAIR_LOCKOUT_SECS: u64 = 300; // 5 minutes
 /// Maximum number of tracked client entries to bound memory usage.
 const MAX_TRACKED_CLIENTS: usize = 1024;
 
+/// Per-client failed attempt counter with optional lockout timestamp.
+type FailedAttempts = HashMap<String, (u32, Option<Instant>)>;
+
 /// Manages pairing state for the gateway.
 ///
 /// Bearer tokens are stored as SHA-256 hashes to prevent plaintext exposure
@@ -36,7 +39,7 @@ pub struct PairingGuard {
     /// Set of SHA-256 hashed bearer tokens (persisted across restarts).
     paired_tokens: Arc<Mutex<HashSet<String>>>,
     /// Brute-force protection: per-client failed attempt counter + lockout time.
-    failed_attempts: Arc<Mutex<HashMap<String, (u32, Option<Instant>)>>>,
+    failed_attempts: Arc<Mutex<FailedAttempts>>,
 }
 
 impl PairingGuard {
@@ -215,9 +218,7 @@ fn generate_code() -> String {
 /// on macOS). The 32 random bytes (256 bits) are hex-encoded for a
 /// 64-character token, providing 256 bits of entropy.
 fn generate_token() -> String {
-    use rand::RngCore;
-    let mut bytes = [0u8; 32];
-    rand::rng().fill_bytes(&mut bytes);
+    let bytes: [u8; 32] = rand::random();
     format!("zc_{}", hex::encode(bytes))
 }
 

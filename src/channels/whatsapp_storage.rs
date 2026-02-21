@@ -1092,6 +1092,8 @@ impl DeviceStoreTrait for RusqliteStore {
             bytes
         };
 
+        // Safety: device account data is stored to DB only; to_store_err! converts
+        // rusqlite errors without logging parameter values.
         let account = device.account.as_ref().map(|a| a.encode_to_vec());
 
         to_store_err!(execute: conn.execute(

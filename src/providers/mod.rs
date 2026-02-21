@@ -1,3 +1,21 @@
+//! Provider subsystem for model inference backends.
+//!
+//! This module implements the factory pattern for AI model providers. Each provider
+//! implements the [`Provider`] trait defined in [`traits`], and is registered in the
+//! factory function [`create_provider`] by its canonical string key (e.g., `"openai"`,
+//! `"anthropic"`, `"ollama"`, `"gemini"`). Provider aliases are resolved internally
+//! so that user-facing keys remain stable.
+//!
+//! The subsystem supports resilient multi-provider configurations through the
+//! [`ReliableProvider`](reliable::ReliableProvider) wrapper, which handles fallback
+//! chains and automatic retry. Model routing across providers is available via
+//! [`create_routed_provider`].
+//!
+//! # Extension
+//!
+//! To add a new provider, implement [`Provider`] in a new submodule and register it
+//! in [`create_provider_with_url`]. See `AGENTS.md` §7.1 for the full change playbook.
+
 pub mod anthropic;
 pub mod bedrock;
 pub mod compatible;
@@ -9,6 +27,7 @@ pub mod openai_codex;
 pub mod openrouter;
 pub mod reliable;
 pub mod router;
+pub mod telnyx;
 pub mod traits;
 
 #[allow(unused_imports)]
@@ -17,6 +36,7 @@ pub use traits::{
     ToolCall, ToolResultMessage,
 };
 
+use crate::auth::AuthService;
 use compatible::{AuthStyle, OpenAiCompatibleProvider};
 use reliable::ReliableProvider;
 use serde::Deserialize;
@@ -53,6 +73,7 @@ const QWEN_OAUTH_DEFAULT_CLIENT_ID: &str = "f0304373b74a44d2b584a3fb70ca9e56";
 const QWEN_OAUTH_CREDENTIAL_FILE: &str = ".qwen/oauth_creds.json";
 const ZAI_GLOBAL_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
 const ZAI_CN_BASE_URL: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
+const VERCEL_AI_GATEWAY_BASE_URL: &str = "https://ai-gateway.vercel.sh/v1";
 
 pub(crate) fn is_minimax_intl_alias(name: &str) -> bool {
     matches!(
@@ -148,6 +169,10 @@ pub(crate) fn is_qianfan_alias(name: &str) -> bool {
     matches!(name, "qianfan" | "baidu")
 }
 
+pub(crate) fn is_doubao_alias(name: &str) -> bool {
+    matches!(name, "doubao" | "volcengine" | "ark" | "doubao-cn")
+}
+
 #[derive(Clone, Copy, Debug)]
 enum MinimaxOauthRegion {
     Global,
@@ -179,7 +204,7 @@ struct MinimaxOauthBaseResponse {
     status_msg: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Clone, Deserialize, Default)]
 struct QwenOauthCredentials {
     #[serde(default)]
     access_token: Option<String>,
@@ -189,6 +214,15 @@ struct QwenOauthCredentials {
     resource_url: Option<String>,
     #[serde(default)]
     expiry_date: Option<i64>,
+}
+
+impl std::fmt::Debug for QwenOauthCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QwenOauthCredentials")
+            .field("resource_url", &self.resource_url)
+            .field("expiry_date", &self.expiry_date)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -207,10 +241,18 @@ struct QwenOauthTokenResponse {
     error_description: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 struct QwenOauthProviderContext {
     credential: Option<String>,
     base_url: Option<String>,
+}
+
+impl std::fmt::Debug for QwenOauthProviderContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QwenOauthProviderContext")
+            .field("base_url", &self.base_url)
+            .finish_non_exhaustive()
+    }
 }
 
 fn read_non_empty_env(name: &str) -> Option<String> {
@@ -568,6 +610,8 @@ pub(crate) fn canonical_china_provider_name(name: &str) -> Option<&'static str> 
         Some("zai")
     } else if is_qianfan_alias(name) {
         Some("qianfan")
+    } else if is_doubao_alias(name) {
+        Some("doubao")
     } else {
         None
     }
@@ -786,6 +830,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         // not a single API key. Credential resolution happens inside BedrockProvider.
         "bedrock" | "aws-bedrock" => return None,
         name if is_qianfan_alias(name) => vec!["QIANFAN_API_KEY"],
+        name if is_doubao_alias(name) => vec!["ARK_API_KEY", "DOUBAO_API_KEY"],
         name if is_qwen_alias(name) => vec!["DASHSCOPE_API_KEY"],
         name if is_zai_alias(name) => vec!["ZAI_API_KEY"],
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => vec!["NVIDIA_API_KEY"],
@@ -795,6 +840,11 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "cloudflare" | "cloudflare-ai" => vec!["CLOUDFLARE_API_KEY"],
         "ovhcloud" | "ovh" => vec!["OVH_AI_ENDPOINTS_ACCESS_TOKEN"],
         "astrai" => vec!["ASTRAI_API_KEY"],
+        "llamacpp" | "llama.cpp" => vec!["LLAMACPP_API_KEY"],
+        "sglang" => vec!["SGLANG_API_KEY"],
+        "vllm" => vec!["VLLM_API_KEY"],
+        "osaurus" => vec!["OSAURUS_API_KEY"],
+        "telnyx" => vec!["TELNYX_API_KEY"],
         _ => vec![],
     };
 
@@ -913,15 +963,33 @@ fn create_provider_with_url_and_options(
             options.reasoning_enabled,
         ))),
         "gemini" | "google" | "google-gemini" => {
-            Ok(Box::new(gemini::GeminiProvider::new(key)))
+            let state_dir = options
+                .zeroclaw_dir
+                .clone()
+                .unwrap_or_else(|| {
+                    directories::UserDirs::new().map_or_else(
+                        || PathBuf::from(".zeroclaw"),
+                        |dirs| dirs.home_dir().join(".zeroclaw"),
+                    )
+                });
+            let auth_service = AuthService::new(&state_dir, options.secrets_encrypt);
+            Ok(Box::new(gemini::GeminiProvider::new_with_auth(
+                key,
+                auth_service,
+                options.auth_profile_override.clone(),
+            )))
         }
+        "telnyx" => Ok(Box::new(telnyx::TelnyxProvider::new(key))),
 
         // ── OpenAI-compatible providers ──────────────────────
         "venice" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Venice", "https://api.venice.ai", key, AuthStyle::Bearer,
         ))),
         "vercel" | "vercel-ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Vercel AI Gateway", "https://api.vercel.ai", key, AuthStyle::Bearer,
+            "Vercel AI Gateway",
+            VERCEL_AI_GATEWAY_BASE_URL,
+            key,
+            AuthStyle::Bearer,
         ))),
         "cloudflare" | "cloudflare-ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Cloudflare AI Gateway",
@@ -945,7 +1013,7 @@ fn create_provider_with_url_and_options(
             ),
         )),
         "synthetic" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Synthetic", "https://api.synthetic.com", key, AuthStyle::Bearer,
+            "Synthetic", "https://api.synthetic.new/openai/v1", key, AuthStyle::Bearer,
         ))),
         "opencode" | "opencode-zen" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "OpenCode Zen", "https://opencode.ai/zen/v1", key, AuthStyle::Bearer,
@@ -981,22 +1049,31 @@ fn create_provider_with_url_and_options(
                 .or_else(|| qwen_oauth_context.as_ref().and_then(|context| context.base_url.clone()))
                 .unwrap_or_else(|| QWEN_OAUTH_BASE_FALLBACK_URL.to_string());
 
-            Ok(Box::new(OpenAiCompatibleProvider::new_with_user_agent(
+            Ok(Box::new(
+                OpenAiCompatibleProvider::new_with_user_agent_and_vision(
                 "Qwen Code",
                 &base_url,
                 key,
                 AuthStyle::Bearer,
                 "QwenCode/1.0",
+                true,
             )))
         }
         name if is_qianfan_alias(name) => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Qianfan", "https://aip.baidubce.com", key, AuthStyle::Bearer,
         ))),
-        name if qwen_base_url(name).is_some() => Ok(Box::new(OpenAiCompatibleProvider::new(
+        name if is_doubao_alias(name) => Ok(Box::new(OpenAiCompatibleProvider::new(
+            "Doubao",
+            "https://ark.cn-beijing.volces.com/api/v3",
+            key,
+            AuthStyle::Bearer,
+        ))),
+        name if qwen_base_url(name).is_some() => Ok(Box::new(OpenAiCompatibleProvider::new_with_vision(
             "Qwen",
             qwen_base_url(name).expect("checked in guard"),
             key,
             AuthStyle::Bearer,
+            true,
         ))),
 
         // ── Extended ecosystem (community favorites) ─────────
@@ -1034,6 +1111,62 @@ fn create_provider_with_url_and_options(
                 "LM Studio",
                 "http://localhost:1234/v1",
                 Some(lm_studio_key),
+                AuthStyle::Bearer,
+            )))
+        }
+        "llamacpp" | "llama.cpp" => {
+            let base_url = api_url
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("http://localhost:8080/v1");
+            let llama_cpp_key = key
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("llama.cpp");
+            Ok(Box::new(OpenAiCompatibleProvider::new(
+                "llama.cpp",
+                base_url,
+                Some(llama_cpp_key),
+                AuthStyle::Bearer,
+            )))
+        }
+        "sglang" => {
+            let base_url = api_url
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("http://localhost:30000/v1");
+            Ok(Box::new(OpenAiCompatibleProvider::new(
+                "SGLang",
+                base_url,
+                key,
+                AuthStyle::Bearer,
+            )))
+        }
+        "vllm" => {
+            let base_url = api_url
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("http://localhost:8000/v1");
+            Ok(Box::new(OpenAiCompatibleProvider::new(
+                "vLLM",
+                base_url,
+                key,
+                AuthStyle::Bearer,
+            )))
+        }
+        "osaurus" => {
+            let base_url = api_url
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("http://localhost:1337/v1");
+            let osaurus_key = key
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("osaurus");
+            Ok(Box::new(OpenAiCompatibleProvider::new(
+                "Osaurus",
+                base_url,
+                Some(osaurus_key),
                 AuthStyle::Bearer,
             )))
         }
@@ -1095,6 +1228,22 @@ fn create_provider_with_url_and_options(
     }
 }
 
+/// Parse `"provider:profile"` syntax for fallback entries.
+///
+/// Returns `(provider_name, Some(profile))` when the entry contains a colon-
+/// delimited profile, or `(original_str, None)` otherwise.  Entries starting
+/// with `custom:` or `anthropic-custom:` are left untouched because the colon
+/// is part of the URL scheme.
+fn parse_provider_profile(s: &str) -> (&str, Option<&str>) {
+    if s.starts_with("custom:") || s.starts_with("anthropic-custom:") {
+        return (s, None);
+    }
+    match s.split_once(':') {
+        Some((provider, profile)) if !profile.is_empty() => (provider, Some(profile)),
+        _ => (s, None),
+    }
+}
+
 /// Create provider chain with retry and fallback behavior.
 pub fn create_resilient_provider(
     primary_name: &str,
@@ -1134,16 +1283,27 @@ pub fn create_resilient_provider_with_options(
             continue;
         }
 
+        let (provider_name, profile_override) = parse_provider_profile(fallback);
+
         // Each fallback provider resolves its own credential via provider-
         // specific env vars (e.g. DEEPSEEK_API_KEY for "deepseek") instead
         // of inheriting the primary provider's key. Passing `None` lets
         // `resolve_provider_credential` check the correct env var for the
         // fallback provider name.
         //
-        // Keep using `create_provider_with_options` so fallback entries that
-        // require runtime options (for example Codex auth profile overrides)
-        // continue to work.
-        match create_provider_with_options(fallback, None, options) {
+        // When a profile override is present (e.g. "openai-codex:second"),
+        // propagate it through `auth_profile_override` so the provider
+        // picks up the correct OAuth credential set.
+        let fallback_options = match profile_override {
+            Some(profile) => {
+                let mut opts = options.clone();
+                opts.auth_profile_override = Some(profile.to_string());
+                opts
+            }
+            None => options.clone(),
+        };
+
+        match create_provider_with_options(provider_name, None, &fallback_options) {
             Ok(provider) => providers.push((fallback.clone(), provider)),
             Err(_error) => {
                 tracing::warn!(
@@ -1404,6 +1564,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             local: false,
         },
         ProviderInfo {
+            name: "doubao",
+            display_name: "Doubao (Volcengine)",
+            aliases: &["volcengine", "ark", "doubao-cn"],
+            local: false,
+        },
+        ProviderInfo {
             name: "qwen",
             display_name: "Qwen (DashScope / Qwen Code OAuth)",
             aliases: &[
@@ -1476,6 +1642,30 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             name: "lmstudio",
             display_name: "LM Studio",
             aliases: &["lm-studio"],
+            local: true,
+        },
+        ProviderInfo {
+            name: "llamacpp",
+            display_name: "llama.cpp server",
+            aliases: &["llama.cpp"],
+            local: true,
+        },
+        ProviderInfo {
+            name: "sglang",
+            display_name: "SGLang",
+            aliases: &[],
+            local: true,
+        },
+        ProviderInfo {
+            name: "vllm",
+            display_name: "vLLM",
+            aliases: &[],
+            local: true,
+        },
+        ProviderInfo {
+            name: "osaurus",
+            display_name: "Osaurus",
+            aliases: &[],
             local: true,
         },
         ProviderInfo {
@@ -1692,12 +1882,17 @@ mod tests {
         assert!(is_zai_alias("zai-cn"));
         assert!(is_qianfan_alias("qianfan"));
         assert!(is_qianfan_alias("baidu"));
+        assert!(is_doubao_alias("doubao"));
+        assert!(is_doubao_alias("volcengine"));
+        assert!(is_doubao_alias("ark"));
+        assert!(is_doubao_alias("doubao-cn"));
 
         assert!(!is_moonshot_alias("openrouter"));
         assert!(!is_glm_alias("openai"));
         assert!(!is_qwen_alias("gemini"));
         assert!(!is_zai_alias("anthropic"));
         assert!(!is_qianfan_alias("cohere"));
+        assert!(!is_doubao_alias("deepseek"));
     }
 
     #[test]
@@ -1715,6 +1910,8 @@ mod tests {
         assert_eq!(canonical_china_provider_name("z.ai-cn"), Some("zai"));
         assert_eq!(canonical_china_provider_name("qianfan"), Some("qianfan"));
         assert_eq!(canonical_china_provider_name("baidu"), Some("qianfan"));
+        assert_eq!(canonical_china_provider_name("doubao"), Some("doubao"));
+        assert_eq!(canonical_china_provider_name("volcengine"), Some("doubao"));
         assert_eq!(canonical_china_provider_name("openai"), None);
     }
 
@@ -1792,6 +1989,12 @@ mod tests {
         assert!(create_provider("gemini", None).is_ok());
     }
 
+    #[test]
+    fn factory_telnyx() {
+        assert!(create_provider("telnyx", Some("test-key")).is_ok());
+        assert!(create_provider("telnyx", None).is_ok());
+    }
+
     // ── OpenAI-compatible providers ──────────────────────────
 
     #[test]
@@ -1803,6 +2006,14 @@ mod tests {
     fn factory_vercel() {
         assert!(create_provider("vercel", Some("key")).is_ok());
         assert!(create_provider("vercel-ai", Some("key")).is_ok());
+    }
+
+    #[test]
+    fn vercel_gateway_base_url_matches_public_gateway_endpoint() {
+        assert_eq!(
+            VERCEL_AI_GATEWAY_BASE_URL,
+            "https://ai-gateway.vercel.sh/v1"
+        );
     }
 
     #[test]
@@ -1889,6 +2100,14 @@ mod tests {
     }
 
     #[test]
+    fn factory_doubao() {
+        assert!(create_provider("doubao", Some("key")).is_ok());
+        assert!(create_provider("volcengine", Some("key")).is_ok());
+        assert!(create_provider("ark", Some("key")).is_ok());
+        assert!(create_provider("doubao-cn", Some("key")).is_ok());
+    }
+
+    #[test]
     fn factory_qwen() {
         assert!(create_provider("qwen", Some("key")).is_ok());
         assert!(create_provider("dashscope", Some("key")).is_ok());
@@ -1905,10 +2124,77 @@ mod tests {
     }
 
     #[test]
+    fn qwen_provider_supports_vision() {
+        let provider = create_provider("qwen", Some("key")).expect("qwen provider should build");
+        assert!(provider.supports_vision());
+
+        let oauth_provider =
+            create_provider("qwen-code", Some("key")).expect("qwen oauth provider should build");
+        assert!(oauth_provider.supports_vision());
+    }
+
+    #[test]
     fn factory_lmstudio() {
         assert!(create_provider("lmstudio", Some("key")).is_ok());
         assert!(create_provider("lm-studio", Some("key")).is_ok());
         assert!(create_provider("lmstudio", None).is_ok());
+    }
+
+    #[test]
+    fn factory_llamacpp() {
+        assert!(create_provider("llamacpp", Some("key")).is_ok());
+        assert!(create_provider("llama.cpp", Some("key")).is_ok());
+        assert!(create_provider("llamacpp", None).is_ok());
+    }
+
+    #[test]
+    fn factory_sglang() {
+        assert!(create_provider("sglang", None).is_ok());
+        assert!(create_provider("sglang", Some("key")).is_ok());
+    }
+
+    #[test]
+    fn factory_vllm() {
+        assert!(create_provider("vllm", None).is_ok());
+        assert!(create_provider("vllm", Some("key")).is_ok());
+    }
+
+    #[test]
+    fn factory_osaurus() {
+        // Osaurus works without an explicit key (defaults to "osaurus").
+        assert!(create_provider("osaurus", None).is_ok());
+        // Osaurus also works with an explicit key.
+        assert!(create_provider("osaurus", Some("custom-key")).is_ok());
+    }
+
+    #[test]
+    fn factory_osaurus_uses_default_key_when_none() {
+        // Verify that create_provider_with_url_and_options succeeds even
+        // without an API key — the match arm provides a default placeholder.
+        let options = ProviderRuntimeOptions::default();
+        let p = create_provider_with_url_and_options("osaurus", None, None, &options);
+        assert!(p.is_ok());
+    }
+
+    #[test]
+    fn factory_osaurus_custom_url() {
+        // Verify that a custom api_url overrides the default localhost endpoint.
+        let options = ProviderRuntimeOptions::default();
+        let p = create_provider_with_url_and_options(
+            "osaurus",
+            Some("key"),
+            Some("http://192.168.1.100:1337/v1"),
+            &options,
+        );
+        assert!(p.is_ok());
+    }
+
+    #[test]
+    fn resolve_provider_credential_osaurus_env() {
+        let _env_lock = env_lock();
+        let _guard = EnvGuard::set("OSAURUS_API_KEY", Some("osaurus-test-key"));
+        let resolved = resolve_provider_credential("osaurus", None);
+        assert_eq!(resolved, Some("osaurus-test-key".to_string()));
     }
 
     // ── Extended ecosystem ───────────────────────────────────
@@ -1932,6 +2218,13 @@ mod tests {
     #[test]
     fn factory_deepseek() {
         assert!(create_provider("deepseek", Some("key")).is_ok());
+    }
+
+    #[test]
+    fn deepseek_provider_keeps_vision_disabled() {
+        let provider =
+            create_provider("deepseek", Some("key")).expect("deepseek provider should build");
+        assert!(!provider.supports_vision());
     }
 
     #[test]
@@ -2227,6 +2520,25 @@ mod tests {
         assert!(provider.is_ok());
     }
 
+    /// Osaurus works as a fallback provider alongside other named providers.
+    #[test]
+    fn resilient_fallback_includes_osaurus() {
+        let reliability = crate::config::ReliabilityConfig {
+            provider_retries: 1,
+            provider_backoff_ms: 100,
+            fallback_providers: vec!["osaurus".into(), "lmstudio".into()],
+            api_keys: Vec::new(),
+            model_fallbacks: std::collections::HashMap::new(),
+            channel_initial_backoff_secs: 2,
+            channel_max_backoff_secs: 60,
+            scheduler_poll_secs: 15,
+            scheduler_retries: 2,
+        };
+
+        let provider = create_resilient_provider("zai", Some("zai-test-key"), None, &reliability);
+        assert!(provider.is_ok());
+    }
+
     #[test]
     fn factory_all_providers_create_successfully() {
         let providers = [
@@ -2253,12 +2565,18 @@ mod tests {
             "minimax-cn",
             "bedrock",
             "qianfan",
+            "doubao",
             "qwen",
             "qwen-intl",
             "qwen-cn",
             "qwen-us",
             "qwen-code",
             "lmstudio",
+            "llamacpp",
+            "sglang",
+            "vllm",
+            "osaurus",
+            "telnyx",
             "groq",
             "mistral",
             "xai",
@@ -2443,5 +2761,102 @@ mod tests {
         let input = "failed: github_pat_11AABBC_xyzzy789";
         let result = scrub_secret_patterns(input);
         assert_eq!(result, "failed: [REDACTED]");
+    }
+
+    // --- parse_provider_profile ---
+
+    #[test]
+    fn parse_provider_profile_plain_name() {
+        let (name, profile) = parse_provider_profile("gemini");
+        assert_eq!(name, "gemini");
+        assert_eq!(profile, None);
+    }
+
+    #[test]
+    fn parse_provider_profile_with_profile() {
+        let (name, profile) = parse_provider_profile("openai-codex:second");
+        assert_eq!(name, "openai-codex");
+        assert_eq!(profile, Some("second"));
+    }
+
+    #[test]
+    fn parse_provider_profile_custom_url_not_split() {
+        let input = "custom:https://my-api.example.com/v1";
+        let (name, profile) = parse_provider_profile(input);
+        assert_eq!(name, input);
+        assert_eq!(profile, None);
+    }
+
+    #[test]
+    fn parse_provider_profile_anthropic_custom_not_split() {
+        let input = "anthropic-custom:https://bedrock.example.com";
+        let (name, profile) = parse_provider_profile(input);
+        assert_eq!(name, input);
+        assert_eq!(profile, None);
+    }
+
+    #[test]
+    fn parse_provider_profile_empty_profile_ignored() {
+        let (name, profile) = parse_provider_profile("openai-codex:");
+        assert_eq!(name, "openai-codex:");
+        assert_eq!(profile, None);
+    }
+
+    #[test]
+    fn parse_provider_profile_extra_colons_kept() {
+        let (name, profile) = parse_provider_profile("provider:profile:extra");
+        assert_eq!(name, "provider");
+        assert_eq!(profile, Some("profile:extra"));
+    }
+
+    // --- resilient fallback with profile syntax ---
+
+    #[test]
+    fn resilient_fallback_with_profile_syntax() {
+        let _guard = env_lock();
+
+        let reliability = crate::config::ReliabilityConfig {
+            provider_retries: 1,
+            provider_backoff_ms: 100,
+            fallback_providers: vec!["openai-codex:second".into()],
+            api_keys: Vec::new(),
+            model_fallbacks: std::collections::HashMap::new(),
+            channel_initial_backoff_secs: 2,
+            channel_max_backoff_secs: 60,
+            scheduler_poll_secs: 15,
+            scheduler_retries: 2,
+        };
+
+        // openai-codex resolves its own OAuth credential; it should not
+        // fail even with a profile override that has no local token file.
+        // The provider initializes successfully and will attempt auth at
+        // request time.
+        let provider = create_resilient_provider("lmstudio", None, None, &reliability);
+        assert!(provider.is_ok());
+    }
+
+    #[test]
+    fn resilient_fallback_mixed_profiles_and_custom() {
+        let _guard = env_lock();
+
+        let reliability = crate::config::ReliabilityConfig {
+            provider_retries: 1,
+            provider_backoff_ms: 100,
+            fallback_providers: vec![
+                "openai-codex:second".into(),
+                "custom:http://localhost:8080/v1".into(),
+                "lmstudio".into(),
+                "nonexistent-provider".into(),
+            ],
+            api_keys: Vec::new(),
+            model_fallbacks: std::collections::HashMap::new(),
+            channel_initial_backoff_secs: 2,
+            channel_max_backoff_secs: 60,
+            scheduler_poll_secs: 15,
+            scheduler_retries: 2,
+        };
+
+        let provider = create_resilient_provider("ollama", None, None, &reliability);
+        assert!(provider.is_ok());
     }
 }

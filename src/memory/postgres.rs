@@ -30,29 +30,55 @@ impl PostgresMemory {
         validate_identifier(schema, "storage schema")?;
         validate_identifier(table, "storage table")?;
 
-        let mut config: postgres::Config = db_url
-            .parse()
-            .context("invalid PostgreSQL connection URL")?;
-
-        if let Some(timeout_secs) = connect_timeout_secs {
-            let bounded = timeout_secs.min(POSTGRES_CONNECT_TIMEOUT_CAP_SECS);
-            config.connect_timeout(Duration::from_secs(bounded));
-        }
-
-        let mut client = config
-            .connect(NoTls)
-            .context("failed to connect to PostgreSQL memory backend")?;
-
         let schema_ident = quote_identifier(schema);
         let table_ident = quote_identifier(table);
         let qualified_table = format!("{schema_ident}.{table_ident}");
 
-        Self::init_schema(&mut client, &schema_ident, &qualified_table)?;
+        let client = Self::initialize_client(
+            db_url.to_string(),
+            connect_timeout_secs,
+            schema_ident.clone(),
+            qualified_table.clone(),
+        )?;
 
         Ok(Self {
             client: Arc::new(Mutex::new(client)),
             qualified_table,
         })
+    }
+
+    fn initialize_client(
+        db_url: String,
+        connect_timeout_secs: Option<u64>,
+        schema_ident: String,
+        qualified_table: String,
+    ) -> Result<Client> {
+        let init_handle = std::thread::Builder::new()
+            .name("postgres-memory-init".to_string())
+            .spawn(move || -> Result<Client> {
+                let mut config: postgres::Config = db_url
+                    .parse()
+                    .context("invalid PostgreSQL connection URL")?;
+
+                if let Some(timeout_secs) = connect_timeout_secs {
+                    let bounded = timeout_secs.min(POSTGRES_CONNECT_TIMEOUT_CAP_SECS);
+                    config.connect_timeout(Duration::from_secs(bounded));
+                }
+
+                let mut client = config
+                    .connect(NoTls)
+                    .context("failed to connect to PostgreSQL memory backend")?;
+
+                Self::init_schema(&mut client, &schema_ident, &qualified_table)?;
+                Ok(client)
+            })
+            .context("failed to spawn PostgreSQL initializer thread")?;
+
+        let init_result = init_handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("PostgreSQL initializer thread panicked"))?;
+
+        init_result
     }
 
     fn init_schema(client: &mut Client, schema_ident: &str, qualified_table: &str) -> Result<()> {
@@ -344,6 +370,24 @@ mod tests {
         assert_eq!(
             PostgresMemory::parse_category("custom_notes"),
             MemoryCategory::Custom("custom_notes".into())
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn new_does_not_panic_inside_tokio_runtime() {
+        let outcome = std::panic::catch_unwind(|| {
+            PostgresMemory::new(
+                "postgres://zeroclaw:password@127.0.0.1:1/zeroclaw",
+                "public",
+                "memories",
+                Some(1),
+            )
+        });
+
+        assert!(outcome.is_ok(), "PostgresMemory::new should not panic");
+        assert!(
+            outcome.unwrap().is_err(),
+            "PostgresMemory::new should return a connect error for an unreachable endpoint"
         );
     }
 }

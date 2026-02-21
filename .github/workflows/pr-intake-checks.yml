@@ -2,6 +2,7 @@ name: PR Intake Checks
 
 on:
     pull_request_target:
+        branches: [dev, main]
         types: [opened, reopened, synchronize, edited, ready_for_review]
 
 concurrency:

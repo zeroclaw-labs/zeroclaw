@@ -19,10 +19,12 @@ Last reviewed: **February 18, 2026**.
 | `README.zh-CN.md` | Current Guide (localized) | Chinese readers |
 | `README.ja.md` | Current Guide (localized) | Japanese readers |
 | `README.ru.md` | Current Guide (localized) | Russian readers |
+| `README.vi.md` | Current Guide (localized) | Vietnamese readers |
 | `docs/README.md` | Current Guide (hub) | all readers |
 | `docs/README.zh-CN.md` | Current Guide (localized hub) | Chinese readers |
 | `docs/README.ja.md` | Current Guide (localized hub) | Japanese readers |
 | `docs/README.ru.md` | Current Guide (localized hub) | Russian readers |
+| `docs/README.vi.md` | Current Guide (localized hub) | Vietnamese readers |
 | `docs/SUMMARY.md` | Current Guide (unified TOC) | all readers |
 
 ## Collection Index Docs
@@ -45,6 +47,7 @@ Last reviewed: **February 18, 2026**.
 | `docs/commands-reference.md` | Current Reference | users/operators |
 | `docs/providers-reference.md` | Current Reference | users/operators |
 | `docs/channels-reference.md` | Current Reference | users/operators |
+| `docs/nextcloud-talk-setup.md` | Current Guide | operators |
 | `docs/config-reference.md` | Current Reference | operators |
 | `docs/custom-providers.md` | Current Integration Guide | integration developers |
 | `docs/zai-glm-setup.md` | Current Provider Setup Guide | users/operators |

@@ -13,7 +13,7 @@ use async_imap::extensions::idle::IdleResponse;
 use async_imap::types::Fetch;
 use async_imap::Session;
 use async_trait::async_trait;
-use futures::TryStreamExt;
+use futures_util::TryStreamExt;
 use lettre::message::SinglePart;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
@@ -67,6 +67,15 @@ pub struct EmailConfig {
     /// Allowed sender addresses/domains (empty = deny all, ["*"] = allow all)
     #[serde(default)]
     pub allowed_senders: Vec<String>,
+}
+
+impl crate::config::traits::ChannelConfig for EmailConfig {
+    fn name() -> &'static str {
+        "Email"
+    }
+    fn desc() -> &'static str {
+        "Email over IMAP/SMTP"
+    }
 }
 
 fn default_imap_port() -> u16 {

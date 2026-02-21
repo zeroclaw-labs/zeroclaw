@@ -2,6 +2,7 @@
 
 Describe this PR in 2-5 bullets:
 
+- Base branch target (`dev` for normal contributions; `main` only for `dev` promotion):
 - Problem:
 - Why it matters:
 - What changed:
@@ -12,11 +13,7 @@ Describe this PR in 2-5 bullets:
 - Risk label (`risk: low|medium|high`):
 - Size label (`size: XS|S|M|L|XL`, auto-managed/read-only):
 - Scope labels (`core|agent|channel|config|cron|daemon|doctor|gateway|health|heartbeat|integration|memory|observability|onboard|provider|runtime|security|service|skillforge|skills|tool|tunnel|docs|dependencies|ci|tests|scripts|dev`, comma-separated):
-<<<<<<< chore/labeler-spacing-trusted-tier
 - Module labels (`<module>: <component>`, for example `channel: telegram`, `provider: kimi`, `tool: shell`):
-=======
-- Module labels (`<module>:<component>`, for example `channel:telegram`, `provider:kimi`, `tool:shell`):
->>>>>>> main
 - Contributor tier label (`trusted contributor|experienced contributor|principal contributor|distinguished contributor`, auto-managed/read-only; author merged PRs >=5/10/20/50):
 - If any auto-label is incorrect, note requested correction:
 
@@ -73,6 +70,14 @@ cargo test
 - Config/env changes? (`Yes/No`)
 - Migration needed? (`Yes/No`)
 - If yes, exact upgrade steps:
+
+## i18n Follow-Through (required when docs or user-facing wording changes)
+
+- i18n follow-through triggered? (`Yes/No`)
+- If `Yes`, locale navigation parity updated in `README*`, `docs/README*`, and `docs/SUMMARY.md` for supported locales (`en`, `zh-CN`, `ja`, `ru`, `fr`, `vi`)? (`Yes/No`)
+- If `Yes`, localized runtime-contract docs updated where equivalents exist (minimum for `fr`/`vi`: `commands-reference`, `config-reference`, `troubleshooting`)? (`Yes/No/N.A.`)
+- If `Yes`, Vietnamese canonical docs under `docs/i18n/vi/**` synced and compatibility shims under `docs/*.vi.md` validated? (`Yes/No/N.A.`)
+- If any `No`/`N.A.`, link follow-up issue/PR and explain scope decision:
 
 ## Human Verification (required)
 

@@ -163,8 +163,20 @@ fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<ResponsesInpu
 
 fn clamp_reasoning_effort(model: &str, effort: &str) -> String {
     let id = normalize_model_id(model);
+    // gpt-5-codex currently supports only low|medium|high.
+    if id == "gpt-5-codex" {
+        return match effort {
+            "low" | "medium" | "high" => effort.to_string(),
+            "minimal" => "low".to_string(),
+            "xhigh" => "high".to_string(),
+            _ => "high".to_string(),
+        };
+    }
     if (id.starts_with("gpt-5.2") || id.starts_with("gpt-5.3")) && effort == "minimal" {
         return "low".to_string();
+    }
+    if id.starts_with("gpt-5-codex") && effort == "xhigh" {
+        return "high".to_string();
     }
     if id == "gpt-5.1" && effort == "xhigh" {
         return "high".to_string();
@@ -382,7 +394,8 @@ impl OpenAiCodexProvider {
     ) -> anyhow::Result<String> {
         let profile = self
             .auth
-            .get_profile("openai-codex", self.auth_profile_override.as_deref())?;
+            .get_profile("openai-codex", self.auth_profile_override.as_deref())
+            .await?;
         let access_token = self
             .auth
             .get_valid_openai_access_token(self.auth_profile_override.as_deref())
@@ -533,11 +546,27 @@ mod tests {
     #[test]
     fn clamp_reasoning_effort_adjusts_known_models() {
         assert_eq!(
+            clamp_reasoning_effort("gpt-5-codex", "xhigh"),
+            "high".to_string()
+        );
+        assert_eq!(
+            clamp_reasoning_effort("gpt-5-codex", "minimal"),
+            "low".to_string()
+        );
+        assert_eq!(
+            clamp_reasoning_effort("gpt-5-codex", "medium"),
+            "medium".to_string()
+        );
+        assert_eq!(
             clamp_reasoning_effort("gpt-5.3-codex", "minimal"),
             "low".to_string()
         );
         assert_eq!(
             clamp_reasoning_effort("gpt-5.1", "xhigh"),
+            "high".to_string()
+        );
+        assert_eq!(
+            clamp_reasoning_effort("gpt-5-codex", "xhigh"),
             "high".to_string()
         );
         assert_eq!(

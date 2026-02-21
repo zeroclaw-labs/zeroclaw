@@ -2,7 +2,7 @@
 
 This is a high-signal reference for common config sections and defaults.
 
-Last verified: **February 19, 2026**.
+Last verified: **February 21, 2026**.
 
 Config path resolution at startup:
 
@@ -25,6 +25,39 @@ Schema export command:
 | `default_provider` | `openrouter` | provider ID or alias |
 | `default_model` | `anthropic/claude-sonnet-4-6` | model routed through selected provider |
 | `default_temperature` | `0.7` | model temperature |
+
+## `[observability]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `backend` | `none` | Observability backend: `none`, `noop`, `log`, `prometheus`, `otel`, `opentelemetry`, or `otlp` |
+| `otel_endpoint` | `http://localhost:4318` | OTLP HTTP endpoint used when backend is `otel` |
+| `otel_service_name` | `zeroclaw` | Service name emitted to OTLP collector |
+| `runtime_trace_mode` | `none` | Runtime trace storage mode: `none`, `rolling`, or `full` |
+| `runtime_trace_path` | `state/runtime-trace.jsonl` | Runtime trace JSONL path (relative to workspace unless absolute) |
+| `runtime_trace_max_entries` | `200` | Maximum retained events when `runtime_trace_mode = "rolling"` |
+
+Notes:
+
+- `backend = "otel"` uses OTLP HTTP export with a blocking exporter client so spans and metrics can be emitted safely from non-Tokio contexts.
+- Alias values `opentelemetry` and `otlp` map to the same OTel backend.
+- Runtime traces are intended for debugging tool-call failures and malformed model tool payloads. They can contain model output text, so keep this disabled by default on shared hosts.
+- Query runtime traces with:
+  - `zeroclaw doctor traces --limit 20`
+  - `zeroclaw doctor traces --event tool_call_result --contains \"error\"`
+  - `zeroclaw doctor traces --id <trace-id>`
+
+Example:
+
+```toml
+[observability]
+backend = "otel"
+otel_endpoint = "http://localhost:4318"
+otel_service_name = "zeroclaw"
+runtime_trace_mode = "rolling"
+runtime_trace_path = "state/runtime-trace.jsonl"
+runtime_trace_max_entries = 200
+```
 
 ## Environment Provider Overrides
 
@@ -53,6 +86,54 @@ Notes:
 
 - Setting `max_tool_iterations = 0` falls back to safe default `10`.
 - If a channel message exceeds this value, the runtime returns: `Agent exceeded maximum tool iterations (<value>)`.
+- In CLI, gateway, and channel tool loops, multiple independent tool calls are executed concurrently by default when the pending calls do not require approval gating; result order remains stable.
+- `parallel_tools` applies to the `Agent::turn()` API surface. It does not gate the runtime loop used by CLI, gateway, or channel handlers.
+
+## `[security.otp]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable OTP gating for sensitive actions/domains |
+| `method` | `totp` | OTP method (`totp`, `pairing`, `cli-prompt`) |
+| `token_ttl_secs` | `30` | TOTP time-step window in seconds |
+| `cache_valid_secs` | `300` | Cache window for recently validated OTP codes |
+| `gated_actions` | `["shell","file_write","browser_open","browser","memory_forget"]` | Tool actions protected by OTP |
+| `gated_domains` | `[]` | Explicit domain patterns requiring OTP (`*.example.com`, `login.example.com`) |
+| `gated_domain_categories` | `[]` | Domain preset categories (`banking`, `medical`, `government`, `identity_providers`) |
+
+Notes:
+
+- Domain patterns support wildcard `*`.
+- Category presets expand to curated domain sets during validation.
+- Invalid domain globs or unknown categories fail fast at startup.
+- When `enabled = true` and no OTP secret exists, ZeroClaw generates one and prints an enrollment URI once.
+
+Example:
+
+```toml
+[security.otp]
+enabled = true
+method = "totp"
+token_ttl_secs = 30
+cache_valid_secs = 300
+gated_actions = ["shell", "browser_open"]
+gated_domains = ["*.chase.com", "accounts.google.com"]
+gated_domain_categories = ["banking"]
+```
+
+## `[security.estop]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable emergency-stop state machine and CLI |
+| `state_file` | `~/.zeroclaw/estop-state.json` | Persistent estop state path |
+| `require_otp_to_resume` | `true` | Require OTP validation before resume operations |
+
+Notes:
+
+- Estop state is persisted atomically and reloaded on startup.
+- Corrupted/unreadable estop state falls back to fail-closed `kill_all`.
+- Use CLI command `zeroclaw estop` to engage and `zeroclaw estop resume` to clear levels.
 
 ## `[agents.<name>]`
 
@@ -66,6 +147,15 @@ Delegate sub-agent configurations. Each key under `[agents]` defines a named sub
 | `api_key` | unset | Optional API key override (stored encrypted when `secrets.encrypt = true`) |
 | `temperature` | unset | Temperature override for the sub-agent |
 | `max_depth` | `3` | Max recursion depth for nested delegation |
+| `agentic` | `false` | Enable multi-turn tool-call loop mode for the sub-agent |
+| `allowed_tools` | `[]` | Tool allowlist for agentic mode |
+| `max_iterations` | `10` | Max tool-call iterations for agentic mode |
+
+Notes:
+
+- `agentic = false` preserves existing single prompt→response delegate behavior.
+- `agentic = true` requires at least one matching entry in `allowed_tools`.
+- The `delegate` tool is excluded from sub-agent allowlists to prevent re-entrant delegation loops.
 
 ```toml
 [agents.researcher]
@@ -73,6 +163,9 @@ provider = "openrouter"
 model = "anthropic/claude-sonnet-4-6"
 system_prompt = "You are a research assistant."
 max_depth = 2
+agentic = true
+allowed_tools = ["web_search", "http_request", "file_read"]
+max_iterations = 8
 
 [agents.coder]
 provider = "ollama"
@@ -92,6 +185,25 @@ Notes:
 - `reasoning_enabled = true` explicitly requests reasoning for supported providers (`think: true` on `ollama`).
 - Unset keeps provider defaults.
 
+## `[skills]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `open_skills_enabled` | `false` | Opt-in loading/sync of community `open-skills` repository |
+| `open_skills_dir` | unset | Optional local path for `open-skills` (defaults to `$HOME/open-skills` when enabled) |
+| `prompt_injection_mode` | `full` | Skill prompt verbosity: `full` (inline instructions/tools) or `compact` (name/description/location only) |
+
+Notes:
+
+- Security-first default: ZeroClaw does **not** clone or sync `open-skills` unless `open_skills_enabled = true`.
+- Environment overrides:
+  - `ZEROCLAW_OPEN_SKILLS_ENABLED` accepts `1/0`, `true/false`, `yes/no`, `on/off`.
+  - `ZEROCLAW_OPEN_SKILLS_DIR` overrides the repository path when non-empty.
+  - `ZEROCLAW_SKILLS_PROMPT_MODE` accepts `full` or `compact`.
+- Precedence for enable flag: `ZEROCLAW_OPEN_SKILLS_ENABLED` → `skills.open_skills_enabled` in `config.toml` → default `false`.
+- `prompt_injection_mode = "compact"` is recommended on low-context local models to reduce startup prompt size while keeping skill files available on demand.
+- Skill loading and `zeroclaw skills install` both apply a static security audit. Skills that contain symlinks, script-like files, high-risk shell payload snippets, or unsafe markdown link traversal are rejected.
+
 ## `[composio]`
 
 | Key | Default | Purpose |
@@ -104,6 +216,7 @@ Notes:
 
 - Backward compatibility: legacy `enable = true` is accepted as an alias for `enabled = true`.
 - If `enabled = false` or `api_key` is missing, the `composio` tool is not registered.
+- ZeroClaw requests Composio v3 tools with `toolkit_versions=latest` and executes tools with `version="latest"` to avoid stale default tool revisions.
 - Typical flow: call `connect`, complete browser OAuth, then run `execute` for the desired tool action.
 - If Composio returns a missing connected-account reference error, call `list_accounts` (optionally with `app`) and pass the returned `connected_account_id` to `execute`.
 
@@ -159,7 +272,7 @@ Notes:
 | Key | Default | Purpose |
 |---|---|---|
 | `enabled` | `false` | Enable `browser_open` tool (opens URLs without scraping) |
-| `allowed_domains` | `[]` | Allowed domains for `browser_open` (exact or subdomain match) |
+| `allowed_domains` | `[]` | Allowed domains for `browser_open` (exact/subdomain match, or `"*"` for all public domains) |
 | `session_name` | unset | Browser session name (for agent-browser automation) |
 | `backend` | `agent_browser` | Browser automation backend: `"agent_browser"`, `"rust_native"`, `"computer_use"`, or `"auto"` |
 | `native_headless` | `true` | Headless mode for rust-native backend |
@@ -189,21 +302,22 @@ Notes:
 | Key | Default | Purpose |
 |---|---|---|
 | `enabled` | `false` | Enable `http_request` tool for API interactions |
-| `allowed_domains` | `[]` | Allowed domains for HTTP requests (exact or subdomain match) |
+| `allowed_domains` | `[]` | Allowed domains for HTTP requests (exact/subdomain match, or `"*"` for all public domains) |
 | `max_response_size` | `1000000` | Maximum response size in bytes (default: 1 MB) |
 | `timeout_secs` | `30` | Request timeout in seconds |
 
 Notes:
 
 - Deny-by-default: if `allowed_domains` is empty, all HTTP requests are rejected.
-- Use exact domain or subdomain matching (e.g. `"api.example.com"`, `"example.com"`).
+- Use exact domain or subdomain matching (e.g. `"api.example.com"`, `"example.com"`), or `"*"` to allow any public domain.
+- Local/private targets are still blocked even when `"*"` is configured.
 
 ## `[gateway]`
 
 | Key | Default | Purpose |
 |---|---|---|
 | `host` | `127.0.0.1` | bind address |
-| `port` | `3000` | gateway listen port |
+| `port` | `42617` | gateway listen port |
 | `require_pairing` | `true` | require pairing before bearer auth |
 | `allow_public_bind` | `false` | block accidental public exposure |
 
@@ -212,11 +326,12 @@ Notes:
 | Key | Default | Purpose |
 |---|---|---|
 | `level` | `supervised` | `read_only`, `supervised`, or `full` |
-| `workspace_only` | `true` | restrict writes/command paths to workspace scope |
+| `workspace_only` | `true` | reject absolute path inputs unless explicitly disabled |
 | `allowed_commands` | _required for shell execution_ | allowlist of executable names |
-| `forbidden_paths` | `[]` | explicit path denylist |
-| `max_actions_per_hour` | `100` | per-policy action budget |
-| `max_cost_per_day_cents` | `1000` | per-policy spend guardrail |
+| `forbidden_paths` | built-in protected list | explicit path denylist (system paths + sensitive dotdirs by default) |
+| `allowed_roots` | `[]` | additional roots allowed outside workspace after canonicalization |
+| `max_actions_per_hour` | `20` | per-policy action budget |
+| `max_cost_per_day_cents` | `500` | per-policy spend guardrail |
 | `require_approval_for_medium_risk` | `true` | approval gate for medium-risk commands |
 | `block_high_risk_commands` | `true` | hard block for high-risk commands |
 | `auto_approve` | `[]` | tool operations always auto-approved |
@@ -225,8 +340,17 @@ Notes:
 Notes:
 
 - `level = "full"` skips medium-risk approval gating for shell execution, while still enforcing configured guardrails.
+- Access outside the workspace requires `allowed_roots`, even when `workspace_only = false`.
+- `allowed_roots` supports absolute paths, `~/...`, and workspace-relative paths.
 - Shell separator/operator parsing is quote-aware. Characters like `;` inside quoted arguments are treated as literals, not command separators.
 - Unquoted shell chaining/operators are still enforced by policy checks (`;`, `|`, `&&`, `||`, background chaining, and redirects).
+
+```toml
+[autonomy]
+workspace_only = false
+forbidden_paths = ["/etc", "/root", "/proc", "/sys", "~/.ssh", "~/.gnupg", "~/.aws"]
+allowed_roots = ["~/Desktop/projects", "/opt/shared-repo"]
+```
 
 ## `[memory]`
 
@@ -289,6 +413,17 @@ Upgrade strategy:
 2. Update only `model = "...new-version..."` in the route entries.
 3. Validate with `zeroclaw doctor` before restart/rollout.
 
+Natural-language config path:
+
+- During normal agent chat, ask the assistant to rewire routes in plain language.
+- The runtime can persist these updates via tool `model_routing_config` (defaults, scenarios, and delegate sub-agents) without manual TOML editing.
+
+Example requests:
+
+- `Set conversation to provider kimi, model moonshot-v1-8k.`
+- `Set coding to provider openai, model gpt-5.3-codex, and auto-route when message contains code blocks.`
+- `Create a coder sub-agent using openai/gpt-5.3-codex with tools file_read,file_write,shell.`
+
 ## `[query_classification]`
 
 Automatic model hint routing — maps user messages to `[[model_routes]]` hints based on content patterns.
@@ -332,25 +467,107 @@ Top-level channel options are configured under `channels_config`.
 
 | Key | Default | Purpose |
 |---|---|---|
-| `message_timeout_secs` | `300` | Timeout in seconds for processing a single channel message (LLM + tools) |
+| `message_timeout_secs` | `300` | Base timeout in seconds for channel message processing; runtime scales this with tool-loop depth (up to 4x) |
 
 Examples:
 
 - `[channels_config.telegram]`
 - `[channels_config.discord]`
 - `[channels_config.whatsapp]`
+- `[channels_config.linq]`
+- `[channels_config.nextcloud_talk]`
 - `[channels_config.email]`
+- `[channels_config.nostr]`
 
 Notes:
 
 - Default `300s` is optimized for on-device LLMs (Ollama) which are slower than cloud APIs.
+- Runtime timeout budget is `message_timeout_secs * scale`, where `scale = min(max_tool_iterations, 4)` and a minimum of `1`.
+- This scaling avoids false timeouts when the first LLM turn is slow/retried but later tool-loop turns still need to complete.
 - If using cloud APIs (OpenAI, Anthropic, etc.), you can reduce this to `60` or lower.
 - Values below `30` are clamped to `30` to avoid immediate timeout churn.
 - When a timeout occurs, users receive: `⚠️ Request timed out while waiting for the model. Please try again.`
 - Telegram-only interruption behavior is controlled with `channels_config.telegram.interrupt_on_new_message` (default `false`).
   When enabled, a newer message from the same sender in the same chat cancels the in-flight request and preserves interrupted user context.
+- While `zeroclaw channel start` is running, updates to `default_provider`, `default_model`, `default_temperature`, `api_key`, `api_url`, and `reliability.*` are hot-applied from `config.toml` on the next inbound message.
+
+### `[channels_config.nostr]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `private_key` | _required_ | Nostr private key (hex or `nsec1…` bech32); encrypted at rest when `secrets.encrypt = true` |
+| `relays` | see note | List of relay WebSocket URLs; defaults to `relay.damus.io`, `nos.lol`, `relay.primal.net`, `relay.snort.social` |
+| `allowed_pubkeys` | `[]` (deny all) | Sender allowlist (hex or `npub1…`); use `"*"` to allow all senders |
+
+Notes:
+
+- Supports both NIP-04 (legacy encrypted DMs) and NIP-17 (gift-wrapped private messages). Replies mirror the sender's protocol automatically.
+- The `private_key` is a high-value secret; keep `secrets.encrypt = true` (the default) in production.
 
 See detailed channel matrix and allowlist behavior in [channels-reference.md](channels-reference.md).
+
+### `[channels_config.whatsapp]`
+
+WhatsApp supports two backends under one config table.
+
+Cloud API mode (Meta webhook):
+
+| Key | Required | Purpose |
+|---|---|---|
+| `access_token` | Yes | Meta Cloud API bearer token |
+| `phone_number_id` | Yes | Meta phone number ID |
+| `verify_token` | Yes | Webhook verification token |
+| `app_secret` | Optional | Enables webhook signature verification (`X-Hub-Signature-256`) |
+| `allowed_numbers` | Recommended | Allowed inbound numbers (`[]` = deny all, `"*"` = allow all) |
+
+WhatsApp Web mode (native client):
+
+| Key | Required | Purpose |
+|---|---|---|
+| `session_path` | Yes | Persistent SQLite session path |
+| `pair_phone` | Optional | Pair-code flow phone number (digits only) |
+| `pair_code` | Optional | Custom pair code (otherwise auto-generated) |
+| `allowed_numbers` | Recommended | Allowed inbound numbers (`[]` = deny all, `"*"` = allow all) |
+
+Notes:
+
+- WhatsApp Web requires build flag `whatsapp-web`.
+- If both Cloud and Web fields are present, Cloud mode wins for backward compatibility.
+
+### `[channels_config.linq]`
+
+Linq Partner V3 API integration for iMessage, RCS, and SMS.
+
+| Key | Required | Purpose |
+|---|---|---|
+| `api_token` | Yes | Linq Partner API bearer token |
+| `from_phone` | Yes | Phone number to send from (E.164 format) |
+| `signing_secret` | Optional | Webhook signing secret for HMAC-SHA256 signature verification |
+| `allowed_senders` | Recommended | Allowed inbound phone numbers (`[]` = deny all, `"*"` = allow all) |
+
+Notes:
+
+- Webhook endpoint is `POST /linq`.
+- `ZEROCLAW_LINQ_SIGNING_SECRET` overrides `signing_secret` when set.
+- Signatures use `X-Webhook-Signature` and `X-Webhook-Timestamp` headers; stale timestamps (>300s) are rejected.
+- See [channels-reference.md](channels-reference.md) for full config examples.
+
+### `[channels_config.nextcloud_talk]`
+
+Native Nextcloud Talk bot integration (webhook receive + OCS send API).
+
+| Key | Required | Purpose |
+|---|---|---|
+| `base_url` | Yes | Nextcloud base URL (e.g. `https://cloud.example.com`) |
+| `app_token` | Yes | Bot app token used for OCS bearer auth |
+| `webhook_secret` | Optional | Enables webhook signature verification |
+| `allowed_users` | Recommended | Allowed Nextcloud actor IDs (`[]` = deny all, `"*"` = allow all) |
+
+Notes:
+
+- Webhook endpoint is `POST /nextcloud-talk`.
+- `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET` overrides `webhook_secret` when set.
+- See [nextcloud-talk-setup.md](nextcloud-talk-setup.md) for setup and troubleshooting.
 
 ## `[hardware]`
 
@@ -425,6 +642,7 @@ After editing config:
 zeroclaw status
 zeroclaw doctor
 zeroclaw channel doctor
+zeroclaw service restart
 ```
 
 ## Related Docs

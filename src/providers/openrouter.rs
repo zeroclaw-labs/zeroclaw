@@ -1,6 +1,7 @@
+use crate::multimodal;
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ToolCall as ProviderToolCall,
+    Provider, ProviderCapabilities, TokenUsage, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -21,7 +22,26 @@ struct ChatRequest {
 #[derive(Debug, Serialize)]
 struct Message {
     role: String,
-    content: String,
+    content: MessageContent,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum MessageContent {
+    Text(String),
+    Parts(Vec<MessagePart>),
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum MessagePart {
+    Text { text: String },
+    ImageUrl { image_url: ImageUrlPart },
+}
+
+#[derive(Debug, Serialize)]
+struct ImageUrlPart {
+    url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,7 +74,7 @@ struct NativeChatRequest {
 struct NativeMessage {
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
+    content: Option<MessageContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -93,6 +113,16 @@ struct NativeFunctionCall {
 #[derive(Debug, Deserialize)]
 struct NativeChatResponse {
     choices: Vec<NativeChoice>,
+    #[serde(default)]
+    usage: Option<UsageInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UsageInfo {
+    #[serde(default)]
+    prompt_tokens: Option<u64>,
+    #[serde(default)]
+    completion_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -161,7 +191,7 @@ impl OpenRouterProvider {
                                 let content = value
                                     .get("content")
                                     .and_then(serde_json::Value::as_str)
-                                    .map(ToString::to_string);
+                                    .map(|value| MessageContent::Text(value.to_string()));
                                 return NativeMessage {
                                     role: "assistant".to_string(),
                                     content,
@@ -182,7 +212,8 @@ impl OpenRouterProvider {
                         let content = value
                             .get("content")
                             .and_then(serde_json::Value::as_str)
-                            .map(ToString::to_string);
+                            .map(|value| MessageContent::Text(value.to_string()))
+                            .or_else(|| Some(MessageContent::Text(m.content.clone())));
                         return NativeMessage {
                             role: "tool".to_string(),
                             content,
@@ -194,12 +225,39 @@ impl OpenRouterProvider {
 
                 NativeMessage {
                     role: m.role.clone(),
-                    content: Some(m.content.clone()),
+                    content: Some(Self::to_message_content(&m.role, &m.content)),
                     tool_call_id: None,
                     tool_calls: None,
                 }
             })
             .collect()
+    }
+
+    fn to_message_content(role: &str, content: &str) -> MessageContent {
+        if role != "user" {
+            return MessageContent::Text(content.to_string());
+        }
+
+        let (cleaned_text, image_refs) = multimodal::parse_image_markers(content);
+        if image_refs.is_empty() {
+            return MessageContent::Text(content.to_string());
+        }
+
+        let mut parts = Vec::with_capacity(image_refs.len() + 1);
+        let trimmed_text = cleaned_text.trim();
+        if !trimmed_text.is_empty() {
+            parts.push(MessagePart::Text {
+                text: trimmed_text.to_string(),
+            });
+        }
+
+        for image_ref in image_refs {
+            parts.push(MessagePart::ImageUrl {
+                image_url: ImageUrlPart { url: image_ref },
+            });
+        }
+
+        MessageContent::Parts(parts)
     }
 
     fn parse_native_response(message: NativeResponseMessage) -> ProviderChatResponse {
@@ -217,6 +275,7 @@ impl OpenRouterProvider {
         ProviderChatResponse {
             text: message.content,
             tool_calls,
+            usage: None,
         }
     }
 
@@ -227,6 +286,13 @@ impl OpenRouterProvider {
 
 #[async_trait]
 impl Provider for OpenRouterProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calling: true,
+            vision: true,
+        }
+    }
+
     async fn warmup(&self) -> anyhow::Result<()> {
         // Hit a lightweight endpoint to establish TLS + HTTP/2 connection pool.
         // This prevents the first real chat request from timing out on cold start.
@@ -256,13 +322,13 @@ impl Provider for OpenRouterProvider {
         if let Some(sys) = system_prompt {
             messages.push(Message {
                 role: "system".to_string(),
-                content: sys.to_string(),
+                content: MessageContent::Text(sys.to_string()),
             });
         }
 
         messages.push(Message {
             role: "user".to_string(),
-            content: message.to_string(),
+            content: Self::to_message_content("user", message),
         });
 
         let request = ChatRequest {
@@ -311,7 +377,7 @@ impl Provider for OpenRouterProvider {
             .iter()
             .map(|m| Message {
                 role: m.role.clone(),
-                content: m.content.clone(),
+                content: Self::to_message_content(&m.role, &m.content),
             })
             .collect();
 
@@ -387,13 +453,19 @@ impl Provider for OpenRouterProvider {
         }
 
         let native_response: NativeChatResponse = response.json().await?;
+        let usage = native_response.usage.map(|u| TokenUsage {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+        });
         let message = native_response
             .choices
             .into_iter()
             .next()
             .map(|c| c.message)
             .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))?;
-        Ok(Self::parse_native_response(message))
+        let mut result = Self::parse_native_response(message);
+        result.usage = usage;
+        Ok(result)
     }
 
     fn supports_native_tools(&self) -> bool {
@@ -475,13 +547,19 @@ impl Provider for OpenRouterProvider {
         }
 
         let native_response: NativeChatResponse = response.json().await?;
+        let usage = native_response.usage.map(|u| TokenUsage {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+        });
         let message = native_response
             .choices
             .into_iter()
             .next()
             .map(|c| c.message)
             .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))?;
-        Ok(Self::parse_native_response(message))
+        let mut result = Self::parse_native_response(message);
+        result.usage = usage;
+        Ok(result)
     }
 }
 
@@ -489,6 +567,14 @@ impl Provider for OpenRouterProvider {
 mod tests {
     use super::*;
     use crate::providers::traits::{ChatMessage, Provider};
+
+    #[test]
+    fn capabilities_report_vision_support() {
+        let provider = OpenRouterProvider::new(Some("openrouter-test-credential"));
+        let caps = <OpenRouterProvider as Provider>::capabilities(&provider);
+        assert!(caps.native_tool_calling);
+        assert!(caps.vision);
+    }
 
     #[test]
     fn creates_with_key() {
@@ -552,11 +638,11 @@ mod tests {
             messages: vec![
                 Message {
                     role: "system".into(),
-                    content: "You are helpful".into(),
+                    content: MessageContent::Text("You are helpful".into()),
                 },
                 Message {
                     role: "user".into(),
-                    content: "Summarize this".into(),
+                    content: MessageContent::Text("Summarize this".into()),
                 },
             ],
             temperature: 0.5,
@@ -589,7 +675,7 @@ mod tests {
                 .iter()
                 .map(|msg| Message {
                     role: msg.role.clone(),
-                    content: msg.content.clone(),
+                    content: MessageContent::Text(msg.content.clone()),
                 })
                 .collect(),
             temperature: 0.0,
@@ -725,7 +811,16 @@ mod tests {
         let converted = OpenRouterProvider::convert_messages(&messages);
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].role, "assistant");
-        assert_eq!(converted[0].content.as_deref(), Some("Using tool"));
+        assert_eq!(
+            converted[0]
+                .content
+                .as_ref()
+                .and_then(|content| match content {
+                    MessageContent::Text(value) => Some(value.as_str()),
+                    MessageContent::Parts(_) => None,
+                }),
+            Some("Using tool")
+        );
 
         let tool_calls = converted[0].tool_calls.as_ref().unwrap();
         assert_eq!(tool_calls.len(), 1);
@@ -745,7 +840,50 @@ mod tests {
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].role, "tool");
         assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_xyz"));
-        assert_eq!(converted[0].content.as_deref(), Some("done"));
+        assert_eq!(
+            converted[0]
+                .content
+                .as_ref()
+                .and_then(|content| match content {
+                    MessageContent::Text(value) => Some(value.as_str()),
+                    MessageContent::Parts(_) => None,
+                }),
+            Some("done")
+        );
         assert!(converted[0].tool_calls.is_none());
+    }
+
+    #[test]
+    fn to_message_content_converts_image_markers_to_openai_parts() {
+        let content = "Describe this\n\n[IMAGE:data:image/png;base64,abcd]";
+        let value =
+            serde_json::to_value(OpenRouterProvider::to_message_content("user", content)).unwrap();
+        let parts = value
+            .as_array()
+            .expect("multimodal content should be an array");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "Describe this");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,abcd");
+    }
+
+    #[test]
+    fn native_response_parses_usage() {
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {"prompt_tokens": 42, "completion_tokens": 15}
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, Some(42));
+        assert_eq!(usage.completion_tokens, Some(15));
+    }
+
+    #[test]
+    fn native_response_parses_without_usage() {
+        let json = r#"{"choices": [{"message": {"content": "Hello"}}]}"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.usage.is_none());
     }
 }

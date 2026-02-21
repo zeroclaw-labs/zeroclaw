@@ -7,14 +7,21 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
-use crate::channels::{Channel, LinqChannel, SendMessage, WhatsAppChannel};
+pub mod api;
+pub mod sse;
+pub mod static_files;
+pub mod ws;
+
+use crate::channels::{Channel, LinqChannel, NextcloudTalkChannel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
+use crate::cost::CostTracker;
 use crate::memory::{self, Memory, MemoryCategory};
-use crate::providers::{self, ChatMessage, Provider, ProviderCapabilityError};
+use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::security::SecurityPolicy;
 use crate::tools;
+use crate::tools::traits::ToolSpec;
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use axum::{
@@ -22,7 +29,7 @@ use axum::{
     extract::{ConnectInfo, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json},
-    routing::{get, post},
+    routing::{delete, get, post, put},
     Router,
 };
 use parking_lot::Mutex;
@@ -55,6 +62,10 @@ fn whatsapp_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String 
 
 fn linq_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
     format!("linq_{}_{}", msg.sender, msg.id)
+}
+
+fn nextcloud_talk_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
+    format!("nextcloud_talk_{}_{}", msg.sender, msg.id)
 }
 
 fn hash_webhook_secret(value: &str) -> String {
@@ -281,8 +292,17 @@ pub struct AppState {
     pub linq: Option<Arc<LinqChannel>>,
     /// Linq webhook signing secret for signature verification
     pub linq_signing_secret: Option<Arc<str>>,
+    pub nextcloud_talk: Option<Arc<NextcloudTalkChannel>>,
+    /// Nextcloud Talk webhook secret for signature verification
+    pub nextcloud_talk_webhook_secret: Option<Arc<str>>,
     /// Observability backend for metrics scraping
     pub observer: Arc<dyn crate::observability::Observer>,
+    /// Registered tool specs (for web dashboard tools page)
+    pub tools_registry: Arc<Vec<ToolSpec>>,
+    /// Cost tracker (optional, for web dashboard cost page)
+    pub cost_tracker: Option<Arc<CostTracker>>,
+    /// SSE broadcast channel for real-time events
+    pub event_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -298,6 +318,13 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         );
     }
     let config_state = Arc::new(Mutex::new(config.clone()));
+
+    // ── Hooks ──────────────────────────────────────────────────────
+    let hooks: Option<std::sync::Arc<crate::hooks::HookRunner>> = if config.hooks.enabled {
+        Some(std::sync::Arc::new(crate::hooks::HookRunner::new()))
+    } else {
+        None
+    };
 
     let addr: SocketAddr = format!("{host}:{port}").parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -343,7 +370,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         (None, None)
     };
 
-    let _tools_registry = Arc::new(tools::all_tools_with_runtime(
+    let tools_registry_raw = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -356,7 +383,25 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
-    ));
+    );
+    let tools_registry: Arc<Vec<ToolSpec>> =
+        Arc::new(tools_registry_raw.iter().map(|t| t.spec()).collect());
+
+    // Cost tracker (optional)
+    let cost_tracker = if config.cost.enabled {
+        match CostTracker::new(config.cost.clone(), &config.workspace_dir) {
+            Ok(ct) => Some(Arc::new(ct)),
+            Err(e) => {
+                tracing::warn!("Failed to initialize cost tracker: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // SSE broadcast channel for real-time events
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
     // Extract webhook secret for authentication
     let webhook_secret_hash: Option<Arc<str>> =
         config.channels_config.webhook.as_ref().and_then(|webhook| {
@@ -429,6 +474,40 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         })
         .map(Arc::from);
 
+    // Nextcloud Talk channel (if configured)
+    let nextcloud_talk_channel: Option<Arc<NextcloudTalkChannel>> =
+        config.channels_config.nextcloud_talk.as_ref().map(|nc| {
+            Arc::new(NextcloudTalkChannel::new(
+                nc.base_url.clone(),
+                nc.app_token.clone(),
+                nc.allowed_users.clone(),
+            ))
+        });
+
+    // Nextcloud Talk webhook secret for signature verification
+    // Priority: environment variable > config file
+    let nextcloud_talk_webhook_secret: Option<Arc<str>> =
+        std::env::var("ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET")
+            .ok()
+            .and_then(|secret| {
+                let secret = secret.trim();
+                (!secret.is_empty()).then(|| secret.to_owned())
+            })
+            .or_else(|| {
+                config
+                    .channels_config
+                    .nextcloud_talk
+                    .as_ref()
+                    .and_then(|nc| {
+                        nc.webhook_secret
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|secret| !secret.is_empty())
+                            .map(ToOwned::to_owned)
+                    })
+            })
+            .map(Arc::from);
+
     // ── Pairing guard ──────────────────────────────────────
     let pairing = Arc::new(PairingGuard::new(
         config.gateway.require_pairing,
@@ -474,6 +553,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     if let Some(ref url) = tunnel_url {
         println!("  🌐 Public URL: {url}");
     }
+    println!("  🌐 Web Dashboard: http://{display_addr}/");
     println!("  POST /pair      — pair a new client (X-Pairing-Code header)");
     println!("  POST /webhook   — {{\"message\": \"your prompt\"}}");
     if whatsapp_channel.is_some() {
@@ -483,6 +563,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     if linq_channel.is_some() {
         println!("  POST /linq      — Linq message webhook (iMessage/RCS/SMS)");
     }
+    if nextcloud_talk_channel.is_some() {
+        println!("  POST /nextcloud-talk — Nextcloud Talk bot webhook");
+    }
+    println!("  GET  /api/*     — REST API (bearer token required)");
+    println!("  GET  /ws/chat   — WebSocket agent chat");
     println!("  GET  /health    — health check");
     println!("  GET  /metrics   — Prometheus metrics");
     if let Some(code) = pairing.pairing_code() {
@@ -501,9 +586,17 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     crate::health::mark_component_ok("gateway");
 
-    // Build shared state
-    let observer: Arc<dyn crate::observability::Observer> =
-        Arc::from(crate::observability::create_observer(&config.observability));
+    // Fire gateway start hook
+    if let Some(ref hooks) = hooks {
+        hooks.fire_gateway_start(host, actual_port).await;
+    }
+
+    // Wrap observer with broadcast capability for SSE
+    let broadcast_observer: Arc<dyn crate::observability::Observer> =
+        Arc::new(sse::BroadcastObserver::new(
+            crate::observability::create_observer(&config.observability),
+            event_tx.clone(),
+        ));
 
     let state = AppState {
         config: config_state,
@@ -521,11 +614,22 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         whatsapp_app_secret,
         linq: linq_channel,
         linq_signing_secret,
-        observer,
+        nextcloud_talk: nextcloud_talk_channel,
+        nextcloud_talk_webhook_secret,
+        observer: broadcast_observer,
+        tools_registry,
+        cost_tracker,
+        event_tx,
     };
+
+    // Config PUT needs larger body limit (1MB)
+    let config_put_router = Router::new()
+        .route("/api/config", put(api::handle_api_config_put))
+        .layer(RequestBodyLimitLayer::new(1_048_576));
 
     // Build router with middleware
     let app = Router::new()
+        // ── Existing routes ──
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
         .route("/pair", post(handle_pair))
@@ -533,12 +637,38 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
         .route("/linq", post(handle_linq_webhook))
+        .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
+        // ── Web Dashboard API routes ──
+        .route("/api/status", get(api::handle_api_status))
+        .route("/api/config", get(api::handle_api_config_get))
+        .route("/api/tools", get(api::handle_api_tools))
+        .route("/api/cron", get(api::handle_api_cron_list))
+        .route("/api/cron", post(api::handle_api_cron_add))
+        .route("/api/cron/{id}", delete(api::handle_api_cron_delete))
+        .route("/api/integrations", get(api::handle_api_integrations))
+        .route("/api/doctor", post(api::handle_api_doctor))
+        .route("/api/memory", get(api::handle_api_memory_list))
+        .route("/api/memory", post(api::handle_api_memory_store))
+        .route("/api/memory/{key}", delete(api::handle_api_memory_delete))
+        .route("/api/cost", get(api::handle_api_cost))
+        .route("/api/cli-tools", get(api::handle_api_cli_tools))
+        .route("/api/health", get(api::handle_api_health))
+        // ── SSE event stream ──
+        .route("/api/events", get(sse::handle_sse_events))
+        // ── WebSocket agent chat ──
+        .route("/ws/chat", get(ws::handle_ws_chat))
+        // ── Static assets (web dashboard) ──
+        .route("/_app/{*path}", get(static_files::handle_static))
+        // ── Config PUT with larger body limit ──
+        .merge(config_put_router)
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(REQUEST_TIMEOUT_SECS),
-        ));
+        ))
+        // ── SPA fallback: non-API GET requests serve index.html ──
+        .fallback(get(static_files::handle_spa_fallback));
 
     // Run the server
     axum::serve(
@@ -666,23 +796,9 @@ async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGua
     Ok(())
 }
 
-async fn run_gateway_chat_with_multimodal(
-    state: &AppState,
-    provider_label: &str,
-    message: &str,
-) -> anyhow::Result<String> {
+/// Simple chat for webhook endpoint (no tools, for backward compatibility and testing).
+async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Result<String> {
     let user_messages = vec![ChatMessage::user(message)];
-    let image_marker_count = crate::multimodal::count_image_markers(&user_messages);
-    if image_marker_count > 0 && !state.provider.supports_vision() {
-        return Err(ProviderCapabilityError {
-            provider: provider_label.to_string(),
-            capability: "vision".to_string(),
-            message: format!(
-                "received {image_marker_count} image marker(s), but this provider does not support vision input"
-            ),
-        }
-        .into());
-    }
 
     // Keep webhook/gateway prompts aligned with channel behavior by injecting
     // workspace-aware system context before model invocation.
@@ -710,6 +826,12 @@ async fn run_gateway_chat_with_multimodal(
         .provider
         .chat_with_history(&prepared.messages, &state.model, state.temperature)
         .await
+}
+
+/// Full-featured chat with tools for channel handlers (WhatsApp, Linq, Nextcloud Talk).
+async fn run_gateway_chat_with_tools(state: &AppState, message: &str) -> anyhow::Result<String> {
+    let config = state.config.lock().clone();
+    crate::agent::process_message(config, message).await
 }
 
 /// Webhook request body
@@ -833,7 +955,7 @@ async fn handle_webhook(
             messages_count: 1,
         });
 
-    match run_gateway_chat_with_multimodal(&state, &provider_label, message).await {
+    match run_gateway_chat_simple(&state, message).await {
         Ok(response) => {
             let duration = started_at.elapsed();
             state
@@ -844,6 +966,8 @@ async fn handle_webhook(
                     duration,
                     success: true,
                     error_message: None,
+                    input_tokens: None,
+                    output_tokens: None,
                 });
             state.observer.record_metric(
                 &crate::observability::traits::ObserverMetric::RequestLatency(duration),
@@ -873,6 +997,8 @@ async fn handle_webhook(
                     duration,
                     success: false,
                     error_message: Some(sanitized.clone()),
+                    input_tokens: None,
+                    output_tokens: None,
                 });
             state.observer.record_metric(
                 &crate::observability::traits::ObserverMetric::RequestLatency(duration),
@@ -1017,12 +1143,6 @@ async fn handle_whatsapp_message(
     }
 
     // Process each message
-    let provider_label = state
-        .config
-        .lock()
-        .default_provider
-        .clone()
-        .unwrap_or_else(|| "unknown".to_string());
     for msg in &messages {
         tracing::info!(
             "WhatsApp message from {}: {}",
@@ -1039,7 +1159,7 @@ async fn handle_whatsapp_message(
                 .await;
         }
 
-        match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content).await {
+        match run_gateway_chat_with_tools(&state, &msg.content).await {
             Ok(response) => {
                 // Send reply via WhatsApp
                 if let Err(e) = wa
@@ -1130,12 +1250,6 @@ async fn handle_linq_webhook(
     }
 
     // Process each message
-    let provider_label = state
-        .config
-        .lock()
-        .default_provider
-        .clone()
-        .unwrap_or_else(|| "unknown".to_string());
     for msg in &messages {
         tracing::info!(
             "Linq message from {}: {}",
@@ -1153,7 +1267,7 @@ async fn handle_linq_webhook(
         }
 
         // Call the LLM
-        match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content).await {
+        match run_gateway_chat_with_tools(&state, &msg.content).await {
             Ok(response) => {
                 // Send reply via Linq
                 if let Err(e) = linq
@@ -1179,6 +1293,108 @@ async fn handle_linq_webhook(
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
+/// POST /nextcloud-talk — incoming message webhook (Nextcloud Talk bot API)
+async fn handle_nextcloud_talk_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let Some(ref nextcloud_talk) = state.nextcloud_talk else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Nextcloud Talk not configured"})),
+        );
+    };
+
+    let body_str = String::from_utf8_lossy(&body);
+
+    // ── Security: Verify Nextcloud Talk HMAC signature if secret is configured ──
+    if let Some(ref webhook_secret) = state.nextcloud_talk_webhook_secret {
+        let random = headers
+            .get("X-Nextcloud-Talk-Random")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        let signature = headers
+            .get("X-Nextcloud-Talk-Signature")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        if !crate::channels::nextcloud_talk::verify_nextcloud_talk_signature(
+            webhook_secret,
+            random,
+            &body_str,
+            signature,
+        ) {
+            tracing::warn!(
+                "Nextcloud Talk webhook signature verification failed (signature: {})",
+                if signature.is_empty() {
+                    "missing"
+                } else {
+                    "invalid"
+                }
+            );
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Invalid signature"})),
+            );
+        }
+    }
+
+    // Parse JSON body
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid JSON payload"})),
+        );
+    };
+
+    // Parse messages from webhook payload
+    let messages = nextcloud_talk.parse_webhook_payload(&payload);
+    if messages.is_empty() {
+        // Acknowledge webhook even if payload does not contain actionable user messages.
+        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+    }
+
+    for msg in &messages {
+        tracing::info!(
+            "Nextcloud Talk message from {}: {}",
+            msg.sender,
+            truncate_with_ellipsis(&msg.content, 50)
+        );
+
+        if state.auto_save {
+            let key = nextcloud_talk_memory_key(msg);
+            let _ = state
+                .mem
+                .store(&key, &msg.content, MemoryCategory::Conversation, None)
+                .await;
+        }
+
+        match run_gateway_chat_with_tools(&state, &msg.content).await {
+            Ok(response) => {
+                if let Err(e) = nextcloud_talk
+                    .send(&SendMessage::new(response, &msg.reply_target))
+                    .await
+                {
+                    tracing::error!("Failed to send Nextcloud Talk reply: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::error!("LLM error for Nextcloud Talk message: {e:#}");
+                let _ = nextcloud_talk
+                    .send(&SendMessage::new(
+                        "Sorry, I couldn't process your message right now.",
+                        &msg.reply_target,
+                    ))
+                    .await;
+            }
+        }
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1194,8 +1410,7 @@ mod tests {
 
     /// Generate a random hex secret at runtime to avoid hard-coded cryptographic values.
     fn generate_test_secret() -> String {
-        use rand::Rng;
-        let bytes: [u8; 32] = rand::rng().random();
+        let bytes: [u8; 32] = rand::random();
         hex::encode(bytes)
     }
 
@@ -1255,7 +1470,12 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1298,7 +1518,12 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
             observer,
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1398,7 +1623,7 @@ mod tests {
 
     #[test]
     fn client_key_defaults_to_peer_addr_when_untrusted_proxy_mode() {
-        let peer = SocketAddr::from(([10, 0, 0, 5], 3000));
+        let peer = SocketAddr::from(([10, 0, 0, 5], 42617));
         let mut headers = HeaderMap::new();
         headers.insert(
             "X-Forwarded-For",
@@ -1411,7 +1636,7 @@ mod tests {
 
     #[test]
     fn client_key_uses_forwarded_ip_only_in_trusted_proxy_mode() {
-        let peer = SocketAddr::from(([10, 0, 0, 5], 3000));
+        let peer = SocketAddr::from(([10, 0, 0, 5], 42617));
         let mut headers = HeaderMap::new();
         headers.insert(
             "X-Forwarded-For",
@@ -1424,7 +1649,7 @@ mod tests {
 
     #[test]
     fn client_key_falls_back_to_peer_when_forwarded_header_invalid() {
-        let peer = SocketAddr::from(([10, 0, 0, 5], 3000));
+        let peer = SocketAddr::from(([10, 0, 0, 5], 42617));
         let mut headers = HeaderMap::new();
         headers.insert("X-Forwarded-For", HeaderValue::from_static("garbage-value"));
 
@@ -1658,7 +1883,12 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
         };
 
         let mut headers = HeaderMap::new();
@@ -1716,7 +1946,12 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
         };
 
         let headers = HeaderMap::new();
@@ -1786,7 +2021,12 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
         };
 
         let response = handle_webhook(
@@ -1828,7 +2068,12 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
         };
 
         let mut headers = HeaderMap::new();
@@ -1875,7 +2120,12 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
         };
 
         let mut headers = HeaderMap::new();
@@ -1894,6 +2144,115 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn compute_nextcloud_signature_hex(secret: &str, random: &str, body: &str) -> String {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let payload = format!("{random}{body}");
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(payload.as_bytes());
+        hex::encode(mac.finalize().into_bytes())
+    }
+
+    #[tokio::test]
+    async fn nextcloud_talk_webhook_returns_not_found_when_not_configured() {
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider::default());
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+        };
+
+        let response = handle_nextcloud_talk_webhook(
+            State(state),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"type":"message"}"#),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn nextcloud_talk_webhook_rejects_invalid_signature() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let channel = Arc::new(NextcloudTalkChannel::new(
+            "https://cloud.example.com".into(),
+            "app-token".into(),
+            vec!["*".into()],
+        ));
+
+        let secret = "nextcloud-test-secret";
+        let random = "seed-value";
+        let body = r#"{"type":"message","object":{"token":"room-token"},"message":{"actorType":"users","actorId":"user_a","message":"hello"}}"#;
+        let _valid_signature = compute_nextcloud_signature_hex(secret, random, body);
+        let invalid_signature = "deadbeef";
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: Some(channel),
+            nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Nextcloud-Talk-Random",
+            HeaderValue::from_str(random).unwrap(),
+        );
+        headers.insert(
+            "X-Nextcloud-Talk-Signature",
+            HeaderValue::from_str(invalid_signature).unwrap(),
+        );
+
+        let response = handle_nextcloud_talk_webhook(State(state), headers, Bytes::from(body))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
     }
 
     // ══════════════════════════════════════════════════════════
@@ -2088,5 +2447,199 @@ mod tests {
             body,
             &signature_header
         ));
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // IdempotencyStore Edge-Case Tests
+    // ══════════════════════════════════════════════════════════
+
+    #[test]
+    fn idempotency_store_allows_different_keys() {
+        let store = IdempotencyStore::new(Duration::from_secs(60), 100);
+        assert!(store.record_if_new("key-a"));
+        assert!(store.record_if_new("key-b"));
+        assert!(store.record_if_new("key-c"));
+        assert!(store.record_if_new("key-d"));
+    }
+
+    #[test]
+    fn idempotency_store_max_keys_clamped_to_one() {
+        let store = IdempotencyStore::new(Duration::from_secs(60), 0);
+        assert!(store.record_if_new("only-key"));
+        assert!(!store.record_if_new("only-key"));
+    }
+
+    #[test]
+    fn idempotency_store_rapid_duplicate_rejected() {
+        let store = IdempotencyStore::new(Duration::from_secs(300), 100);
+        assert!(store.record_if_new("rapid"));
+        assert!(!store.record_if_new("rapid"));
+    }
+
+    #[test]
+    fn idempotency_store_accepts_after_ttl_expires() {
+        let store = IdempotencyStore::new(Duration::from_millis(1), 100);
+        assert!(store.record_if_new("ttl-key"));
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(store.record_if_new("ttl-key"));
+    }
+
+    #[test]
+    fn idempotency_store_eviction_preserves_newest() {
+        let store = IdempotencyStore::new(Duration::from_secs(300), 1);
+        assert!(store.record_if_new("old-key"));
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(store.record_if_new("new-key"));
+
+        let keys = store.keys.lock();
+        assert_eq!(keys.len(), 1);
+        assert!(!keys.contains_key("old-key"));
+        assert!(keys.contains_key("new-key"));
+    }
+
+    #[test]
+    fn rate_limiter_allows_after_window_expires() {
+        let window = Duration::from_millis(50);
+        let limiter = SlidingWindowRateLimiter::new(2, window, 100);
+        assert!(limiter.allow("ip-1"));
+        assert!(limiter.allow("ip-1"));
+        assert!(!limiter.allow("ip-1")); // blocked
+
+        // Wait for window to expire
+        std::thread::sleep(Duration::from_millis(60));
+
+        // Should be allowed again
+        assert!(limiter.allow("ip-1"));
+    }
+
+    #[test]
+    fn rate_limiter_independent_keys_tracked_separately() {
+        let limiter = SlidingWindowRateLimiter::new(2, Duration::from_secs(60), 100);
+        assert!(limiter.allow("ip-1"));
+        assert!(limiter.allow("ip-1"));
+        assert!(!limiter.allow("ip-1")); // ip-1 blocked
+
+        // ip-2 should still work
+        assert!(limiter.allow("ip-2"));
+        assert!(limiter.allow("ip-2"));
+        assert!(!limiter.allow("ip-2")); // ip-2 now blocked
+    }
+
+    #[test]
+    fn rate_limiter_exact_boundary_at_max_keys() {
+        let limiter = SlidingWindowRateLimiter::new(10, Duration::from_secs(60), 3);
+        assert!(limiter.allow("ip-1"));
+        assert!(limiter.allow("ip-2"));
+        assert!(limiter.allow("ip-3"));
+        // At capacity now
+        assert!(limiter.allow("ip-4")); // should evict ip-1
+
+        let guard = limiter.requests.lock();
+        assert_eq!(guard.0.len(), 3);
+        assert!(
+            !guard.0.contains_key("ip-1"),
+            "ip-1 should have been evicted"
+        );
+        assert!(guard.0.contains_key("ip-2"));
+        assert!(guard.0.contains_key("ip-3"));
+        assert!(guard.0.contains_key("ip-4"));
+    }
+
+    #[test]
+    fn gateway_rate_limiter_pair_and_webhook_are_independent() {
+        let limiter = GatewayRateLimiter::new(2, 3, 100);
+
+        // Exhaust pair limit
+        assert!(limiter.allow_pair("ip-1"));
+        assert!(limiter.allow_pair("ip-1"));
+        assert!(!limiter.allow_pair("ip-1")); // pair blocked
+
+        // Webhook should still work
+        assert!(limiter.allow_webhook("ip-1"));
+        assert!(limiter.allow_webhook("ip-1"));
+        assert!(limiter.allow_webhook("ip-1"));
+        assert!(!limiter.allow_webhook("ip-1")); // webhook now blocked
+    }
+
+    #[test]
+    fn rate_limiter_single_key_max_allows_one_request() {
+        let limiter = SlidingWindowRateLimiter::new(5, Duration::from_secs(60), 1);
+        assert!(limiter.allow("ip-1"));
+        assert!(limiter.allow("ip-2")); // evicts ip-1
+
+        let guard = limiter.requests.lock();
+        assert_eq!(guard.0.len(), 1);
+        assert!(guard.0.contains_key("ip-2"));
+        assert!(!guard.0.contains_key("ip-1"));
+    }
+
+    #[test]
+    fn rate_limiter_concurrent_access_safe() {
+        use std::sync::Arc;
+
+        let limiter = Arc::new(SlidingWindowRateLimiter::new(
+            1000,
+            Duration::from_secs(60),
+            1000,
+        ));
+        let mut handles = Vec::new();
+
+        for i in 0..10 {
+            let limiter = limiter.clone();
+            handles.push(std::thread::spawn(move || {
+                for j in 0..100 {
+                    limiter.allow(&format!("thread-{i}-req-{j}"));
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Should not panic or deadlock
+        let guard = limiter.requests.lock();
+        assert!(guard.0.len() <= 1000, "should respect max_keys");
+    }
+
+    #[test]
+    fn idempotency_store_concurrent_access_safe() {
+        use std::sync::Arc;
+
+        let store = Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000));
+        let mut handles = Vec::new();
+
+        for i in 0..10 {
+            let store = store.clone();
+            handles.push(std::thread::spawn(move || {
+                for j in 0..100 {
+                    store.record_if_new(&format!("thread-{i}-key-{j}"));
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let keys = store.keys.lock();
+        assert!(keys.len() <= 1000, "should respect max_keys");
+    }
+
+    #[test]
+    fn rate_limiter_rapid_burst_then_cooldown() {
+        let limiter = SlidingWindowRateLimiter::new(5, Duration::from_millis(50), 100);
+
+        // Burst: use all 5 requests
+        for _ in 0..5 {
+            assert!(limiter.allow("burst-ip"));
+        }
+        assert!(!limiter.allow("burst-ip")); // 6th should fail
+
+        // Cooldown
+        std::thread::sleep(Duration::from_millis(60));
+
+        // Should be allowed again
+        assert!(limiter.allow("burst-ip"));
     }
 }

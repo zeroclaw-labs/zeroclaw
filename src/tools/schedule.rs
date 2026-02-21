@@ -55,6 +55,11 @@ impl Tool for ScheduleTool {
                     "type": "string",
                     "description": "Shell command to execute. Required for create/add/once."
                 },
+                "approved": {
+                    "type": "boolean",
+                    "description": "Set true to explicitly approve medium/high-risk shell commands in supervised mode",
+                    "default": false
+                },
                 "id": {
                     "type": "string",
                     "description": "Task ID. Required for get/cancel/remove/pause/resume."
@@ -83,7 +88,11 @@ impl Tool for ScheduleTool {
                 if let Some(blocked) = self.enforce_mutation_allowed(action) {
                     return Ok(blocked);
                 }
-                self.handle_create_like(action, &args)
+                let approved = args
+                    .get("approved")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                self.handle_create_like(action, &args, approved)
             }
             "cancel" | "remove" => {
                 if let Some(blocked) = self.enforce_mutation_allowed(action) {
@@ -128,6 +137,16 @@ impl Tool for ScheduleTool {
 
 impl ScheduleTool {
     fn enforce_mutation_allowed(&self, action: &str) -> Option<ToolResult> {
+        if !self.config.cron.enabled {
+            return Some(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "cron is disabled by config (cron.enabled=false); cannot perform '{action}'"
+                )),
+            });
+        }
+
         if !self.security.can_act() {
             return Some(ToolResult {
                 success: false,
@@ -219,12 +238,25 @@ impl ScheduleTool {
         }
     }
 
-    fn handle_create_like(&self, action: &str, args: &serde_json::Value) -> Result<ToolResult> {
+    fn handle_create_like(
+        &self,
+        action: &str,
+        args: &serde_json::Value,
+        approved: bool,
+    ) -> Result<ToolResult> {
         let command = args
             .get("command")
             .and_then(|value| value.as_str())
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| anyhow::anyhow!("Missing or empty 'command' parameter"))?;
+
+        if let Err(reason) = self.security.validate_command_execution(command, approved) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(reason),
+            });
+        }
 
         let expression = args.get("expression").and_then(|value| value.as_str());
         let delay = args.get("delay").and_then(|value| value.as_str());
@@ -517,6 +549,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rate_limit_blocks_create_action() {
+        let tmp = TempDir::new().unwrap();
+        let config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            autonomy: crate::config::AutonomyConfig {
+                level: AutonomyLevel::Full,
+                max_actions_per_hour: 0,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        tokio::fs::create_dir_all(&config.workspace_dir)
+            .await
+            .unwrap();
+        let security = Arc::new(SecurityPolicy::from_config(
+            &config.autonomy,
+            &config.workspace_dir,
+        ));
+        let tool = ScheduleTool::new(security, config);
+
+        let blocked = tool
+            .execute(json!({
+                "action": "create",
+                "expression": "*/5 * * * *",
+                "command": "echo blocked-by-rate-limit"
+            }))
+            .await
+            .unwrap();
+        assert!(!blocked.success);
+        assert!(blocked
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Rate limit exceeded"));
+
+        let list = tool.execute(json!({"action": "list"})).await.unwrap();
+        assert!(list.success);
+        assert!(list.output.contains("No scheduled jobs"));
+    }
+
+    #[tokio::test]
+    async fn rate_limit_blocks_cancel_and_keeps_job() {
+        let tmp = TempDir::new().unwrap();
+        let config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            autonomy: crate::config::AutonomyConfig {
+                level: AutonomyLevel::Full,
+                max_actions_per_hour: 1,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        tokio::fs::create_dir_all(&config.workspace_dir)
+            .await
+            .unwrap();
+        let security = Arc::new(SecurityPolicy::from_config(
+            &config.autonomy,
+            &config.workspace_dir,
+        ));
+        let tool = ScheduleTool::new(security, config);
+
+        let create = tool
+            .execute(json!({
+                "action": "create",
+                "expression": "*/5 * * * *",
+                "command": "echo keep-me"
+            }))
+            .await
+            .unwrap();
+        assert!(create.success);
+        let id = create.output.split_whitespace().nth(3).unwrap();
+
+        let cancel = tool
+            .execute(json!({"action": "cancel", "id": id}))
+            .await
+            .unwrap();
+        assert!(!cancel.success);
+        assert!(cancel
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Rate limit exceeded"));
+
+        let get = tool
+            .execute(json!({"action": "get", "id": id}))
+            .await
+            .unwrap();
+        assert!(get.success);
+        assert!(get.output.contains("echo keep-me"));
+    }
+
+    #[tokio::test]
     async fn unknown_action_returns_failure() {
         let (_tmp, config, security) = test_setup().await;
         let tool = ScheduleTool::new(security, config);
@@ -524,5 +650,116 @@ mod tests {
         let result = tool.execute(json!({"action": "explode"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap().contains("Unknown action"));
+    }
+
+    #[tokio::test]
+    async fn mutating_actions_fail_when_cron_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.cron.enabled = false;
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let security = Arc::new(SecurityPolicy::from_config(
+            &config.autonomy,
+            &config.workspace_dir,
+        ));
+        let tool = ScheduleTool::new(security, config);
+
+        let create = tool
+            .execute(json!({
+                "action": "create",
+                "expression": "*/5 * * * *",
+                "command": "echo hello"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!create.success);
+        assert!(create
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("cron is disabled"));
+    }
+
+    #[tokio::test]
+    async fn create_blocks_disallowed_command() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.autonomy.level = AutonomyLevel::Supervised;
+        config.autonomy.allowed_commands = vec!["echo".into()];
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let security = Arc::new(SecurityPolicy::from_config(
+            &config.autonomy,
+            &config.workspace_dir,
+        ));
+        let tool = ScheduleTool::new(security, config);
+
+        let result = tool
+            .execute(json!({
+                "action": "create",
+                "expression": "*/5 * * * *",
+                "command": "curl https://example.com"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("not allowed"));
+    }
+
+    #[tokio::test]
+    async fn medium_risk_create_requires_approval() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.autonomy.level = AutonomyLevel::Supervised;
+        config.autonomy.allowed_commands = vec!["touch".into()];
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let security = Arc::new(SecurityPolicy::from_config(
+            &config.autonomy,
+            &config.workspace_dir,
+        ));
+        let tool = ScheduleTool::new(security, config);
+
+        let denied = tool
+            .execute(json!({
+                "action": "create",
+                "expression": "*/5 * * * *",
+                "command": "touch schedule-policy-test"
+            }))
+            .await
+            .unwrap();
+        assert!(!denied.success);
+        assert!(denied
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("explicit approval"));
+
+        let approved = tool
+            .execute(json!({
+                "action": "create",
+                "expression": "*/5 * * * *",
+                "command": "touch schedule-policy-test",
+                "approved": true
+            }))
+            .await
+            .unwrap();
+        assert!(approved.success, "{:?}", approved.error);
     }
 }

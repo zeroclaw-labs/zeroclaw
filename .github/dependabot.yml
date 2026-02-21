@@ -4,8 +4,8 @@ updates:
   - package-ecosystem: cargo
     directory: "/"
     schedule:
-      interval: monthly
-    target-branch: main
+      interval: daily
+    target-branch: dev
     open-pull-requests-limit: 3
     labels:
       - "dependencies"
@@ -20,8 +20,8 @@ updates:
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
-      interval: monthly
-    target-branch: main
+      interval: daily
+    target-branch: dev
     open-pull-requests-limit: 1
     labels:
       - "ci"
@@ -37,31 +37,14 @@ updates:
   - package-ecosystem: docker
     directory: "/"
     schedule:
-      interval: monthly
-    target-branch: main
+      interval: daily
+    target-branch: dev
     open-pull-requests-limit: 1
     labels:
       - "ci"
       - "dependencies"
     groups:
       docker-all:
-        patterns:
-          - "*"
-        update-types:
-          - minor
-          - patch
-
-  - package-ecosystem: docker
-    directory: "/"
-    schedule:
-      interval: weekly
-    target-branch: main
-    open-pull-requests-limit: 3
-    labels:
-      - "ci"
-      - "dependencies"
-    groups:
-      docker-minor-patch:
         patterns:
           - "*"
         update-types:

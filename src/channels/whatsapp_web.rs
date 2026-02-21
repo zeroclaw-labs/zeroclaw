@@ -15,7 +15,7 @@
 //! # Configuration
 //!
 //! ```toml
-//! [channels.whatsapp]
+//! [channels_config.whatsapp]
 //! session_path = "~/.zeroclaw/whatsapp-session.db"  # Required for Web mode
 //! pair_phone = "15551234567"  # Optional: for pair code linking
 //! allowed_numbers = ["+1234567890", "*"]  # Same as Cloud API
@@ -43,7 +43,7 @@ use tokio::select;
 /// # Configuration
 ///
 /// ```toml
-/// [channels.whatsapp]
+/// [channels_config.whatsapp]
 /// session_path = "~/.zeroclaw/whatsapp-session.db"
 /// pair_phone = "15551234567"  # Optional
 /// allowed_numbers = ["+1234567890", "*"]
@@ -96,8 +96,7 @@ impl WhatsAppWebChannel {
     /// Check if a phone number is allowed (E.164 format: +1234567890)
     #[cfg(feature = "whatsapp-web")]
     fn is_number_allowed(&self, phone: &str) -> bool {
-        self.allowed_numbers.is_empty()
-            || self.allowed_numbers.iter().any(|n| n == "*" || n == phone)
+        self.allowed_numbers.iter().any(|n| n == "*" || n == phone)
     }
 
     /// Normalize phone number to E.164 format
@@ -114,6 +113,12 @@ impl WhatsAppWebChannel {
         } else {
             format!("+{normalized_user}")
         }
+    }
+
+    /// Whether the recipient string is a WhatsApp JID (contains a domain suffix).
+    #[cfg(feature = "whatsapp-web")]
+    fn is_jid(recipient: &str) -> bool {
+        recipient.trim().contains('@')
     }
 
     /// Convert a recipient to a wa-rs JID.
@@ -156,14 +161,16 @@ impl Channel for WhatsAppWebChannel {
             anyhow::bail!("WhatsApp Web client not connected. Initialize the bot first.");
         };
 
-        // Validate recipient is allowed
-        let normalized = self.normalize_phone(&message.recipient);
-        if !self.is_number_allowed(&normalized) {
-            tracing::warn!(
-                "WhatsApp Web: recipient {} not in allowed list",
-                message.recipient
-            );
-            return Ok(());
+        // Validate recipient allowlist only for direct phone-number targets.
+        if !Self::is_jid(&message.recipient) {
+            let normalized = self.normalize_phone(&message.recipient);
+            if !self.is_number_allowed(&normalized) {
+                tracing::warn!(
+                    "WhatsApp Web: recipient {} not in allowed list",
+                    message.recipient
+                );
+                return Ok(());
+            }
         }
 
         let to = self.recipient_to_jid(&message.recipient)?;
@@ -246,7 +253,12 @@ impl Channel for WhatsAppWebChannel {
                             let sender = info.source.sender.user().to_string();
                             let chat = info.source.chat.to_string();
 
-                            tracing::info!("📨 WhatsApp message from {} in {}: {}", sender, chat, text);
+                            tracing::info!(
+                                "WhatsApp Web message from {} in {}: {}",
+                                sender,
+                                chat,
+                                text
+                            );
 
                             // Check if sender is allowed
                             let normalized = if sender.starts_with('+') {
@@ -255,17 +267,26 @@ impl Channel for WhatsAppWebChannel {
                                 format!("+{sender}")
                             };
 
-                            if allowed_numbers.is_empty()
-                                || allowed_numbers.iter().any(|n| n == "*" || n == &normalized)
-                            {
+                            if allowed_numbers.iter().any(|n| n == "*" || n == &normalized) {
+                                let trimmed = text.trim();
+                                if trimmed.is_empty() {
+                                    tracing::debug!(
+                                        "WhatsApp Web: ignoring empty or non-text message from {}",
+                                        normalized
+                                    );
+                                    return;
+                                }
+
                                 if let Err(e) = tx_inner
                                     .send(ChannelMessage {
                                         id: uuid::Uuid::new_v4().to_string(),
                                         channel: "whatsapp".to_string(),
                                         sender: normalized.clone(),
-                                        reply_target: normalized.clone(),
-                                        content: text.to_string(),
-                                        timestamp: chrono::Utc::now().timestamp_millis() as u64,
+                                        // Reply to the originating chat JID (DM or group).
+                                        reply_target: chat,
+                                        content: trimmed.to_string(),
+                                        timestamp: chrono::Utc::now().timestamp() as u64,
+                                        thread_ts: None,
                                     })
                                     .await
                                 {
@@ -276,20 +297,24 @@ impl Channel for WhatsAppWebChannel {
                             }
                         }
                         Event::Connected(_) => {
-                            tracing::info!("✅ WhatsApp Web connected successfully!");
+                            tracing::info!("WhatsApp Web connected successfully");
                         }
                         Event::LoggedOut(_) => {
-                            tracing::warn!("❌ WhatsApp Web was logged out!");
+                            tracing::warn!("WhatsApp Web was logged out");
                         }
                         Event::StreamError(stream_error) => {
-                            tracing::error!("❌ WhatsApp Web stream error: {:?}", stream_error);
+                            tracing::error!("WhatsApp Web stream error: {:?}", stream_error);
                         }
                         Event::PairingCode { code, .. } => {
-                            tracing::info!("🔑 Pair code received: {}", code);
-                            tracing::info!("Link your phone by entering this code in WhatsApp > Linked Devices");
+                            tracing::info!("WhatsApp Web pair code received: {}", code);
+                            tracing::info!(
+                                "Link your phone by entering this code in WhatsApp > Linked Devices"
+                            );
                         }
                         Event::PairingQrCode { code, .. } => {
-                            tracing::info!("📱 QR code received (scan with WhatsApp > Linked Devices)");
+                            tracing::info!(
+                                "WhatsApp Web QR code received (scan with WhatsApp > Linked Devices)"
+                            );
                             tracing::debug!("QR code: {}", code);
                         }
                         _ => {}
@@ -352,13 +377,15 @@ impl Channel for WhatsAppWebChannel {
             anyhow::bail!("WhatsApp Web client not connected. Initialize the bot first.");
         };
 
-        let normalized = self.normalize_phone(recipient);
-        if !self.is_number_allowed(&normalized) {
-            tracing::warn!(
-                "WhatsApp Web: typing target {} not in allowed list",
-                recipient
-            );
-            return Ok(());
+        if !Self::is_jid(recipient) {
+            let normalized = self.normalize_phone(recipient);
+            if !self.is_number_allowed(&normalized) {
+                tracing::warn!(
+                    "WhatsApp Web: typing target {} not in allowed list",
+                    recipient
+                );
+                return Ok(());
+            }
         }
 
         let to = self.recipient_to_jid(recipient)?;
@@ -378,13 +405,15 @@ impl Channel for WhatsAppWebChannel {
             anyhow::bail!("WhatsApp Web client not connected. Initialize the bot first.");
         };
 
-        let normalized = self.normalize_phone(recipient);
-        if !self.is_number_allowed(&normalized) {
-            tracing::warn!(
-                "WhatsApp Web: typing target {} not in allowed list",
-                recipient
-            );
-            return Ok(());
+        if !Self::is_jid(recipient) {
+            let normalized = self.normalize_phone(recipient);
+            if !self.is_number_allowed(&normalized) {
+                tracing::warn!(
+                    "WhatsApp Web: typing target {} not in allowed list",
+                    recipient
+                );
+                return Ok(());
+            }
         }
 
         let to = self.recipient_to_jid(recipient)?;
@@ -498,8 +527,8 @@ mod tests {
     #[cfg(feature = "whatsapp-web")]
     fn whatsapp_web_number_denied_empty() {
         let ch = WhatsAppWebChannel::new("/tmp/test.db".into(), None, None, vec![]);
-        // Empty allowed_numbers means "allow all" (same behavior as Cloud API)
-        assert!(ch.is_number_allowed("+1234567890"));
+        // Empty allowlist means "deny all" (matches channel-wide allowlist policy).
+        assert!(!ch.is_number_allowed("+1234567890"));
     }
 
     #[test]
@@ -514,6 +543,16 @@ mod tests {
     fn whatsapp_web_normalize_phone_preserves_plus() {
         let ch = make_channel();
         assert_eq!(ch.normalize_phone("+1234567890"), "+1234567890");
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_normalize_phone_from_jid() {
+        let ch = make_channel();
+        assert_eq!(
+            ch.normalize_phone("1234567890@s.whatsapp.net"),
+            "+1234567890"
+        );
     }
 
     #[tokio::test]

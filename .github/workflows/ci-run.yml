@@ -2,9 +2,9 @@ name: CI Run
 
 on:
     push:
-        branches: [main]
+        branches: [dev, main]
     pull_request:
-        branches: [main]
+        branches: [dev, main]
 
 concurrency:
     group: ci-${{ github.event.pull_request.number || github.sha }}
@@ -91,7 +91,9 @@ jobs:
                   toolchain: 1.92.0
             - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
             - name: Build binary (smoke check)
-              run: cargo build --locked --verbose
+              run: cargo build --profile release-fast --locked --verbose
+            - name: Check binary size
+              run: bash scripts/ci/check_binary_size.sh target/release-fast/zeroclaw
 
     docs-only:
         name: Docs-Only Fast Path
@@ -212,10 +214,29 @@ jobs:
                   script: |
                     const script = require('./.github/workflows/scripts/ci_workflow_owner_approval.js');
                     await script({ github, context, core });
+
+    license-file-owner-guard:
+        name: License File Owner Guard
+        needs: [changes]
+        if: github.event_name == 'pull_request'
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        permissions:
+            contents: read
+            pull-requests: read
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - name: Enforce owner-only edits for root license files
+              uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+              with:
+                  script: |
+                    const script = require('./.github/workflows/scripts/ci_license_file_owner_guard.js');
+                    await script({ github, context, core });
     ci-required:
         name: CI Required Gate
         if: always()
-        needs: [changes, lint, test, build, docs-only, non-rust, docs-quality, lint-feedback, workflow-owner-approval]
+        needs: [changes, lint, test, build, docs-only, non-rust, docs-quality, lint-feedback, workflow-owner-approval, license-file-owner-guard]
         runs-on: blacksmith-2vcpu-ubuntu-2404
         steps:
             - name: Enforce required status
@@ -229,11 +250,17 @@ jobs:
                   workflow_changed="${{ needs.changes.outputs.workflow_changed }}"
                   docs_result="${{ needs.docs-quality.result }}"
                   workflow_owner_result="${{ needs.workflow-owner-approval.result }}"
+                  license_owner_result="${{ needs.license-file-owner-guard.result }}"
 
                   if [ "${{ needs.changes.outputs.docs_only }}" = "true" ]; then
                     echo "workflow_owner_approval=${workflow_owner_result}"
-                    if [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
+                    echo "license_file_owner_guard=${license_owner_result}"
+                    if [ "$event_name" = "pull_request" ] && [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
                       echo "Workflow files changed but workflow owner approval gate did not pass."
+                      exit 1
+                    fi
+                    if [ "$event_name" = "pull_request" ] && [ "$license_owner_result" != "success" ]; then
+                      echo "License file owner guard did not pass."
                       exit 1
                     fi
                     if [ "$event_name" != "pull_request" ] && [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
@@ -247,8 +274,13 @@ jobs:
                   if [ "$rust_changed" != "true" ]; then
                     echo "rust_changed=false (non-rust fast path)"
                     echo "workflow_owner_approval=${workflow_owner_result}"
-                    if [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
+                    echo "license_file_owner_guard=${license_owner_result}"
+                    if [ "$event_name" = "pull_request" ] && [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
                       echo "Workflow files changed but workflow owner approval gate did not pass."
+                      exit 1
+                    fi
+                    if [ "$event_name" = "pull_request" ] && [ "$license_owner_result" != "success" ]; then
+                      echo "License file owner guard did not pass."
                       exit 1
                     fi
                     if [ "$event_name" != "pull_request" ] && [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
@@ -270,9 +302,15 @@ jobs:
                   echo "build=${build_result}"
                   echo "docs=${docs_result}"
                   echo "workflow_owner_approval=${workflow_owner_result}"
+                  echo "license_file_owner_guard=${license_owner_result}"
 
-                  if [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
+                  if [ "$event_name" = "pull_request" ] && [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
                     echo "Workflow files changed but workflow owner approval gate did not pass."
+                    exit 1
+                  fi
+
+                  if [ "$event_name" = "pull_request" ] && [ "$license_owner_result" != "success" ]; then
+                    echo "License file owner guard did not pass."
                     exit 1
                   fi
 

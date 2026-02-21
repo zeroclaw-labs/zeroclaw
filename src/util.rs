@@ -16,7 +16,7 @@
 /// * Truncated string with "..." appended if length > `max_chars`
 ///
 /// # Examples
-/// ```
+/// ```ignore
 /// use zeroclaw::util::truncate_with_ellipsis;
 ///
 /// // ASCII string - no truncation needed

@@ -1,12 +1,35 @@
+//! Security subsystem for policy enforcement, sandboxing, and secret management.
+//!
+//! This module provides the security infrastructure for ZeroClaw. The core type
+//! [`SecurityPolicy`] defines autonomy levels, workspace boundaries, and
+//! access-control rules that are enforced across the tool and runtime subsystems.
+//! [`PairingGuard`] implements device pairing for channel authentication, and
+//! [`SecretStore`] handles encrypted credential storage.
+//!
+//! OS-level isolation is provided through the [`Sandbox`] trait defined in
+//! [`traits`], with pluggable backends including Docker, Firejail, Bubblewrap,
+//! and Landlock. The [`create_sandbox`] function selects the best available
+//! backend at runtime. An [`AuditLogger`] records security-relevant events for
+//! forensic review.
+//!
+//! # Extension
+//!
+//! To add a new sandbox backend, implement [`Sandbox`] in a new submodule and
+//! register it in [`detect::create_sandbox`]. See `AGENTS.md` §7.5 for security
+//! change guidelines.
+
 pub mod audit;
 #[cfg(feature = "sandbox-bubblewrap")]
 pub mod bubblewrap;
 pub mod detect;
 pub mod docker;
+pub mod domain_matcher;
+pub mod estop;
 #[cfg(target_os = "linux")]
 pub mod firejail;
 #[cfg(feature = "sandbox-landlock")]
 pub mod landlock;
+pub mod otp;
 pub mod pairing;
 pub mod policy;
 pub mod secrets;
@@ -16,6 +39,11 @@ pub mod traits;
 pub use audit::{AuditEvent, AuditEventType, AuditLogger};
 #[allow(unused_imports)]
 pub use detect::create_sandbox;
+pub use domain_matcher::DomainMatcher;
+#[allow(unused_imports)]
+pub use estop::{EstopLevel, EstopManager, EstopState, ResumeSelector};
+#[allow(unused_imports)]
+pub use otp::OtpValidator;
 #[allow(unused_imports)]
 pub use pairing::PairingGuard;
 pub use policy::{AutonomyLevel, SecurityPolicy};

@@ -17,30 +17,34 @@ use tokio::time::{self, Duration};
 
 const MIN_POLL_SECONDS: u64 = 5;
 const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
+const SCHEDULER_COMPONENT: &str = "scheduler";
 
 pub async fn run(config: Config) -> Result<()> {
     let poll_secs = config.reliability.scheduler_poll_secs.max(MIN_POLL_SECONDS);
     let mut interval = time::interval(Duration::from_secs(poll_secs));
+    interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let security = Arc::new(SecurityPolicy::from_config(
         &config.autonomy,
         &config.workspace_dir,
     ));
 
-    crate::health::mark_component_ok("scheduler");
+    crate::health::mark_component_ok(SCHEDULER_COMPONENT);
 
     loop {
         interval.tick().await;
+        // Keep scheduler liveness fresh even when there are no due jobs.
+        crate::health::mark_component_ok(SCHEDULER_COMPONENT);
 
         let jobs = match due_jobs(&config, Utc::now()) {
             Ok(jobs) => jobs,
             Err(e) => {
-                crate::health::mark_component_error("scheduler", e.to_string());
+                crate::health::mark_component_error(SCHEDULER_COMPONENT, e.to_string());
                 tracing::warn!("Scheduler query failed: {e}");
                 continue;
             }
         };
 
-        process_due_jobs(&config, &security, jobs).await;
+        process_due_jobs(&config, &security, jobs, SCHEDULER_COMPONENT).await;
     }
 }
 
@@ -61,7 +65,7 @@ async fn execute_job_with_retry(
     for attempt in 0..=retries {
         let (success, output) = match job.job_type {
             JobType::Shell => run_job_command(config, security, job).await,
-            JobType::Agent => run_agent_job(config, job).await,
+            JobType::Agent => run_agent_job(config, security, job).await,
         };
         last_output = output;
 
@@ -84,18 +88,32 @@ async fn execute_job_with_retry(
     (false, last_output)
 }
 
-async fn process_due_jobs(config: &Config, security: &Arc<SecurityPolicy>, jobs: Vec<CronJob>) {
+async fn process_due_jobs(
+    config: &Config,
+    security: &Arc<SecurityPolicy>,
+    jobs: Vec<CronJob>,
+    component: &str,
+) {
+    // Refresh scheduler health on every successful poll cycle, including idle cycles.
+    crate::health::mark_component_ok(component);
+
     let max_concurrent = config.scheduler.max_concurrent.max(1);
-    let mut in_flight = stream::iter(jobs.into_iter().map(|job| {
-        let config = config.clone();
-        let security = Arc::clone(security);
-        async move { execute_and_persist_job(&config, security.as_ref(), &job).await }
-    }))
-    .buffer_unordered(max_concurrent);
+    let mut in_flight =
+        stream::iter(
+            jobs.into_iter().map(|job| {
+                let config = config.clone();
+                let security = Arc::clone(security);
+                let component = component.to_owned();
+                async move {
+                    execute_and_persist_job(&config, security.as_ref(), &job, &component).await
+                }
+            }),
+        )
+        .buffer_unordered(max_concurrent);
 
     while let Some((job_id, success)) = in_flight.next().await {
         if !success {
-            crate::health::mark_component_error("scheduler", format!("job {job_id} failed"));
+            tracing::warn!("Scheduler job '{job_id}' failed");
         }
     }
 }
@@ -104,8 +122,9 @@ async fn execute_and_persist_job(
     config: &Config,
     security: &SecurityPolicy,
     job: &CronJob,
+    component: &str,
 ) -> (String, bool) {
-    crate::health::mark_component_ok("scheduler");
+    crate::health::mark_component_ok(component);
     warn_if_high_frequency_agent_job(job);
 
     let started_at = Utc::now();
@@ -116,7 +135,31 @@ async fn execute_and_persist_job(
     (job.id.clone(), success)
 }
 
-async fn run_agent_job(config: &Config, job: &CronJob) -> (bool, String) {
+async fn run_agent_job(
+    config: &Config,
+    security: &SecurityPolicy,
+    job: &CronJob,
+) -> (bool, String) {
+    if !security.can_act() {
+        return (
+            false,
+            "blocked by security policy: autonomy is read-only".to_string(),
+        );
+    }
+
+    if security.is_rate_limited() {
+        return (
+            false,
+            "blocked by security policy: rate limit exceeded".to_string(),
+        );
+    }
+
+    if !security.record_action() {
+        return (
+            false,
+            "blocked by security policy: action budget exhausted".to_string(),
+        );
+    }
     let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
     let prompt = job.prompt.clone().unwrap_or_default();
     let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
@@ -131,6 +174,7 @@ async fn run_agent_job(config: &Config, job: &CronJob) -> (bool, String) {
                 model_override,
                 config.default_temperature,
                 vec![],
+                false,
             )
             .await
         }
@@ -316,64 +360,6 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
     Ok(())
 }
 
-fn is_env_assignment(word: &str) -> bool {
-    word.contains('=')
-        && word
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-}
-
-fn strip_wrapping_quotes(token: &str) -> &str {
-    token.trim_matches(|c| c == '"' || c == '\'')
-}
-
-fn forbidden_path_argument(security: &SecurityPolicy, command: &str) -> Option<String> {
-    let mut normalized = command.to_string();
-    for sep in ["&&", "||"] {
-        normalized = normalized.replace(sep, "\x00");
-    }
-    for sep in ['\n', ';', '|'] {
-        normalized = normalized.replace(sep, "\x00");
-    }
-
-    for segment in normalized.split('\x00') {
-        let tokens: Vec<&str> = segment.split_whitespace().collect();
-        if tokens.is_empty() {
-            continue;
-        }
-
-        // Skip leading env assignments and executable token.
-        let mut idx = 0;
-        while idx < tokens.len() && is_env_assignment(tokens[idx]) {
-            idx += 1;
-        }
-        if idx >= tokens.len() {
-            continue;
-        }
-        idx += 1;
-
-        for token in &tokens[idx..] {
-            let candidate = strip_wrapping_quotes(token);
-            if candidate.is_empty() || candidate.starts_with('-') || candidate.contains("://") {
-                continue;
-            }
-
-            let looks_like_path = candidate.starts_with('/')
-                || candidate.starts_with("./")
-                || candidate.starts_with("../")
-                || candidate.starts_with("~/")
-                || candidate.contains('/');
-
-            if looks_like_path && !security.is_path_allowed(candidate) {
-                return Some(candidate.to_string());
-            }
-        }
-    }
-
-    None
-}
-
 async fn run_job_command(
     config: &Config,
     security: &SecurityPolicy,
@@ -418,7 +404,7 @@ async fn run_job_command_with_timeout(
         );
     }
 
-    if let Some(path) = forbidden_path_argument(security, &job.command) {
+    if let Some(path) = security.forbidden_path_argument(&job.command) {
         return (
             false,
             format!("blocked by security policy: forbidden path argument: {path}"),
@@ -512,6 +498,10 @@ mod tests {
         }
     }
 
+    fn unique_component(prefix: &str) -> String {
+        format!("{prefix}-{}", uuid::Uuid::new_v4())
+    }
+
     #[tokio::test]
     async fn run_job_command_success() {
         let tmp = TempDir::new().unwrap();
@@ -579,6 +569,65 @@ mod tests {
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("forbidden path argument"));
         assert!(output.contains("/etc/passwd"));
+    }
+
+    #[tokio::test]
+    async fn run_job_command_blocks_forbidden_option_assignment_path_argument() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.allowed_commands = vec!["grep".into()];
+        let job = test_job("grep --file=/etc/passwd root ./src");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(!success);
+        assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("forbidden path argument"));
+        assert!(output.contains("/etc/passwd"));
+    }
+
+    #[tokio::test]
+    async fn run_job_command_blocks_forbidden_short_option_attached_path_argument() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.allowed_commands = vec!["grep".into()];
+        let job = test_job("grep -f/etc/passwd root ./src");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(!success);
+        assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("forbidden path argument"));
+        assert!(output.contains("/etc/passwd"));
+    }
+
+    #[tokio::test]
+    async fn run_job_command_blocks_tilde_user_path_argument() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.allowed_commands = vec!["cat".into()];
+        let job = test_job("cat ~root/.ssh/id_rsa");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(!success);
+        assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("forbidden path argument"));
+        assert!(output.contains("~root/.ssh/id_rsa"));
+    }
+
+    #[tokio::test]
+    async fn run_job_command_blocks_input_redirection_path_bypass() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.allowed_commands = vec!["cat".into()];
+        let job = test_job("cat </etc/passwd");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(!success);
+        assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("command not allowed"));
     }
 
     #[tokio::test]
@@ -653,13 +702,82 @@ mod tests {
         let mut job = test_job("");
         job.job_type = JobType::Agent;
         job.prompt = Some("Say hello".into());
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) = run_agent_job(&config, &job).await;
-        assert!(!success, "Agent job without provider key should fail");
-        assert!(
-            !output.is_empty(),
-            "Expected non-empty error output from failed agent job"
-        );
+        let (success, output) = run_agent_job(&config, &security, &job).await;
+        assert!(!success);
+        assert!(output.contains("agent job failed:"));
+    }
+
+    #[tokio::test]
+    async fn run_agent_job_blocks_readonly_mode() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("Say hello".into());
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_agent_job(&config, &security, &job).await;
+        assert!(!success);
+        assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("read-only"));
+    }
+
+    #[tokio::test]
+    async fn run_agent_job_blocks_rate_limited() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.max_actions_per_hour = 0;
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("Say hello".into());
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_agent_job(&config, &security, &job).await;
+        assert!(!success);
+        assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("rate limit exceeded"));
+    }
+
+    #[tokio::test]
+    async fn process_due_jobs_marks_component_ok_even_when_idle() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let security = Arc::new(SecurityPolicy::from_config(
+            &config.autonomy,
+            &config.workspace_dir,
+        ));
+        let component = unique_component("scheduler-idle");
+
+        crate::health::mark_component_error(&component, "pre-existing error");
+        process_due_jobs(&config, &security, Vec::new(), &component).await;
+
+        let snapshot = crate::health::snapshot_json();
+        let entry = &snapshot["components"][component.as_str()];
+        assert_eq!(entry["status"], "ok");
+        assert!(entry["last_ok"].as_str().is_some());
+        assert!(entry["last_error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn process_due_jobs_failure_does_not_mark_component_unhealthy() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = test_job("ls definitely_missing_file_for_scheduler_component_health_test");
+        let security = Arc::new(SecurityPolicy::from_config(
+            &config.autonomy,
+            &config.workspace_dir,
+        ));
+        let component = unique_component("scheduler-fail");
+
+        crate::health::mark_component_ok(&component);
+        process_due_jobs(&config, &security, vec![job], &component).await;
+
+        let snapshot = crate::health::snapshot_json();
+        let entry = &snapshot["components"][component.as_str()];
+        assert_eq!(entry["status"], "ok");
     }
 
     #[tokio::test]

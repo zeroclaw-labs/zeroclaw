@@ -2,22 +2,9 @@ name: Pub Docker Img
 
 on:
     push:
-        branches: [main]
         tags: ["v*"]
-        paths:
-            - "Dockerfile"
-            - ".dockerignore"
-            - "Cargo.toml"
-            - "Cargo.lock"
-            - "rust-toolchain.toml"
-            - "src/**"
-            - "crates/**"
-            - "benches/**"
-            - "firmware/**"
-            - "dev/config.template.toml"
-            - ".github/workflows/pub-docker-img.yml"
     pull_request:
-        branches: [main]
+        branches: [dev, main]
         paths:
             - "Dockerfile"
             - ".dockerignore"
@@ -78,7 +65,7 @@ jobs:
 
     publish:
         name: Build and Push Docker Image
-        if: (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))) && github.repository == 'zeroclaw-labs/zeroclaw'
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && github.repository == 'zeroclaw-labs/zeroclaw'
         runs-on: blacksmith-2vcpu-ubuntu-2404
         timeout-minutes: 45
         permissions:
@@ -105,17 +92,13 @@ jobs:
                   set -euo pipefail
                   IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
                   SHA_TAG="${IMAGE}:sha-${GITHUB_SHA::12}"
-
-                  if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-                    TAG_NAME="${GITHUB_REF#refs/tags/}"
-                    TAGS="${IMAGE}:${TAG_NAME},${SHA_TAG}"
-                  elif [[ "${GITHUB_REF}" == "refs/heads/main" ]]; then
-                    TAGS="${IMAGE}:latest,${SHA_TAG}"
-                  else
-                    BRANCH_NAME="${GITHUB_REF#refs/heads/}"
-                    BRANCH_NAME="${BRANCH_NAME//\//-}"
-                    TAGS="${IMAGE}:${BRANCH_NAME},${SHA_TAG}"
+                  if [[ "${GITHUB_REF}" != refs/tags/v* ]]; then
+                    echo "::error::Docker publish is restricted to v* tag pushes."
+                    exit 1
                   fi
+
+                  TAG_NAME="${GITHUB_REF#refs/tags/}"
+                  TAGS="${IMAGE}:${TAG_NAME},${SHA_TAG}"
 
                   echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
 
@@ -169,6 +152,7 @@ jobs:
               shell: bash
               run: |
                   set -euo pipefail
+                  TAG_NAME="${GITHUB_REF#refs/tags/}"
                   token_resp="$(curl -sS "https://ghcr.io/token?scope=repository:${GITHUB_REPOSITORY}:pull")"
                   token="$(echo "$token_resp" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')"
 
@@ -180,7 +164,7 @@ jobs:
                   code="$(curl -sS -o /tmp/ghcr-manifest.json -w "%{http_code}" \
                     -H "Authorization: Bearer ${token}" \
                     -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
-                    "https://ghcr.io/v2/${GITHUB_REPOSITORY}/manifests/latest")"
+                    "https://ghcr.io/v2/${GITHUB_REPOSITORY}/manifests/${TAG_NAME}")"
 
                   if [ "$code" != "200" ]; then
                     echo "::error::Anonymous manifest pull failed with HTTP ${code}"

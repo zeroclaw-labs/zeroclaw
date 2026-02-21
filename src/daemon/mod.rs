@@ -66,7 +66,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
             max_backoff,
             move || {
                 let cfg = heartbeat_cfg.clone();
-                async move { run_heartbeat_worker(cfg).await }
+                async move { Box::pin(run_heartbeat_worker(cfg)).await }
             },
         ));
     }
@@ -196,8 +196,16 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         for task in tasks {
             let prompt = format!("[Heartbeat Task] {task}");
             let temp = config.default_temperature;
-            if let Err(e) =
-                crate::agent::run(config.clone(), Some(prompt), None, None, temp, vec![]).await
+            if let Err(e) = crate::agent::run(
+                config.clone(),
+                Some(prompt),
+                None,
+                None,
+                temp,
+                vec![],
+                false,
+            )
+            .await
             {
                 crate::health::mark_component_error("heartbeat", e.to_string());
                 tracing::warn!("Heartbeat task failed: {e}");
@@ -209,40 +217,11 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
 }
 
 fn has_supervised_channels(config: &Config) -> bool {
-    let crate::config::ChannelsConfig {
-        cli: _,     // `cli` is used only when running the CLI manually
-        webhook: _, // Managed by the gateway
-        telegram,
-        discord,
-        slack,
-        mattermost,
-        imessage,
-        matrix,
-        signal,
-        whatsapp,
-        email,
-        irc,
-        lark,
-        dingtalk,
-        linq,
-        qq,
-        ..
-    } = &config.channels_config;
-
-    telegram.is_some()
-        || discord.is_some()
-        || slack.is_some()
-        || mattermost.is_some()
-        || imessage.is_some()
-        || matrix.is_some()
-        || signal.is_some()
-        || whatsapp.is_some()
-        || email.is_some()
-        || irc.is_some()
-        || lark.is_some()
-        || dingtalk.is_some()
-        || linq.is_some()
-        || qq.is_some()
+    config
+        .channels_config
+        .channels_except_webhook()
+        .iter()
+        .any(|(_, ok)| *ok)
 }
 
 #[cfg(test)]
@@ -358,6 +337,18 @@ mod tests {
         config.channels_config.qq = Some(crate::config::schema::QQConfig {
             app_id: "app-id".into(),
             app_secret: "app-secret".into(),
+            allowed_users: vec!["*".into()],
+        });
+        assert!(has_supervised_channels(&config));
+    }
+
+    #[test]
+    fn detects_nextcloud_talk_as_supervised_channel() {
+        let mut config = Config::default();
+        config.channels_config.nextcloud_talk = Some(crate::config::schema::NextcloudTalkConfig {
+            base_url: "https://cloud.example.com".into(),
+            app_token: "app-token".into(),
+            webhook_secret: None,
             allowed_users: vec!["*".into()],
         });
         assert!(has_supervised_channels(&config));

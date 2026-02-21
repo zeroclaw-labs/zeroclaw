@@ -2,7 +2,7 @@
 
 This guide focuses on common setup/runtime failures and fast resolution paths.
 
-Last verified: **February 19, 2026**.
+Last verified: **February 20, 2026**.
 
 ## Installation / Bootstrap
 
@@ -32,6 +32,48 @@ Fix:
 ./bootstrap.sh --install-system-deps
 ```
 
+### Build fails on low-RAM / low-disk hosts
+
+Symptoms:
+
+- `cargo build --release` is killed (`signal: 9`, OOM killer, or `cannot allocate memory`)
+- Build crashes after adding swap because disk space runs out
+
+Why this happens:
+
+- Runtime memory (<5MB for common operations) is not the same as compile-time memory.
+- Full source build can require **2 GB RAM + swap** and **6+ GB free disk**.
+- Enabling swap on a tiny disk can avoid RAM OOM but still fail due to disk exhaustion.
+
+Preferred path for constrained machines:
+
+```bash
+./bootstrap.sh --prefer-prebuilt
+```
+
+Binary-only mode (no source fallback):
+
+```bash
+./bootstrap.sh --prebuilt-only
+```
+
+If you must compile from source on constrained hosts:
+
+1. Add swap only if you also have enough free disk for both swap + build output.
+1. Limit cargo parallelism:
+
+```bash
+CARGO_BUILD_JOBS=1 cargo build --release --locked
+```
+
+1. Reduce heavy features when Matrix is not required:
+
+```bash
+cargo build --release --locked --features hardware
+```
+
+1. Cross-compile on a stronger machine and copy the binary to the target host.
+
 ### Build is very slow or appears stuck
 
 Symptoms:
@@ -58,15 +100,21 @@ The timing report is written to `target/cargo-timings/cargo-timing.html`.
 Faster local iteration (when Matrix channel is not needed):
 
 ```bash
-cargo check --no-default-features --features hardware
+cargo check
 ```
 
-This skips `channel-matrix` and can significantly reduce compile time.
+This uses the lean default feature set and can significantly reduce compile time.
 
 To build with Matrix support explicitly enabled:
 
 ```bash
-cargo check --no-default-features --features hardware,channel-matrix
+cargo check --features channel-matrix
+```
+
+To build with Matrix + Lark + hardware support:
+
+```bash
+cargo check --features hardware,channel-matrix,channel-lark
 ```
 
 Lock-contention mitigation:
@@ -106,7 +154,7 @@ zeroclaw doctor
 Verify `~/.zeroclaw/config.toml`:
 
 - `[gateway].host` (default `127.0.0.1`)
-- `[gateway].port` (default `3000`)
+- `[gateway].port` (default `42617`)
 - `allow_public_bind` only when intentionally exposing LAN/public interfaces
 
 ### Pairing / auth failures on webhook

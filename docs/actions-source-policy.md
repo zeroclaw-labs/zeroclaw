@@ -22,6 +22,7 @@ Selected allowlist patterns:
 - `rhysd/actionlint@*`
 - `softprops/action-gh-release@*`
 - `sigstore/cosign-installer@*`
+- `Checkmarx/vorpal-reviewdog-github-action@*`
 - `useblacksmith/*` (Blacksmith self-hosted runner infrastructure)
 
 ## Change Control Export
@@ -74,6 +75,9 @@ If encountered, add only the specific trusted missing action, rerun, and documen
 
 Latest sweep notes:
 
+- 2026-02-21: Added manual Vorpal reviewdog workflow for targeted secure-coding checks on supported file types
+    - Added allowlist pattern: `Checkmarx/vorpal-reviewdog-github-action@*`
+    - Workflow uses pinned source: `Checkmarx/vorpal-reviewdog-github-action@8cc292f337a2f1dea581b4f4bd73852e7becb50d` (v1.2.0)
 - 2026-02-17: Rust dependency cache migrated from `Swatinem/rust-cache` to `useblacksmith/rust-cache`
     - No new allowlist pattern required (`useblacksmith/*` already allowlisted)
 - 2026-02-16: Hidden dependency discovered in `release.yml`: `sigstore/cosign-installer@...`

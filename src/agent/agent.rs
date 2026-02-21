@@ -30,6 +30,7 @@ pub struct Agent {
     workspace_dir: std::path::PathBuf,
     identity_config: crate::config::IdentityConfig,
     skills: Vec<crate::skills::Skill>,
+    skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
     auto_save: bool,
     history: Vec<ConversationMessage>,
     classification_config: crate::config::QueryClassificationConfig,
@@ -50,6 +51,7 @@ pub struct AgentBuilder {
     workspace_dir: Option<std::path::PathBuf>,
     identity_config: Option<crate::config::IdentityConfig>,
     skills: Option<Vec<crate::skills::Skill>>,
+    skills_prompt_mode: Option<crate::config::SkillsPromptInjectionMode>,
     auto_save: Option<bool>,
     classification_config: Option<crate::config::QueryClassificationConfig>,
     available_hints: Option<Vec<String>>,
@@ -71,6 +73,7 @@ impl AgentBuilder {
             workspace_dir: None,
             identity_config: None,
             skills: None,
+            skills_prompt_mode: None,
             auto_save: None,
             classification_config: None,
             available_hints: None,
@@ -142,6 +145,14 @@ impl AgentBuilder {
         self
     }
 
+    pub fn skills_prompt_mode(
+        mut self,
+        skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
+    ) -> Self {
+        self.skills_prompt_mode = Some(skills_prompt_mode);
+        self
+    }
+
     pub fn auto_save(mut self, auto_save: bool) -> Self {
         self.auto_save = Some(auto_save);
         self
@@ -197,6 +208,7 @@ impl AgentBuilder {
                 .unwrap_or_else(|| std::path::PathBuf::from(".")),
             identity_config: self.identity_config.unwrap_or_default(),
             skills: self.skills.unwrap_or_default(),
+            skills_prompt_mode: self.skills_prompt_mode.unwrap_or_default(),
             auto_save: self.auto_save.unwrap_or(false),
             history: Vec::new(),
             classification_config: self.classification_config.unwrap_or_default(),
@@ -308,7 +320,11 @@ impl Agent {
             .classification_config(config.query_classification.clone())
             .available_hints(available_hints)
             .identity_config(config.identity.clone())
-            .skills(crate::skills::load_skills(&config.workspace_dir))
+            .skills(crate::skills::load_skills_with_config(
+                &config.workspace_dir,
+                config,
+            ))
+            .skills_prompt_mode(config.skills.prompt_injection_mode)
             .auto_save(config.memory.auto_save)
             .build()
     }
@@ -347,6 +363,7 @@ impl Agent {
             model_name: &self.model_name,
             tools: &self.tools,
             skills: &self.skills,
+            skills_prompt_mode: self.skills_prompt_mode,
             identity_config: Some(&self.identity_config),
             dispatcher_instructions: &instructions,
         };
@@ -400,11 +417,11 @@ impl Agent {
             return results;
         }
 
-        let mut results = Vec::with_capacity(calls.len());
-        for call in calls {
-            results.push(self.execute_tool_call(call).await);
-        }
-        results
+        let futs: Vec<_> = calls
+            .iter()
+            .map(|call| self.execute_tool_call(call))
+            .collect();
+        futures_util::future::join_all(futs).await
     }
 
     fn classify_model(&self, user_message: &str) -> String {
@@ -633,6 +650,7 @@ mod tests {
                 return Ok(crate::providers::ChatResponse {
                     text: Some("done".into()),
                     tool_calls: vec![],
+                    usage: None,
                 });
             }
             Ok(guard.remove(0))
@@ -670,6 +688,7 @@ mod tests {
             responses: Mutex::new(vec![crate::providers::ChatResponse {
                 text: Some("hello".into()),
                 tool_calls: vec![],
+                usage: None,
             }]),
         });
 
@@ -678,7 +697,8 @@ mod tests {
             ..crate::config::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None).unwrap(),
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
         );
 
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -690,7 +710,7 @@ mod tests {
             .tool_dispatcher(Box::new(XmlToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
             .build()
-            .unwrap();
+            .expect("agent builder should succeed with valid config");
 
         let response = agent.turn("hi").await.unwrap();
         assert_eq!(response, "hello");
@@ -707,10 +727,12 @@ mod tests {
                         name: "echo".into(),
                         arguments: "{}".into(),
                     }],
+                    usage: None,
                 },
                 crate::providers::ChatResponse {
                     text: Some("done".into()),
                     tool_calls: vec![],
+                    usage: None,
                 },
             ]),
         });
@@ -720,7 +742,8 @@ mod tests {
             ..crate::config::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None).unwrap(),
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
         );
 
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -732,7 +755,7 @@ mod tests {
             .tool_dispatcher(Box::new(NativeToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
             .build()
-            .unwrap();
+            .expect("agent builder should succeed with valid config");
 
         let response = agent.turn("hi").await.unwrap();
         assert_eq!(response, "done");

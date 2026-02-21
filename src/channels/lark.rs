@@ -14,6 +14,47 @@ const FEISHU_WS_BASE_URL: &str = "https://open.feishu.cn";
 const LARK_BASE_URL: &str = "https://open.larksuite.com/open-apis";
 const LARK_WS_BASE_URL: &str = "https://open.larksuite.com";
 
+const LARK_ACK_REACTIONS_ZH_CN: &[&str] = &["OK", "加油", "鼓掌", "碰拳", "看", "奋斗", "强"];
+const LARK_ACK_REACTIONS_ZH_TW: &[&str] = &[
+    "我看行",
+    "OK",
+    "加油",
+    "鼓掌",
+    "碰拳",
+    "看",
+    "奮鬥",
+    "強",
+    "很 OK",
+];
+const LARK_ACK_REACTIONS_EN: &[&str] = &[
+    "LooksGoodToMe",
+    "OK",
+    "Praise",
+    "Determined",
+    "Glance",
+    "FistBump",
+    "Applaud",
+    "FightOn",
+];
+const LARK_ACK_REACTIONS_JA: &[&str] = &[
+    "いいと思う",
+    "OK",
+    "よくできた",
+    "頑張る",
+    "見る",
+    "グータッチ",
+    "拍手",
+    "頑張れ",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LarkAckLocale {
+    ZhCn,
+    ZhTw,
+    En,
+    Ja,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Feishu WebSocket long-connection: pbbp2.proto frame codec
 // ─────────────────────────────────────────────────────────────────────────────
@@ -126,6 +167,12 @@ struct LarkMessage {
 /// Heartbeat timeout for WS connection — must be larger than ping_interval (default 120 s).
 /// If no binary frame (pong or event) is received within this window, reconnect.
 const WS_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(300);
+/// Refresh tenant token this many seconds before the announced expiry.
+const LARK_TOKEN_REFRESH_SKEW: Duration = Duration::from_secs(120);
+/// Fallback tenant token TTL when `expire`/`expires_in` is absent.
+const LARK_DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(7200);
+/// Feishu/Lark API business code for expired/invalid tenant access token.
+const LARK_INVALID_ACCESS_TOKEN_CODE: i64 = 99_991_663;
 
 /// Returns true when the WebSocket frame indicates live traffic that should
 /// refresh the heartbeat watchdog.
@@ -133,11 +180,70 @@ fn should_refresh_last_recv(msg: &WsMsg) -> bool {
     matches!(msg, WsMsg::Binary(_) | WsMsg::Ping(_) | WsMsg::Pong(_))
 }
 
+#[derive(Debug, Clone)]
+struct CachedTenantToken {
+    value: String,
+    refresh_after: Instant,
+}
+
+fn extract_lark_response_code(body: &serde_json::Value) -> Option<i64> {
+    body.get("code").and_then(|c| c.as_i64())
+}
+
+fn is_lark_invalid_access_token(body: &serde_json::Value) -> bool {
+    extract_lark_response_code(body) == Some(LARK_INVALID_ACCESS_TOKEN_CODE)
+}
+
+fn should_refresh_lark_tenant_token(status: reqwest::StatusCode, body: &serde_json::Value) -> bool {
+    status == reqwest::StatusCode::UNAUTHORIZED || is_lark_invalid_access_token(body)
+}
+
+fn extract_lark_token_ttl_seconds(body: &serde_json::Value) -> u64 {
+    let ttl = body
+        .get("expire")
+        .or_else(|| body.get("expires_in"))
+        .and_then(|v| v.as_u64())
+        .or_else(|| {
+            body.get("expire")
+                .or_else(|| body.get("expires_in"))
+                .and_then(|v| v.as_i64())
+                .and_then(|v| u64::try_from(v).ok())
+        })
+        .unwrap_or(LARK_DEFAULT_TOKEN_TTL.as_secs());
+    ttl.max(1)
+}
+
+fn next_token_refresh_deadline(now: Instant, ttl_seconds: u64) -> Instant {
+    let ttl = Duration::from_secs(ttl_seconds.max(1));
+    let refresh_in = ttl
+        .checked_sub(LARK_TOKEN_REFRESH_SKEW)
+        .unwrap_or(Duration::from_secs(1));
+    now + refresh_in
+}
+
+fn ensure_lark_send_success(
+    status: reqwest::StatusCode,
+    body: &serde_json::Value,
+    context: &str,
+) -> anyhow::Result<()> {
+    if !status.is_success() {
+        anyhow::bail!("Lark send failed {context}: status={status}, body={body}");
+    }
+
+    let code = extract_lark_response_code(body).unwrap_or(0);
+    if code != 0 {
+        anyhow::bail!("Lark send failed {context}: code={code}, body={body}");
+    }
+
+    Ok(())
+}
+
 /// Lark/Feishu channel.
 ///
 /// Supports two receive modes (configured via `receive_mode` in config):
 /// - **`websocket`** (default): persistent WSS long-connection; no public URL needed.
 /// - **`webhook`**: HTTP callback server; requires a public HTTPS endpoint.
+#[derive(Clone)]
 pub struct LarkChannel {
     app_id: String,
     app_secret: String,
@@ -149,7 +255,7 @@ pub struct LarkChannel {
     /// How to receive events: WebSocket long-connection or HTTP webhook.
     receive_mode: crate::config::schema::LarkReceiveMode,
     /// Cached tenant access token
-    tenant_token: Arc<RwLock<Option<String>>>,
+    tenant_token: Arc<RwLock<Option<CachedTenantToken>>>,
     /// Dedup set: WS message_ids seen in last ~30 min to prevent double-dispatch
     ws_seen_ids: Arc<RwLock<HashMap<String, Instant>>>,
 }
@@ -215,6 +321,107 @@ impl LarkChannel {
 
     fn send_message_url(&self) -> String {
         format!("{}/im/v1/messages?receive_id_type=chat_id", self.api_base())
+    }
+
+    fn message_reaction_url(&self, message_id: &str) -> String {
+        format!("{}/im/v1/messages/{message_id}/reactions", self.api_base())
+    }
+
+    async fn post_message_reaction_with_token(
+        &self,
+        message_id: &str,
+        token: &str,
+        emoji_type: &str,
+    ) -> anyhow::Result<reqwest::Response> {
+        let url = self.message_reaction_url(message_id);
+        let body = serde_json::json!({
+            "reaction_type": {
+                "emoji_type": emoji_type
+            }
+        });
+
+        let response = self
+            .http_client()
+            .post(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json; charset=utf-8")
+            .json(&body)
+            .send()
+            .await?;
+
+        Ok(response)
+    }
+
+    /// Best-effort "received" signal for incoming messages.
+    /// Failures are logged and never block normal message handling.
+    async fn try_add_ack_reaction(&self, message_id: &str, emoji_type: &str) {
+        if message_id.is_empty() {
+            return;
+        }
+
+        let mut token = match self.get_tenant_access_token().await {
+            Ok(token) => token,
+            Err(err) => {
+                tracing::warn!("Lark: failed to fetch token for reaction: {err}");
+                return;
+            }
+        };
+
+        let mut retried = false;
+        loop {
+            let response = match self
+                .post_message_reaction_with_token(message_id, &token, emoji_type)
+                .await
+            {
+                Ok(resp) => resp,
+                Err(err) => {
+                    tracing::warn!("Lark: failed to add reaction for {message_id}: {err}");
+                    return;
+                }
+            };
+
+            if response.status().as_u16() == 401 && !retried {
+                self.invalidate_token().await;
+                token = match self.get_tenant_access_token().await {
+                    Ok(new_token) => new_token,
+                    Err(err) => {
+                        tracing::warn!(
+                            "Lark: failed to refresh token for reaction on {message_id}: {err}"
+                        );
+                        return;
+                    }
+                };
+                retried = true;
+                continue;
+            }
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let err_body = response.text().await.unwrap_or_default();
+                tracing::warn!(
+                    "Lark: add reaction failed for {message_id}: status={status}, body={err_body}"
+                );
+                return;
+            }
+
+            let payload: serde_json::Value = match response.json().await {
+                Ok(v) => v,
+                Err(err) => {
+                    tracing::warn!("Lark: add reaction decode failed for {message_id}: {err}");
+                    return;
+                }
+            };
+
+            let code = payload.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+            if code != 0 {
+                let msg = payload
+                    .get("msg")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown error");
+                tracing::warn!("Lark: add reaction returned code={code} for {message_id}: {msg}");
+            }
+            return;
+        }
     }
 
     /// POST /callback/ws/endpoint → (wss_url, client_config)
@@ -334,7 +541,6 @@ impl LarkChannel {
                             match ws_msg {
                                 WsMsg::Binary(b) => b,
                                 WsMsg::Ping(d) => { let _ = write.send(WsMsg::Pong(d)).await; continue; }
-                                WsMsg::Pong(_) => continue,
                                 WsMsg::Close(_) => { tracing::info!("Lark: WS closed — reconnecting"); break; }
                                 _ => continue,
                             }
@@ -407,7 +613,9 @@ impl LarkChannel {
                     };
                     if event.header.event_type != "im.message.receive_v1" { continue; }
 
-                    let recv: MsgReceivePayload = match serde_json::from_value(event.event) {
+                    let event_payload = event.event;
+
+                    let recv: MsgReceivePayload = match serde_json::from_value(event_payload.clone()) {
                         Ok(r) => r,
                         Err(e) => { tracing::error!("Lark: payload parse: {e}"); continue; }
                     };
@@ -464,6 +672,16 @@ impl LarkChannel {
                         continue;
                     }
 
+                    let ack_emoji =
+                        random_lark_ack_reaction(Some(&event_payload), &text).to_string();
+                    let reaction_channel = self.clone();
+                    let reaction_message_id = lark_msg.message_id.clone();
+                    tokio::spawn(async move {
+                        reaction_channel
+                            .try_add_ack_reaction(&reaction_message_id, &ack_emoji)
+                            .await;
+                    });
+
                     let channel_msg = ChannelMessage {
                         id: Uuid::new_v4().to_string(),
                         sender: lark_msg.chat_id.clone(),
@@ -496,7 +714,9 @@ impl LarkChannel {
         {
             let cached = self.tenant_token.read().await;
             if let Some(ref token) = *cached {
-                return Ok(token.clone());
+                if Instant::now() < token.refresh_after {
+                    return Ok(token.value.clone());
+                }
             }
         }
 
@@ -507,7 +727,12 @@ impl LarkChannel {
         });
 
         let resp = self.http_client().post(&url).json(&body).send().await?;
+        let status = resp.status();
         let data: serde_json::Value = resp.json().await?;
+
+        if !status.is_success() {
+            anyhow::bail!("Lark tenant_access_token request failed: status={status}, body={data}");
+        }
 
         let code = data.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
         if code != 0 {
@@ -524,19 +749,46 @@ impl LarkChannel {
             .ok_or_else(|| anyhow::anyhow!("missing tenant_access_token in response"))?
             .to_string();
 
-        // Cache it
+        let ttl_seconds = extract_lark_token_ttl_seconds(&data);
+        let refresh_after = next_token_refresh_deadline(Instant::now(), ttl_seconds);
+
+        // Cache it with proactive refresh metadata.
         {
             let mut cached = self.tenant_token.write().await;
-            *cached = Some(token.clone());
+            *cached = Some(CachedTenantToken {
+                value: token.clone(),
+                refresh_after,
+            });
         }
 
         Ok(token)
     }
 
-    /// Invalidate cached token (called on 401)
+    /// Invalidate cached token (called when API reports an expired tenant token).
     async fn invalidate_token(&self) {
         let mut cached = self.tenant_token.write().await;
         *cached = None;
+    }
+
+    async fn send_text_once(
+        &self,
+        url: &str,
+        token: &str,
+        body: &serde_json::Value,
+    ) -> anyhow::Result<(reqwest::StatusCode, serde_json::Value)> {
+        let resp = self
+            .http_client()
+            .post(url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json; charset=utf-8")
+            .json(body)
+            .send()
+            .await?;
+        let status = resp.status();
+        let raw = resp.text().await.unwrap_or_default();
+        let parsed = serde_json::from_str::<serde_json::Value>(&raw)
+            .unwrap_or_else(|_| serde_json::json!({ "raw": raw }));
+        Ok((status, parsed))
     }
 
     /// Parse an event callback payload and extract text messages
@@ -660,40 +912,26 @@ impl Channel for LarkChannel {
             "content": content,
         });
 
-        let resp = self
-            .http_client()
-            .post(&url)
-            .header("Authorization", format!("Bearer {token}"))
-            .header("Content-Type", "application/json; charset=utf-8")
-            .json(&body)
-            .send()
-            .await?;
+        let (status, response) = self.send_text_once(&url, &token, &body).await?;
 
-        if resp.status().as_u16() == 401 {
-            // Token expired, invalidate and retry once
+        if should_refresh_lark_tenant_token(status, &response) {
+            // Token expired/invalid, invalidate and retry once.
             self.invalidate_token().await;
             let new_token = self.get_tenant_access_token().await?;
-            let retry_resp = self
-                .http_client()
-                .post(&url)
-                .header("Authorization", format!("Bearer {new_token}"))
-                .header("Content-Type", "application/json; charset=utf-8")
-                .json(&body)
-                .send()
-                .await?;
+            let (retry_status, retry_response) =
+                self.send_text_once(&url, &new_token, &body).await?;
 
-            if !retry_resp.status().is_success() {
-                let err = retry_resp.text().await.unwrap_or_default();
-                anyhow::bail!("Lark send failed after token refresh: {err}");
+            if should_refresh_lark_tenant_token(retry_status, &retry_response) {
+                anyhow::bail!(
+                    "Lark send failed after token refresh: status={retry_status}, body={retry_response}"
+                );
             }
+
+            ensure_lark_send_success(retry_status, &retry_response, "after token refresh")?;
             return Ok(());
         }
 
-        if !resp.status().is_success() {
-            let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Lark send failed: {err}");
-        }
-
+        ensure_lark_send_success(status, &response, "without token refresh")?;
         Ok(())
     }
 
@@ -751,6 +989,24 @@ impl LarkChannel {
 
             // Parse event messages
             let messages = state.channel.parse_event_payload(&payload);
+            if !messages.is_empty() {
+                if let Some(message_id) = payload
+                    .pointer("/event/message/message_id")
+                    .and_then(|m| m.as_str())
+                {
+                    let ack_text = messages.first().map_or("", |msg| msg.content.as_str());
+                    let ack_emoji =
+                        random_lark_ack_reaction(payload.get("event"), ack_text).to_string();
+                    let reaction_channel = Arc::clone(&state.channel);
+                    let reaction_message_id = message_id.to_string();
+                    tokio::spawn(async move {
+                        reaction_channel
+                            .try_add_ack_reaction(&reaction_message_id, &ack_emoji)
+                            .await;
+                    });
+                }
+            }
+
             for msg in messages {
                 if state.tx.send(msg).await.is_err() {
                     tracing::warn!("Lark: message channel closed");
@@ -767,13 +1023,7 @@ impl LarkChannel {
 
         let state = AppState {
             verification_token: self.verification_token.clone(),
-            channel: Arc::new(LarkChannel::new(
-                self.app_id.clone(),
-                self.app_secret.clone(),
-                self.verification_token.clone(),
-                None,
-                self.allowed_users.clone(),
-            )),
+            channel: Arc::new(self.clone()),
             tx,
         };
 
@@ -794,6 +1044,208 @@ impl LarkChannel {
 // ─────────────────────────────────────────────────────────────────────────────
 // WS helper functions
 // ─────────────────────────────────────────────────────────────────────────────
+
+fn pick_uniform_index(len: usize) -> usize {
+    debug_assert!(len > 0);
+    let upper = len as u64;
+    let reject_threshold = (u64::MAX / upper) * upper;
+
+    loop {
+        let value = rand::random::<u64>();
+        if value < reject_threshold {
+            return (value % upper) as usize;
+        }
+    }
+}
+
+fn random_from_pool(pool: &'static [&'static str]) -> &'static str {
+    pool[pick_uniform_index(pool.len())]
+}
+
+fn lark_ack_pool(locale: LarkAckLocale) -> &'static [&'static str] {
+    match locale {
+        LarkAckLocale::ZhCn => LARK_ACK_REACTIONS_ZH_CN,
+        LarkAckLocale::ZhTw => LARK_ACK_REACTIONS_ZH_TW,
+        LarkAckLocale::En => LARK_ACK_REACTIONS_EN,
+        LarkAckLocale::Ja => LARK_ACK_REACTIONS_JA,
+    }
+}
+
+fn map_locale_tag(tag: &str) -> Option<LarkAckLocale> {
+    let normalized = tag.trim().to_ascii_lowercase().replace('-', "_");
+    if normalized.is_empty() {
+        return None;
+    }
+
+    if normalized.starts_with("ja") {
+        return Some(LarkAckLocale::Ja);
+    }
+    if normalized.starts_with("en") {
+        return Some(LarkAckLocale::En);
+    }
+    if normalized.contains("hant")
+        || normalized.starts_with("zh_tw")
+        || normalized.starts_with("zh_hk")
+        || normalized.starts_with("zh_mo")
+    {
+        return Some(LarkAckLocale::ZhTw);
+    }
+    if normalized.starts_with("zh") {
+        return Some(LarkAckLocale::ZhCn);
+    }
+    None
+}
+
+fn find_locale_hint(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for key in [
+                "locale",
+                "language",
+                "lang",
+                "i18n_locale",
+                "user_locale",
+                "locale_id",
+            ] {
+                if let Some(locale) = map.get(key).and_then(serde_json::Value::as_str) {
+                    return Some(locale.to_string());
+                }
+            }
+
+            for child in map.values() {
+                if let Some(locale) = find_locale_hint(child) {
+                    return Some(locale);
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                if let Some(locale) = find_locale_hint(child) {
+                    return Some(locale);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn detect_locale_from_post_content(content: &str) -> Option<LarkAckLocale> {
+    let parsed = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    let obj = parsed.as_object()?;
+    for key in obj.keys() {
+        if let Some(locale) = map_locale_tag(key) {
+            return Some(locale);
+        }
+    }
+    None
+}
+
+fn is_japanese_kana(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x3040..=0x309F | // Hiragana
+        0x30A0..=0x30FF | // Katakana
+        0x31F0..=0x31FF // Katakana Phonetic Extensions
+    )
+}
+
+fn is_cjk_han(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x3400..=0x4DBF | // CJK Extension A
+        0x4E00..=0x9FFF // CJK Unified Ideographs
+    )
+}
+
+fn is_traditional_only_han(ch: char) -> bool {
+    matches!(
+        ch,
+        '奮' | '鬥'
+            | '強'
+            | '體'
+            | '國'
+            | '臺'
+            | '萬'
+            | '與'
+            | '為'
+            | '這'
+            | '學'
+            | '機'
+            | '開'
+            | '裡'
+    )
+}
+
+fn is_simplified_only_han(ch: char) -> bool {
+    matches!(
+        ch,
+        '奋' | '斗'
+            | '强'
+            | '体'
+            | '国'
+            | '台'
+            | '万'
+            | '与'
+            | '为'
+            | '这'
+            | '学'
+            | '机'
+            | '开'
+            | '里'
+    )
+}
+
+fn detect_locale_from_text(text: &str) -> Option<LarkAckLocale> {
+    if text.chars().any(is_japanese_kana) {
+        return Some(LarkAckLocale::Ja);
+    }
+    if text.chars().any(is_traditional_only_han) {
+        return Some(LarkAckLocale::ZhTw);
+    }
+    if text.chars().any(is_simplified_only_han) {
+        return Some(LarkAckLocale::ZhCn);
+    }
+    if text.chars().any(is_cjk_han) {
+        return Some(LarkAckLocale::ZhCn);
+    }
+    None
+}
+
+fn detect_lark_ack_locale(
+    payload: Option<&serde_json::Value>,
+    fallback_text: &str,
+) -> LarkAckLocale {
+    if let Some(payload) = payload {
+        if let Some(locale) = find_locale_hint(payload).and_then(|hint| map_locale_tag(&hint)) {
+            return locale;
+        }
+
+        let message_content = payload
+            .pointer("/message/content")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                payload
+                    .pointer("/event/message/content")
+                    .and_then(serde_json::Value::as_str)
+            });
+
+        if let Some(locale) = message_content.and_then(detect_locale_from_post_content) {
+            return locale;
+        }
+    }
+
+    detect_locale_from_text(fallback_text).unwrap_or(LarkAckLocale::En)
+}
+
+fn random_lark_ack_reaction(
+    payload: Option<&serde_json::Value>,
+    fallback_text: &str,
+) -> &'static str {
+    let locale = detect_lark_ack_locale(payload, fallback_text);
+    random_from_pool(lark_ack_pool(locale))
+}
 
 /// Flatten a Feishu `post` rich-text message to plain text.
 ///
@@ -928,6 +1380,68 @@ mod tests {
     fn lark_ws_non_activity_frames_do_not_refresh_heartbeat_watchdog() {
         assert!(!should_refresh_last_recv(&WsMsg::Text("hello".into())));
         assert!(!should_refresh_last_recv(&WsMsg::Close(None)));
+    }
+
+    #[test]
+    fn lark_should_refresh_token_on_http_401() {
+        let body = serde_json::json!({ "code": 0 });
+        assert!(should_refresh_lark_tenant_token(
+            reqwest::StatusCode::UNAUTHORIZED,
+            &body
+        ));
+    }
+
+    #[test]
+    fn lark_should_refresh_token_on_body_code_99991663() {
+        let body = serde_json::json!({
+            "code": LARK_INVALID_ACCESS_TOKEN_CODE,
+            "msg": "Invalid access token for authorization."
+        });
+        assert!(should_refresh_lark_tenant_token(
+            reqwest::StatusCode::OK,
+            &body
+        ));
+    }
+
+    #[test]
+    fn lark_should_not_refresh_token_on_success_body() {
+        let body = serde_json::json!({ "code": 0, "msg": "ok" });
+        assert!(!should_refresh_lark_tenant_token(
+            reqwest::StatusCode::OK,
+            &body
+        ));
+    }
+
+    #[test]
+    fn lark_extract_token_ttl_seconds_supports_expire_and_expires_in() {
+        let body_expire = serde_json::json!({ "expire": 7200 });
+        let body_expires_in = serde_json::json!({ "expires_in": 3600 });
+        let body_missing = serde_json::json!({});
+        assert_eq!(extract_lark_token_ttl_seconds(&body_expire), 7200);
+        assert_eq!(extract_lark_token_ttl_seconds(&body_expires_in), 3600);
+        assert_eq!(
+            extract_lark_token_ttl_seconds(&body_missing),
+            LARK_DEFAULT_TOKEN_TTL.as_secs()
+        );
+    }
+
+    #[test]
+    fn lark_next_token_refresh_deadline_reserves_refresh_skew() {
+        let now = Instant::now();
+        let regular = next_token_refresh_deadline(now, 7200);
+        let short_ttl = next_token_refresh_deadline(now, 60);
+
+        assert_eq!(regular.duration_since(now), Duration::from_secs(7080));
+        assert_eq!(short_ttl.duration_since(now), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn lark_ensure_send_success_rejects_non_zero_code() {
+        let ok = serde_json::json!({ "code": 0 });
+        let bad = serde_json::json!({ "code": 12345, "msg": "bad request" });
+
+        assert!(ensure_lark_send_success(reqwest::StatusCode::OK, &ok, "test").is_ok());
+        assert!(ensure_lark_send_success(reqwest::StatusCode::OK, &bad, "test").is_err());
     }
 
     #[test]
@@ -1267,5 +1781,118 @@ mod tests {
         let msgs = ch.parse_event_payload(&payload);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].sender, "ou_user");
+    }
+
+    #[test]
+    fn lark_reaction_url_matches_region() {
+        let ch_cn = make_channel();
+        assert_eq!(
+            ch_cn.message_reaction_url("om_test_message_id"),
+            "https://open.feishu.cn/open-apis/im/v1/messages/om_test_message_id/reactions"
+        );
+
+        let mut ch_intl = make_channel();
+        ch_intl.use_feishu = false;
+        assert_eq!(
+            ch_intl.message_reaction_url("om_test_message_id"),
+            "https://open.larksuite.com/open-apis/im/v1/messages/om_test_message_id/reactions"
+        );
+    }
+
+    #[test]
+    fn lark_reaction_locale_explicit_language_tags() {
+        assert_eq!(map_locale_tag("zh-CN"), Some(LarkAckLocale::ZhCn));
+        assert_eq!(map_locale_tag("zh_TW"), Some(LarkAckLocale::ZhTw));
+        assert_eq!(map_locale_tag("zh-Hant"), Some(LarkAckLocale::ZhTw));
+        assert_eq!(map_locale_tag("en-US"), Some(LarkAckLocale::En));
+        assert_eq!(map_locale_tag("ja-JP"), Some(LarkAckLocale::Ja));
+        assert_eq!(map_locale_tag("fr-FR"), None);
+    }
+
+    #[test]
+    fn lark_reaction_locale_prefers_explicit_payload_locale() {
+        let payload = serde_json::json!({
+            "sender": {
+                "locale": "ja-JP"
+            },
+            "message": {
+                "content": "{\"text\":\"hello\"}"
+            }
+        });
+        assert_eq!(
+            detect_lark_ack_locale(Some(&payload), "你好，世界"),
+            LarkAckLocale::Ja
+        );
+    }
+
+    #[test]
+    fn lark_reaction_locale_unsupported_payload_falls_back_to_text_script() {
+        let payload = serde_json::json!({
+            "sender": {
+                "locale": "fr-FR"
+            },
+            "message": {
+                "content": "{\"text\":\"頑張れ\"}"
+            }
+        });
+        assert_eq!(
+            detect_lark_ack_locale(Some(&payload), "頑張ってください"),
+            LarkAckLocale::Ja
+        );
+    }
+
+    #[test]
+    fn lark_reaction_locale_detects_simplified_and_traditional_text() {
+        assert_eq!(
+            detect_lark_ack_locale(None, "继续奋斗，今天很强"),
+            LarkAckLocale::ZhCn
+        );
+        assert_eq!(
+            detect_lark_ack_locale(None, "繼續奮鬥，今天很強"),
+            LarkAckLocale::ZhTw
+        );
+    }
+
+    #[test]
+    fn lark_reaction_locale_defaults_to_english_for_unsupported_text() {
+        assert_eq!(
+            detect_lark_ack_locale(None, "Bonjour tout le monde"),
+            LarkAckLocale::En
+        );
+    }
+
+    #[test]
+    fn random_lark_ack_reaction_respects_detected_locale_pool() {
+        let payload = serde_json::json!({
+            "sender": {
+                "locale": "zh-CN"
+            }
+        });
+        let selected = random_lark_ack_reaction(Some(&payload), "hello");
+        assert!(LARK_ACK_REACTIONS_ZH_CN.contains(&selected));
+
+        let payload = serde_json::json!({
+            "sender": {
+                "locale": "zh-TW"
+            }
+        });
+        let selected = random_lark_ack_reaction(Some(&payload), "hello");
+        assert!(LARK_ACK_REACTIONS_ZH_TW.contains(&selected));
+
+        let payload = serde_json::json!({
+            "sender": {
+                "locale": "en-US"
+            }
+        });
+        let selected = random_lark_ack_reaction(Some(&payload), "hello");
+        assert!(LARK_ACK_REACTIONS_EN.contains(&selected));
+
+        let payload = serde_json::json!({
+            "sender": {
+                "locale": "ja-JP"
+            }
+        });
+        let selected = random_lark_ack_reaction(Some(&payload), "hello");
+        assert!(LARK_ACK_REACTIONS_JA.contains(&selected));
     }
 }

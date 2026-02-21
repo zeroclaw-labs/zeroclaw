@@ -114,8 +114,14 @@ impl HttpRequestTool {
         headers: Vec<(String, String)>,
         body: Option<&str>,
     ) -> anyhow::Result<reqwest::Response> {
+        let timeout_secs = if self.timeout_secs == 0 {
+            tracing::warn!("http_request: timeout_secs is 0, using safe default of 30s");
+            30
+        } else {
+            self.timeout_secs
+        };
         let builder = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.timeout_secs))
+            .timeout(Duration::from_secs(timeout_secs))
             .connect_timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none());
         let builder = crate::config::apply_runtime_proxy_to_builder(builder, "tool.http_request");
@@ -493,13 +499,23 @@ mod tests {
     }
 
     #[test]
-    fn validate_accepts_star_allowlist() {
+    fn validate_accepts_wildcard_allowlist_for_public_host() {
         let tool = test_tool(vec!["*"]);
-        assert!(tool.validate_url("https://api.openai.com/v1").is_ok());
+        assert!(tool.validate_url("https://news.ycombinator.com").is_ok());
     }
 
     #[test]
-    fn validate_accepts_wildcard_allowlist() {
+    fn validate_wildcard_allowlist_still_rejects_private_host() {
+        let tool = test_tool(vec!["*"]);
+        let err = tool
+            .validate_url("https://localhost:8080")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("local/private"));
+    }
+
+    #[test]
+    fn validate_accepts_wildcard_subdomain_pattern() {
         let tool = test_tool(vec!["*.example.com"]);
         assert!(tool.validate_url("https://example.com").is_ok());
         assert!(tool.validate_url("https://sub.example.com").is_ok());

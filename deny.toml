@@ -11,6 +11,7 @@ yanked = "deny"
 ignore = [
     # bincode v2.0.1 via probe-rs — project ceased but 1.3.3 considered complete
     "RUSTSEC-2025-0141",
+    { id = "RUSTSEC-2024-0384", reason = "Reported to `rust-nostr/nostr` and it's WIP" },
 ]
 
 [licenses]
@@ -30,6 +31,7 @@ allow = [
     "CDLA-Permissive-2.0",
     "0BSD",
     "BSL-1.0",
+    "CC0-1.0",
 ]
 unused-allowed-license = "allow"
 
