@@ -1455,23 +1455,47 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 
         AuthCommands::Refresh { provider, profile } => {
             let provider = auth::normalize_provider(&provider)?;
-            if provider != "openai-codex" {
-                bail!("`auth refresh` currently supports only --provider openai-codex");
-            }
 
-            match auth_service
-                .get_valid_openai_access_token(profile.as_deref())
-                .await?
-            {
-                Some(_) => {
-                    println!("OpenAI Codex token is valid (refresh completed if needed).");
-                    Ok(())
+            match provider.as_str() {
+                "openai-codex" => {
+                    match auth_service
+                        .get_valid_openai_access_token(profile.as_deref())
+                        .await?
+                    {
+                        Some(_) => {
+                            println!("OpenAI Codex token is valid (refresh completed if needed).");
+                            Ok(())
+                        }
+                        None => {
+                            bail!(
+                                "No OpenAI Codex auth profile found. Run `zeroclaw auth login --provider openai-codex`."
+                            )
+                        }
+                    }
                 }
-                None => {
-                    bail!(
-                        "No OpenAI Codex auth profile found. Run `zeroclaw auth login --provider openai-codex`."
-                    )
+                "gemini" => {
+                    match auth_service
+                        .get_valid_gemini_access_token(profile.as_deref())
+                        .await?
+                    {
+                        Some(_) => {
+                            let profile_name = profile
+                                .as_deref()
+                                .unwrap_or("default");
+                            println!("✓ Gemini token refreshed successfully");
+                            println!("  Profile: gemini:{}", profile_name);
+                            Ok(())
+                        }
+                        None => {
+                            bail!(
+                                "No Gemini auth profile found. Run `zeroclaw auth login --provider gemini`."
+                            )
+                        }
+                    }
                 }
+                _ => bail!(
+                    "`auth refresh` supports --provider openai-codex or gemini"
+                ),
             }
         }
 

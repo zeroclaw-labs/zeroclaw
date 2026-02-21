@@ -834,7 +834,7 @@ impl GeminiProvider {
     ) -> reqwest::RequestBuilder {
         let req = self.http_client().post(url).json(request);
         match auth {
-            GeminiAuth::OAuthToken(_) => {
+            GeminiAuth::OAuthToken(_) | GeminiAuth::ManagedOAuth => {
                 let token = oauth_token.unwrap_or_default();
                 // Internal Code Assist API uses a wrapped payload shape:
                 // { model, project?, user_prompt_id?, request: { contents, systemInstruction?, generationConfig } }
