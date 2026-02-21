@@ -24,8 +24,6 @@ pub mod uno_q_setup;
 #[cfg(all(feature = "peripheral-rpi", target_os = "linux"))]
 pub mod rpi;
 
-pub use traits::Peripheral;
-
 use crate::config::{Config, PeripheralBoardConfig, PeripheralsConfig};
 #[cfg(feature = "hardware")]
 use crate::tools::HardwareMemoryMapTool;

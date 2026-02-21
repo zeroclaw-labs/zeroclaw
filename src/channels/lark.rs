@@ -365,9 +365,7 @@ impl LarkChannel {
             let payload: serde_json::Value = match response.json().await {
                 Ok(v) => v,
                 Err(err) => {
-                    tracing::warn!(
-                        "Lark: add reaction decode failed for {message_id}: {err}"
-                    );
+                    tracing::warn!("Lark: add reaction decode failed for {message_id}: {err}");
                     return;
                 }
             };
@@ -378,9 +376,7 @@ impl LarkChannel {
                     .get("msg")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown error");
-                tracing::warn!(
-                    "Lark: add reaction returned code={code} for {message_id}: {msg}"
-                );
+                tracing::warn!("Lark: add reaction returned code={code} for {message_id}: {msg}");
             }
             return;
         }

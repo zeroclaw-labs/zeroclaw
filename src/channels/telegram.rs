@@ -756,7 +756,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
     }
 
-    fn parse_update_message(&self, update: &serde_json::Value) -> Option<(ChannelMessage, Option<String>)> {
+    fn parse_update_message(
+        &self,
+        update: &serde_json::Value,
+    ) -> Option<(ChannelMessage, Option<String>)> {
         let message = update.get("message")?;
 
         // Support both text messages and photo messages (with optional caption)
@@ -764,7 +767,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let caption_opt = message.get("caption").and_then(serde_json::Value::as_str);
 
         // Extract file_id from photo (highest resolution = last element)
-        let photo_file_id = message.get("photo")
+        let photo_file_id = message
+            .get("photo")
             .and_then(serde_json::Value::as_array)
             .and_then(|photos| photos.last())
             .and_then(|p| p.get("file_id"))
@@ -852,18 +856,21 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             text.to_string()
         };
 
-        Some((ChannelMessage {
-            id: format!("telegram_{chat_id}_{message_id}"),
-            sender: sender_identity,
-            reply_target,
-            content,
-            channel: "telegram".to_string(),
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            thread_ts: None,
-        }, photo_file_id))
+        Some((
+            ChannelMessage {
+                id: format!("telegram_{chat_id}_{message_id}"),
+                sender: sender_identity,
+                reply_target,
+                content,
+                channel: "telegram".to_string(),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                thread_ts: None,
+            },
+            photo_file_id,
+        ))
     }
 
     /// Download a Telegram photo by file_id, resize to fit within 1024px, and return as base64 data URI.
@@ -905,7 +912,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 image::ImageFormat::Jpeg,
             )?;
             Ok(buf)
-        }).await??;
+        })
+        .await??;
 
         let b64 = base64::engine::general_purpose::STANDARD.encode(&resized_bytes);
         Ok(format!("data:image/jpeg;base64,{}", b64))
@@ -2241,7 +2249,8 @@ mod tests {
         });
 
         let msg = ch
-            .parse_update_message(&update).map(|(m,_)|m)
+            .parse_update_message(&update)
+            .map(|(m, _)| m)
             .expect("message should parse");
 
         assert_eq!(msg.sender, "alice");
@@ -2268,7 +2277,8 @@ mod tests {
         });
 
         let msg = ch
-            .parse_update_message(&update).map(|(m,_)|m)
+            .parse_update_message(&update)
+            .map(|(m, _)| m)
             .expect("numeric allowlist should pass");
 
         assert_eq!(msg.sender, "555");
@@ -2295,7 +2305,8 @@ mod tests {
         });
 
         let msg = ch
-            .parse_update_message(&update).map(|(m,_)|m)
+            .parse_update_message(&update)
+            .map(|(m, _)| m)
             .expect("message with thread_id should parse");
 
         assert_eq!(msg.sender, "alice");
@@ -2908,7 +2919,8 @@ mod tests {
         });
 
         let parsed = ch
-            .parse_update_message(&update).map(|(m,_)|m)
+            .parse_update_message(&update)
+            .map(|(m, _)| m)
             .expect("mention should parse");
         assert_eq!(parsed.content, "Hi status please");
 

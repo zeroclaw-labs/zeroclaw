@@ -716,7 +716,7 @@ async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGua
 /// Simple chat for webhook endpoint (no tools, for backward compatibility and testing).
 async fn run_gateway_chat_simple(
     state: &AppState,
-    provider_label: &str,
+    _provider_label: &str,
     message: &str,
 ) -> anyhow::Result<String> {
     let user_messages = vec![ChatMessage::user(message)];
@@ -1273,7 +1273,7 @@ async fn handle_nextcloud_talk_webhook(
         return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
     }
 
-    let provider_label = state
+    let _provider_label = state
         .config
         .lock()
         .default_provider
