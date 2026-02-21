@@ -4500,6 +4500,7 @@ mod tests {
     use tokio::test;
     use tokio_stream::wrappers::ReadDirStream;
     use tokio_stream::StreamExt;
+    use tempfile::TempDir;
 
     // ── Defaults ─────────────────────────────────────────────
 
@@ -4567,6 +4568,27 @@ mod tests {
                 .is_some(),
             "schema should include reusable type definitions"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    async fn save_sets_config_permissions_on_new_file() {
+        let temp = TempDir::new().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        let workspace_dir = temp.path().join("workspace");
+
+        let mut config = Config::default();
+        config.config_path = config_path.clone();
+        config.workspace_dir = workspace_dir;
+
+        config.save().await.expect("save config");
+
+        let mode = std::fs::metadata(&config_path)
+            .expect("config metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]
