@@ -116,10 +116,11 @@ Notes:
 ### 3) Promotion PR `dev` -> `main`
 
 1. Maintainer opens PR with head `dev` and base `main`.
-2. `main-promotion-gate.yml` runs and fails if head repo/branch is not `<this-repo>:dev`.
-3. `ci-run.yml` and `sec-audit.yml` run on the promotion PR.
-4. Maintainer merges PR once checks and review policy pass.
-5. Merge emits a `push` event on `main`.
+2. `main-promotion-gate.yml` runs and fails unless PR author is `willsarg` or `theonlyhennygod`.
+3. `main-promotion-gate.yml` also fails if head repo/branch is not `<this-repo>:dev`.
+4. `ci-run.yml` and `sec-audit.yml` run on the promotion PR.
+5. Maintainer merges PR once checks and review policy pass.
+6. Merge emits a `push` event on `main`.
 
 ### 4) Push to `dev` or `main` (including after merge)
 
