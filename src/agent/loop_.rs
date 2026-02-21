@@ -98,6 +98,29 @@ const COMPACTION_MAX_SOURCE_CHARS: usize = 12_000;
 /// Max characters retained in stored compaction summary.
 const COMPACTION_MAX_SUMMARY_CHARS: usize = 2_000;
 
+/// Minimum interval between progress sends to avoid flooding the draft channel.
+pub(crate) const PROGRESS_MIN_INTERVAL_MS: u64 = 500;
+
+/// Sentinel value sent through on_delta to signal the draft updater to clear accumulated text.
+/// Used before streaming the final answer so progress lines are replaced by the clean response.
+pub(crate) const DRAFT_CLEAR_SENTINEL: &str = "\x00CLEAR\x00";
+
+/// Extract a short hint from tool call arguments for progress display.
+fn truncate_tool_args_for_progress(name: &str, args: &serde_json::Value, max_len: usize) -> String {
+    let hint = match name {
+        "shell" => args.get("command").and_then(|v| v.as_str()),
+        "file_read" | "file_write" => args.get("path").and_then(|v| v.as_str()),
+        _ => args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .or_else(|| args.get("query").and_then(|v| v.as_str())),
+    };
+    match hint {
+        Some(s) => truncate_with_ellipsis(s, max_len),
+        None => String::new(),
+    }
+}
+
 /// Convert a tool registry to OpenAI function-calling format for native tool support.
 fn tools_to_openai_format(tools_registry: &[Box<dyn Tool>]) -> Vec<serde_json::Value> {
     tools_registry
@@ -1675,6 +1698,16 @@ pub(crate) async fn run_tool_call_loop(
         let prepared_messages =
             multimodal::prepare_messages_for_provider(history, multimodal_config).await?;
 
+        // ── Progress: LLM thinking ────────────────────────────
+        if let Some(ref tx) = on_delta {
+            let phase = if iteration == 0 {
+                "\u{1f914} Thinking...\n".to_string()
+            } else {
+                format!("\u{1f914} Thinking (round {})...\n", iteration + 1)
+            };
+            let _ = tx.send(phase).await;
+        }
+
         observer.record_event(&ObserverEvent::LlmRequest {
             provider: provider_name.to_string(),
             model: model.to_string(),
@@ -1852,6 +1885,19 @@ pub(crate) async fn run_tool_call_loop(
             parsed_text
         };
 
+        // ── Progress: LLM responded ─────────────────────────────
+        if let Some(ref tx) = on_delta {
+            let llm_secs = llm_started_at.elapsed().as_secs();
+            if !tool_calls.is_empty() {
+                let _ = tx
+                    .send(format!(
+                        "\u{1f4ac} Got {} tool call(s) ({llm_secs}s)\n",
+                        tool_calls.len()
+                    ))
+                    .await;
+            }
+        }
+
         if tool_calls.is_empty() {
             runtime_trace::record_event(
                 "turn_final_response",
@@ -1870,6 +1916,8 @@ pub(crate) async fn run_tool_call_loop(
             // If a streaming sender is provided, relay the text in small chunks
             // so the channel can progressively update the draft message.
             if let Some(ref tx) = on_delta {
+                // Clear accumulated progress lines before streaming the final answer.
+                let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
                 // Split on whitespace boundaries, accumulating chunks of at least
                 // STREAM_CHUNK_MIN_CHARS characters for progressive draft updates.
                 let mut chunk = String::new();
@@ -2020,6 +2068,18 @@ pub(crate) async fn run_tool_call_loop(
                 }),
             );
 
+            // ── Progress: tool start ────────────────────────────
+            if let Some(ref tx) = on_delta {
+                let hint = truncate_tool_args_for_progress(&tool_name, &tool_args, 60);
+                let progress = if hint.is_empty() {
+                    format!("\u{23f3} {}\n", tool_name)
+                } else {
+                    format!("\u{23f3} {}: {hint}\n", tool_name)
+                };
+                tracing::debug!(tool = %tool_name, "Sending progress start to draft");
+                let _ = tx.send(progress).await;
+            }
+
             executable_indices.push(idx);
             executable_calls.push(ParsedToolCall {
                 name: tool_name,
@@ -2076,6 +2136,18 @@ pub(crate) async fn run_tool_call_loop(
                 hooks
                     .fire_after_tool_call(&call.name, &tool_result_obj, outcome.duration)
                     .await;
+            }
+
+            // ── Progress: tool completion ───────────────────────
+            if let Some(ref tx) = on_delta {
+                let secs = outcome.duration.as_secs();
+                let icon = if outcome.success {
+                    "\u{2705}"
+                } else {
+                    "\u{274c}"
+                };
+                tracing::debug!(tool = %call.name, secs, "Sending progress complete to draft");
+                let _ = tx.send(format!("{icon} {} ({secs}s)\n", call.name)).await;
             }
 
             ordered_results[*idx] = Some((call.name.clone(), outcome));
