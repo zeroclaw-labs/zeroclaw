@@ -206,6 +206,10 @@ pub struct Config {
     /// Voice transcription configuration (Whisper API via Groq).
     #[serde(default)]
     pub transcription: TranscriptionConfig,
+
+    /// ClawHub configuration (`[clawhub]`).
+    #[serde(default)]
+    pub clawhub: ClawHubConfig,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -362,6 +366,22 @@ impl Default for TranscriptionConfig {
             max_duration_secs: default_transcription_max_duration_secs(),
         }
     }
+}
+
+/// ClawHub configuration (`[clawhub]` section).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ClawHubConfig {
+    /// ClawHub API URL (default: https://clawhub.ai)
+    #[serde(default = "default_clawhub_url")]
+    pub api_url: String,
+
+    /// Auto-update installed clawhub skills on agent start
+    #[serde(default)]
+    pub auto_update: bool,
+}
+
+fn default_clawhub_url() -> String {
+    "https://clawhub.ai".to_string()
 }
 
 /// Agent orchestration configuration (`[agent]` section).
@@ -3419,6 +3439,7 @@ impl Default for Config {
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
+            clawhub: ClawHubConfig::default(),
         }
     }
 }
@@ -4689,6 +4710,7 @@ default_temperature = 0.7
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
+            clawhub: ClawHubConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -4863,6 +4885,7 @@ tool_dispatcher = "xml"
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
+            clawhub: ClawHubConfig::default(),
         };
 
         config.save().await.unwrap();
