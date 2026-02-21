@@ -18,6 +18,10 @@ pub use schema::{
     TelegramConfig, TranscriptionConfig, TunnelConfig, WebSearchConfig, WebhookConfig,
 };
 
+pub fn name_and_presence<T: traits::ChannelConfig>(channel: &Option<T>) -> (&'static str, bool) {
+    (T::name(), channel.is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
