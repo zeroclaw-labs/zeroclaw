@@ -1,11 +1,7 @@
 name: CI Build (Fast)
 
-# Optional accelerated release build using cargo-slicer.
-# Runs alongside the normal Build (Smoke) job — does not gate merges.
-# Stubs unreachable library functions to skip LLVM codegen,
-# saving ~27% wall time on a 48-core server (more on fewer cores).
-#
-# See docs/cargo-slicer-speedup.md for benchmarks and details.
+# Optional fast release build that runs alongside the normal Build (Smoke) job.
+# This workflow is informational and does not gate merges.
 
 on:
     push:
@@ -22,7 +18,6 @@ permissions:
 
 env:
     CARGO_TERM_COLOR: always
-    CARGO_SLICER_VERSION: "0.0.2"
 
 jobs:
     changes:
@@ -45,7 +40,7 @@ jobs:
               run: ./scripts/ci/detect_change_scope.sh
 
     build-fast:
-        name: Build (Fast — cargo-slicer)
+        name: Build (Fast)
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true' || needs.changes.outputs.workflow_changed == 'true'
         runs-on: blacksmith-2vcpu-ubuntu-2404
@@ -56,54 +51,11 @@ jobs:
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # nightly
               with:
                   toolchain: nightly
-                  components: rust-src, rustc-dev, llvm-tools-preview
 
             - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
               with:
                   prefix-key: fast-build
                   cache-targets: true
 
-            - name: Install cargo-slicer
-              id: install_slicer
-              shell: bash
-              run: |
-                  set -euo pipefail
-
-                  if cargo install cargo-slicer --version "$CARGO_SLICER_VERSION" --locked 2>/dev/null \
-                    || cargo install cargo-slicer --version "$CARGO_SLICER_VERSION"; then
-                    echo "slicer_ready=true" >> "$GITHUB_OUTPUT"
-                  else
-                    echo "::warning::Unable to install cargo-slicer CLI; using fallback nightly release build."
-                    echo "slicer_ready=false" >> "$GITHUB_OUTPUT"
-                    echo "driver_ready=false" >> "$GITHUB_OUTPUT"
-                    exit 0
-                  fi
-
-                  if cargo +nightly install cargo-slicer --version "$CARGO_SLICER_VERSION" --profile release-rustc \
-                    --bin cargo-slicer-rustc --bin cargo_slicer_dispatch \
-                    --features rustc-driver --locked 2>/dev/null \
-                    || cargo +nightly install cargo-slicer --version "$CARGO_SLICER_VERSION" --profile release-rustc \
-                      --bin cargo-slicer-rustc --bin cargo_slicer_dispatch \
-                      --features rustc-driver; then
-                    echo "driver_ready=true" >> "$GITHUB_OUTPUT"
-                  else
-                    echo "::warning::cargo-slicer rustc-driver install failed (nightly rustc API drift); using fallback nightly release build."
-                    echo "driver_ready=false" >> "$GITHUB_OUTPUT"
-                  fi
-
-            - name: Pre-analyze workspace
-              if: steps.install_slicer.outputs.slicer_ready == 'true'
-              run: cargo-slicer pre-analyze
-
-            - name: Build release binary (virtual slicing + MIR-precise)
-              if: steps.install_slicer.outputs.driver_ready == 'true'
-              run: |
-                  CARGO_SLICER_MIR_PRECISE=1 \
-                    CARGO_SLICER_WORKSPACE_CRATES=zeroclaw,zeroclaw_robot_kit \
-                    CARGO_SLICER_VIRTUAL=1 CARGO_SLICER_CODEGEN_FILTER=1 \
-                    RUSTC_WRAPPER=$(which cargo_slicer_dispatch) \
-                    cargo +nightly build --release --verbose
-
-            - name: Fallback release build (no slicer wrapper)
-              if: steps.install_slicer.outputs.driver_ready != 'true'
+            - name: Build release binary
               run: cargo +nightly build --release --verbose
