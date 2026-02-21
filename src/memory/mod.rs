@@ -8,6 +8,7 @@ pub mod markdown;
 pub mod none;
 #[cfg(feature = "memory-postgres")]
 pub mod postgres;
+pub mod qdrant;
 pub mod response_cache;
 pub mod snapshot;
 pub mod sqlite;
@@ -25,14 +26,14 @@ pub use none::NoneMemory;
 #[cfg(feature = "memory-postgres")]
 pub use postgres::PostgresMemory;
 pub use response_cache::ResponseCache;
+pub use qdrant::QdrantMemory;
 pub use sqlite::SqliteMemory;
 pub use traits::Memory;
 #[allow(unused_imports)]
 pub use traits::{MemoryCategory, MemoryEntry};
 
-use crate::config::{EmbeddingRouteConfig, MemoryConfig, StorageProviderConfig};
-#[cfg(feature = "memory-postgres")]
 use anyhow::Context;
+use crate::config::{EmbeddingRouteConfig, MemoryConfig, StorageProviderConfig};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -54,7 +55,7 @@ where
             Ok(Box::new(LucidMemory::new(workspace_dir, local)))
         }
         MemoryBackendKind::Postgres => postgres_builder(),
-        MemoryBackendKind::Markdown => Ok(Box::new(MarkdownMemory::new(workspace_dir))),
+        MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => Ok(Box::new(MarkdownMemory::new(workspace_dir))),
         MemoryBackendKind::None => Ok(Box::new(NoneMemory::new())),
         MemoryBackendKind::Unknown => {
             tracing::warn!(
@@ -293,6 +294,47 @@ pub fn create_memory_with_storage_and_routes(
         anyhow::bail!(
             "memory backend 'postgres' requested but this build was compiled without `memory-postgres`; rebuild with `--features memory-postgres`"
         );
+    }
+
+    if matches!(backend_kind, MemoryBackendKind::Qdrant) {
+        let url = config
+            .qdrant
+            .url
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| std::env::var("QDRANT_URL").ok())
+            .filter(|s| !s.trim().is_empty())
+            .context(
+                "Qdrant memory backend requires url in [memory.qdrant] or QDRANT_URL env var",
+            )?;
+        let collection = std::env::var("QDRANT_COLLECTION")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| config.qdrant.collection.clone());
+        let qdrant_api_key = config
+            .qdrant
+            .api_key
+            .clone()
+            .or_else(|| std::env::var("QDRANT_API_KEY").ok())
+            .filter(|s| !s.trim().is_empty());
+        let embedder: Arc<dyn embeddings::EmbeddingProvider> =
+            Arc::from(embeddings::create_embedding_provider(
+                &resolved_embedding.provider,
+                resolved_embedding.api_key.as_deref(),
+                &resolved_embedding.model,
+                resolved_embedding.dimensions,
+            ));
+        tracing::info!(
+            "📦 Qdrant memory backend configured (url: {}, collection: {})",
+            url,
+            collection
+        );
+        return Ok(Box::new(QdrantMemory::new_lazy(
+            &url,
+            &collection,
+            qdrant_api_key,
+            embedder,
+        )));
     }
 
     create_memory_with_builders(

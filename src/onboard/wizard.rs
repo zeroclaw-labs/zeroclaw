@@ -388,6 +388,7 @@ fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
         snapshot_on_hygiene: false,
         auto_hydrate: true,
         sqlite_open_timeout_secs: None,
+        qdrant: crate::config::QdrantConfig::default(),
     }
 }
 

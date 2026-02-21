@@ -1697,6 +1697,21 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return Ok(());
         }
 
+        // Remap Docker container workspace path (/workspace/...) to the host
+        // workspace directory so files written by the containerised runtime
+        // can be found and sent by the host-side Telegram sender.
+        let remapped;
+        let target = if let Some(rel) = target.strip_prefix("/workspace/") {
+            if let Some(ws) = &self.workspace_dir {
+                remapped = ws.join(rel);
+                remapped.to_str().unwrap_or(target)
+            } else {
+                target
+            }
+        } else {
+            target
+        };
+
         let path = Path::new(target);
         if !path.exists() {
             anyhow::bail!("Telegram attachment path not found: {target}");
