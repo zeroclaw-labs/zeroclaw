@@ -14,7 +14,7 @@ All measurements are clean `cargo +nightly build --release`. MIR-precise mode re
 
 ## CI Integration
 
-The workflow [`.github/workflows/ci-build-fast.yml`](../.github/workflows/ci-build-fast.yml) runs an accelerated release build alongside the standard one. It does not gate merges and runs in parallel as a non-blocking check.
+The workflow [`.github/workflows/ci-build-fast.yml`](../.github/workflows/ci-build-fast.yml) runs an accelerated release build alongside the standard one. It triggers on Rust-code changes and workflow changes, does not gate merges, and runs in parallel as a non-blocking check.
 
 CI uses a resilient two-path strategy:
 - **Fast path**: install `cargo-slicer` plus the `rustc-driver` binaries and run the MIR-precise sliced build.

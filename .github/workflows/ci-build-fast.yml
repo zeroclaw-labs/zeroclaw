@@ -46,7 +46,7 @@ jobs:
     build-fast:
         name: Build (Fast — cargo-slicer)
         needs: [changes]
-        if: needs.changes.outputs.rust_changed == 'true'
+        if: needs.changes.outputs.rust_changed == 'true' || needs.changes.outputs.workflow_changed == 'true'
         runs-on: blacksmith-2vcpu-ubuntu-2404
         timeout-minutes: 25
         steps:
