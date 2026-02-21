@@ -29,3 +29,7 @@ venv/
 *.pem
 credentials.json
 .worktrees/
+
+# Local config overrides
+.zeroclaw-config/
+rust-toolchain.toml
