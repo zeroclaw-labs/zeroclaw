@@ -444,6 +444,28 @@ pub async fn run_quick_setup(
     .await
 }
 
+fn resolve_quick_setup_dirs_with_home(home: &Path) -> (PathBuf, PathBuf) {
+    if let Ok(custom_config_dir) = std::env::var("ZEROCLAW_CONFIG_DIR") {
+        let trimmed = custom_config_dir.trim();
+        if !trimmed.is_empty() {
+            let config_dir = PathBuf::from(trimmed);
+            return (config_dir.clone(), config_dir.join("workspace"));
+        }
+    }
+
+    if let Ok(custom_workspace) = std::env::var("ZEROCLAW_WORKSPACE") {
+        let trimmed = custom_workspace.trim();
+        if !trimmed.is_empty() {
+            return crate::config::schema::resolve_config_dir_for_workspace(&PathBuf::from(
+                trimmed,
+            ));
+        }
+    }
+
+    let config_dir = home.join(".zeroclaw");
+    (config_dir.clone(), config_dir.join("workspace"))
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run_quick_setup_with_home(
     credential_override: Option<&str>,
@@ -462,8 +484,7 @@ async fn run_quick_setup_with_home(
     );
     println!();
 
-    let zeroclaw_dir = home.join(".zeroclaw");
-    let workspace_dir = zeroclaw_dir.join("workspace");
+    let (zeroclaw_dir, workspace_dir) = resolve_quick_setup_dirs_with_home(home);
     let config_path = zeroclaw_dir.join("config.toml");
 
     ensure_onboard_overwrite_allowed(&config_path, force)?;
@@ -1856,14 +1877,12 @@ async fn persist_workspace_selection(config_path: &Path) -> Result<()> {
 // ── Step 1: Workspace ────────────────────────────────────────────
 
 async fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
-    let home = directories::UserDirs::new()
-        .map(|u| u.home_dir().to_path_buf())
-        .context("Could not find home directory")?;
-    let default_dir = home.join(".zeroclaw");
+    let (default_config_dir, default_workspace_dir) =
+        crate::config::schema::resolve_runtime_dirs_for_onboarding().await?;
 
     print_bullet(&format!(
         "Default location: {}",
-        style(default_dir.display()).green()
+        style(default_workspace_dir.display()).green()
     ));
 
     let use_default = Confirm::new()
@@ -1871,18 +1890,17 @@ async fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
         .default(true)
         .interact()?;
 
-    let zeroclaw_dir = if use_default {
-        default_dir
+    let (config_dir, workspace_dir) = if use_default {
+        (default_config_dir, default_workspace_dir)
     } else {
         let custom: String = Input::new()
             .with_prompt("  Enter workspace path")
             .interact_text()?;
         let expanded = shellexpand::tilde(&custom).to_string();
-        PathBuf::from(expanded)
+        crate::config::schema::resolve_config_dir_for_workspace(&PathBuf::from(expanded))
     };
 
-    let workspace_dir = zeroclaw_dir.join("workspace");
-    let config_path = zeroclaw_dir.join("config.toml");
+    let config_path = config_dir.join("config.toml");
 
     fs::create_dir_all(&workspace_dir)
         .await
@@ -5541,7 +5559,42 @@ fn print_summary(config: &Config) {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     // ── ProjectContext defaults ──────────────────────────────────
 
@@ -5708,6 +5761,35 @@ mod tests {
         let config_raw = tokio::fs::read_to_string(config.config_path).await.unwrap();
         assert!(config_raw.contains("default_provider = \"openrouter\""));
         assert!(config_raw.contains("default_model = \"custom-model-fresh\""));
+    }
+
+    #[tokio::test]
+    async fn quick_setup_respects_zero_claw_workspace_env_layout() {
+        let _env_guard = env_lock().lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let workspace_root = tmp.path().join("zeroclaw-data");
+        let workspace_dir = workspace_root.join("workspace");
+        let expected_config_path = workspace_root.join(".zeroclaw").join("config.toml");
+
+        let _workspace_env = EnvVarGuard::set(
+            "ZEROCLAW_WORKSPACE",
+            workspace_dir.to_string_lossy().as_ref(),
+        );
+        let _config_env = EnvVarGuard::unset("ZEROCLAW_CONFIG_DIR");
+
+        let config = run_quick_setup_with_home(
+            Some("sk-env"),
+            Some("openrouter"),
+            Some("model-env"),
+            Some("sqlite"),
+            false,
+            tmp.path(),
+        )
+        .await
+        .expect("quick setup should honor ZEROCLAW_WORKSPACE");
+
+        assert_eq!(config.workspace_dir, workspace_dir);
+        assert_eq!(config.config_path, expected_config_path);
     }
 
     // ── scaffold_workspace: basic file creation ─────────────────

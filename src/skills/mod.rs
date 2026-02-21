@@ -141,6 +141,14 @@ fn load_skills_from_directory(skills_dir: &Path) -> Vec<Skill> {
 }
 
 fn load_open_skills(repo_dir: &Path) -> Vec<Skill> {
+    // Modern open-skills layout stores skill packages in `skills/<name>/SKILL.md`.
+    // Prefer that structure to avoid treating repository docs (e.g. CONTRIBUTING.md)
+    // as executable skills.
+    let nested_skills_dir = repo_dir.join("skills");
+    if nested_skills_dir.is_dir() {
+        return load_skills_from_directory(&nested_skills_dir);
+    }
+
     let mut skills = Vec::new();
 
     let Ok(entries) = std::fs::read_dir(repo_dir) else {
@@ -1294,10 +1302,15 @@ description = "Bare minimum"
         fs::create_dir_all(workspace_dir.join("skills")).unwrap();
 
         let open_skills_dir = dir.path().join("open-skills-local");
-        fs::create_dir_all(&open_skills_dir).unwrap();
+        fs::create_dir_all(open_skills_dir.join("skills/http_request")).unwrap();
         fs::write(open_skills_dir.join("README.md"), "# open skills\n").unwrap();
         fs::write(
-            open_skills_dir.join("http_request.md"),
+            open_skills_dir.join("CONTRIBUTING.md"),
+            "# contribution guide\n",
+        )
+        .unwrap();
+        fs::write(
+            open_skills_dir.join("skills/http_request/SKILL.md"),
             "# HTTP request\nFetch API responses.\n",
         )
         .unwrap();
@@ -1310,6 +1323,7 @@ description = "Bare minimum"
         let skills = load_skills_with_config(&workspace_dir, &config);
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "http_request");
+        assert_ne!(skills[0].name, "CONTRIBUTING");
     }
 }
 
