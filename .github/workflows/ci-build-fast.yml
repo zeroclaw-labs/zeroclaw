@@ -52,9 +52,11 @@ jobs:
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+            # Pin nightly date: cargo-slicer 0.0.2 uses rustc-private FileName::prefer_local()
+            # which was removed after nightly-2026-02-20. Unpin when cargo-slicer ships a fix.
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # nightly
               with:
-                  toolchain: nightly
+                  toolchain: nightly-2026-02-20
                   components: rust-src, rustc-dev, llvm-tools-preview
 
             - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
@@ -66,10 +68,10 @@ jobs:
               run: |
                   cargo install cargo-slicer --locked 2>/dev/null \
                     || cargo install cargo-slicer
-                  cargo +nightly install cargo-slicer --profile release-rustc \
+                  cargo +nightly-2026-02-20 install cargo-slicer --profile release-rustc \
                     --bin cargo-slicer-rustc --bin cargo_slicer_dispatch \
                     --features rustc-driver --locked 2>/dev/null \
-                    || cargo +nightly install cargo-slicer --profile release-rustc \
+                    || cargo +nightly-2026-02-20 install cargo-slicer --profile release-rustc \
                       --bin cargo-slicer-rustc --bin cargo_slicer_dispatch \
                       --features rustc-driver
 
@@ -82,4 +84,4 @@ jobs:
                     CARGO_SLICER_WORKSPACE_CRATES=zeroclaw,zeroclaw_robot_kit \
                     CARGO_SLICER_VIRTUAL=1 CARGO_SLICER_CODEGEN_FILTER=1 \
                     RUSTC_WRAPPER=$(which cargo_slicer_dispatch) \
-                    cargo +nightly build --release --verbose
+                    cargo +nightly-2026-02-20 build --release --verbose
