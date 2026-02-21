@@ -4454,18 +4454,11 @@ impl Config {
             anyhow::bail!("Failed to atomically replace config file: {e}");
         }
 
+        // Ensure config file is not world-readable (may contain API keys).
         #[cfg(unix)]
         {
             use std::{fs::Permissions, os::unix::fs::PermissionsExt};
-            if let Err(err) =
-                fs::set_permissions(&self.config_path, Permissions::from_mode(0o600)).await
-            {
-                tracing::warn!(
-                    "Failed to harden config permissions to 0600 at {}: {}",
-                    self.config_path.display(),
-                    err
-                );
-            }
+            let _ = fs::set_permissions(&self.config_path, Permissions::from_mode(0o600)).await;
         }
 
         sync_directory(parent_dir).await?;
