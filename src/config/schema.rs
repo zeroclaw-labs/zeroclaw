@@ -1,3 +1,4 @@
+use crate::config::traits::ChannelConfig;
 use crate::providers::{is_glm_alias, is_zai_alias};
 use crate::security::AutonomyLevel;
 use anyhow::{Context, Result};
@@ -2514,6 +2515,15 @@ pub struct TelegramConfig {
     pub mention_only: bool,
 }
 
+impl ChannelConfig for TelegramConfig {
+    fn name() -> &'static str {
+        "Telegram"
+    }
+    fn desc() -> &'static str {
+        "connect your bot"
+    }
+}
+
 /// Discord bot channel configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DiscordConfig {
@@ -2534,6 +2544,15 @@ pub struct DiscordConfig {
     pub mention_only: bool,
 }
 
+impl ChannelConfig for DiscordConfig {
+    fn name() -> &'static str {
+        "Discord"
+    }
+    fn desc() -> &'static str {
+        "connect your bot"
+    }
+}
+
 /// Slack bot channel configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SlackConfig {
@@ -2547,6 +2566,15 @@ pub struct SlackConfig {
     /// Allowed Slack user IDs. Empty = deny all.
     #[serde(default)]
     pub allowed_users: Vec<String>,
+}
+
+impl ChannelConfig for SlackConfig {
+    fn name() -> &'static str {
+        "Slack"
+    }
+    fn desc() -> &'static str {
+        "connect your bot"
+    }
 }
 
 /// Mattermost bot channel configuration.
@@ -2571,6 +2599,15 @@ pub struct MattermostConfig {
     pub mention_only: Option<bool>,
 }
 
+impl ChannelConfig for MattermostConfig {
+    fn name() -> &'static str {
+        "Mattermost"
+    }
+    fn desc() -> &'static str {
+        "connect to your bot"
+    }
+}
+
 /// Webhook channel configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WebhookConfig {
@@ -2580,11 +2617,29 @@ pub struct WebhookConfig {
     pub secret: Option<String>,
 }
 
+impl ChannelConfig for WebhookConfig {
+    fn name() -> &'static str {
+        "Webhook"
+    }
+    fn desc() -> &'static str {
+        "HTTP endpoint"
+    }
+}
+
 /// iMessage channel configuration (macOS only).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct IMessageConfig {
     /// Allowed iMessage contacts (phone numbers or email addresses). Empty = deny all.
     pub allowed_contacts: Vec<String>,
+}
+
+impl ChannelConfig for IMessageConfig {
+    fn name() -> &'static str {
+        "iMessage"
+    }
+    fn desc() -> &'static str {
+        "macOS only"
+    }
 }
 
 /// Matrix channel configuration.
@@ -2604,6 +2659,15 @@ pub struct MatrixConfig {
     pub room_id: String,
     /// Allowed Matrix user IDs. Empty = deny all.
     pub allowed_users: Vec<String>,
+}
+
+impl ChannelConfig for MatrixConfig {
+    fn name() -> &'static str {
+        "Matrix"
+    }
+    fn desc() -> &'static str {
+        "self-hosted chat"
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -2628,6 +2692,16 @@ pub struct SignalConfig {
     #[serde(default)]
     pub ignore_stories: bool,
 }
+
+impl ChannelConfig for SignalConfig {
+    fn name() -> &'static str {
+        "Signal"
+    }
+    fn desc() -> &'static str {
+        "An open-source, encrypted messaging service"
+    }
+}
+
 
 /// WhatsApp channel configuration (Cloud API or Web mode).
 ///
@@ -2667,6 +2741,15 @@ pub struct WhatsAppConfig {
     pub allowed_numbers: Vec<String>,
 }
 
+impl ChannelConfig for WhatsAppConfig {
+    fn name() -> &'static str {
+        "WhatsApp"
+    }
+    fn desc() -> &'static str {
+        "Business Cloud API"
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LinqConfig {
     /// Linq Partner API token (Bearer auth)
@@ -2679,6 +2762,15 @@ pub struct LinqConfig {
     /// Allowed sender handles (phone numbers) or "*" for all
     #[serde(default)]
     pub allowed_senders: Vec<String>,
+}
+
+impl ChannelConfig for LinqConfig {
+    fn name() -> &'static str {
+        "Linq"
+    }
+    fn desc() -> &'static str {
+        "iMessage/RCS/SMS via Linq API"
+    }
 }
 
 /// Nextcloud Talk bot configuration (webhook receive + OCS send API).
@@ -2696,6 +2788,15 @@ pub struct NextcloudTalkConfig {
     /// Allowed Nextcloud actor IDs (`[]` = deny all, `"*"` = allow all).
     #[serde(default)]
     pub allowed_users: Vec<String>,
+}
+
+impl ChannelConfig for NextcloudTalkConfig {
+    fn name() -> &'static str {
+        "NextCloud Talk"
+    }
+    fn desc() -> &'static str {
+        "NextCloud Talk platform"
+    }
 }
 
 impl WhatsAppConfig {
@@ -2758,6 +2859,15 @@ pub struct IrcConfig {
     pub verify_tls: Option<bool>,
 }
 
+impl ChannelConfig for IrcConfig {
+    fn name() -> &'static str {
+        "IRC"
+    }
+    fn desc() -> &'static str {
+        "IRC over TLS"
+    }
+}
+
 fn default_irc_port() -> u16 {
     6697
 }
@@ -2801,6 +2911,15 @@ pub struct LarkConfig {
     /// Not required (and ignored) for websocket mode.
     #[serde(default)]
     pub port: Option<u16>,
+}
+
+impl ChannelConfig for LarkConfig {
+    fn name() -> &'static str {
+        "Lark/Feishu"
+    }
+    fn desc() -> &'static str {
+        "Lark/Feishu Bot"
+    }
 }
 
 // ── Security Config ─────────────────────────────────────────────────
@@ -2968,6 +3087,15 @@ pub struct DingTalkConfig {
     pub allowed_users: Vec<String>,
 }
 
+impl ChannelConfig for DingTalkConfig {
+    fn name() -> &'static str {
+        "DingTalk"
+    }
+    fn desc() -> &'static str {
+        "DingTalk Stream Mode"
+    }
+}
+
 /// QQ Official Bot configuration (Tencent QQ Bot SDK)
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct QQConfig {
@@ -2978,6 +3106,15 @@ pub struct QQConfig {
     /// Allowed user IDs. Empty = deny all, "*" = allow all
     #[serde(default)]
     pub allowed_users: Vec<String>,
+}
+
+impl ChannelConfig for QQConfig {
+    fn name() -> &'static str {
+        "QQ Official"
+    }
+    fn desc() -> &'static str {
+        "Tencent QQ Bot"
+    }
 }
 
 /// Nostr channel configuration (NIP-04 + NIP-17 private messages)
@@ -2991,6 +3128,15 @@ pub struct NostrConfig {
     /// Allowed sender public keys (hex or npub). Empty = deny all, "*" = allow all
     #[serde(default)]
     pub allowed_pubkeys: Vec<String>,
+}
+
+impl ChannelConfig for NostrConfig {
+    fn name() -> &'static str {
+        "Nostr"
+    }
+    fn desc() -> &'static str {
+        "Nostr DMs"
+    }
 }
 
 pub fn default_nostr_relays() -> Vec<String> {

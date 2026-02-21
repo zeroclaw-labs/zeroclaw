@@ -1,4 +1,5 @@
 pub mod schema;
+pub mod traits;
 
 #[allow(unused_imports)]
 pub use schema::{
