@@ -1550,6 +1550,7 @@ mod tests {
             Ok(ChatResponse {
                 text: Some(self.response_text.to_string()),
                 tool_calls: self.tool_calls.clone(),
+                usage: None,
             })
         }
     }
@@ -1741,6 +1742,7 @@ mod tests {
             Ok(ChatResponse {
                 text: Some(self.response_text.to_string()),
                 tool_calls: vec![],
+                usage: None,
             })
         }
     }
