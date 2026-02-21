@@ -997,12 +997,7 @@ async fn main() -> Result<()> {
                 .parent()
                 .context("Config path must have parent")?
                 .to_path_buf();
-            clawhub::cli::handle_command(
-                clawhub_command,
-                &config_dir,
-                &config.workspace_dir,
-            )
-            .await
+            clawhub::cli::handle_command(clawhub_command, &config_dir, &config.workspace_dir).await
         }
 
         Commands::Migrate { migrate_command } => {

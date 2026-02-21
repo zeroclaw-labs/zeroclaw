@@ -98,7 +98,12 @@ mod tests {
         let mut registry = Registry::new(dir.path());
 
         registry
-            .add_skill("test-skill", "Test Skill", "1.0.0", "https://example.com/test")
+            .add_skill(
+                "test-skill",
+                "Test Skill",
+                "1.0.0",
+                "https://example.com/test",
+            )
             .unwrap();
 
         let skills = registry.list_skills();
@@ -115,7 +120,12 @@ mod tests {
         assert!(!registry.is_installed("test-skill"));
 
         registry
-            .add_skill("test-skill", "Test Skill", "1.0.0", "https://example.com/test")
+            .add_skill(
+                "test-skill",
+                "Test Skill",
+                "1.0.0",
+                "https://example.com/test",
+            )
             .unwrap();
 
         assert!(registry.is_installed("test-skill"));
@@ -127,10 +137,20 @@ mod tests {
         let mut registry = Registry::new(dir.path());
 
         registry
-            .add_skill("test-skill", "Test Skill", "1.0.0", "https://example.com/test")
+            .add_skill(
+                "test-skill",
+                "Test Skill",
+                "1.0.0",
+                "https://example.com/test",
+            )
             .unwrap();
         registry
-            .add_skill("test-skill", "Test Skill", "2.0.0", "https://example.com/test")
+            .add_skill(
+                "test-skill",
+                "Test Skill",
+                "2.0.0",
+                "https://example.com/test",
+            )
             .unwrap();
 
         let skills = registry.list_skills();
@@ -144,7 +164,12 @@ mod tests {
         let mut registry = Registry::new(dir.path());
 
         registry
-            .add_skill("test-skill", "Test Skill", "1.0.0", "https://example.com/test")
+            .add_skill(
+                "test-skill",
+                "Test Skill",
+                "1.0.0",
+                "https://example.com/test",
+            )
             .unwrap();
         assert!(registry.is_installed("test-skill"));
 

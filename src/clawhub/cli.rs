@@ -3,8 +3,9 @@
 
 use crate::clawhub::client::ClawHubClient;
 use crate::clawhub::registry::Registry;
+use crate::clawhub::types::InstalledSkill;
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// CLI subcommands for clawhub
 #[derive(Debug, Clone, clap::Subcommand)]
@@ -52,22 +53,14 @@ pub async fn handle_command(
     workspace_dir: &PathBuf,
 ) -> Result<()> {
     match command {
-        ClawHubSubcommand::Search { query, limit } => {
-            handle_search(&query, limit).await
-        }
+        ClawHubSubcommand::Search { query, limit } => handle_search(&query, limit).await,
         ClawHubSubcommand::Install { slug, version } => {
             handle_install(&slug, version.as_deref(), config_dir, workspace_dir).await
         }
-        ClawHubSubcommand::Uninstall { slug } => {
-            handle_uninstall(&slug, config_dir, workspace_dir)
-        }
+        ClawHubSubcommand::Uninstall { slug } => handle_uninstall(&slug, config_dir, workspace_dir),
         ClawHubSubcommand::List => handle_list(config_dir),
-        ClawHubSubcommand::Update => {
-            handle_update(config_dir, workspace_dir).await
-        }
-        ClawHubSubcommand::Inspect { slug } => {
-            handle_inspect(&slug).await
-        }
+        ClawHubSubcommand::Update => handle_update(config_dir, workspace_dir).await,
+        ClawHubSubcommand::Inspect { slug } => handle_inspect(&slug).await,
         ClawHubSubcommand::Login => handle_login(),
         ClawHubSubcommand::Whoami => handle_whoami(config_dir).await,
     }
@@ -79,10 +72,7 @@ async fn handle_search(query: &str, limit: usize) -> Result<()> {
 
     println!("Searching ClawHub for \"{query}\"...");
     println!("Found {} skills:\n", result.total);
-    println!(
-        "  {:<20} {:<30} {:<8} Tags",
-        "Name", "Description", "Stars"
-    );
+    println!("  {:<20} {:<30} {:<8} Tags", "Name", "Description", "Stars");
     println!("  {}", "-".repeat(70));
 
     for skill in result.skills {
@@ -112,10 +102,7 @@ async fn handle_install(
     println!("  Found: {} v{}", skill.name, skill.version);
     println!("  Description: {}", skill.description);
 
-    let readme_url = skill
-        .readme_url
-        .as_ref()
-        .context("Skill has no SKILL.md")?;
+    let readme_url = skill.readme_url.as_ref().context("Skill has no SKILL.md")?;
 
     println!("  Downloading from: {}", readme_url);
 
@@ -169,10 +156,7 @@ async fn handle_update(config_dir: &PathBuf, _workspace_dir: &PathBuf) -> Result
     for skill in registry.list_skills() {
         if let Ok(remote) = client.get_skill(&skill.slug).await {
             if remote.version != skill.version {
-                println!(
-                    "  {}: {} -> {}",
-                    skill.slug, skill.version, remote.version
-                );
+                println!("  {}: {} -> {}", skill.slug, skill.version, remote.version);
             } else {
                 println!("  {}: {} (up to date)", skill.slug, skill.version);
             }
@@ -188,7 +172,10 @@ async fn handle_inspect(slug: &str) -> Result<()> {
 
     println!("Skill: {} ({})", skill.name, skill.slug);
     println!("Version: {}", skill.version);
-    println!("Author: {}", skill.author.unwrap_or_else(|| "unknown".into()));
+    println!(
+        "Author: {}",
+        skill.author.unwrap_or_else(|| "unknown".into())
+    );
     println!("Stars: {}", skill.stars);
     println!("Tags: [{}]", skill.tags.join(", "));
     println!("\nDescription:\n{}", skill.description);
@@ -236,5 +223,54 @@ async fn handle_whoami(config_dir: &PathBuf) -> Result<()> {
     }
 
     println!("Not authenticated. Run 'zeroclaw clawhub login' first.");
+    Ok(())
+}
+
+/// Update the skills README to include ClawHub skills
+pub fn update_skills_readme(skills_dir: &Path, clawhub_skills: &[InstalledSkill]) -> Result<()> {
+    let readme_path = skills_dir.join("README.md");
+
+    let mut content = String::new();
+
+    // Header
+    content.push_str("# ZeroClaw Skills\n\n");
+
+    // Local skills section
+    content.push_str("## Local Skills\n\n");
+    content.push_str("Each subdirectory is a skill. Create a `SKILL.toml` or `SKILL.md` file inside.\n\n");
+
+    // ClawHub skills section
+    if !clawhub_skills.is_empty() {
+        content.push_str("## ClawHub Skills\n\n");
+        content.push_str("These skills installed from [ClawHub](https://clawhub.ai):\n\n");
+        content.push_str("| Skill | Version | Source |\n");
+        content.push_str("|-------|---------|--------|\n");
+
+        for skill in clawhub_skills {
+            content.push_str(&format!(
+                "| [{}]({}) | {} | [ClawHub](https://clawhub.ai/s/{}) |\n",
+                skill.name,
+                format!("skills/{}/SKILL.md", skill.slug),
+                skill.version,
+                skill.slug
+            ));
+        }
+
+        content.push_str("\n");
+    }
+
+    // Installation instructions
+    content.push_str("## Installing More Skills\n\n");
+    content.push_str("```bash\n");
+    content.push_str("# Search ClawHub for skills\n");
+    content.push_str("zeroclaw clawhub search <query>\n\n");
+    content.push_str("# Install a skill\n");
+    content.push_str("zeroclaw clawhub install <slug>\n\n");
+    content.push_str("# List installed skills\n");
+    content.push_str("zeroclaw clawhub list\n");
+    content.push_str("```\n");
+
+    std::fs::write(&readme_path, content)?;
+
     Ok(())
 }
