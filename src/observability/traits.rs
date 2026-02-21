@@ -26,6 +26,8 @@ pub enum ObserverEvent {
         duration: Duration,
         success: bool,
         error_message: Option<String>,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
     },
     /// The agent session has finished.
     ///

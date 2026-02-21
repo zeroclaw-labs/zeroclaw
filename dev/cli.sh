@@ -78,7 +78,7 @@ case "$1" in
         # Build context MUST be set correctly for docker compose
         docker compose -f "$COMPOSE_FILE" up -d
         echo -e "${GREEN}✅ Environment is running!${NC}"
-        echo -e "   - Agent: http://127.0.0.1:3000"
+        echo -e "   - Agent: http://127.0.0.1:42617"
         echo -e "   - Sandbox: running (background)"
         echo -e "   - Config: target/.zeroclaw/config.toml (Edit locally to apply changes)"
         ;;

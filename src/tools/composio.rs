@@ -16,6 +16,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
+use std::fmt::Write;
 use std::sync::Arc;
 
 const COMPOSIO_API_BASE_V2: &str = "https://backend.composio.dev/api/v2";
@@ -789,9 +790,7 @@ impl Tool for ComposioTool {
                             if let Some(app_name) = app {
                                 self.cache_connected_account(app_name, entity_id, connected_account_id);
                             }
-                            output.push_str(&format!(
-                                "\nConnected account ID: {connected_account_id}"
-                            ));
+                            let _ = write!(output, "\nConnected account ID: {connected_account_id}");
                         }
                         Ok(ToolResult {
                             success: true,

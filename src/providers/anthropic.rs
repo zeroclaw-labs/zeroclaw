@@ -1,6 +1,6 @@
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ToolCall as ProviderToolCall,
+    Provider, TokenUsage, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -128,6 +128,16 @@ struct SystemBlock {
 struct NativeChatResponse {
     #[serde(default)]
     content: Vec<NativeContentIn>,
+    #[serde(default)]
+    usage: Option<AnthropicUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicUsage {
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    #[serde(default)]
+    output_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -362,6 +372,11 @@ impl AnthropicProvider {
         let mut text_parts = Vec::new();
         let mut tool_calls = Vec::new();
 
+        let usage = response.usage.map(|u| TokenUsage {
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+        });
+
         for block in response.content {
             match block.kind.as_str() {
                 "text" => {
@@ -396,6 +411,7 @@ impl AnthropicProvider {
                 Some(text_parts.join("\n"))
             },
             tool_calls,
+            usage,
         }
     }
 
@@ -1314,5 +1330,26 @@ mod tests {
         );
 
         server_handle.abort();
+    }
+
+    #[test]
+    fn native_response_parses_usage() {
+        let json = r#"{
+            "content": [{"type": "text", "text": "Hello"}],
+            "usage": {"input_tokens": 300, "output_tokens": 75}
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let result = AnthropicProvider::parse_native_response(resp);
+        let usage = result.usage.unwrap();
+        assert_eq!(usage.input_tokens, Some(300));
+        assert_eq!(usage.output_tokens, Some(75));
+    }
+
+    #[test]
+    fn native_response_parses_without_usage() {
+        let json = r#"{"content": [{"type": "text", "text": "Hello"}]}"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let result = AnthropicProvider::parse_native_response(resp);
+        assert!(result.usage.is_none());
     }
 }

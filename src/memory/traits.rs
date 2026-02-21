@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 /// A single memory entry
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct MemoryEntry {
     pub id: String,
     pub key: String,
@@ -11,6 +11,19 @@ pub struct MemoryEntry {
     pub timestamp: String,
     pub session_id: Option<String>,
     pub score: Option<f64>,
+}
+
+impl std::fmt::Debug for MemoryEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryEntry")
+            .field("id", &self.id)
+            .field("key", &self.key)
+            .field("content", &self.content)
+            .field("category", &self.category)
+            .field("timestamp", &self.timestamp)
+            .field("score", &self.score)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Memory categories for organization

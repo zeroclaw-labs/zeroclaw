@@ -66,7 +66,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
             max_backoff,
             move || {
                 let cfg = heartbeat_cfg.clone();
-                async move { run_heartbeat_worker(cfg).await }
+                async move { Box::pin(run_heartbeat_worker(cfg)).await }
             },
         ));
     }
@@ -196,8 +196,16 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         for task in tasks {
             let prompt = format!("[Heartbeat Task] {task}");
             let temp = config.default_temperature;
-            if let Err(e) =
-                crate::agent::run(config.clone(), Some(prompt), None, None, temp, vec![]).await
+            if let Err(e) = crate::agent::run(
+                config.clone(),
+                Some(prompt),
+                None,
+                None,
+                temp,
+                vec![],
+                false,
+            )
+            .await
             {
                 crate::health::mark_component_error("heartbeat", e.to_string());
                 tracing::warn!("Heartbeat task failed: {e}");
@@ -225,7 +233,9 @@ fn has_supervised_channels(config: &Config) -> bool {
         lark,
         dingtalk,
         linq,
+        nextcloud_talk,
         qq,
+        nostr,
         ..
     } = &config.channels_config;
 
@@ -242,7 +252,9 @@ fn has_supervised_channels(config: &Config) -> bool {
         || lark.is_some()
         || dingtalk.is_some()
         || linq.is_some()
+        || nextcloud_talk.is_some()
         || qq.is_some()
+        || nostr.is_some()
 }
 
 #[cfg(test)]
@@ -358,6 +370,18 @@ mod tests {
         config.channels_config.qq = Some(crate::config::schema::QQConfig {
             app_id: "app-id".into(),
             app_secret: "app-secret".into(),
+            allowed_users: vec!["*".into()],
+        });
+        assert!(has_supervised_channels(&config));
+    }
+
+    #[test]
+    fn detects_nextcloud_talk_as_supervised_channel() {
+        let mut config = Config::default();
+        config.channels_config.nextcloud_talk = Some(crate::config::schema::NextcloudTalkConfig {
+            base_url: "https://cloud.example.com".into(),
+            app_token: "app-token".into(),
+            webhook_secret: None,
             allowed_users: vec!["*".into()],
         });
         assert!(has_supervised_channels(&config));

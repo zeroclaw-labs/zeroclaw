@@ -445,52 +445,92 @@ fn write_xml_text_element(out: &mut String, indent: usize, tag: &str, value: &st
     out.push_str(">\n");
 }
 
+fn resolve_skill_location(skill: &Skill, workspace_dir: &Path) -> PathBuf {
+    skill.location.clone().unwrap_or_else(|| {
+        workspace_dir
+            .join("skills")
+            .join(&skill.name)
+            .join("SKILL.md")
+    })
+}
+
+fn render_skill_location(skill: &Skill, workspace_dir: &Path, prefer_relative: bool) -> String {
+    let location = resolve_skill_location(skill, workspace_dir);
+    if prefer_relative {
+        if let Ok(relative) = location.strip_prefix(workspace_dir) {
+            return relative.display().to_string();
+        }
+    }
+    location.display().to_string()
+}
+
 /// Build the "Available Skills" system prompt section with full skill instructions.
 pub fn skills_to_prompt(skills: &[Skill], workspace_dir: &Path) -> String {
+    skills_to_prompt_with_mode(
+        skills,
+        workspace_dir,
+        crate::config::SkillsPromptInjectionMode::Full,
+    )
+}
+
+/// Build the "Available Skills" system prompt section with configurable verbosity.
+pub fn skills_to_prompt_with_mode(
+    skills: &[Skill],
+    workspace_dir: &Path,
+    mode: crate::config::SkillsPromptInjectionMode,
+) -> String {
     use std::fmt::Write;
 
     if skills.is_empty() {
         return String::new();
     }
 
-    let mut prompt = String::from(
-        "## Available Skills\n\n\
-         Skill instructions and tool metadata are preloaded below.\n\
-         Follow these instructions directly; do not read skill files at runtime unless the user asks.\n\n\
-         <available_skills>\n",
-    );
+    let mut prompt = match mode {
+        crate::config::SkillsPromptInjectionMode::Full => String::from(
+            "## Available Skills\n\n\
+             Skill instructions and tool metadata are preloaded below.\n\
+             Follow these instructions directly; do not read skill files at runtime unless the user asks.\n\n\
+             <available_skills>\n",
+        ),
+        crate::config::SkillsPromptInjectionMode::Compact => String::from(
+            "## Available Skills\n\n\
+             Skill summaries are preloaded below to keep context compact.\n\
+             Skill instructions are loaded on demand: read the skill file in `location` only when needed.\n\n\
+             <available_skills>\n",
+        ),
+    };
 
     for skill in skills {
         let _ = writeln!(prompt, "  <skill>");
         write_xml_text_element(&mut prompt, 4, "name", &skill.name);
         write_xml_text_element(&mut prompt, 4, "description", &skill.description);
+        let location = render_skill_location(
+            skill,
+            workspace_dir,
+            matches!(mode, crate::config::SkillsPromptInjectionMode::Compact),
+        );
+        write_xml_text_element(&mut prompt, 4, "location", &location);
 
-        let location = skill.location.clone().unwrap_or_else(|| {
-            workspace_dir
-                .join("skills")
-                .join(&skill.name)
-                .join("SKILL.md")
-        });
-        write_xml_text_element(&mut prompt, 4, "location", &location.display().to_string());
-
-        if !skill.prompts.is_empty() {
-            let _ = writeln!(prompt, "    <instructions>");
-            for instruction in &skill.prompts {
-                write_xml_text_element(&mut prompt, 6, "instruction", instruction);
+        if matches!(mode, crate::config::SkillsPromptInjectionMode::Full) {
+            if !skill.prompts.is_empty() {
+                let _ = writeln!(prompt, "    <instructions>");
+                for instruction in &skill.prompts {
+                    write_xml_text_element(&mut prompt, 6, "instruction", instruction);
+                }
+                let _ = writeln!(prompt, "    </instructions>");
             }
-            let _ = writeln!(prompt, "    </instructions>");
-        }
 
-        if !skill.tools.is_empty() {
-            let _ = writeln!(prompt, "    <tools>");
-            for tool in &skill.tools {
-                let _ = writeln!(prompt, "      <tool>");
-                write_xml_text_element(&mut prompt, 8, "name", &tool.name);
-                write_xml_text_element(&mut prompt, 8, "description", &tool.description);
-                write_xml_text_element(&mut prompt, 8, "kind", &tool.kind);
-                let _ = writeln!(prompt, "      </tool>");
+            if !skill.tools.is_empty() {
+                let _ = writeln!(prompt, "    <tools>");
+                for tool in &skill.tools {
+                    let _ = writeln!(prompt, "      <tool>");
+                    write_xml_text_element(&mut prompt, 8, "name", &tool.name);
+                    write_xml_text_element(&mut prompt, 8, "description", &tool.description);
+                    write_xml_text_element(&mut prompt, 8, "kind", &tool.kind);
+                    let _ = writeln!(prompt, "      </tool>");
+                }
+                let _ = writeln!(prompt, "    </tools>");
             }
-            let _ = writeln!(prompt, "    </tools>");
         }
 
         let _ = writeln!(prompt, "  </skill>");
@@ -887,6 +927,39 @@ command = "echo hello"
         assert!(prompt.contains("<available_skills>"));
         assert!(prompt.contains("<name>test</name>"));
         assert!(prompt.contains("<instruction>Do the thing.</instruction>"));
+    }
+
+    #[test]
+    fn skills_to_prompt_compact_mode_omits_instructions_and_tools() {
+        let skills = vec![Skill {
+            name: "test".to_string(),
+            description: "A test".to_string(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: vec![],
+            tools: vec![SkillTool {
+                name: "run".to_string(),
+                description: "Run task".to_string(),
+                kind: "shell".to_string(),
+                command: "echo hi".to_string(),
+                args: HashMap::new(),
+            }],
+            prompts: vec!["Do the thing.".to_string()],
+            location: Some(PathBuf::from("/tmp/workspace/skills/test/SKILL.md")),
+        }];
+        let prompt = skills_to_prompt_with_mode(
+            &skills,
+            Path::new("/tmp/workspace"),
+            crate::config::SkillsPromptInjectionMode::Compact,
+        );
+
+        assert!(prompt.contains("<available_skills>"));
+        assert!(prompt.contains("<name>test</name>"));
+        assert!(prompt.contains("<location>skills/test/SKILL.md</location>"));
+        assert!(prompt.contains("loaded on demand"));
+        assert!(!prompt.contains("<instructions>"));
+        assert!(!prompt.contains("<instruction>Do the thing.</instruction>"));
+        assert!(!prompt.contains("<tools>"));
     }
 
     #[test]

@@ -109,10 +109,12 @@ jobs:
                     fi
                   fi
 
-                  echo "release_ref=${release_ref}" >> "$GITHUB_OUTPUT"
-                  echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
-                  echo "publish_release=${publish_release}" >> "$GITHUB_OUTPUT"
-                  echo "draft_release=${draft_release}" >> "$GITHUB_OUTPUT"
+                  {
+                    echo "release_ref=${release_ref}"
+                    echo "release_tag=${release_tag}"
+                    echo "publish_release=${publish_release}"
+                    echo "draft_release=${draft_release}"
+                  } >> "$GITHUB_OUTPUT"
 
                   {
                     echo "### Release Context"
@@ -186,6 +188,7 @@ jobs:
                   targets: ${{ matrix.target }}
 
             - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
+              if: runner.os != 'Windows'
 
             - name: Install cross-compilation toolchain (Linux)
               if: runner.os == 'Linux' && matrix.cross_compiler != ''
@@ -194,6 +197,7 @@ jobs:
                   sudo apt-get install -y ${{ matrix.cross_compiler }}
 
             - name: Build release
+              shell: bash
               env:
                   LINKER_ENV: ${{ matrix.linker_env }}
                   LINKER: ${{ matrix.linker }}
@@ -202,42 +206,22 @@ jobs:
                     echo "Using linker override: $LINKER_ENV=$LINKER"
                     export "$LINKER_ENV=$LINKER"
                   fi
-                  cargo build --release --locked --target ${{ matrix.target }}
+                  cargo build --profile release-fast --locked --target ${{ matrix.target }}
 
             - name: Check binary size (Unix)
               if: runner.os != 'Windows'
-              run: |
-                  BIN="target/${{ matrix.target }}/release/${{ matrix.artifact }}"
-                  if [ ! -f "$BIN" ]; then
-                    echo "::error::Expected binary not found: $BIN"
-                    exit 1
-                  fi
-                  SIZE=$(stat -f%z "$BIN" 2>/dev/null || stat -c%s "$BIN")
-                  SIZE_MB=$((SIZE / 1024 / 1024))
-                  echo "Binary size: ${SIZE_MB}MB ($SIZE bytes)"
-                  echo "### Binary Size: ${{ matrix.target }}" >> "$GITHUB_STEP_SUMMARY"
-                  echo "- Size: ${SIZE_MB}MB ($SIZE bytes)" >> "$GITHUB_STEP_SUMMARY"
-                  if [ "$SIZE" -gt 41943040 ]; then
-                    echo "::error::Binary exceeds 40MB safeguard (${SIZE_MB}MB)"
-                    exit 1
-                  elif [ "$SIZE" -gt 15728640 ]; then
-                    echo "::warning::Binary exceeds 15MB advisory target (${SIZE_MB}MB)"
-                  elif [ "$SIZE" -gt 5242880 ]; then
-                    echo "::warning::Binary exceeds 5MB target (${SIZE_MB}MB)"
-                  else
-                    echo "Binary size within target."
-                  fi
+              run: bash scripts/ci/check_binary_size.sh "target/${{ matrix.target }}/release-fast/${{ matrix.artifact }}" "${{ matrix.target }}"
 
             - name: Package (Unix)
               if: runner.os != 'Windows'
               run: |
-                  cd target/${{ matrix.target }}/release
+                  cd target/${{ matrix.target }}/release-fast
                   tar czf ../../../zeroclaw-${{ matrix.target }}.${{ matrix.archive_ext }} ${{ matrix.artifact }}
 
             - name: Package (Windows)
               if: runner.os == 'Windows'
               run: |
-                  cd target/${{ matrix.target }}/release
+                  cd target/${{ matrix.target }}/release-fast
                   7z a ../../../zeroclaw-${{ matrix.target }}.${{ matrix.archive_ext }} ${{ matrix.artifact }}
 
             - name: Upload artifact
@@ -329,11 +313,11 @@ jobs:
                   set -euo pipefail
                   while IFS= read -r -d '' file; do
                     cosign sign-blob --yes \
-                      --oidc-issuer=https://token.actions.githubusercontent.com \
+                      --bundle="${file}.sigstore.json" \
                       --output-signature="${file}.sig" \
                       --output-certificate="${file}.pem" \
                       "$file"
-                  done < <(find artifacts -type f ! -name '*.sig' ! -name '*.pem' -print0)
+                  done < <(find artifacts -type f ! -name '*.sig' ! -name '*.pem' ! -name '*.sigstore.json' -print0)
 
             - name: Verify GHCR release tag availability
               shell: bash
@@ -348,15 +332,22 @@ jobs:
                   sleep_seconds=20
 
                   for attempt in $(seq 1 "$max_attempts"); do
-                    code="$(curl -sS -o /tmp/ghcr-release-manifest.json -w "%{http_code}" \
-                      -u "${GITHUB_ACTOR}:${{ secrets.GITHUB_TOKEN }}" \
-                      -H "Accept: ${accept_header}" \
-                      "${manifest_url}" || true)"
+                    token_resp="$(curl -sS "https://ghcr.io/token?scope=repository:${repo}:pull" || true)"
+                    token="$(echo "$token_resp" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')"
+
+                    if [ -z "$token" ]; then
+                      code="000"
+                    else
+                      code="$(curl -sS -o /tmp/ghcr-release-manifest.json -w "%{http_code}" \
+                        -H "Authorization: Bearer ${token}" \
+                        -H "Accept: ${accept_header}" \
+                        "${manifest_url}" || true)"
+                    fi
 
                     if [ "$code" = "200" ]; then
                       echo "GHCR release tag is available: ${repo}:${RELEASE_TAG}"
                       exit 0
-                    fi
+                  fi
 
                     if [ "$attempt" -lt "$max_attempts" ]; then
                       echo "Waiting for GHCR tag ${repo}:${RELEASE_TAG} (attempt ${attempt}/${max_attempts}, HTTP ${code})..."

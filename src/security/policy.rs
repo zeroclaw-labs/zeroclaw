@@ -85,10 +85,12 @@ pub struct SecurityPolicy {
     pub workspace_only: bool,
     pub allowed_commands: Vec<String>,
     pub forbidden_paths: Vec<String>,
+    pub allowed_roots: Vec<PathBuf>,
     pub max_actions_per_hour: u32,
     pub max_cost_per_day_cents: u32,
     pub require_approval_for_medium_risk: bool,
     pub block_high_risk_commands: bool,
+    pub shell_env_passthrough: Vec<String>,
     pub tracker: ActionTracker,
 }
 
@@ -135,10 +137,12 @@ impl Default for SecurityPolicy {
                 "~/.aws".into(),
                 "~/.config".into(),
             ],
+            allowed_roots: Vec::new(),
             max_actions_per_hour: 20,
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
+            shell_env_passthrough: vec![],
             tracker: ActionTracker::new(),
         }
     }
@@ -356,7 +360,6 @@ fn contains_unquoted_char(command: &str, target: char) -> bool {
                 }
                 if ch == '"' {
                     quote = QuoteState::None;
-                    continue;
                 }
             }
             QuoteState::None => {
@@ -716,7 +719,7 @@ impl SecurityPolicy {
         true
     }
 
-    /// Validate that a resolved path is still inside the workspace.
+    /// Validate that a resolved path is inside the workspace or an allowed root.
     /// Call this AFTER joining `workspace_dir` + relative path and canonicalizing.
     pub fn is_resolved_path_allowed(&self, resolved: &Path) -> bool {
         // Must be under workspace_dir (prevents symlink escapes).
@@ -726,7 +729,19 @@ impl SecurityPolicy {
             .workspace_dir
             .canonicalize()
             .unwrap_or_else(|_| self.workspace_dir.clone());
-        resolved.starts_with(workspace_root)
+        if resolved.starts_with(&workspace_root) {
+            return true;
+        }
+
+        // Check extra allowed roots (e.g. shared skills directories).
+        for root in &self.allowed_roots {
+            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+            if resolved.starts_with(&canonical) {
+                return true;
+            }
+        }
+
+        false
     }
 
     /// Check if autonomy level permits any action at all
@@ -789,10 +804,16 @@ impl SecurityPolicy {
             workspace_only: autonomy_config.workspace_only,
             allowed_commands: autonomy_config.allowed_commands.clone(),
             forbidden_paths: autonomy_config.forbidden_paths.clone(),
+            allowed_roots: autonomy_config
+                .allowed_roots
+                .iter()
+                .map(PathBuf::from)
+                .collect(),
             max_actions_per_hour: autonomy_config.max_actions_per_hour,
             max_cost_per_day_cents: autonomy_config.max_cost_per_day_cents,
             require_approval_for_medium_risk: autonomy_config.require_approval_for_medium_risk,
             block_high_risk_commands: autonomy_config.block_high_risk_commands,
+            shell_env_passthrough: autonomy_config.shell_env_passthrough.clone(),
             tracker: ActionTracker::new(),
         }
     }
@@ -1128,6 +1149,7 @@ mod tests {
             max_cost_per_day_cents: 1000,
             require_approval_for_medium_risk: false,
             block_high_risk_commands: false,
+            shell_env_passthrough: vec!["DATABASE_URL".into()],
             ..crate::config::AutonomyConfig::default()
         };
         let workspace = PathBuf::from("/tmp/test-workspace");
@@ -1141,6 +1163,7 @@ mod tests {
         assert_eq!(policy.max_cost_per_day_cents, 1000);
         assert!(!policy.require_approval_for_medium_risk);
         assert!(!policy.block_high_risk_commands);
+        assert_eq!(policy.shell_env_passthrough, vec!["DATABASE_URL"]);
         assert_eq!(policy.workspace_dir, PathBuf::from("/tmp/test-workspace"));
     }
 
@@ -1157,6 +1180,7 @@ mod tests {
         assert!(p.max_cost_per_day_cents > 0);
         assert!(p.require_approval_for_medium_risk);
         assert!(p.block_high_risk_commands);
+        assert!(p.shell_env_passthrough.is_empty());
     }
 
     // ── ActionTracker / rate limiting ───────────────────────
@@ -1719,6 +1743,60 @@ mod tests {
         assert!(
             !policy.is_resolved_path_allowed(&resolved),
             "symlink-resolved path outside workspace must be blocked"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn allowed_roots_permits_paths_outside_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join("zeroclaw_test_allowed_roots");
+        let workspace = root.join("workspace");
+        let extra = root.join("extra_root");
+        let extra_file = extra.join("data.txt");
+
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&extra).unwrap();
+        std::fs::write(&extra_file, "test").unwrap();
+
+        // Symlink inside workspace pointing to extra root
+        let link_path = workspace.join("link_to_extra");
+        symlink(&extra, &link_path).unwrap();
+
+        let resolved = link_path.join("data.txt").canonicalize().unwrap();
+
+        // Without allowed_roots — blocked (symlink escape)
+        let policy_without = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            allowed_roots: vec![],
+            ..SecurityPolicy::default()
+        };
+        assert!(
+            !policy_without.is_resolved_path_allowed(&resolved),
+            "without allowed_roots, symlink target must be blocked"
+        );
+
+        // With allowed_roots — permitted
+        let policy_with = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            allowed_roots: vec![extra.clone()],
+            ..SecurityPolicy::default()
+        };
+        assert!(
+            policy_with.is_resolved_path_allowed(&resolved),
+            "with allowed_roots containing the target, symlink must be allowed"
+        );
+
+        // Unrelated path still blocked
+        let unrelated = root.join("unrelated");
+        std::fs::create_dir_all(&unrelated).unwrap();
+        assert!(
+            !policy_with.is_resolved_path_allowed(&unrelated.canonicalize().unwrap()),
+            "paths outside workspace and allowed_roots must still be blocked"
         );
 
         let _ = std::fs::remove_dir_all(&root);

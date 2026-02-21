@@ -15,6 +15,36 @@ impl CronAddTool {
     pub fn new(config: Arc<Config>, security: Arc<SecurityPolicy>) -> Self {
         Self { config, security }
     }
+
+    fn enforce_mutation_allowed(&self, action: &str) -> Option<ToolResult> {
+        if !self.security.can_act() {
+            return Some(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Security policy: read-only mode, cannot perform '{action}'"
+                )),
+            });
+        }
+
+        if self.security.is_rate_limited() {
+            return Some(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Rate limit exceeded: too many actions in the last hour".to_string()),
+            });
+        }
+
+        if !self.security.record_action() {
+            return Some(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Rate limit exceeded: action budget exhausted".to_string()),
+            });
+        }
+
+        None
+    }
 }
 
 #[async_trait]
@@ -42,7 +72,12 @@ impl Tool for CronAddTool {
                 "session_target": { "type": "string", "enum": ["isolated", "main"] },
                 "model": { "type": "string" },
                 "delivery": { "type": "object" },
-                "delete_after_run": { "type": "boolean" }
+                "delete_after_run": { "type": "boolean" },
+                "approved": {
+                    "type": "boolean",
+                    "description": "Set true to explicitly approve medium/high-risk shell commands in supervised mode",
+                    "default": false
+                }
             },
             "required": ["schedule"]
         })
@@ -106,6 +141,10 @@ impl Tool for CronAddTool {
             .get("delete_after_run")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(default_delete_after_run);
+        let approved = args
+            .get("approved")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
 
         let result = match job_type {
             JobType::Shell => {
@@ -120,12 +159,16 @@ impl Tool for CronAddTool {
                     }
                 };
 
-                if !self.security.is_command_allowed(command) {
+                if let Err(reason) = self.security.validate_command_execution(command, approved) {
                     return Ok(ToolResult {
                         success: false,
                         output: String::new(),
-                        error: Some(format!("Command blocked by security policy: {command}")),
+                        error: Some(reason),
                     });
+                }
+
+                if let Some(blocked) = self.enforce_mutation_allowed("cron_add") {
+                    return Ok(blocked);
                 }
 
                 cron::add_shell_job(&self.config, name, schedule, command)
@@ -174,6 +217,10 @@ impl Tool for CronAddTool {
                     },
                     None => None,
                 };
+
+                if let Some(blocked) = self.enforce_mutation_allowed("cron_add") {
+                    return Ok(blocked);
+                }
 
                 cron::add_agent_job(
                     &self.config,
@@ -280,10 +327,74 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
+        assert!(result.error.unwrap_or_default().contains("not allowed"));
+    }
+
+    #[tokio::test]
+    async fn blocks_mutation_in_read_only_mode() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.autonomy.level = AutonomyLevel::ReadOnly;
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let cfg = Arc::new(config);
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
+                "job_type": "shell",
+                "command": "echo ok"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        let error = result.error.unwrap_or_default();
+        assert!(error.contains("read-only") || error.contains("not allowed"));
+    }
+
+    #[tokio::test]
+    async fn medium_risk_shell_command_requires_approval() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.autonomy.allowed_commands = vec!["touch".into()];
+        config.autonomy.level = AutonomyLevel::Supervised;
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let cfg = Arc::new(config);
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+
+        let denied = tool
+            .execute(json!({
+                "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
+                "job_type": "shell",
+                "command": "touch cron-approval-test"
+            }))
+            .await
+            .unwrap();
+        assert!(!denied.success);
+        assert!(denied
             .error
             .unwrap_or_default()
-            .contains("blocked by security policy"));
+            .contains("explicit approval"));
+
+        let approved = tool
+            .execute(json!({
+                "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
+                "job_type": "shell",
+                "command": "touch cron-approval-test",
+                "approved": true
+            }))
+            .await
+            .unwrap();
+        assert!(approved.success, "{:?}", approved.error);
     }
 
     #[tokio::test]

@@ -27,6 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Legacy values are still decrypted for backward compatibility but should be migrated.
 
 ### Fixed
+- **Gemini thinking model support** — Responses from thinking models (e.g. `gemini-3-pro-preview`)
+  are now handled correctly. The provider skips internal reasoning parts (`thought: true`) and
+  signature parts (`thoughtSignature`), extracting only the final answer text. Falls back to
+  thinking content when no non-thinking response is available.
+- Updated default gateway port to `42617`.
+- Removed all user-facing references to port `3000`.
 - **Onboarding channel menu dispatch** now uses an enum-backed selector instead of hard-coded
   numeric match arms, preventing duplicated pattern arms and related `unreachable pattern`
   compiler warnings in `src/onboard/wizard.rs`.

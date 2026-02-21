@@ -113,7 +113,7 @@ baud = 115200
 ## Phase 4: Run and Test
 
 ```bash
-zeroclaw daemon --host 127.0.0.1 --port 3000
+zeroclaw daemon --host 127.0.0.1 --port 42617
 ```
 
 Or use the agent directly:

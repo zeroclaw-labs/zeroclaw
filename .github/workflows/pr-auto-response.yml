@@ -8,6 +8,9 @@ on:
 
 permissions: {}
 
+env:
+  LABEL_POLICY_PATH: .github/label-policy.json
+
 jobs:
   contributor-tier-issues:
     if: >-

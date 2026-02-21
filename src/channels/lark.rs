@@ -13,6 +13,7 @@ const FEISHU_BASE_URL: &str = "https://open.feishu.cn/open-apis";
 const FEISHU_WS_BASE_URL: &str = "https://open.feishu.cn";
 const LARK_BASE_URL: &str = "https://open.larksuite.com/open-apis";
 const LARK_WS_BASE_URL: &str = "https://open.larksuite.com";
+const ACK_REACTION_EMOJI_TYPE: &str = "SMILE";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Feishu WebSocket long-connection: pbbp2.proto frame codec
@@ -281,6 +282,106 @@ impl LarkChannel {
         format!("{}/im/v1/messages?receive_id_type=chat_id", self.api_base())
     }
 
+    fn message_reaction_url(&self, message_id: &str) -> String {
+        format!("{}/im/v1/messages/{message_id}/reactions", self.api_base())
+    }
+
+    async fn post_message_reaction_with_token(
+        &self,
+        message_id: &str,
+        token: &str,
+    ) -> anyhow::Result<reqwest::Response> {
+        let url = self.message_reaction_url(message_id);
+        let body = serde_json::json!({
+            "reaction_type": {
+                "emoji_type": ACK_REACTION_EMOJI_TYPE
+            }
+        });
+
+        let response = self
+            .http_client()
+            .post(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json; charset=utf-8")
+            .json(&body)
+            .send()
+            .await?;
+
+        Ok(response)
+    }
+
+    /// Best-effort "received" signal for incoming messages.
+    /// Failures are logged and never block normal message handling.
+    async fn try_add_ack_reaction(&self, message_id: &str) {
+        if message_id.is_empty() {
+            return;
+        }
+
+        let mut token = match self.get_tenant_access_token().await {
+            Ok(token) => token,
+            Err(err) => {
+                tracing::warn!("Lark: failed to fetch token for reaction: {err}");
+                return;
+            }
+        };
+
+        let mut retried = false;
+        loop {
+            let response = match self
+                .post_message_reaction_with_token(message_id, &token)
+                .await
+            {
+                Ok(resp) => resp,
+                Err(err) => {
+                    tracing::warn!("Lark: failed to add reaction for {message_id}: {err}");
+                    return;
+                }
+            };
+
+            if response.status().as_u16() == 401 && !retried {
+                self.invalidate_token().await;
+                token = match self.get_tenant_access_token().await {
+                    Ok(new_token) => new_token,
+                    Err(err) => {
+                        tracing::warn!(
+                            "Lark: failed to refresh token for reaction on {message_id}: {err}"
+                        );
+                        return;
+                    }
+                };
+                retried = true;
+                continue;
+            }
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let err_body = response.text().await.unwrap_or_default();
+                tracing::warn!(
+                    "Lark: add reaction failed for {message_id}: status={status}, body={err_body}"
+                );
+                return;
+            }
+
+            let payload: serde_json::Value = match response.json().await {
+                Ok(v) => v,
+                Err(err) => {
+                    tracing::warn!("Lark: add reaction decode failed for {message_id}: {err}");
+                    return;
+                }
+            };
+
+            let code = payload.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+            if code != 0 {
+                let msg = payload
+                    .get("msg")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown error");
+                tracing::warn!("Lark: add reaction returned code={code} for {message_id}: {msg}");
+            }
+            return;
+        }
+    }
+
     /// POST /callback/ws/endpoint → (wss_url, client_config)
     async fn get_ws_endpoint(&self) -> anyhow::Result<(String, WsClientConfig)> {
         let resp = self
@@ -398,7 +499,6 @@ impl LarkChannel {
                             match ws_msg {
                                 WsMsg::Binary(b) => b,
                                 WsMsg::Ping(d) => { let _ = write.send(WsMsg::Pong(d)).await; continue; }
-                                WsMsg::Pong(_) => continue,
                                 WsMsg::Close(_) => { tracing::info!("Lark: WS closed — reconnecting"); break; }
                                 _ => continue,
                             }
@@ -527,6 +627,8 @@ impl LarkChannel {
                     if lark_msg.chat_type == "group" && !should_respond_in_group(&lark_msg.mentions) {
                         continue;
                     }
+
+                    self.try_add_ack_reaction(&lark_msg.message_id).await;
 
                     let channel_msg = ChannelMessage {
                         id: Uuid::new_v4().to_string(),
@@ -835,6 +937,15 @@ impl LarkChannel {
 
             // Parse event messages
             let messages = state.channel.parse_event_payload(&payload);
+            if !messages.is_empty() {
+                if let Some(message_id) = payload
+                    .pointer("/event/message/message_id")
+                    .and_then(|m| m.as_str())
+                {
+                    state.channel.try_add_ack_reaction(message_id).await;
+                }
+            }
+
             for msg in messages {
                 if state.tx.send(msg).await.is_err() {
                     tracing::warn!("Lark: message channel closed");
@@ -1413,5 +1524,21 @@ mod tests {
         let msgs = ch.parse_event_payload(&payload);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].sender, "ou_user");
+    }
+
+    #[test]
+    fn lark_reaction_url_matches_region() {
+        let ch_cn = make_channel();
+        assert_eq!(
+            ch_cn.message_reaction_url("om_test_message_id"),
+            "https://open.feishu.cn/open-apis/im/v1/messages/om_test_message_id/reactions"
+        );
+
+        let mut ch_intl = make_channel();
+        ch_intl.use_feishu = false;
+        assert_eq!(
+            ch_intl.message_reaction_url("om_test_message_id"),
+            "https://open.larksuite.com/open-apis/im/v1/messages/om_test_message_id/reactions"
+        );
     }
 }

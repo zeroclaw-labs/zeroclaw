@@ -10,6 +10,7 @@ For encrypted Matrix rooms, also read the dedicated runbook:
 - Need a full config reference by channel: jump to [Per-Channel Config Examples](#4-per-channel-config-examples).
 - Need a no-response diagnosis flow: jump to [Troubleshooting Checklist](#6-troubleshooting-checklist).
 - Need Matrix encrypted-room help: use [Matrix E2EE Guide](./matrix-e2ee-guide.md).
+- Need Nextcloud Talk bot setup: use [Nextcloud Talk Setup](./nextcloud-talk-setup.md).
 - Need deployment/network assumptions (polling vs webhook): use [Network Deployment](./network-deployment.md).
 
 ## FAQ: Matrix setup passes but no reply
@@ -69,24 +70,30 @@ Operational notes:
 
 ## Channel Matrix
 
-### Build Feature Toggle (`channel-matrix`)
+### Build Feature Toggles (`channel-matrix`, `channel-lark`)
 
-Matrix support is controlled at compile time by the `channel-matrix` Cargo feature.
+Matrix and Lark support are controlled at compile time.
 
-- Default builds include Matrix support (`default = ["hardware", "channel-matrix"]`).
-- For faster local iteration when Matrix is not needed:
-
-```bash
-cargo check --no-default-features --features hardware
-```
-
-- To explicitly enable Matrix support in custom feature sets:
+- Default builds are lean (`default = []`) and do not include Matrix/Lark.
+- Typical local check with only hardware support:
 
 ```bash
-cargo check --no-default-features --features hardware,channel-matrix
+cargo check --features hardware
 ```
 
-If `[channels_config.matrix]` is present but the binary was built without `channel-matrix`, `zeroclaw channel list`, `zeroclaw channel doctor`, and `zeroclaw channel start` will log that Matrix is intentionally skipped for this build.
+- Enable Matrix explicitly when needed:
+
+```bash
+cargo check --features hardware,channel-matrix
+```
+
+- Enable Lark explicitly when needed:
+
+```bash
+cargo check --features hardware,channel-lark
+```
+
+If `[channels_config.matrix]` or `[channels_config.lark]` is present but the corresponding feature is not compiled in, `zeroclaw channel list`, `zeroclaw channel doctor`, and `zeroclaw channel start` will report that the channel is intentionally skipped for this build.
 
 ---
 
@@ -102,13 +109,16 @@ If `[channels_config.matrix]` is present but the binary was built without `chann
 | Matrix | sync API (supports E2EE) | No |
 | Signal | signal-cli HTTP bridge | No (local bridge endpoint) |
 | WhatsApp | webhook (Cloud API) or websocket (Web mode) | Cloud API: Yes (public HTTPS callback), Web mode: No |
+| Nextcloud Talk | webhook (`/nextcloud-talk`) | Yes (public HTTPS callback) |
 | Webhook | gateway endpoint (`/webhook`) | Usually yes |
 | Email | IMAP polling + SMTP send | No |
 | IRC | IRC socket | No |
 | Lark/Feishu | websocket (default) or webhook | Webhook mode only |
 | DingTalk | stream mode | No |
 | QQ | bot gateway | No |
+| Linq | webhook (`/linq`) | Yes (public HTTPS callback) |
 | iMessage | local integration | No |
+| Nostr | relay websocket (NIP-04 / NIP-17) | No |
 
 ---
 
@@ -122,11 +132,12 @@ For channels with inbound sender allowlists:
 
 Field names differ by channel:
 
-- `allowed_users` (Telegram/Discord/Slack/Mattermost/Matrix/IRC/Lark/DingTalk/QQ)
+- `allowed_users` (Telegram/Discord/Slack/Mattermost/Matrix/IRC/Lark/DingTalk/QQ/Nextcloud Talk)
 - `allowed_from` (Signal)
 - `allowed_numbers` (WhatsApp)
-- `allowed_senders` (Email)
+- `allowed_senders` (Email/Linq)
 - `allowed_contacts` (iMessage)
+- `allowed_pubkeys` (Nostr)
 
 ---
 
@@ -166,9 +177,14 @@ mention_only = false
 [channels_config.slack]
 bot_token = "xoxb-..."
 app_token = "xapp-..."             # optional
-channel_id = "C1234567890"         # optional
+channel_id = "C1234567890"         # optional: single channel; omit or "*" for all accessible channels
 allowed_users = ["*"]
 ```
+
+Slack listen behavior:
+
+- `channel_id = "C123..."`: listen only on that channel.
+- `channel_id = "*"` or omitted: auto-discover and listen across all accessible channels.
 
 ### 4.4 Mattermost
 
@@ -299,6 +315,20 @@ receive_mode = "websocket"          # or "webhook"
 port = 8081                          # required for webhook mode
 ```
 
+### 4.12 Nostr
+
+```toml
+[channels_config.nostr]
+private_key = "nsec1..."                   # hex or nsec bech32 (encrypted at rest)
+# relays default to relay.damus.io, nos.lol, relay.primal.net, relay.snort.social
+# relays = ["wss://relay.damus.io", "wss://nos.lol"]
+allowed_pubkeys = ["hex-or-npub"]          # empty = deny all, "*" = allow all
+```
+
+Nostr supports both NIP-04 (legacy encrypted DMs) and NIP-17 (gift-wrapped private messages).
+Replies automatically use the same protocol the sender used. The private key is encrypted at rest
+via the `SecretStore` when `secrets.encrypt = true` (the default).
+
 Interactive onboarding support:
 
 ```bash
@@ -318,7 +348,7 @@ Runtime token behavior:
 - send requests automatically retry once after token invalidation when Feishu/Lark returns either HTTP `401` or business error code `99991663` (`Invalid access token`).
 - if the retry still returns token-invalid responses, the send call fails with the upstream status/body for easier troubleshooting.
 
-### 4.12 DingTalk
+### 4.13 DingTalk
 
 ```toml
 [channels_config.dingtalk]
@@ -327,7 +357,7 @@ client_secret = "ding-app-secret"
 allowed_users = ["*"]
 ```
 
-### 4.13 QQ
+### 4.14 QQ
 
 ```toml
 [channels_config.qq]
@@ -336,7 +366,44 @@ app_secret = "qq-app-secret"
 allowed_users = ["*"]
 ```
 
-### 4.14 iMessage
+### 4.15 Nextcloud Talk
+
+```toml
+[channels_config.nextcloud_talk]
+base_url = "https://cloud.example.com"
+app_token = "nextcloud-talk-app-token"
+webhook_secret = "optional-webhook-secret"  # optional but recommended
+allowed_users = ["*"]
+```
+
+Notes:
+
+- Inbound webhook endpoint: `POST /nextcloud-talk`.
+- Signature verification uses `X-Nextcloud-Talk-Random` and `X-Nextcloud-Talk-Signature`.
+- If `webhook_secret` is set, invalid signatures are rejected with `401`.
+- `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET` overrides config secret.
+- See [nextcloud-talk-setup.md](./nextcloud-talk-setup.md) for a full runbook.
+
+### 4.16 Linq
+
+```toml
+[channels_config.linq]
+api_token = "linq-partner-api-token"
+from_phone = "+15551234567"
+signing_secret = "optional-webhook-signing-secret"  # optional but recommended
+allowed_senders = ["*"]
+```
+
+Notes:
+
+- Linq uses the Partner V3 API for iMessage, RCS, and SMS.
+- Inbound webhook endpoint: `POST /linq`.
+- Signature verification uses `X-Webhook-Signature` (HMAC-SHA256) and `X-Webhook-Timestamp`.
+- If `signing_secret` is set, invalid or stale (>300s) signatures are rejected.
+- `ZEROCLAW_LINQ_SIGNING_SECRET` overrides config secret.
+- `allowed_senders` uses E.164 phone number format (e.g. `+1234567890`).
+
+### 4.17 iMessage
 
 ```toml
 [channels_config.imessage]
@@ -391,7 +458,7 @@ RUST_LOG=info zeroclaw daemon 2>&1 | tee /tmp/zeroclaw.log
 Then filter channel/gateway events:
 
 ```bash
-rg -n "Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|DingTalk|QQ|iMessage|Webhook|Channel" /tmp/zeroclaw.log
+rg -n "Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|DingTalk|QQ|iMessage|Nostr|Webhook|Channel" /tmp/zeroclaw.log
 ```
 
 ### 7.2 Keyword table
@@ -400,7 +467,7 @@ rg -n "Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|D
 |---|---|---|---|
 | Telegram | `Telegram channel listening for messages...` | `Telegram: ignoring message from unauthorized user:` | `Telegram poll error:` / `Telegram parse error:` / `Telegram polling conflict (409):` |
 | Discord | `Discord: connected and identified` | `Discord: ignoring message from unauthorized user:` | `Discord: received Reconnect (op 7)` / `Discord: received Invalid Session (op 9)` |
-| Slack | `Slack channel listening on #` | `Slack: ignoring message from unauthorized user:` | `Slack poll error:` / `Slack parse error:` |
+| Slack | `Slack channel listening on #` / `Slack channel_id not set (or '*'); listening across all accessible channels.` | `Slack: ignoring message from unauthorized user:` | `Slack poll error:` / `Slack parse error:` / `Slack channel discovery failed:` |
 | Mattermost | `Mattermost channel listening on` | `Mattermost: ignoring message from unauthorized user:` | `Mattermost poll error:` / `Mattermost parse error:` |
 | Matrix | `Matrix channel listening on room` / `Matrix room ... is encrypted; E2EE decryption is enabled via matrix-sdk.` | `Matrix whoami failed; falling back to configured session hints for E2EE session restore:` / `Matrix whoami failed while resolving listener user_id; using configured user_id hint:` | `Matrix sync error: ... retrying...` |
 | Signal | `Signal channel listening via SSE on` | (allowlist checks are enforced by `allowed_from`) | `Signal SSE returned ...` / `Signal SSE connect error:` |
@@ -411,7 +478,9 @@ rg -n "Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|D
 | Lark / Feishu | `Lark: WS connected` / `Lark event callback server listening on` | `Lark WS: ignoring ... (not in allowed_users)` / `Lark: ignoring message from unauthorized user:` | `Lark: ping failed, reconnecting` / `Lark: heartbeat timeout, reconnecting` / `Lark: WS read error:` |
 | DingTalk | `DingTalk: connected and listening for messages...` | `DingTalk: ignoring message from unauthorized user:` | `DingTalk WebSocket error:` / `DingTalk: message channel closed` |
 | QQ | `QQ: connected and identified` | `QQ: ignoring C2C message from unauthorized user:` / `QQ: ignoring group message from unauthorized user:` | `QQ: received Reconnect (op 7)` / `QQ: received Invalid Session (op 9)` / `QQ: message channel closed` |
+| Nextcloud Talk (gateway) | `POST /nextcloud-talk — Nextcloud Talk bot webhook` | `Nextcloud Talk webhook signature verification failed` / `Nextcloud Talk: ignoring message from unauthorized actor:` | `Nextcloud Talk send failed:` / `LLM error for Nextcloud Talk message:` |
 | iMessage | `iMessage channel listening (AppleScript bridge)...` | (contact allowlist enforced by `allowed_contacts`) | `iMessage poll error:` |
+| Nostr | `Nostr channel listening as npub1...` | `Nostr: ignoring NIP-04 message from unauthorized pubkey:` / `Nostr: ignoring NIP-17 message from unauthorized pubkey:` | `Failed to decrypt NIP-04 message:` / `Failed to unwrap NIP-17 gift wrap:` / `Nostr relay pool shut down` |
 
 ### 7.3 Runtime supervisor keywords
 

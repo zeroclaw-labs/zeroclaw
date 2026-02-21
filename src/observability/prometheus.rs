@@ -9,6 +9,9 @@ pub struct PrometheusObserver {
 
     // Counters
     agent_starts: IntCounterVec,
+    llm_requests: IntCounterVec,
+    tokens_input_total: IntCounterVec,
+    tokens_output_total: IntCounterVec,
     tool_calls: IntCounterVec,
     channel_messages: IntCounterVec,
     heartbeat_ticks: prometheus::IntCounter,
@@ -31,6 +34,27 @@ impl PrometheusObserver {
 
         let agent_starts = IntCounterVec::new(
             prometheus::Opts::new("zeroclaw_agent_starts_total", "Total agent invocations"),
+            &["provider", "model"],
+        )
+        .expect("valid metric");
+
+        let llm_requests = IntCounterVec::new(
+            prometheus::Opts::new("zeroclaw_llm_requests_total", "Total LLM provider requests"),
+            &["provider", "model", "success"],
+        )
+        .expect("valid metric");
+
+        let tokens_input_total = IntCounterVec::new(
+            prometheus::Opts::new("zeroclaw_tokens_input_total", "Total input tokens consumed"),
+            &["provider", "model"],
+        )
+        .expect("valid metric");
+
+        let tokens_output_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "zeroclaw_tokens_output_total",
+                "Total output tokens consumed",
+            ),
             &["provider", "model"],
         )
         .expect("valid metric");
@@ -106,6 +130,11 @@ impl PrometheusObserver {
 
         // Register all metrics
         registry.register(Box::new(agent_starts.clone())).ok();
+        registry.register(Box::new(llm_requests.clone())).ok();
+        registry.register(Box::new(tokens_input_total.clone())).ok();
+        registry
+            .register(Box::new(tokens_output_total.clone()))
+            .ok();
         registry.register(Box::new(tool_calls.clone())).ok();
         registry.register(Box::new(channel_messages.clone())).ok();
         registry.register(Box::new(heartbeat_ticks.clone())).ok();
@@ -120,6 +149,9 @@ impl PrometheusObserver {
         Self {
             registry,
             agent_starts,
+            llm_requests,
+            tokens_input_total,
+            tokens_output_total,
             tool_calls,
             channel_messages,
             heartbeat_ticks,
@@ -166,10 +198,32 @@ impl Observer for PrometheusObserver {
                     self.tokens_used.set(i64::try_from(*t).unwrap_or(i64::MAX));
                 }
             }
+            ObserverEvent::LlmResponse {
+                provider,
+                model,
+                success,
+                input_tokens,
+                output_tokens,
+                ..
+            } => {
+                let success_str = if *success { "true" } else { "false" };
+                self.llm_requests
+                    .with_label_values(&[provider.as_str(), model.as_str(), success_str])
+                    .inc();
+                if let Some(input) = input_tokens {
+                    self.tokens_input_total
+                        .with_label_values(&[provider.as_str(), model.as_str()])
+                        .inc_by(*input);
+                }
+                if let Some(output) = output_tokens {
+                    self.tokens_output_total
+                        .with_label_values(&[provider.as_str(), model.as_str()])
+                        .inc_by(*output);
+                }
+            }
             ObserverEvent::ToolCallStart { tool: _ }
             | ObserverEvent::TurnComplete
-            | ObserverEvent::LlmRequest { .. }
-            | ObserverEvent::LlmResponse { .. } => {}
+            | ObserverEvent::LlmRequest { .. } => {}
             ObserverEvent::ToolCall {
                 tool,
                 duration,
@@ -380,5 +434,63 @@ mod tests {
 
         let output = obs.encode();
         assert!(output.contains("zeroclaw_tokens_used_last 200"));
+    }
+
+    #[test]
+    fn llm_response_tracks_request_count_and_tokens() {
+        let obs = PrometheusObserver::new();
+
+        obs.record_event(&ObserverEvent::LlmResponse {
+            provider: "openrouter".into(),
+            model: "claude-sonnet".into(),
+            duration: Duration::from_millis(200),
+            success: true,
+            error_message: None,
+            input_tokens: Some(100),
+            output_tokens: Some(50),
+        });
+        obs.record_event(&ObserverEvent::LlmResponse {
+            provider: "openrouter".into(),
+            model: "claude-sonnet".into(),
+            duration: Duration::from_millis(300),
+            success: true,
+            error_message: None,
+            input_tokens: Some(200),
+            output_tokens: Some(80),
+        });
+
+        let output = obs.encode();
+        assert!(output.contains(
+            r#"zeroclaw_llm_requests_total{model="claude-sonnet",provider="openrouter",success="true"} 2"#
+        ));
+        assert!(output.contains(
+            r#"zeroclaw_tokens_input_total{model="claude-sonnet",provider="openrouter"} 300"#
+        ));
+        assert!(output.contains(
+            r#"zeroclaw_tokens_output_total{model="claude-sonnet",provider="openrouter"} 130"#
+        ));
+    }
+
+    #[test]
+    fn llm_response_without_tokens_increments_request_only() {
+        let obs = PrometheusObserver::new();
+
+        obs.record_event(&ObserverEvent::LlmResponse {
+            provider: "ollama".into(),
+            model: "llama3".into(),
+            duration: Duration::from_millis(100),
+            success: false,
+            error_message: Some("timeout".into()),
+            input_tokens: None,
+            output_tokens: None,
+        });
+
+        let output = obs.encode();
+        assert!(output.contains(
+            r#"zeroclaw_llm_requests_total{model="llama3",provider="ollama",success="false"} 1"#
+        ));
+        // Token counters should not appear (no data recorded)
+        assert!(!output.contains("zeroclaw_tokens_input_total{"));
+        assert!(!output.contains("zeroclaw_tokens_output_total{"));
     }
 }

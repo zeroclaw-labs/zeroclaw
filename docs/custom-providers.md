@@ -78,6 +78,37 @@ zeroclaw agent -m "hello"
 
 You do not need to export `ZEROCLAW_API_KEY=dummy` for this flow.
 
+## vLLM Server
+
+ZeroClaw includes a first-class local provider for [vLLM](https://docs.vllm.ai/):
+
+- Provider ID: `vllm`
+- Default endpoint: `http://localhost:8000/v1`
+- API key is optional unless the server requires authentication
+
+Start a local server (example):
+
+```bash
+vllm serve meta-llama/Llama-3.1-8B-Instruct
+```
+
+Then configure ZeroClaw:
+
+```toml
+default_provider = "vllm"
+default_model = "meta-llama/Llama-3.1-8B-Instruct"
+default_temperature = 0.7
+```
+
+Quick validation:
+
+```bash
+zeroclaw models refresh --provider vllm
+zeroclaw agent -m "hello"
+```
+
+You do not need to export `ZEROCLAW_API_KEY=dummy` for this flow.
+
 ## Testing Configuration
 
 Verify your custom endpoint:

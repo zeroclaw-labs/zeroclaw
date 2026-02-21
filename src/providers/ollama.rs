@@ -1,6 +1,6 @@
 use crate::multimodal;
 use crate::providers::traits::{
-    ChatMessage, ChatResponse, Provider, ProviderCapabilities, ToolCall,
+    ChatMessage, ChatResponse, Provider, ProviderCapabilities, TokenUsage, ToolCall,
 };
 use async_trait::async_trait;
 use reqwest::Client;
@@ -63,6 +63,10 @@ struct Options {
 #[derive(Debug, Deserialize)]
 struct ApiChatResponse {
     message: ResponseMessage,
+    #[serde(default)]
+    prompt_eval_count: Option<u64>,
+    #[serde(default)]
+    eval_count: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,6 +96,19 @@ struct OllamaFunction {
 // ─── Implementation ───────────────────────────────────────────────────────────
 
 impl OllamaProvider {
+    fn normalize_base_url(raw_url: &str) -> String {
+        let trimmed = raw_url.trim().trim_end_matches('/');
+        if trimmed.is_empty() {
+            return String::new();
+        }
+
+        trimmed
+            .strip_suffix("/api")
+            .unwrap_or(trimmed)
+            .trim_end_matches('/')
+            .to_string()
+    }
+
     pub fn new(base_url: Option<&str>, api_key: Option<&str>) -> Self {
         Self::new_with_reasoning(base_url, api_key, None)
     }
@@ -107,10 +124,7 @@ impl OllamaProvider {
         });
 
         Self {
-            base_url: base_url
-                .unwrap_or("http://localhost:11434")
-                .trim_end_matches('/')
-                .to_string(),
+            base_url: Self::normalize_base_url(base_url.unwrap_or("http://localhost:11434")),
             api_key,
             reasoning_enabled,
         }
@@ -590,6 +604,15 @@ impl Provider for OllamaProvider {
             )
             .await?;
 
+        let usage = if response.prompt_eval_count.is_some() || response.eval_count.is_some() {
+            Some(TokenUsage {
+                input_tokens: response.prompt_eval_count,
+                output_tokens: response.eval_count,
+            })
+        } else {
+            None
+        };
+
         // Native tool calls returned by the model.
         if !response.message.tool_calls.is_empty() {
             let tool_calls: Vec<ToolCall> = response
@@ -614,7 +637,11 @@ impl Provider for OllamaProvider {
             } else {
                 Some(response.message.content)
             };
-            return Ok(ChatResponse { text, tool_calls });
+            return Ok(ChatResponse {
+                text,
+                tool_calls,
+                usage,
+            });
         }
 
         // Plain text response.
@@ -631,6 +658,7 @@ impl Provider for OllamaProvider {
                         if thinking.len() > 200 { &thinking[..200] } else { thinking }
                     )),
                     tool_calls: vec![],
+                    usage,
                 });
             }
             tracing::warn!("Ollama returned empty content with no tool calls");
@@ -638,6 +666,7 @@ impl Provider for OllamaProvider {
         Ok(ChatResponse {
             text: Some(content),
             tool_calls: vec![],
+            usage,
         })
     }
 
@@ -646,6 +675,45 @@ impl Provider for OllamaProvider {
         // (qwen2.5, llama3.1, mistral-nemo, etc.). chat_with_tools() sends tool
         // definitions in the request and returns structured ToolCall objects.
         true
+    }
+
+    async fn chat(
+        &self,
+        request: crate::providers::traits::ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ChatResponse> {
+        // Convert ToolSpec to OpenAI-compatible JSON and delegate to chat_with_tools.
+        if let Some(specs) = request.tools {
+            if !specs.is_empty() {
+                let tools: Vec<serde_json::Value> = specs
+                    .iter()
+                    .map(|s| {
+                        serde_json::json!({
+                            "type": "function",
+                            "function": {
+                                "name": s.name,
+                                "description": s.description,
+                                "parameters": s.parameters
+                            }
+                        })
+                    })
+                    .collect();
+                return self
+                    .chat_with_tools(request.messages, &tools, model, temperature)
+                    .await;
+            }
+        }
+
+        // No tools — fall back to plain text chat.
+        let text = self
+            .chat_with_history(request.messages, model, temperature)
+            .await?;
+        Ok(ChatResponse {
+            text: Some(text),
+            tool_calls: vec![],
+            usage: None,
+        })
     }
 }
 
@@ -671,6 +739,12 @@ mod tests {
     fn custom_url_no_trailing_slash() {
         let p = OllamaProvider::new(Some("http://myserver:11434"), None);
         assert_eq!(p.base_url, "http://myserver:11434");
+    }
+
+    #[test]
+    fn custom_url_strips_api_suffix() {
+        let p = OllamaProvider::new(Some("https://ollama.com/api/"), None);
+        assert_eq!(p.base_url, "https://ollama.com");
     }
 
     #[test]
@@ -713,6 +787,14 @@ mod tests {
     fn remote_endpoint_auth_enabled_when_key_present() {
         let p = OllamaProvider::new(Some("https://ollama.com"), Some("ollama-key"));
         let (_model, should_auth) = p.resolve_request_details("qwen3").unwrap();
+        assert!(should_auth);
+    }
+
+    #[test]
+    fn remote_endpoint_with_api_suffix_still_allows_cloud_models() {
+        let p = OllamaProvider::new(Some("https://ollama.com/api"), Some("ollama-key"));
+        let (model, should_auth) = p.resolve_request_details("qwen3:cloud").unwrap();
+        assert_eq!(model, "qwen3");
         assert!(should_auth);
     }
 
@@ -947,5 +1029,25 @@ mod tests {
         let caps = <OllamaProvider as Provider>::capabilities(&provider);
         assert!(caps.native_tool_calling);
         assert!(caps.vision);
+    }
+
+    #[test]
+    fn api_response_parses_eval_counts() {
+        let json = r#"{
+            "message": {"content": "Hello", "tool_calls": []},
+            "prompt_eval_count": 50,
+            "eval_count": 25
+        }"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.prompt_eval_count, Some(50));
+        assert_eq!(resp.eval_count, Some(25));
+    }
+
+    #[test]
+    fn api_response_parses_without_eval_counts() {
+        let json = r#"{"message": {"content": "Hello", "tool_calls": []}}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.prompt_eval_count.is_none());
+        assert!(resp.eval_count.is_none());
     }
 }

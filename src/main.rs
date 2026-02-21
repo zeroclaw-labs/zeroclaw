@@ -56,6 +56,7 @@ mod rag {
     pub use zeroclaw::rag::*;
 }
 mod config;
+mod cost;
 mod cron;
 mod daemon;
 mod doctor;
@@ -63,6 +64,7 @@ mod gateway;
 mod hardware;
 mod health;
 mod heartbeat;
+mod hooks;
 mod identity;
 mod integrations;
 mod memory;
@@ -83,35 +85,11 @@ mod util;
 
 use config::Config;
 
-// Re-export so binary's hardware/peripherals modules can use crate::HardwareCommands etc.
-pub use zeroclaw::{HardwareCommands, PeripheralCommands};
-
-/// `ZeroClaw` - Zero overhead. Zero compromise. 100% Rust.
-#[derive(Parser, Debug)]
-#[command(name = "zeroclaw")]
-#[command(author = "theonlyhennygod")]
-#[command(version = "0.1.0")]
-#[command(about = "The fastest, smallest AI assistant.", long_about = None)]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-}
-
-#[derive(Subcommand, Debug)]
-enum ServiceCommands {
-    /// Install daemon service unit for auto-start and restart
-    Install,
-    /// Start daemon service
-    Start,
-    /// Stop daemon service
-    Stop,
-    /// Restart daemon service to apply latest config
-    Restart,
-    /// Check daemon service status
-    Status,
-    /// Uninstall daemon service unit
-    Uninstall,
-}
+// Re-export so binary modules can use crate::<CommandEnum> while keeping a single source of truth.
+pub use zeroclaw::{
+    ChannelCommands, CronCommands, HardwareCommands, IntegrationCommands, MigrateCommands,
+    PeripheralCommands, ServiceCommands, SkillCommands,
+};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 enum CompletionShell {
@@ -127,6 +105,20 @@ enum CompletionShell {
     Elvish,
 }
 
+/// `ZeroClaw` - Zero overhead. Zero compromise. 100% Rust.
+#[derive(Parser, Debug)]
+#[command(name = "zeroclaw")]
+#[command(author = "theonlyhennygod")]
+#[command(version = "0.1.0")]
+#[command(about = "The fastest, smallest AI assistant.", long_about = None)]
+struct Cli {
+    #[arg(long, global = true)]
+    config_dir: Option<String>,
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Initialize your workspace and configuration
@@ -134,6 +126,10 @@ enum Commands {
         /// Run the full interactive wizard (default is quick setup)
         #[arg(long)]
         interactive: bool,
+
+        /// Overwrite existing config without confirmation
+        #[arg(long)]
+        force: bool,
 
         /// Reconfigure channels only (fast repair flow)
         #[arg(long)]
@@ -239,6 +235,10 @@ Examples:
 
     /// Manage OS service lifecycle (launchd/systemd user service)
     Service {
+        /// Init system to use: auto (detect), systemd, or openrc
+        #[arg(long, default_value = "auto", value_parser = ["auto", "systemd", "openrc"])]
+        service_init: String,
+
         #[command(subcommand)]
         service_command: ServiceCommands,
     },
@@ -365,6 +365,25 @@ Examples:
         peripheral_command: zeroclaw::PeripheralCommands,
     },
 
+    /// Manage agent memory (list, get, stats, clear)
+    #[command(long_about = "\
+Manage agent memory entries.
+
+List, inspect, and clear memory entries stored by the agent. \
+Supports filtering by category and session, pagination, and \
+batch clearing with confirmation.
+
+Examples:
+  zeroclaw memory stats
+  zeroclaw memory list
+  zeroclaw memory list --category core --limit 10
+  zeroclaw memory get <key>
+  zeroclaw memory clear --category conversation --yes")]
+    Memory {
+        #[command(subcommand)]
+        memory_command: MemoryCommands,
+    },
+
     /// Manage configuration
     #[command(long_about = "\
 Manage ZeroClaw configuration.
@@ -488,89 +507,6 @@ enum AuthCommands {
 }
 
 #[derive(Subcommand, Debug)]
-enum MigrateCommands {
-    /// Import memory from an `OpenClaw` workspace into this `ZeroClaw` workspace
-    Openclaw {
-        /// Optional path to `OpenClaw` workspace (defaults to ~/.openclaw/workspace)
-        #[arg(long)]
-        source: Option<std::path::PathBuf>,
-
-        /// Validate and preview migration without writing any data
-        #[arg(long)]
-        dry_run: bool,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum CronCommands {
-    /// List all scheduled tasks
-    List,
-    /// Add a new scheduled task
-    Add {
-        /// Cron expression
-        expression: String,
-        /// Optional IANA timezone (e.g. America/Los_Angeles)
-        #[arg(long)]
-        tz: Option<String>,
-        /// Command to run
-        command: String,
-    },
-    /// Add a one-shot scheduled task at an RFC3339 timestamp
-    AddAt {
-        /// One-shot timestamp in RFC3339 format
-        at: String,
-        /// Command to run
-        command: String,
-    },
-    /// Add a fixed-interval scheduled task
-    AddEvery {
-        /// Interval in milliseconds
-        every_ms: u64,
-        /// Command to run
-        command: String,
-    },
-    /// Add a one-shot delayed task (e.g. "30m", "2h", "1d")
-    Once {
-        /// Delay duration
-        delay: String,
-        /// Command to run
-        command: String,
-    },
-    /// Remove a scheduled task
-    Remove {
-        /// Task ID
-        id: String,
-    },
-    /// Update a scheduled task
-    Update {
-        /// Task ID
-        id: String,
-        /// New cron expression
-        #[arg(long)]
-        expression: Option<String>,
-        /// New IANA timezone
-        #[arg(long)]
-        tz: Option<String>,
-        /// New command to run
-        #[arg(long)]
-        command: Option<String>,
-        /// New job name
-        #[arg(long)]
-        name: Option<String>,
-    },
-    /// Pause a scheduled task
-    Pause {
-        /// Task ID
-        id: String,
-    },
-    /// Resume a paused task
-    Resume {
-        /// Task ID
-        id: String,
-    },
-}
-
-#[derive(Subcommand, Debug)]
 enum ModelCommands {
     /// Refresh and cache provider models
     Refresh {
@@ -596,57 +532,50 @@ enum DoctorCommands {
         #[arg(long)]
         use_cache: bool,
     },
-}
-
-#[derive(Subcommand, Debug)]
-enum ChannelCommands {
-    /// List configured channels
-    List,
-    /// Start all configured channels (Telegram, Discord, Slack)
-    Start,
-    /// Run health checks for configured channels
-    Doctor,
-    /// Add a new channel
-    Add {
-        /// Channel type
-        channel_type: String,
-        /// Configuration JSON
-        config: String,
-    },
-    /// Remove a channel
-    Remove {
-        /// Channel name
-        name: String,
-    },
-    /// Bind a Telegram identity (username or numeric user ID) into allowlist
-    BindTelegram {
-        /// Telegram identity to allow (username without '@' or numeric user ID)
-        identity: String,
+    /// Query runtime trace events (tool diagnostics and model replies)
+    Traces {
+        /// Show a specific trace event by id
+        #[arg(long)]
+        id: Option<String>,
+        /// Filter list output by event type
+        #[arg(long)]
+        event: Option<String>,
+        /// Case-insensitive text match across message/payload
+        #[arg(long)]
+        contains: Option<String>,
+        /// Maximum number of events to display
+        #[arg(long, default_value = "20")]
+        limit: usize,
     },
 }
 
 #[derive(Subcommand, Debug)]
-enum SkillCommands {
-    /// List installed skills
-    List,
-    /// Install a skill from a git URL (HTTPS/SSH) or local path
-    Install {
-        /// Git URL (HTTPS/SSH) or local path
-        source: String,
+enum MemoryCommands {
+    /// List memory entries with optional filters
+    List {
+        #[arg(long)]
+        category: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long, default_value = "50")]
+        limit: usize,
+        #[arg(long, default_value = "0")]
+        offset: usize,
     },
-    /// Remove an installed skill
-    Remove {
-        /// Skill name
-        name: String,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum IntegrationCommands {
-    /// Show details about a specific integration
-    Info {
-        /// Integration name
-        name: String,
+    /// Get a specific memory entry by key
+    Get { key: String },
+    /// Show memory backend statistics and health
+    Stats,
+    /// Clear memories by category, by key, or clear all
+    Clear {
+        /// Delete a single entry by key (supports prefix match)
+        #[arg(long)]
+        key: Option<String>,
+        #[arg(long)]
+        category: Option<String>,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -661,6 +590,13 @@ async fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
+
+    if let Some(config_dir) = &cli.config_dir {
+        if config_dir.trim().is_empty() {
+            bail!("--config-dir cannot be empty");
+        }
+        std::env::set_var("ZEROCLAW_CONFIG_DIR", config_dir);
+    }
 
     // Completions must remain stdout-only and should not load config or initialize logging.
     // This avoids warnings/log lines corrupting sourced completion scripts.
@@ -685,6 +621,7 @@ async fn main() -> Result<()> {
     // not allowed", we run the wizard on a blocking thread via spawn_blocking.
     if let Commands::Onboard {
         interactive,
+        force,
         channels_only,
         api_key,
         provider,
@@ -693,6 +630,7 @@ async fn main() -> Result<()> {
     } = &cli.command
     {
         let interactive = *interactive;
+        let force = *force;
         let channels_only = *channels_only;
         let api_key = api_key.clone();
         let provider = provider.clone();
@@ -707,16 +645,20 @@ async fn main() -> Result<()> {
         {
             bail!("--channels-only does not accept --api-key, --provider, --model, or --memory");
         }
+        if channels_only && force {
+            bail!("--channels-only does not accept --force");
+        }
         let config = if channels_only {
             onboard::run_channels_repair_wizard().await
         } else if interactive {
-            onboard::run_wizard().await
+            onboard::run_wizard(force).await
         } else {
             onboard::run_quick_setup(
                 api_key.as_deref(),
                 provider.as_deref(),
                 model.as_deref(),
                 memory.as_deref(),
+                force,
             )
             .await
         }?;
@@ -730,6 +672,7 @@ async fn main() -> Result<()> {
     // All other commands need config loaded first
     let mut config = Config::load_or_init().await?;
     config.apply_env_overrides();
+    observability::runtime_trace::init_from_config(&config.observability, &config.workspace_dir);
 
     match cli.command {
         Commands::Onboard { .. } => unreachable!(),
@@ -741,9 +684,17 @@ async fn main() -> Result<()> {
             model,
             temperature,
             peripheral,
-        } => agent::run(config, message, provider, model, temperature, peripheral)
-            .await
-            .map(|_| ()),
+        } => agent::run(
+            config,
+            message,
+            provider,
+            model,
+            temperature,
+            peripheral,
+            true,
+        )
+        .await
+        .map(|_| ()),
 
         Commands::Gateway { port, host } => {
             let port = port.unwrap_or(config.gateway.port);
@@ -783,6 +734,10 @@ async fn main() -> Result<()> {
                 config.default_model.as_deref().unwrap_or("(default)")
             );
             println!("📊 Observability:  {}", config.observability.backend);
+            println!(
+                "🧾 Trace storage:  {} ({})",
+                config.observability.runtime_trace_mode, config.observability.runtime_trace_path
+            );
             println!("🛡️  Autonomy:      {:?}", config.autonomy.level);
             println!("⚙️  Runtime:       {}", config.runtime.kind);
             let effective_memory_backend = memory::effective_memory_backend_name(
@@ -826,6 +781,7 @@ async fn main() -> Result<()> {
                 ("Discord", config.channels_config.discord.is_some()),
                 ("Slack", config.channels_config.slack.is_some()),
                 ("Webhook", config.channels_config.webhook.is_some()),
+                ("Nextcloud", config.channels_config.nextcloud_talk.is_some()),
             ] {
                 println!(
                     "  {name:9} {}",
@@ -855,12 +811,7 @@ async fn main() -> Result<()> {
 
         Commands::Models { model_command } => match model_command {
             ModelCommands::Refresh { provider, force } => {
-                let config_for_refresh = config.clone();
-                tokio::task::spawn_blocking(move || {
-                    onboard::run_models_refresh(&config_for_refresh, provider.as_deref(), force)
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("models refresh task failed: {e}"))?
+                onboard::run_models_refresh(&config, provider.as_deref(), force).await
             }
         },
 
@@ -897,20 +848,31 @@ async fn main() -> Result<()> {
             Ok(())
         }
 
-        Commands::Service { service_command } => service::handle_command(&service_command, &config),
+        Commands::Service {
+            service_command,
+            service_init,
+        } => {
+            let init_system = service_init.parse()?;
+            service::handle_command(&service_command, &config, init_system)
+        }
 
         Commands::Doctor { doctor_command } => match doctor_command {
             Some(DoctorCommands::Models {
                 provider,
                 use_cache,
-            }) => {
-                let config_for_models = config.clone();
-                tokio::task::spawn_blocking(move || {
-                    doctor::run_models(&config_for_models, provider.as_deref(), use_cache)
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("doctor models task failed: {e}"))?
-            }
+            }) => doctor::run_models(&config, provider.as_deref(), use_cache).await,
+            Some(DoctorCommands::Traces {
+                id,
+                event,
+                contains,
+                limit,
+            }) => doctor::run_traces(
+                &config,
+                id.as_deref(),
+                event.as_deref(),
+                contains.as_deref(),
+                limit,
+            ),
             None => doctor::run(&config),
         },
 
@@ -928,6 +890,10 @@ async fn main() -> Result<()> {
 
         Commands::Migrate { migrate_command } => {
             migration::handle_command(migrate_command, &config).await
+        }
+
+        Commands::Memory { memory_command } => {
+            memory::cli::handle_command(memory_command, &config).await
         }
 
         Commands::Auth { auth_command } => handle_auth_command(auth_command, &config).await,
@@ -1156,7 +1122,9 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                         let account_id =
                             extract_openai_account_id_for_profile(&token_set.access_token);
 
-                        auth_service.store_openai_tokens(&profile, token_set, account_id, true)?;
+                        auth_service
+                            .store_openai_tokens(&profile, token_set, account_id, true)
+                            .await?;
                         clear_pending_openai_login(config);
 
                         println!("Saved profile {profile}");
@@ -1206,7 +1174,9 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 auth::openai_oauth::exchange_code_for_tokens(&client, &code, &pkce).await?;
             let account_id = extract_openai_account_id_for_profile(&token_set.access_token);
 
-            auth_service.store_openai_tokens(&profile, token_set, account_id, true)?;
+            auth_service
+                .store_openai_tokens(&profile, token_set, account_id, true)
+                .await?;
             clear_pending_openai_login(config);
 
             println!("Saved profile {profile}");
@@ -1259,7 +1229,9 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 auth::openai_oauth::exchange_code_for_tokens(&client, &code, &pkce).await?;
             let account_id = extract_openai_account_id_for_profile(&token_set.access_token);
 
-            auth_service.store_openai_tokens(&profile, token_set, account_id, true)?;
+            auth_service
+                .store_openai_tokens(&profile, token_set, account_id, true)
+                .await?;
             clear_pending_openai_login(config);
 
             println!("Saved profile {profile}");
@@ -1289,7 +1261,9 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 kind.as_metadata_value().to_string(),
             );
 
-            auth_service.store_provider_token(&provider, &profile, &token, metadata, true)?;
+            auth_service
+                .store_provider_token(&provider, &profile, &token, metadata, true)
+                .await?;
             println!("Saved profile {profile}");
             println!("Active profile for {provider}: {profile}");
             Ok(())
@@ -1309,7 +1283,9 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 kind.as_metadata_value().to_string(),
             );
 
-            auth_service.store_provider_token(&provider, &profile, &token, metadata, true)?;
+            auth_service
+                .store_provider_token(&provider, &profile, &token, metadata, true)
+                .await?;
             println!("Saved profile {profile}");
             println!("Active profile for {provider}: {profile}");
             Ok(())
@@ -1339,7 +1315,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 
         AuthCommands::Logout { provider, profile } => {
             let provider = auth::normalize_provider(&provider)?;
-            let removed = auth_service.remove_profile(&provider, &profile)?;
+            let removed = auth_service.remove_profile(&provider, &profile).await?;
             if removed {
                 println!("Removed auth profile {provider}:{profile}");
             } else {
@@ -1350,13 +1326,13 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 
         AuthCommands::Use { provider, profile } => {
             let provider = auth::normalize_provider(&provider)?;
-            auth_service.set_active_profile(&provider, &profile)?;
+            auth_service.set_active_profile(&provider, &profile).await?;
             println!("Active profile for {provider}: {profile}");
             Ok(())
         }
 
         AuthCommands::List => {
-            let data = auth_service.load_profiles()?;
+            let data = auth_service.load_profiles().await?;
             if data.profiles.is_empty() {
                 println!("No auth profiles configured.");
                 return Ok(());
@@ -1375,7 +1351,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
         }
 
         AuthCommands::Status => {
-            let data = auth_service.load_profiles()?;
+            let data = auth_service.load_profiles().await?;
             if data.profiles.is_empty() {
                 println!("No auth profiles configured.");
                 return Ok(());
@@ -1453,6 +1429,7 @@ mod tests {
         match cli.command {
             Commands::Onboard {
                 interactive,
+                force,
                 channels_only,
                 api_key,
                 provider,
@@ -1460,6 +1437,7 @@ mod tests {
                 ..
             } => {
                 assert!(!interactive);
+                assert!(!force);
                 assert!(!channels_only);
                 assert_eq!(provider.as_deref(), Some("openrouter"));
                 assert_eq!(model.as_deref(), Some("custom-model-946"));
@@ -1491,5 +1469,16 @@ mod tests {
             script.contains("zeroclaw"),
             "completion script should reference binary name"
         );
+    }
+
+    #[test]
+    fn onboard_cli_accepts_force_flag() {
+        let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--force"])
+            .expect("onboard --force should parse");
+
+        match cli.command {
+            Commands::Onboard { force, .. } => assert!(force),
+            other => panic!("expected onboard command, got {other:?}"),
+        }
     }
 }

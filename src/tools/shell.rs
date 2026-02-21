@@ -3,6 +3,7 @@ use crate::runtime::RuntimeAdapter;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,6 +27,34 @@ impl ShellTool {
     pub fn new(security: Arc<SecurityPolicy>, runtime: Arc<dyn RuntimeAdapter>) -> Self {
         Self { security, runtime }
     }
+}
+
+fn is_valid_env_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
+        _ => return false,
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn collect_allowed_shell_env_vars(security: &SecurityPolicy) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for key in SAFE_ENV_VARS
+        .iter()
+        .copied()
+        .chain(security.shell_env_passthrough.iter().map(|s| s.as_str()))
+    {
+        let candidate = key.trim();
+        if candidate.is_empty() || !is_valid_env_var_name(candidate) {
+            continue;
+        }
+        if seen.insert(candidate.to_string()) {
+            out.push(candidate.to_string());
+        }
+    }
+    out
 }
 
 #[async_trait]
@@ -111,9 +140,9 @@ impl Tool for ShellTool {
         };
         cmd.env_clear();
 
-        for var in SAFE_ENV_VARS {
-            if let Ok(val) = std::env::var(var) {
-                cmd.env(var, val);
+        for var in collect_allowed_shell_env_vars(&self.security) {
+            if let Ok(val) = std::env::var(&var) {
+                cmd.env(&var, val);
             }
         }
 
@@ -276,6 +305,16 @@ mod tests {
         })
     }
 
+    fn test_security_with_env_passthrough(vars: &[&str]) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["env".into()],
+            shell_env_passthrough: vars.iter().map(|v| (*v).to_string()).collect(),
+            ..SecurityPolicy::default()
+        })
+    }
+
     /// RAII guard that restores an environment variable to its original state on drop,
     /// ensuring cleanup even if the test panics.
     struct EnvGuard {
@@ -344,6 +383,42 @@ mod tests {
             !result.output.trim().is_empty(),
             "PATH should be available in shell"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shell_allows_configured_env_passthrough() {
+        let _guard = EnvGuard::set("ZEROCLAW_TEST_PASSTHROUGH", "db://unit-test");
+        let tool = ShellTool::new(
+            test_security_with_env_passthrough(&["ZEROCLAW_TEST_PASSTHROUGH"]),
+            test_runtime(),
+        );
+
+        let result = tool
+            .execute(json!({"command": "env"}))
+            .await
+            .expect("env command execution should succeed");
+        assert!(result.success);
+        assert!(result
+            .output
+            .contains("ZEROCLAW_TEST_PASSTHROUGH=db://unit-test"));
+    }
+
+    #[test]
+    fn invalid_shell_env_passthrough_names_are_filtered() {
+        let security = SecurityPolicy {
+            shell_env_passthrough: vec![
+                "VALID_NAME".into(),
+                "BAD-NAME".into(),
+                "1NOPE".into(),
+                "ALSO_VALID".into(),
+            ],
+            ..SecurityPolicy::default()
+        };
+        let vars = collect_allowed_shell_env_vars(&security);
+        assert!(vars.contains(&"VALID_NAME".to_string()));
+        assert!(vars.contains(&"ALSO_VALID".to_string()));
+        assert!(!vars.contains(&"BAD-NAME".to_string()));
+        assert!(!vars.contains(&"1NOPE".to_string()));
     }
 
     #[tokio::test]
@@ -439,5 +514,57 @@ mod tests {
             .expect("rate-limited command should return a result");
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap_or("").contains("Rate limit"));
+    }
+
+    #[tokio::test]
+    async fn shell_handles_nonexistent_command() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        });
+        let tool = ShellTool::new(security, test_runtime());
+        let result = tool
+            .execute(json!({"command": "nonexistent_binary_xyz_12345"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+    }
+
+    #[tokio::test]
+    async fn shell_captures_stderr_output() {
+        let tool = ShellTool::new(test_security(AutonomyLevel::Full), test_runtime());
+        let result = tool
+            .execute(json!({"command": "echo error_msg >&2"}))
+            .await
+            .unwrap();
+        assert!(result.error.as_deref().unwrap_or("").contains("error_msg"));
+    }
+
+    #[tokio::test]
+    async fn shell_record_action_budget_exhaustion() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            max_actions_per_hour: 1,
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        });
+        let tool = ShellTool::new(security, test_runtime());
+
+        let r1 = tool
+            .execute(json!({"command": "echo first"}))
+            .await
+            .unwrap();
+        assert!(r1.success);
+
+        let r2 = tool
+            .execute(json!({"command": "echo second"}))
+            .await
+            .unwrap();
+        assert!(!r2.success);
+        assert!(
+            r2.error.as_deref().unwrap_or("").contains("Rate limit")
+                || r2.error.as_deref().unwrap_or("").contains("budget")
+        );
     }
 }

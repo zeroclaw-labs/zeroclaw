@@ -31,6 +31,16 @@ pub struct MatrixChannel {
     http_client: Client,
 }
 
+impl std::fmt::Debug for MatrixChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MatrixChannel")
+            .field("homeserver", &self.homeserver)
+            .field("room_id", &self.room_id)
+            .field("allowed_users", &self.allowed_users)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct SyncResponse {
     next_batch: String,

@@ -13,6 +13,7 @@ Structured reference index for commands, providers, channels, config, and integr
 
 - Custom provider endpoints: [../custom-providers.md](../custom-providers.md)
 - Z.AI / GLM provider onboarding: [../zai-glm-setup.md](../zai-glm-setup.md)
+- Nextcloud Talk bot integration: [../nextcloud-talk-setup.md](../nextcloud-talk-setup.md)
 - LangGraph-based integration patterns: [../langgraph-integration.md](../langgraph-integration.md)
 
 ## Usage
