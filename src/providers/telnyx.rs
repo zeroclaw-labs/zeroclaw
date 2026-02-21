@@ -321,7 +321,7 @@ mod tests {
 
     #[test]
     fn creates_provider_without_key() {
-        let provider = TelnyxProvider::new(None);
+        let _provider = TelnyxProvider::new(None);
         // Will be None if env vars not set
     }
 
