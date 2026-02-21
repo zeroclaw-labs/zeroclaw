@@ -2,7 +2,7 @@
 
 This reference is derived from the current CLI surface (`zeroclaw --help`).
 
-Last verified: **February 20, 2026**.
+Last verified: **February 21, 2026**.
 
 ## Top-Level Commands
 
@@ -15,6 +15,7 @@ Last verified: **February 20, 2026**.
 | `service` | Manage user-level OS service lifecycle |
 | `doctor` | Run diagnostics and freshness checks |
 | `status` | Print current configuration and system summary |
+| `estop` | Engage/resume emergency stop levels and inspect estop state |
 | `cron` | Manage scheduled tasks |
 | `models` | Refresh provider model catalogs |
 | `providers` | List provider IDs, aliases, and active provider |
@@ -62,6 +63,25 @@ Tip:
 
 - `zeroclaw gateway [--host <HOST>] [--port <PORT>]`
 - `zeroclaw daemon [--host <HOST>] [--port <PORT>]`
+
+### `estop`
+
+- `zeroclaw estop` (engage `kill-all`)
+- `zeroclaw estop --level network-kill`
+- `zeroclaw estop --level domain-block --domain "*.chase.com" [--domain "*.paypal.com"]`
+- `zeroclaw estop --level tool-freeze --tool shell [--tool browser]`
+- `zeroclaw estop status`
+- `zeroclaw estop resume`
+- `zeroclaw estop resume --network`
+- `zeroclaw estop resume --domain "*.chase.com"`
+- `zeroclaw estop resume --tool shell`
+- `zeroclaw estop resume --otp <123456>`
+
+Notes:
+
+- `estop` commands require `[security.estop].enabled = true`.
+- When `[security.estop].require_otp_to_resume = true`, `resume` requires OTP validation.
+- OTP prompt appears automatically if `--otp` is omitted.
 
 ### `service`
 

@@ -1,6 +1,6 @@
 use crate::config::traits::ChannelConfig;
 use crate::providers::{is_glm_alias, is_zai_alias};
-use crate::security::AutonomyLevel;
+use crate::security::{AutonomyLevel, DomainMatcher};
 use anyhow::{Context, Result};
 use directories::UserDirs;
 use schemars::JsonSchema;
@@ -86,6 +86,10 @@ pub struct Config {
     /// Autonomy and security policy configuration (`[autonomy]`).
     #[serde(default)]
     pub autonomy: AutonomyConfig,
+
+    /// Security subsystem configuration (`[security]`).
+    #[serde(default)]
+    pub security: SecurityConfig,
 
     /// Runtime adapter configuration (`[runtime]`). Controls native vs Docker execution.
     #[serde(default)]
@@ -3040,6 +3044,123 @@ pub struct SecurityConfig {
     /// Audit logging configuration
     #[serde(default)]
     pub audit: AuditConfig,
+
+    /// OTP gating configuration for sensitive actions/domains.
+    #[serde(default)]
+    pub otp: OtpConfig,
+
+    /// Emergency-stop state machine configuration.
+    #[serde(default)]
+    pub estop: EstopConfig,
+}
+
+/// OTP validation strategy.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum OtpMethod {
+    /// Time-based one-time password (RFC 6238).
+    #[default]
+    Totp,
+    /// Future method for paired-device confirmations.
+    Pairing,
+    /// Future method for local CLI challenge prompts.
+    CliPrompt,
+}
+
+/// Security OTP configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OtpConfig {
+    /// Enable OTP gating. Defaults to disabled for backward compatibility.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// OTP method.
+    #[serde(default)]
+    pub method: OtpMethod,
+
+    /// TOTP time-step in seconds.
+    #[serde(default = "default_otp_token_ttl_secs")]
+    pub token_ttl_secs: u64,
+
+    /// Reuse window for recently validated OTP codes.
+    #[serde(default = "default_otp_cache_valid_secs")]
+    pub cache_valid_secs: u64,
+
+    /// Tool/action names gated by OTP.
+    #[serde(default = "default_otp_gated_actions")]
+    pub gated_actions: Vec<String>,
+
+    /// Explicit domain patterns gated by OTP.
+    #[serde(default)]
+    pub gated_domains: Vec<String>,
+
+    /// Domain-category presets expanded into `gated_domains`.
+    #[serde(default)]
+    pub gated_domain_categories: Vec<String>,
+}
+
+fn default_otp_token_ttl_secs() -> u64 {
+    30
+}
+
+fn default_otp_cache_valid_secs() -> u64 {
+    300
+}
+
+fn default_otp_gated_actions() -> Vec<String> {
+    vec![
+        "shell".to_string(),
+        "file_write".to_string(),
+        "browser_open".to_string(),
+        "browser".to_string(),
+        "memory_forget".to_string(),
+    ]
+}
+
+impl Default for OtpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            method: OtpMethod::Totp,
+            token_ttl_secs: default_otp_token_ttl_secs(),
+            cache_valid_secs: default_otp_cache_valid_secs(),
+            gated_actions: default_otp_gated_actions(),
+            gated_domains: Vec::new(),
+            gated_domain_categories: Vec::new(),
+        }
+    }
+}
+
+/// Emergency stop configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EstopConfig {
+    /// Enable emergency stop controls.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// File path used to persist estop state.
+    #[serde(default = "default_estop_state_file")]
+    pub state_file: String,
+
+    /// Require a valid OTP before resume operations.
+    #[serde(default = "default_true")]
+    pub require_otp_to_resume: bool,
+}
+
+fn default_estop_state_file() -> String {
+    "~/.zeroclaw/estop-state.json".to_string()
+}
+
+impl Default for EstopConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            state_file: default_estop_state_file(),
+            require_otp_to_resume: true,
+        }
+    }
 }
 
 /// Sandbox configuration for OS-level isolation
@@ -3268,6 +3389,7 @@ impl Default for Config {
             default_temperature: 0.7,
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
+            security: SecurityConfig::default(),
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
@@ -3764,6 +3886,43 @@ impl Config {
                     "autonomy.shell_env_passthrough[{i}] is invalid ({env_name}); expected [A-Za-z_][A-Za-z0-9_]*"
                 );
             }
+        }
+
+        // Security OTP / estop
+        if self.security.otp.token_ttl_secs == 0 {
+            anyhow::bail!("security.otp.token_ttl_secs must be greater than 0");
+        }
+        if self.security.otp.cache_valid_secs == 0 {
+            anyhow::bail!("security.otp.cache_valid_secs must be greater than 0");
+        }
+        if self.security.otp.cache_valid_secs < self.security.otp.token_ttl_secs {
+            anyhow::bail!(
+                "security.otp.cache_valid_secs must be greater than or equal to security.otp.token_ttl_secs"
+            );
+        }
+        for (i, action) in self.security.otp.gated_actions.iter().enumerate() {
+            let normalized = action.trim();
+            if normalized.is_empty() {
+                anyhow::bail!("security.otp.gated_actions[{i}] must not be empty");
+            }
+            if !normalized
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                anyhow::bail!(
+                    "security.otp.gated_actions[{i}] contains invalid characters: {normalized}"
+                );
+            }
+        }
+        DomainMatcher::new(
+            &self.security.otp.gated_domains,
+            &self.security.otp.gated_domain_categories,
+        )
+        .with_context(|| {
+            "Invalid security.otp.gated_domains or security.otp.gated_domain_categories"
+        })?;
+        if self.security.estop.state_file.trim().is_empty() {
+            anyhow::bail!("security.estop.state_file must not be empty");
         }
 
         // Scheduler
@@ -4466,6 +4625,7 @@ default_temperature = 0.7
                 allowed_roots: vec![],
                 non_cli_excluded_tools: vec![],
             },
+            security: SecurityConfig::default(),
             runtime: RuntimeConfig {
                 kind: "docker".into(),
                 ..RuntimeConfig::default()
@@ -4673,6 +4833,7 @@ tool_dispatcher = "xml"
             default_temperature: 0.9,
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
+            security: SecurityConfig::default(),
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
@@ -6718,5 +6879,85 @@ default_model = "legacy-model"
         let parsed: Config = toml::from_str(toml_str).unwrap();
         assert!(!parsed.transcription.enabled);
         assert_eq!(parsed.transcription.max_duration_secs, 120);
+    }
+
+    #[test]
+    async fn security_defaults_are_backward_compatible() {
+        let parsed: Config = toml::from_str(
+            r#"
+default_provider = "openrouter"
+default_model = "anthropic/claude-sonnet-4.6"
+default_temperature = 0.7
+"#,
+        )
+        .unwrap();
+
+        assert!(!parsed.security.otp.enabled);
+        assert_eq!(parsed.security.otp.method, OtpMethod::Totp);
+        assert!(!parsed.security.estop.enabled);
+        assert!(parsed.security.estop.require_otp_to_resume);
+    }
+
+    #[test]
+    async fn security_toml_parses_otp_and_estop_sections() {
+        let parsed: Config = toml::from_str(
+            r#"
+default_provider = "openrouter"
+default_model = "anthropic/claude-sonnet-4.6"
+default_temperature = 0.7
+
+[security.otp]
+enabled = true
+method = "totp"
+token_ttl_secs = 30
+cache_valid_secs = 120
+gated_actions = ["shell", "browser_open"]
+gated_domains = ["*.chase.com", "accounts.google.com"]
+gated_domain_categories = ["banking"]
+
+[security.estop]
+enabled = true
+state_file = "~/.zeroclaw/estop-state.json"
+require_otp_to_resume = true
+"#,
+        )
+        .unwrap();
+
+        assert!(parsed.security.otp.enabled);
+        assert!(parsed.security.estop.enabled);
+        assert_eq!(parsed.security.otp.gated_actions.len(), 2);
+        assert_eq!(parsed.security.otp.gated_domains.len(), 2);
+        parsed.validate().unwrap();
+    }
+
+    #[test]
+    async fn security_validation_rejects_invalid_domain_glob() {
+        let mut config = Config::default();
+        config.security.otp.gated_domains = vec!["bad domain.com".into()];
+
+        let err = config.validate().expect_err("expected invalid domain glob");
+        assert!(err.to_string().contains("gated_domains"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_unknown_domain_category() {
+        let mut config = Config::default();
+        config.security.otp.gated_domain_categories = vec!["not_real".into()];
+
+        let err = config
+            .validate()
+            .expect_err("expected unknown domain category");
+        assert!(err.to_string().contains("gated_domain_categories"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_zero_token_ttl() {
+        let mut config = Config::default();
+        config.security.otp.token_ttl_secs = 0;
+
+        let err = config
+            .validate()
+            .expect_err("expected ttl validation failure");
+        assert!(err.to_string().contains("token_ttl_secs"));
     }
 }

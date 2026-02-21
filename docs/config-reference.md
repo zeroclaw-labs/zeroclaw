@@ -2,7 +2,7 @@
 
 This is a high-signal reference for common config sections and defaults.
 
-Last verified: **February 19, 2026**.
+Last verified: **February 21, 2026**.
 
 Config path resolution at startup:
 
@@ -88,6 +88,52 @@ Notes:
 - If a channel message exceeds this value, the runtime returns: `Agent exceeded maximum tool iterations (<value>)`.
 - In CLI, gateway, and channel tool loops, multiple independent tool calls are executed concurrently by default when the pending calls do not require approval gating; result order remains stable.
 - `parallel_tools` applies to the `Agent::turn()` API surface. It does not gate the runtime loop used by CLI, gateway, or channel handlers.
+
+## `[security.otp]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable OTP gating for sensitive actions/domains |
+| `method` | `totp` | OTP method (`totp`, `pairing`, `cli-prompt`) |
+| `token_ttl_secs` | `30` | TOTP time-step window in seconds |
+| `cache_valid_secs` | `300` | Cache window for recently validated OTP codes |
+| `gated_actions` | `["shell","file_write","browser_open","browser","memory_forget"]` | Tool actions protected by OTP |
+| `gated_domains` | `[]` | Explicit domain patterns requiring OTP (`*.example.com`, `login.example.com`) |
+| `gated_domain_categories` | `[]` | Domain preset categories (`banking`, `medical`, `government`, `identity_providers`) |
+
+Notes:
+
+- Domain patterns support wildcard `*`.
+- Category presets expand to curated domain sets during validation.
+- Invalid domain globs or unknown categories fail fast at startup.
+- When `enabled = true` and no OTP secret exists, ZeroClaw generates one and prints an enrollment URI once.
+
+Example:
+
+```toml
+[security.otp]
+enabled = true
+method = "totp"
+token_ttl_secs = 30
+cache_valid_secs = 300
+gated_actions = ["shell", "browser_open"]
+gated_domains = ["*.chase.com", "accounts.google.com"]
+gated_domain_categories = ["banking"]
+```
+
+## `[security.estop]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable emergency-stop state machine and CLI |
+| `state_file` | `~/.zeroclaw/estop-state.json` | Persistent estop state path |
+| `require_otp_to_resume` | `true` | Require OTP validation before resume operations |
+
+Notes:
+
+- Estop state is persisted atomically and reloaded on startup.
+- Corrupted/unreadable estop state falls back to fail-closed `kill_all`.
+- Use CLI command `zeroclaw estop` to engage and `zeroclaw estop resume` to clear levels.
 
 ## `[agents.<name>]`
 

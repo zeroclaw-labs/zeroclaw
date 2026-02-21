@@ -23,10 +23,13 @@ pub mod audit;
 pub mod bubblewrap;
 pub mod detect;
 pub mod docker;
+pub mod domain_matcher;
+pub mod estop;
 #[cfg(target_os = "linux")]
 pub mod firejail;
 #[cfg(feature = "sandbox-landlock")]
 pub mod landlock;
+pub mod otp;
 pub mod pairing;
 pub mod policy;
 pub mod secrets;
@@ -36,6 +39,11 @@ pub mod traits;
 pub use audit::{AuditEvent, AuditEventType, AuditLogger};
 #[allow(unused_imports)]
 pub use detect::create_sandbox;
+pub use domain_matcher::DomainMatcher;
+#[allow(unused_imports)]
+pub use estop::{EstopLevel, EstopManager, EstopState, ResumeSelector};
+#[allow(unused_imports)]
+pub use otp::OtpValidator;
 #[allow(unused_imports)]
 pub use pairing::PairingGuard;
 pub use policy::{AutonomyLevel, SecurityPolicy};
