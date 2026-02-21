@@ -109,9 +109,10 @@ glob = "0.3"
 # Binary discovery (init system detection)
 which = "7.0"
 
-# WebSocket client channels (Discord/Lark/DingTalk)
+# WebSocket client channels (Discord/Lark/DingTalk/Nostr)
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+nostr-sdk = { version = "0.44", default-features = false, features = ["nip04", "nip59"] }
 regex = "1.10"
 hostname = "0.4.2"
 rustls = "0.23"
@@ -219,6 +220,7 @@ panic = "abort"
 tempfile = "3.14"
 criterion = { version = "0.8", features = ["async_tokio"] }
 tokio-stream = { version = "0.1.18", default-features = false, features = ["fs"] }
+wiremock = "0.6"
 
 [[bench]]
 name = "agent_benchmarks"

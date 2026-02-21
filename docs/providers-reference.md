@@ -56,6 +56,7 @@ credential is not reused for fallback providers.
 | `copilot` | `github-copilot` | No | (use config/`API_KEY` fallback with GitHub token) |
 | `lmstudio` | `lm-studio` | Yes | (optional; local by default) |
 | `llamacpp` | `llama.cpp` | Yes | `LLAMACPP_API_KEY` (optional; only if server auth is enabled) |
+| `vllm` | — | Yes | `VLLM_API_KEY` (optional) |
 | `nvidia` | `nvidia-nim`, `build.nvidia.com` | No | `NVIDIA_API_KEY` |
 
 ### Gemini Notes
@@ -64,6 +65,7 @@ credential is not reused for fallback providers.
 - Auth can come from `GEMINI_API_KEY`, `GOOGLE_API_KEY`, or Gemini CLI OAuth cache (`~/.gemini/oauth_creds.json`)
 - API key requests use `generativelanguage.googleapis.com/v1beta`
 - Gemini CLI OAuth requests use `cloudcode-pa.googleapis.com/v1internal` with Code Assist request envelope semantics
+- Thinking models (e.g. `gemini-3-pro-preview`) are supported — internal reasoning parts are automatically filtered from the response
 
 ### Ollama Vision Notes
 
@@ -86,6 +88,13 @@ credential is not reused for fallback providers.
 - Default endpoint: `http://localhost:8080/v1`
 - API key is optional by default; set `LLAMACPP_API_KEY` only when `llama-server` is started with `--api-key`.
 - Model discovery: `zeroclaw models refresh --provider llamacpp`
+
+### vLLM Server Notes
+
+- Provider ID: `vllm`
+- Default endpoint: `http://localhost:8000/v1`
+- API key is optional by default; set `VLLM_API_KEY` only when the server requires authentication.
+- Model discovery: `zeroclaw models refresh --provider vllm`
 
 ### Bedrock Notes
 

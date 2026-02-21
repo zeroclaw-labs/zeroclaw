@@ -116,7 +116,9 @@ If `[channels_config.matrix]` or `[channels_config.lark]` is present but the cor
 | Lark/Feishu | websocket (default) or webhook | Webhook mode only |
 | DingTalk | stream mode | No |
 | QQ | bot gateway | No |
+| Linq | webhook (`/linq`) | Yes (public HTTPS callback) |
 | iMessage | local integration | No |
+| Nostr | relay websocket (NIP-04 / NIP-17) | No |
 
 ---
 
@@ -133,8 +135,9 @@ Field names differ by channel:
 - `allowed_users` (Telegram/Discord/Slack/Mattermost/Matrix/IRC/Lark/DingTalk/QQ/Nextcloud Talk)
 - `allowed_from` (Signal)
 - `allowed_numbers` (WhatsApp)
-- `allowed_senders` (Email)
+- `allowed_senders` (Email/Linq)
 - `allowed_contacts` (iMessage)
+- `allowed_pubkeys` (Nostr)
 
 ---
 
@@ -307,6 +310,20 @@ receive_mode = "websocket"          # or "webhook"
 port = 8081                          # required for webhook mode
 ```
 
+### 4.12 Nostr
+
+```toml
+[channels_config.nostr]
+private_key = "nsec1..."                   # hex or nsec bech32 (encrypted at rest)
+# relays default to relay.damus.io, nos.lol, relay.primal.net, relay.snort.social
+# relays = ["wss://relay.damus.io", "wss://nos.lol"]
+allowed_pubkeys = ["hex-or-npub"]          # empty = deny all, "*" = allow all
+```
+
+Nostr supports both NIP-04 (legacy encrypted DMs) and NIP-17 (gift-wrapped private messages).
+Replies automatically use the same protocol the sender used. The private key is encrypted at rest
+via the `SecretStore` when `secrets.encrypt = true` (the default).
+
 Interactive onboarding support:
 
 ```bash
@@ -326,7 +343,7 @@ Runtime token behavior:
 - send requests automatically retry once after token invalidation when Feishu/Lark returns either HTTP `401` or business error code `99991663` (`Invalid access token`).
 - if the retry still returns token-invalid responses, the send call fails with the upstream status/body for easier troubleshooting.
 
-### 4.12 DingTalk
+### 4.13 DingTalk
 
 ```toml
 [channels_config.dingtalk]
@@ -335,7 +352,7 @@ client_secret = "ding-app-secret"
 allowed_users = ["*"]
 ```
 
-### 4.13 QQ
+### 4.14 QQ
 
 ```toml
 [channels_config.qq]
@@ -344,7 +361,7 @@ app_secret = "qq-app-secret"
 allowed_users = ["*"]
 ```
 
-### 4.14 Nextcloud Talk
+### 4.15 Nextcloud Talk
 
 ```toml
 [channels_config.nextcloud_talk]
@@ -362,7 +379,26 @@ Notes:
 - `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET` overrides config secret.
 - See [nextcloud-talk-setup.md](./nextcloud-talk-setup.md) for a full runbook.
 
-### 4.15 iMessage
+### 4.16 Linq
+
+```toml
+[channels_config.linq]
+api_token = "linq-partner-api-token"
+from_phone = "+15551234567"
+signing_secret = "optional-webhook-signing-secret"  # optional but recommended
+allowed_senders = ["*"]
+```
+
+Notes:
+
+- Linq uses the Partner V3 API for iMessage, RCS, and SMS.
+- Inbound webhook endpoint: `POST /linq`.
+- Signature verification uses `X-Webhook-Signature` (HMAC-SHA256) and `X-Webhook-Timestamp`.
+- If `signing_secret` is set, invalid or stale (>300s) signatures are rejected.
+- `ZEROCLAW_LINQ_SIGNING_SECRET` overrides config secret.
+- `allowed_senders` uses E.164 phone number format (e.g. `+1234567890`).
+
+### 4.17 iMessage
 
 ```toml
 [channels_config.imessage]
@@ -417,7 +453,7 @@ RUST_LOG=info zeroclaw daemon 2>&1 | tee /tmp/zeroclaw.log
 Then filter channel/gateway events:
 
 ```bash
-rg -n "Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|DingTalk|QQ|iMessage|Webhook|Channel" /tmp/zeroclaw.log
+rg -n "Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|DingTalk|QQ|iMessage|Nostr|Webhook|Channel" /tmp/zeroclaw.log
 ```
 
 ### 7.2 Keyword table
@@ -439,6 +475,7 @@ rg -n "Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|D
 | QQ | `QQ: connected and identified` | `QQ: ignoring C2C message from unauthorized user:` / `QQ: ignoring group message from unauthorized user:` | `QQ: received Reconnect (op 7)` / `QQ: received Invalid Session (op 9)` / `QQ: message channel closed` |
 | Nextcloud Talk (gateway) | `POST /nextcloud-talk — Nextcloud Talk bot webhook` | `Nextcloud Talk webhook signature verification failed` / `Nextcloud Talk: ignoring message from unauthorized actor:` | `Nextcloud Talk send failed:` / `LLM error for Nextcloud Talk message:` |
 | iMessage | `iMessage channel listening (AppleScript bridge)...` | (contact allowlist enforced by `allowed_contacts`) | `iMessage poll error:` |
+| Nostr | `Nostr channel listening as npub1...` | `Nostr: ignoring NIP-04 message from unauthorized pubkey:` / `Nostr: ignoring NIP-17 message from unauthorized pubkey:` | `Failed to decrypt NIP-04 message:` / `Failed to unwrap NIP-17 gift wrap:` / `Nostr relay pool shut down` |
 
 ### 7.3 Runtime supervisor keywords
 

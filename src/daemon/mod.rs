@@ -66,7 +66,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
             max_backoff,
             move || {
                 let cfg = heartbeat_cfg.clone();
-                async move { run_heartbeat_worker(cfg).await }
+                async move { Box::pin(run_heartbeat_worker(cfg)).await }
             },
         ));
     }
@@ -227,6 +227,7 @@ fn has_supervised_channels(config: &Config) -> bool {
         linq,
         nextcloud_talk,
         qq,
+        nostr,
         ..
     } = &config.channels_config;
 
@@ -245,6 +246,7 @@ fn has_supervised_channels(config: &Config) -> bool {
         || linq.is_some()
         || nextcloud_talk.is_some()
         || qq.is_some()
+        || nostr.is_some()
 }
 
 #[cfg(test)]

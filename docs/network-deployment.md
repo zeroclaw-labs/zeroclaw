@@ -11,11 +11,12 @@ This document covers deploying ZeroClaw on a Raspberry Pi or other host on your 
 | **Telegram polling** | No | ZeroClaw polls Telegram API; works from anywhere |
 | **Matrix sync (including E2EE)** | No | ZeroClaw syncs via Matrix client API; no inbound webhook required |
 | **Discord/Slack** | No | Same — outbound only |
+| **Nostr** | No | Connects to relays via WebSocket; outbound only |
 | **Gateway webhook** | Yes | POST /webhook, /whatsapp, /linq, /nextcloud-talk need a public URL |
 | **Gateway pairing** | Yes | If you pair clients via the gateway |
 | **Alpine/OpenRC service** | No | System-wide background service on Alpine Linux |
 
-**Key:** Telegram, Discord, and Slack use **long-polling** — ZeroClaw makes outbound requests. No port forwarding or public IP required.
+**Key:** Telegram, Discord, Slack, and Nostr use **outbound connections** — ZeroClaw connects to external servers/relays. No port forwarding or public IP required.
 
 ---
 

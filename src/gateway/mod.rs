@@ -10,7 +10,7 @@
 use crate::channels::{Channel, LinqChannel, NextcloudTalkChannel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
-use crate::providers::{self, ChatMessage, Provider, ProviderCapabilityError};
+use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::security::SecurityPolicy;
@@ -713,23 +713,13 @@ async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGua
     Ok(())
 }
 
-async fn run_gateway_chat_with_multimodal(
+/// Simple chat for webhook endpoint (no tools, for backward compatibility and testing).
+async fn run_gateway_chat_simple(
     state: &AppState,
     provider_label: &str,
     message: &str,
 ) -> anyhow::Result<String> {
     let user_messages = vec![ChatMessage::user(message)];
-    let image_marker_count = crate::multimodal::count_image_markers(&user_messages);
-    if image_marker_count > 0 && !state.provider.supports_vision() {
-        return Err(ProviderCapabilityError {
-            provider: provider_label.to_string(),
-            capability: "vision".to_string(),
-            message: format!(
-                "received {image_marker_count} image marker(s), but this provider does not support vision input"
-            ),
-        }
-        .into());
-    }
 
     // Keep webhook/gateway prompts aligned with channel behavior by injecting
     // workspace-aware system context before model invocation.
@@ -757,6 +747,12 @@ async fn run_gateway_chat_with_multimodal(
         .provider
         .chat_with_history(&prepared.messages, &state.model, state.temperature)
         .await
+}
+
+/// Full-featured chat with tools for channel handlers (WhatsApp, Linq, Nextcloud Talk).
+async fn run_gateway_chat_with_tools(state: &AppState, message: &str) -> anyhow::Result<String> {
+    let config = state.config.lock().clone();
+    crate::agent::process_message(config, message).await
 }
 
 /// Webhook request body
@@ -880,7 +876,7 @@ async fn handle_webhook(
             messages_count: 1,
         });
 
-    match run_gateway_chat_with_multimodal(&state, &provider_label, message).await {
+    match run_gateway_chat_simple(&state, &provider_label, message).await {
         Ok(response) => {
             let duration = started_at.elapsed();
             state
@@ -891,6 +887,8 @@ async fn handle_webhook(
                     duration,
                     success: true,
                     error_message: None,
+                    input_tokens: None,
+                    output_tokens: None,
                 });
             state.observer.record_metric(
                 &crate::observability::traits::ObserverMetric::RequestLatency(duration),
@@ -920,6 +918,8 @@ async fn handle_webhook(
                     duration,
                     success: false,
                     error_message: Some(sanitized.clone()),
+                    input_tokens: None,
+                    output_tokens: None,
                 });
             state.observer.record_metric(
                 &crate::observability::traits::ObserverMetric::RequestLatency(duration),
@@ -1064,12 +1064,6 @@ async fn handle_whatsapp_message(
     }
 
     // Process each message
-    let provider_label = state
-        .config
-        .lock()
-        .default_provider
-        .clone()
-        .unwrap_or_else(|| "unknown".to_string());
     for msg in &messages {
         tracing::info!(
             "WhatsApp message from {}: {}",
@@ -1086,7 +1080,7 @@ async fn handle_whatsapp_message(
                 .await;
         }
 
-        match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content).await {
+        match run_gateway_chat_with_tools(&state, &msg.content).await {
             Ok(response) => {
                 // Send reply via WhatsApp
                 if let Err(e) = wa
@@ -1177,12 +1171,6 @@ async fn handle_linq_webhook(
     }
 
     // Process each message
-    let provider_label = state
-        .config
-        .lock()
-        .default_provider
-        .clone()
-        .unwrap_or_else(|| "unknown".to_string());
     for msg in &messages {
         tracing::info!(
             "Linq message from {}: {}",
@@ -1200,7 +1188,7 @@ async fn handle_linq_webhook(
         }
 
         // Call the LLM
-        match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content).await {
+        match run_gateway_chat_with_tools(&state, &msg.content).await {
             Ok(response) => {
                 // Send reply via Linq
                 if let Err(e) = linq
@@ -1311,7 +1299,7 @@ async fn handle_nextcloud_talk_webhook(
                 .await;
         }
 
-        match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content).await {
+        match run_gateway_chat_with_tools(&state, &msg.content).await {
             Ok(response) => {
                 if let Err(e) = nextcloud_talk
                     .send(&SendMessage::new(response, &msg.reply_target))
