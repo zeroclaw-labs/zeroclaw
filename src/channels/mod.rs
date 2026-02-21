@@ -1842,6 +1842,13 @@ async fn process_channel_message(
                     "  ❌ LLM error after {}ms: {e}",
                     started_at.elapsed().as_millis()
                 );
+                // Close the orphan user turn so subsequent messages don't
+                // inherit this failed request as unfinished context.
+                append_sender_turn(
+                    ctx.as_ref(),
+                    &history_key,
+                    ChatMessage::assistant("[Task failed — not continuing this request]"),
+                );
                 if let Some(channel) = target_channel.as_ref() {
                     if let Some(ref draft_id) = draft_message_id {
                         let _ = channel
@@ -1867,6 +1874,13 @@ async fn process_channel_message(
                 "  ❌ {} (elapsed: {}ms)",
                 timeout_msg,
                 started_at.elapsed().as_millis()
+            );
+            // Close the orphan user turn so subsequent messages don't
+            // inherit this timed-out request as unfinished context.
+            append_sender_turn(
+                ctx.as_ref(),
+                &history_key,
+                ChatMessage::assistant("[Task timed out — not continuing this request]"),
             );
             if let Some(channel) = target_channel.as_ref() {
                 let error_text =
@@ -3210,6 +3224,42 @@ mod tests {
         assert_eq!(normalized[2].role, "user");
         assert!(normalized[1].content.contains("assistant part 1"));
         assert!(normalized[1].content.contains("assistant part 2"));
+    }
+
+    /// Verify that an orphan user turn followed by a failure-marker assistant
+    /// turn normalizes correctly, so the LLM sees the failed request as closed
+    /// and does not re-execute it on the next user message.
+    #[test]
+    fn normalize_preserves_failure_marker_after_orphan_user_turn() {
+        let turns = vec![
+            ChatMessage::user("download something from GitHub"),
+            ChatMessage::assistant("[Task failed — not continuing this request]"),
+            ChatMessage::user("what is WAL?"),
+        ];
+
+        let normalized = normalize_cached_channel_turns(turns);
+        assert_eq!(normalized.len(), 3);
+        assert_eq!(normalized[0].role, "user");
+        assert_eq!(normalized[1].role, "assistant");
+        assert!(normalized[1].content.contains("Task failed"));
+        assert_eq!(normalized[2].role, "user");
+        assert_eq!(normalized[2].content, "what is WAL?");
+    }
+
+    /// Same as above but for the timeout variant.
+    #[test]
+    fn normalize_preserves_timeout_marker_after_orphan_user_turn() {
+        let turns = vec![
+            ChatMessage::user("run a long task"),
+            ChatMessage::assistant("[Task timed out — not continuing this request]"),
+            ChatMessage::user("next question"),
+        ];
+
+        let normalized = normalize_cached_channel_turns(turns);
+        assert_eq!(normalized.len(), 3);
+        assert_eq!(normalized[1].role, "assistant");
+        assert!(normalized[1].content.contains("Task timed out"));
+        assert_eq!(normalized[2].content, "next question");
     }
 
     #[test]
