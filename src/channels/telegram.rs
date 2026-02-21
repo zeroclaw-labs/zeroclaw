@@ -1007,6 +1007,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     '<' => line_out.push_str("&lt;"),
                     '>' => line_out.push_str("&gt;"),
                     '&' => line_out.push_str("&amp;"),
+                    '"' => line_out.push_str("&quot;"),
+                    '\'' => line_out.push_str("&#39;"),
                     _ => line_out.push(ch),
                 }
                 i += ch.len_utf8();
@@ -1018,7 +1020,6 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let joined = result_lines.join("\n");
         let mut final_out = String::with_capacity(joined.len());
         let mut in_code_block = false;
-        let mut code_lang = String::new();
         let mut code_buf = String::new();
 
         for line in joined.split('\n') {
@@ -1026,17 +1027,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             if trimmed.starts_with("```") {
                 if !in_code_block {
                     in_code_block = true;
-                    code_lang = trimmed.trim_start_matches('`').to_string();
                     code_buf.clear();
                 } else {
                     in_code_block = false;
                     let escaped = code_buf.trim_end_matches('\n');
-                    if !code_lang.is_empty() {
-                        final_out.push_str(&format!("<pre><code class=\"language-{code_lang}\">{escaped}</code></pre>\n"));
-                    } else {
-                        final_out.push_str(&format!("<pre>{escaped}</pre>\n"));
-                    }
-                    code_lang.clear();
+                    // Telegram HTML parse mode supports <pre> and <code>, but not class attributes.
+                    final_out.push_str(&format!("<pre><code>{escaped}</code></pre>\n"));
                     code_buf.clear();
                 }
             } else if in_code_block {
@@ -1048,14 +1044,18 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
         }
         if in_code_block && !code_buf.is_empty() {
-            final_out.push_str(&format!("<pre>{}</pre>\n", code_buf.trim_end()));
+            final_out.push_str(&format!("<pre><code>{}</code></pre>\n", code_buf.trim_end()));
         }
 
         final_out.trim_end_matches('\n').to_string()
     }
 
     fn escape_html(s: &str) -> String {
-        s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&#39;")
     }
 
     async fn send_text_chunks(
@@ -2218,6 +2218,32 @@ mod tests {
             ch.api_url("getMe"),
             "https://api.telegram.org/bot123:ABC/getMe"
         );
+    }
+
+    #[test]
+    fn telegram_markdown_to_html_escapes_quotes_in_link_href() {
+        let rendered =
+            TelegramChannel::markdown_to_telegram_html("[click](https://example.com?q=\"x\"&a='b')");
+        assert_eq!(
+            rendered,
+            "<a href=\"https://example.com?q=&quot;x&quot;&amp;a=&#39;b&#39;\">click</a>"
+        );
+    }
+
+    #[test]
+    fn telegram_markdown_to_html_escapes_quotes_in_plain_text() {
+        let rendered = TelegramChannel::markdown_to_telegram_html("say \"hi\" & <tag> 'ok'");
+        assert_eq!(rendered, "say &quot;hi&quot; &amp; &lt;tag&gt; &#39;ok&#39;");
+    }
+
+    #[test]
+    fn telegram_markdown_to_html_code_block_drops_language_attribute() {
+        let rendered = TelegramChannel::markdown_to_telegram_html(
+            "```rust\" onclick=\"alert(1)\nlet x = 1;\n```",
+        );
+        assert_eq!(rendered, "<pre><code>let x = 1;</code></pre>");
+        assert!(!rendered.contains("language-"));
+        assert!(!rendered.contains("onclick"));
     }
 
     #[test]
