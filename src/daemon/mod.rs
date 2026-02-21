@@ -217,7 +217,11 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
 }
 
 fn has_supervised_channels(config: &Config) -> bool {
-    config.channels_config.channels_except_webhook().iter().any(|(_, ok)| *ok)
+    config
+        .channels_config
+        .channels_except_webhook()
+        .iter()
+        .any(|(_, ok)| *ok)
 }
 
 #[cfg(test)]

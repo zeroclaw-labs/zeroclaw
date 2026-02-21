@@ -2586,7 +2586,11 @@ pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Con
             println!("Channels:");
             println!("  ✅ CLI (always available)");
             for (channel, configured) in config.channels_config.channels() {
-                println!("  {} {}", if configured { "✅" } else { "❌" }, channel.name());
+                println!(
+                    "  {} {}",
+                    if configured { "✅" } else { "❌" },
+                    channel.name()
+                );
             }
             if !cfg!(feature = "channel-matrix") {
                 println!(
