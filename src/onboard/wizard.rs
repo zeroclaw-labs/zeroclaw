@@ -4803,9 +4803,9 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
     // Summary line
     let channels = config.channels();
-    let channels = channels.iter().filter_map(|(channel, ok)|{
-        ok.then_some(channel.name())
-    });
+    let channels = channels
+        .iter()
+        .filter_map(|(channel, ok)| ok.then_some(channel.name()));
     let channels: Vec<_> = std::iter::once("Cli").chain(channels).collect();
     let active = channels.join(", ");
 
@@ -5302,9 +5302,9 @@ fn print_summary(config: &Config) {
 
     // Channels summary
     let channels = config.channels_config.channels();
-    let channels = channels.iter().filter_map(|(channel, ok)|{
-        ok.then_some(channel.name())
-    });
+    let channels = channels
+        .iter()
+        .filter_map(|(channel, ok)| ok.then_some(channel.name()));
     let channels: Vec<_> = std::iter::once("Cli").chain(channels).collect();
 
     println!(
