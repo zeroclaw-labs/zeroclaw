@@ -2,9 +2,9 @@ name: CI Run
 
 on:
     push:
-        branches: [main]
+        branches: [dev, main]
     pull_request:
-        branches: [main]
+        branches: [dev, main]
 
 concurrency:
     group: ci-${{ github.event.pull_request.number || github.sha }}

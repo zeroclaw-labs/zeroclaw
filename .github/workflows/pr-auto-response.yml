@@ -4,6 +4,7 @@ on:
   issues:
     types: [opened, reopened, labeled, unlabeled]
   pull_request_target:
+    branches: [dev, main]
     types: [opened, labeled, unlabeled]
 
 permissions: {}

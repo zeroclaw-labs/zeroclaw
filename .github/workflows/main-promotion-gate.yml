@@ -1,0 +1,38 @@
+name: Main Promotion Gate
+
+on:
+    pull_request:
+        branches: [main]
+
+concurrency:
+    group: main-promotion-${{ github.event.pull_request.number || github.sha }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+
+jobs:
+    enforce-dev-promotion:
+        name: Enforce Dev -> Main Promotion
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        steps:
+            - name: Validate PR source branch
+              shell: bash
+              env:
+                  HEAD_REF: ${{ github.head_ref }}
+                  HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+                  BASE_REPO: ${{ github.repository }}
+              run: |
+                  set -euo pipefail
+
+                  if [[ "$HEAD_REPO" != "$BASE_REPO" ]]; then
+                    echo "::error::PRs into main must originate from ${BASE_REPO}:dev. Current head repo: ${HEAD_REPO}."
+                    exit 1
+                  fi
+
+                  if [[ "$HEAD_REF" != "dev" ]]; then
+                    echo "::error::PRs into main must use head branch 'dev'. Current head branch: ${HEAD_REF}."
+                    exit 1
+                  fi
+
+                  echo "Promotion policy satisfied: ${HEAD_REPO}:${HEAD_REF} -> main"

@@ -2,7 +2,7 @@ name: Sec Audit
 
 on:
     push:
-        branches: [main]
+        branches: [dev, main]
         paths:
             - "Cargo.toml"
             - "Cargo.lock"
@@ -10,7 +10,7 @@ on:
             - "crates/**"
             - "deny.toml"
     pull_request:
-        branches: [main]
+        branches: [dev, main]
         paths:
             - "Cargo.toml"
             - "Cargo.lock"

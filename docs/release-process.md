@@ -2,7 +2,7 @@
 
 This runbook defines the maintainers' standard release flow.
 
-Last verified: **February 20, 2026**.
+Last verified: **February 21, 2026**.
 
 ## Release Goals
 
@@ -91,7 +91,7 @@ Expected publish outputs:
 ### 5) Post-release validation
 
 1. Verify GitHub Release assets are downloadable.
-2. Verify GHCR tags for the released version and `latest`.
+2. Verify GHCR tags for the released version (`vX.Y.Z`) and release commit SHA tag (`sha-<12>`).
 3. Verify install paths that rely on release assets (for example bootstrap binary download).
 
 ## Emergency / Recovery Path

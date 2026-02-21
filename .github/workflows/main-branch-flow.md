@@ -1,6 +1,6 @@
 # Main Branch Delivery Flows
 
-This document explains what runs when code is proposed to `main`, merged into `main`, and released.
+This document explains what runs when code is proposed to `dev`, promoted to `main`, and released.
 
 Use this with:
 
@@ -13,8 +13,8 @@ Use this with:
 | Event | Main workflows |
 | --- | --- |
 | PR activity (`pull_request_target`) | `pr-intake-checks.yml`, `pr-labeler.yml`, `pr-auto-response.yml` |
-| PR activity (`pull_request`) | `ci-run.yml`, `sec-audit.yml`, plus path-scoped `pub-docker-img.yml`, `workflow-sanity.yml`, `pr-label-policy-check.yml` |
-| Push to `main` | `ci-run.yml`, `sec-audit.yml`, plus path-scoped workflows |
+| PR activity (`pull_request`) | `ci-run.yml`, `sec-audit.yml`, `main-promotion-gate.yml` (for `main` PRs), plus path-scoped workflows |
+| Push to `dev`/`main` | `ci-run.yml`, `sec-audit.yml`, plus path-scoped workflows |
 | Tag push (`v*`) | `pub-release.yml` publish mode, `pub-docker-img.yml` publish job |
 | Scheduled/manual | `pub-release.yml` verification mode, `sec-codeql.yml`, `feature-matrix.yml`, `test-fuzz.yml`, `pr-check-stale.yml`, `pr-check-status.yml`, `sync-contributors.yml`, `test-benchmarks.yml`, `test-e2e.yml` |
 
@@ -27,26 +27,26 @@ Observed averages below are from recent completed runs (sampled from GitHub Acti
 | `pr-intake-checks.yml` | PR open/update (`pull_request_target`) | 14.5s | No | No | No |
 | `pr-labeler.yml` | PR open/update (`pull_request_target`) | 53.7s | No | No | No |
 | `pr-auto-response.yml` | PR/issue automation | 24.3s | No | No | No |
-| `ci-run.yml` | PR + push to `main` | 74.7s | No | No | No |
-| `sec-audit.yml` | PR + push to `main` | 127.2s | No | No | No |
+| `ci-run.yml` | PR + push to `dev`/`main` | 74.7s | No | No | No |
+| `sec-audit.yml` | PR + push to `dev`/`main` | 127.2s | No | No | No |
 | `workflow-sanity.yml` | Workflow-file changes | 34.2s | No | No | No |
 | `pr-label-policy-check.yml` | Label policy/automation changes | 14.7s | No | No | No |
 | `pub-docker-img.yml` (`pull_request`) | Docker build-input PR changes | 240.4s | Yes | Yes | No |
-| `pub-docker-img.yml` (`push`/`workflow_dispatch`) | `main` push (build-input paths), tag push `v*`, or manual dispatch | 139.9s | Yes | No | Yes |
+| `pub-docker-img.yml` (`push`) | tag push `v*` | 139.9s | Yes | No | Yes |
 | `pub-release.yml` | Tag push `v*` (publish) + manual/scheduled verification (no publish) | N/A in recent sample | No | No | No |
 
 Notes:
 
 1. `pub-docker-img.yml` is the only workflow in the main PR/push path that builds Docker images.
 2. Container runtime verification (`docker run`) occurs in PR smoke only.
-3. Container registry push occurs on `main` build-input pushes, tag pushes, and manual dispatch.
+3. Container registry push occurs on tag pushes (`v*`) only.
 4. `ci-run.yml` "Build (Smoke)" builds Rust binaries, not Docker images.
 
 ## Step-By-Step
 
-### 1) PR from branch in this repository -> `main`
+### 1) PR from branch in this repository -> `dev`
 
-1. Contributor opens or updates PR against `main`.
+1. Contributor opens or updates PR against `dev`.
 2. `pull_request_target` automation runs (typical runtime):
    - `pr-intake-checks.yml` posts intake warnings/errors.
    - `pr-labeler.yml` sets size/risk/scope labels.
@@ -70,15 +70,15 @@ Notes:
    - `test`
    - `docs-quality`
 7. If `.github/workflows/**` changed, `workflow-owner-approval` must pass.
-8. If root license files (`LICENSE`, `LICENSE-APACHE`) changed, `license-file-owner-guard` requires PR author login in `LICENSE_FILE_OWNER_LOGINS` (fallback `willsarg`).
+8. If root license files (`LICENSE`, `LICENSE-APACHE`) changed, `license-file-owner-guard` allows only PR author `willsarg`.
 9. `lint-feedback` posts actionable comment if lint/docs gates fail.
 10. `CI Required Gate` aggregates results to final pass/fail.
 11. Maintainer merges PR once checks and review policy are satisfied.
-12. Merge emits a `push` event on `main` (see scenario 3).
+12. Merge emits a `push` event on `dev` (see scenario 4).
 
-### 2) PR from fork -> `main`
+### 2) PR from fork -> `dev`
 
-1. External contributor opens PR from `fork/<branch>` into `zeroclaw:main`.
+1. External contributor opens PR from `fork/<branch>` into `zeroclaw:dev`.
 2. Immediately on `opened`:
    - `pull_request_target` workflows start with base-repo context and base-repo token:
      - `pr-intake-checks.yml`
@@ -111,11 +111,19 @@ Notes:
    - `license-file-owner-guard` failing when root license files are modified by non-owner PR author.
    - `CI Required Gate` failure caused by upstream jobs.
    - repeated `pull_request_target` reruns from label churn causing noisy signals.
-9. After merge, normal `push` workflows on `main` execute (scenario 3).
+9. After merge, normal `push` workflows on `dev` execute (scenario 4).
 
-### 3) Push to `main` (including after merge)
+### 3) Promotion PR `dev` -> `main`
 
-1. Commit reaches `main` (usually from a merged PR).
+1. Maintainer opens PR with head `dev` and base `main`.
+2. `main-promotion-gate.yml` runs and fails if head repo/branch is not `<this-repo>:dev`.
+3. `ci-run.yml` and `sec-audit.yml` run on the promotion PR.
+4. Maintainer merges PR once checks and review policy pass.
+5. Merge emits a `push` event on `main`.
+
+### 4) Push to `dev` or `main` (including after merge)
+
+1. Commit reaches `dev` or `main` (usually from a merged PR).
 2. `ci-run.yml` runs on `push`.
 3. `sec-audit.yml` runs on `push`.
 4. Path-filtered workflows run only if touched files match their filters.
@@ -130,7 +138,7 @@ Workflow: `.github/workflows/pub-docker-img.yml`
 
 ### PR behavior
 
-1. Triggered on `pull_request` to `main` when Docker build-input paths change.
+1. Triggered on `pull_request` to `dev` or `main` when Docker build-input paths change.
 2. Runs `PR Docker Smoke` job:
    - Builds local smoke image with Blacksmith builder.
    - Verifies container with `docker run ... --version`.
@@ -139,18 +147,15 @@ Workflow: `.github/workflows/pub-docker-img.yml`
 
 ### Push behavior
 
-1. `publish` job runs on `push` and `workflow_dispatch`.
-2. Workflow trigger includes `main` pushes with Docker build-input changes and tag pushes `v*`.
+1. `publish` job runs on tag pushes `v*` only.
+2. Workflow trigger includes semantic version tag pushes (`v*`) only.
 3. Login to `ghcr.io` uses `${{ github.actor }}` and `${{ secrets.GITHUB_TOKEN }}`.
-4. Tag computation includes:
-   - `latest` + SHA tag (`sha-<12 chars>`) for `main`
-   - semantic tag from pushed git tag (`vX.Y.Z`) + SHA tag for tag pushes
-   - branch name + SHA tag for non-`main` manual dispatch refs
-5. Multi-platform publish is used for both `main` and tag pushes (`linux/amd64,linux/arm64`).
+4. Tag computation includes semantic tag from pushed git tag (`vX.Y.Z`) + SHA tag.
+5. Multi-platform publish is used for tag pushes (`linux/amd64,linux/arm64`).
 6. Typical runtime in recent sample: ~139.9s.
 7. Result: pushed image tags under `ghcr.io/<owner>/<repo>`.
 
-Important: Docker publish now runs on qualifying `main` pushes; no release tag is required to refresh `latest`.
+Important: Docker publish now requires a `v*` tag push; regular branch pushes do not publish images.
 
 ## Release Logic
 
@@ -176,11 +181,11 @@ Workflow: `.github/workflows/pub-release.yml`
 
 ## Mermaid Diagrams
 
-### PR to Main (Internal/Fork)
+### PR to Dev
 
 ```mermaid
 flowchart TD
-  A["PR opened or updated -> main"] --> B["pull_request_target lane"]
+  A["PR opened or updated -> dev"] --> B["pull_request_target lane"]
   B --> B1["pr-intake-checks.yml"]
   B --> B2["pr-labeler.yml"]
   B --> B3["pr-auto-response.yml"]
@@ -194,14 +199,19 @@ flowchart TD
   D --> E{"Checks + review policy pass?"}
   E -->|No| F["PR stays open"]
   E -->|Yes| G["Merge PR"]
-  G --> H["push event on main"]
+  G --> H["push event on dev"]
 ```
 
-### Push/Tag Delivery
+### Promotion and Release
 
 ```mermaid
 flowchart TD
-  A["Commit reaches main"] --> B["ci-run.yml"]
+  D0["Commit reaches dev"] --> B0["ci-run.yml"]
+  D0 --> C0["sec-audit.yml"]
+  P["Promotion PR dev -> main"] --> PG["main-promotion-gate.yml"]
+  PG --> M["Merge to main"]
+  M --> A["Commit reaches main"]
+  A --> B["ci-run.yml"]
   A --> C["sec-audit.yml"]
   A --> D["path-scoped workflows (if matched)"]
   T["Tag push v*"] --> R["pub-release.yml"]
@@ -217,4 +227,4 @@ flowchart TD
 1. Unexpected skipped jobs: inspect `scripts/ci/detect_change_scope.sh` outputs.
 2. Workflow-change PR blocked: verify `WORKFLOW_OWNER_LOGINS` and approvals.
 3. Fork PR appears stalled: check whether Actions run approval is pending.
-4. Docker not published: confirm changed files match Docker build-input paths, or run workflow dispatch manually.
+4. Docker not published: confirm a `v*` tag was pushed to the intended commit.

@@ -93,7 +93,7 @@ Automation assists with triage and guardrails, but final merge accountability re
 
 ## 3. Required Repository Settings
 
-Maintain these branch protection rules on `main`:
+Maintain these branch protection rules on `dev` and `main`:
 
 - Require status checks before merge.
 - Require check `CI Required Gate`.
@@ -102,6 +102,8 @@ Maintain these branch protection rules on `main`:
 - For `.github/workflows/**`, require owner approval via `CI Required Gate` (`WORKFLOW_OWNER_LOGINS`) and keep branch/ruleset bypass limited to org owners.
 - Dismiss stale approvals when new commits are pushed.
 - Restrict force-push on protected branches.
+- Route normal contributor PRs to `dev`.
+- Allow `main` merges only through a promotion PR from `dev` (enforced by `Main Promotion Gate`).
 
 ---
 
