@@ -50,6 +50,10 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
   Deploy anywhere. Swap anything.
 </p>
 
+<p align="center">
+  ZeroClaw is the <strong>runtime operating system</strong> for agentic workflows — infrastructure that abstracts models, tools, memory, and execution so agents can be built once and run anywhere.
+</p>
+
 <p align="center"><code>Trait-driven architecture · secure-by-default runtime · provider/channel/tool swappable · pluggable everything</code></p>
 
 ### 📢 Announcements
@@ -1104,6 +1108,8 @@ The **ZeroClaw** name and logo are trademarks of ZeroClaw Labs. This license doe
 - No trademark rights are transferred by contributing
 
 ## Contributing
+
+New to ZeroClaw? Look for issues labeled [`good first issue`](https://github.com/zeroclaw-labs/zeroclaw/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) — see our [Contributing Guide](CONTRIBUTING.md#first-time-contributors) for how to get started.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) and [CLA.md](CLA.md). Implement a trait, submit a PR:
 - CI workflow guide: [docs/ci-map.md](docs/ci-map.md)

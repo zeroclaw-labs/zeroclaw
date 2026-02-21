@@ -50,6 +50,10 @@
   Triển khai ở đâu cũng được. Thay thế gì cũng được.
 </p>
 
+<p align="center">
+  ZeroClaw là <strong>hệ điều hành runtime</strong> cho các quy trình làm việc của tác tử — cơ sở hạ tầng trừu tượng hóa mô hình, công cụ, bộ nhớ và thực thi để xây dựng tác tử một lần và chạy ở mọi nơi.
+</p>
+
 <p align="center"><code>Kiến trúc trait-driven · mặc định bảo mật · provider/channel/tool hoán đổi tự do · mọi thứ đều dễ mở rộng</code></p>
 
 ### 📢 Thông báo

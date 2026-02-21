@@ -2,6 +2,27 @@
 
 Thanks for your interest in contributing to ZeroClaw! This guide will help you get started.
 
+## First-Time Contributors
+
+Welcome — contributions of all sizes are valued. If this is your first contribution, here is how to get started:
+
+1. **Find an issue.** Look for issues labeled [`good first issue`](https://github.com/zeroclaw-labs/zeroclaw/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) — these are scoped for newcomers and include context to get moving quickly.
+
+2. **Pick a scope.** Good first contributions include:
+   - Typo and documentation fixes
+   - Test additions or improvements
+   - Small bug fixes with clear reproduction steps
+
+3. **Follow the fork → branch → change → test → PR workflow:**
+   - Fork the repository and clone your fork
+   - Create a feature branch (`git checkout -b fix/my-change`)
+   - Make your changes and run `cargo fmt && cargo clippy && cargo test`
+   - Open a PR against `main` using the PR template
+
+4. **Start with Track A.** ZeroClaw uses three [collaboration tracks](#collaboration-tracks-risk-based) (A/B/C) based on risk. First-time contributors should target **Track A** (docs, tests, chore) — these require lighter review and are the fastest path to a merged PR.
+
+If you get stuck, open a draft PR early and ask questions in the description.
+
 ## Development Setup
 
 ```bash

@@ -50,6 +50,10 @@ Construit par des étudiants et membres des communautés Harvard, MIT et Sundai.
   Déployez n'importe où. Échangez n'importe quoi.
 </p>
 
+<p align="center">
+  ZeroClaw est le <strong>système d'exploitation runtime</strong> pour les workflows agentiques — une infrastructure qui abstrait les modèles, outils, mémoire et exécution pour construire des agents une fois et les exécuter partout.
+</p>
+
 <p align="center"><code>Architecture pilotée par traits · runtime sécurisé par défaut · fournisseur/canal/outil interchangeables · tout est pluggable</code></p>
 
 ### 📢 Annonces
