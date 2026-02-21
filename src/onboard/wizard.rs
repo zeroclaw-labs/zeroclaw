@@ -62,10 +62,7 @@ const MODEL_CACHE_TTL_SECS: u64 = 12 * 60 * 60;
 const CUSTOM_MODEL_SENTINEL: &str = "__custom_model__";
 
 fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
-    channels
-        .channels_except_webhook()
-        .iter()
-        .any(|(_, ok)| *ok)
+    channels.channels_except_webhook().iter().any(|(_, ok)| *ok)
 }
 
 // ── Main wizard entry point ──────────────────────────────────────
