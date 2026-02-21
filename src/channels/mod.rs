@@ -2171,8 +2171,12 @@ pub fn build_system_prompt_with_mode(
 
     // ── 6. Date & Time ──────────────────────────────────────────
     let now = chrono::Local::now();
-    let tz = now.format("%Z").to_string();
-    let _ = writeln!(prompt, "## Current Date & Time\n\nTimezone: {tz}\n");
+    let _ = writeln!(
+        prompt,
+        "## Current Date & Time\n\n{} ({})\n",
+        now.format("%Y-%m-%d %H:%M:%S"),
+        now.format("%Z")
+    );
 
     // ── 7. Runtime ──────────────────────────────────────────────
     let host =
