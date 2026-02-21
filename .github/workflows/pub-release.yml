@@ -107,6 +107,19 @@ jobs:
                       echo "::error::Tag ${release_tag} is not reachable from origin/main. Release tags must be cut from main."
                       exit 1
                     fi
+
+                    # Guardrail: release tag and Cargo package version must stay aligned.
+                    tag_version="${release_tag#v}"
+                    cargo_version="$(git -C "$tmp_repo" show "refs/tags/${release_tag}:Cargo.toml" | sed -n 's/^version = "\([^"]*\)"/\1/p' | head -n1)"
+                    if [[ -z "$cargo_version" ]]; then
+                      echo "::error::Unable to read Cargo package version from ${release_tag}:Cargo.toml"
+                      exit 1
+                    fi
+                    if [[ "$cargo_version" != "$tag_version" ]]; then
+                      echo "::error::Tag ${release_tag} does not match Cargo.toml version (${cargo_version})."
+                      echo "::error::Bump Cargo.toml version first, then create/publish the matching tag."
+                      exit 1
+                    fi
                   fi
 
                   {

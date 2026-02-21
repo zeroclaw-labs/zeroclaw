@@ -16,7 +16,7 @@ Use this with:
 | PR activity (`pull_request`) | `ci-run.yml`, `sec-audit.yml`, `main-promotion-gate.yml` (for `main` PRs), plus path-scoped workflows |
 | Push to `dev`/`main` | `ci-run.yml`, `sec-audit.yml`, plus path-scoped workflows |
 | Tag push (`v*`) | `pub-release.yml` publish mode, `pub-docker-img.yml` publish job |
-| Scheduled/manual | `pub-release.yml` verification mode, `sec-codeql.yml`, `feature-matrix.yml`, `test-fuzz.yml`, `pr-check-stale.yml`, `pr-check-status.yml`, `sync-contributors.yml`, `test-benchmarks.yml`, `test-e2e.yml` |
+| Scheduled/manual | `pub-release.yml` verification mode, `pub-homebrew-core.yml` (manual), `sec-codeql.yml`, `feature-matrix.yml`, `test-fuzz.yml`, `pr-check-stale.yml`, `pr-check-status.yml`, `sync-contributors.yml`, `test-benchmarks.yml`, `test-e2e.yml` |
 
 ## Runtime and Docker Matrix
 
@@ -34,6 +34,7 @@ Observed averages below are from recent completed runs (sampled from GitHub Acti
 | `pub-docker-img.yml` (`pull_request`) | Docker build-input PR changes | 240.4s | Yes | Yes | No |
 | `pub-docker-img.yml` (`push`) | tag push `v*` | 139.9s | Yes | No | Yes |
 | `pub-release.yml` | Tag push `v*` (publish) + manual/scheduled verification (no publish) | N/A in recent sample | No | No | No |
+| `pub-homebrew-core.yml` | Manual workflow dispatch only | N/A in recent sample | No | No | No |
 
 Notes:
 
@@ -167,10 +168,17 @@ Workflow: `.github/workflows/pub-release.yml`
    - Manual dispatch -> verification-only or publish mode (input-driven).
    - Weekly schedule -> verification-only mode.
 2. `prepare` resolves release context (`release_ref`, `release_tag`, publish/draft mode) and validates manual publish inputs.
+   - publish mode enforces `release_tag` == `Cargo.toml` version at the tag commit.
 3. `build-release` builds matrix artifacts across Linux/macOS/Windows targets.
 4. `verify-artifacts` enforces presence of all expected archives before any publish attempt.
 5. In publish mode, workflow generates SBOM (`CycloneDX` + `SPDX`), `SHA256SUMS`, keyless cosign signatures, and verifies GHCR release-tag availability.
 6. In publish mode, workflow creates/updates the GitHub Release for the resolved tag and commit-ish.
+
+Manual Homebrew formula flow:
+
+1. Run `.github/workflows/pub-homebrew-core.yml` with `release_tag=vX.Y.Z`.
+2. Use `dry_run=true` first to validate formula patch and metadata.
+3. Use `dry_run=false` to push from bot fork and open `homebrew-core` PR.
 
 ## Merge/Policy Notes
 

@@ -37,6 +37,9 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
     - Noise control: excludes common test/fixture paths and test file patterns by default (`include_tests=false`)
 - `.github/workflows/pub-release.yml` (`Release`)
     - Purpose: build release artifacts in verification mode (manual/scheduled) and publish GitHub releases on tag push or manual publish mode
+- `.github/workflows/pub-homebrew-core.yml` (`Pub Homebrew Core`)
+    - Purpose: manual, bot-owned Homebrew core formula bump PR flow for tagged releases
+    - Guardrail: release tag must match `Cargo.toml` version
 - `.github/workflows/pr-label-policy-check.yml` (`Label Policy Sanity`)
     - Purpose: validate shared contributor-tier policy in `.github/label-policy.json` and ensure label workflows consume that policy
 - `.github/workflows/test-rust-build.yml` (`Rust Reusable Job`)
@@ -74,6 +77,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 - `CI`: push to `dev` and `main`, PRs to `dev` and `main`
 - `Docker`: tag push (`v*`) for publish, matching PRs to `dev`/`main` for smoke build, manual dispatch for smoke only
 - `Release`: tag push (`v*`), weekly schedule (verification-only), manual dispatch (verification or publish)
+- `Pub Homebrew Core`: manual dispatch only
 - `Security Audit`: push to `dev` and `main`, PRs to `dev` and `main`, weekly schedule
 - `Sec Vorpal Reviewdog`: manual dispatch only
 - `Workflow Sanity`: PR/push when `.github/workflows/**`, `.github/*.yml`, or `.github/*.yaml` change
@@ -91,12 +95,13 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 1. `CI Required Gate` failing: start with `.github/workflows/ci-run.yml`.
 2. Docker failures on PRs: inspect `.github/workflows/pub-docker-img.yml` `pr-smoke` job.
 3. Release failures (tag/manual/scheduled): inspect `.github/workflows/pub-release.yml` and the `prepare` job outputs.
-4. Security failures: inspect `.github/workflows/sec-audit.yml` and `deny.toml`.
-5. Workflow syntax/lint failures: inspect `.github/workflows/workflow-sanity.yml`.
-6. PR intake failures: inspect `.github/workflows/pr-intake-checks.yml` sticky comment and run logs.
-7. Label policy parity failures: inspect `.github/workflows/pr-label-policy-check.yml`.
-8. Docs failures in CI: inspect `docs-quality` job logs in `.github/workflows/ci-run.yml`.
-9. Strict delta lint failures in CI: inspect `lint-strict-delta` job logs and compare with `BASE_SHA` diff scope.
+4. Homebrew formula publish failures: inspect `.github/workflows/pub-homebrew-core.yml` summary output and bot token/fork variables.
+5. Security failures: inspect `.github/workflows/sec-audit.yml` and `deny.toml`.
+6. Workflow syntax/lint failures: inspect `.github/workflows/workflow-sanity.yml`.
+7. PR intake failures: inspect `.github/workflows/pr-intake-checks.yml` sticky comment and run logs.
+8. Label policy parity failures: inspect `.github/workflows/pr-label-policy-check.yml`.
+9. Docs failures in CI: inspect `docs-quality` job logs in `.github/workflows/ci-run.yml`.
+10. Strict delta lint failures in CI: inspect `lint-strict-delta` job logs and compare with `BASE_SHA` diff scope.
 
 ## Maintenance Rules
 
