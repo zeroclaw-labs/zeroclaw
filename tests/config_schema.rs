@@ -3,9 +3,7 @@
 //! Validates: config defaults, backward compatibility, invalid input rejection,
 //! and gateway/security/agent config boundary conditions.
 
-use zeroclaw::config::{
-    AutonomyConfig, ChannelsConfig, Config, GatewayConfig, SecurityConfig,
-};
+use zeroclaw::config::{AutonomyConfig, ChannelsConfig, Config, GatewayConfig, SecurityConfig};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Invalid value fail-fast

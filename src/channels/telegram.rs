@@ -1279,27 +1279,27 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             let len = bytes.len();
             while i < len {
                 // Bold: **text** or __text__
-                if i + 1 < len && bytes[i] == b'*' && bytes[i+1] == b'*' {
-                    if let Some(end) = line[i+2..].find("**") {
-                        let inner = Self::escape_html(&line[i+2..i+2+end]);
+                if i + 1 < len && bytes[i] == b'*' && bytes[i + 1] == b'*' {
+                    if let Some(end) = line[i + 2..].find("**") {
+                        let inner = Self::escape_html(&line[i + 2..i + 2 + end]);
                         line_out.push_str(&format!("<b>{inner}</b>"));
                         i += 4 + end;
                         continue;
                     }
                 }
-                if i + 1 < len && bytes[i] == b'_' && bytes[i+1] == b'_' {
-                    if let Some(end) = line[i+2..].find("__") {
-                        let inner = Self::escape_html(&line[i+2..i+2+end]);
+                if i + 1 < len && bytes[i] == b'_' && bytes[i + 1] == b'_' {
+                    if let Some(end) = line[i + 2..].find("__") {
+                        let inner = Self::escape_html(&line[i + 2..i + 2 + end]);
                         line_out.push_str(&format!("<b>{inner}</b>"));
                         i += 4 + end;
                         continue;
                     }
                 }
                 // Italic: *text* or _text_ (single)
-                if bytes[i] == b'*' && (i == 0 || bytes[i-1] != b'*') {
-                    if let Some(end) = line[i+1..].find('*') {
+                if bytes[i] == b'*' && (i == 0 || bytes[i - 1] != b'*') {
+                    if let Some(end) = line[i + 1..].find('*') {
                         if end > 0 {
-                            let inner = Self::escape_html(&line[i+1..i+1+end]);
+                            let inner = Self::escape_html(&line[i + 1..i + 1 + end]);
                             line_out.push_str(&format!("<i>{inner}</i>"));
                             i += 2 + end;
                             continue;
@@ -1307,9 +1307,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     }
                 }
                 // Inline code: `code`
-                if bytes[i] == b'`' && (i == 0 || bytes[i-1] != b'`') {
-                    if let Some(end) = line[i+1..].find('`') {
-                        let inner = Self::escape_html(&line[i+1..i+1+end]);
+                if bytes[i] == b'`' && (i == 0 || bytes[i - 1] != b'`') {
+                    if let Some(end) = line[i + 1..].find('`') {
+                        let inner = Self::escape_html(&line[i + 1..i + 1 + end]);
                         line_out.push_str(&format!("<code>{inner}</code>"));
                         i += 2 + end;
                         continue;
@@ -1317,16 +1317,18 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 }
                 // Markdown link: [text](url)
                 if bytes[i] == b'[' {
-                    if let Some(bracket_end) = line[i+1..].find(']') {
-                        let text_part = &line[i+1..i+1+bracket_end];
+                    if let Some(bracket_end) = line[i + 1..].find(']') {
+                        let text_part = &line[i + 1..i + 1 + bracket_end];
                         let after_bracket = i + 1 + bracket_end + 1; // position after ']'
                         if after_bracket < len && bytes[after_bracket] == b'(' {
-                            if let Some(paren_end) = line[after_bracket+1..].find(')') {
-                                let url = &line[after_bracket+1..after_bracket+1+paren_end];
+                            if let Some(paren_end) = line[after_bracket + 1..].find(')') {
+                                let url = &line[after_bracket + 1..after_bracket + 1 + paren_end];
                                 if url.starts_with("http://") || url.starts_with("https://") {
                                     let text_html = Self::escape_html(text_part);
                                     let url_html = Self::escape_html(url);
-                                    line_out.push_str(&format!("<a href=\"{url_html}\">{text_html}</a>"));
+                                    line_out.push_str(&format!(
+                                        "<a href=\"{url_html}\">{text_html}</a>"
+                                    ));
                                     i = after_bracket + 1 + paren_end + 1;
                                     continue;
                                 }
@@ -1335,9 +1337,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     }
                 }
                 // Strikethrough: ~~text~~
-                if i + 1 < len && bytes[i] == b'~' && bytes[i+1] == b'~' {
-                    if let Some(end) = line[i+2..].find("~~") {
-                        let inner = Self::escape_html(&line[i+2..i+2+end]);
+                if i + 1 < len && bytes[i] == b'~' && bytes[i + 1] == b'~' {
+                    if let Some(end) = line[i + 2..].find("~~") {
+                        let inner = Self::escape_html(&line[i + 2..i + 2 + end]);
                         line_out.push_str(&format!("<s>{inner}</s>"));
                         i += 4 + end;
                         continue;
@@ -1386,7 +1388,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
         }
         if in_code_block && !code_buf.is_empty() {
-            final_out.push_str(&format!("<pre><code>{}</code></pre>\n", code_buf.trim_end()));
+            final_out.push_str(&format!(
+                "<pre><code>{}</code></pre>\n",
+                code_buf.trim_end()
+            ));
         }
 
         final_out.trim_end_matches('\n').to_string()
@@ -2581,8 +2586,9 @@ mod tests {
 
     #[test]
     fn telegram_markdown_to_html_escapes_quotes_in_link_href() {
-        let rendered =
-            TelegramChannel::markdown_to_telegram_html("[click](https://example.com?q=\"x\"&a='b')");
+        let rendered = TelegramChannel::markdown_to_telegram_html(
+            "[click](https://example.com?q=\"x\"&a='b')",
+        );
         assert_eq!(
             rendered,
             "<a href=\"https://example.com?q=&quot;x&quot;&amp;a=&#39;b&#39;\">click</a>"
@@ -2592,7 +2598,10 @@ mod tests {
     #[test]
     fn telegram_markdown_to_html_escapes_quotes_in_plain_text() {
         let rendered = TelegramChannel::markdown_to_telegram_html("say \"hi\" & <tag> 'ok'");
-        assert_eq!(rendered, "say &quot;hi&quot; &amp; &lt;tag&gt; &#39;ok&#39;");
+        assert_eq!(
+            rendered,
+            "say &quot;hi&quot; &amp; &lt;tag&gt; &#39;ok&#39;"
+        );
     }
 
     #[test]

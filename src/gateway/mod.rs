@@ -2449,7 +2449,10 @@ mod tests {
 
         let guard = limiter.requests.lock();
         assert_eq!(guard.0.len(), 3);
-        assert!(!guard.0.contains_key("ip-1"), "ip-1 should have been evicted");
+        assert!(
+            !guard.0.contains_key("ip-1"),
+            "ip-1 should have been evicted"
+        );
         assert!(guard.0.contains_key("ip-2"));
         assert!(guard.0.contains_key("ip-3"));
         assert!(guard.0.contains_key("ip-4"));
