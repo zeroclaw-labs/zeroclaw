@@ -69,7 +69,7 @@ port = 99999
 #[test]
 fn gateway_config_defaults_are_secure() {
     let gw = GatewayConfig::default();
-    assert_eq!(gw.port, 3000);
+    assert_eq!(gw.port, 42617);
     assert_eq!(gw.host, "127.0.0.1");
     assert!(gw.require_pairing, "pairing should be required by default");
     assert!(
@@ -120,7 +120,7 @@ fn gateway_config_missing_section_uses_defaults() {
 default_temperature = 0.5
 "#;
     let parsed: Config = toml::from_str(toml_str).expect("missing gateway section should parse");
-    assert_eq!(parsed.gateway.port, 3000);
+    assert_eq!(parsed.gateway.port, 42617);
     assert_eq!(parsed.gateway.host, "127.0.0.1");
     assert!(parsed.gateway.require_pairing);
     assert!(!parsed.gateway.allow_public_bind);
@@ -231,7 +231,7 @@ fn config_minimal_toml_with_temperature_uses_defaults() {
     let toml_str = "default_temperature = 0.7\n";
     let parsed: Config = toml::from_str(toml_str).expect("minimal TOML should parse");
     assert_eq!(parsed.agent.max_tool_iterations, 10);
-    assert_eq!(parsed.gateway.port, 3000);
+    assert_eq!(parsed.gateway.port, 42617);
 }
 
 #[test]

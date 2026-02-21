@@ -809,7 +809,7 @@ fn parse_xml_attribute_tool_calls(response: &str) -> Vec<ParsedToolCall> {
 
 /// Parse Perl/hash-ref style tool calls from response text.
 /// This handles formats like:
-/// ```
+/// ```text
 /// TOOL_CALL
 /// {tool => "shell", args => {
 ///   --command "ls -la"
@@ -884,7 +884,7 @@ fn parse_perl_style_tool_calls(response: &str) -> Vec<ParsedToolCall> {
 
 /// Parse FunctionCall-style tool calls from response text.
 /// This handles formats like:
-/// ```
+/// ```text
 /// <FunctionCall>
 /// file_read
 /// <code>path>/Users/kylelampa/Documents/zeroclaw/README.md</code>
