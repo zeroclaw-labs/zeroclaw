@@ -155,7 +155,7 @@ Workflow: `.github/workflows/pub-docker-img.yml`
 6. Typical runtime in recent sample: ~139.9s.
 7. Result: pushed image tags under `ghcr.io/<owner>/<repo>`.
 
-Important: Docker publish now requires a `v*` tag push; regular branch pushes do not publish images.
+Important: Docker publish now requires a `v*` tag push; regular `dev`/`main` branch pushes do not publish images.
 
 ## Release Logic
 
