@@ -684,7 +684,7 @@ encrypt = true                 # API keys encrypted with local key file
 
 [browser]
 enabled = false                # opt-in browser_open + browser tools
-allowed_domains = ["docs.rs"]  # required when browser is enabled
+allowed_domains = ["docs.rs"]  # required when browser is enabled ("*" allows all public domains)
 backend = "agent_browser"      # "agent_browser" (default), "rust_native", "computer_use", "auto"
 native_headless = true         # applies when backend uses rust-native
 native_webdriver_url = "http://127.0.0.1:9515" # WebDriver endpoint (chromedriver/selenium)

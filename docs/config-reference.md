@@ -214,7 +214,7 @@ Notes:
 | Key | Default | Purpose |
 |---|---|---|
 | `enabled` | `false` | Enable `browser_open` tool (opens URLs without scraping) |
-| `allowed_domains` | `[]` | Allowed domains for `browser_open` (exact or subdomain match) |
+| `allowed_domains` | `[]` | Allowed domains for `browser_open` (exact/subdomain match, or `"*"` for all public domains) |
 | `session_name` | unset | Browser session name (for agent-browser automation) |
 | `backend` | `agent_browser` | Browser automation backend: `"agent_browser"`, `"rust_native"`, `"computer_use"`, or `"auto"` |
 | `native_headless` | `true` | Headless mode for rust-native backend |
@@ -244,14 +244,15 @@ Notes:
 | Key | Default | Purpose |
 |---|---|---|
 | `enabled` | `false` | Enable `http_request` tool for API interactions |
-| `allowed_domains` | `[]` | Allowed domains for HTTP requests (exact or subdomain match) |
+| `allowed_domains` | `[]` | Allowed domains for HTTP requests (exact/subdomain match, or `"*"` for all public domains) |
 | `max_response_size` | `1000000` | Maximum response size in bytes (default: 1 MB) |
 | `timeout_secs` | `30` | Request timeout in seconds |
 
 Notes:
 
 - Deny-by-default: if `allowed_domains` is empty, all HTTP requests are rejected.
-- Use exact domain or subdomain matching (e.g. `"api.example.com"`, `"example.com"`).
+- Use exact domain or subdomain matching (e.g. `"api.example.com"`, `"example.com"`), or `"*"` to allow any public domain.
+- Local/private targets are still blocked even when `"*"` is configured.
 
 ## `[gateway]`
 
