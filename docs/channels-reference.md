@@ -52,6 +52,28 @@ Notes:
 - Model cache previews come from `zeroclaw models refresh --provider <ID>`.
 - These are runtime chat commands, not CLI subcommands.
 
+## In-Chat Emergency-Stop Controls (Telegram / Discord / Slack / Mattermost)
+
+Supported runtime commands:
+
+- `/estop` (engage `kill-all`)
+- `/estop network`
+- `/estop block <domain ...>`
+- `/estop freeze <tool ...>`
+- `/estop status`
+- `/estop resume <OTP>`
+- `/estop resume network <OTP>`
+- `/estop resume kill-all <OTP>`
+- `/estop resume block <domain ...> <OTP>`
+- `/estop resume freeze <tool ...> <OTP>`
+
+Operational notes:
+
+- Commands are accepted only from allowed users configured for that channel.
+- Commands remain available while estop is active so operators can inspect state and recover safely.
+- OTP must be provided inline for resume commands and must be a 6-digit code.
+- While an OTP approval prompt is pending, non-OTP messages from the same operator are queued and replayed after approval/denial.
+
 ## Inbound Image Marker Protocol
 
 ZeroClaw supports multimodal input through inline message markers:

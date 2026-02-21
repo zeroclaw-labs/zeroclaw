@@ -8,8 +8,8 @@ use crate::providers::{
 };
 use crate::runtime;
 use crate::security::{
-    DomainMatcher, EstopManager, OtpApprovalCache, OtpRequired, OtpRequiredScope, OtpValidator,
-    SecretStore, SecurityPolicy,
+    DomainMatcher, EstopLevel, EstopManager, EstopState, OtpApprovalCache, OtpRequired,
+    OtpRequiredScope, OtpValidator, ResumeSelector, SecretStore, SecurityPolicy,
 };
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
@@ -90,7 +90,7 @@ struct PendingOtpGate {
 }
 
 impl ToolSecurityRuntime {
-    fn resolve_target_domain(
+    pub(crate) fn resolve_target_domain(
         &self,
         tool: &dyn Tool,
         args: &Value,
@@ -99,7 +99,7 @@ impl ToolSecurityRuntime {
             .map_err(|err| format!("Tool argument validation failed: {err}"))
     }
 
-    fn enforce_estop(
+    pub(crate) fn enforce_estop(
         &self,
         tool_name: &str,
         args: &Value,
@@ -122,6 +122,46 @@ impl ToolSecurityRuntime {
             return OtpGateDecision::Allow;
         };
         otp.enforce(tool_name, args, domain, prompt_inline)
+    }
+
+    pub(crate) fn approve_otp_required(
+        &self,
+        required: &OtpRequired,
+        code: &str,
+    ) -> std::result::Result<(), String> {
+        let Some(otp) = &self.otp else {
+            return Err("OTP runtime is not enabled".to_string());
+        };
+        otp.approve_required(required, code)
+    }
+
+    pub(crate) fn estop_status(&self) -> std::result::Result<EstopState, String> {
+        let Some(estop) = &self.estop else {
+            return Err("Emergency-stop runtime is not enabled".to_string());
+        };
+        estop.status()
+    }
+
+    pub(crate) fn estop_engage(
+        &self,
+        level: EstopLevel,
+    ) -> std::result::Result<EstopState, String> {
+        let Some(estop) = &self.estop else {
+            return Err("Emergency-stop runtime is not enabled".to_string());
+        };
+        estop.engage(level)
+    }
+
+    pub(crate) fn estop_resume(
+        &self,
+        selector: ResumeSelector,
+        otp_code: Option<&str>,
+    ) -> std::result::Result<EstopState, String> {
+        let Some(estop) = &self.estop else {
+            return Err("Emergency-stop runtime is not enabled".to_string());
+        };
+        let otp_validator = self.otp.as_ref().map(|otp| otp.validator.as_ref());
+        estop.resume(selector, otp_code, otp_validator)
     }
 }
 
@@ -152,6 +192,46 @@ impl EstopRuntime {
                 .map_err(|err| err.to_string())?;
         }
         Ok(())
+    }
+
+    fn status(&self) -> std::result::Result<EstopState, String> {
+        EstopManager::load(&self.config, &self.config_dir)
+            .map(|manager| manager.status())
+            .map_err(|err| format!("Failed to load estop state: {err}"))
+    }
+
+    fn engage(&self, level: EstopLevel) -> std::result::Result<EstopState, String> {
+        let mut manager = EstopManager::load(&self.config, &self.config_dir)
+            .map_err(|err| format!("Failed to load estop state: {err}"))?;
+        manager
+            .engage(level)
+            .map_err(|err| format!("Failed to engage estop: {err}"))?;
+
+        let state = manager.status();
+        self.was_engaged.store(state.is_engaged(), Ordering::SeqCst);
+        if state.is_engaged() {
+            if let Some(cache) = &self.approval_cache {
+                cache.clear();
+            }
+        }
+        Ok(state)
+    }
+
+    fn resume(
+        &self,
+        selector: ResumeSelector,
+        otp_code: Option<&str>,
+        otp_validator: Option<&OtpValidator>,
+    ) -> std::result::Result<EstopState, String> {
+        let mut manager = EstopManager::load(&self.config, &self.config_dir)
+            .map_err(|err| format!("Failed to load estop state: {err}"))?;
+        manager
+            .resume(selector, otp_code, otp_validator)
+            .map_err(|err| err.to_string())?;
+
+        let state = manager.status();
+        self.was_engaged.store(state.is_engaged(), Ordering::SeqCst);
+        Ok(state)
     }
 }
 
@@ -229,6 +309,32 @@ impl OtpRuntime {
             };
             OtpGateDecision::Required(payload)
         }
+    }
+
+    fn approve_required(
+        &self,
+        required: &OtpRequired,
+        code: &str,
+    ) -> std::result::Result<(), String> {
+        let valid = self
+            .validator
+            .validate(code)
+            .map_err(|err| format!("OTP validation failed: {err}"))?;
+        if !valid {
+            return Err("Invalid OTP code".to_string());
+        }
+
+        let tool_key = format!("tool:{}", normalize_gate_key(&required.tool_name));
+        self.approval_cache
+            .approve(&tool_key, self.cache_valid_secs);
+
+        if let Some(domain) = required.domain.as_deref() {
+            let domain_key = format!("domain:{}", normalize_gate_key(domain));
+            self.approval_cache
+                .approve(&domain_key, self.cache_valid_secs);
+        }
+
+        Ok(())
     }
 }
 
@@ -2838,6 +2944,16 @@ pub async fn run(
 /// Process a single message through the full agent (with tools, peripherals, memory).
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
 pub async fn process_message(config: Config, message: &str) -> Result<String> {
+    process_message_with_security_runtime(config, message, None).await
+}
+
+/// Same as `process_message`, but allows callers to provide a shared security runtime.
+/// This enables cross-request OTP/estop state reuse for surfaces like gateway webhooks.
+pub(crate) async fn process_message_with_security_runtime(
+    config: Config,
+    message: &str,
+    shared_security_runtime: Option<Arc<ToolSecurityRuntime>>,
+) -> Result<String> {
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
@@ -2997,7 +3113,11 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         ChatMessage::user(&enriched),
     ];
 
-    let tool_security_runtime = build_tool_security_runtime(&config)?;
+    let tool_security_runtime = if let Some(runtime) = shared_security_runtime {
+        Some(runtime)
+    } else {
+        build_tool_security_runtime(&config)?
+    };
 
     run_tool_call_loop(
         provider.as_ref(),

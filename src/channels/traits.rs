@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
 /// A message received from or sent to a channel
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ChannelMessage {
     pub id: String,
     pub sender: String,

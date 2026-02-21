@@ -86,6 +86,7 @@ Notes:
 | `method` | `totp` | OTP method (`totp`, `pairing`, `cli-prompt`) |
 | `token_ttl_secs` | `30` | TOTP time-step window in seconds |
 | `cache_valid_secs` | `300` | Cache window for recently validated OTP codes |
+| `prompt_timeout_secs` | `120` | Timeout for channel/gateway OTP approval prompts |
 | `gated_actions` | `["shell","file_write","browser_open","browser","memory_forget"]` | Tool actions protected by OTP |
 | `gated_domains` | `[]` | Explicit domain patterns requiring OTP (`*.example.com`, `login.example.com`) |
 | `gated_domain_categories` | `[]` | Domain preset categories (`banking`, `medical`, `government`, `identity_providers`) |
@@ -97,6 +98,7 @@ Notes:
 - Invalid domain globs or unknown categories fail fast at startup.
 - When `enabled = true` and no OTP secret exists, ZeroClaw generates one and prints an enrollment URI once.
 - OTP approvals are cached in-memory by scope (`tool:<name>` / `domain:<host>`) for `cache_valid_secs` and are not persisted across process restarts.
+- Channel and gateway OTP approval prompts expire after `prompt_timeout_secs`.
 - For browser tools, `browser.allowed_domains` is validated before OTP domain gating; disallowed domains are blocked before OTP challenge.
 - When estop transitions from disengaged to engaged, runtime OTP approvals are cleared immediately.
 
@@ -108,6 +110,7 @@ enabled = true
 method = "totp"
 token_ttl_secs = 30
 cache_valid_secs = 300
+prompt_timeout_secs = 120
 gated_actions = ["shell", "browser_open"]
 gated_domains = ["*.chase.com", "accounts.google.com"]
 gated_domain_categories = ["banking"]
@@ -312,7 +315,20 @@ Notes:
 | `host` | `127.0.0.1` | bind address |
 | `port` | `42617` | gateway listen port |
 | `require_pairing` | `true` | require pairing before bearer auth |
+| `pair_rate_limit_per_minute` | `10` | limit for `POST /pair` attempts per client |
+| `webhook_rate_limit_per_minute` | `60` | limit for webhook/approval requests per client |
+| `estop_write_rate_limit_per_minute` | `10` | limit for estop mutation endpoints (`POST /estop*`) per client |
+| `rate_limit_max_keys` | `10000` | max distinct client keys tracked by rate limiter |
+| `idempotency_ttl_secs` | `300` | duplicate-window TTL for `X-Idempotency-Key` cache |
 | `allow_public_bind` | `false` | block accidental public exposure |
+| `trust_forwarded_headers` | `false` | trust `X-Forwarded-For` / `X-Real-IP` for client identity |
+
+Gateway security surfaces:
+
+- `POST /webhook/approve` accepts `{ "otp": "123456" }` for pending webhook OTP challenges.
+- `POST /estop` engages an emergency-stop level.
+- `POST /estop/resume` resumes levels (OTP required when `[security.estop].require_otp_to_resume = true`).
+- `GET /estop/status` returns the current emergency-stop state.
 
 ## `[autonomy]`
 

@@ -64,6 +64,20 @@ Agent security behavior:
 - `zeroclaw gateway [--host <HOST>] [--port <PORT>]`
 - `zeroclaw daemon [--host <HOST>] [--port <PORT>]`
 
+Gateway HTTP control surfaces:
+
+- `POST /webhook` main webhook entry point.
+- `POST /webhook/approve` approve a pending OTP challenge from webhook flows (`{"otp":"123456"}`).
+- `POST /estop` engage emergency-stop levels (`kill-all`, `network-kill`, `domain-block`, `tool-freeze`).
+- `POST /estop/resume` resume emergency-stop levels with OTP validation.
+- `GET /estop/status` inspect current emergency-stop state.
+
+Notes:
+
+- Pairing bearer auth still applies when `[gateway].require_pairing = true`.
+- `POST /estop` and `POST /estop/resume` use a dedicated write limiter via `[gateway].estop_write_rate_limit_per_minute`.
+- Webhook OTP challenges return structured `otp_required` payloads with `approval_endpoint="/webhook/approve"` and `timeout_secs`.
+
 ### `estop`
 
 - `zeroclaw estop` (engage `kill-all`)
@@ -131,6 +145,19 @@ Runtime in-chat commands (Telegram/Discord while channel server is running):
 - `/models <provider>`
 - `/model`
 - `/model <model-id>`
+
+Runtime emergency-stop commands (Telegram/Discord/Slack/Mattermost):
+
+- `/estop` (engage `kill-all`)
+- `/estop network`
+- `/estop block <domain ...>`
+- `/estop freeze <tool ...>`
+- `/estop status`
+- `/estop resume <OTP>`
+- `/estop resume network <OTP>`
+- `/estop resume kill-all <OTP>`
+- `/estop resume block <domain ...> <OTP>`
+- `/estop resume freeze <tool ...> <OTP>`
 
 Channel runtime also watches `config.toml` and hot-applies updates to:
 - `default_provider`

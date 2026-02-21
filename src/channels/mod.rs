@@ -72,7 +72,10 @@ use crate::memory::{self, Memory};
 use crate::observability::{self, Observer};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
-use crate::security::SecurityPolicy;
+use crate::security::{
+    EstopLevel, EstopState, OtpPromptHandler, OtpRequired, OtpRequiredScope, ResumeSelector,
+    SecurityPolicy,
+};
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
@@ -118,6 +121,7 @@ const MEMORY_CONTEXT_ENTRY_MAX_CHARS: usize = 800;
 const MEMORY_CONTEXT_MAX_CHARS: usize = 4_000;
 const CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES: usize = 12;
 const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 600;
+const OTP_CODE_DIGITS: usize = 6;
 /// Guardrail for hook-modified outbound channel content.
 const CHANNEL_HOOK_MAX_OUTBOUND_CHARS: usize = 20_000;
 
@@ -149,6 +153,22 @@ enum ChannelRuntimeCommand {
     SetProvider(String),
     ShowModel,
     SetModel(String),
+    Estop(ChannelEstopCommand),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChannelEstopCommand {
+    EngageKillAll,
+    EngageNetworkKill,
+    EngageDomainBlock(Vec<String>),
+    EngageToolFreeze(Vec<String>),
+    ResumeAll { otp: String },
+    ResumeKillAll { otp: String },
+    ResumeNetwork { otp: String },
+    ResumeDomains { domains: Vec<String>, otp: String },
+    ResumeTools { tools: Vec<String>, otp: String },
+    Status,
+    Help,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -221,6 +241,7 @@ struct ChannelRuntimeContext {
     multimodal: crate::config::MultimodalConfig,
     hooks: Option<Arc<crate::hooks::HookRunner>>,
     tool_security: Option<Arc<crate::agent::loop_::ToolSecurityRuntime>>,
+    otp_prompt_handler: Option<Arc<OtpPromptHandler>>,
     non_cli_excluded_tools: Arc<Vec<String>>,
 }
 
@@ -453,11 +474,134 @@ fn supports_runtime_model_switch(channel_name: &str) -> bool {
     matches!(channel_name, "telegram" | "discord")
 }
 
-fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
-    if !supports_runtime_model_switch(channel_name) {
-        return None;
+fn supports_estop_commands(channel_name: &str) -> bool {
+    matches!(
+        channel_name,
+        "telegram" | "discord" | "slack" | "mattermost"
+    )
+}
+
+fn parse_estop_command(arguments: &[&str]) -> ChannelEstopCommand {
+    if arguments.is_empty() {
+        return ChannelEstopCommand::EngageKillAll;
     }
 
+    let sub = arguments[0].trim().to_ascii_lowercase();
+    match sub.as_str() {
+        "status" => ChannelEstopCommand::Status,
+        "network" | "network-kill" => ChannelEstopCommand::EngageNetworkKill,
+        "block" | "domain" | "domain-block" => {
+            let domains = arguments[1..]
+                .iter()
+                .map(|item| item.trim().to_ascii_lowercase())
+                .filter(|item| !item.is_empty())
+                .collect::<Vec<_>>();
+            if domains.is_empty() {
+                ChannelEstopCommand::Help
+            } else {
+                ChannelEstopCommand::EngageDomainBlock(domains)
+            }
+        }
+        "freeze" | "tool" | "tool-freeze" => {
+            let tools = arguments[1..]
+                .iter()
+                .map(|item| item.trim().to_ascii_lowercase())
+                .filter(|item| !item.is_empty())
+                .collect::<Vec<_>>();
+            if tools.is_empty() {
+                ChannelEstopCommand::Help
+            } else {
+                ChannelEstopCommand::EngageToolFreeze(tools)
+            }
+        }
+        "resume" => parse_estop_resume_command(&arguments[1..]),
+        "help" => ChannelEstopCommand::Help,
+        _ => ChannelEstopCommand::Help,
+    }
+}
+
+fn parse_estop_resume_command(arguments: &[&str]) -> ChannelEstopCommand {
+    if arguments.is_empty() {
+        return ChannelEstopCommand::Help;
+    }
+
+    if arguments.len() == 1 {
+        return ChannelEstopCommand::ResumeAll {
+            otp: arguments[0].trim().to_string(),
+        };
+    }
+
+    let mode = arguments[0].trim().to_ascii_lowercase();
+    match mode.as_str() {
+        "all" => {
+            if arguments.len() == 2 {
+                ChannelEstopCommand::ResumeAll {
+                    otp: arguments[1].trim().to_string(),
+                }
+            } else {
+                ChannelEstopCommand::Help
+            }
+        }
+        "kill-all" | "killall" | "kill" => {
+            if arguments.len() == 2 {
+                ChannelEstopCommand::ResumeKillAll {
+                    otp: arguments[1].trim().to_string(),
+                }
+            } else {
+                ChannelEstopCommand::Help
+            }
+        }
+        "network" | "network-kill" => {
+            if arguments.len() == 2 {
+                ChannelEstopCommand::ResumeNetwork {
+                    otp: arguments[1].trim().to_string(),
+                }
+            } else {
+                ChannelEstopCommand::Help
+            }
+        }
+        "block" | "domain" | "domain-block" => {
+            if arguments.len() < 3 {
+                return ChannelEstopCommand::Help;
+            }
+            let otp = arguments[arguments.len() - 1].trim().to_string();
+            let domains = arguments[1..arguments.len() - 1]
+                .iter()
+                .map(|item| item.trim().to_ascii_lowercase())
+                .filter(|item| !item.is_empty())
+                .collect::<Vec<_>>();
+            if domains.is_empty() {
+                ChannelEstopCommand::Help
+            } else {
+                ChannelEstopCommand::ResumeDomains { domains, otp }
+            }
+        }
+        "freeze" | "tool" | "tool-freeze" => {
+            if arguments.len() < 3 {
+                return ChannelEstopCommand::Help;
+            }
+            let otp = arguments[arguments.len() - 1].trim().to_string();
+            let tools = arguments[1..arguments.len() - 1]
+                .iter()
+                .map(|item| item.trim().to_ascii_lowercase())
+                .filter(|item| !item.is_empty())
+                .collect::<Vec<_>>();
+            if tools.is_empty() {
+                ChannelEstopCommand::Help
+            } else {
+                ChannelEstopCommand::ResumeTools { tools, otp }
+            }
+        }
+        _ => ChannelEstopCommand::Help,
+    }
+}
+
+fn is_six_digit_otp_code(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.len() == OTP_CODE_DIGITS && trimmed.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
     let trimmed = content.trim();
     if !trimmed.starts_with('/') {
         return None;
@@ -472,7 +616,13 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
         .to_ascii_lowercase();
 
     match base_command.as_str() {
+        "/estop" if supports_estop_commands(channel_name) => Some(ChannelRuntimeCommand::Estop(
+            parse_estop_command(&parts.collect::<Vec<_>>()),
+        )),
         "/models" => {
+            if !supports_runtime_model_switch(channel_name) {
+                return None;
+            }
             if let Some(provider) = parts.next() {
                 Some(ChannelRuntimeCommand::SetProvider(
                     provider.trim().to_string(),
@@ -482,6 +632,9 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
             }
         }
         "/model" => {
+            if !supports_runtime_model_switch(channel_name) {
+                return None;
+            }
             let model = parts.collect::<Vec<_>>().join(" ").trim().to_string();
             if model.is_empty() {
                 Some(ChannelRuntimeCommand::ShowModel)
@@ -936,6 +1089,210 @@ fn build_providers_help_response(current: &ChannelRouteSelection) -> String {
     response
 }
 
+fn estop_help_text() -> String {
+    [
+        "Emergency-stop commands:",
+        "- `/estop` → engage kill-all",
+        "- `/estop network` → engage network-kill",
+        "- `/estop block <domain ...>` → block one or more domains",
+        "- `/estop freeze <tool ...>` → freeze one or more tools",
+        "- `/estop status` → show current estop state",
+        "- `/estop resume <OTP>` → resume all active levels",
+        "- `/estop resume network <OTP>`",
+        "- `/estop resume kill-all <OTP>`",
+        "- `/estop resume block <domain ...> <OTP>`",
+        "- `/estop resume freeze <tool ...> <OTP>`",
+    ]
+    .join("\n")
+}
+
+fn format_estop_status(state: &EstopState) -> String {
+    let mut lines = vec!["Emergency-stop status:".to_string()];
+    lines.push(format!(
+        "- `kill-all`: {}",
+        if state.kill_all { "active" } else { "inactive" }
+    ));
+    lines.push(format!(
+        "- `network-kill`: {}",
+        if state.network_kill {
+            "active"
+        } else {
+            "inactive"
+        }
+    ));
+
+    if state.blocked_domains.is_empty() {
+        lines.push("- `domain-block`: none".to_string());
+    } else {
+        lines.push(format!(
+            "- `domain-block`: {}",
+            state.blocked_domains.join(", ")
+        ));
+    }
+
+    if state.frozen_tools.is_empty() {
+        lines.push("- `tool-freeze`: none".to_string());
+    } else {
+        lines.push(format!(
+            "- `tool-freeze`: {}",
+            state.frozen_tools.join(", ")
+        ));
+    }
+
+    if let Some(updated) = state.updated_at.as_deref() {
+        lines.push(format!("- updated_at: `{updated}`"));
+    }
+
+    lines.join("\n")
+}
+
+fn render_estop_change(prefix: &str, state: &EstopState) -> String {
+    format!("{prefix}\n\n{}", format_estop_status(state))
+}
+
+fn execute_channel_estop_command(
+    command: ChannelEstopCommand,
+    tool_security: Option<&Arc<crate::agent::loop_::ToolSecurityRuntime>>,
+) -> String {
+    let Some(runtime) = tool_security else {
+        return "Emergency-stop controls are unavailable: security runtime is not enabled."
+            .to_string();
+    };
+
+    match command {
+        ChannelEstopCommand::Help => estop_help_text(),
+        ChannelEstopCommand::Status => match runtime.estop_status() {
+            Ok(state) => format_estop_status(&state),
+            Err(err) => format!("Failed to read estop state: {err}"),
+        },
+        ChannelEstopCommand::EngageKillAll => match runtime.estop_engage(EstopLevel::KillAll) {
+            Ok(state) => render_estop_change("Emergency stop engaged: `kill-all`.", &state),
+            Err(err) => format!("Failed to engage `kill-all`: {err}"),
+        },
+        ChannelEstopCommand::EngageNetworkKill => {
+            match runtime.estop_engage(EstopLevel::NetworkKill) {
+                Ok(state) => render_estop_change("Emergency stop engaged: `network-kill`.", &state),
+                Err(err) => format!("Failed to engage `network-kill`: {err}"),
+            }
+        }
+        ChannelEstopCommand::EngageDomainBlock(domains) => {
+            match runtime.estop_engage(EstopLevel::DomainBlock(domains.clone())) {
+                Ok(state) => render_estop_change(
+                    &format!(
+                        "Emergency stop engaged: `domain-block` for {}.",
+                        domains.join(", ")
+                    ),
+                    &state,
+                ),
+                Err(err) => format!("Failed to engage `domain-block`: {err}"),
+            }
+        }
+        ChannelEstopCommand::EngageToolFreeze(tools) => {
+            match runtime.estop_engage(EstopLevel::ToolFreeze(tools.clone())) {
+                Ok(state) => render_estop_change(
+                    &format!(
+                        "Emergency stop engaged: `tool-freeze` for {}.",
+                        tools.join(", ")
+                    ),
+                    &state,
+                ),
+                Err(err) => format!("Failed to engage `tool-freeze`: {err}"),
+            }
+        }
+        ChannelEstopCommand::ResumeAll { otp } => {
+            if !is_six_digit_otp_code(&otp) {
+                return "Resume denied: OTP must be a 6-digit code.".to_string();
+            }
+
+            let status = match runtime.estop_status() {
+                Ok(state) => state,
+                Err(err) => return format!("Failed to read estop state: {err}"),
+            };
+
+            let mut errors: Vec<String> = Vec::new();
+            if status.kill_all {
+                if let Err(err) = runtime.estop_resume(ResumeSelector::KillAll, Some(&otp)) {
+                    errors.push(err);
+                }
+            }
+            if status.network_kill {
+                if let Err(err) = runtime.estop_resume(ResumeSelector::Network, Some(&otp)) {
+                    errors.push(err);
+                }
+            }
+            if !status.blocked_domains.is_empty() {
+                if let Err(err) = runtime.estop_resume(
+                    ResumeSelector::Domains(status.blocked_domains.clone()),
+                    Some(&otp),
+                ) {
+                    errors.push(err);
+                }
+            }
+            if !status.frozen_tools.is_empty() {
+                if let Err(err) = runtime.estop_resume(
+                    ResumeSelector::Tools(status.frozen_tools.clone()),
+                    Some(&otp),
+                ) {
+                    errors.push(err);
+                }
+            }
+
+            if !errors.is_empty() {
+                return format!("Failed to resume estop state: {}", errors.join(" | "));
+            }
+
+            match runtime.estop_status() {
+                Ok(state) => {
+                    render_estop_change("Emergency stop resumed for all active levels.", &state)
+                }
+                Err(err) => format!("Resume succeeded but state refresh failed: {err}"),
+            }
+        }
+        ChannelEstopCommand::ResumeKillAll { otp } => {
+            if !is_six_digit_otp_code(&otp) {
+                return "Resume denied: OTP must be a 6-digit code.".to_string();
+            }
+            match runtime.estop_resume(ResumeSelector::KillAll, Some(&otp)) {
+                Ok(state) => render_estop_change("Resumed: `kill-all`.", &state),
+                Err(err) => format!("Failed to resume `kill-all`: {err}"),
+            }
+        }
+        ChannelEstopCommand::ResumeNetwork { otp } => {
+            if !is_six_digit_otp_code(&otp) {
+                return "Resume denied: OTP must be a 6-digit code.".to_string();
+            }
+            match runtime.estop_resume(ResumeSelector::Network, Some(&otp)) {
+                Ok(state) => render_estop_change("Resumed: `network-kill`.", &state),
+                Err(err) => format!("Failed to resume `network-kill`: {err}"),
+            }
+        }
+        ChannelEstopCommand::ResumeDomains { domains, otp } => {
+            if !is_six_digit_otp_code(&otp) {
+                return "Resume denied: OTP must be a 6-digit code.".to_string();
+            }
+            match runtime.estop_resume(ResumeSelector::Domains(domains.clone()), Some(&otp)) {
+                Ok(state) => render_estop_change(
+                    &format!("Resumed domain blocks for {}.", domains.join(", ")),
+                    &state,
+                ),
+                Err(err) => format!("Failed to resume domain block: {err}"),
+            }
+        }
+        ChannelEstopCommand::ResumeTools { tools, otp } => {
+            if !is_six_digit_otp_code(&otp) {
+                return "Resume denied: OTP must be a 6-digit code.".to_string();
+            }
+            match runtime.estop_resume(ResumeSelector::Tools(tools.clone()), Some(&otp)) {
+                Ok(state) => render_estop_change(
+                    &format!("Resumed frozen tools for {}.", tools.join(", ")),
+                    &state,
+                ),
+                Err(err) => format!("Failed to resume tool freeze: {err}"),
+            }
+        }
+    }
+}
+
 async fn handle_runtime_command_if_needed(
     ctx: &ChannelRuntimeContext,
     msg: &traits::ChannelMessage,
@@ -998,6 +1355,9 @@ async fn handle_runtime_command_if_needed(
                     current.provider
                 )
             }
+        }
+        ChannelRuntimeCommand::Estop(estop_command) => {
+            execute_channel_estop_command(estop_command, ctx.tool_security.as_ref())
         }
     };
 
@@ -1445,6 +1805,168 @@ fn spawn_scoped_typing_task(
     handle
 }
 
+fn parse_otp_required_response(response: &str) -> Option<OtpRequired> {
+    let parsed = serde_json::from_str::<OtpRequired>(response).ok()?;
+    (parsed.response_type == "otp_required").then_some(parsed)
+}
+
+fn format_channel_otp_prompt(required: &OtpRequired, timeout_secs: u64) -> String {
+    match required.scope {
+        OtpRequiredScope::Tool => format!(
+            "⚠️ Authorization required.\nThe agent wants to execute `{}` with `{}`.\nReply with your 6-digit OTP code within {} seconds to approve.\nNon-OTP messages sent while waiting will be queued.",
+            required.tool_name, required.parameters_summary, timeout_secs
+        ),
+        OtpRequiredScope::Domain => {
+            let domain = required
+                .domain
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .unwrap_or("unknown-domain");
+            format!(
+                "⚠️ Authorization required.\nThe agent wants to access `{domain}` via `{}` (`{}`).\nReply with your 6-digit OTP code within {} seconds to approve.\nNon-OTP messages sent while waiting will be queued.",
+                required.tool_name, required.parameters_summary, timeout_secs
+            )
+        }
+    }
+}
+
+fn rollback_last_user_turn(ctx: &ChannelRuntimeContext, sender_key: &str, expected_content: &str) {
+    let mut histories = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(turns) = histories.get_mut(sender_key) else {
+        return;
+    };
+    if turns
+        .last()
+        .is_some_and(|last| last.role == "user" && last.content == expected_content)
+    {
+        turns.pop();
+    }
+}
+
+fn decode_channel_message_context(context: &serde_json::Value) -> Option<traits::ChannelMessage> {
+    serde_json::from_value::<traits::ChannelMessage>(context.clone()).ok()
+}
+
+async fn replay_channel_message_contexts(
+    ctx: Arc<ChannelRuntimeContext>,
+    contexts: Vec<serde_json::Value>,
+) {
+    for context in contexts {
+        if let Some(msg) = decode_channel_message_context(&context) {
+            Box::pin(process_channel_message(
+                Arc::clone(&ctx),
+                msg,
+                CancellationToken::new(),
+            ))
+            .await;
+        }
+    }
+}
+
+async fn handle_pending_channel_otp_if_any(
+    ctx: Arc<ChannelRuntimeContext>,
+    msg: &traits::ChannelMessage,
+    target_channel: &Arc<dyn Channel>,
+) -> bool {
+    let Some(handler) = ctx.otp_prompt_handler.as_ref() else {
+        return false;
+    };
+    let Some(runtime) = ctx.tool_security.as_ref() else {
+        return false;
+    };
+
+    let is_otp_candidate = is_six_digit_otp_code(&msg.content);
+
+    if let Some(timeout) = handler.consume_expired_for_operator(&msg.channel, &msg.sender) {
+        let _ = target_channel
+            .send(
+                &SendMessage::new(
+                    "Authorization request timed out. The pending action was denied.",
+                    &msg.reply_target,
+                )
+                .in_thread(msg.thread_ts.clone()),
+            )
+            .await;
+
+        replay_channel_message_contexts(Arc::clone(&ctx), timeout.queued_contexts).await;
+        return is_otp_candidate;
+    }
+
+    let Some(pending) = handler.pending_for_operator(&msg.channel, &msg.sender) else {
+        return false;
+    };
+
+    if !is_otp_candidate {
+        let context = serde_json::to_value(msg).unwrap_or_else(|_| serde_json::json!({}));
+        let queue_len = handler
+            .enqueue_non_otp(&pending.pending_id, context)
+            .unwrap_or(0);
+        let _ = target_channel
+            .send(
+                &SendMessage::new(
+                    format!(
+                        "Authorization is still pending. I queued this message (queue size: {}).",
+                        queue_len
+                    ),
+                    &msg.reply_target,
+                )
+                .in_thread(msg.thread_ts.clone()),
+            )
+            .await;
+        return true;
+    }
+
+    match handler.resolve(&pending.pending_id, &msg.content, |required, code| {
+        runtime.approve_otp_required(required, code)
+    }) {
+        Ok(approved) => {
+            let _ = target_channel
+                .send(
+                    &SendMessage::new(
+                        "OTP verified. Continuing the pending action now.",
+                        &msg.reply_target,
+                    )
+                    .in_thread(msg.thread_ts.clone()),
+                )
+                .await;
+
+            let mut contexts = Vec::with_capacity(1 + approved.queued_contexts.len());
+            contexts.push(approved.original_context);
+            contexts.extend(approved.queued_contexts);
+            replay_channel_message_contexts(ctx, contexts).await;
+            true
+        }
+        Err(denied) => {
+            if denied.timed_out {
+                let _ = target_channel
+                    .send(
+                        &SendMessage::new(
+                            "Authorization request timed out. The pending action was denied.",
+                            &msg.reply_target,
+                        )
+                        .in_thread(msg.thread_ts.clone()),
+                    )
+                    .await;
+                replay_channel_message_contexts(Arc::clone(&ctx), denied.queued_contexts).await;
+            } else {
+                let _ = target_channel
+                    .send(
+                        &SendMessage::new(
+                            format!("Authorization denied: {}", denied.reason),
+                            &msg.reply_target,
+                        )
+                        .in_thread(msg.thread_ts.clone()),
+                    )
+                    .await;
+            }
+            true
+        }
+    }
+}
+
 async fn process_channel_message(
     ctx: Arc<ChannelRuntimeContext>,
     msg: traits::ChannelMessage,
@@ -1480,6 +2002,12 @@ async fn process_channel_message(
     }
     if handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
         return;
+    }
+
+    if let Some(channel) = target_channel.as_ref() {
+        if handle_pending_channel_otp_if_any(Arc::clone(&ctx), &msg, channel).await {
+            return;
+        }
     }
 
     let history_key = conversation_history_key(&msg);
@@ -1704,116 +2232,168 @@ async fn process_channel_message(
             }
         }
         LlmExecutionResult::Completed(Ok(Ok(response))) => {
-            // ── Hook: on_message_sending (modifying) ─────────
-            let mut outbound_response = response;
-            if let Some(hooks) = &ctx.hooks {
-                match hooks
-                    .run_on_message_sending(
-                        msg.channel.clone(),
-                        msg.reply_target.clone(),
-                        outbound_response.clone(),
-                    )
-                    .await
+            let mut otp_prompted = false;
+            if let Some(required) = parse_otp_required_response(&response) {
+                if let (Some(handler), Some(channel)) =
+                    (ctx.otp_prompt_handler.as_ref(), target_channel.as_ref())
                 {
-                    crate::hooks::HookResult::Cancel(reason) => {
-                        tracing::info!(%reason, "outgoing message suppressed by hook");
-                        return;
-                    }
-                    crate::hooks::HookResult::Continue((
-                        hook_channel,
-                        hook_recipient,
-                        mut modified_content,
-                    )) => {
-                        if hook_channel != msg.channel || hook_recipient != msg.reply_target {
+                    rollback_last_user_turn(ctx.as_ref(), &history_key, &msg.content);
+                    let original_context =
+                        serde_json::to_value(&msg).unwrap_or_else(|_| serde_json::json!({}));
+                    let pending = handler.prompt(
+                        msg.channel.clone(),
+                        msg.sender.clone(),
+                        required.clone(),
+                        original_context,
+                    );
+                    let prompt_message = format_channel_otp_prompt(&required, pending.timeout_secs);
+                    otp_prompted = true;
+
+                    println!(
+                        "  🔐 OTP challenge issued ({}ms): {}",
+                        started_at.elapsed().as_millis(),
+                        truncate_with_ellipsis(&prompt_message, 80)
+                    );
+
+                    if let Some(ref draft_id) = draft_message_id {
+                        if let Err(err) = channel
+                            .finalize_draft(&msg.reply_target, draft_id, &prompt_message)
+                            .await
+                        {
                             tracing::warn!(
-                                from_channel = %msg.channel,
-                                from_recipient = %msg.reply_target,
-                                to_channel = %hook_channel,
-                                to_recipient = %hook_recipient,
-                                "on_message_sending attempted to rewrite channel routing; only content mutation is applied"
+                                "Failed to finalize OTP prompt draft: {err}; sending as new message"
                             );
+                            let _ = channel
+                                .send(
+                                    &SendMessage::new(&prompt_message, &msg.reply_target)
+                                        .in_thread(msg.thread_ts.clone()),
+                                )
+                                .await;
                         }
-
-                        let modified_len = modified_content.chars().count();
-                        if modified_len > CHANNEL_HOOK_MAX_OUTBOUND_CHARS {
-                            tracing::warn!(
-                                limit = CHANNEL_HOOK_MAX_OUTBOUND_CHARS,
-                                attempted = modified_len,
-                                "hook-modified outbound content exceeded limit; truncating"
-                            );
-                            modified_content = truncate_with_ellipsis(
-                                &modified_content,
-                                CHANNEL_HOOK_MAX_OUTBOUND_CHARS,
-                            );
-                        }
-
-                        if modified_content != outbound_response {
-                            tracing::info!(
-                                channel = %msg.channel,
-                                sender = %msg.sender,
-                                before_len = outbound_response.chars().count(),
-                                after_len = modified_content.chars().count(),
-                                "outgoing message content modified by hook"
-                            );
-                        }
-
-                        outbound_response = modified_content;
+                    } else if let Err(err) = channel
+                        .send(
+                            &SendMessage::new(&prompt_message, &msg.reply_target)
+                                .in_thread(msg.thread_ts.clone()),
+                        )
+                        .await
+                    {
+                        tracing::warn!("Failed to send OTP prompt on {}: {err}", channel.name());
                     }
                 }
             }
 
-            let sanitized_response =
-                sanitize_channel_response(&outbound_response, ctx.tools_registry.as_ref());
-            let delivered_response = if sanitized_response.is_empty()
-                && !outbound_response.trim().is_empty()
-            {
-                "I encountered malformed tool-call output and could not produce a safe reply. Please try again.".to_string()
-            } else {
-                sanitized_response
-            };
-
-            // Extract condensed tool-use context from the history messages
-            // added during run_tool_call_loop, so the LLM retains awareness
-            // of what it did on subsequent turns.
-            let tool_summary = extract_tool_context_summary(&history, history_len_before_tools);
-            let history_response = if tool_summary.is_empty() || msg.channel == "telegram" {
-                delivered_response.clone()
-            } else {
-                format!("{tool_summary}\n{delivered_response}")
-            };
-
-            append_sender_turn(
-                ctx.as_ref(),
-                &history_key,
-                ChatMessage::assistant(&history_response),
-            );
-            println!(
-                "  🤖 Reply ({}ms): {}",
-                started_at.elapsed().as_millis(),
-                truncate_with_ellipsis(&delivered_response, 80)
-            );
-            if let Some(channel) = target_channel.as_ref() {
-                if let Some(ref draft_id) = draft_message_id {
-                    if let Err(e) = channel
-                        .finalize_draft(&msg.reply_target, draft_id, &delivered_response)
+            if !otp_prompted {
+                // ── Hook: on_message_sending (modifying) ─────────
+                let mut outbound_response = response;
+                if let Some(hooks) = &ctx.hooks {
+                    match hooks
+                        .run_on_message_sending(
+                            msg.channel.clone(),
+                            msg.reply_target.clone(),
+                            outbound_response.clone(),
+                        )
                         .await
                     {
-                        tracing::warn!("Failed to finalize draft: {e}; sending as new message");
-                        let _ = channel
-                            .send(
-                                &SendMessage::new(&delivered_response, &msg.reply_target)
-                                    .in_thread(msg.thread_ts.clone()),
-                            )
-                            .await;
+                        crate::hooks::HookResult::Cancel(reason) => {
+                            tracing::info!(%reason, "outgoing message suppressed by hook");
+                            return;
+                        }
+                        crate::hooks::HookResult::Continue((
+                            hook_channel,
+                            hook_recipient,
+                            mut modified_content,
+                        )) => {
+                            if hook_channel != msg.channel || hook_recipient != msg.reply_target {
+                                tracing::warn!(
+                                    from_channel = %msg.channel,
+                                    from_recipient = %msg.reply_target,
+                                    to_channel = %hook_channel,
+                                    to_recipient = %hook_recipient,
+                                    "on_message_sending attempted to rewrite channel routing; only content mutation is applied"
+                                );
+                            }
+
+                            let modified_len = modified_content.chars().count();
+                            if modified_len > CHANNEL_HOOK_MAX_OUTBOUND_CHARS {
+                                tracing::warn!(
+                                    limit = CHANNEL_HOOK_MAX_OUTBOUND_CHARS,
+                                    attempted = modified_len,
+                                    "hook-modified outbound content exceeded limit; truncating"
+                                );
+                                modified_content = truncate_with_ellipsis(
+                                    &modified_content,
+                                    CHANNEL_HOOK_MAX_OUTBOUND_CHARS,
+                                );
+                            }
+
+                            if modified_content != outbound_response {
+                                tracing::info!(
+                                    channel = %msg.channel,
+                                    sender = %msg.sender,
+                                    before_len = outbound_response.chars().count(),
+                                    after_len = modified_content.chars().count(),
+                                    "outgoing message content modified by hook"
+                                );
+                            }
+
+                            outbound_response = modified_content;
+                        }
                     }
-                } else if let Err(e) = channel
-                    .send(
-                        &SendMessage::new(delivered_response, &msg.reply_target)
-                            .in_thread(msg.thread_ts.clone()),
-                    )
-                    .await
+                }
+
+                let sanitized_response =
+                    sanitize_channel_response(&outbound_response, ctx.tools_registry.as_ref());
+                let delivered_response = if sanitized_response.is_empty()
+                    && !outbound_response.trim().is_empty()
                 {
-                    eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
+                    "I encountered malformed tool-call output and could not produce a safe reply. Please try again.".to_string()
+                } else {
+                    sanitized_response
+                };
+
+                // Extract condensed tool-use context from the history messages
+                // added during run_tool_call_loop, so the LLM retains awareness
+                // of what it did on subsequent turns.
+                let tool_summary = extract_tool_context_summary(&history, history_len_before_tools);
+                let history_response = if tool_summary.is_empty() || msg.channel == "telegram" {
+                    delivered_response.clone()
+                } else {
+                    format!("{tool_summary}\n{delivered_response}")
+                };
+
+                append_sender_turn(
+                    ctx.as_ref(),
+                    &history_key,
+                    ChatMessage::assistant(&history_response),
+                );
+                println!(
+                    "  🤖 Reply ({}ms): {}",
+                    started_at.elapsed().as_millis(),
+                    truncate_with_ellipsis(&delivered_response, 80)
+                );
+                if let Some(channel) = target_channel.as_ref() {
+                    if let Some(ref draft_id) = draft_message_id {
+                        if let Err(e) = channel
+                            .finalize_draft(&msg.reply_target, draft_id, &delivered_response)
+                            .await
+                        {
+                            tracing::warn!("Failed to finalize draft: {e}; sending as new message");
+                            let _ = channel
+                                .send(
+                                    &SendMessage::new(&delivered_response, &msg.reply_target)
+                                        .in_thread(msg.thread_ts.clone()),
+                                )
+                                .await;
+                        }
+                    } else if let Err(e) = channel
+                        .send(
+                            &SendMessage::new(delivered_response, &msg.reply_target)
+                                .in_thread(msg.thread_ts.clone()),
+                        )
+                        .await
+                    {
+                        eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
+                    }
                 }
             }
         }
@@ -3091,6 +3671,14 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .telegram
         .as_ref()
         .is_some_and(|tg| tg.interrupt_on_new_message);
+    let tool_security_runtime = build_tool_security_runtime(&config)?;
+    let otp_prompt_handler = if config.security.otp.enabled && tool_security_runtime.is_some() {
+        Some(Arc::new(OtpPromptHandler::new(
+            config.security.otp.prompt_timeout_secs,
+        )))
+    } else {
+        None
+    };
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
@@ -3125,7 +3713,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
         } else {
             None
         },
-        tool_security: build_tool_security_runtime(&config)?,
+        tool_security: tool_security_runtime,
+        otp_prompt_handler,
         non_cli_excluded_tools: Arc::new(config.autonomy.non_cli_excluded_tools.clone()),
     });
 
@@ -3201,6 +3790,136 @@ mod tests {
             channel_message_timeout_budget_secs(300, 10),
             300 * CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP
         );
+    }
+
+    #[test]
+    fn supports_estop_commands_are_channel_scoped() {
+        assert!(supports_estop_commands("telegram"));
+        assert!(supports_estop_commands("discord"));
+        assert!(supports_estop_commands("slack"));
+        assert!(supports_estop_commands("mattermost"));
+        assert!(!supports_estop_commands("whatsapp"));
+        assert!(!supports_estop_commands("linq"));
+    }
+
+    #[test]
+    fn parse_estop_command_covers_primary_variants() {
+        assert_eq!(parse_estop_command(&[]), ChannelEstopCommand::EngageKillAll);
+        assert_eq!(
+            parse_estop_command(&["network"]),
+            ChannelEstopCommand::EngageNetworkKill
+        );
+        assert_eq!(
+            parse_estop_command(&["block", "Chase.com", " PayPal.com "]),
+            ChannelEstopCommand::EngageDomainBlock(vec!["chase.com".into(), "paypal.com".into()])
+        );
+        assert_eq!(
+            parse_estop_command(&["freeze", "Shell", " browser_open "]),
+            ChannelEstopCommand::EngageToolFreeze(vec!["shell".into(), "browser_open".into()])
+        );
+        assert_eq!(parse_estop_command(&["block"]), ChannelEstopCommand::Help);
+        assert_eq!(
+            parse_estop_command(&["unknown-subcommand"]),
+            ChannelEstopCommand::Help
+        );
+    }
+
+    #[test]
+    fn parse_estop_resume_command_covers_modes_and_validation() {
+        assert_eq!(
+            parse_estop_resume_command(&["123456"]),
+            ChannelEstopCommand::ResumeAll {
+                otp: "123456".into()
+            }
+        );
+        assert_eq!(
+            parse_estop_resume_command(&["all", "123456"]),
+            ChannelEstopCommand::ResumeAll {
+                otp: "123456".into()
+            }
+        );
+        assert_eq!(
+            parse_estop_resume_command(&["kill-all", "123456"]),
+            ChannelEstopCommand::ResumeKillAll {
+                otp: "123456".into()
+            }
+        );
+        assert_eq!(
+            parse_estop_resume_command(&["network", "123456"]),
+            ChannelEstopCommand::ResumeNetwork {
+                otp: "123456".into()
+            }
+        );
+        assert_eq!(
+            parse_estop_resume_command(&["block", "Bank.Example.com", "123456"]),
+            ChannelEstopCommand::ResumeDomains {
+                domains: vec!["bank.example.com".into()],
+                otp: "123456".into(),
+            }
+        );
+        assert_eq!(
+            parse_estop_resume_command(&["freeze", "shell", "browser_open", "654321"]),
+            ChannelEstopCommand::ResumeTools {
+                tools: vec!["shell".into(), "browser_open".into()],
+                otp: "654321".into(),
+            }
+        );
+        assert_eq!(parse_estop_resume_command(&[]), ChannelEstopCommand::Help);
+        assert_eq!(
+            parse_estop_resume_command(&["block", "123456"]),
+            ChannelEstopCommand::Help
+        );
+        assert_eq!(
+            parse_estop_resume_command(&["kill-all", "123456", "extra"]),
+            ChannelEstopCommand::Help
+        );
+    }
+
+    #[test]
+    fn parse_runtime_command_routes_estop_for_supported_channels() {
+        assert_eq!(
+            parse_runtime_command("telegram", "/estop resume network 123456"),
+            Some(ChannelRuntimeCommand::Estop(
+                ChannelEstopCommand::ResumeNetwork {
+                    otp: "123456".into(),
+                }
+            ))
+        );
+        assert_eq!(
+            parse_runtime_command("discord", "/estop@ZeroClaw status"),
+            Some(ChannelRuntimeCommand::Estop(ChannelEstopCommand::Status))
+        );
+    }
+
+    #[test]
+    fn parse_runtime_command_rejects_estop_for_unsupported_channels() {
+        assert_eq!(parse_runtime_command("whatsapp", "/estop status"), None);
+        assert_eq!(parse_runtime_command("linq", "/estop"), None);
+    }
+
+    #[test]
+    fn parse_and_format_otp_required_payloads_are_stable() {
+        let required = OtpRequired::for_domain("browser_open", "chase.com", "url=https://...");
+        let encoded = serde_json::to_string(&required).unwrap();
+        let parsed = parse_otp_required_response(&encoded).expect("valid otp_required payload");
+        assert_eq!(parsed.response_type, "otp_required");
+        assert_eq!(parsed.tool_name, "browser_open");
+        assert_eq!(parsed.domain.as_deref(), Some("chase.com"));
+
+        let prompt = format_channel_otp_prompt(&parsed, 90);
+        assert!(prompt.contains("Authorization required"));
+        assert!(prompt.contains("chase.com"));
+        assert!(prompt.contains("90 seconds"));
+
+        let mut invalid = serde_json::to_value(&required).unwrap();
+        invalid["type"] = serde_json::Value::String("not-otp-required".to_string());
+        assert!(parse_otp_required_response(&invalid.to_string()).is_none());
+    }
+
+    #[test]
+    fn execute_channel_estop_command_reports_missing_runtime() {
+        let rendered = execute_channel_estop_command(ChannelEstopCommand::Status, None);
+        assert!(rendered.contains("security runtime is not enabled"));
     }
 
     #[test]
@@ -3340,6 +4059,7 @@ mod tests {
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             hooks: None,
             tool_security: None,
+            otp_prompt_handler: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         };
 
@@ -3820,6 +4540,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             tool_security: None,
+            otp_prompt_handler: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
@@ -3880,6 +4601,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             tool_security: None,
+            otp_prompt_handler: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
@@ -3954,6 +4676,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             tool_security: None,
+            otp_prompt_handler: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
@@ -4014,6 +4737,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             tool_security: None,
+            otp_prompt_handler: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
@@ -4083,6 +4807,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             tool_security: None,
+            otp_prompt_handler: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
@@ -4173,6 +4898,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             tool_security: None,
+            otp_prompt_handler: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
@@ -4245,6 +4971,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             tool_security: None,
+            otp_prompt_handler: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
@@ -4332,6 +5059,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             tool_security: None,
+            otp_prompt_handler: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
@@ -4404,6 +5132,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             tool_security: None,
+            otp_prompt_handler: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
@@ -4465,6 +5194,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             tool_security: None,
+            otp_prompt_handler: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
@@ -4637,6 +5367,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             tool_security: None,
+            otp_prompt_handler: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
@@ -4718,6 +5449,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             tool_security: None,
+            otp_prompt_handler: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
@@ -4811,6 +5543,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             tool_security: None,
+            otp_prompt_handler: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
@@ -4886,6 +5619,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             tool_security: None,
+            otp_prompt_handler: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
@@ -4946,6 +5680,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             tool_security: None,
+            otp_prompt_handler: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
@@ -5463,6 +6198,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             tool_security: None,
+            otp_prompt_handler: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
@@ -5549,6 +6285,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             tool_security: None,
+            otp_prompt_handler: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
@@ -5635,6 +6372,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             tool_security: None,
+            otp_prompt_handler: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
@@ -6183,6 +6921,7 @@ This is an example JSON object for profile settings."#;
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             tool_security: None,
+            otp_prompt_handler: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 

@@ -30,6 +30,7 @@ pub mod firejail;
 #[cfg(feature = "sandbox-landlock")]
 pub mod landlock;
 pub mod otp;
+pub mod otp_prompt;
 pub mod pairing;
 pub mod policy;
 pub mod secrets;
@@ -46,6 +47,8 @@ pub use domain_matcher::DomainMatcher;
 pub use estop::{EstopLevel, EstopManager, EstopState, ResumeSelector};
 #[allow(unused_imports)]
 pub use otp::{OtpApprovalCache, OtpValidator};
+#[allow(unused_imports)]
+pub use otp_prompt::{OtpApproved, OtpDenied, OtpPending, OtpPromptHandler};
 #[allow(unused_imports)]
 pub use pairing::PairingGuard;
 pub use policy::{AutonomyLevel, SecurityPolicy};

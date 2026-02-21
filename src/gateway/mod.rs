@@ -12,6 +12,7 @@ pub mod sse;
 pub mod static_files;
 pub mod ws;
 
+use crate::agent::loop_::{build_tool_security_runtime, process_message_with_security_runtime};
 use crate::channels::{Channel, LinqChannel, NextcloudTalkChannel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
 use crate::cost::CostTracker;
@@ -19,7 +20,7 @@ use crate::memory::{self, Memory, MemoryCategory};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
-use crate::security::SecurityPolicy;
+use crate::security::{EstopLevel, OtpPromptHandler, OtpRequired, ResumeSelector, SecurityPolicy};
 use crate::tools;
 use crate::tools::traits::ToolSpec;
 use crate::util::truncate_with_ellipsis;
@@ -47,6 +48,8 @@ pub const MAX_BODY_SIZE: usize = 65_536;
 pub const REQUEST_TIMEOUT_SECS: u64 = 30;
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
+/// Shared channel key for webhook OTP prompts.
+const OTP_WEBHOOK_CHANNEL: &str = "gateway_webhook";
 /// Fallback max distinct client keys tracked in gateway rate limiter.
 pub const RATE_LIMIT_MAX_KEYS_DEFAULT: usize = 10_000;
 /// Fallback max distinct idempotency keys retained in gateway memory.
@@ -152,14 +155,25 @@ impl SlidingWindowRateLimiter {
 pub struct GatewayRateLimiter {
     pair: SlidingWindowRateLimiter,
     webhook: SlidingWindowRateLimiter,
+    estop_write: SlidingWindowRateLimiter,
 }
 
 impl GatewayRateLimiter {
     fn new(pair_per_minute: u32, webhook_per_minute: u32, max_keys: usize) -> Self {
+        Self::new_with_estop(pair_per_minute, webhook_per_minute, 10, max_keys)
+    }
+
+    fn new_with_estop(
+        pair_per_minute: u32,
+        webhook_per_minute: u32,
+        estop_write_per_minute: u32,
+        max_keys: usize,
+    ) -> Self {
         let window = Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
         Self {
             pair: SlidingWindowRateLimiter::new(pair_per_minute, window, max_keys),
             webhook: SlidingWindowRateLimiter::new(webhook_per_minute, window, max_keys),
+            estop_write: SlidingWindowRateLimiter::new(estop_write_per_minute, window, max_keys),
         }
     }
 
@@ -169,6 +183,10 @@ impl GatewayRateLimiter {
 
     fn allow_webhook(&self, key: &str) -> bool {
         self.webhook.allow(key)
+    }
+
+    fn allow_estop_write(&self, key: &str) -> bool {
+        self.estop_write.allow(key)
     }
 }
 
@@ -299,6 +317,10 @@ pub struct AppState {
     pub observer: Arc<dyn crate::observability::Observer>,
     /// Registered tool specs (for web dashboard tools page)
     pub tools_registry: Arc<Vec<ToolSpec>>,
+    /// Shared tool security runtime (OTP + estop) for gateway flows.
+    pub(crate) tool_security_runtime: Option<Arc<crate::agent::loop_::ToolSecurityRuntime>>,
+    /// Shared OTP prompt coordinator used by webhook challenge/approve flow.
+    pub(crate) otp_prompt_handler: Option<Arc<OtpPromptHandler>>,
     /// Cost tracker (optional, for web dashboard cost page)
     pub cost_tracker: Option<Arc<CostTracker>>,
     /// SSE broadcast channel for real-time events
@@ -517,9 +539,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         config.gateway.rate_limit_max_keys,
         RATE_LIMIT_MAX_KEYS_DEFAULT,
     );
-    let rate_limiter = Arc::new(GatewayRateLimiter::new(
+    let rate_limiter = Arc::new(GatewayRateLimiter::new_with_estop(
         config.gateway.pair_rate_limit_per_minute,
         config.gateway.webhook_rate_limit_per_minute,
+        config.gateway.estop_write_rate_limit_per_minute,
         rate_limit_max_keys,
     ));
     let idempotency_max_keys = normalize_max_keys(
@@ -556,6 +579,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     println!("  🌐 Web Dashboard: http://{display_addr}/");
     println!("  POST /pair      — pair a new client (X-Pairing-Code header)");
     println!("  POST /webhook   — {{\"message\": \"your prompt\"}}");
+    println!("  POST /webhook/approve — {{\"otp\": \"123456\"}}");
+    println!("  POST /estop     — engage emergency-stop level");
+    println!("  POST /estop/resume — resume emergency-stop level(s)");
+    println!("  GET  /estop/status — emergency-stop status");
     if whatsapp_channel.is_some() {
         println!("  GET  /whatsapp  — Meta webhook verification");
         println!("  POST /whatsapp  — WhatsApp message webhook");
@@ -597,6 +624,14 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             crate::observability::create_observer(&config.observability),
             event_tx.clone(),
         ));
+    let tool_security_runtime = build_tool_security_runtime(&config)?;
+    let otp_prompt_handler = if config.security.otp.enabled && tool_security_runtime.is_some() {
+        Some(Arc::new(OtpPromptHandler::new(
+            config.security.otp.prompt_timeout_secs,
+        )))
+    } else {
+        None
+    };
 
     let state = AppState {
         config: config_state,
@@ -618,6 +653,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         nextcloud_talk_webhook_secret,
         observer: broadcast_observer,
         tools_registry,
+        tool_security_runtime,
+        otp_prompt_handler,
         cost_tracker,
         event_tx,
     };
@@ -634,6 +671,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/metrics", get(handle_metrics))
         .route("/pair", post(handle_pair))
         .route("/webhook", post(handle_webhook))
+        .route("/webhook/approve", post(handle_webhook_approve))
+        .route("/estop", post(handle_estop_engage))
+        .route("/estop/resume", post(handle_estop_resume))
+        .route("/estop/status", get(handle_estop_status))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
         .route("/linq", post(handle_linq_webhook))
@@ -831,13 +872,166 @@ async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Res
 /// Full-featured chat with tools for channel handlers (WhatsApp, Linq, Nextcloud Talk).
 async fn run_gateway_chat_with_tools(state: &AppState, message: &str) -> anyhow::Result<String> {
     let config = state.config.lock().clone();
-    crate::agent::process_message(config, message).await
+    process_message_with_security_runtime(config, message, state.tool_security_runtime.clone())
+        .await
 }
 
 /// Webhook request body
 #[derive(serde::Deserialize)]
 pub struct WebhookBody {
     pub message: String,
+}
+
+/// OTP approval request body for pending webhook authorization challenges.
+#[derive(serde::Deserialize)]
+pub struct WebhookApproveBody {
+    pub otp: String,
+}
+
+#[derive(serde::Deserialize)]
+struct GatewayEstopRequest {
+    level: String,
+    #[serde(default)]
+    targets: Vec<String>,
+    #[allow(dead_code)]
+    reason: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct GatewayEstopResumeRequest {
+    level: Option<String>,
+    #[serde(default)]
+    targets: Vec<String>,
+    otp: String,
+}
+
+fn parse_bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|auth| auth.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn gateway_operator_id(rate_key: &str, token: Option<&str>) -> String {
+    if let Some(token) = token {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(token.as_bytes());
+        let fingerprint = hex::encode(&digest)[..16].to_string();
+        format!("token:{fingerprint}")
+    } else {
+        format!("client:{rate_key}")
+    }
+}
+
+fn parse_otp_required_payload(response: &str) -> Option<OtpRequired> {
+    let payload = serde_json::from_str::<OtpRequired>(response).ok()?;
+    (payload.response_type == "otp_required").then_some(payload)
+}
+
+fn is_six_digit_otp(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.len() == 6 && trimmed.chars().all(|c| c.is_ascii_digit())
+}
+
+fn otp_required_webhook_body(required: &OtpRequired, timeout_secs: u64) -> serde_json::Value {
+    serde_json::json!({
+        "status": "otp_required",
+        "action": required.tool_name,
+        "parameters_summary": required.parameters_summary,
+        "domain_classification": serde_json::Value::Null,
+        "prompt": required.prompt,
+        "approval_endpoint": "/webhook/approve",
+        "timeout_secs": timeout_secs,
+    })
+}
+
+fn estop_state_payload(state: &crate::security::EstopState) -> serde_json::Value {
+    serde_json::json!({
+        "kill_all": state.kill_all,
+        "network_kill": state.network_kill,
+        "blocked_domains": state.blocked_domains,
+        "frozen_tools": state.frozen_tools,
+        "updated_at": state.updated_at,
+        "engaged": state.is_engaged(),
+    })
+}
+
+fn parse_estop_engage_level(level: &str, targets: &[String]) -> Result<EstopLevel, String> {
+    match level.trim().to_ascii_lowercase().as_str() {
+        "kill-all" | "kill_all" | "killall" => Ok(EstopLevel::KillAll),
+        "network-kill" | "network_kill" | "network" => Ok(EstopLevel::NetworkKill),
+        "domain-block" | "domain_block" | "domain" | "block" => {
+            if targets.is_empty() {
+                Err("`targets` must include at least one domain for domain-block".to_string())
+            } else {
+                Ok(EstopLevel::DomainBlock(
+                    targets
+                        .iter()
+                        .map(|item| item.to_ascii_lowercase())
+                        .collect(),
+                ))
+            }
+        }
+        "tool-freeze" | "tool_freeze" | "freeze" | "tool" => {
+            if targets.is_empty() {
+                Err("`targets` must include at least one tool for tool-freeze".to_string())
+            } else {
+                Ok(EstopLevel::ToolFreeze(
+                    targets
+                        .iter()
+                        .map(|item| item.to_ascii_lowercase())
+                        .collect(),
+                ))
+            }
+        }
+        other => Err(format!("Unsupported estop level: {other}")),
+    }
+}
+
+fn parse_estop_resume_selector(
+    level: Option<&str>,
+    targets: &[String],
+) -> Result<Option<ResumeSelector>, String> {
+    let Some(level) = level.map(str::trim).filter(|item| !item.is_empty()) else {
+        return Ok(None);
+    };
+
+    let selector = match level.to_ascii_lowercase().as_str() {
+        "all" => return Ok(None),
+        "kill-all" | "kill_all" | "killall" => ResumeSelector::KillAll,
+        "network-kill" | "network_kill" | "network" => ResumeSelector::Network,
+        "domain-block" | "domain_block" | "domain" | "block" => {
+            if targets.is_empty() {
+                return Err(
+                    "`targets` must include at least one domain for domain-block resume"
+                        .to_string(),
+                );
+            }
+            ResumeSelector::Domains(
+                targets
+                    .iter()
+                    .map(|item| item.to_ascii_lowercase())
+                    .collect(),
+            )
+        }
+        "tool-freeze" | "tool_freeze" | "freeze" | "tool" => {
+            if targets.is_empty() {
+                return Err(
+                    "`targets` must include at least one tool for tool-freeze resume".to_string(),
+                );
+            }
+            ResumeSelector::Tools(
+                targets
+                    .iter()
+                    .map(|item| item.to_ascii_lowercase())
+                    .collect(),
+            )
+        }
+        other => return Err(format!("Unsupported estop resume level: {other}")),
+    };
+    Ok(Some(selector))
 }
 
 /// POST /webhook — main webhook endpoint
@@ -849,6 +1043,7 @@ async fn handle_webhook(
 ) -> impl IntoResponse {
     let rate_key =
         client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+    let bearer_token = parse_bearer_token(&headers);
     if !state.rate_limiter.allow_webhook(&rate_key) {
         tracing::warn!("/webhook rate limit exceeded");
         let err = serde_json::json!({
@@ -860,11 +1055,7 @@ async fn handle_webhook(
 
     // ── Bearer token auth (pairing) ──
     if state.pairing.require_pairing() {
-        let auth = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let token = auth.strip_prefix("Bearer ").unwrap_or("");
+        let token = bearer_token.unwrap_or("");
         if !state.pairing.is_authenticated(token) {
             tracing::warn!("Webhook: rejected — not paired / invalid bearer token");
             let err = serde_json::json!({
@@ -955,7 +1146,16 @@ async fn handle_webhook(
             messages_count: 1,
         });
 
-    match run_gateway_chat_simple(&state, message).await {
+    let use_security_flow =
+        state.tool_security_runtime.is_some() && state.otp_prompt_handler.is_some();
+    let operator_id = gateway_operator_id(&rate_key, bearer_token);
+    let response_result = if use_security_flow {
+        run_gateway_chat_with_tools(&state, message).await
+    } else {
+        run_gateway_chat_simple(&state, message).await
+    };
+
+    match response_result {
         Ok(response) => {
             let duration = started_at.elapsed();
             state
@@ -981,6 +1181,22 @@ async fn handle_webhook(
                     tokens_used: None,
                     cost_usd: None,
                 });
+
+            if use_security_flow {
+                if let (Some(handler), Some(required)) = (
+                    state.otp_prompt_handler.as_ref(),
+                    parse_otp_required_payload(&response),
+                ) {
+                    handler.prompt(
+                        OTP_WEBHOOK_CHANNEL,
+                        operator_id,
+                        required.clone(),
+                        serde_json::json!({ "message": message }),
+                    );
+                    let body = otp_required_webhook_body(&required, handler.timeout_secs());
+                    return (StatusCode::ACCEPTED, Json(body));
+                }
+            }
 
             let body = serde_json::json!({"response": response, "model": state.model});
             (StatusCode::OK, Json(body))
@@ -1022,6 +1238,484 @@ async fn handle_webhook(
             tracing::error!("Webhook provider error: {}", sanitized);
             let err = serde_json::json!({"error": "LLM request failed"});
             (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+        }
+    }
+}
+
+/// POST /webhook/approve — approve and continue a pending webhook OTP challenge.
+async fn handle_webhook_approve(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Result<Json<WebhookApproveBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    let rate_key =
+        client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+    if !state.rate_limiter.allow_webhook(&rate_key) {
+        let err = serde_json::json!({
+            "error": "Too many webhook requests. Please retry later.",
+            "retry_after": RATE_LIMIT_WINDOW_SECS,
+        });
+        return (StatusCode::TOO_MANY_REQUESTS, Json(err));
+    }
+
+    let token = parse_bearer_token(&headers);
+    if state.pairing.require_pairing() {
+        let Some(token) = token else {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+                })),
+            );
+        };
+        if !state.pairing.is_authenticated(token) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+                })),
+            );
+        }
+    }
+
+    if let Some(ref secret_hash) = state.webhook_secret_hash {
+        let header_hash = headers
+            .get("X-Webhook-Secret")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(hash_webhook_secret);
+        match header_hash {
+            Some(val) if constant_time_eq(&val, secret_hash.as_ref()) => {}
+            _ => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({
+                        "error": "Unauthorized — invalid or missing X-Webhook-Secret header"
+                    })),
+                );
+            }
+        }
+    }
+
+    let Json(request) = match body {
+        Ok(body) => body,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    serde_json::json!({"error": "Invalid JSON body. Expected: {\"otp\": \"123456\"}"}),
+                ),
+            );
+        }
+    };
+
+    if !is_six_digit_otp(&request.otp) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "OTP must be a 6-digit code"})),
+        );
+    }
+
+    let Some(handler) = state.otp_prompt_handler.as_ref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "No pending OTP flow is enabled"})),
+        );
+    };
+    let Some(runtime) = state.tool_security_runtime.as_ref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Security runtime is not enabled"})),
+        );
+    };
+
+    let operator_id = gateway_operator_id(&rate_key, token);
+    let Some(pending) = handler.pending_for_operator(OTP_WEBHOOK_CHANNEL, &operator_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "No pending OTP challenge"})),
+        );
+    };
+
+    let approved = match handler.resolve(&pending.pending_id, &request.otp, |required, code| {
+        runtime.approve_otp_required(required, code)
+    }) {
+        Ok(approved) => approved,
+        Err(denied) => {
+            let status = if denied.timed_out {
+                StatusCode::REQUEST_TIMEOUT
+            } else if denied.reason.to_ascii_lowercase().contains("invalid otp") {
+                StatusCode::UNAUTHORIZED
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            return (
+                status,
+                Json(serde_json::json!({
+                    "status": "otp_denied",
+                    "error": denied.reason,
+                    "timed_out": denied.timed_out,
+                })),
+            );
+        }
+    };
+
+    let Some(message) = approved
+        .original_context
+        .get("message")
+        .and_then(|value| value.as_str())
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Pending OTP context is malformed"})),
+        );
+    };
+
+    match run_gateway_chat_with_tools(&state, message).await {
+        Ok(response) => {
+            if let Some(required) = parse_otp_required_payload(&response) {
+                handler.prompt(
+                    OTP_WEBHOOK_CHANNEL,
+                    operator_id,
+                    required.clone(),
+                    serde_json::json!({ "message": message }),
+                );
+                return (
+                    StatusCode::ACCEPTED,
+                    Json(otp_required_webhook_body(&required, handler.timeout_secs())),
+                );
+            }
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "ok",
+                    "response": response,
+                    "model": state.model
+                })),
+            )
+        }
+        Err(err) => {
+            let sanitized = providers::sanitize_api_error(&err.to_string());
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "error": sanitized,
+                })),
+            )
+        }
+    }
+}
+
+/// GET /estop/status — return current emergency-stop state.
+async fn handle_estop_status(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let rate_key =
+        client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+    let token = parse_bearer_token(&headers);
+    if state.pairing.require_pairing() {
+        let Some(token) = token else {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+                })),
+            );
+        };
+        if !state.pairing.is_authenticated(token) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+                })),
+            );
+        }
+    }
+
+    let Some(runtime) = state.tool_security_runtime.as_ref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Security runtime is not enabled"})),
+        );
+    };
+
+    match runtime.estop_status() {
+        Ok(status) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "ok",
+                "operator": gateway_operator_id(&rate_key, token),
+                "state": estop_state_payload(&status),
+            })),
+        ),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": err})),
+        ),
+    }
+}
+
+/// POST /estop — engage emergency-stop state.
+async fn handle_estop_engage(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Result<Json<GatewayEstopRequest>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    let rate_key =
+        client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+    if !state.rate_limiter.allow_estop_write(&rate_key) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "Too many estop write requests. Please retry later.",
+                "retry_after": RATE_LIMIT_WINDOW_SECS,
+            })),
+        );
+    }
+
+    let token = parse_bearer_token(&headers);
+    if state.pairing.require_pairing() {
+        let Some(token) = token else {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+                })),
+            );
+        };
+        if !state.pairing.is_authenticated(token) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+                })),
+            );
+        }
+    }
+
+    let Json(request) = match body {
+        Ok(body) => body,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "Invalid JSON body. Expected level/targets payload."
+                })),
+            );
+        }
+    };
+
+    let Some(runtime) = state.tool_security_runtime.as_ref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Security runtime is not enabled"})),
+        );
+    };
+
+    let level = match parse_estop_engage_level(&request.level, &request.targets) {
+        Ok(level) => level,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": err})),
+            )
+        }
+    };
+
+    match runtime.estop_engage(level) {
+        Ok(status) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "ok",
+                "state": estop_state_payload(&status),
+            })),
+        ),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": err})),
+        ),
+    }
+}
+
+/// POST /estop/resume — resume emergency-stop state with OTP validation.
+async fn handle_estop_resume(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Result<Json<GatewayEstopResumeRequest>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    let rate_key =
+        client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+    if !state.rate_limiter.allow_estop_write(&rate_key) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "Too many estop write requests. Please retry later.",
+                "retry_after": RATE_LIMIT_WINDOW_SECS,
+            })),
+        );
+    }
+
+    let token = parse_bearer_token(&headers);
+    if state.pairing.require_pairing() {
+        let Some(token) = token else {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+                })),
+            );
+        };
+        if !state.pairing.is_authenticated(token) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+                })),
+            );
+        }
+    }
+
+    let Json(request) = match body {
+        Ok(body) => body,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "Invalid JSON body. Expected level/targets/otp payload."
+                })),
+            );
+        }
+    };
+
+    if !is_six_digit_otp(&request.otp) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "OTP must be a 6-digit code"})),
+        );
+    }
+
+    let Some(runtime) = state.tool_security_runtime.as_ref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Security runtime is not enabled"})),
+        );
+    };
+
+    let selector = match parse_estop_resume_selector(request.level.as_deref(), &request.targets) {
+        Ok(selector) => selector,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": err})),
+            )
+        }
+    };
+
+    let resume_result = if let Some(selector) = selector {
+        runtime.estop_resume(selector, Some(&request.otp))
+    } else {
+        let current = match runtime.estop_status() {
+            Ok(status) => status,
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": err})),
+                );
+            }
+        };
+
+        if current.kill_all {
+            if let Err(err) = runtime.estop_resume(ResumeSelector::KillAll, Some(&request.otp)) {
+                return if err.to_ascii_lowercase().contains("invalid otp") {
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        Json(serde_json::json!({"error": err})),
+                    )
+                } else {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"error": err})),
+                    )
+                };
+            }
+        }
+        if !current.blocked_domains.is_empty() {
+            if let Err(err) = runtime.estop_resume(
+                ResumeSelector::Domains(current.blocked_domains.clone()),
+                Some(&request.otp),
+            ) {
+                return if err.to_ascii_lowercase().contains("invalid otp") {
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        Json(serde_json::json!({"error": err})),
+                    )
+                } else {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"error": err})),
+                    )
+                };
+            }
+        }
+        if !current.frozen_tools.is_empty() {
+            if let Err(err) = runtime.estop_resume(
+                ResumeSelector::Tools(current.frozen_tools.clone()),
+                Some(&request.otp),
+            ) {
+                return if err.to_ascii_lowercase().contains("invalid otp") {
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        Json(serde_json::json!({"error": err})),
+                    )
+                } else {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"error": err})),
+                    )
+                };
+            }
+        }
+        if current.network_kill {
+            if let Err(err) = runtime.estop_resume(ResumeSelector::Network, Some(&request.otp)) {
+                return if err.to_ascii_lowercase().contains("invalid otp") {
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        Json(serde_json::json!({"error": err})),
+                    )
+                } else {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"error": err})),
+                    )
+                };
+            }
+        }
+        runtime.estop_status()
+    };
+
+    match resume_result {
+        Ok(status) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "ok",
+                "state": estop_state_payload(&status),
+            })),
+        ),
+        Err(err) => {
+            let status = if err.to_ascii_lowercase().contains("invalid otp") {
+                StatusCode::UNAUTHORIZED
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (status, Json(serde_json::json!({"error": err})))
         }
     }
 }
@@ -1452,6 +2146,165 @@ mod tests {
         assert_clone::<AppState>();
     }
 
+    #[test]
+    fn parse_estop_engage_level_supports_aliases_and_normalizes_targets() {
+        assert!(matches!(
+            parse_estop_engage_level("kill-all", &[]),
+            Ok(EstopLevel::KillAll)
+        ));
+        assert!(matches!(
+            parse_estop_engage_level("network", &[]),
+            Ok(EstopLevel::NetworkKill)
+        ));
+        assert_eq!(
+            parse_estop_engage_level(
+                "block",
+                &[String::from("Chase.COM"), String::from("PayPal.com")]
+            )
+            .unwrap(),
+            EstopLevel::DomainBlock(vec!["chase.com".into(), "paypal.com".into()])
+        );
+        assert_eq!(
+            parse_estop_engage_level("freeze", &[String::from("Shell"), String::from("Browser")])
+                .unwrap(),
+            EstopLevel::ToolFreeze(vec!["shell".into(), "browser".into()])
+        );
+    }
+
+    #[test]
+    fn parse_estop_engage_level_rejects_invalid_inputs() {
+        let no_targets = parse_estop_engage_level("domain-block", &[]).unwrap_err();
+        assert!(no_targets.contains("at least one domain"));
+
+        let unknown = parse_estop_engage_level("unsupported-level", &[]).unwrap_err();
+        assert!(unknown.contains("Unsupported estop level"));
+    }
+
+    #[test]
+    fn parse_estop_resume_selector_supports_aliases_and_all_mode() {
+        assert_eq!(parse_estop_resume_selector(None, &[]).unwrap(), None);
+        assert_eq!(parse_estop_resume_selector(Some("all"), &[]).unwrap(), None);
+        assert_eq!(
+            parse_estop_resume_selector(Some("killall"), &[]).unwrap(),
+            Some(ResumeSelector::KillAll)
+        );
+        assert_eq!(
+            parse_estop_resume_selector(Some("network"), &[]).unwrap(),
+            Some(ResumeSelector::Network)
+        );
+        assert_eq!(
+            parse_estop_resume_selector(
+                Some("block"),
+                &[String::from("Bank.Example.com"), String::from("PayPal.com")]
+            )
+            .unwrap(),
+            Some(ResumeSelector::Domains(vec![
+                "bank.example.com".into(),
+                "paypal.com".into()
+            ]))
+        );
+        assert_eq!(
+            parse_estop_resume_selector(Some("freeze"), &[String::from("Shell")]).unwrap(),
+            Some(ResumeSelector::Tools(vec!["shell".into()]))
+        );
+    }
+
+    #[test]
+    fn parse_estop_resume_selector_rejects_invalid_inputs() {
+        let missing_targets = parse_estop_resume_selector(Some("block"), &[]).unwrap_err();
+        assert!(missing_targets.contains("at least one domain"));
+
+        let unknown = parse_estop_resume_selector(Some("unknown"), &[]).unwrap_err();
+        assert!(unknown.contains("Unsupported estop resume level"));
+    }
+
+    #[test]
+    fn otp_required_webhook_body_contains_approval_metadata() {
+        let required = OtpRequired::for_tool("shell", "command=rm -rf ./build");
+        let body = otp_required_webhook_body(&required, 120);
+        assert_eq!(body["status"], "otp_required");
+        assert_eq!(body["approval_endpoint"], "/webhook/approve");
+        assert_eq!(body["action"], "shell");
+        assert_eq!(body["timeout_secs"], 120);
+    }
+
+    #[test]
+    fn parse_otp_required_payload_requires_expected_type() {
+        let required = OtpRequired::for_domain("browser_open", "chase.com", "url=https://...");
+        let encoded = serde_json::to_string(&required).unwrap();
+        let parsed = parse_otp_required_payload(&encoded).expect("valid payload");
+        assert_eq!(parsed.response_type, "otp_required");
+        assert_eq!(parsed.domain.as_deref(), Some("chase.com"));
+
+        let invalid = serde_json::json!({
+            "type": "other",
+            "scope": "tool",
+            "tool_name": "shell",
+            "parameters_summary": "command=ls",
+            "prompt": "otp needed",
+        });
+        assert!(parse_otp_required_payload(&invalid.to_string()).is_none());
+    }
+
+    #[test]
+    fn gateway_rate_limiter_estop_write_is_independent_and_enforced() {
+        let limiter = GatewayRateLimiter::new_with_estop(2, 2, 1, 100);
+
+        assert!(limiter.allow_estop_write("ip-1"));
+        assert!(!limiter.allow_estop_write("ip-1"));
+
+        // Pair/webhook buckets stay independent from estop-write limits.
+        assert!(limiter.allow_pair("ip-1"));
+        assert!(limiter.allow_webhook("ip-1"));
+    }
+
+    #[tokio::test]
+    async fn estop_resume_rejects_non_six_digit_otp_before_runtime_lookup() {
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider: Arc::new(MockProvider::default()),
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tool_security_runtime: None,
+            otp_prompt_handler: None,
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+        };
+
+        let response = handle_estop_resume(
+            State(state),
+            test_connect_info(),
+            HeaderMap::new(),
+            Ok(Json(GatewayEstopResumeRequest {
+                level: None,
+                targets: Vec::new(),
+                otp: "abc123".into(),
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(body["error"], "OTP must be a 6-digit code");
+    }
+
     #[tokio::test]
     async fn metrics_endpoint_returns_hint_when_prometheus_is_disabled() {
         let state = AppState {
@@ -1474,6 +2327,8 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tool_security_runtime: None,
+            otp_prompt_handler: None,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
         };
@@ -1522,6 +2377,8 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer,
             tools_registry: Arc::new(Vec::new()),
+            tool_security_runtime: None,
+            otp_prompt_handler: None,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
         };
@@ -1887,6 +2744,8 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tool_security_runtime: None,
+            otp_prompt_handler: None,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
         };
@@ -1950,6 +2809,8 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tool_security_runtime: None,
+            otp_prompt_handler: None,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
         };
@@ -2025,6 +2886,8 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tool_security_runtime: None,
+            otp_prompt_handler: None,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
         };
@@ -2072,6 +2935,8 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tool_security_runtime: None,
+            otp_prompt_handler: None,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
         };
@@ -2124,6 +2989,8 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tool_security_runtime: None,
+            otp_prompt_handler: None,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
         };
@@ -2181,6 +3048,8 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tool_security_runtime: None,
+            otp_prompt_handler: None,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
         };
@@ -2234,6 +3103,8 @@ mod tests {
             nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tool_security_runtime: None,
+            otp_prompt_handler: None,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
         };
