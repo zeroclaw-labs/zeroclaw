@@ -520,6 +520,7 @@ impl LarkChannel {
                         tracing::warn!("Lark: ping failed, reconnecting");
                         break;
                     }
+                    tracing::debug!("Lark: ping sent (seq={seq}, last_recv={:.0}s ago)", last_recv.elapsed().as_secs_f64());
                     // GC stale fragments > 5 min
                     let cutoff = Instant::now().checked_sub(Duration::from_secs(300)).unwrap_or(Instant::now());
                     frag_cache.retain(|_, (_, ts)| *ts > cutoff);
@@ -556,7 +557,9 @@ impl LarkChannel {
 
                     // CONTROL frame
                     if frame.method == 0 {
-                        if frame.header_value("type") == "pong" {
+                        let ctrl_type = frame.header_value("type");
+                        if ctrl_type == "pong" {
+                            tracing::debug!("Lark: pong received (seq={})", frame.seq_id);
                             if let Some(p) = &frame.payload {
                                 if let Ok(cfg) = serde_json::from_slice::<WsClientConfig>(p) {
                                     if let Some(secs) = cfg.ping_interval {
@@ -574,6 +577,7 @@ impl LarkChannel {
                     }
 
                     // DATA frame
+                    tracing::debug!("Lark: data frame (method={}, seq={}, headers={:?})", frame.method, frame.seq_id, frame.headers.iter().map(|h| format!("{}={}", h.key, h.value)).collect::<Vec<_>>());
                     let msg_type = frame.header_value("type").to_string();
                     let msg_id   = frame.header_value("message_id").to_string();
                     let sum      = frame.header_value("sum").parse::<usize>().unwrap_or(1);
@@ -605,13 +609,19 @@ impl LarkChannel {
                         } else { continue; }
                     };
 
-                    if msg_type != "event" { continue; }
+                    if msg_type != "event" {
+                        tracing::debug!("Lark: non-event frame type={msg_type}");
+                        continue;
+                    }
 
                     let event: LarkEvent = match serde_json::from_slice(&payload) {
                         Ok(e) => e,
                         Err(e) => { tracing::error!("Lark: event JSON: {e}"); continue; }
                     };
-                    if event.header.event_type != "im.message.receive_v1" { continue; }
+                    if event.header.event_type != "im.message.receive_v1" {
+                        tracing::debug!("Lark: ignoring event_type={}", event.header.event_type);
+                        continue;
+                    }
 
                     let event_payload = event.event;
 
@@ -619,6 +629,8 @@ impl LarkChannel {
                         Ok(r) => r,
                         Err(e) => { tracing::error!("Lark: payload parse: {e}"); continue; }
                     };
+
+                    tracing::debug!("Lark: msg_type={}, chat_type={}, sender_type={}", recv.message.message_type, recv.message.chat_type, recv.sender.sender_type);
 
                     if recv.sender.sender_type == "app" || recv.sender.sender_type == "bot" { continue; }
 
@@ -648,16 +660,16 @@ impl LarkChannel {
                         "text" => {
                             let v: serde_json::Value = match serde_json::from_str(&lark_msg.content) {
                                 Ok(v) => v,
-                                Err(_) => continue,
+                                Err(e) => { tracing::warn!("Lark: text content parse error: {e}, raw={}", lark_msg.content); continue; }
                             };
                             match v.get("text").and_then(|t| t.as_str()).filter(|s| !s.is_empty()) {
                                 Some(t) => t.to_string(),
-                                None => continue,
+                                None => { tracing::warn!("Lark: text content empty or missing 'text' field, raw={}", lark_msg.content); continue; }
                             }
                         }
                         "post" => match parse_post_content(&lark_msg.content) {
                             Some(t) => t,
-                            None => continue,
+                            None => { tracing::warn!("Lark: post content parse returned None, raw={}", lark_msg.content); continue; }
                         },
                         _ => { tracing::debug!("Lark WS: skipping unsupported type '{}'", lark_msg.message_type); continue; }
                     };
@@ -1256,14 +1268,21 @@ fn random_lark_ack_reaction(
 /// placeholder string to the agent.
 fn parse_post_content(content: &str) -> Option<String> {
     let parsed = serde_json::from_str::<serde_json::Value>(content).ok()?;
-    let locale = parsed
-        .get("zh_cn")
-        .or_else(|| parsed.get("en_us"))
-        .or_else(|| {
-            parsed
-                .as_object()
-                .and_then(|m| m.values().find(|v| v.is_object()))
-        })?;
+    // WS events use flat format: {"title":"","content":[[...]]}
+    // Webhook events use locale-wrapped format: {"zh_cn":{"title":"","content":[...]}}
+    let locale = if parsed.get("content").is_some() {
+        // Flat format — the parsed value itself is the locale object
+        &parsed
+    } else {
+        parsed
+            .get("zh_cn")
+            .or_else(|| parsed.get("en_us"))
+            .or_else(|| {
+                parsed
+                    .as_object()
+                    .and_then(|m| m.values().find(|v| v.is_object()))
+            })?
+    };
 
     let mut text = String::new();
 
