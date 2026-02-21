@@ -313,6 +313,8 @@ app_secret = "xxx"
 encrypt_key = ""                    # optional
 verification_token = ""             # optional
 allowed_users = ["*"]
+mention_only = false              # optional: require @mention in groups (DMs always allowed)
+use_feishu = false
 receive_mode = "websocket"          # or "webhook"
 port = 8081                          # required for webhook mode
 ```

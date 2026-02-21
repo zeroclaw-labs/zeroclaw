@@ -3027,9 +3027,11 @@ pub struct LarkConfig {
     /// Allowed user IDs or union IDs (empty = deny all, "*" = allow all)
     #[serde(default)]
     pub allowed_users: Vec<String>,
-    /// Legacy compatibility flag: route this Lark config to Feishu endpoint.
-    ///
-    /// Prefer `[channels_config.feishu]` for new setups.
+    /// When true, only respond to messages that @-mention the bot in groups.
+    /// Direct messages are always processed.
+    #[serde(default)]
+    pub mention_only: bool,
+    /// Whether to use the Feishu (Chinese) endpoint instead of Lark (International)
     #[serde(default)]
     pub use_feishu: bool,
     /// Event receive mode: "websocket" (default) or "webhook"
@@ -6833,6 +6835,7 @@ default_model = "legacy-model"
             encrypt_key: Some("encrypt_key".into()),
             verification_token: Some("verify_token".into()),
             allowed_users: vec!["user_123".into(), "user_456".into()],
+            mention_only: false,
             use_feishu: true,
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
@@ -6855,6 +6858,7 @@ default_model = "legacy-model"
             encrypt_key: Some("encrypt_key".into()),
             verification_token: Some("verify_token".into()),
             allowed_users: vec!["*".into()],
+            mention_only: false,
             use_feishu: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
@@ -6873,6 +6877,7 @@ default_model = "legacy-model"
         assert!(parsed.encrypt_key.is_none());
         assert!(parsed.verification_token.is_none());
         assert!(parsed.allowed_users.is_empty());
+        assert!(!parsed.mention_only);
         assert!(!parsed.use_feishu);
     }
 

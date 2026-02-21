@@ -4797,28 +4797,17 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     );
                 }
 
-                if is_feishu {
-                    config.feishu = Some(FeishuConfig {
-                        app_id,
-                        app_secret,
-                        verification_token,
-                        encrypt_key: None,
-                        allowed_users,
-                        receive_mode,
-                        port,
-                    });
-                } else {
-                    config.lark = Some(LarkConfig {
-                        app_id,
-                        app_secret,
-                        verification_token,
-                        encrypt_key: None,
-                        allowed_users,
-                        use_feishu: false,
-                        receive_mode,
-                        port,
-                    });
-                }
+                config.lark = Some(LarkConfig {
+                    app_id,
+                    app_secret,
+                    verification_token,
+                    encrypt_key: None,
+                    allowed_users,
+                    mention_only: false,
+                    use_feishu,
+                    receive_mode,
+                    port,
+                });
             }
             ChannelMenuChoice::Nostr => {
                 // ── Nostr ──
