@@ -962,7 +962,7 @@ fn create_provider_with_url_and_options(
             key,
             options.reasoning_enabled,
         ))),
-        "gemini" | "google" | "google-gemini" => {
+        "gemini" | "google" | "google-gemini" | "gemini-advanced" | "gemini-sub" => {
             let state_dir = options
                 .zeroclaw_dir
                 .clone()
@@ -1480,6 +1480,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             aliases: &["google", "google-gemini"],
             local: false,
         },
+        ProviderInfo {
+            name: "gemini-advanced",
+            display_name: "Google Gemini Advanced (Subscription OAuth)",
+            aliases: &["gemini-sub"],
+            local: false,
+        },
         // ── OpenAI-compatible providers ──────────────────────
         ProviderInfo {
             name: "venice",
@@ -1987,6 +1993,15 @@ mod tests {
         assert!(create_provider("google-gemini", Some("test-key")).is_ok());
         // Should also work without key (will try CLI auth)
         assert!(create_provider("gemini", None).is_ok());
+    }
+
+    #[test]
+    fn factory_gemini_advanced() {
+        // Subscription provider: works with managed OAuth (no key required)
+        assert!(create_provider("gemini-advanced", None).is_ok());
+        assert!(create_provider("gemini-sub", None).is_ok());
+        // Also accepts an explicit key for API-key based access
+        assert!(create_provider("gemini-advanced", Some("test-key")).is_ok());
     }
 
     #[test]

@@ -627,6 +627,7 @@ fn canonical_provider_name(provider_name: &str) -> &str {
         "grok" => "xai",
         "together" => "together-ai",
         "google" | "google-gemini" => "gemini",
+        "gemini-sub" => "gemini-advanced",
         "kimi_coding" | "kimi_for_coding" => "kimi-code",
         "nvidia-nim" | "build.nvidia.com" => "nvidia",
         "aws-bedrock" => "bedrock",
@@ -682,6 +683,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "llamacpp" => "ggml-org/gpt-oss-20b-GGUF".into(),
         "sglang" | "vllm" | "osaurus" => "default".into(),
         "gemini" => "gemini-2.5-pro".into(),
+        "gemini-advanced" => "gemini-3.1-pro".into(),
         "kimi-code" => "kimi-for-coding".into(),
         "bedrock" => "anthropic.claude-sonnet-4-5-20250929-v1:0".into(),
         "nvidia" => "meta/llama-3.3-70b-instruct".into(),
@@ -1090,6 +1092,20 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
             (
                 "gemini-2.5-flash-lite".to_string(),
                 "Gemini 2.5 Flash-Lite (lowest cost)".to_string(),
+            ),
+        ],
+        "gemini-advanced" => vec![
+            (
+                "gemini-3.1-pro".to_string(),
+                "Gemini 3.1 Pro (subscription, recommended)".to_string(),
+            ),
+            (
+                "gemini-3-pro-preview".to_string(),
+                "Gemini 3 Pro Preview (latest frontier reasoning)".to_string(),
+            ),
+            (
+                "gemini-2.5-pro".to_string(),
+                "Gemini 2.5 Pro (stable reasoning)".to_string(),
             ),
         ],
         _ => vec![("default".to_string(), "Default model".to_string())],
@@ -1936,6 +1952,10 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                 "gemini",
                 "Google Gemini — Gemini 2.0 Flash & Pro (supports CLI auth)",
             ),
+            (
+                "gemini-advanced",
+                "Google Gemini Advanced — Gemini 3.1 Pro (subscription OAuth, no API key)",
+            ),
         ],
         1 => vec![
             ("groq", "Groq — ultra-fast LPU inference"),
@@ -2219,6 +2239,16 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
         }
 
         key
+    } else if canonical_provider_name(provider_name) == "gemini-advanced" {
+        // Gemini Advanced subscription: uses managed OAuth, no API key required
+        print_bullet(&format!(
+            "{} Google Gemini Advanced uses subscription OAuth — no API key needed.",
+            style("ℹ").blue().bold()
+        ));
+        print_bullet("Run: zeroclaw auth login --provider gemini");
+        print_bullet("This will authenticate using your Google account with Gemini Advanced.");
+        println!();
+        String::new() // Empty key — authentication is handled via OAuth profile
     } else if canonical_provider_name(provider_name) == "gemini" {
         // Special handling for Gemini: check for CLI auth first
         if crate::providers::gemini::GeminiProvider::has_cli_credentials() {
@@ -2667,6 +2697,7 @@ fn provider_env_var(name: &str) -> &'static str {
         "cloudflare" | "cloudflare-ai" => "CLOUDFLARE_API_KEY",
         "bedrock" | "aws-bedrock" => "AWS_ACCESS_KEY_ID",
         "gemini" => "GEMINI_API_KEY",
+        "gemini-advanced" => "GEMINI_API_KEY",
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => "NVIDIA_API_KEY",
         "astrai" => "ASTRAI_API_KEY",
         _ => "API_KEY",

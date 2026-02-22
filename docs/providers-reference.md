@@ -31,6 +31,7 @@ credential is not reused for fallback providers.
 | `openai` | — | No | `OPENAI_API_KEY` |
 | `ollama` | — | Yes | `OLLAMA_API_KEY` (optional) |
 | `gemini` | `google`, `google-gemini` | No | `GEMINI_API_KEY`, `GOOGLE_API_KEY` |
+| `gemini-advanced` | `gemini-sub` | No | (subscription OAuth via `zeroclaw auth login --provider gemini`) |
 | `venice` | — | No | `VENICE_API_KEY` |
 | `vercel` | `vercel-ai` | No | `VERCEL_API_KEY` |
 | `cloudflare` | `cloudflare-ai` | No | `CLOUDFLARE_API_KEY` |
@@ -76,6 +77,29 @@ credential is not reused for fallback providers.
 - API key requests use `generativelanguage.googleapis.com/v1beta`
 - Gemini CLI OAuth requests use `cloudcode-pa.googleapis.com/v1internal` with Code Assist request envelope semantics
 - Thinking models (e.g. `gemini-3-pro-preview`) are supported — internal reasoning parts are automatically filtered from the response
+
+### Gemini Advanced Notes (Subscription OAuth)
+
+- Provider ID: `gemini-advanced` (alias: `gemini-sub`)
+- Designed for users with a Google One AI Premium subscription (Gemini Advanced)
+- No API key required — authentication uses managed OAuth via `zeroclaw auth login --provider gemini`
+- Uses the same underlying `cloudcode-pa.googleapis.com/v1internal` endpoint as Gemini CLI OAuth
+- Default model: `gemini-3.1-pro`
+- Available models: `gemini-3.1-pro`, `gemini-3-pro-preview`, `gemini-2.5-pro`
+- OAuth profile is shared with the `gemini` provider (auth-profiles.json)
+
+Setup:
+
+```bash
+zeroclaw auth login --provider gemini
+```
+
+Config example:
+
+```toml
+default_provider = "gemini-advanced"
+default_model = "gemini-3.1-pro"
+```
 
 ### Ollama Vision Notes
 

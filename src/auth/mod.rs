@@ -349,7 +349,9 @@ pub fn normalize_provider(provider: &str) -> Result<String> {
     match normalized.as_str() {
         "openai-codex" | "openai_codex" | "codex" => Ok(OPENAI_CODEX_PROVIDER.to_string()),
         "anthropic" | "claude" | "claude-code" => Ok(ANTHROPIC_PROVIDER.to_string()),
-        "gemini" | "google" | "vertex" => Ok(GEMINI_PROVIDER.to_string()),
+        "gemini" | "google" | "vertex" | "gemini-advanced" | "gemini-sub" => {
+            Ok(GEMINI_PROVIDER.to_string())
+        }
         other if !other.is_empty() => Ok(other.to_string()),
         _ => anyhow::bail!("Provider name cannot be empty"),
     }
