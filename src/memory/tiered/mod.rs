@@ -30,7 +30,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, Mutex};
 
-use crate::memory::tiered::merge::{merge_and_rank, TierWeights, TieredRecallItem};
+use crate::memory::tiered::merge::{merge_and_rank, FactConfidenceLevel, TierWeights, TieredRecallItem};
 
 use crate::memory::traits::{Memory, MemoryCategory, MemoryEntry};
 
@@ -159,6 +159,19 @@ impl Memory for TieredMemory {
                 let base_score = entry.score.unwrap_or(0.5) as f32;
                 let recency = recency_score_from_timestamp(&entry.timestamp);
 
+                let is_fact = entry.key.starts_with("fact:");
+                let fact_confidence = if is_fact {
+                    serde_json::from_str::<crate::memory::tiered::facts::FactEntry>(&entry.content)
+                        .ok()
+                        .map(|f| match f.confidence {
+                            crate::memory::tiered::facts::FactConfidence::High => FactConfidenceLevel::High,
+                            crate::memory::tiered::facts::FactConfidence::Medium => FactConfidenceLevel::Medium,
+                            crate::memory::tiered::facts::FactConfidence::Low => FactConfidenceLevel::Low,
+                        })
+                } else {
+                    None
+                };
+
                 items.push(TieredRecallItem {
                     entry_id: entry.id.clone(),
                     origin_id: entry.id.clone(),
@@ -167,6 +180,8 @@ impl Memory for TieredMemory {
                     recency_score: recency,
                     has_cross_tier_link: false,
                     final_score: 0.0,
+                    is_fact,
+                    fact_confidence,
                 });
 
                 entry_map.insert(entry.id.clone(), entry.clone());

@@ -3,6 +3,16 @@
 use crate::memory::tiered::types::MemoryTier;
 use std::collections::HashSet;
 
+// ── FactConfidenceLevel ──────────────────────────────────────────────────────
+
+/// Confidence level used for fact-first recall boosting.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FactConfidenceLevel {
+    Low,
+    Medium,
+    High,
+}
+
 // ── TieredRecallItem ──────────────────────────────────────────────────────────
 
 /// A single candidate result from any tier, ready to be merged and ranked.
@@ -21,6 +31,10 @@ pub struct TieredRecallItem {
     pub has_cross_tier_link: bool,
     /// Computed by merge_and_rank(), 0.0 before that
     pub final_score: f32,
+    /// True if this entry is a structured fact (key starts with "fact:")
+    pub is_fact: bool,
+    /// Confidence level of the fact, used for scoring boost
+    pub fact_confidence: Option<FactConfidenceLevel>,
 }
 
 // ── TierWeights ───────────────────────────────────────────────────────────────
@@ -31,6 +45,16 @@ pub struct TierWeights {
     pub stm: f32,
     pub mtm: f32,
     pub ltm: f32,
+}
+
+impl Default for TierWeights {
+    fn default() -> Self {
+        Self {
+            stm: 0.45,
+            mtm: 0.35,
+            ltm: 0.20,
+        }
+    }
 }
 
 impl TierWeights {
@@ -49,8 +73,9 @@ impl TierWeights {
 /// Merge candidates from all tiers into a ranked, deduplicated, diverse list.
 ///
 /// Scoring formula:
-///   final_score = tier_weight * base_score + 0.25 * recency_score + link_boost
+///   final_score = tier_weight * base_score + 0.25 * recency_score + link_boost + fact_boost
 ///   where link_boost = 0.15 if has_cross_tier_link else 0.0
+///   and fact_boost = 0.20 (High), 0.10 (Medium), 0.05 (Low), 0.0 (non-fact)
 ///
 /// Deduplication: keep highest final_score per origin_id
 /// Threshold: filter items where final_score < min_threshold
@@ -67,9 +92,20 @@ pub fn merge_and_rank(
         .into_iter()
         .map(|mut item| {
             let link_boost = if item.has_cross_tier_link { 0.15 } else { 0.0 };
+            let fact_boost = if item.is_fact {
+                match &item.fact_confidence {
+                    Some(FactConfidenceLevel::High) => 0.20,
+                    Some(FactConfidenceLevel::Medium) => 0.10,
+                    Some(FactConfidenceLevel::Low) => 0.05,
+                    None => 0.0,
+                }
+            } else {
+                0.0
+            };
             item.final_score = weights.weight_for(item.tier) * item.base_score
                 + 0.25 * item.recency_score
-                + link_boost;
+                + link_boost
+                + fact_boost;
             item
         })
         .collect();
@@ -163,6 +199,8 @@ mod tests {
             recency_score: 1.0 - (age_secs as f32 / 86400.0).min(1.0),
             has_cross_tier_link: false,
             final_score: 0.0,
+            is_fact: false,
+            fact_confidence: None,
         }
     }
 
@@ -238,5 +276,36 @@ mod tests {
         // Should not panic
         let result = merge_and_rank(vec![nan_item, normal], &weights, 0.0, 5);
         assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn fact_entries_get_confidence_boost() {
+        let items = vec![
+            TieredRecallItem {
+                entry_id: "raw-1".into(),
+                origin_id: "raw-1".into(),
+                tier: MemoryTier::Stm,
+                base_score: 0.8,
+                recency_score: 0.5,
+                has_cross_tier_link: false,
+                final_score: 0.0,
+                is_fact: false,
+                fact_confidence: None,
+            },
+            TieredRecallItem {
+                entry_id: "fact-1".into(),
+                origin_id: "fact-1".into(),
+                tier: MemoryTier::Stm,
+                base_score: 0.7,
+                recency_score: 0.5,
+                has_cross_tier_link: false,
+                final_score: 0.0,
+                is_fact: true,
+                fact_confidence: Some(FactConfidenceLevel::High),
+            },
+        ];
+        let weights = TierWeights::default();
+        let results = merge_and_rank(items, &weights, 0.0, 10);
+        assert_eq!(results[0].entry_id, "fact-1");
     }
 }
