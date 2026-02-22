@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use super::traits::PluginCapability;
 
@@ -16,6 +17,25 @@ pub struct PluginManifest {
     pub module_path: String,
     #[serde(default)]
     pub wit_packages: Vec<String>,
+    #[serde(default)]
+    pub tools: Vec<PluginToolManifest>,
+    #[serde(default)]
+    pub providers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginToolManifest {
+    pub name: String,
+    pub description: String,
+    #[serde(default = "default_plugin_tool_parameters")]
+    pub parameters: Value,
+}
+
+fn default_plugin_tool_parameters() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {}
+    })
 }
 
 fn parse_wit_package_version(input: &str) -> anyhow::Result<(&str, u64)> {
@@ -53,6 +73,19 @@ pub fn validate_manifest(manifest: &PluginManifest) -> anyhow::Result<()> {
             );
         }
     }
+    for tool in &manifest.tools {
+        if tool.name.trim().is_empty() {
+            anyhow::bail!("plugin tool name cannot be empty");
+        }
+        if tool.description.trim().is_empty() {
+            anyhow::bail!("plugin tool description cannot be empty");
+        }
+    }
+    for provider in &manifest.providers {
+        if provider.trim().is_empty() {
+            anyhow::bail!("plugin provider name cannot be empty");
+        }
+    }
     Ok(())
 }
 
@@ -77,6 +110,8 @@ mod tests {
             capabilities: vec![],
             module_path: "plugins/demo.wasm".into(),
             wit_packages: vec!["zeroclaw:hooks@1.0.0".into()],
+            tools: vec![],
+            providers: vec![],
         };
         assert!(valid.is_valid());
     }
@@ -89,6 +124,8 @@ mod tests {
             capabilities: vec![],
             module_path: "plugins/demo.wasm".into(),
             wit_packages: vec!["zeroclaw:hooks@2.0.0".into()],
+            tools: vec![],
+            providers: vec![],
         };
         assert!(validate_manifest(&manifest).is_err());
     }
@@ -101,6 +138,8 @@ mod tests {
             capabilities: vec![],
             module_path: "plugins/demo.wasm".into(),
             wit_packages: vec!["zeroclaw:unknown@1.0.0".into()],
+            tools: vec![],
+            providers: vec![],
         };
         assert!(validate_manifest(&manifest).is_err());
     }

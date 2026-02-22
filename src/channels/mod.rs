@@ -2981,6 +2981,10 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 /// Start all configured channels and route messages to the agent
 #[allow(clippy::too_many_lines)]
 pub async fn start_channels(config: Config) -> Result<()> {
+    if let Err(error) = crate::plugins::runtime::initialize_from_config(&config.plugins) {
+        tracing::warn!("plugin registry initialization skipped: {error}");
+    }
+
     let provider_name = resolved_default_provider(&config);
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
