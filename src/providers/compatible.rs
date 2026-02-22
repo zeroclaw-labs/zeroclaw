@@ -33,6 +33,9 @@ pub struct OpenAiCompatibleProvider {
     /// to the first `user` message, then drop the system messages.
     /// Required for providers that reject `role: system` (e.g. MiniMax).
     merge_system_into_user: bool,
+    /// Whether this provider supports OpenAI-style native tool calling.
+    /// When false, tools are injected into the system prompt as text.
+    native_tool_calling: bool,
 }
 
 /// How the provider expects the API key to be sent.
@@ -54,7 +57,7 @@ impl OpenAiCompatibleProvider {
         auth_style: AuthStyle,
     ) -> Self {
         Self::new_with_options(
-            name, base_url, credential, auth_style, false, true, None, false,
+            name, base_url, credential, auth_style, false, true, None, false, true,
         )
     }
 
@@ -74,6 +77,7 @@ impl OpenAiCompatibleProvider {
             true,
             None,
             false,
+            true,
         )
     }
 
@@ -86,7 +90,7 @@ impl OpenAiCompatibleProvider {
         auth_style: AuthStyle,
     ) -> Self {
         Self::new_with_options(
-            name, base_url, credential, auth_style, false, false, None, false,
+            name, base_url, credential, auth_style, false, false, None, false, true,
         )
     }
 
@@ -110,6 +114,7 @@ impl OpenAiCompatibleProvider {
             true,
             Some(user_agent),
             false,
+            true,
         )
     }
 
@@ -130,6 +135,7 @@ impl OpenAiCompatibleProvider {
             true,
             Some(user_agent),
             false,
+            true,
         )
     }
 
@@ -142,7 +148,7 @@ impl OpenAiCompatibleProvider {
         auth_style: AuthStyle,
     ) -> Self {
         Self::new_with_options(
-            name, base_url, credential, auth_style, false, false, None, true,
+            name, base_url, credential, auth_style, false, false, None, true, false,
         )
     }
 
@@ -155,6 +161,7 @@ impl OpenAiCompatibleProvider {
         supports_responses_fallback: bool,
         user_agent: Option<&str>,
         merge_system_into_user: bool,
+        native_tool_calling: bool,
     ) -> Self {
         Self {
             name: name.to_string(),
@@ -165,6 +172,7 @@ impl OpenAiCompatibleProvider {
             supports_responses_fallback,
             user_agent: user_agent.map(ToString::to_string),
             merge_system_into_user,
+            native_tool_calling,
         }
     }
 
@@ -1090,7 +1098,7 @@ impl OpenAiCompatibleProvider {
 impl Provider for OpenAiCompatibleProvider {
     fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
         crate::providers::traits::ProviderCapabilities {
-            native_tool_calling: true,
+            native_tool_calling: self.native_tool_calling,
             vision: self.supports_vision,
         }
     }
@@ -2325,6 +2333,22 @@ mod tests {
         let caps = <OpenAiCompatibleProvider as Provider>::capabilities(&p);
         assert!(caps.native_tool_calling);
         assert!(caps.vision);
+    }
+
+    #[test]
+    fn minimax_provider_disables_native_tool_calling() {
+        let p = OpenAiCompatibleProvider::new_merge_system_into_user(
+            "MiniMax",
+            "https://api.minimax.chat/v1",
+            Some("k"),
+            AuthStyle::Bearer,
+        );
+        let caps = <OpenAiCompatibleProvider as Provider>::capabilities(&p);
+        assert!(
+            !caps.native_tool_calling,
+            "MiniMax should use prompt-guided tool calling, not native"
+        );
+        assert!(!caps.vision);
     }
 
     #[test]
