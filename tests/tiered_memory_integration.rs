@@ -248,6 +248,7 @@ async fn full_pipeline_stm_to_mtm_to_ltm() {
         ltm: Arc::clone(&ltm),
         cfg: Arc::clone(&cfg),
         cmd_tx: cmd_tx.clone(),
+        extraction_tx: None,
     };
 
     // 4. Create a TierManager with MockSummarizer + BasicTagExtractor.

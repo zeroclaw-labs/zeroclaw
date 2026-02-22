@@ -34,7 +34,7 @@ pub use traits::{MemoryCategory, MemoryEntry};
 // Tiered-memory public API
 pub use tiered::TieredMemory;
 #[allow(unused_imports)]
-pub use tiered::{SharedMemory, TierCommand, TierConfig};
+pub use tiered::{ExtractionRequest, SharedMemory, TierCommand, TierConfig};
 
 use crate::config::{EmbeddingRouteConfig, MemoryConfig, StorageProviderConfig};
 #[cfg(feature = "memory-postgres")]
@@ -380,6 +380,7 @@ pub fn create_tiered_memory_from_backends(
     mtm: Box<dyn Memory + Send>,
     ltm: Box<dyn Memory + Send>,
     cfg: tiered::TierConfig,
+    extraction_tx: Option<tokio::sync::mpsc::Sender<tiered::ExtractionRequest>>,
 ) -> (
     tiered::TieredMemory,
     tokio::sync::mpsc::Sender<tiered::TierCommand>,
@@ -392,6 +393,7 @@ pub fn create_tiered_memory_from_backends(
         ltm: Arc::new(tokio::sync::Mutex::new(ltm)),
         cfg: Arc::new(cfg),
         cmd_tx: cmd_tx.clone(),
+        extraction_tx,
     };
     (tiered_mem, cmd_tx, cmd_rx)
 }
@@ -624,7 +626,7 @@ mod tests {
         let ltm: Box<dyn Memory + Send> = Box::new(NoneMemory::new());
         let cfg = TierConfig::default();
 
-        let (tiered, cmd_tx, _cmd_rx) = create_tiered_memory_from_backends(stm, mtm, ltm, cfg);
+        let (tiered, cmd_tx, _cmd_rx) = create_tiered_memory_from_backends(stm, mtm, ltm, cfg, None);
 
         assert_eq!(tiered.name(), "tiered");
         assert_eq!(tiered.count().await.unwrap(), 0);

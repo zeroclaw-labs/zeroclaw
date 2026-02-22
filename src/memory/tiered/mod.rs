@@ -33,6 +33,16 @@ use crate::memory::tiered::merge::{merge_and_rank, TierWeights, TieredRecallItem
 
 use crate::memory::traits::{Memory, MemoryCategory, MemoryEntry};
 
+/// A request to extract facts from a conversation turn.
+#[derive(Debug, Clone)]
+pub struct ExtractionRequest {
+    pub content: String,
+    pub role: String,       // "user" or "agent"
+    pub key: String,
+    pub session_id: Option<String>,
+    pub timestamp_unix_ms: i64,
+}
+
 /// Shared handle to a [`Memory`] backend, safe for concurrent access.
 pub type SharedMemory = Arc<Mutex<Box<dyn Memory + Send>>>;
 
@@ -46,6 +56,7 @@ pub struct TieredMemory {
     pub ltm: SharedMemory,
     pub cfg: Arc<TierConfig>,
     pub cmd_tx: mpsc::Sender<TierCommand>,
+    pub extraction_tx: Option<mpsc::Sender<ExtractionRequest>>,
 }
 
 /// Compute a recency score in [0.0, 1.0] from an ISO-8601 timestamp string.
@@ -80,7 +91,8 @@ impl Memory for TieredMemory {
         "tiered"
     }
 
-    /// Store writes to STM only.
+    /// Store writes to STM only; then enqueues a non-blocking extraction
+    /// request when an extraction channel is configured.
     async fn store(
         &self,
         key: &str,
@@ -92,7 +104,22 @@ impl Memory for TieredMemory {
             .lock()
             .await
             .store(key, content, category, session_id)
-            .await
+            .await?;
+
+        // Non-blocking extraction enqueue (best-effort).
+        if let Some(ref tx) = self.extraction_tx {
+            let role = if key.starts_with("msg:agent:") { "agent" } else { "user" };
+            let req = ExtractionRequest {
+                content: content.to_string(),
+                role: role.to_string(),
+                key: key.to_string(),
+                session_id: session_id.map(|s| s.to_string()),
+                timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
+            };
+            let _ = tx.try_send(req); // Non-blocking, drop if queue full
+        }
+
+        Ok(())
     }
 
     /// Recall: fetch from all 3 tiers concurrently, merge and rank.
@@ -327,6 +354,7 @@ mod tests {
             ltm: make_shared(InMemoryBackend::new()),
             cfg: Arc::new(TierConfig::default()),
             cmd_tx,
+            extraction_tx: None,
         }
     }
 
@@ -341,6 +369,7 @@ mod tests {
             ltm: make_shared(InMemoryBackend::new()),
             cfg: Arc::new(cfg),
             cmd_tx,
+            extraction_tx: None,
         }
     }
 
@@ -541,5 +570,40 @@ mod tests {
             (score - 0.0).abs() < f32::EPSILON,
             "invalid timestamp should score 0.0"
         );
+    }
+
+    #[tokio::test]
+    async fn store_enqueues_extraction_when_extractor_set() {
+        let (cmd_tx, _cmd_rx) = mpsc::channel(16);
+        let (ext_tx, mut ext_rx) = mpsc::channel(16);
+        let tiered = TieredMemory {
+            stm: make_shared(InMemoryBackend::new()),
+            mtm: make_shared(InMemoryBackend::new()),
+            ltm: make_shared(InMemoryBackend::new()),
+            cfg: Arc::new(TierConfig::default()),
+            cmd_tx,
+            extraction_tx: Some(ext_tx),
+        };
+
+        tiered
+            .store("msg:agent:123", "Hello world", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let req = ext_rx.try_recv().expect("should have received an ExtractionRequest");
+        assert_eq!(req.content, "Hello world");
+        assert_eq!(req.role, "agent");
+        assert_eq!(req.key, "msg:agent:123");
+    }
+
+    #[tokio::test]
+    async fn store_works_without_extractor() {
+        let tiered = make_test_tiered().await;
+        // Should succeed without panic even though extraction_tx is None
+        tiered
+            .store("msg:user:456", "test content", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        assert_eq!(tiered.stm.lock().await.count().await.unwrap(), 1);
     }
 }
