@@ -60,6 +60,7 @@ impl Tool for MemoryRecallTool {
                 success: true,
                 output: "No memories found matching that query.".into(),
                 error: None,
+                error_kind: None,
             }),
             Ok(entries) => {
                 let mut output = format!("Found {} memories:\n", entries.len());
@@ -77,12 +78,14 @@ impl Tool for MemoryRecallTool {
                     success: true,
                     output,
                     error: None,
+                    error_kind: None,
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Memory recall failed: {e}")),
+                error_kind: None,
             }),
         }
     }

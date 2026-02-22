@@ -1,4 +1,4 @@
-use super::traits::{Tool, ToolResult};
+use super::traits::{ErrorKind, Tool, ToolResult};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -58,6 +58,7 @@ impl Tool for FileWriteTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: autonomy is read-only".into()),
+                error_kind: Some(ErrorKind::PolicyDenied),
             });
         }
 
@@ -66,6 +67,7 @@ impl Tool for FileWriteTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".into()),
+                error_kind: Some(ErrorKind::RateLimited),
             });
         }
 
@@ -75,6 +77,7 @@ impl Tool for FileWriteTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Path not allowed by security policy: {path}")),
+                error_kind: Some(ErrorKind::PolicyDenied),
             });
         }
 
@@ -85,6 +88,7 @@ impl Tool for FileWriteTool {
                 success: false,
                 output: String::new(),
                 error: Some("Invalid path: missing parent directory".into()),
+                error_kind: Some(ErrorKind::InvalidInput),
             });
         };
 
@@ -99,6 +103,7 @@ impl Tool for FileWriteTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Failed to resolve file path: {e}")),
+                    error_kind: Some(ErrorKind::NotFound),
                 });
             }
         };
@@ -111,6 +116,7 @@ impl Tool for FileWriteTool {
                     self.security
                         .resolved_path_violation_message(&resolved_parent),
                 ),
+                error_kind: Some(ErrorKind::PermissionDenied),
             });
         }
 
@@ -119,6 +125,7 @@ impl Tool for FileWriteTool {
                 success: false,
                 output: String::new(),
                 error: Some("Invalid path: missing file name".into()),
+                error_kind: Some(ErrorKind::InvalidInput),
             });
         };
 
@@ -134,6 +141,7 @@ impl Tool for FileWriteTool {
                         "Refusing to write through symlink: {}",
                         resolved_target.display()
                     )),
+                    error_kind: Some(ErrorKind::PermissionDenied),
                 });
             }
         }
@@ -143,6 +151,7 @@ impl Tool for FileWriteTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: action budget exhausted".into()),
+                error_kind: Some(ErrorKind::RateLimited),
             });
         }
 
@@ -151,11 +160,13 @@ impl Tool for FileWriteTool {
                 success: true,
                 output: format!("Written {} bytes to {path}", content.len()),
                 error: None,
+                error_kind: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to write file: {e}")),
+                error_kind: Some(ErrorKind::ExecutionFailed),
             }),
         }
     }
