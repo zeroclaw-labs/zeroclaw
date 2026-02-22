@@ -5,26 +5,35 @@ use serde_json::json;
 use std::time::Duration;
 
 /// Web search tool for searching the internet.
-/// Supports multiple providers: DuckDuckGo (free), Brave (requires API key).
+/// Supports multiple providers: DuckDuckGo (free), Brave (requires API key), and Firecrawl (requires feature + API key).
 pub struct WebSearchTool {
     provider: String,
     brave_api_key: Option<String>,
+    firecrawl_api_key: Option<String>,
+    firecrawl_api_url: Option<String>,
     max_results: usize,
     timeout_secs: u64,
+    user_agent: String,
 }
 
 impl WebSearchTool {
     pub fn new(
         provider: String,
         brave_api_key: Option<String>,
+        firecrawl_api_key: Option<String>,
+        firecrawl_api_url: Option<String>,
         max_results: usize,
         timeout_secs: u64,
+        user_agent: String,
     ) -> Self {
         Self {
             provider: provider.trim().to_lowercase(),
             brave_api_key,
+            firecrawl_api_key,
+            firecrawl_api_url,
             max_results: max_results.clamp(1, 10),
             timeout_secs: timeout_secs.max(1),
+            user_agent,
         }
     }
 
@@ -34,7 +43,7 @@ impl WebSearchTool {
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.timeout_secs))
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .user_agent(&self.user_agent)
             .build()?;
 
         let response = client.get(&search_url).send().await?;
@@ -162,6 +171,66 @@ impl WebSearchTool {
 
         Ok(lines.join("\n"))
     }
+
+    #[cfg(feature = "firecrawl")]
+    async fn search_firecrawl(&self, query: &str) -> anyhow::Result<String> {
+        use firecrawl::search::SearchParams;
+        use firecrawl::FirecrawlApp;
+
+        let api_key = self
+            .firecrawl_api_key
+            .as_deref()
+            .filter(|k| !k.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Firecrawl API key not configured. \
+                    Set [web_search].firecrawl_api_key in config.toml"
+                )
+            })?;
+
+        let app = match self.firecrawl_api_url.as_deref().filter(|u| !u.is_empty()) {
+            Some(url) => FirecrawlApp::new_selfhosted(url, Some(api_key)),
+            None => FirecrawlApp::new(api_key),
+        }
+        .map_err(|e| anyhow::anyhow!("Failed to initialize Firecrawl client: {e}"))?;
+
+        let params = SearchParams {
+            query: query.to_string(),
+            limit: Some(self.max_results as u32),
+            timeout: Some(self.timeout_secs as u32),
+            ..Default::default()
+        };
+
+        let response = app
+            .search_with_params(params)
+            .await
+            .map_err(|e| anyhow::anyhow!("Firecrawl search failed: {e}"))?;
+
+        if response.data.is_empty() {
+            return Ok(format!("No results found for: {}", query));
+        }
+
+        let mut lines = vec![format!("Search results for: {} (via Firecrawl)", query)];
+
+        for (i, doc) in response.data.into_iter().enumerate() {
+            lines.push(format!("{}. {}", i + 1, doc.title));
+            lines.push(format!("   {}", doc.url));
+            if !doc.description.is_empty() {
+                lines.push(format!("   {}", doc.description));
+            }
+        }
+
+        Ok(lines.join("\n"))
+    }
+
+    #[cfg(not(feature = "firecrawl"))]
+    #[allow(clippy::unused_async)]
+    async fn search_firecrawl(&self, _query: &str) -> anyhow::Result<String> {
+        anyhow::bail!(
+            "The 'firecrawl' provider requires the 'firecrawl' compile-time feature. \
+            Rebuild with: cargo build --features firecrawl"
+        )
+    }
 }
 
 fn decode_ddg_redirect_url(raw_url: &str) -> String {
@@ -219,8 +288,9 @@ impl Tool for WebSearchTool {
         let result = match self.provider.as_str() {
             "duckduckgo" | "ddg" => self.search_duckduckgo(query).await?,
             "brave" => self.search_brave(query).await?,
+            "firecrawl" => self.search_firecrawl(query).await?,
             _ => anyhow::bail!(
-                "Unknown search provider: '{}'. Set tools.web_search.provider to 'duckduckgo' or 'brave' in config.toml",
+                "Unknown search provider: '{}'. Set tools.web_search.provider to 'duckduckgo', 'brave', or 'firecrawl' in config.toml",
                 self.provider
             ),
         };
@@ -239,19 +309,43 @@ mod tests {
 
     #[test]
     fn test_tool_name() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new(
+            "duckduckgo".to_string(),
+            None,
+            None,
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
         assert_eq!(tool.name(), "web_search_tool");
     }
 
     #[test]
     fn test_tool_description() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new(
+            "duckduckgo".to_string(),
+            None,
+            None,
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
         assert!(tool.description().contains("Search the web"));
     }
 
     #[test]
     fn test_parameters_schema() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new(
+            "duckduckgo".to_string(),
+            None,
+            None,
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
         let schema = tool.parameters_schema();
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["query"].is_object());
@@ -265,7 +359,15 @@ mod tests {
 
     #[test]
     fn test_parse_duckduckgo_results_empty() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new(
+            "duckduckgo".to_string(),
+            None,
+            None,
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
         let result = tool
             .parse_duckduckgo_results("<html>No results here</html>", "test")
             .unwrap();
@@ -274,7 +376,15 @@ mod tests {
 
     #[test]
     fn test_parse_duckduckgo_results_with_data() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new(
+            "duckduckgo".to_string(),
+            None,
+            None,
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
         let html = r#"
             <a class="result__a" href="https://example.com">Example Title</a>
             <a class="result__snippet">This is a description</a>
@@ -286,7 +396,15 @@ mod tests {
 
     #[test]
     fn test_parse_duckduckgo_results_decodes_redirect_url() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new(
+            "duckduckgo".to_string(),
+            None,
+            None,
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
         let html = r#"
             <a class="result__a" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpath%3Fa%3D1&amp;rut=test">Example Title</a>
             <a class="result__snippet">This is a description</a>
@@ -298,7 +416,15 @@ mod tests {
 
     #[test]
     fn test_constructor_clamps_web_search_limits() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 0, 0);
+        let tool = WebSearchTool::new(
+            "duckduckgo".to_string(),
+            None,
+            None,
+            None,
+            0,
+            0,
+            "test".to_string(),
+        );
         let html = r#"
             <a class="result__a" href="https://example.com">Example Title</a>
             <a class="result__snippet">This is a description</a>
@@ -307,25 +433,89 @@ mod tests {
         assert!(result.contains("Example Title"));
     }
 
+    #[test]
+    fn test_constructor_stores_firecrawl_fields() {
+        let tool = WebSearchTool::new(
+            "firecrawl".to_string(),
+            None,
+            Some("fc-123".to_string()),
+            Some("http://localhost:3000".to_string()),
+            5,
+            15,
+            "test".to_string(),
+        );
+        assert_eq!(tool.firecrawl_api_key.as_deref(), Some("fc-123"));
+        assert_eq!(
+            tool.firecrawl_api_url.as_deref(),
+            Some("http://localhost:3000")
+        );
+    }
+
     #[tokio::test]
     async fn test_execute_missing_query() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new(
+            "duckduckgo".to_string(),
+            None,
+            None,
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_execute_empty_query() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new(
+            "duckduckgo".to_string(),
+            None,
+            None,
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
         let result = tool.execute(json!({"query": ""})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_execute_brave_without_api_key() {
-        let tool = WebSearchTool::new("brave".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new(
+            "brave".to_string(),
+            None,
+            None,
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
         let result = tool.execute(json!({"query": "test"})).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("API key"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_firecrawl_without_api_key() {
+        let tool = WebSearchTool::new(
+            "firecrawl".to_string(),
+            None,
+            None,
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
+        let result = tool.execute(json!({"query": "test"})).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+
+        #[cfg(feature = "firecrawl")]
+        assert!(err_msg.contains("API key not configured"));
+
+        #[cfg(not(feature = "firecrawl"))]
+        assert!(err_msg.contains("requires the 'firecrawl' compile-time feature"));
     }
 }

@@ -57,6 +57,12 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 # URL encoding for web search
 urlencoding = "2.1"
 
+# HTML to Markdown conversion (web_fetch tool, fast_html2md provider; optional via web-fetch feature)
+fast_html2md = { version = "0.0", optional = true }
+
+# Firecrawl cloud scraping API (web_fetch tool, firecrawl provider; optional to keep binary size lean)
+firecrawl = { version = "1", optional = true }
+
 # Optional Rust-native browser automation backend
 fantoccini = { version = "0.22.0", optional = true, default-features = false, features = ["rustls-tls"] }
 
@@ -180,7 +186,11 @@ landlock = { version = "0.4", optional = true }
 libc = "0.2"
 
 [features]
-default = []
+# web-fetch = web page fetch + HTML-to-Markdown tool; on by default (fast_html2md provider)
+# Disable with --no-default-features or override default = [] in a workspace manifest.
+# Add --features firecrawl to also enable the Firecrawl cloud provider.
+default = ["web-fetch"]
+web-fetch = ["dep:fast_html2md"]
 hardware = ["nusb", "tokio-serial"]
 channel-matrix = ["dep:matrix-sdk"]
 channel-lark = ["dep:prost"]
@@ -202,6 +212,8 @@ probe = ["dep:probe-rs"]
 rag-pdf = ["dep:pdf-extract"]
 # whatsapp-web = Native WhatsApp Web client with custom rusqlite storage backend
 whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "dep:serde-big-array", "dep:prost", "dep:qrcode"]
+# firecrawl = cloud web scraping provider for web_fetch tool (adds firecrawl SDK; optional)
+firecrawl = ["dep:firecrawl"]
 
 [profile.release]
 opt-level = "z"      # Optimize for size

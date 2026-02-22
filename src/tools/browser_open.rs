@@ -1,4 +1,7 @@
 use super::traits::{Tool, ToolResult};
+use super::url_validation::{
+    extract_host, host_matches_allowlist, is_private_or_local_host, normalize_allowed_domains,
+};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -184,131 +187,6 @@ async fn open_in_brave(url: &str) -> anyhow::Result<()> {
     }
 }
 
-fn normalize_allowed_domains(domains: Vec<String>) -> Vec<String> {
-    let mut normalized = domains
-        .into_iter()
-        .filter_map(|d| normalize_domain(&d))
-        .collect::<Vec<_>>();
-    normalized.sort_unstable();
-    normalized.dedup();
-    normalized
-}
-
-fn normalize_domain(raw: &str) -> Option<String> {
-    let mut d = raw.trim().to_lowercase();
-    if d.is_empty() {
-        return None;
-    }
-
-    if let Some(stripped) = d.strip_prefix("https://") {
-        d = stripped.to_string();
-    } else if let Some(stripped) = d.strip_prefix("http://") {
-        d = stripped.to_string();
-    }
-
-    if let Some((host, _)) = d.split_once('/') {
-        d = host.to_string();
-    }
-
-    d = d.trim_start_matches('.').trim_end_matches('.').to_string();
-
-    if let Some((host, _)) = d.split_once(':') {
-        d = host.to_string();
-    }
-
-    if d.is_empty() || d.chars().any(char::is_whitespace) {
-        return None;
-    }
-
-    Some(d)
-}
-
-fn extract_host(url: &str) -> anyhow::Result<String> {
-    let rest = url
-        .strip_prefix("https://")
-        .ok_or_else(|| anyhow::anyhow!("Only https:// URLs are allowed"))?;
-
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("Invalid URL"))?;
-
-    if authority.is_empty() {
-        anyhow::bail!("URL must include a host");
-    }
-
-    if authority.contains('@') {
-        anyhow::bail!("URL userinfo is not allowed");
-    }
-
-    if authority.starts_with('[') {
-        anyhow::bail!("IPv6 hosts are not supported in browser_open");
-    }
-
-    let host = authority
-        .split(':')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .trim_end_matches('.')
-        .to_lowercase();
-
-    if host.is_empty() {
-        anyhow::bail!("URL must include a valid host");
-    }
-
-    Ok(host)
-}
-
-fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
-    if allowed_domains.iter().any(|domain| domain == "*") {
-        return true;
-    }
-
-    allowed_domains.iter().any(|domain| {
-        host == domain
-            || host
-                .strip_suffix(domain)
-                .is_some_and(|prefix| prefix.ends_with('.'))
-    })
-}
-
-fn is_private_or_local_host(host: &str) -> bool {
-    let has_local_tld = host
-        .rsplit('.')
-        .next()
-        .is_some_and(|label| label == "local");
-
-    if host == "localhost" || host.ends_with(".localhost") || has_local_tld || host == "::1" {
-        return true;
-    }
-
-    if let Some([a, b, _, _]) = parse_ipv4(host) {
-        return a == 0
-            || a == 10
-            || a == 127
-            || (a == 169 && b == 254)
-            || (a == 172 && (16..=31).contains(&b))
-            || (a == 192 && b == 168)
-            || (a == 100 && (64..=127).contains(&b));
-    }
-
-    false
-}
-
-fn parse_ipv4(host: &str) -> Option<[u8; 4]> {
-    let parts: Vec<&str> = host.split('.').collect();
-    if parts.len() != 4 {
-        return None;
-    }
-
-    let mut octets = [0_u8; 4];
-    for (i, part) in parts.iter().enumerate() {
-        octets[i] = part.parse::<u8>().ok()?;
-    }
-    Some(octets)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,22 +201,6 @@ mod tests {
             security,
             allowed_domains.into_iter().map(String::from).collect(),
         )
-    }
-
-    #[test]
-    fn normalize_domain_strips_scheme_path_and_case() {
-        let got = normalize_domain("  HTTPS://Docs.Example.com/path ").unwrap();
-        assert_eq!(got, "docs.example.com");
-    }
-
-    #[test]
-    fn normalize_allowed_domains_deduplicates() {
-        let got = normalize_allowed_domains(vec![
-            "example.com".into(),
-            "EXAMPLE.COM".into(),
-            "https://example.com/".into(),
-        ]);
-        assert_eq!(got, vec!["example.com".to_string()]);
     }
 
     #[test]
@@ -439,18 +301,6 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("allowed_domains"));
-    }
-
-    #[test]
-    fn parse_ipv4_valid() {
-        assert_eq!(parse_ipv4("1.2.3.4"), Some([1, 2, 3, 4]));
-    }
-
-    #[test]
-    fn parse_ipv4_invalid() {
-        assert_eq!(parse_ipv4("1.2.3"), None);
-        assert_eq!(parse_ipv4("1.2.3.999"), None);
-        assert_eq!(parse_ipv4("not-an-ip"), None);
     }
 
     #[tokio::test]

@@ -89,7 +89,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
     );
     println!();
 
-    print_step(1, 9, "Workspace Setup");
+    print_step(1, 10, "Workspace Setup");
     let (workspace_dir, config_path) = setup_workspace().await?;
     match resolve_interactive_onboarding_mode(&config_path, force)? {
         InteractiveOnboardingMode::FullOnboarding => {}
@@ -98,28 +98,31 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         }
     }
 
-    print_step(2, 9, "AI Provider & API Key");
+    print_step(2, 10, "AI Provider & API Key");
     let (provider, api_key, model, provider_api_url) = setup_provider(&workspace_dir).await?;
 
-    print_step(3, 9, "Channels (How You Talk to ZeroClaw)");
+    print_step(3, 10, "Channels (How You Talk to ZeroClaw)");
     let channels_config = setup_channels()?;
 
-    print_step(4, 9, "Tunnel (Expose to Internet)");
+    print_step(4, 10, "Tunnel (Expose to Internet)");
     let tunnel_config = setup_tunnel()?;
 
-    print_step(5, 9, "Tool Mode & Security");
+    print_step(5, 10, "Tool Mode & Security");
     let (composio_config, secrets_config) = setup_tool_mode()?;
 
-    print_step(6, 9, "Hardware (Physical World)");
+    print_step(6, 10, "Web & Internet Tools");
+    let (web_search_config, web_fetch_config, http_request_config) = setup_web_tools()?;
+
+    print_step(7, 10, "Hardware (Physical World)");
     let hardware_config = setup_hardware()?;
 
-    print_step(7, 9, "Memory Configuration");
+    print_step(8, 10, "Memory Configuration");
     let memory_config = setup_memory()?;
 
-    print_step(8, 9, "Project Context (Personalize Your Agent)");
+    print_step(9, 10, "Project Context (Personalize Your Agent)");
     let project_ctx = setup_project_context()?;
 
-    print_step(9, 9, "Workspace Files");
+    print_step(10, 10, "Workspace Files");
     scaffold_workspace(&workspace_dir, &project_ctx).await?;
 
     // ── Build config ──
@@ -138,8 +141,8 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         default_temperature: 0.7,
         observability: ObservabilityConfig::default(),
         autonomy: AutonomyConfig::default(),
-        security: crate::config::SecurityConfig::default(),
         runtime: RuntimeConfig::default(),
+        security: crate::config::SecurityConfig::default(),
         reliability: crate::config::ReliabilityConfig::default(),
         scheduler: crate::config::schema::SchedulerConfig::default(),
         agent: crate::config::schema::AgentConfig::default(),
@@ -156,9 +159,10 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         composio: composio_config,
         secrets: secrets_config,
         browser: BrowserConfig::default(),
-        http_request: crate::config::HttpRequestConfig::default(),
+        http_request: http_request_config,
         multimodal: crate::config::MultimodalConfig::default(),
-        web_search: crate::config::WebSearchConfig::default(),
+        web_search: web_search_config,
+        web_fetch: web_fetch_config,
         proxy: crate::config::ProxyConfig::default(),
         identity: crate::config::IdentityConfig::default(),
         cost: crate::config::CostConfig::default(),
@@ -486,8 +490,8 @@ async fn run_quick_setup_with_home(
         default_temperature: 0.7,
         observability: ObservabilityConfig::default(),
         autonomy: AutonomyConfig::default(),
-        security: crate::config::SecurityConfig::default(),
         runtime: RuntimeConfig::default(),
+        security: crate::config::SecurityConfig::default(),
         reliability: crate::config::ReliabilityConfig::default(),
         scheduler: crate::config::schema::SchedulerConfig::default(),
         agent: crate::config::schema::AgentConfig::default(),
@@ -507,6 +511,13 @@ async fn run_quick_setup_with_home(
         http_request: crate::config::HttpRequestConfig::default(),
         multimodal: crate::config::MultimodalConfig::default(),
         web_search: crate::config::WebSearchConfig::default(),
+        web_fetch: crate::config::WebFetchConfig {
+            // Keep disabled in non-interactive setup, but pre-populate allowed_domains
+            // so the user doesn't hit the empty-allowlist error if they later enable
+            // web_fetch manually in config.toml.
+            allowed_domains: vec!["*".to_string()],
+            ..crate::config::WebFetchConfig::default()
+        },
         proxy: crate::config::ProxyConfig::default(),
         identity: crate::config::IdentityConfig::default(),
         cost: crate::config::CostConfig::default(),
@@ -2678,6 +2689,260 @@ fn provider_supports_keyless_local_usage(provider_name: &str) -> bool {
         canonical_provider_name(provider_name),
         "ollama" | "llamacpp" | "sglang" | "vllm" | "osaurus"
     )
+}
+
+// ── Step 6: Web & Internet Tools ─────────────────────────────────
+
+fn parse_allowed_domains(raw: &str) -> Vec<String> {
+    if raw.trim() == "*" {
+        return vec!["*".to_string()];
+    }
+    raw.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn setup_web_tools() -> Result<(
+    crate::config::WebSearchConfig,
+    crate::config::WebFetchConfig,
+    crate::config::HttpRequestConfig,
+)> {
+    print_bullet("Configure web tools: search, page fetch, and HTTP API access.");
+    print_bullet("You can always change these later in config.toml.");
+    println!();
+
+    // ── Web Search ──
+    let enable_search = Confirm::new()
+        .with_prompt("  Enable web search?")
+        .default(true)
+        .interact()?;
+
+    let web_search = if enable_search {
+        #[cfg(feature = "firecrawl")]
+        let search_providers: Vec<&str> = vec![
+            "DuckDuckGo (free, no API key, default)",
+            "Brave Search (higher quality, requires API key)",
+            "Firecrawl (cloud search, requires API key)",
+        ];
+        #[cfg(not(feature = "firecrawl"))]
+        let search_providers: Vec<&str> = vec![
+            "DuckDuckGo (free, no API key, default)",
+            "Brave Search (higher quality, requires API key)",
+        ];
+
+        let search_idx = Select::new()
+            .with_prompt("  Search provider")
+            .items(&search_providers)
+            .default(0)
+            .interact()?;
+
+        let (provider, brave_api_key) = match search_idx {
+            1 => {
+                print_bullet("Get your API key at: https://brave.com/search/api/");
+                let key: String = Input::new()
+                    .with_prompt("  Brave Search API key (or Enter to skip)")
+                    .allow_empty(true)
+                    .interact_text()?;
+                (
+                    "brave".to_string(),
+                    if key.trim().is_empty() {
+                        None
+                    } else {
+                        Some(key.trim().to_string())
+                    },
+                )
+            }
+            #[cfg(feature = "firecrawl")]
+            2 => {
+                print_bullet("Get your API key at: https://firecrawl.dev");
+                let key: String = Input::new()
+                    .with_prompt("  Firecrawl API key (or Enter to skip)")
+                    .allow_empty(true)
+                    .interact_text()?;
+                (
+                    "firecrawl".to_string(),
+                    if key.trim().is_empty() {
+                        None
+                    } else {
+                        Some(key.trim().to_string())
+                    },
+                )
+            }
+            _ => ("duckduckgo".to_string(), None),
+        };
+
+        println!(
+            "  {} Web search: {} ({})",
+            style("✓").green().bold(),
+            style("enabled").green(),
+            style(&provider).cyan()
+        );
+
+        crate::config::WebSearchConfig {
+            enabled: true,
+            provider,
+            brave_api_key,
+            ..crate::config::WebSearchConfig::default()
+        }
+    } else {
+        println!(
+            "  {} Web search: {}",
+            style("✓").green().bold(),
+            style("disabled").dim()
+        );
+        crate::config::WebSearchConfig::default()
+    };
+
+    println!();
+
+    // ── Web Fetch ──
+    let enable_fetch = Confirm::new()
+        .with_prompt("  Enable web fetch? (fetch and convert web pages to Markdown)")
+        .default(true)
+        .interact()?;
+
+    let web_fetch = if enable_fetch {
+        #[cfg(feature = "firecrawl")]
+        let fetch_providers: Vec<&str> = vec![
+            "fast_html2md (local, no API key, default)",
+            "Firecrawl (cloud, better quality, requires API key)",
+        ];
+        #[cfg(not(feature = "firecrawl"))]
+        let fetch_providers: Vec<&str> = vec!["fast_html2md (local, no API key, default)"];
+
+        let fetch_idx = Select::new()
+            .with_prompt("  Fetch provider")
+            .items(&fetch_providers)
+            .default(0)
+            .interact()?;
+
+        #[cfg(feature = "firecrawl")]
+        let (provider, firecrawl_api_key) = if fetch_idx == 1 {
+            print_bullet("Get your API key at: https://firecrawl.dev");
+            let key: String = Input::new()
+                .with_prompt("  Firecrawl API key (or Enter to skip)")
+                .allow_empty(true)
+                .interact_text()?;
+            (
+                "firecrawl".to_string(),
+                if key.trim().is_empty() {
+                    None
+                } else {
+                    Some(key.trim().to_string())
+                },
+            )
+        } else {
+            ("fast_html2md".to_string(), None)
+        };
+
+        #[cfg(not(feature = "firecrawl"))]
+        let (provider, firecrawl_api_key) = {
+            let _ = fetch_idx;
+            ("fast_html2md".to_string(), None)
+        };
+
+        let domains_raw: String = Input::new()
+            .with_prompt("  Allowed domains for web fetch (comma-separated, '*' for all)")
+            .default("*".into())
+            .interact_text()?;
+        let allowed_domains = parse_allowed_domains(&domains_raw);
+
+        println!(
+            "  {} Web fetch: {} ({}, domains: {})",
+            style("✓").green().bold(),
+            style("enabled").green(),
+            style(&provider).cyan(),
+            style(if allowed_domains == vec!["*"] {
+                "all".to_string()
+            } else {
+                format!("{}", allowed_domains.len())
+            })
+            .cyan()
+        );
+
+        crate::config::WebFetchConfig {
+            enabled: true,
+            provider,
+            firecrawl_api_key,
+            allowed_domains,
+            ..crate::config::WebFetchConfig::default()
+        }
+    } else {
+        println!(
+            "  {} Web fetch: {}",
+            style("✓").green().bold(),
+            style("disabled").dim()
+        );
+        crate::config::WebFetchConfig {
+            allowed_domains: vec!["*".to_string()],
+            ..crate::config::WebFetchConfig::default()
+        }
+    };
+
+    println!();
+
+    // ── HTTP Request ──
+    let enable_http = Confirm::new()
+        .with_prompt("  Enable HTTP request tool? (make arbitrary API calls)")
+        .default(false)
+        .interact()?;
+
+    let http_request = if enable_http {
+        let web_fetch_domains = &web_fetch.allowed_domains;
+        let reuse_domains = if web_fetch_domains.is_empty() {
+            false
+        } else {
+            let domain_display = if web_fetch_domains == &vec!["*".to_string()] {
+                "all (*)".to_string()
+            } else {
+                format!("{} domain(s)", web_fetch_domains.len())
+            };
+            Confirm::new()
+                .with_prompt(format!(
+                    "  Reuse web fetch allowed domains for HTTP requests ({domain_display})?"
+                ))
+                .default(true)
+                .interact()?
+        };
+
+        let allowed_domains = if reuse_domains {
+            web_fetch_domains.clone()
+        } else {
+            let domains_raw: String = Input::new()
+                .with_prompt("  Allowed domains for HTTP requests (comma-separated, '*' for all)")
+                .default("*".into())
+                .interact_text()?;
+            parse_allowed_domains(&domains_raw)
+        };
+
+        println!(
+            "  {} HTTP request: {} (domains: {})",
+            style("✓").green().bold(),
+            style("enabled").green(),
+            style(if allowed_domains == vec!["*"] {
+                "all".to_string()
+            } else {
+                format!("{}", allowed_domains.len())
+            })
+            .cyan()
+        );
+
+        crate::config::HttpRequestConfig {
+            enabled: true,
+            allowed_domains,
+            ..crate::config::HttpRequestConfig::default()
+        }
+    } else {
+        println!(
+            "  {} HTTP request: {}",
+            style("✓").green().bold(),
+            style("disabled").dim()
+        );
+        crate::config::HttpRequestConfig::default()
+    };
+
+    Ok((web_search, web_fetch, http_request))
 }
 
 // ── Step 5: Tool Mode & Security ────────────────────────────────
@@ -5417,6 +5682,50 @@ fn print_summary(config: &Config) {
             }
         } else {
             "disabled (software only)".to_string()
+        }
+    );
+
+    // Web Search
+    println!(
+        "    {} Web search:    {}",
+        style("🔍").cyan(),
+        if config.web_search.enabled {
+            style(format!("enabled ({})", config.web_search.provider))
+                .green()
+                .to_string()
+        } else {
+            "disabled".to_string()
+        }
+    );
+
+    // Web Fetch
+    println!(
+        "    {} Web fetch:     {}",
+        style("🌐").cyan(),
+        if config.web_fetch.enabled {
+            style(format!("enabled ({})", config.web_fetch.provider))
+                .green()
+                .to_string()
+        } else {
+            "disabled".to_string()
+        }
+    );
+
+    // HTTP Request
+    println!(
+        "    {} HTTP request:  {}",
+        style("📡").cyan(),
+        if config.http_request.enabled {
+            let domain_label = if config.http_request.allowed_domains == vec!["*".to_string()] {
+                "all domains".to_string()
+            } else {
+                format!("{} domain(s)", config.http_request.allowed_domains.len())
+            };
+            style(format!("enabled ({domain_label})"))
+                .green()
+                .to_string()
+        } else {
+            "disabled".to_string()
         }
     );
 
