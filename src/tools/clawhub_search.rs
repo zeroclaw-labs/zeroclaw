@@ -55,10 +55,7 @@ impl Tool for ClawhubSearchTool {
                 for skill in skills {
                     output.push_str(&format!(
                         "- {} ({})\n  {}\n  Stars: {}\n\n",
-                        skill.name,
-                        skill.slug,
-                        skill.description,
-                        skill.stars
+                        skill.name, skill.slug, skill.description, skill.stars
                     ));
                 }
 

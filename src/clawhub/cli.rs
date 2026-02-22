@@ -73,15 +73,19 @@ async fn handle_search(query: &str, limit: usize) -> Result<()> {
 
     println!("Searching ClawHub for \"{query}\"...");
     println!("Found {} skills:\n", skills.len());
-    println!("  {:<20} {:<30} {:<8} Tags", "Name", "Description", "Stars");
-    println!("  {}", "-".repeat(70));
+    println!(
+        "  {:<25} {:<25} {:<8} Install Command",
+        "Display Name", "Description", "Stars"
+    );
+    println!("  {}", "-".repeat(80));
 
     for skill in skills {
         println!(
-            "  {:<20} {:<30} {:<8}",
-            skill.name.chars().take(20).collect::<String>(),
-            skill.description.chars().take(30).collect::<String>(),
-            skill.stars
+            "  {:<25} {:<25} {:<8} zeroclaw clawhub install {}",
+            skill.name.chars().take(25).collect::<String>(),
+            skill.description.chars().take(25).collect::<String>(),
+            skill.stars,
+            skill.slug
         );
     }
 
@@ -115,7 +119,10 @@ async fn handle_install(
 
     // Check if already installed
     if skill_dir.exists() {
-        anyhow::bail!("Skill '{}' is already installed. Use 'zeroclaw clawhub update' to update.", slug);
+        anyhow::bail!(
+            "Skill '{}' is already installed. Use 'zeroclaw clawhub update' to update.",
+            slug
+        );
     }
 
     // Download to temp location first for audit
@@ -136,7 +143,10 @@ async fn handle_install(
                 let _ = std::fs::remove_dir_all(&temp_dir);
                 anyhow::bail!("Security audit failed: {}", report.summary());
             }
-            println!("  Security audit passed ({} files scanned)", report.files_scanned);
+            println!(
+                "  Security audit passed ({} files scanned)",
+                report.files_scanned
+            );
         }
         Err(e) => {
             let _ = std::fs::remove_dir_all(&temp_dir);
@@ -241,10 +251,7 @@ async fn handle_inspect(slug: &str) -> Result<()> {
 
     println!("Skill: {} ({})", skill.name, skill.slug);
     println!("Version: {}", skill.version);
-    println!(
-        "Author: {}",
-        skill.author
-    );
+    println!("Author: {}", skill.author);
     println!("Stars: {}", skill.stars);
     println!("Tags: [{}]", skill.tags.join(", "));
     println!("\nDescription:\n{}", skill.description);
@@ -306,7 +313,9 @@ pub fn update_skills_readme(skills_dir: &Path, clawhub_skills: &[InstalledSkill]
 
     // Local skills section
     content.push_str("## Local Skills\n\n");
-    content.push_str("Each subdirectory is a skill. Create a `SKILL.toml` or `SKILL.md` file inside.\n\n");
+    content.push_str(
+        "Each subdirectory is a skill. Create a `SKILL.toml` or `SKILL.md` file inside.\n\n",
+    );
 
     // ClawHub skills section
     if !clawhub_skills.is_empty() {

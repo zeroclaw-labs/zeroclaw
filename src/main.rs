@@ -584,7 +584,9 @@ Examples:
     },
 
     /// Manage ClawHub skills
-    #[command(name = "clawhub", long_about = "\
+    #[command(
+        name = "clawhub",
+        long_about = "\
 Manage ClawHub skills.
 
 Discover, install, and manage skills from ClawHub (https://clawhub.ai).
@@ -593,7 +595,8 @@ Examples:
   zeroclaw clawhub search \"weather\"
   zeroclaw clawhub install weather-tool
   zeroclaw clawhub list
-  zeroclaw clawhub update")]
+  zeroclaw clawhub update"
+    )]
     ClawHub {
         #[command(subcommand)]
         clawhub_command: clawhub::ClawHubSubcommand,
