@@ -173,7 +173,8 @@ impl ScreenshotTool {
                 let size = bytes.len();
                 let mut encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
                 let truncated = if encoded.len() > MAX_BASE64_BYTES {
-                    encoded.truncate(encoded.floor_char_boundary(MAX_BASE64_BYTES));
+                    // Base64 output is ASCII, so byte truncation is UTF-8 safe.
+                    encoded.truncate(MAX_BASE64_BYTES);
                     true
                 } else {
                     false

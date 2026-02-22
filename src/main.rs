@@ -73,6 +73,7 @@ mod multimodal;
 mod observability;
 mod onboard;
 mod peripherals;
+mod plugins;
 mod providers;
 mod runtime;
 mod security;
