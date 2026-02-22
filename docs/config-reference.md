@@ -312,6 +312,43 @@ Notes:
 - Use exact domain or subdomain matching (e.g. `"api.example.com"`, `"example.com"`), or `"*"` to allow any public domain.
 - Local/private targets are still blocked even when `"*"` is configured.
 
+## `[web_search]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable `web_search_tool` for web searches |
+| `provider` | `"duckduckgo"` | Search provider: `"duckduckgo"`, `"brave"`, or `"perplexity"` |
+| `brave_api_key` | — | Brave Search API key (required if `provider = "brave"`) |
+| `perplexity_api_key` | — | Perplexity Search API key (required if `provider = "perplexity"`) |
+| `max_results` | `5` | Maximum results per search (1–10) |
+| `timeout_secs` | `15` | Request timeout in seconds |
+
+Environment variable overrides:
+
+| Variable (preferred) | Fallback | Field |
+|---|---|---|
+| `ZEROCLAW_WEB_SEARCH_PROVIDER` | `WEB_SEARCH_PROVIDER` | `provider` |
+| `ZEROCLAW_BRAVE_API_KEY` | `BRAVE_API_KEY` | `brave_api_key` |
+| `ZEROCLAW_PERPLEXITY_API_KEY` | `PERPLEXITY_API_KEY` | `perplexity_api_key` |
+| `ZEROCLAW_WEB_SEARCH_MAX_RESULTS` | `WEB_SEARCH_MAX_RESULTS` | `max_results` |
+| `ZEROCLAW_WEB_SEARCH_TIMEOUT_SECS` | `WEB_SEARCH_TIMEOUT_SECS` | `timeout_secs` |
+
+Notes:
+
+- `duckduckgo` is free and requires no API key.
+- `brave` requires a key from <https://brave.com/search/api>. Returns structured results (title, URL, description).
+- `perplexity` requires a key from <https://www.perplexity.ai/settings/api>. Uses `POST /search` and returns structured results (title, URL, snippet). The `PERPLEXITY_API_KEY` env var is shared with the Perplexity LLM provider.
+- API keys are encrypted at rest via `SecretStore`.
+
+```toml
+[web_search]
+enabled = true
+provider = "perplexity"
+perplexity_api_key = "pplx-..."  # encrypted at rest
+max_results = 5
+timeout_secs = 15
+```
+
 ## `[gateway]`
 
 | Key | Default | Purpose |
