@@ -685,6 +685,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "qwen-code" => "qwen3-coder-plus".into(),
         "ollama" => "llama3.2".into(),
         "llamacpp" => "ggml-org/gpt-oss-20b-GGUF".into(),
+        "codex-cli" => "gpt-5.3-codex-spark".into(),
         "sglang" | "vllm" | "osaurus" => "default".into(),
         "gemini" => "gemini-2.5-pro".into(),
         "kimi-code" => "kimi-for-coding".into(),
@@ -768,6 +769,20 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "GPT-5.2 Codex (agentic coding)".to_string(),
             ),
             ("o4-mini".to_string(), "o4-mini (fallback)".to_string()),
+        ],
+        "codex-cli" => vec![
+            (
+                "gpt-5.3-codex-spark".to_string(),
+                "GPT-5.3 Codex Spark (recommended, fast local)".to_string(),
+            ),
+            (
+                "gpt-5.3-codex".to_string(),
+                "GPT-5.3 Codex (full local runner)".to_string(),
+            ),
+            (
+                "gpt-5-codex".to_string(),
+                "GPT-5 Codex (stable baseline)".to_string(),
+            ),
         ],
         "venice" => vec![
             (
@@ -2632,6 +2647,10 @@ fn local_provider_choices() -> Vec<(&'static str, &'static str)> {
             "osaurus",
             "Osaurus — unified AI edge runtime (local MLX + cloud proxy + MCP)",
         ),
+        (
+            "codex-cli",
+            "Codex CLI (local runner)",
+        ),
     ]
 }
 
@@ -2650,6 +2669,7 @@ fn provider_env_var(name: &str) -> &'static str {
         "sglang" => "SGLANG_API_KEY",
         "vllm" => "VLLM_API_KEY",
         "osaurus" => "OSAURUS_API_KEY",
+        "codex-cli" => "CODEX_CLI_API_KEY",
         "venice" => "VENICE_API_KEY",
         "groq" => "GROQ_API_KEY",
         "mistral" => "MISTRAL_API_KEY",
@@ -2681,7 +2701,7 @@ fn provider_env_var(name: &str) -> &'static str {
 fn provider_supports_keyless_local_usage(provider_name: &str) -> bool {
     matches!(
         canonical_provider_name(provider_name),
-        "ollama" | "llamacpp" | "sglang" | "vllm" | "osaurus"
+        "ollama" | "llamacpp" | "sglang" | "vllm" | "osaurus" | "codex-cli"
     )
 }
 
@@ -6259,6 +6279,19 @@ mod tests {
             default_model_for_provider("astrai"),
             "anthropic/claude-sonnet-4.6"
         );
+    }
+
+    #[test]
+    fn default_model_for_codex_cli_is_spark() {
+        assert_eq!(
+            default_model_for_provider("codex-cli"),
+            "gpt-5.3-codex-spark"
+        );
+    }
+
+    #[test]
+    fn provider_supports_keyless_local_usage_includes_codex_cli() {
+        assert!(provider_supports_keyless_local_usage("codex-cli"));
     }
 
     #[test]
