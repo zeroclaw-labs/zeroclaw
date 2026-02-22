@@ -192,6 +192,7 @@ async fn auto_compact_history(
     provider: &dyn Provider,
     model: &str,
     max_history: usize,
+    hooks: Option<&crate::hooks::HookRunner>,
 ) -> Result<bool> {
     let has_system = history.first().map_or(false, |m| m.role == "system");
     let non_system_count = if has_system {
@@ -213,6 +214,17 @@ async fn auto_compact_history(
 
     let compact_end = start + compact_count;
     let to_compact: Vec<ChatMessage> = history[start..compact_end].to_vec();
+    let to_compact = if let Some(hooks) = hooks {
+        match hooks.run_before_compaction(to_compact).await {
+            crate::hooks::HookResult::Continue(messages) => messages,
+            crate::hooks::HookResult::Cancel(reason) => {
+                tracing::info!(%reason, "history compaction cancelled by hook");
+                return Ok(false);
+            }
+        }
+    } else {
+        to_compact
+    };
     let transcript = build_compaction_transcript(&to_compact);
 
     let summarizer_system = "You are a conversation compaction engine. Summarize older chat history into concise context for future turns. Preserve: user preferences, commitments, decisions, unresolved tasks, key facts. Omit: filler, repeated chit-chat, verbose tool logs. Output plain text bullet points only.";
@@ -231,6 +243,17 @@ async fn auto_compact_history(
         });
 
     let summary = truncate_with_ellipsis(&summary_raw, COMPACTION_MAX_SUMMARY_CHARS);
+    let summary = if let Some(hooks) = hooks {
+        match hooks.run_after_compaction(summary).await {
+            crate::hooks::HookResult::Continue(next_summary) => next_summary,
+            crate::hooks::HookResult::Cancel(reason) => {
+                tracing::info!(%reason, "post-compaction summary cancelled by hook");
+                return Ok(false);
+            }
+        }
+    } else {
+        summary
+    };
     apply_compaction_summary(history, start, compact_end, &summary);
 
     Ok(true)
@@ -387,7 +410,7 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
             return Some(ParsedToolCall {
                 name,
                 arguments,
-                tool_call_id: tool_call_id,
+                tool_call_id,
             });
         }
     }
@@ -409,7 +432,7 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
     Some(ParsedToolCall {
         name,
         arguments,
-        tool_call_id: tool_call_id,
+        tool_call_id,
     })
 }
 
@@ -2482,6 +2505,7 @@ pub(crate) async fn run_tool_call_loop(
             .zip(executable_calls.iter())
             .zip(executed_outcomes.into_iter())
         {
+            let mut outcome = outcome;
             runtime_trace::record_event(
                 "tool_call_result",
                 Some(channel_name),
@@ -2500,11 +2524,30 @@ pub(crate) async fn run_tool_call_loop(
 
             // ── Hook: after_tool_call (void) ─────────────────
             if let Some(hooks) = hooks {
-                let tool_result_obj = crate::tools::ToolResult {
+                let mut tool_result_obj = crate::tools::ToolResult {
                     success: outcome.success,
                     output: outcome.output.clone(),
-                    error: None,
+                    error: outcome.error_reason.clone(),
                 };
+                match hooks
+                    .run_tool_result_persist(call.name.clone(), tool_result_obj.clone())
+                    .await
+                {
+                    crate::hooks::HookResult::Continue(next) => {
+                        tool_result_obj = next;
+                        outcome.success = tool_result_obj.success;
+                        outcome.output = tool_result_obj.output.clone();
+                        outcome.error_reason = tool_result_obj.error.clone();
+                    }
+                    crate::hooks::HookResult::Cancel(reason) => {
+                        outcome.success = false;
+                        outcome.error_reason = Some(scrub_credentials(&reason));
+                        outcome.output = format!("Tool result blocked by hook: {reason}");
+                        tool_result_obj.success = false;
+                        tool_result_obj.error = Some(reason);
+                        tool_result_obj.output = outcome.output.clone();
+                    }
+                }
                 hooks
                     .fire_after_tool_call(&call.name, &tool_result_obj, outcome.duration)
                     .await;
@@ -2632,9 +2675,16 @@ pub async fn run(
     peripheral_overrides: Vec<String>,
     interactive: bool,
 ) -> Result<String> {
+    if let Err(error) = crate::plugins::runtime::initialize_from_config(&config.plugins) {
+        tracing::warn!("plugin registry initialization skipped: {error}");
+    }
+
     // ── Wire up agnostic subsystems ──────────────────────────────
-    let base_observer = observability::create_observer(&config.observability);
-    let observer: Arc<dyn Observer> = Arc::from(base_observer);
+    let base_observer: Arc<dyn Observer> =
+        Arc::from(observability::create_observer(&config.observability));
+    let observer: Arc<dyn Observer> = Arc::new(
+        crate::plugins::bridge::observer::ObserverBridge::new(base_observer),
+    );
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(
@@ -2875,6 +2925,22 @@ pub async fn run(
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
 
+    let hooks: Option<std::sync::Arc<crate::hooks::HookRunner>> = if config.hooks.enabled {
+        let mut runner = crate::hooks::HookRunner::new();
+        if config.hooks.builtin.boot_script {
+            runner.register(Box::new(crate::hooks::builtin::BootScriptHook));
+        }
+        if config.hooks.builtin.command_logger {
+            runner.register(Box::new(crate::hooks::builtin::CommandLoggerHook::new()));
+        }
+        if config.hooks.builtin.session_memory {
+            runner.register(Box::new(crate::hooks::builtin::SessionMemoryHook));
+        }
+        Some(std::sync::Arc::new(runner))
+    } else {
+        None
+    };
+
     // ── Approval manager (supervised mode) ───────────────────────
     let approval_manager = if interactive {
         Some(ApprovalManager::from_config(&config.autonomy))
@@ -2932,7 +2998,7 @@ pub async fn run(
             config.agent.max_tool_iterations,
             None,
             None,
-            None,
+            hooks.as_deref(),
             &[],
         )
         .await?;
@@ -3053,7 +3119,7 @@ pub async fn run(
                 config.agent.max_tool_iterations,
                 None,
                 None,
-                None,
+                hooks.as_deref(),
                 &[],
             )
             .await
@@ -3081,6 +3147,7 @@ pub async fn run(
                 provider.as_ref(),
                 model_name,
                 config.agent.max_history_messages,
+                hooks.as_deref(),
             )
             .await
             {
@@ -3109,8 +3176,15 @@ pub async fn run(
 /// Process a single message through the full agent (with tools, peripherals, memory).
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
 pub async fn process_message(config: Config, message: &str) -> Result<String> {
-    let observer: Arc<dyn Observer> =
+    if let Err(error) = crate::plugins::runtime::initialize_from_config(&config.plugins) {
+        tracing::warn!("plugin registry initialization skipped: {error}");
+    }
+
+    let base_observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
+    let observer: Arc<dyn Observer> = Arc::new(
+        crate::plugins::bridge::observer::ObserverBridge::new(base_observer),
+    );
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(

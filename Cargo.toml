@@ -144,6 +144,11 @@ opentelemetry = { version = "0.31", default-features = false, features = ["trace
 opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "metrics"], optional = true }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls-webpki-roots"], optional = true }
 
+# WASM runtime for plugin execution
+# Keep this on a RustSec-patched line that remains compatible with the
+# workspace rust-version = "1.87".
+wasmtime = { version = "36.0.5", default-features = false, features = ["runtime", "cranelift"] }
+
 # Serial port for peripheral communication (STM32, etc.)
 tokio-serial = { version = "5", default-features = false, optional = true }
 

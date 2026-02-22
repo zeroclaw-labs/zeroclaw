@@ -2981,6 +2981,10 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 /// Start all configured channels and route messages to the agent
 #[allow(clippy::too_many_lines)]
 pub async fn start_channels(config: Config) -> Result<()> {
+    if let Err(error) = crate::plugins::runtime::initialize_from_config(&config.plugins) {
+        tracing::warn!("plugin registry initialization skipped: {error}");
+    }
+
     let provider_name = resolved_default_provider(&config);
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
@@ -3019,8 +3023,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
         );
     }
 
-    let observer: Arc<dyn Observer> =
+    let base_observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
+    let observer: Arc<dyn Observer> = Arc::new(
+        crate::plugins::bridge::observer::ObserverBridge::new(base_observer),
+    );
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(
@@ -3267,8 +3274,14 @@ pub async fn start_channels(config: Config) -> Result<()> {
         multimodal: config.multimodal.clone(),
         hooks: if config.hooks.enabled {
             let mut runner = crate::hooks::HookRunner::new();
+            if config.hooks.builtin.boot_script {
+                runner.register(Box::new(crate::hooks::builtin::BootScriptHook));
+            }
             if config.hooks.builtin.command_logger {
                 runner.register(Box::new(crate::hooks::builtin::CommandLoggerHook::new()));
+            }
+            if config.hooks.builtin.session_memory {
+                runner.register(Box::new(crate::hooks::builtin::SessionMemoryHook));
             }
             Some(Arc::new(runner))
         } else {
