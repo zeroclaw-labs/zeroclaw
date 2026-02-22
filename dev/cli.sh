@@ -14,12 +14,26 @@ else
 fi
 
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+if [ "$BASE_DIR" = "dev" ]; then
+    ENV_FILE=".env"
+else
+    ENV_FILE="../.env"
+fi
 
 # Colors
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m' # No Color
+
+function load_env {
+    if [ -f "$ENV_FILE" ]; then
+        # Auto-export variables from .env for docker compose passthrough.
+        set -a
+        source "$ENV_FILE"
+        set +a
+    fi
+}
 
 function ensure_config {
     CONFIG_DIR="$HOST_TARGET_DIR/.zeroclaw"
@@ -54,6 +68,8 @@ if [ -z "$1" ]; then
     print_help
     exit 1
 fi
+
+load_env
 
 case "$1" in
     up)
