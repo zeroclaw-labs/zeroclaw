@@ -12,6 +12,7 @@ Localized hubs: [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · 
 |---|---|
 | Install and run ZeroClaw quickly | [README.md (Quick Start)](../README.md#quick-start) |
 | Bootstrap in one command | [one-click-bootstrap.md](one-click-bootstrap.md) |
+| Update or uninstall on macOS | [getting-started/macos-update-uninstall.md](getting-started/macos-update-uninstall.md) |
 | Find commands by task | [commands-reference.md](commands-reference.md) |
 | Check config defaults and keys quickly | [config-reference.md](config-reference.md) |
 | Configure custom providers/endpoints | [custom-providers.md](custom-providers.md) |
