@@ -1,6 +1,7 @@
 //! Three-tier memory system: STM (short-term), MTM (medium-term), LTM (long-term).
 
 pub mod types;
+pub mod budget;
 
 #[allow(unused_imports)]
 pub use types::{
