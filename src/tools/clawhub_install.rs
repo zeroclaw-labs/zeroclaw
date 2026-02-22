@@ -56,14 +56,12 @@ impl Tool for ClawhubInstallTool {
                     output: format!(
                         "Skill '{}' ({}) v{} would be installed.\n\
                         Description: {}\n\
-                        Author: {}\n\
-                        Tags: [{}]",
+                        Author: {}",
                         skill.name,
                         skill.slug,
                         skill.version,
                         skill.description,
-                        skill.author.unwrap_or_else(|| "unknown".into()),
-                        skill.tags.join(", ")
+                        skill.author
                     ),
                     error: None,
                 })

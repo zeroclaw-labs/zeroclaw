@@ -48,18 +48,17 @@ impl Tool for ClawhubSearchTool {
 
         let client = ClawHubClient::default();
 
-        match client.search(query, limit).await {
-            Ok(result) => {
-                let mut output = format!("Found {} skills:\n\n", result.total);
+        match client.search_skills(query, limit).await {
+            Ok(skills) => {
+                let mut output = format!("Found {} skills:\n\n", skills.len());
 
-                for skill in result.skills {
+                for skill in skills {
                     output.push_str(&format!(
-                        "- {} ({})\n  {}\n  Stars: {} | Tags: [{}]\n\n",
+                        "- {} ({})\n  {}\n  Stars: {}\n\n",
                         skill.name,
                         skill.slug,
                         skill.description,
-                        skill.stars,
-                        skill.tags.join(", ")
+                        skill.stars
                     ));
                 }
 
