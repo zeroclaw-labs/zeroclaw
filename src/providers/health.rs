@@ -68,18 +68,12 @@ impl ProviderHealthTracker {
     /// Returns:
     /// - `Ok(())` if circuit is closed (provider can be tried)
     /// - `Err((remaining, state))` if circuit is open (provider blocked)
-    pub fn should_try(
-        &self,
-        provider: &str,
-    ) -> Result<(), (Duration, ProviderHealthState)> {
+    pub fn should_try(&self, provider: &str) -> Result<(), (Duration, ProviderHealthState)> {
         // Check circuit breaker
         if let Some((remaining, _)) = self.backoff.get(&provider.to_string()) {
             // Circuit is open - return remaining time and current state
             let states = self.states.lock();
-            let state = states
-                .get(provider)
-                .cloned()
-                .unwrap_or_default();
+            let state = states.get(provider).cloned().unwrap_or_default();
             return Err((remaining, state));
         }
 
@@ -136,7 +130,11 @@ impl ProviderHealthTracker {
 
     /// Get current health state for a provider.
     pub fn get_state(&self, provider: &str) -> ProviderHealthState {
-        self.states.lock().get(provider).cloned().unwrap_or_default()
+        self.states
+            .lock()
+            .get(provider)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Get all tracked provider states (for observability).

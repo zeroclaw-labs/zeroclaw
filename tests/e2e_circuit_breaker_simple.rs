@@ -26,10 +26,15 @@ impl MockProviderScenario {
     fn try_call(&self, health: &ProviderHealthTracker) -> Result<String, String> {
         // Check circuit breaker
         if let Err((remaining, _)) = health.should_try(&self.name) {
-            return Err(format!("Circuit open, {} seconds remaining", remaining.as_secs()));
+            return Err(format!(
+                "Circuit open, {} seconds remaining",
+                remaining.as_secs()
+            ));
         }
 
-        let attempt = self.current_attempt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let attempt = self
+            .current_attempt
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         if attempt < self.failure_count {
             let error = format!("Provider {} failed (attempt {})", self.name, attempt + 1);
@@ -90,8 +95,8 @@ fn e2e_circuit_breaker_enables_fallback() {
     // Message 4-5: Primary circuit is open, skip to secondary immediately
     for i in 3..5 {
         assert!(
-            results[i].1.contains("Success from secondary") ||
-            results[i].1.contains("Circuit open"),
+            results[i].1.contains("Success from secondary")
+                || results[i].1.contains("Circuit open"),
             "Message {} should skip primary (circuit open) and use secondary",
             i + 1
         );
@@ -99,8 +104,14 @@ fn e2e_circuit_breaker_enables_fallback() {
 
     // Verify circuit breaker state
     let primary_result = health.should_try("primary");
-    assert!(primary_result.is_err(), "Primary circuit should remain open");
+    assert!(
+        primary_result.is_err(),
+        "Primary circuit should remain open"
+    );
 
     let secondary_result = health.should_try("secondary");
-    assert!(secondary_result.is_ok(), "Secondary circuit should be closed");
+    assert!(
+        secondary_result.is_ok(),
+        "Secondary circuit should be closed"
+    );
 }

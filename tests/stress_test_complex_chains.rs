@@ -24,13 +24,19 @@ impl ProviderSimulator {
         }
     }
 
-    fn try_call(&self, health: &ProviderHealthTracker, elapsed_secs: u64) -> Result<String, String> {
+    fn try_call(
+        &self,
+        health: &ProviderHealthTracker,
+        elapsed_secs: u64,
+    ) -> Result<String, String> {
         // Check circuit breaker first
         if let Err((remaining, _)) = health.should_try(&self.name) {
             return Err(format!("Circuit open ({}s remaining)", remaining.as_secs()));
         }
 
-        let attempt = self.attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let attempt = self
+            .attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         // Check if we're in a failure window
         for (start, end, fail_count) in &self.failure_windows {

@@ -33,8 +33,8 @@ fn stress_test_1_minute_time_based_failures() {
 
         // Simulate time-based failure window: fail during seconds 10-20 and 40-50
         let elapsed_secs = start.elapsed().as_secs();
-        let should_fail = (elapsed_secs >= 10 && elapsed_secs < 20) ||
-                          (elapsed_secs >= 40 && elapsed_secs < 50);
+        let should_fail =
+            (elapsed_secs >= 10 && elapsed_secs < 20) || (elapsed_secs >= 40 && elapsed_secs < 50);
 
         if should_fail {
             health.record_failure("stress-provider", "Time-based failure window");
@@ -53,9 +53,15 @@ fn stress_test_1_minute_time_based_failures() {
     println!("  Provider failures: {}", provider_failures);
     println!("  Circuit blocks: {}", circuit_blocks);
 
-    assert!(total_attempts > 100, "Should have many attempts in 1 minute");
+    assert!(
+        total_attempts > 100,
+        "Should have many attempts in 1 minute"
+    );
     assert!(successful_calls > 0, "Should have some successful calls");
-    assert!(circuit_blocks > 0, "Circuit should have blocked some attempts");
+    assert!(
+        circuit_blocks > 0,
+        "Circuit should have blocked some attempts"
+    );
 }
 
 #[test]
@@ -104,7 +110,10 @@ fn stress_test_5_minute_sustained_load() {
     println!("  Provider failures: {}", provider_failures);
     println!("  Circuit blocks: {}", circuit_blocks);
 
-    assert!(total_attempts > 1000, "Should have many attempts in 5 minutes");
+    assert!(
+        total_attempts > 1000,
+        "Should have many attempts in 5 minutes"
+    );
     assert!(successful_calls > 0, "Should have some successful calls");
     assert!(
         provider_failures > 0,
