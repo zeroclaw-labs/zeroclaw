@@ -3787,8 +3787,16 @@ impl Config {
             let contents = fs::read_to_string(&config_path)
                 .await
                 .context("Failed to read config file")?;
-            let mut config: Config =
-                toml::from_str(&contents).context("Failed to parse config file")?;
+            let mut unused_keys = std::collections::BTreeSet::new();
+            let deserializer =
+                toml::Deserializer::parse(&contents).context("Failed to parse config file")?;
+            let mut config: Config = serde_ignored::deserialize(deserializer, |path| {
+                unused_keys.insert(path.to_string());
+            })
+            .context("Failed to parse config file")?;
+            for key in &unused_keys {
+                tracing::warn!("Unknown config key ignored: \"{key}\"");
+            }
             // Set computed paths that are skipped during serialization
             config.config_path = config_path.clone();
             config.workspace_dir = workspace_dir;
