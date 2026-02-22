@@ -35,6 +35,12 @@ pub use traits::{MemoryCategory, MemoryEntry};
 pub use tiered::TieredMemory;
 #[allow(unused_imports)]
 pub use tiered::{ExtractionRequest, SharedMemory, TierCommand, TierConfig};
+#[allow(unused_imports)]
+pub use tiered::{
+    FactEntry, FactConfidence, FactStatus, SourceRole, VolatilityClass, SourceTurnRef,
+    FactExtractor, MockFactExtractor, OpenRouterFactExtractor, FactEntryDraft,
+    MemoryAgentConfig, MemoryAgentsConfig,
+};
 
 use crate::config::{EmbeddingRouteConfig, MemoryConfig, StorageProviderConfig};
 #[cfg(feature = "memory-postgres")]

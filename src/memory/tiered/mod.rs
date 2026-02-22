@@ -22,6 +22,12 @@ pub use types::{
     CompressionJob, CompressionJobKind, CompressionJobStatus, IndexEntry, MemoryTier, TierCommand,
     TierConfig,
 };
+#[allow(unused_imports)]
+pub use facts::{FactEntry, FactConfidence, FactStatus, SourceRole, VolatilityClass, SourceTurnRef};
+#[allow(unused_imports)]
+pub use extractor::{FactExtractor, MockFactExtractor, OpenRouterFactExtractor, FactEntryDraft};
+#[allow(unused_imports)]
+pub use types::{MemoryAgentConfig, MemoryAgentsConfig};
 
 use std::collections::HashMap;
 use std::sync::Arc;
