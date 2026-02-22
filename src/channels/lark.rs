@@ -1,6 +1,7 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
+use parking_lot::Mutex;
 use prost::Message as ProstMessage;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,37 +15,20 @@ const FEISHU_WS_BASE_URL: &str = "https://open.feishu.cn";
 const LARK_BASE_URL: &str = "https://open.larksuite.com/open-apis";
 const LARK_WS_BASE_URL: &str = "https://open.larksuite.com";
 
-const LARK_ACK_REACTIONS_ZH_CN: &[&str] = &["OK", "加油", "鼓掌", "碰拳", "看", "奋斗", "强"];
+/// Feishu/Lark API emoji_type keys for message reactions.
+/// These must match the API's enum values exactly (case-sensitive).
+/// Reference: https://open.feishu.cn/document/server-docs/im-v1/message-reaction/emojis-introduce
+const LARK_ACK_REACTIONS_ZH_CN: &[&str] = &[
+    "OK", "MUSCLE", "APPLAUSE", "FISTBUMP", "GLANCE", "STRIVE", "THUMBSUP",
+];
 const LARK_ACK_REACTIONS_ZH_TW: &[&str] = &[
-    "我看行",
-    "OK",
-    "加油",
-    "鼓掌",
-    "碰拳",
-    "看",
-    "奮鬥",
-    "強",
-    "很 OK",
+    "LGTM", "OK", "MUSCLE", "APPLAUSE", "FISTBUMP", "GLANCE", "STRIVE", "THUMBSUP", "DONE",
 ];
 const LARK_ACK_REACTIONS_EN: &[&str] = &[
-    "LooksGoodToMe",
-    "OK",
-    "Praise",
-    "Determined",
-    "Glance",
-    "FistBump",
-    "Applaud",
-    "FightOn",
+    "LGTM", "OK", "PRAISE", "MUSCLE", "GLANCE", "FISTBUMP", "APPLAUSE", "STRIVE",
 ];
 const LARK_ACK_REACTIONS_JA: &[&str] = &[
-    "いいと思う",
-    "OK",
-    "よくできた",
-    "頑張る",
-    "見る",
-    "グータッチ",
-    "拍手",
-    "頑張れ",
+    "LGTM", "OK", "PRAISE", "MUSCLE", "GLANCE", "FISTBUMP", "APPLAUSE", "STRIVE",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,6 +285,14 @@ pub struct LarkChannel {
     tenant_token: Arc<RwLock<Option<CachedTenantToken>>>,
     /// Dedup set: WS message_ids seen in last ~30 min to prevent double-dispatch
     ws_seen_ids: Arc<RwLock<HashMap<String, Instant>>>,
+    /// Rate-limit tracking for draft edits per chat
+    last_draft_edit: Arc<Mutex<HashMap<String, Instant>>>,
+    /// Minimum interval between draft edits (ms)
+    draft_update_interval_ms: u64,
+    /// Maximum number of edits per draft message before stopping updates
+    max_draft_edits: u32,
+    /// Per-message edit count tracker
+    draft_edit_counts: Arc<Mutex<HashMap<String, u32>>>,
 }
 
 impl LarkChannel {
@@ -339,6 +331,10 @@ impl LarkChannel {
             receive_mode: crate::config::schema::LarkReceiveMode::default(),
             tenant_token: Arc::new(RwLock::new(None)),
             ws_seen_ids: Arc::new(RwLock::new(HashMap::new())),
+            last_draft_edit: Arc::new(Mutex::new(HashMap::new())),
+            draft_update_interval_ms: 3000,
+            max_draft_edits: 20,
+            draft_edit_counts: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -387,6 +383,8 @@ impl LarkChannel {
             LarkPlatform::Feishu,
         );
         ch.receive_mode = config.receive_mode.clone();
+        ch.draft_update_interval_ms = config.draft_update_interval_ms;
+        ch.max_draft_edits = config.max_draft_edits;
         ch
     }
 
@@ -410,8 +408,70 @@ impl LarkChannel {
         format!("{}/auth/v3/tenant_access_token/internal", self.api_base())
     }
 
-    fn send_message_url(&self) -> String {
-        format!("{}/im/v1/messages?receive_id_type=chat_id", self.api_base())
+    fn send_message_url(&self, recipient: &str) -> String {
+        let id_type = lark_receive_id_type(recipient);
+        format!(
+            "{}/im/v1/messages?receive_id_type={id_type}",
+            self.api_base()
+        )
+    }
+
+    fn edit_message_url(&self, message_id: &str) -> String {
+        format!("{}/im/v1/messages/{message_id}", self.api_base())
+    }
+
+    /// PUT (edit) a post/text message by ID, retrying once on 401.
+    /// Feishu uses PUT for text/post edits, PATCH is only for interactive cards.
+    /// Returns `Ok(true)` on success, `Ok(false)` on API failure, or
+    /// `Err` only on transport-level errors.
+    async fn edit_message(
+        &self,
+        message_id: &str,
+        body: &serde_json::Value,
+    ) -> anyhow::Result<bool> {
+        let url = self.edit_message_url(message_id);
+        let mut token = self.get_tenant_access_token().await?;
+
+        let resp = self
+            .http_client()
+            .put(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json; charset=utf-8")
+            .json(body)
+            .send()
+            .await?;
+
+        if resp.status().as_u16() == 401 {
+            self.invalidate_token().await;
+            token = self.get_tenant_access_token().await?;
+            let retry_resp = self
+                .http_client()
+                .put(&url)
+                .header("Authorization", format!("Bearer {token}"))
+                .header("Content-Type", "application/json; charset=utf-8")
+                .json(body)
+                .send()
+                .await?;
+
+            if !retry_resp.status().is_success() {
+                let status = retry_resp.status();
+                let err = retry_resp.text().await.unwrap_or_default();
+                tracing::debug!(
+                    "Lark PUT edit {message_id} failed after token refresh ({status}): {err}"
+                );
+                return Ok(false);
+            }
+            return Ok(true);
+        }
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp.text().await.unwrap_or_default();
+            tracing::debug!("Lark PUT edit {message_id} failed ({status}): {err}");
+            return Ok(false);
+        }
+
+        Ok(true)
     }
 
     fn message_reaction_url(&self, message_id: &str) -> String {
@@ -611,6 +671,7 @@ impl LarkChannel {
                         tracing::warn!("Lark: ping failed, reconnecting");
                         break;
                     }
+                    tracing::debug!("Lark: ping sent (seq={seq}, last_recv={:.0}s ago)", last_recv.elapsed().as_secs_f64());
                     // GC stale fragments > 5 min
                     let cutoff = Instant::now().checked_sub(Duration::from_secs(300)).unwrap_or(Instant::now());
                     frag_cache.retain(|_, (_, ts)| *ts > cutoff);
@@ -647,7 +708,9 @@ impl LarkChannel {
 
                     // CONTROL frame
                     if frame.method == 0 {
-                        if frame.header_value("type") == "pong" {
+                        let ctrl_type = frame.header_value("type");
+                        if ctrl_type == "pong" {
+                            tracing::debug!("Lark: pong received (seq={})", frame.seq_id);
                             if let Some(p) = &frame.payload {
                                 if let Ok(cfg) = serde_json::from_slice::<WsClientConfig>(p) {
                                     if let Some(secs) = cfg.ping_interval {
@@ -665,6 +728,7 @@ impl LarkChannel {
                     }
 
                     // DATA frame
+                    tracing::debug!("Lark: data frame (method={}, seq={}, headers={:?})", frame.method, frame.seq_id, frame.headers.iter().map(|h| format!("{}={}", h.key, h.value)).collect::<Vec<_>>());
                     let msg_type = frame.header_value("type").to_string();
                     let msg_id   = frame.header_value("message_id").to_string();
                     let sum      = frame.header_value("sum").parse::<usize>().unwrap_or(1);
@@ -696,13 +760,19 @@ impl LarkChannel {
                         } else { continue; }
                     };
 
-                    if msg_type != "event" { continue; }
+                    if msg_type != "event" {
+                        tracing::debug!("Lark: non-event frame type={msg_type}");
+                        continue;
+                    }
 
                     let event: LarkEvent = match serde_json::from_slice(&payload) {
                         Ok(e) => e,
                         Err(e) => { tracing::error!("Lark: event JSON: {e}"); continue; }
                     };
-                    if event.header.event_type != "im.message.receive_v1" { continue; }
+                    if event.header.event_type != "im.message.receive_v1" {
+                        tracing::debug!("Lark: ignoring event_type={}", event.header.event_type);
+                        continue;
+                    }
 
                     let event_payload = event.event;
 
@@ -710,6 +780,8 @@ impl LarkChannel {
                         Ok(r) => r,
                         Err(e) => { tracing::error!("Lark: payload parse: {e}"); continue; }
                     };
+
+                    tracing::debug!("Lark: msg_type={}, chat_type={}, sender_type={}, sender_open_id={}", recv.message.message_type, recv.message.chat_type, recv.sender.sender_type, recv.sender.sender_id.open_id.as_deref().unwrap_or(""));
 
                     if recv.sender.sender_type == "app" || recv.sender.sender_type == "bot" { continue; }
 
@@ -739,16 +811,16 @@ impl LarkChannel {
                         "text" => {
                             let v: serde_json::Value = match serde_json::from_str(&lark_msg.content) {
                                 Ok(v) => v,
-                                Err(_) => continue,
+                                Err(e) => { tracing::warn!("Lark: text content parse error: {e}, raw={}", lark_msg.content); continue; }
                             };
                             match v.get("text").and_then(|t| t.as_str()).filter(|s| !s.is_empty()) {
                                 Some(t) => t.to_string(),
-                                None => continue,
+                                None => { tracing::warn!("Lark: text content empty or missing 'text' field, raw={}", lark_msg.content); continue; }
                             }
                         }
                         "post" => match parse_post_content(&lark_msg.content) {
                             Some(t) => t,
-                            None => continue,
+                            None => { tracing::warn!("Lark: post content parse returned None, raw={}", lark_msg.content); continue; }
                         },
                         _ => { tracing::debug!("Lark WS: skipping unsupported type '{}'", lark_msg.message_type); continue; }
                     };
@@ -994,12 +1066,14 @@ impl Channel for LarkChannel {
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let token = self.get_tenant_access_token().await?;
-        let url = self.send_message_url();
+        let url = self.send_message_url(&message.recipient);
 
-        let content = serde_json::json!({ "text": message.content }).to_string();
+        let cleaned = strip_tool_blocks(&message.content);
+        let post = markdown_to_lark_post(&cleaned);
+        let content = post.to_string();
         let body = serde_json::json!({
             "receive_id": message.recipient,
-            "msg_type": "text",
+            "msg_type": "post",
             "content": content,
         });
 
@@ -1037,9 +1111,269 @@ impl Channel for LarkChannel {
     async fn health_check(&self) -> bool {
         self.get_tenant_access_token().await.is_ok()
     }
+
+    fn supports_draft_updates(&self) -> bool {
+        true
+    }
+
+    async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+        let token = self.get_tenant_access_token().await?;
+        let url = self.send_message_url(&message.recipient);
+
+        let initial_text = if message.content.is_empty() {
+            "..."
+        } else {
+            &message.content
+        };
+        let post = markdown_to_lark_post(initial_text);
+        let content = post.to_string();
+
+        let body = serde_json::json!({
+            "receive_id": message.recipient,
+            "msg_type": "post",
+            "content": content,
+        });
+
+        let resp = self
+            .http_client()
+            .post(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json; charset=utf-8")
+            .json(&body)
+            .send()
+            .await?;
+
+        if resp.status().as_u16() == 401 {
+            self.invalidate_token().await;
+            let new_token = self.get_tenant_access_token().await?;
+            let retry_resp = self
+                .http_client()
+                .post(&url)
+                .header("Authorization", format!("Bearer {new_token}"))
+                .header("Content-Type", "application/json; charset=utf-8")
+                .json(&body)
+                .send()
+                .await?;
+
+            if !retry_resp.status().is_success() {
+                let err = retry_resp.text().await.unwrap_or_default();
+                anyhow::bail!("Lark send_draft failed after token refresh: {err}");
+            }
+
+            let resp_json: serde_json::Value = retry_resp.json().await?;
+            let message_id = resp_json
+                .pointer("/data/message_id")
+                .and_then(|id| id.as_str())
+                .map(String::from);
+
+            if let Some(ref id) = message_id {
+                self.last_draft_edit
+                    .lock()
+                    .insert(id.clone(), Instant::now());
+                self.draft_edit_counts.lock().insert(id.clone(), 0);
+            }
+            return Ok(message_id);
+        }
+
+        if !resp.status().is_success() {
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Lark send_draft failed: {err}");
+        }
+
+        let resp_json: serde_json::Value = resp.json().await?;
+        let message_id = resp_json
+            .pointer("/data/message_id")
+            .and_then(|id| id.as_str())
+            .map(String::from);
+
+        if let Some(ref id) = message_id {
+            self.last_draft_edit
+                .lock()
+                .insert(id.clone(), Instant::now());
+            self.draft_edit_counts.lock().insert(id.clone(), 0);
+        }
+
+        Ok(message_id)
+    }
+
+    async fn update_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<Option<String>> {
+        // Rate-limit edits per message
+        {
+            let last_edits = self.last_draft_edit.lock();
+            if let Some(last_time) = last_edits.get(message_id) {
+                let elapsed = u64::try_from(last_time.elapsed().as_millis()).unwrap_or(u64::MAX);
+                if elapsed < self.draft_update_interval_ms {
+                    return Ok(None);
+                }
+            }
+        }
+
+        // When the platform edit cap is reached, create a continuation message
+        // instead of silently dropping updates.
+        let cap_reached = {
+            let counts = self.draft_edit_counts.lock();
+            counts
+                .get(message_id)
+                .is_some_and(|&count| count >= self.max_draft_edits)
+        };
+        if cap_reached {
+            tracing::info!(
+                "Lark update_draft: edit cap reached for {message_id} ({}); \
+                 creating continuation message",
+                self.max_draft_edits
+            );
+            self.last_draft_edit.lock().remove(message_id);
+            self.draft_edit_counts.lock().remove(message_id);
+            let new_id = self.send_draft(&SendMessage::new(text, recipient)).await?;
+            return Ok(new_id);
+        }
+
+        let cleaned = strip_tool_blocks(text);
+        let post = markdown_to_lark_post(&cleaned);
+        let content = post.to_string();
+
+        let body = serde_json::json!({
+            "msg_type": "post",
+            "content": content,
+        });
+
+        match self.edit_message(message_id, &body).await {
+            Ok(_) => {
+                self.last_draft_edit
+                    .lock()
+                    .insert(message_id.to_string(), Instant::now());
+                *self
+                    .draft_edit_counts
+                    .lock()
+                    .entry(message_id.to_string())
+                    .or_insert(0) += 1;
+            }
+            Err(e) => {
+                tracing::debug!("Lark update_draft failed for {message_id}: {e}");
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn finalize_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        self.last_draft_edit.lock().remove(message_id);
+        self.draft_edit_counts.lock().remove(message_id);
+
+        let cleaned = strip_tool_blocks(text);
+        let post = markdown_to_lark_post(&cleaned);
+        let content = post.to_string();
+
+        let body = serde_json::json!({
+            "msg_type": "post",
+            "content": content,
+        });
+
+        match self.edit_message(message_id, &body).await {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                tracing::warn!("Lark finalize_draft edit returned false; falling back to send");
+                self.send(&SendMessage::new(text, recipient).in_thread(None))
+                    .await
+            }
+            Err(e) => {
+                tracing::warn!("Lark finalize_draft edit error: {e}; falling back to send");
+                self.send(&SendMessage::new(text, recipient).in_thread(None))
+                    .await
+            }
+        }
+    }
+
+    async fn cancel_draft(&self, _recipient: &str, message_id: &str) -> anyhow::Result<()> {
+        self.last_draft_edit.lock().remove(message_id);
+        self.draft_edit_counts.lock().remove(message_id);
+
+        let post = markdown_to_lark_post("\u{26a0}\u{fe0f} Cancelled");
+        let content = post.to_string();
+
+        let body = serde_json::json!({
+            "msg_type": "post",
+            "content": content,
+        });
+
+        // Best-effort — ignore failures
+        let _ = self.edit_message(message_id, &body).await;
+
+        Ok(())
+    }
 }
 
 impl LarkChannel {
+    /// Send an interactive card message (Lark-specific, not part of Channel trait).
+    pub async fn send_card(
+        &self,
+        recipient: &str,
+        title: &str,
+        markdown_body: &str,
+    ) -> anyhow::Result<()> {
+        let token = self.get_tenant_access_token().await?;
+        let url = self.send_message_url(recipient);
+
+        let card = serde_json::json!({
+            "config": { "wide_screen_mode": true },
+            "header": {
+                "title": { "tag": "plain_text", "content": title },
+                "template": "turquoise"
+            },
+            "elements": markdown_to_card_elements(markdown_body)
+        });
+
+        let body = serde_json::json!({
+            "receive_id": recipient,
+            "msg_type": "interactive",
+            "content": card.to_string(),
+        });
+
+        let resp = self
+            .http_client()
+            .post(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json; charset=utf-8")
+            .json(&body)
+            .send()
+            .await?;
+
+        if resp.status().as_u16() == 401 {
+            self.invalidate_token().await;
+            let new_token = self.get_tenant_access_token().await?;
+            let retry_resp = self
+                .http_client()
+                .post(&url)
+                .header("Authorization", format!("Bearer {new_token}"))
+                .header("Content-Type", "application/json; charset=utf-8")
+                .json(&body)
+                .send()
+                .await?;
+            if !retry_resp.status().is_success() {
+                let err = retry_resp.text().await.unwrap_or_default();
+                anyhow::bail!("Lark card send failed after token refresh: {err}");
+            }
+            return Ok(());
+        }
+
+        if !resp.status().is_success() {
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Lark card send failed: {err}");
+        }
+
+        Ok(())
+    }
+
     /// HTTP callback server (legacy — requires a public endpoint).
     /// Use `listen()` (WS long-connection) for new deployments.
     pub async fn listen_http(
@@ -1345,14 +1679,21 @@ fn random_lark_ack_reaction(
 /// placeholder string to the agent.
 fn parse_post_content(content: &str) -> Option<String> {
     let parsed = serde_json::from_str::<serde_json::Value>(content).ok()?;
-    let locale = parsed
-        .get("zh_cn")
-        .or_else(|| parsed.get("en_us"))
-        .or_else(|| {
-            parsed
-                .as_object()
-                .and_then(|m| m.values().find(|v| v.is_object()))
-        })?;
+    // WS events use flat format: {"title":"","content":[[...]]}
+    // Webhook events use locale-wrapped format: {"zh_cn":{"title":"","content":[...]}}
+    let locale = if parsed.get("content").is_some() {
+        // Flat format — the parsed value itself is the locale object
+        &parsed
+    } else {
+        parsed
+            .get("zh_cn")
+            .or_else(|| parsed.get("en_us"))
+            .or_else(|| {
+                parsed
+                    .as_object()
+                    .and_then(|m| m.values().find(|v| v.is_object()))
+            })?
+    };
 
     let mut text = String::new();
 
@@ -1436,6 +1777,414 @@ fn strip_at_placeholders(text: &str) -> String {
 /// In group chats, only respond when the bot is explicitly @-mentioned.
 fn should_respond_in_group(mentions: &[serde_json::Value]) -> bool {
     !mentions.is_empty()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Markdown → Lark card elements converter (for interactive cards)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Convert a markdown string (potentially containing tables) into a `Vec` of
+/// Lark interactive-card element JSON values.
+///
+/// - Non-table paragraphs → `{ "tag": "markdown", "content": "..." }`
+/// - Tables → each data row becomes `{ "tag": "div", "fields": [...] }` where
+///   each field is `{ "is_short": true, "text": { "tag": "lark_md", "content": "**col**\nval" }}`
+/// - An `{ "tag": "hr" }` separator is inserted between adjacent blocks.
+fn markdown_to_card_elements(md: &str) -> Vec<serde_json::Value> {
+    let mut elements: Vec<serde_json::Value> = Vec::new();
+    let mut text_buf = String::new();
+
+    // Flush accumulated non-table text as a markdown element.
+    let flush_text = |buf: &mut String, elems: &mut Vec<serde_json::Value>| {
+        let trimmed = buf.trim();
+        if !trimmed.is_empty() {
+            if !elems.is_empty() {
+                elems.push(serde_json::json!({ "tag": "hr" }));
+            }
+            elems.push(serde_json::json!({
+                "tag": "markdown",
+                "content": trimmed
+            }));
+        }
+        buf.clear();
+    };
+
+    let lines: Vec<&str> = md.lines().collect();
+    let len = lines.len();
+    let mut i = 0;
+
+    while i < len {
+        let line = lines[i];
+        let trimmed = line.trim();
+
+        // Detect start of a table: line starts with '|' and next line is a separator
+        if trimmed.starts_with('|') && i + 1 < len && is_table_separator(lines[i + 1].trim()) {
+            // Flush any accumulated text first
+            flush_text(&mut text_buf, &mut elements);
+
+            // Parse header row
+            let headers = parse_table_row(trimmed);
+            // Skip separator line
+            i += 2;
+
+            if !elements.is_empty() {
+                elements.push(serde_json::json!({ "tag": "hr" }));
+            }
+
+            // Parse data rows
+            while i < len {
+                let row_trimmed = lines[i].trim();
+                if !row_trimmed.starts_with('|') {
+                    break;
+                }
+                if is_table_separator(row_trimmed) {
+                    i += 1;
+                    continue;
+                }
+                let cells = parse_table_row(row_trimmed);
+                let mut fields: Vec<serde_json::Value> = Vec::new();
+                for (col_idx, header) in headers.iter().enumerate() {
+                    let value = cells.get(col_idx).map(|s| s.as_str()).unwrap_or("");
+                    fields.push(serde_json::json!({
+                        "is_short": true,
+                        "text": {
+                            "tag": "lark_md",
+                            "content": format!("**{}**\n{}", header, value)
+                        }
+                    }));
+                }
+                // If column count > 2 and odd, pad with an empty field for alignment
+                if headers.len() > 2 && !fields.len().is_multiple_of(2) {
+                    fields.push(serde_json::json!({
+                        "is_short": true,
+                        "text": { "tag": "lark_md", "content": "" }
+                    }));
+                }
+                elements.push(serde_json::json!({
+                    "tag": "div",
+                    "fields": fields
+                }));
+                i += 1;
+            }
+            continue;
+        }
+
+        // Non-table line: accumulate
+        if !text_buf.is_empty() {
+            text_buf.push('\n');
+        }
+        text_buf.push_str(line);
+        i += 1;
+    }
+
+    // Flush remaining text
+    flush_text(&mut text_buf, &mut elements);
+
+    // Fallback: if nothing was produced, return a single empty markdown element
+    if elements.is_empty() {
+        elements.push(serde_json::json!({
+            "tag": "markdown",
+            "content": ""
+        }));
+    }
+
+    elements
+}
+
+/// Check if a line is a markdown table separator (e.g. `|---|---|---|`).
+fn is_table_separator(line: &str) -> bool {
+    if !line.starts_with('|') {
+        return false;
+    }
+    // All non-pipe characters should be '-', ':', or whitespace
+    line.chars()
+        .all(|c| c == '|' || c == '-' || c == ':' || c == ' ')
+}
+
+/// Parse a markdown table row into cells, trimming whitespace.
+/// `| A | B | C |` → `["A", "B", "C"]`
+fn parse_table_row(line: &str) -> Vec<String> {
+    let stripped = line.trim().trim_matches('|');
+    stripped
+        .split('|')
+        .map(|cell| cell.trim().to_string())
+        .collect()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Markdown → Lark post (rich-text) converter
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Infer the Feishu `receive_id_type` from a recipient ID prefix.
+///  - `ou_`  → `open_id`  (user — creates/reuses a p2p chat)
+///  - `on_`  → `union_id`
+///  - `oc_`  → `chat_id`  (existing chat, p2p or group)
+///  - other  → `chat_id`  (safe default)
+fn lark_receive_id_type(recipient: &str) -> &'static str {
+    if recipient.starts_with("ou_") {
+        "open_id"
+    } else if recipient.starts_with("on_") {
+        "union_id"
+    } else {
+        "chat_id"
+    }
+}
+
+/// Strip `<tool_code>…</tool_code>` blocks (and similar tags) that models
+/// sometimes leak into their replies. These are internal tool-call artifacts
+/// and should never be shown to end users.
+fn strip_tool_blocks(text: &str) -> String {
+    // Matches <tool_code>…</tool_code>, <tool_call>…</tool_call>, etc.
+    let re = regex::Regex::new(r"(?s)<tool_\w+>.*?</tool_\w+>").unwrap();
+    let cleaned = re.replace_all(text, "");
+    // Collapse runs of 3+ newlines left by removal into double newlines
+    let collapse = regex::Regex::new(r"\n{3,}").unwrap();
+    collapse.replace_all(&cleaned, "\n\n").trim().to_string()
+}
+
+/// Convert a Markdown string into a Lark post `content` JSON value.
+///
+/// The returned structure follows the Lark "post" message format:
+/// ```json
+/// { "zh_cn": { "content": [ [element, ...], ... ] } }
+/// ```
+fn markdown_to_lark_post(md: &str) -> serde_json::Value {
+    let mut lines_out: Vec<Vec<serde_json::Value>> = Vec::new();
+    let mut in_code_block = false;
+    let mut code_block_buf = String::new();
+
+    for raw_line in md.lines() {
+        // ── fenced code blocks ──────────────────────────────────────
+        if raw_line.trim_start().starts_with("```") {
+            if in_code_block {
+                // closing fence
+                lines_out.push(vec![serde_json::json!({
+                    "tag": "code_block",
+                    "text": code_block_buf.trim_end_matches('\n'),
+                })]);
+                code_block_buf.clear();
+                in_code_block = false;
+            } else {
+                in_code_block = true;
+            }
+            continue;
+        }
+        if in_code_block {
+            if !code_block_buf.is_empty() {
+                code_block_buf.push('\n');
+            }
+            code_block_buf.push_str(raw_line);
+            continue;
+        }
+
+        let trimmed = raw_line.trim_start();
+
+        // ── headings → bold text ────────────────────────────────────
+        if let Some(rest) = strip_heading(trimmed) {
+            lines_out.push(vec![serde_json::json!({
+                "tag": "text",
+                "text": rest,
+                "style": ["bold"],
+            })]);
+            continue;
+        }
+
+        // ── unordered list items ────────────────────────────────────
+        if let Some(rest) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        {
+            let mut elems = vec![serde_json::json!({"tag": "text", "text": "  \u{2022} "})];
+            elems.extend(parse_inline(rest));
+            lines_out.push(elems);
+            continue;
+        }
+
+        // ── ordered list items ──────────────────────────────────────
+        if let Some((num, rest)) = strip_ordered_prefix(trimmed) {
+            let mut elems = vec![serde_json::json!({"tag": "text", "text": format!("  {num}. ")})];
+            elems.extend(parse_inline(rest));
+            lines_out.push(elems);
+            continue;
+        }
+
+        // ── plain / inline-formatted line ───────────────────────────
+        let elems = parse_inline(trimmed);
+        if elems.is_empty() {
+            // preserve blank lines as empty text segments
+            lines_out.push(vec![serde_json::json!({"tag": "text", "text": ""})]);
+        } else {
+            lines_out.push(elems);
+        }
+    }
+
+    // Unclosed code block — flush as-is
+    if in_code_block && !code_block_buf.is_empty() {
+        lines_out.push(vec![serde_json::json!({
+            "tag": "code_block",
+            "text": code_block_buf.trim_end_matches('\n'),
+        })]);
+    }
+
+    serde_json::json!({
+        "zh_cn": {
+            "content": lines_out,
+        }
+    })
+}
+
+/// Strip a Markdown heading prefix (`# `, `## `, …) and return the remainder.
+fn strip_heading(line: &str) -> Option<&str> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i] == b'#' {
+        i += 1;
+    }
+    if i > 0 && i < bytes.len() && bytes[i] == b' ' {
+        Some(&line[i + 1..])
+    } else {
+        None
+    }
+}
+
+/// Match `1. `, `2. `, etc. and return `(number, rest)`.
+fn strip_ordered_prefix(line: &str) -> Option<(&str, &str)> {
+    let dot = line.find(". ")?;
+    let num = &line[..dot];
+    if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
+        Some((num, &line[dot + 2..]))
+    } else {
+        None
+    }
+}
+
+/// Parse inline Markdown spans into a sequence of Lark post elements.
+///
+/// Supported: `**bold**`, `*italic*`, `` `code` ``, `[text](url)`.
+fn parse_inline(text: &str) -> Vec<serde_json::Value> {
+    let mut elems: Vec<serde_json::Value> = Vec::new();
+    let mut buf = String::new();
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        // ── link [text](url) ────────────────────────────────────────
+        if chars[i] == '[' {
+            if let Some((link_text, href, end)) = try_parse_link(&chars, i) {
+                flush_text(&mut buf, &mut elems);
+                elems.push(serde_json::json!({"tag": "a", "text": link_text, "href": href}));
+                i = end;
+                continue;
+            }
+        }
+
+        // ── inline code `…` ─────────────────────────────────────────
+        if chars[i] == '`' {
+            if let Some((code, end)) = try_parse_backtick(&chars, i) {
+                flush_text(&mut buf, &mut elems);
+                // Feishu post API does not support `code_inline` tag.
+                // Render as plain text wrapped in backticks to preserve readability.
+                elems.push(serde_json::json!({"tag": "text", "text": format!("`{code}`")}));
+                i = end;
+                continue;
+            }
+        }
+
+        // ── bold **…** ──────────────────────────────────────────────
+        if chars[i] == '*' && i + 1 < len && chars[i + 1] == '*' {
+            if let Some((inner, end)) = try_parse_delimited(&chars, i, "**") {
+                flush_text(&mut buf, &mut elems);
+                elems.push(serde_json::json!({"tag": "text", "text": inner, "style": ["bold"]}));
+                i = end;
+                continue;
+            }
+        }
+
+        // ── italic *…* (single asterisk, not double) ────────────────
+        if chars[i] == '*' && !(i + 1 < len && chars[i + 1] == '*') {
+            if let Some((inner, end)) = try_parse_delimited(&chars, i, "*") {
+                flush_text(&mut buf, &mut elems);
+                elems.push(serde_json::json!({"tag": "text", "text": inner, "style": ["italic"]}));
+                i = end;
+                continue;
+            }
+        }
+
+        buf.push(chars[i]);
+        i += 1;
+    }
+    flush_text(&mut buf, &mut elems);
+    elems
+}
+
+/// Flush accumulated plain text into the elements list.
+fn flush_text(buf: &mut String, elems: &mut Vec<serde_json::Value>) {
+    if !buf.is_empty() {
+        elems.push(serde_json::json!({"tag": "text", "text": buf.as_str()}));
+        buf.clear();
+    }
+}
+
+/// Try to parse `[text](url)` starting at position `start`.
+/// Returns `(link_text, href, next_index)` on success.
+fn try_parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
+    // chars[start] == '['
+    let close_bracket = find_char(chars, start + 1, ']')?;
+    let link_text: String = chars[start + 1..close_bracket].iter().collect();
+    // Expect '(' immediately after ']'
+    if close_bracket + 1 >= chars.len() || chars[close_bracket + 1] != '(' {
+        return None;
+    }
+    let close_paren = find_char(chars, close_bracket + 2, ')')?;
+    let href: String = chars[close_bracket + 2..close_paren].iter().collect();
+    Some((link_text, href, close_paren + 1))
+}
+
+/// Try to parse `` `code` `` starting at position `start`.
+fn try_parse_backtick(chars: &[char], start: usize) -> Option<(String, usize)> {
+    let close = find_char(chars, start + 1, '`')?;
+    let code: String = chars[start + 1..close].iter().collect();
+    if code.is_empty() {
+        return None;
+    }
+    Some((code, close + 1))
+}
+
+/// Try to parse a delimited span (`*…*` or `**…**`) starting at `start`.
+fn try_parse_delimited(chars: &[char], start: usize, delim: &str) -> Option<(String, usize)> {
+    let dlen = delim.len();
+    let after = start + dlen;
+    if after >= chars.len() {
+        return None;
+    }
+    // Search for closing delimiter
+    let delim_chars: Vec<char> = delim.chars().collect();
+    let mut j = after;
+    while j + dlen <= chars.len() {
+        if chars[j..j + dlen] == delim_chars[..] {
+            let inner: String = chars[after..j].iter().collect();
+            if inner.is_empty() {
+                return None;
+            }
+            return Some((inner, j + dlen));
+        }
+        j += 1;
+    }
+    None
+}
+
+/// Find the first occurrence of `target` in `chars` starting from `from`.
+fn find_char(chars: &[char], from: usize, target: char) -> Option<usize> {
+    chars.iter().enumerate().skip(from).find_map(
+        |(idx, &ch)| {
+            if ch == target {
+                Some(idx)
+            } else {
+                None
+            }
+        },
+    )
 }
 
 #[cfg(test)]
@@ -1784,6 +2533,8 @@ mod tests {
             use_feishu: false,
             receive_mode: LarkReceiveMode::default(),
             port: None,
+            draft_update_interval_ms: 3000,
+            max_draft_edits: 20,
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -1805,6 +2556,8 @@ mod tests {
             use_feishu: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
+            draft_update_interval_ms: 3000,
+            max_draft_edits: 20,
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
@@ -1837,6 +2590,8 @@ mod tests {
             use_feishu: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
+            draft_update_interval_ms: 5000,
+            max_draft_edits: 10,
         };
 
         let ch = LarkChannel::from_config(&cfg);
@@ -1845,6 +2600,8 @@ mod tests {
         assert_eq!(ch.ws_base(), LARK_WS_BASE_URL);
         assert_eq!(ch.receive_mode, LarkReceiveMode::Webhook);
         assert_eq!(ch.port, Some(9898));
+        assert_eq!(ch.draft_update_interval_ms, 5000);
+        assert_eq!(ch.max_draft_edits, 10);
     }
 
     #[test]
@@ -1860,6 +2617,8 @@ mod tests {
             use_feishu: true,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
+            draft_update_interval_ms: 3000,
+            max_draft_edits: 20,
         };
 
         let ch = LarkChannel::from_lark_config(&cfg);
@@ -1881,6 +2640,8 @@ mod tests {
             allowed_users: vec!["*".into()],
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
+            draft_update_interval_ms: 3000,
+            max_draft_edits: 20,
         };
 
         let ch = LarkChannel::from_feishu_config(&cfg);
@@ -1933,6 +2694,8 @@ mod tests {
             allowed_users: vec!["*".into()],
             receive_mode: crate::config::schema::LarkReceiveMode::Webhook,
             port: Some(9898),
+            draft_update_interval_ms: 3000,
+            max_draft_edits: 20,
         };
         let ch_feishu = LarkChannel::from_feishu_config(&feishu_cfg);
         assert_eq!(
@@ -2036,5 +2799,419 @@ mod tests {
         });
         let selected = random_lark_ack_reaction(Some(&payload), "hello");
         assert!(LARK_ACK_REACTIONS_JA.contains(&selected));
+    }
+
+    // ── markdown_to_lark_post tests ─────────────────────────────────
+
+    /// Helper: extract the content array from the post structure.
+    fn post_content(val: &serde_json::Value) -> &Vec<serde_json::Value> {
+        val["zh_cn"]["content"].as_array().unwrap()
+    }
+
+    #[test]
+    fn md_to_post_plain_text() {
+        let post = markdown_to_lark_post("hello world");
+        let content = post_content(&post);
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0][0]["tag"], "text");
+        assert_eq!(content[0][0]["text"], "hello world");
+    }
+
+    #[test]
+    fn md_to_post_bold() {
+        let post = markdown_to_lark_post("this is **bold** text");
+        let line = &post_content(&post)[0];
+        assert_eq!(line[0]["text"], "this is ");
+        assert_eq!(line[1]["text"], "bold");
+        assert_eq!(line[1]["style"][0], "bold");
+        assert_eq!(line[2]["text"], " text");
+    }
+
+    #[test]
+    fn md_to_post_italic() {
+        let post = markdown_to_lark_post("this is *italic* text");
+        let line = &post_content(&post)[0];
+        assert_eq!(line[0]["text"], "this is ");
+        assert_eq!(line[1]["text"], "italic");
+        assert_eq!(line[1]["style"][0], "italic");
+        assert_eq!(line[2]["text"], " text");
+    }
+
+    #[test]
+    fn md_to_post_link() {
+        let post = markdown_to_lark_post("click [here](https://example.com) now");
+        let line = &post_content(&post)[0];
+        assert_eq!(line[0]["text"], "click ");
+        assert_eq!(line[1]["tag"], "a");
+        assert_eq!(line[1]["text"], "here");
+        assert_eq!(line[1]["href"], "https://example.com");
+        assert_eq!(line[2]["text"], " now");
+    }
+
+    #[test]
+    fn md_to_post_inline_code() {
+        let post = markdown_to_lark_post("run `cargo test` now");
+        let line = &post_content(&post)[0];
+        assert_eq!(line[0]["text"], "run ");
+        assert_eq!(line[1]["tag"], "text");
+        assert_eq!(line[1]["text"], "`cargo test`");
+        assert_eq!(line[2]["text"], " now");
+    }
+
+    #[test]
+    fn md_to_post_heading() {
+        let post = markdown_to_lark_post("# Title\n## Subtitle");
+        let content = post_content(&post);
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0][0]["text"], "Title");
+        assert_eq!(content[0][0]["style"][0], "bold");
+        assert_eq!(content[1][0]["text"], "Subtitle");
+        assert_eq!(content[1][0]["style"][0], "bold");
+    }
+
+    #[test]
+    fn md_to_post_unordered_list() {
+        let post = markdown_to_lark_post("- first\n- second");
+        let content = post_content(&post);
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0][0]["text"], "  \u{2022} ");
+        assert_eq!(content[0][1]["text"], "first");
+        assert_eq!(content[1][0]["text"], "  \u{2022} ");
+        assert_eq!(content[1][1]["text"], "second");
+    }
+
+    #[test]
+    fn md_to_post_ordered_list() {
+        let post = markdown_to_lark_post("1. alpha\n2. beta");
+        let content = post_content(&post);
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0][0]["text"], "  1. ");
+        assert_eq!(content[0][1]["text"], "alpha");
+        assert_eq!(content[1][0]["text"], "  2. ");
+        assert_eq!(content[1][1]["text"], "beta");
+    }
+
+    #[test]
+    fn md_to_post_code_block() {
+        let post = markdown_to_lark_post("```rust\nfn main() {}\n```");
+        let content = post_content(&post);
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0][0]["tag"], "code_block");
+        assert_eq!(content[0][0]["text"], "fn main() {}");
+    }
+
+    #[test]
+    fn md_to_post_mixed_inline() {
+        let post = markdown_to_lark_post("**bold** and *italic* and `code`");
+        let line = &post_content(&post)[0];
+        assert_eq!(line[0]["text"], "bold");
+        assert_eq!(line[0]["style"][0], "bold");
+        assert_eq!(line[1]["text"], " and ");
+        assert_eq!(line[2]["text"], "italic");
+        assert_eq!(line[2]["style"][0], "italic");
+        assert_eq!(line[3]["text"], " and ");
+        assert_eq!(line[4]["tag"], "text");
+        assert_eq!(line[4]["text"], "`code`");
+    }
+
+    #[test]
+    fn md_to_post_multiline() {
+        let post = markdown_to_lark_post("line one\n\nline three");
+        let content = post_content(&post);
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0][0]["text"], "line one");
+        assert_eq!(content[1][0]["text"], ""); // blank line preserved
+        assert_eq!(content[2][0]["text"], "line three");
+    }
+
+    #[test]
+    fn md_to_post_list_with_bold_item() {
+        let post = markdown_to_lark_post("- **important** item");
+        let line = &post_content(&post)[0];
+        assert_eq!(line[0]["text"], "  \u{2022} ");
+        assert_eq!(line[1]["text"], "important");
+        assert_eq!(line[1]["style"][0], "bold");
+        assert_eq!(line[2]["text"], " item");
+    }
+
+    #[test]
+    fn md_to_post_unclosed_code_block() {
+        let post = markdown_to_lark_post("```\nsome code");
+        let content = post_content(&post);
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0][0]["tag"], "code_block");
+        assert_eq!(content[0][0]["text"], "some code");
+    }
+
+    #[test]
+    fn strip_tool_blocks_removes_tool_code() {
+        let input = "Here is my plan.\n<tool_code>\n{\"name\":\"shell\"}\n</tool_code>\nDone.";
+        let result = strip_tool_blocks(input);
+        assert_eq!(result, "Here is my plan.\n\nDone.");
+        assert!(!result.contains("tool_code"));
+    }
+
+    #[test]
+    fn strip_tool_blocks_preserves_clean_text() {
+        let input = "No tool calls here.";
+        assert_eq!(strip_tool_blocks(input), input);
+    }
+
+    // ── draft support tests ─────────────────────────────────────────
+
+    #[test]
+    fn lark_supports_draft_updates() {
+        let ch = make_channel();
+        assert!(ch.supports_draft_updates());
+    }
+
+    #[test]
+    fn lark_edit_message_url_matches_region() {
+        let ch_cn = make_channel();
+        assert_eq!(
+            ch_cn.edit_message_url("om_draft_123"),
+            "https://open.feishu.cn/open-apis/im/v1/messages/om_draft_123"
+        );
+
+        let mut ch_intl = make_channel();
+        ch_intl.platform = LarkPlatform::Lark;
+        assert_eq!(
+            ch_intl.edit_message_url("om_draft_123"),
+            "https://open.larksuite.com/open-apis/im/v1/messages/om_draft_123"
+        );
+    }
+
+    #[tokio::test]
+    async fn lark_update_draft_rate_limit_short_circuits() {
+        let ch = make_channel();
+        // Insert a recent edit timestamp to trigger rate-limit
+        ch.last_draft_edit
+            .lock()
+            .insert("om_msg_1".to_string(), Instant::now());
+
+        // Should return Ok without network call since we edited < 3s ago
+        let result = ch.update_draft("oc_chat_1", "om_msg_1", "new text").await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn lark_draft_update_interval_default() {
+        let ch = make_channel();
+        assert_eq!(ch.draft_update_interval_ms, 3000);
+        assert_eq!(ch.max_draft_edits, 20);
+        assert!(ch.draft_edit_counts.lock().is_empty());
+    }
+
+    // ── markdown_to_card_elements tests ──────────────────────────────
+
+    #[test]
+    fn card_elements_plain_text() {
+        let elems = markdown_to_card_elements("Hello world\n\nNo tables here.");
+        assert_eq!(elems.len(), 1);
+        assert_eq!(elems[0]["tag"], "markdown");
+        assert_eq!(elems[0]["content"], "Hello world\n\nNo tables here.");
+    }
+
+    #[test]
+    fn card_elements_table_only() {
+        let md = "| Component | Status | Note |\n|---|---|---|\n| Memory | OK | SQLite |\n| Agent | OK | Running |";
+        let elems = markdown_to_card_elements(md);
+        // Two data rows → two div elements
+        assert_eq!(elems.len(), 2);
+        for elem in &elems {
+            assert_eq!(elem["tag"], "div");
+            let fields = elem["fields"].as_array().unwrap();
+            // 3 columns (odd, >2) → padded to 4 fields
+            assert_eq!(fields.len(), 4);
+            assert_eq!(fields[0]["is_short"], true);
+            assert_eq!(fields[0]["text"]["tag"], "lark_md");
+        }
+        // Check first row content
+        let first_fields = elems[0]["fields"].as_array().unwrap();
+        assert_eq!(first_fields[0]["text"]["content"], "**Component**\nMemory");
+        assert_eq!(first_fields[1]["text"]["content"], "**Status**\nOK");
+        assert_eq!(first_fields[2]["text"]["content"], "**Note**\nSQLite");
+        // Padding field
+        assert_eq!(first_fields[3]["text"]["content"], "");
+    }
+
+    #[test]
+    fn card_elements_mixed() {
+        let md = "## System Status\n\n| Col | Val |\n|---|---|\n| A | 1 |\n\nAll good.";
+        let elems = markdown_to_card_elements(md);
+        // markdown("## System Status") + hr + div(A|1) + hr + markdown("All good.")
+        assert_eq!(elems.len(), 5);
+        assert_eq!(elems[0]["tag"], "markdown");
+        assert!(elems[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("System Status"));
+        assert_eq!(elems[1]["tag"], "hr");
+        assert_eq!(elems[2]["tag"], "div");
+        assert_eq!(elems[3]["tag"], "hr");
+        assert_eq!(elems[4]["tag"], "markdown");
+        assert_eq!(elems[4]["content"], "All good.");
+    }
+
+    #[test]
+    fn card_elements_multi_table() {
+        let md = "## Table 1\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\n## Table 2\n\n| X | Y |\n|---|---|\n| 3 | 4 |";
+        let elems = markdown_to_card_elements(md);
+        // markdown("## Table 1") + hr + div(1|2) + hr + markdown("## Table 2") + hr + div(3|4)
+        assert_eq!(elems.len(), 7);
+        assert_eq!(elems[0]["tag"], "markdown");
+        assert_eq!(elems[1]["tag"], "hr");
+        assert_eq!(elems[2]["tag"], "div");
+        assert_eq!(elems[3]["tag"], "hr");
+        assert_eq!(elems[4]["tag"], "markdown");
+        assert_eq!(elems[5]["tag"], "hr");
+        assert_eq!(elems[6]["tag"], "div");
+    }
+
+    #[test]
+    fn card_elements_even_columns_no_padding() {
+        let md = "| A | B |\n|---|---|\n| 1 | 2 |";
+        let elems = markdown_to_card_elements(md);
+        assert_eq!(elems.len(), 1);
+        let fields = elems[0]["fields"].as_array().unwrap();
+        // 2 columns (even) → no padding
+        assert_eq!(fields.len(), 2);
+    }
+
+    #[test]
+    fn card_elements_empty_input() {
+        let elems = markdown_to_card_elements("");
+        assert_eq!(elems.len(), 1);
+        assert_eq!(elems[0]["tag"], "markdown");
+    }
+
+    #[test]
+    fn table_separator_detection() {
+        assert!(is_table_separator("|---|---|---|"));
+        assert!(is_table_separator("| --- | --- |"));
+        assert!(is_table_separator("|:---:|:---|---:|"));
+        assert!(!is_table_separator("| data | here |"));
+        assert!(!is_table_separator("not a table"));
+    }
+
+    #[test]
+    fn table_row_parsing() {
+        let cells = parse_table_row("| Component | Status | Note |");
+        assert_eq!(cells, vec!["Component", "Status", "Note"]);
+    }
+
+    // ── lark_receive_id_type tests ──────────────────────────────
+
+    #[test]
+    fn lark_receive_id_type_open_id_prefix() {
+        assert_eq!(lark_receive_id_type("ou_abc123def"), "open_id");
+    }
+
+    #[test]
+    fn lark_receive_id_type_union_id_prefix() {
+        assert_eq!(lark_receive_id_type("on_abc123def"), "union_id");
+    }
+
+    #[test]
+    fn lark_receive_id_type_chat_id_prefix() {
+        assert_eq!(lark_receive_id_type("oc_abc123def"), "chat_id");
+    }
+
+    #[test]
+    fn lark_receive_id_type_empty_defaults_to_chat_id() {
+        assert_eq!(lark_receive_id_type(""), "chat_id");
+    }
+
+    #[test]
+    fn lark_receive_id_type_random_defaults_to_chat_id() {
+        assert_eq!(lark_receive_id_type("hello_world"), "chat_id");
+    }
+
+    #[test]
+    fn lark_receive_id_type_bare_prefix_still_matches() {
+        assert_eq!(lark_receive_id_type("ou_"), "open_id");
+        assert_eq!(lark_receive_id_type("on_"), "union_id");
+    }
+
+    #[test]
+    fn lark_receive_id_type_uppercase_prefix_no_match() {
+        assert_eq!(lark_receive_id_type("OU_abc123"), "chat_id");
+        assert_eq!(lark_receive_id_type("ON_abc123"), "chat_id");
+    }
+
+    // ── strip_tool_blocks tests ─────────────────────────────────
+
+    #[test]
+    fn strip_tool_blocks_removes_tool_call() {
+        let input = "hello <tool_call>some call</tool_call> world";
+        let result = strip_tool_blocks(input);
+        assert!(!result.contains("tool_call"));
+        assert!(!result.contains("some call"));
+    }
+
+    #[test]
+    fn strip_tool_blocks_empty_input() {
+        assert_eq!(strip_tool_blocks(""), "");
+    }
+
+    #[test]
+    fn strip_tool_blocks_multiple_blocks() {
+        let input = "a <tool_code>x</tool_code> b <tool_call>y</tool_call> c";
+        let result = strip_tool_blocks(input);
+        assert!(!result.contains("tool_code"));
+        assert!(!result.contains("tool_call"));
+        assert!(result.contains('a'));
+        assert!(result.contains('b'));
+        assert!(result.contains('c'));
+    }
+
+    #[test]
+    fn strip_tool_blocks_multiline() {
+        let input = "before\n<tool_code>\nline1\nline2\n</tool_code>\nafter";
+        let result = strip_tool_blocks(input);
+        assert!(!result.contains("tool_code"));
+        assert!(!result.contains("line1"));
+        assert!(result.contains("before"));
+        assert!(result.contains("after"));
+    }
+
+    // ── Emoji/reaction constant validation ──────────────────────
+
+    #[test]
+    fn lark_ack_reactions_arrays_non_empty() {
+        assert!(!LARK_ACK_REACTIONS_ZH_CN.is_empty());
+        assert!(!LARK_ACK_REACTIONS_ZH_TW.is_empty());
+        assert!(!LARK_ACK_REACTIONS_EN.is_empty());
+        assert!(!LARK_ACK_REACTIONS_JA.is_empty());
+    }
+
+    #[test]
+    fn lark_ack_reactions_no_duplicates() {
+        for (name, arr) in &[
+            ("ZH_CN", LARK_ACK_REACTIONS_ZH_CN),
+            ("ZH_TW", LARK_ACK_REACTIONS_ZH_TW),
+            ("EN", LARK_ACK_REACTIONS_EN),
+            ("JA", LARK_ACK_REACTIONS_JA),
+        ] {
+            let mut seen = std::collections::HashSet::new();
+            for key in *arr {
+                assert!(seen.insert(*key), "Duplicate '{key}' in {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn lark_ack_reactions_all_uppercase() {
+        for (name, arr) in &[
+            ("ZH_CN", LARK_ACK_REACTIONS_ZH_CN),
+            ("ZH_TW", LARK_ACK_REACTIONS_ZH_TW),
+            ("EN", LARK_ACK_REACTIONS_EN),
+            ("JA", LARK_ACK_REACTIONS_JA),
+        ] {
+            for key in *arr {
+                assert!(!key.is_empty(), "Empty key in {name}");
+                assert_eq!(*key, key.to_uppercase(), "'{key}' in {name} not UPPERCASE");
+            }
+        }
     }
 }
