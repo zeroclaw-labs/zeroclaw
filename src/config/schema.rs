@@ -207,6 +207,13 @@ pub struct Config {
     /// Voice transcription configuration (Whisper API via Groq).
     #[serde(default)]
     pub transcription: TranscriptionConfig,
+
+    /// Vision support override for the active provider/model.
+    /// - `None` (default): use provider's built-in default
+    /// - `Some(true)`: force vision support on (e.g. Ollama running llava)
+    /// - `Some(false)`: force vision support off
+    #[serde(default)]
+    pub model_support_vision: Option<bool>,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -3475,6 +3482,7 @@ impl Default for Config {
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
+            model_support_vision: None,
         }
     }
 }
@@ -4199,6 +4207,18 @@ impl Config {
             }
         }
 
+        // Vision support override: ZEROCLAW_MODEL_SUPPORT_VISION or MODEL_SUPPORT_VISION
+        if let Ok(flag) = std::env::var("ZEROCLAW_MODEL_SUPPORT_VISION")
+            .or_else(|_| std::env::var("MODEL_SUPPORT_VISION"))
+        {
+            let normalized = flag.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "1" | "true" | "yes" | "on" => self.model_support_vision = Some(true),
+                "0" | "false" | "no" | "off" => self.model_support_vision = Some(false),
+                _ => {}
+            }
+        }
+
         // Web search enabled: ZEROCLAW_WEB_SEARCH_ENABLED or WEB_SEARCH_ENABLED
         if let Ok(enabled) = std::env::var("ZEROCLAW_WEB_SEARCH_ENABLED")
             .or_else(|_| std::env::var("WEB_SEARCH_ENABLED"))
@@ -4800,6 +4820,7 @@ default_temperature = 0.7
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
+            model_support_vision: None,
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -4892,6 +4913,24 @@ reasoning_enabled = false
     }
 
     #[test]
+    async fn model_support_vision_deserializes() {
+        let raw = r#"
+default_temperature = 0.7
+model_support_vision = true
+"#;
+
+        let parsed: Config = toml::from_str(raw).unwrap();
+        assert_eq!(parsed.model_support_vision, Some(true));
+
+        // Default (omitted) should be None
+        let raw_no_vision = r#"
+default_temperature = 0.7
+"#;
+        let parsed2: Config = toml::from_str(raw_no_vision).unwrap();
+        assert_eq!(parsed2.model_support_vision, None);
+    }
+
+    #[test]
     async fn agent_config_defaults() {
         let cfg = AgentConfig::default();
         assert!(!cfg.compact_context);
@@ -4980,6 +5019,7 @@ tool_dispatcher = "xml"
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
+            model_support_vision: None,
         };
 
         config.save().await.unwrap();
@@ -6563,6 +6603,28 @@ default_model = "legacy-model"
         assert_eq!(config.runtime.reasoning_enabled, Some(false));
 
         std::env::remove_var("ZEROCLAW_REASONING_ENABLED");
+    }
+
+    #[test]
+    async fn env_override_model_support_vision() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        assert_eq!(config.model_support_vision, None);
+
+        std::env::set_var("ZEROCLAW_MODEL_SUPPORT_VISION", "true");
+        config.apply_env_overrides();
+        assert_eq!(config.model_support_vision, Some(true));
+
+        std::env::set_var("ZEROCLAW_MODEL_SUPPORT_VISION", "false");
+        config.apply_env_overrides();
+        assert_eq!(config.model_support_vision, Some(false));
+
+        std::env::set_var("ZEROCLAW_MODEL_SUPPORT_VISION", "maybe");
+        config.model_support_vision = Some(true);
+        config.apply_env_overrides();
+        assert_eq!(config.model_support_vision, Some(true));
+
+        std::env::remove_var("ZEROCLAW_MODEL_SUPPORT_VISION");
     }
 
     #[test]

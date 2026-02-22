@@ -25,6 +25,14 @@ Schema export command:
 | `default_provider` | `openrouter` | provider ID or alias |
 | `default_model` | `anthropic/claude-sonnet-4-6` | model routed through selected provider |
 | `default_temperature` | `0.7` | model temperature |
+| `model_support_vision` | unset (`None`) | Vision support override for active provider/model |
+
+Notes:
+
+- `model_support_vision = true` forces vision support on (e.g. Ollama running `llava`).
+- `model_support_vision = false` forces vision support off.
+- Unset keeps the provider's built-in default.
+- Environment override: `ZEROCLAW_MODEL_SUPPORT_VISION` or `MODEL_SUPPORT_VISION` (values: `true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`).
 
 ## `[observability]`
 
