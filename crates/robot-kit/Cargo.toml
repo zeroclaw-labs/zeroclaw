@@ -57,7 +57,7 @@ directories = "6.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # GPIO (Raspberry Pi only, optional)
-rppal = { version = "0.19", optional = true }
+rppal = { version = "0.22", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
