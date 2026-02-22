@@ -140,6 +140,7 @@ Runtime in-chat commands (Telegram/Discord while channel server is running):
 - `/models <provider>`
 - `/model`
 - `/model <model-id>`
+- `/new`
 
 Channel runtime also watches `config.toml` and hot-applies updates to:
 - `default_provider`
