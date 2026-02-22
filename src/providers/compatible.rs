@@ -1059,6 +1059,21 @@ impl OpenAiCompatibleProvider {
         .iter()
         .any(|hint| lower.contains(hint))
     }
+
+    /// Check if any message contains multimodal content (image_url).
+    /// Some providers like MiniMax don't support multimodal + tool calling.
+    fn has_multimodal_content(messages: &[ChatMessage]) -> bool {
+        for message in messages {
+            // Check if content contains image markers like [IMAGE:...] or image_url
+            if message.content.contains("[IMAGE:")
+                || message.content.contains("image_url")
+                || message.content.contains("<path-or-url>")
+            {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 #[async_trait]
@@ -1424,7 +1439,16 @@ impl Provider for OpenAiCompatibleProvider {
             )
         })?;
 
-        let tools = Self::convert_tool_specs(request.tools);
+        // Check for multimodal content - MiniMax doesn't support multimodal + tool calling
+        // (causes 500 error code 1000). Only disable tools for MiniMax provider.
+        let has_multimodal = Self::has_multimodal_content(request.messages);
+        let is_minimax = self.name.to_lowercase().contains("minimax");
+        let tools = if is_minimax && has_multimodal {
+            None
+        } else {
+            Self::convert_tool_specs(request.tools)
+        };
+
         let effective_messages = if self.merge_system_into_user {
             Self::flatten_system_messages(request.messages)
         } else {
