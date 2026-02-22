@@ -8,6 +8,7 @@
 
 ## Языковые точки входа
 
+- Карта структуры docs (язык/раздел/функция): [structure/README.md](structure/README.md)
 - README на английском: [../README.md](../README.md)
 - README на китайском: [../README.zh-CN.md](../README.zh-CN.md)
 - README на японском: [../README.ja.md](../README.ja.md)

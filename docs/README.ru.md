@@ -80,6 +80,7 @@
 ## Инвентаризация и структура docs
 
 - Единый TOC: [SUMMARY.md](SUMMARY.md)
+- Карта структуры docs (язык/раздел/функция): [structure/README.md](structure/README.md)
 - Инвентарь и классификация docs: [docs-inventory.md](docs-inventory.md)
 
 ## Другие языки

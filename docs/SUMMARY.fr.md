@@ -8,6 +8,7 @@ Dernière mise à jour : **18 février 2026**.
 
 ## Points d'entrée par langue
 
+- Carte de structure docs (langue/partie/fonction) : [structure/README.md](structure/README.md)
 - README en anglais : [../README.md](../README.md)
 - README en chinois : [../README.zh-CN.md](../README.zh-CN.md)
 - README en japonais : [../README.ja.md](../README.ja.md)
