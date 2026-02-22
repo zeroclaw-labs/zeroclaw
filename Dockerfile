@@ -54,7 +54,7 @@ workspace_dir = "/zeroclaw-data/workspace"
 config_path = "/zeroclaw-data/.zeroclaw/config.toml"
 api_key = "AIzaSyCJcSfhSmgNl5VHZ_bdBPqvFF79fkWaPTQ"
 default_provider = "google"
-default_model = "gemini-3-flash-preview"
+default_model = "gemini-2.0-flash"
 default_temperature = 0.7
 
 [reliability]
