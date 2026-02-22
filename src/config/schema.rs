@@ -4381,6 +4381,20 @@ impl Config {
             anyhow::bail!("Failed to atomically replace config file: {e}");
         }
 
+        #[cfg(unix)]
+        {
+            use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+            if let Err(err) =
+                fs::set_permissions(&self.config_path, Permissions::from_mode(0o600)).await
+            {
+                tracing::warn!(
+                    "Failed to harden config permissions to 0600 at {}: {}",
+                    self.config_path.display(),
+                    err
+                );
+            }
+        }
+
         sync_directory(parent_dir).await?;
 
         if had_existing_config {
@@ -4413,9 +4427,9 @@ async fn sync_directory(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     #[cfg(unix)]
-    use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
     use tokio::sync::{Mutex, MutexGuard};
     use tokio::test;
     use tokio_stream::wrappers::ReadDirStream;
@@ -6812,16 +6826,47 @@ default_model = "legacy-model"
         config.config_path = config_path.clone();
         config.save().await.unwrap();
 
-        // Apply the same permission logic as load_or_init
-        fs::set_permissions(&config_path, Permissions::from_mode(0o600))
-            .await
-            .expect("Failed to set permissions");
-
         let meta = fs::metadata(&config_path).await.unwrap();
         let mode = meta.permissions().mode() & 0o777;
         assert_eq!(
             mode, 0o600,
             "New config file should be owner-only (0600), got {mode:o}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    async fn save_restricts_existing_world_readable_config_to_owner_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let mut config = Config::default();
+        config.config_path = config_path.clone();
+        config.save().await.unwrap();
+
+        // Simulate the regression state observed in issue #1345.
+        std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let loose_mode = std::fs::metadata(&config_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            loose_mode, 0o644,
+            "test setup requires world-readable config"
+        );
+
+        config.default_temperature = 0.6;
+        config.save().await.unwrap();
+
+        let hardened_mode = std::fs::metadata(&config_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            hardened_mode, 0o600,
+            "Saving config should restore owner-only permissions (0600)"
         );
     }
 
