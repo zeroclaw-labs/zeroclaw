@@ -11,6 +11,7 @@ use async_trait::async_trait;
 
 use crate::agent::memory_loader::MemoryLoader;
 use crate::memory::tiered::budget::estimate_tokens;
+use crate::memory::tiered::facts::{FactConfidence, FactEntry, FactStatus};
 use crate::memory::tiered::types::{IndexEntry, TierConfig};
 use crate::memory::tiered::SharedMemory;
 use crate::memory::traits::{Memory, MemoryCategory, MemoryEntry};
@@ -46,12 +47,20 @@ impl MemoryLoader for TieredMemoryLoader {
         // 1. Get all STM entries.
         let all_stm = self.stm.lock().await.list(None, None).await?;
 
-        // 2. Split into raw entries vs index entries.
+        // 2. Split into raw entries, index entries, and fact entries.
         let mut raw_entries: Vec<MemoryEntry> = Vec::new();
         let mut index_entries: Vec<IndexEntry> = Vec::new();
+        let mut fact_entries: Vec<FactEntry> = Vec::new();
 
         for entry in all_stm {
-            if entry.category == MemoryCategory::Custom(STM_INDEX_CATEGORY.to_string()) {
+            if entry.key.starts_with("fact:") && entry.category == MemoryCategory::Core {
+                // Try to deserialize as FactEntry; only include active facts.
+                if let Ok(fact) = serde_json::from_str::<FactEntry>(&entry.content) {
+                    if fact.status == FactStatus::Active {
+                        fact_entries.push(fact);
+                    }
+                }
+            } else if entry.category == MemoryCategory::Custom(STM_INDEX_CATEGORY.to_string()) {
                 // Try to deserialize as IndexEntry; fall back to ignoring.
                 if let Ok(idx) = serde_json::from_str::<IndexEntry>(&entry.content) {
                     index_entries.push(idx);
@@ -85,6 +94,26 @@ impl MemoryLoader for TieredMemoryLoader {
             writeln!(output).unwrap();
             for entry in &raw_entries {
                 writeln!(output, "- **{}**: {}", entry.key, entry.content).unwrap();
+            }
+            writeln!(output).unwrap();
+        }
+
+        // -- Known Facts --
+        if !fact_entries.is_empty() {
+            writeln!(output, "## Known Facts").unwrap();
+            writeln!(output).unwrap();
+            for fact in &fact_entries {
+                let confidence_tag = match &fact.confidence {
+                    FactConfidence::High => "high",
+                    FactConfidence::Medium => "medium",
+                    FactConfidence::Low => "low",
+                };
+                writeln!(
+                    output,
+                    "- [{}] {} {}: {} ({})",
+                    confidence_tag, fact.subject, fact.attribute, fact.value, fact.context_narrative
+                )
+                .unwrap();
             }
             writeln!(output).unwrap();
         }
@@ -416,11 +445,100 @@ mod tests {
             "missing MTM section"
         );
 
-        // Correct ordering: STM before Index before MTM.
+        // Correct ordering: STM before Known Facts before Index before MTM.
         let stm_pos = output.find("## Active Memory (Short-Term)").unwrap();
         let idx_pos = output.find("## Memory Index").unwrap();
         let mtm_pos = output.find("## Medium-Term Memory (Recent Summaries)").unwrap();
         assert!(stm_pos < idx_pos, "STM should come before Index");
         assert!(idx_pos < mtm_pos, "Index should come before MTM");
+    }
+
+    #[tokio::test]
+    async fn loads_facts_section_from_core_entries() {
+        use crate::memory::tiered::facts::{
+            FactConfidence, FactEntry, FactStatus, SourceRole, SourceTurnRef, VolatilityClass,
+        };
+
+        let stm_backend = InMemoryBackend::new();
+
+        // Create a fact entry and store as JSON with key "fact:personal:user:name"
+        let fact = FactEntry {
+            fact_id: "f-001".to_string(),
+            fact_key: "fact:personal:user:name".to_string(),
+            category: "personal".to_string(),
+            subject: "user".to_string(),
+            attribute: "name".to_string(),
+            value: "Alice".to_string(),
+            context_narrative: "User introduced themselves".to_string(),
+            source_turn: SourceTurnRef {
+                conversation_id: "conv-1".to_string(),
+                turn_index: 1,
+                message_id: None,
+                role: SourceRole::User,
+                timestamp_unix_ms: 1_700_000_000_000,
+            },
+            confidence: FactConfidence::High,
+            related_facts: vec![],
+            extracted_by_tier: "stm".to_string(),
+            extracted_at_unix_ms: 1_700_000_001_000,
+            source_role: SourceRole::User,
+            status: FactStatus::Active,
+            revision: 1,
+            supersedes_fact_id: None,
+            tags: vec!["personal".to_string()],
+            volatility_class: VolatilityClass::Stable,
+            ttl_days: None,
+            expires_at_unix_ms: None,
+            last_verified_unix_ms: None,
+        };
+        let fact_json = serde_json::to_string(&fact).unwrap();
+        stm_backend
+            .store(
+                "fact:personal:user:name",
+                &fact_json,
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Also add a regular raw entry
+        stm_backend
+            .store("pref-1", "likes tea", MemoryCategory::Conversation, None)
+            .await
+            .unwrap();
+
+        let stm = make_shared(stm_backend);
+        let mtm = make_shared(InMemoryBackend::new());
+        let cfg = Arc::new(TierConfig::default());
+
+        let loader = TieredMemoryLoader::new(stm, mtm, cfg);
+        let output = loader.load_context(&NoopMemory, "test").await.unwrap();
+
+        assert!(
+            output.contains("## Known Facts"),
+            "missing Known Facts header in:\n{output}"
+        );
+        assert!(
+            output.contains("Alice"),
+            "missing fact value in:\n{output}"
+        );
+        assert!(
+            output.contains("[high]"),
+            "missing confidence tag in:\n{output}"
+        );
+        assert!(
+            output.contains("user name"),
+            "missing subject/attribute in:\n{output}"
+        );
+
+        // Known Facts should appear after Active Memory and before Memory Index
+        if let Some(stm_pos) = output.find("## Active Memory (Short-Term)") {
+            let facts_pos = output.find("## Known Facts").unwrap();
+            assert!(
+                stm_pos < facts_pos,
+                "Active Memory should come before Known Facts"
+            );
+        }
     }
 }
