@@ -40,32 +40,19 @@ jobs:
     if: github.event.action == 'opened'
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       issues: write
       pull-requests: write
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
       - name: Greet first-time contributors
-        uses: actions/first-interaction@a1db7729b356323c7988c20ed6f0d33fe31297be # v1
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          issue_message: |
-            Thanks for opening this issue.
-
-            Before maintainers triage it, please confirm:
-            - Repro steps are complete and run on latest `main`
-            - Environment details are included (OS, Rust version, ZeroClaw version)
-            - Sensitive values are redacted
-
-            This helps us keep issue throughput high and response latency low.
-          pr_message: |
-            Thanks for contributing to ZeroClaw.
-
-            For faster review, please ensure:
-            - PR template sections are fully completed
-            - `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` are included
-            - If automation/agents were used heavily, add brief workflow notes
-            - Scope is focused (prefer one concern per PR)
-
-            See `CONTRIBUTING.md` and `docs/pr-workflow.md` for full collaboration rules.
+          script: |
+            const script = require('./.github/workflows/scripts/pr_auto_response_first_interaction.js');
+            await script({ github, context, core });
 
   labeled-routes:
     if: github.event.action == 'labeled'
