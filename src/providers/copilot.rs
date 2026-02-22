@@ -378,6 +378,7 @@ impl CopilotProvider {
             text: choice.message.content,
             tool_calls,
             usage,
+            reasoning_content: None,
         })
     }
 
