@@ -3,8 +3,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::SystemTime;
+use tokio::sync::Semaphore;
+use tokio::time::{timeout, Duration};
 use wasmtime::{Engine, Extern, Instance, Memory, Module, Store, TypedFunc};
 
 use super::manifest::PluginManifest;
@@ -16,6 +18,7 @@ const ABI_TOOL_EXEC_FN: &str = "zeroclaw_tool_execute";
 const ABI_PROVIDER_CHAT_FN: &str = "zeroclaw_provider_chat";
 const ABI_ALLOC_FN: &str = "alloc";
 const ABI_DEALLOC_FN: &str = "dealloc";
+const MAX_WASM_PAYLOAD_BYTES_FALLBACK: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Default)]
 pub struct PluginRuntime;
@@ -167,6 +170,9 @@ fn unpack_ptr_len(packed: i64) -> Result<(i32, i32)> {
 }
 
 fn call_wasm_json(module_path: &str, fn_name: &str, input_json: &str) -> Result<String> {
+    if input_json.len() > MAX_WASM_PAYLOAD_BYTES_FALLBACK {
+        anyhow::bail!("wasm input payload exceeds safety limit");
+    }
     let (mut store, instance, memory, alloc, dealloc) = instantiate_module(module_path)?;
     let call = instance
         .get_typed_func::<(i32, i32), i64>(&mut store, fn_name)
@@ -179,22 +185,76 @@ fn call_wasm_json(module_path: &str, fn_name: &str, input_json: &str) -> Result<
     let _ = dealloc.call(&mut store, (in_ptr, in_len));
 
     let (out_ptr, out_len) = unpack_ptr_len(packed)?;
+    if usize::try_from(out_len).unwrap_or(usize::MAX) > MAX_WASM_PAYLOAD_BYTES_FALLBACK {
+        anyhow::bail!("wasm output payload exceeds safety limit");
+    }
     let out_bytes = read_guest_bytes(&mut store, &memory, out_ptr, out_len)?;
     let _ = dealloc.call(&mut store, (out_ptr, out_len));
 
     String::from_utf8(out_bytes).context("wasm function returned non-utf8 output")
 }
 
-pub fn execute_plugin_tool(tool_name: &str, args: &Value) -> Result<ToolResult> {
+fn semaphore_cell() -> &'static RwLock<Arc<Semaphore>> {
+    static CELL: OnceLock<RwLock<Arc<Semaphore>>> = OnceLock::new();
+    CELL.get_or_init(|| RwLock::new(Arc::new(Semaphore::new(8))))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PluginExecutionLimits {
+    invoke_timeout_ms: u64,
+    memory_limit_bytes: u64,
+}
+
+fn current_limits() -> PluginExecutionLimits {
+    let guard = registry_cell()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.limits
+}
+
+async fn call_wasm_json_limited(
+    module_path: String,
+    fn_name: &'static str,
+    payload: String,
+) -> Result<String> {
+    let limits = current_limits();
+    let permit = {
+        let sem = semaphore_cell()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        sem.acquire_owned()
+            .await
+            .context("plugin concurrency limiter closed")?
+    };
+    let max_by_config = usize::try_from(limits.memory_limit_bytes).unwrap_or(usize::MAX);
+    let max_payload = max_by_config.min(MAX_WASM_PAYLOAD_BYTES_FALLBACK);
+    if payload.len() > max_payload {
+        anyhow::bail!("plugin payload exceeds configured memory limit");
+    }
+
+    let handle = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        call_wasm_json(&module_path, fn_name, &payload)
+    });
+    let result = timeout(Duration::from_millis(limits.invoke_timeout_ms), handle)
+        .await
+        .context("plugin invocation timed out")?
+        .context("plugin blocking task join failed")??;
+    Ok(result)
+}
+
+pub async fn execute_plugin_tool(tool_name: &str, args: &Value) -> Result<ToolResult> {
     let registry = current_registry();
     let module_path = registry
         .tool_module_path(tool_name)
-        .ok_or_else(|| anyhow::anyhow!("plugin tool '{tool_name}' not found in registry"))?;
+        .ok_or_else(|| anyhow::anyhow!("plugin tool '{tool_name}' not found in registry"))?
+        .to_string();
     let payload = serde_json::json!({
         "tool": tool_name,
         "args": args,
     });
-    let output = call_wasm_json(module_path, ABI_TOOL_EXEC_FN, &payload.to_string())?;
+    let output = call_wasm_json_limited(module_path, ABI_TOOL_EXEC_FN, payload.to_string()).await?;
     if let Ok(parsed) = serde_json::from_str::<ToolResult>(&output) {
         return Ok(parsed);
     }
@@ -205,7 +265,7 @@ pub fn execute_plugin_tool(tool_name: &str, args: &Value) -> Result<ToolResult> 
     })
 }
 
-pub fn execute_plugin_provider_chat(
+pub async fn execute_plugin_provider_chat(
     provider_name: &str,
     system_prompt: Option<&str>,
     message: &str,
@@ -215,9 +275,8 @@ pub fn execute_plugin_provider_chat(
     let registry = current_registry();
     let module_path = registry
         .provider_module_path(provider_name)
-        .ok_or_else(|| {
-            anyhow::anyhow!("plugin provider '{provider_name}' not found in registry")
-        })?;
+        .ok_or_else(|| anyhow::anyhow!("plugin provider '{provider_name}' not found in registry"))?
+        .to_string();
     let request = ProviderPluginRequest {
         provider: provider_name,
         system_prompt,
@@ -225,11 +284,12 @@ pub fn execute_plugin_provider_chat(
         model,
         temperature,
     };
-    let output = call_wasm_json(
+    let output = call_wasm_json_limited(
         module_path,
         ABI_PROVIDER_CHAT_FN,
-        &serde_json::to_string(&request)?,
-    )?;
+        serde_json::to_string(&request)?,
+    )
+    .await?;
     if let Ok(parsed) = serde_json::from_str::<ProviderPluginResponse>(&output) {
         if let Some(error) = parsed.error {
             anyhow::bail!("plugin provider error: {error}");
@@ -239,7 +299,7 @@ pub fn execute_plugin_provider_chat(
     Ok(output)
 }
 
-fn registry_cell() -> &'static RwLock<PluginRegistry> {
+fn registry_cell() -> &'static RwLock<RuntimeState> {
     static CELL: OnceLock<RwLock<RuntimeState>> = OnceLock::new();
     CELL.get_or_init(|| RwLock::new(RuntimeState::default()))
 }
@@ -250,6 +310,22 @@ struct RuntimeState {
     hot_reload: bool,
     config: Option<PluginsConfig>,
     fingerprints: HashMap<String, SystemTime>,
+    limits: PluginExecutionLimits,
+}
+
+impl Default for RuntimeState {
+    fn default() -> Self {
+        Self {
+            registry: PluginRegistry::default(),
+            hot_reload: false,
+            config: None,
+            fingerprints: HashMap::new(),
+            limits: PluginExecutionLimits {
+                invoke_timeout_ms: 2_000,
+                memory_limit_bytes: 64 * 1024 * 1024,
+            },
+        }
+    }
 }
 
 fn collect_manifest_fingerprints(dirs: &[String]) -> HashMap<String, SystemTime> {
@@ -325,6 +401,14 @@ pub fn initialize_from_config(config: &PluginsConfig) -> Result<()> {
     guard.hot_reload = config.hot_reload;
     guard.config = Some(config.clone());
     guard.fingerprints = fingerprints;
+    guard.limits = PluginExecutionLimits {
+        invoke_timeout_ms: config.limits.invoke_timeout_ms,
+        memory_limit_bytes: config.limits.memory_limit_bytes,
+    };
+    let mut sem_guard = semaphore_cell()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *sem_guard = Arc::new(Semaphore::new(config.limits.max_concurrency.max(1)));
     Ok(())
 }
 

@@ -96,6 +96,7 @@ impl Provider for PluginProvider {
             model,
             temperature,
         )
+        .await
     }
 }
 

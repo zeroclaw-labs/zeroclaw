@@ -158,7 +158,7 @@ impl Tool for PluginManifestTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        match plugins::runtime::execute_plugin_tool(&self.spec.name, &args) {
+        match plugins::runtime::execute_plugin_tool(&self.spec.name, &args).await {
             Ok(result) => Ok(result),
             Err(error) => Ok(ToolResult {
                 success: false,
