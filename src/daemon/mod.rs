@@ -1,7 +1,9 @@
 use crate::config::Config;
 use anyhow::Result;
 use chrono::Utc;
+use std::fs::File;
 use std::future::Future;
+use std::io::{Read as _, Write as _};
 use std::path::PathBuf;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
@@ -9,6 +11,10 @@ use tokio::time::Duration;
 const STATUS_FLUSH_SECONDS: u64 = 5;
 
 pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
+    // Acquire PID lock to enforce single-instance daemon.
+    // The lock is held for the lifetime of `run()` and released on exit/crash.
+    let _pid_lock = acquire_pid_lock(&config)?;
+
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config
         .reliability
@@ -111,6 +117,57 @@ pub fn state_file_path(config: &Config) -> PathBuf {
         .parent()
         .map_or_else(|| PathBuf::from("."), PathBuf::from)
         .join("daemon_state.json")
+}
+
+fn pid_lock_path(config: &Config) -> PathBuf {
+    config
+        .config_path
+        .parent()
+        .map_or_else(|| PathBuf::from("."), PathBuf::from)
+        .join("daemon.pid")
+}
+
+/// Acquire an exclusive advisory lock on the PID file. Returns the open [`File`]
+/// handle — the OS releases the lock automatically when the handle is dropped
+/// (on normal exit or crash), so no stale-lock cleanup is needed.
+fn acquire_pid_lock(config: &Config) -> Result<File> {
+    use std::os::unix::io::AsRawFd;
+
+    let path = pid_lock_path(config);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)?;
+
+    let fd = file.as_raw_fd();
+    let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            let mut existing_pid = String::new();
+            let _ = file.read_to_string(&mut existing_pid);
+            let existing_pid = existing_pid.trim();
+            anyhow::bail!(
+                "Another ZeroClaw daemon is already running (PID {existing_pid}). \
+                 Lock file: {}",
+                path.display()
+            );
+        }
+        return Err(err.into());
+    }
+
+    // Lock acquired — write our PID
+    file.set_len(0)?;
+    write!(file, "{}", std::process::id())?;
+    file.sync_all()?;
+
+    Ok(file)
 }
 
 fn spawn_state_writer(config: Config) -> JoinHandle<()> {
