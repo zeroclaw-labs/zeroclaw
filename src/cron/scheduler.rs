@@ -1,7 +1,8 @@
 use crate::channels::{
-    Channel, DiscordChannel, LarkChannel, MattermostChannel, SendMessage, SlackChannel,
-    TelegramChannel,
+    Channel, DiscordChannel, MattermostChannel, SendMessage, SlackChannel, TelegramChannel,
 };
+#[cfg(feature = "channel-lark")]
+use crate::channels::LarkChannel;
 use crate::config::Config;
 use crate::cron::{
     due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job, reschedule_after_run,
@@ -356,13 +357,18 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
             channel.send(&SendMessage::new(output, target)).await?;
         }
         "lark" => {
-            let lk = config
-                .channels_config
-                .lark
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("lark channel not configured"))?;
-            let channel = LarkChannel::from_config(lk);
-            channel.send(&SendMessage::new(output, target)).await?;
+            #[cfg(feature = "channel-lark")]
+            {
+                let lk = config
+                    .channels_config
+                    .lark
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("lark channel not configured"))?;
+                let channel = LarkChannel::from_config(lk);
+                channel.send(&SendMessage::new(output, target)).await?;
+            }
+            #[cfg(not(feature = "channel-lark"))]
+            anyhow::bail!("lark channel requires the `channel-lark` build feature");
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
