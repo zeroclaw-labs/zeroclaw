@@ -84,14 +84,17 @@ struct PluginProvider {
 impl Provider for PluginProvider {
     async fn chat_with_system(
         &self,
-        _system_prompt: Option<&str>,
-        _message: &str,
-        _model: &str,
-        _temperature: f64,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: f64,
     ) -> anyhow::Result<String> {
-        anyhow::bail!(
-            "provider '{}' is declared by plugin manifest but provider execution is not wired yet",
-            self.name
+        plugins::runtime::execute_plugin_provider_chat(
+            &self.name,
+            system_prompt,
+            message,
+            model,
+            temperature,
         )
     }
 }

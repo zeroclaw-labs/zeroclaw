@@ -1,10 +1,19 @@
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::path::Path;
 use std::sync::{OnceLock, RwLock};
+use wasmtime::{Engine, Extern, Instance, Memory, Module, Store, TypedFunc};
 
 use super::manifest::PluginManifest;
 use super::registry::PluginRegistry;
 use crate::config::PluginsConfig;
+use crate::tools::ToolResult;
+
+const ABI_TOOL_EXEC_FN: &str = "zeroclaw_tool_execute";
+const ABI_PROVIDER_CHAT_FN: &str = "zeroclaw_provider_chat";
+const ABI_ALLOC_FN: &str = "alloc";
+const ABI_DEALLOC_FN: &str = "dealloc";
 
 #[derive(Debug, Default)]
 pub struct PluginRuntime;
@@ -63,6 +72,169 @@ impl PluginRuntime {
         }
         Ok(registry)
     }
+}
+
+#[derive(Debug, Serialize)]
+struct ProviderPluginRequest<'a> {
+    provider: &'a str,
+    system_prompt: Option<&'a str>,
+    message: &'a str,
+    model: &'a str,
+    temperature: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProviderPluginResponse {
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+fn instantiate_module(
+    module_path: &str,
+) -> Result<(
+    Store<()>,
+    Instance,
+    Memory,
+    TypedFunc<i32, i32>,
+    TypedFunc<(i32, i32), ()>,
+)> {
+    let engine = Engine::default();
+    let module = Module::from_file(&engine, module_path)
+        .with_context(|| format!("failed to load wasm module {module_path}"))?;
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[])
+        .with_context(|| format!("failed to instantiate wasm module {module_path}"))?;
+    let memory = match instance.get_export(&mut store, "memory") {
+        Some(Extern::Memory(memory)) => memory,
+        _ => anyhow::bail!("wasm module '{module_path}' missing exported memory"),
+    };
+    let alloc = instance
+        .get_typed_func::<i32, i32>(&mut store, ABI_ALLOC_FN)
+        .with_context(|| format!("wasm module '{module_path}' missing '{ABI_ALLOC_FN}'"))?;
+    let dealloc = instance
+        .get_typed_func::<(i32, i32), ()>(&mut store, ABI_DEALLOC_FN)
+        .with_context(|| format!("wasm module '{module_path}' missing '{ABI_DEALLOC_FN}'"))?;
+    Ok((store, instance, memory, alloc, dealloc))
+}
+
+fn write_guest_bytes(
+    store: &mut Store<()>,
+    memory: &Memory,
+    alloc: &TypedFunc<i32, i32>,
+    bytes: &[u8],
+) -> Result<(i32, i32)> {
+    let len_i32 = i32::try_from(bytes.len()).context("input too large for wasm ABI i32 length")?;
+    let ptr = alloc
+        .call(store, len_i32)
+        .context("wasm alloc call failed")?;
+    let ptr_usize = usize::try_from(ptr).context("wasm alloc returned invalid pointer")?;
+    memory
+        .write(store, ptr_usize, bytes)
+        .context("failed to write input bytes into wasm memory")?;
+    Ok((ptr, len_i32))
+}
+
+fn read_guest_bytes(store: &mut Store<()>, memory: &Memory, ptr: i32, len: i32) -> Result<Vec<u8>> {
+    if ptr < 0 || len < 0 {
+        anyhow::bail!("wasm ABI returned negative ptr/len");
+    }
+    let ptr_usize = usize::try_from(ptr).context("invalid output pointer")?;
+    let len_usize = usize::try_from(len).context("invalid output length")?;
+    let end = ptr_usize
+        .checked_add(len_usize)
+        .context("overflow in output range")?;
+    if end > memory.data_size(store) {
+        anyhow::bail!("output range exceeds wasm memory bounds");
+    }
+    let mut out = vec![0u8; len_usize];
+    memory
+        .read(store, ptr_usize, &mut out)
+        .context("failed to read wasm output bytes")?;
+    Ok(out)
+}
+
+fn unpack_ptr_len(packed: i64) -> Result<(i32, i32)> {
+    let raw = u64::try_from(packed).context("wasm ABI returned negative packed ptr/len")?;
+    let ptr_u32 = (raw >> 32) as u32;
+    let len_u32 = (raw & 0xffff_ffff) as u32;
+    let ptr = i32::try_from(ptr_u32).context("ptr out of i32 range")?;
+    let len = i32::try_from(len_u32).context("len out of i32 range")?;
+    Ok((ptr, len))
+}
+
+fn call_wasm_json(module_path: &str, fn_name: &str, input_json: &str) -> Result<String> {
+    let (mut store, instance, memory, alloc, dealloc) = instantiate_module(module_path)?;
+    let call = instance
+        .get_typed_func::<(i32, i32), i64>(&mut store, fn_name)
+        .with_context(|| format!("wasm module '{module_path}' missing '{fn_name}'"))?;
+
+    let (in_ptr, in_len) = write_guest_bytes(&mut store, &memory, &alloc, input_json.as_bytes())?;
+    let packed = call
+        .call(&mut store, (in_ptr, in_len))
+        .with_context(|| format!("wasm function '{fn_name}' failed"))?;
+    let _ = dealloc.call(&mut store, (in_ptr, in_len));
+
+    let (out_ptr, out_len) = unpack_ptr_len(packed)?;
+    let out_bytes = read_guest_bytes(&mut store, &memory, out_ptr, out_len)?;
+    let _ = dealloc.call(&mut store, (out_ptr, out_len));
+
+    String::from_utf8(out_bytes).context("wasm function returned non-utf8 output")
+}
+
+pub fn execute_plugin_tool(tool_name: &str, args: &Value) -> Result<ToolResult> {
+    let registry = current_registry();
+    let module_path = registry
+        .tool_module_path(tool_name)
+        .ok_or_else(|| anyhow::anyhow!("plugin tool '{tool_name}' not found in registry"))?;
+    let payload = serde_json::json!({
+        "tool": tool_name,
+        "args": args,
+    });
+    let output = call_wasm_json(module_path, ABI_TOOL_EXEC_FN, &payload.to_string())?;
+    if let Ok(parsed) = serde_json::from_str::<ToolResult>(&output) {
+        return Ok(parsed);
+    }
+    Ok(ToolResult {
+        success: true,
+        output,
+        error: None,
+    })
+}
+
+pub fn execute_plugin_provider_chat(
+    provider_name: &str,
+    system_prompt: Option<&str>,
+    message: &str,
+    model: &str,
+    temperature: f64,
+) -> Result<String> {
+    let registry = current_registry();
+    let module_path = registry
+        .provider_module_path(provider_name)
+        .ok_or_else(|| {
+            anyhow::anyhow!("plugin provider '{provider_name}' not found in registry")
+        })?;
+    let request = ProviderPluginRequest {
+        provider: provider_name,
+        system_prompt,
+        message,
+        model,
+        temperature,
+    };
+    let output = call_wasm_json(
+        module_path,
+        ABI_PROVIDER_CHAT_FN,
+        &serde_json::to_string(&request)?,
+    )?;
+    if let Ok(parsed) = serde_json::from_str::<ProviderPluginResponse>(&output) {
+        if let Some(error) = parsed.error {
+            anyhow::bail!("plugin provider error: {error}");
+        }
+        return Ok(parsed.text.unwrap_or_default());
+    }
+    Ok(output)
 }
 
 fn registry_cell() -> &'static RwLock<PluginRegistry> {
