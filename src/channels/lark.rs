@@ -55,6 +55,49 @@ enum LarkAckLocale {
     Ja,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LarkPlatform {
+    Lark,
+    Feishu,
+}
+
+impl LarkPlatform {
+    fn api_base(self) -> &'static str {
+        match self {
+            Self::Lark => LARK_BASE_URL,
+            Self::Feishu => FEISHU_BASE_URL,
+        }
+    }
+
+    fn ws_base(self) -> &'static str {
+        match self {
+            Self::Lark => LARK_WS_BASE_URL,
+            Self::Feishu => FEISHU_WS_BASE_URL,
+        }
+    }
+
+    fn locale_header(self) -> &'static str {
+        match self {
+            Self::Lark => "en",
+            Self::Feishu => "zh",
+        }
+    }
+
+    fn proxy_service_key(self) -> &'static str {
+        match self {
+            Self::Lark => "channel.lark",
+            Self::Feishu => "channel.feishu",
+        }
+    }
+
+    fn channel_name(self) -> &'static str {
+        match self {
+            Self::Lark => "lark",
+            Self::Feishu => "feishu",
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Feishu WebSocket long-connection: pbbp2.proto frame codec
 // ─────────────────────────────────────────────────────────────────────────────
@@ -250,8 +293,8 @@ pub struct LarkChannel {
     verification_token: String,
     port: Option<u16>,
     allowed_users: Vec<String>,
-    /// When true, use Feishu (CN) endpoints; when false, use Lark (international).
-    use_feishu: bool,
+    /// Runtime endpoint/platform selection.
+    platform: LarkPlatform,
     /// How to receive events: WebSocket long-connection or HTTP webhook.
     receive_mode: crate::config::schema::LarkReceiveMode,
     /// Cached tenant access token
@@ -268,51 +311,99 @@ impl LarkChannel {
         port: Option<u16>,
         allowed_users: Vec<String>,
     ) -> Self {
+        Self::new_with_platform(
+            app_id,
+            app_secret,
+            verification_token,
+            port,
+            allowed_users,
+            LarkPlatform::Lark,
+        )
+    }
+
+    fn new_with_platform(
+        app_id: String,
+        app_secret: String,
+        verification_token: String,
+        port: Option<u16>,
+        allowed_users: Vec<String>,
+        platform: LarkPlatform,
+    ) -> Self {
         Self {
             app_id,
             app_secret,
             verification_token,
             port,
             allowed_users,
-            use_feishu: true,
+            platform,
             receive_mode: crate::config::schema::LarkReceiveMode::default(),
             tenant_token: Arc::new(RwLock::new(None)),
             ws_seen_ids: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    /// Build from `LarkConfig` (preserves `use_feishu` and `receive_mode`).
+    /// Build from `LarkConfig` using legacy compatibility:
+    /// when `use_feishu=true`, this instance routes to Feishu endpoints.
     pub fn from_config(config: &crate::config::schema::LarkConfig) -> Self {
-        let mut ch = Self::new(
+        let platform = if config.use_feishu {
+            LarkPlatform::Feishu
+        } else {
+            LarkPlatform::Lark
+        };
+        let mut ch = Self::new_with_platform(
             config.app_id.clone(),
             config.app_secret.clone(),
             config.verification_token.clone().unwrap_or_default(),
             config.port,
             config.allowed_users.clone(),
+            platform,
         );
-        ch.use_feishu = config.use_feishu;
+        ch.receive_mode = config.receive_mode.clone();
+        ch
+    }
+
+    /// Build from explicit Lark config entry.
+    pub fn from_lark_config(config: &crate::config::schema::LarkConfig) -> Self {
+        let mut ch = Self::new_with_platform(
+            config.app_id.clone(),
+            config.app_secret.clone(),
+            config.verification_token.clone().unwrap_or_default(),
+            config.port,
+            config.allowed_users.clone(),
+            LarkPlatform::Lark,
+        );
+        ch.receive_mode = config.receive_mode.clone();
+        ch
+    }
+
+    /// Build from explicit Feishu config entry.
+    pub fn from_feishu_config(config: &crate::config::schema::FeishuConfig) -> Self {
+        let mut ch = Self::new_with_platform(
+            config.app_id.clone(),
+            config.app_secret.clone(),
+            config.verification_token.clone().unwrap_or_default(),
+            config.port,
+            config.allowed_users.clone(),
+            LarkPlatform::Feishu,
+        );
         ch.receive_mode = config.receive_mode.clone();
         ch
     }
 
     fn http_client(&self) -> reqwest::Client {
-        crate::config::build_runtime_proxy_client("channel.lark")
+        crate::config::build_runtime_proxy_client(self.platform.proxy_service_key())
+    }
+
+    fn channel_name(&self) -> &'static str {
+        self.platform.channel_name()
     }
 
     fn api_base(&self) -> &'static str {
-        if self.use_feishu {
-            FEISHU_BASE_URL
-        } else {
-            LARK_BASE_URL
-        }
+        self.platform.api_base()
     }
 
     fn ws_base(&self) -> &'static str {
-        if self.use_feishu {
-            FEISHU_WS_BASE_URL
-        } else {
-            LARK_WS_BASE_URL
-        }
+        self.platform.ws_base()
     }
 
     fn tenant_access_token_url(&self) -> String {
@@ -429,7 +520,7 @@ impl LarkChannel {
         let resp = self
             .http_client()
             .post(format!("{}/callback/ws/endpoint", self.ws_base()))
-            .header("locale", if self.use_feishu { "zh" } else { "en" })
+            .header("locale", self.platform.locale_header())
             .json(&serde_json::json!({
                 "AppID": self.app_id,
                 "AppSecret": self.app_secret,
@@ -687,7 +778,7 @@ impl LarkChannel {
                         sender: lark_msg.chat_id.clone(),
                         reply_target: lark_msg.chat_id.clone(),
                         content: text,
-                        channel: "lark".to_string(),
+                        channel: self.channel_name().to_string(),
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
@@ -886,7 +977,7 @@ impl LarkChannel {
             sender: chat_id.to_string(),
             reply_target: chat_id.to_string(),
             content: text,
-            channel: "lark".to_string(),
+            channel: self.channel_name().to_string(),
             timestamp,
             thread_ts: None,
         });
@@ -898,7 +989,7 @@ impl LarkChannel {
 #[async_trait]
 impl Channel for LarkChannel {
     fn name(&self) -> &str {
-        "lark"
+        self.channel_name()
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
@@ -1757,6 +1848,49 @@ mod tests {
     }
 
     #[test]
+    fn lark_from_lark_config_ignores_legacy_feishu_flag() {
+        use crate::config::schema::{LarkConfig, LarkReceiveMode};
+
+        let cfg = LarkConfig {
+            app_id: "cli_app123".into(),
+            app_secret: "secret456".into(),
+            encrypt_key: None,
+            verification_token: Some("vtoken789".into()),
+            allowed_users: vec!["*".into()],
+            use_feishu: true,
+            receive_mode: LarkReceiveMode::Webhook,
+            port: Some(9898),
+        };
+
+        let ch = LarkChannel::from_lark_config(&cfg);
+
+        assert_eq!(ch.api_base(), LARK_BASE_URL);
+        assert_eq!(ch.ws_base(), LARK_WS_BASE_URL);
+        assert_eq!(ch.name(), "lark");
+    }
+
+    #[test]
+    fn lark_from_feishu_config_sets_feishu_platform() {
+        use crate::config::schema::{FeishuConfig, LarkReceiveMode};
+
+        let cfg = FeishuConfig {
+            app_id: "cli_feishu_app123".into(),
+            app_secret: "secret456".into(),
+            encrypt_key: None,
+            verification_token: Some("vtoken789".into()),
+            allowed_users: vec!["*".into()],
+            receive_mode: LarkReceiveMode::Webhook,
+            port: Some(9898),
+        };
+
+        let ch = LarkChannel::from_feishu_config(&cfg);
+
+        assert_eq!(ch.api_base(), FEISHU_BASE_URL);
+        assert_eq!(ch.ws_base(), FEISHU_WS_BASE_URL);
+        assert_eq!(ch.name(), "feishu");
+    }
+
+    #[test]
     fn lark_parse_fallback_sender_to_open_id() {
         // When chat_id is missing, sender should fall back to open_id
         let ch = LarkChannel::new(
@@ -1785,17 +1919,25 @@ mod tests {
 
     #[test]
     fn lark_reaction_url_matches_region() {
-        let ch_cn = make_channel();
+        let ch_lark = make_channel();
         assert_eq!(
-            ch_cn.message_reaction_url("om_test_message_id"),
-            "https://open.feishu.cn/open-apis/im/v1/messages/om_test_message_id/reactions"
+            ch_lark.message_reaction_url("om_test_message_id"),
+            "https://open.larksuite.com/open-apis/im/v1/messages/om_test_message_id/reactions"
         );
 
-        let mut ch_intl = make_channel();
-        ch_intl.use_feishu = false;
+        let feishu_cfg = crate::config::schema::FeishuConfig {
+            app_id: "cli_app123".into(),
+            app_secret: "secret456".into(),
+            encrypt_key: None,
+            verification_token: Some("vtoken789".into()),
+            allowed_users: vec!["*".into()],
+            receive_mode: crate::config::schema::LarkReceiveMode::Webhook,
+            port: Some(9898),
+        };
+        let ch_feishu = LarkChannel::from_feishu_config(&feishu_cfg);
         assert_eq!(
-            ch_intl.message_reaction_url("om_test_message_id"),
-            "https://open.larksuite.com/open-apis/im/v1/messages/om_test_message_id/reactions"
+            ch_feishu.message_reaction_url("om_test_message_id"),
+            "https://open.feishu.cn/open-apis/im/v1/messages/om_test_message_id/reactions"
         );
     }
 

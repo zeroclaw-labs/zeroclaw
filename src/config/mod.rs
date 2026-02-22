@@ -8,10 +8,10 @@ pub use schema::{
     AgentConfig, AuditConfig, AutonomyConfig, BrowserComputerUseConfig, BrowserConfig,
     BuiltinHooksConfig, ChannelsConfig, ClassificationRule, ComposioConfig, Config, CostConfig,
     CronConfig, DelegateAgentConfig, DiscordConfig, DockerRuntimeConfig, EmbeddingRouteConfig,
-    EstopConfig, GatewayConfig, HardwareConfig, HardwareTransport, HeartbeatConfig, HooksConfig,
-    HttpRequestConfig, IMessageConfig, IdentityConfig, LarkConfig, MatrixConfig, MemoryConfig,
-    ModelRouteConfig, MultimodalConfig, NextcloudTalkConfig, ObservabilityConfig, OtpConfig,
-    OtpMethod, PeripheralBoardConfig, PeripheralsConfig, ProxyConfig, ProxyScope,
+    EstopConfig, FeishuConfig, GatewayConfig, HardwareConfig, HardwareTransport, HeartbeatConfig,
+    HooksConfig, HttpRequestConfig, IMessageConfig, IdentityConfig, LarkConfig, MatrixConfig,
+    MemoryConfig, ModelRouteConfig, MultimodalConfig, NextcloudTalkConfig, ObservabilityConfig,
+    OtpConfig, OtpMethod, PeripheralBoardConfig, PeripheralsConfig, ProxyConfig, ProxyScope,
     QueryClassificationConfig, ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig,
     SandboxBackend, SandboxConfig, SchedulerConfig, SecretsConfig, SecurityConfig, SkillsConfig,
     SkillsPromptInjectionMode, SlackConfig, StorageConfig, StorageProviderConfig,
@@ -65,6 +65,15 @@ mod tests {
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
         };
+        let feishu = FeishuConfig {
+            app_id: "app-id".into(),
+            app_secret: "app-secret".into(),
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec![],
+            receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
+            port: None,
+        };
 
         let nextcloud_talk = NextcloudTalkConfig {
             base_url: "https://cloud.example.com".into(),
@@ -76,6 +85,7 @@ mod tests {
         assert_eq!(telegram.allowed_users.len(), 1);
         assert_eq!(discord.guild_id.as_deref(), Some("123"));
         assert_eq!(lark.app_id, "app-id");
+        assert_eq!(feishu.app_id, "app-id");
         assert_eq!(nextcloud_talk.base_url, "https://cloud.example.com");
     }
 }
