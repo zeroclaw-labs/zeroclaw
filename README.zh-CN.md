@@ -271,7 +271,7 @@ default_temperature = 0.7
 [memory]
 backend = "sqlite"             # sqlite | lucid | markdown | none
 auto_save = true
-embedding_provider = "none"    # none | openai | custom:https://..."
+embedding_provider = "none"    # none | openai | custom:https://...
 
 [gateway]
 host = "127.0.0.1"
