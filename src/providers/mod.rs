@@ -18,6 +18,7 @@
 
 pub mod anthropic;
 pub mod bedrock;
+pub mod codex_cli;
 pub mod compatible;
 pub mod copilot;
 pub mod gemini;
