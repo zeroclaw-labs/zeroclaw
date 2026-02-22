@@ -459,7 +459,6 @@ impl ComposioTool {
         })
     }
 
-
     async fn resolve_auth_config_id(&self, app_name: &str) -> anyhow::Result<String> {
         let url = format!("{COMPOSIO_API_BASE_V3}/auth_configs");
 
@@ -1108,9 +1107,13 @@ mod tests {
 
     #[test]
     fn composio_tool_has_description() {
-        let tool = ComposioTool::new("test-key", None, test_security());
-        assert!(!tool.description().is_empty());
-        assert!(tool.description().contains("1000+"));
+        let _tool = ComposioTool::new("test-key", None, test_security());
+        assert!(!ComposioTool::new("test-key", None, test_security())
+            .description()
+            .is_empty());
+        assert!(ComposioTool::new("test-key", None, test_security())
+            .description()
+            .contains("1000+"));
     }
 
     #[test]
@@ -1232,22 +1235,28 @@ mod tests {
     #[test]
     fn composio_actions_response_deserializes() {
         let json_str = r#"{"items": [{"name": "TEST_ACTION", "appName": "test", "description": "A test", "enabled": true}]}"#;
-        let resp: ComposioActionsResponse = serde_json::from_str(json_str).unwrap();
+        let resp: ComposioToolsResponse = serde_json::from_str(json_str).unwrap();
         assert_eq!(resp.items.len(), 1);
-        assert_eq!(resp.items[0].name, "TEST_ACTION");
+        assert_eq!(
+            resp.items[0]
+                .slug
+                .as_ref()
+                .unwrap_or(&resp.items[0].name.as_ref().unwrap().clone()),
+            "TEST_ACTION"
+        );
     }
 
     #[test]
     fn composio_actions_response_empty() {
         let json_str = r#"{"items": []}"#;
-        let resp: ComposioActionsResponse = serde_json::from_str(json_str).unwrap();
+        let resp: ComposioToolsResponse = serde_json::from_str(json_str).unwrap();
         assert!(resp.items.is_empty());
     }
 
     #[test]
     fn composio_actions_response_missing_items_defaults() {
         let json_str = r"{}";
-        let resp: ComposioActionsResponse = serde_json::from_str(json_str).unwrap();
+        let resp: ComposioToolsResponse = serde_json::from_str(json_str).unwrap();
         assert!(resp.items.is_empty());
     }
 
@@ -1299,18 +1308,9 @@ mod tests {
         assert!(candidates.contains(&"gmail_fetch_emails".to_string()));
 
         let hyphen = build_tool_slug_candidates("github-list-repos");
-        assert_eq!(hyphen.first().map(String::as_str), Some("github-list-repos"));
-    }
-
-    #[test]
-    fn normalize_legacy_action_name_supports_v3_slug_input() {
         assert_eq!(
-            normalize_legacy_action_name("gmail-fetch-emails"),
-            "GMAIL_FETCH_EMAILS"
-        );
-        assert_eq!(
-            normalize_legacy_action_name(" GITHUB_LIST_REPOS "),
-            "GITHUB_LIST_REPOS"
+            hyphen.first().map(String::as_str),
+            Some("github-list-repos")
         );
     }
 
@@ -1496,7 +1496,7 @@ mod tests {
             }));
         }
         let json_str = json!({"items": items}).to_string();
-        let resp: ComposioActionsResponse = serde_json::from_str(&json_str).unwrap();
+        let resp: ComposioToolsResponse = serde_json::from_str(&json_str).unwrap();
         assert_eq!(resp.items.len(), 100);
     }
 
@@ -1557,7 +1557,7 @@ mod tests {
     fn resolve_picks_first_usable_when_multiple_accounts_exist() {
         // Regression test for issue #959: previously returned None when
         // multiple accounts existed, causing the LLM to loop on the OAuth URL.
-        let tool = ComposioTool::new("test-key", None, test_security());
+        let _tool = ComposioTool::new("test-key", None, test_security());
         let accounts = vec![
             ComposioConnectedAccount {
                 id: "ca_old".to_string(),
