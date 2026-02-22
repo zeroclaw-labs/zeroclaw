@@ -359,7 +359,7 @@ Examples:
     },
 
     /// Manage ClawHub skills
-    #[command(long_about = "\
+    #[command(name = "clawhub", long_about = "\
 Manage ClawHub skills.
 
 Discover, install, and manage skills from ClawHub (https://clawhub.ai).
