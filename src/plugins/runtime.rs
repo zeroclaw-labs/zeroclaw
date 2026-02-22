@@ -381,5 +381,17 @@ providers = ["demo-provider"]
         assert_eq!(reg.len(), 1);
         assert_eq!(reg.tools().len(), 1);
         assert!(reg.has_provider("demo-provider"));
+        assert!(reg.tool_module_path("demo_tool").is_some());
+        assert!(reg.provider_module_path("demo-provider").is_some());
+    }
+
+    #[test]
+    fn unpack_ptr_len_roundtrip() {
+        let ptr: u32 = 0x1234_5678;
+        let len: u32 = 0x0000_0100;
+        let packed = ((u64::from(ptr)) << 32) | u64::from(len);
+        let (decoded_ptr, decoded_len) = unpack_ptr_len(packed as i64).expect("unpack");
+        assert_eq!(decoded_ptr as u32, ptr);
+        assert_eq!(decoded_len as u32, len);
     }
 }
