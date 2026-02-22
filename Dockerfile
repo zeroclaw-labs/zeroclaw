@@ -102,7 +102,7 @@ COPY --from=builder /zeroclaw-data /zeroclaw-data
 # 环境配置
 ENV ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace
 ENV HOME=/zeroclaw-data
-ENV ZEROCLAW_GATEWAY_PORT=8080 [cite: 4]
+ENV ZEROCLAW_GATEWAY_PORT=8080
 
 # 切换到非 root 用户以保证安全
 USER 65534:65534
