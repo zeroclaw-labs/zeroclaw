@@ -19,7 +19,6 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::Arc;
 
-const COMPOSIO_API_BASE_V2: &str = "https://backend.composio.dev/api/v2";
 const COMPOSIO_API_BASE_V3: &str = "https://backend.composio.dev/api/v3";
 const COMPOSIO_TOOL_VERSION_LATEST: &str = "latest";
 
@@ -38,6 +37,7 @@ pub struct ComposioTool {
     default_entity_id: String,
     security: Arc<SecurityPolicy>,
     recent_connected_accounts: RwLock<HashMap<String, String>>,
+    action_slug_cache: RwLock<HashMap<String, String>>,
 }
 
 impl ComposioTool {
@@ -51,6 +51,7 @@ impl ComposioTool {
             default_entity_id: normalize_entity_id(default_entity_id.unwrap_or("default")),
             security,
             recent_connected_accounts: RwLock::new(HashMap::new()),
+            action_slug_cache: RwLock::new(HashMap::new()),
         }
     }
 
@@ -60,23 +61,12 @@ impl ComposioTool {
 
     /// List available Composio apps/actions for the authenticated user.
     ///
-    /// Uses v3 endpoint first and falls back to v2 for compatibility.
+    /// Uses the v3 endpoint.
     pub async fn list_actions(
         &self,
         app_name: Option<&str>,
     ) -> anyhow::Result<Vec<ComposioAction>> {
-        match self.list_actions_v3(app_name).await {
-            Ok(items) => Ok(items),
-            Err(v3_err) => {
-                let v2 = self.list_actions_v2(app_name).await;
-                match v2 {
-                    Ok(items) => Ok(items),
-                    Err(v2_err) => anyhow::bail!(
-                        "Composio action listing failed on v3 ({v3_err}) and v2 fallback ({v2_err})"
-                    ),
-                }
-            }
-        }
+        self.list_actions_v3(app_name).await
     }
 
     async fn list_actions_v3(&self, app_name: Option<&str>) -> anyhow::Result<Vec<ComposioAction>> {
@@ -97,32 +87,20 @@ impl ComposioTool {
             .json()
             .await
             .context("Failed to decode Composio v3 tools response")?;
+        self.update_action_slug_cache_from_v3_items(&body.items);
         Ok(map_v3_tools_to_actions(body.items))
     }
 
-    async fn list_actions_v2(&self, app_name: Option<&str>) -> anyhow::Result<Vec<ComposioAction>> {
-        let mut url = format!("{COMPOSIO_API_BASE_V2}/actions");
-        if let Some(app) = app_name {
-            url = format!("{url}?appNames={app}");
+    fn update_action_slug_cache_from_v3_items(&self, items: &[ComposioV3Tool]) {
+        for item in items {
+            let Some(slug) = item.slug.as_deref().or(item.name.as_deref()) else {
+                continue;
+            };
+            self.cache_action_slug(slug, slug);
+            if let Some(name) = item.name.as_deref() {
+                self.cache_action_slug(name, slug);
+            }
         }
-
-        let resp = self
-            .client()
-            .get(&url)
-            .header("x-api-key", &self.api_key)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let err = response_error(resp).await;
-            anyhow::bail!("Composio v2 API error: {err}");
-        }
-
-        let body: ComposioActionsResponse = resp
-            .json()
-            .await
-            .context("Failed to decode Composio v2 actions response")?;
-        Ok(body.items)
     }
 
     /// List connected accounts for a user and optional toolkit/app.
@@ -214,7 +192,7 @@ impl ComposioTool {
 
     /// Execute a Composio action/tool with given parameters.
     ///
-    /// Uses v3 endpoint first and falls back to v2 for compatibility.
+    /// Uses the v3 endpoint.
     pub async fn execute_action(
         &self,
         action_name: &str,
@@ -223,7 +201,6 @@ impl ComposioTool {
         entity_id: Option<&str>,
         connected_account_ref: Option<&str>,
     ) -> anyhow::Result<serde_json::Value> {
-        let tool_slug = normalize_tool_slug(action_name);
         let app_hint = app_name_hint
             .map(normalize_app_slug)
             .filter(|app| !app.is_empty())
@@ -236,49 +213,110 @@ impl ComposioTool {
         let resolved_account_ref = if explicit_account_ref.is_some() {
             explicit_account_ref
         } else {
-            self.resolve_connected_account_ref(app_hint.as_deref(), entity_id)
+            self.resolve_connected_account_ref(app_hint.as_deref(), normalized_entity_id.as_deref())
                 .await?
         };
 
-        match self
-            .execute_action_v3(
-                &tool_slug,
-                params.clone(),
-                entity_id,
-                resolved_account_ref.as_deref(),
-            )
-            .await
-        {
-            Ok(result) => Ok(result),
-            Err(v3_err) => {
-                let mut v2_candidates = vec![action_name.trim().to_string()];
-                let legacy_action_name = normalize_legacy_action_name(action_name);
-                if !legacy_action_name.is_empty() && !v2_candidates.contains(&legacy_action_name) {
-                    v2_candidates.push(legacy_action_name);
-                }
-
-                let mut v2_errors = Vec::new();
-                for candidate in v2_candidates {
-                    match self
-                        .execute_action_v2(&candidate, params.clone(), entity_id)
-                        .await
-                    {
-                        Ok(result) => return Ok(result),
-                        Err(v2_err) => v2_errors.push(format!("{candidate}: {v2_err}")),
+        let mut slug_candidates = self.build_v3_slug_candidates(action_name);
+        let mut prime_error = None;
+        if slug_candidates.is_empty() {
+            if let Some(app) = app_hint.as_deref() {
+                match self.list_actions(Some(app)).await {
+                    Ok(_) => {
+                        slug_candidates = self.build_v3_slug_candidates(action_name);
+                    }
+                    Err(err) => {
+                        prime_error = Some(format!(
+                            "Failed to refresh action list for app '{app}': {err}"
+                        ));
                     }
                 }
-
-                anyhow::bail!(
-                    "Composio execute failed on v3 ({v3_err}) and v2 fallback attempts ({}){}",
-                    v2_errors.join(" | "),
-                    build_connected_account_hint(
-                        app_hint.as_deref(),
-                        normalized_entity_id.as_deref(),
-                        resolved_account_ref.as_deref(),
-                    )
-                );
             }
         }
+
+        if slug_candidates.is_empty() {
+            anyhow::bail!(
+                "Unable to determine tool slug for '{action_name}'. Run action='list' with the relevant app first to prime the cache.{}",
+                prime_error
+                    .as_deref()
+                    .map(|msg| format!(" ({msg})"))
+                    .unwrap_or_default()
+            );
+        }
+
+        let mut v3_errors = Vec::new();
+        for slug in slug_candidates {
+            self.cache_action_slug(action_name, &slug);
+            match self
+                .execute_action_v3(
+                    &slug,
+                    params.clone(),
+                    normalized_entity_id.as_deref(),
+                    resolved_account_ref.as_deref(),
+                )
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(err) => v3_errors.push(format!("{slug}: {err}")),
+            }
+        }
+
+        let v3_error_summary = if v3_errors.is_empty() {
+            "no v3 candidates attempted".to_string()
+        } else {
+            v3_errors.join(" | ")
+        };
+
+        let prime_suffix = prime_error
+            .as_deref()
+            .map(|msg| format!(" ({msg})"))
+            .unwrap_or_default();
+
+        anyhow::bail!(
+            "Composio execute failed on v3 ({v3_error_summary}){prime_suffix}{}",
+            build_connected_account_hint(
+                app_hint.as_deref(),
+                normalized_entity_id.as_deref(),
+                resolved_account_ref.as_deref(),
+            )
+        );
+    }
+
+    fn build_v3_slug_candidates(&self, action_name: &str) -> Vec<String> {
+        let mut candidates = Vec::new();
+        let mut push_candidate = |candidate: String| {
+            if !candidate.is_empty() && !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        };
+
+        if let Some(hit) = self.lookup_cached_action_slug(action_name) {
+            push_candidate(hit);
+        }
+
+        for slug in build_tool_slug_candidates(action_name) {
+            push_candidate(slug);
+        }
+
+        candidates
+    }
+
+    fn cache_action_slug(&self, alias: &str, slug: &str) {
+        let Some(key) = normalize_action_cache_key(alias) else {
+            return;
+        };
+        let trimmed_slug = slug.trim();
+        if trimmed_slug.is_empty() {
+            return;
+        }
+        self.action_slug_cache
+            .write()
+            .insert(key, trimmed_slug.to_string());
+    }
+
+    fn lookup_cached_action_slug(&self, action_name: &str) -> Option<String> {
+        let key = normalize_action_cache_key(action_name)?;
+        self.action_slug_cache.read().get(&key).cloned()
     }
 
     fn build_list_actions_v3_query(app_name: Option<&str>) -> Vec<(String, String)> {
@@ -361,70 +399,17 @@ impl ComposioTool {
         Ok(result)
     }
 
-    async fn execute_action_v2(
-        &self,
-        action_name: &str,
-        params: serde_json::Value,
-        entity_id: Option<&str>,
-    ) -> anyhow::Result<serde_json::Value> {
-        let url = format!("{COMPOSIO_API_BASE_V2}/actions/{action_name}/execute");
-
-        let mut body = json!({
-            "input": params,
-        });
-
-        if let Some(entity) = entity_id {
-            body["entityId"] = json!(entity);
-        }
-
-        let resp = self
-            .client()
-            .post(&url)
-            .header("x-api-key", &self.api_key)
-            .json(&body)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let err = response_error(resp).await;
-            anyhow::bail!("Composio v2 action execution failed: {err}");
-        }
-
-        let result: serde_json::Value = resp
-            .json()
-            .await
-            .context("Failed to decode Composio v2 execute response")?;
-        Ok(result)
-    }
-
     /// Get the OAuth connection URL for a specific app/toolkit or auth config.
     ///
-    /// Uses v3 endpoint first and falls back to v2 for compatibility.
+    /// Uses the v3 endpoint.
     pub async fn get_connection_url(
         &self,
         app_name: Option<&str>,
         auth_config_id: Option<&str>,
         entity_id: &str,
     ) -> anyhow::Result<ComposioConnectionLink> {
-        let v3 = self
-            .get_connection_url_v3(app_name, auth_config_id, entity_id)
-            .await;
-        match v3 {
-            Ok(url) => Ok(url),
-            Err(v3_err) => {
-                let app = app_name.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Composio v3 connect failed ({v3_err}) and v2 fallback requires 'app'"
-                    )
-                })?;
-                match self.get_connection_url_v2(app, entity_id).await {
-                    Ok(url) => Ok(url),
-                    Err(v2_err) => anyhow::bail!(
-                        "Composio connect failed on v3 ({v3_err}) and v2 fallback ({v2_err})"
-                    ),
-                }
-            }
-        }
+        self.get_connection_url_v3(app_name, auth_config_id, entity_id)
+            .await
     }
 
     async fn get_connection_url_v3(
@@ -474,42 +459,6 @@ impl ComposioTool {
         })
     }
 
-    async fn get_connection_url_v2(
-        &self,
-        app_name: &str,
-        entity_id: &str,
-    ) -> anyhow::Result<ComposioConnectionLink> {
-        let url = format!("{COMPOSIO_API_BASE_V2}/connectedAccounts");
-
-        let body = json!({
-            "integrationId": app_name,
-            "entityId": entity_id,
-        });
-
-        let resp = self
-            .client()
-            .post(&url)
-            .header("x-api-key", &self.api_key)
-            .json(&body)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let err = response_error(resp).await;
-            anyhow::bail!("Composio v2 connect failed: {err}");
-        }
-
-        let result: serde_json::Value = resp
-            .json()
-            .await
-            .context("Failed to decode Composio v2 connect response")?;
-        let redirect_url = extract_redirect_url(&result)
-            .ok_or_else(|| anyhow::anyhow!("No redirect URL in Composio v2 response"))?;
-        Ok(ComposioConnectionLink {
-            redirect_url,
-            connected_account_id: extract_connected_account_id(&result),
-        })
-    }
 
     async fn resolve_auth_config_id(&self, app_name: &str) -> anyhow::Result<String> {
         let url = format!("{COMPOSIO_API_BASE_V3}/auth_configs");
@@ -830,8 +779,31 @@ fn normalize_tool_slug(action_name: &str) -> String {
     action_name.trim().replace('_', "-").to_ascii_lowercase()
 }
 
-fn normalize_legacy_action_name(action_name: &str) -> String {
-    action_name.trim().replace('-', "_").to_ascii_uppercase()
+fn build_tool_slug_candidates(action_name: &str) -> Vec<String> {
+    let trimmed = action_name.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+    let mut push_candidate = |candidate: String| {
+        if !candidate.is_empty() && !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    };
+
+    push_candidate(normalize_tool_slug(trimmed));
+
+    let lower = trimmed.to_ascii_lowercase();
+    push_candidate(lower.clone());
+
+    let underscore_lower = lower.replace('-', "_");
+    push_candidate(underscore_lower);
+
+    let hyphen_lower = lower.replace('_', "-");
+    push_candidate(hyphen_lower);
+
+    candidates
 }
 
 fn normalize_app_slug(app_name: &str) -> String {
@@ -869,6 +841,15 @@ fn connected_account_cache_key(app_name: &str, entity_id: &str) -> String {
         normalize_entity_id(entity_id),
         normalize_app_slug(app_name)
     )
+}
+
+fn normalize_action_cache_key(alias: &str) -> Option<String> {
+    let trimmed = alias.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    Some(trimmed.to_ascii_lowercase())
 }
 
 fn build_connected_account_hint(
@@ -1009,12 +990,6 @@ fn extract_api_error_message(body: &str) -> Option<String> {
 }
 
 // ── API response types ──────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-struct ComposioActionsResponse {
-    #[serde(default)]
-    items: Vec<ComposioAction>,
-}
 
 #[derive(Debug, Deserialize)]
 struct ComposioToolsResponse {
@@ -1315,6 +1290,16 @@ mod tests {
             normalize_tool_slug(" github-list-repos "),
             "github-list-repos"
         );
+    }
+
+    #[test]
+    fn build_tool_slug_candidates_cover_common_variants() {
+        let candidates = build_tool_slug_candidates("GMAIL_FETCH_EMAILS");
+        assert!(candidates.contains(&"gmail-fetch-emails".to_string()));
+        assert!(candidates.contains(&"gmail_fetch_emails".to_string()));
+
+        let hyphen = build_tool_slug_candidates("github-list-repos");
+        assert_eq!(hyphen.first().map(String::as_str), Some("github-list-repos"));
     }
 
     #[test]
