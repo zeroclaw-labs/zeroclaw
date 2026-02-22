@@ -173,6 +173,47 @@ model = "qwen2.5-coder:32b"
 temperature = 0.2
 ```
 
+## `[research]`
+
+Research phase allows the agent to gather information through tools before generating the main response.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable research phase |
+| `trigger` | `never` | Research trigger strategy: `never`, `always`, `keywords`, `length`, `question` |
+| `keywords` | `["find", "search", "check", "investigate"]` | Keywords that trigger research (when trigger = `keywords`) |
+| `min_message_length` | `50` | Minimum message length to trigger research (when trigger = `length`) |
+| `max_iterations` | `5` | Maximum tool calls during research phase |
+| `show_progress` | `true` | Show research progress to user |
+
+Notes:
+
+- Research phase is **disabled by default** (`trigger = never`).
+- When enabled, the agent first gathers facts through tools (grep, file_read, shell, memory search), then responds using the collected context.
+- Research runs before the main agent turn and does not count toward `agent.max_tool_iterations`.
+- Trigger strategies:
+  - `never` — research disabled (default)
+  - `always` — research on every user message
+  - `keywords` — research when message contains any keyword from the list
+  - `length` — research when message length exceeds `min_message_length`
+  - `question` — research when message contains '?'
+
+Example:
+
+```toml
+[research]
+enabled = true
+trigger = "keywords"
+keywords = ["find", "show", "check", "how many"]
+max_iterations = 3
+show_progress = true
+```
+
+The agent will research the codebase before responding to queries like:
+- "Find all TODO in src/"
+- "Show contents of main.rs"
+- "How many files in the project?"
+
 ## `[runtime]`
 
 | Key | Default | Purpose |
