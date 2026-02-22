@@ -53,7 +53,7 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
     cp target/release/zeroclaw /app/zeroclaw && \
     strip /app/zeroclaw
 
-# 准备运行时配置：注入 Google API Key 和 Telegram 配置
+# 准备运行时配置：确保包含所有必填字段
 RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace && \
     cat > /zeroclaw-data/.zeroclaw/config.toml <<EOF
 workspace_dir = "/zeroclaw-data/workspace"
@@ -61,6 +61,7 @@ config_path = "/zeroclaw-data/.zeroclaw/config.toml"
 api_key = "AIzaSyCJcSfhSmgNl5VHZ_bdBPqvFF79fkWaPTQ"
 default_provider = "google"
 default_model = "google/gemini-2.0-flash"
+default_temperature = 0.7
 
 [reliability]
 api_keys = ["AIzaSyCJcSfhSmgNl5VHZ_bdBPqvFF79fkWaPTQ"]
@@ -82,9 +83,9 @@ allow_public_bind = true
 paired_tokens = ["5247d9d046f1e53ed49a0f5b4d509cd8432aae614fb8971c9f3d3821866fb8e7"]
 EOF
 
-# 修正权限
-RUN chown -R 65534:65534 /zeroclaw-data
-
+# 修正权限并限制访问权限（解决日志中的模式警告）
+RUN chmod 600 /zeroclaw-data/.zeroclaw/config.toml && \
+    chown -R 65534:65534 /zeroclaw-data
 # ── Stage 3: Production Runtime (Debian Trixie) ──────────────
 FROM debian:trixie-slim AS release
 
