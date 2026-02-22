@@ -52,13 +52,13 @@ RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace && \
     cat > /zeroclaw-data/.zeroclaw/config.toml <<EOF
 workspace_dir = "/zeroclaw-data/workspace"
 config_path = "/zeroclaw-data/.zeroclaw/config.toml"
-api_key = "AIzaSyCJcSfhSmgNl5VHZ_bdBPqvFF79fkWaPTQ"
+api_key = "AIzaSyBJrfIw8nf_D7QCokVLQkq3HPw87XjG3_M"
 default_provider = "google"
 default_model = "gemini-2.0-flash"
 default_temperature = 0.7
 
 [reliability]
-api_keys = ["AIzaSyCJcSfhSmgNl5VHZ_bdBPqvFF79fkWaPTQ"]
+api_keys = ["AIzaSyBJrfIw8nf_D7QCokVLQkq3HPw87XjG3_M"]
 
 [channels_config]
 cli = true
