@@ -132,6 +132,10 @@ pub struct Config {
     #[serde(default)]
     pub cron: CronConfig,
 
+    /// Goal loop configuration for autonomous long-term goal execution (`[goal_loop]`).
+    #[serde(default)]
+    pub goal_loop: GoalLoopConfig,
+
     /// Channel configurations: Telegram, Discord, Slack, etc. (`[channels_config]`).
     #[serde(default)]
     pub channels_config: ChannelsConfig,
@@ -2287,6 +2291,13 @@ pub struct HeartbeatConfig {
     pub enabled: bool,
     /// Interval in minutes between heartbeat pings. Default: `30`.
     pub interval_minutes: u32,
+    /// Optional channel to deliver heartbeat results to (e.g. "lark", "telegram").
+    /// If not set, results are only logged.
+    #[serde(default)]
+    pub channel: Option<String>,
+    /// Optional recipient/chat_id for delivery.
+    #[serde(default)]
+    pub target: Option<String>,
 }
 
 impl Default for HeartbeatConfig {
@@ -2294,6 +2305,45 @@ impl Default for HeartbeatConfig {
         Self {
             enabled: false,
             interval_minutes: 30,
+            channel: None,
+            target: None,
+        }
+    }
+}
+
+// ── Goal Loop Config ────────────────────────────────────────────
+
+/// Configuration for the autonomous goal loop engine (`[goal_loop]`).
+///
+/// When enabled, the daemon periodically picks the highest-priority
+/// in-progress goal and executes its next pending step via the agent.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct GoalLoopConfig {
+    /// Enable autonomous goal execution. Default: `false`.
+    pub enabled: bool,
+    /// Interval in minutes between goal loop cycles. Default: `10`.
+    pub interval_minutes: u32,
+    /// Timeout in seconds for a single step execution. Default: `120`.
+    pub step_timeout_secs: u64,
+    /// Maximum steps to execute per cycle. Default: `3`.
+    pub max_steps_per_cycle: u32,
+    /// Optional channel to deliver goal events to (e.g. "lark", "telegram").
+    #[serde(default)]
+    pub channel: Option<String>,
+    /// Optional recipient/chat_id for goal event delivery.
+    #[serde(default)]
+    pub target: Option<String>,
+}
+
+impl Default for GoalLoopConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_minutes: 10,
+            step_timeout_secs: 120,
+            max_steps_per_cycle: 3,
+            channel: None,
+            target: None,
         }
     }
 }
@@ -2998,6 +3048,14 @@ pub enum LarkReceiveMode {
     Webhook,
 }
 
+fn default_lark_draft_update_interval_ms() -> u64 {
+    3000
+}
+
+fn default_lark_max_draft_edits() -> u32 {
+    20
+}
+
 /// Lark/Feishu configuration for messaging integration.
 /// Lark is the international version; Feishu is the Chinese version.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -3027,6 +3085,14 @@ pub struct LarkConfig {
     /// Not required (and ignored) for websocket mode.
     #[serde(default)]
     pub port: Option<u16>,
+    /// Minimum interval (ms) between draft message edits. Default: 3000.
+    #[serde(default = "default_lark_draft_update_interval_ms")]
+    pub draft_update_interval_ms: u64,
+    /// Maximum number of edits per draft message before stopping updates.
+    /// Feishu limits edits per message; set this below the platform cap.
+    /// Default: 20.
+    #[serde(default = "default_lark_max_draft_edits")]
+    pub max_draft_edits: u32,
 }
 
 impl ChannelConfig for LarkConfig {
@@ -3061,6 +3127,12 @@ pub struct FeishuConfig {
     /// Not required (and ignored) for websocket mode.
     #[serde(default)]
     pub port: Option<u16>,
+    /// Minimum interval between streaming draft edits (milliseconds).
+    #[serde(default = "default_lark_draft_update_interval_ms")]
+    pub draft_update_interval_ms: u64,
+    /// Maximum number of draft edits per message before finalizing.
+    #[serde(default = "default_lark_max_draft_edits")]
+    pub max_draft_edits: u32,
 }
 
 impl ChannelConfig for FeishuConfig {
@@ -3443,6 +3515,7 @@ impl Default for Config {
             embedding_routes: Vec::new(),
             heartbeat: HeartbeatConfig::default(),
             cron: CronConfig::default(),
+            goal_loop: GoalLoopConfig::default(),
             channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -3488,6 +3561,15 @@ fn default_config_dir() -> Result<PathBuf> {
 
 fn active_workspace_state_path(default_dir: &Path) -> PathBuf {
     default_dir.join(ACTIVE_WORKSPACE_STATE_FILE)
+}
+
+/// Returns `true` if `path` lives under the OS temp directory.
+fn is_temp_directory(path: &Path) -> bool {
+    let temp = std::env::temp_dir();
+    // Canonicalize when possible to handle symlinks (macOS /var → /private/var)
+    let canon_temp = temp.canonicalize().unwrap_or_else(|_| temp.clone());
+    let canon_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    canon_path.starts_with(&canon_temp)
 }
 
 async fn load_persisted_workspace_dirs(
@@ -3541,6 +3623,18 @@ async fn load_persisted_workspace_dirs(
 pub(crate) async fn persist_active_workspace_config_dir(config_dir: &Path) -> Result<()> {
     let default_config_dir = default_config_dir()?;
     let state_path = active_workspace_state_path(&default_config_dir);
+
+    // Guard: never persist a temp-directory path as the active workspace.
+    // This prevents transient test runs or one-off invocations from hijacking
+    // the daemon's config resolution.
+    #[cfg(not(test))]
+    if is_temp_directory(config_dir) {
+        tracing::warn!(
+            path = %config_dir.display(),
+            "Refusing to persist temp directory as active workspace marker"
+        );
+        return Ok(());
+    }
 
     if config_dir == default_config_dir {
         if state_path.exists() {
@@ -4425,6 +4519,20 @@ impl Config {
             anyhow::bail!("Failed to atomically replace config file: {e}");
         }
 
+        #[cfg(unix)]
+        {
+            use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+            if let Err(err) =
+                fs::set_permissions(&self.config_path, Permissions::from_mode(0o600)).await
+            {
+                tracing::warn!(
+                    "Failed to harden config permissions to 0600 at {}: {}",
+                    self.config_path.display(),
+                    err
+                );
+            }
+        }
+
         sync_directory(parent_dir).await?;
 
         if had_existing_config {
@@ -4457,9 +4565,9 @@ async fn sync_directory(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     #[cfg(unix)]
-    use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
     use tokio::sync::{Mutex, MutexGuard};
     use tokio::test;
     use tokio_stream::wrappers::ReadDirStream;
@@ -4574,6 +4682,34 @@ mod tests {
         let h = HeartbeatConfig::default();
         assert!(!h.enabled);
         assert_eq!(h.interval_minutes, 30);
+        assert!(h.channel.is_none());
+        assert!(h.target.is_none());
+    }
+
+    #[test]
+    async fn heartbeat_config_serde_with_delivery() {
+        let toml_str = r#"
+            enabled = true
+            interval_minutes = 15
+            channel = "lark"
+            target = "oc_abc123"
+        "#;
+        let h: HeartbeatConfig = toml::from_str(toml_str).unwrap();
+        assert!(h.enabled);
+        assert_eq!(h.interval_minutes, 15);
+        assert_eq!(h.channel.as_deref(), Some("lark"));
+        assert_eq!(h.target.as_deref(), Some("oc_abc123"));
+    }
+
+    #[test]
+    async fn heartbeat_config_serde_without_delivery_fields() {
+        let toml_str = r#"
+            enabled = true
+            interval_minutes = 30
+        "#;
+        let h: HeartbeatConfig = toml::from_str(toml_str).unwrap();
+        assert!(h.channel.is_none());
+        assert!(h.target.is_none());
     }
 
     #[test]
@@ -4683,8 +4819,10 @@ default_temperature = 0.7
             heartbeat: HeartbeatConfig {
                 enabled: true,
                 interval_minutes: 15,
+                ..HeartbeatConfig::default()
             },
             cron: CronConfig::default(),
+            goal_loop: GoalLoopConfig::default(),
             channels_config: ChannelsConfig {
                 cli: true,
                 telegram: Some(TelegramConfig {
@@ -4888,6 +5026,7 @@ tool_dispatcher = "xml"
             query_classification: QueryClassificationConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             cron: CronConfig::default(),
+            goal_loop: GoalLoopConfig::default(),
             channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -6764,6 +6903,8 @@ default_model = "legacy-model"
             use_feishu: true,
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
+            draft_update_interval_ms: 3000,
+            max_draft_edits: 20,
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -6773,6 +6914,8 @@ default_model = "legacy-model"
         assert_eq!(parsed.verification_token.as_deref(), Some("verify_token"));
         assert_eq!(parsed.allowed_users.len(), 2);
         assert!(parsed.use_feishu);
+        assert_eq!(parsed.draft_update_interval_ms, 3000);
+        assert_eq!(parsed.max_draft_edits, 20);
     }
 
     #[test]
@@ -6786,12 +6929,16 @@ default_model = "legacy-model"
             use_feishu: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
+            draft_update_interval_ms: 5000,
+            max_draft_edits: 10,
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.app_id, "cli_123456");
         assert_eq!(parsed.app_secret, "secret_abc");
         assert!(!parsed.use_feishu);
+        assert_eq!(parsed.draft_update_interval_ms, 5000);
+        assert_eq!(parsed.max_draft_edits, 10);
     }
 
     #[test]
@@ -6802,6 +6949,8 @@ default_model = "legacy-model"
         assert!(parsed.verification_token.is_none());
         assert!(parsed.allowed_users.is_empty());
         assert!(!parsed.use_feishu);
+        assert_eq!(parsed.draft_update_interval_ms, 3000);
+        assert_eq!(parsed.max_draft_edits, 20);
     }
 
     #[test]
@@ -6831,6 +6980,8 @@ default_model = "legacy-model"
             allowed_users: vec!["user_123".into(), "user_456".into()],
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
+            draft_update_interval_ms: 3000,
+            max_draft_edits: 20,
         };
         let json = serde_json::to_string(&fc).unwrap();
         let parsed: FeishuConfig = serde_json::from_str(&json).unwrap();
@@ -6851,6 +7002,8 @@ default_model = "legacy-model"
             allowed_users: vec!["*".into()],
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
+            draft_update_interval_ms: 3000,
+            max_draft_edits: 20,
         };
         let toml_str = toml::to_string(&fc).unwrap();
         let parsed: FeishuConfig = toml::from_str(&toml_str).unwrap();
@@ -6909,16 +7062,47 @@ default_model = "legacy-model"
         config.config_path = config_path.clone();
         config.save().await.unwrap();
 
-        // Apply the same permission logic as load_or_init
-        fs::set_permissions(&config_path, Permissions::from_mode(0o600))
-            .await
-            .expect("Failed to set permissions");
-
         let meta = fs::metadata(&config_path).await.unwrap();
         let mode = meta.permissions().mode() & 0o777;
         assert_eq!(
             mode, 0o600,
             "New config file should be owner-only (0600), got {mode:o}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    async fn save_restricts_existing_world_readable_config_to_owner_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let mut config = Config::default();
+        config.config_path = config_path.clone();
+        config.save().await.unwrap();
+
+        // Simulate the regression state observed in issue #1345.
+        std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let loose_mode = std::fs::metadata(&config_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            loose_mode, 0o644,
+            "test setup requires world-readable config"
+        );
+
+        config.default_temperature = 0.6;
+        config.save().await.unwrap();
+
+        let hardened_mode = std::fs::metadata(&config_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            hardened_mode, 0o600,
+            "Saving config should restore owner-only permissions (0600)"
         );
     }
 
@@ -7056,5 +7240,89 @@ require_otp_to_resume = true
             .validate()
             .expect_err("expected ttl validation failure");
         assert!(err.to_string().contains("token_ttl_secs"));
+    }
+
+    // ── is_temp_directory unit tests ───────────────────────────
+
+    #[test]
+    async fn is_temp_directory_detects_os_temp_root() {
+        let temp = std::env::temp_dir();
+        assert!(
+            is_temp_directory(&temp),
+            "OS temp dir itself should be detected as temp"
+        );
+    }
+
+    #[test]
+    async fn is_temp_directory_detects_existing_child_of_temp() {
+        let child = std::env::temp_dir().join("zeroclaw_is_temp_test_child");
+        std::fs::create_dir_all(&child).ok();
+        assert!(
+            is_temp_directory(&child),
+            "existing child of temp dir should be detected"
+        );
+        std::fs::remove_dir_all(&child).ok();
+    }
+
+    #[test]
+    async fn is_temp_directory_detects_deeply_nested_existing_temp_child() {
+        let nested = std::env::temp_dir()
+            .join("zeroclaw_is_temp_test_deep")
+            .join("nested")
+            .join("workspace");
+        std::fs::create_dir_all(&nested).ok();
+        assert!(
+            is_temp_directory(&nested),
+            "deeply nested existing child of temp dir should be detected"
+        );
+        std::fs::remove_dir_all(
+            std::env::temp_dir().join("zeroclaw_is_temp_test_deep"),
+        )
+        .ok();
+    }
+
+    #[test]
+    async fn is_temp_directory_detects_tempfile_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(
+            is_temp_directory(tmp.path()),
+            "tempfile::TempDir path should be detected as temp"
+        );
+    }
+
+    #[test]
+    async fn is_temp_directory_rejects_home_path() {
+        let home = PathBuf::from("/Users/zeroclaw_user/.zeroclaw");
+        assert!(
+            !is_temp_directory(&home),
+            "home directory path should not be temp"
+        );
+    }
+
+    #[test]
+    async fn is_temp_directory_rejects_absolute_project_path() {
+        let project = PathBuf::from("/opt/zeroclaw/workspace");
+        assert!(
+            !is_temp_directory(&project),
+            "project path under /opt should not be temp"
+        );
+    }
+
+    #[test]
+    async fn is_temp_directory_rejects_etc_path() {
+        let etc = PathBuf::from("/etc/zeroclaw");
+        assert!(
+            !is_temp_directory(&etc),
+            "/etc path should not be temp"
+        );
+    }
+
+    #[test]
+    async fn is_temp_directory_rejects_nonexistent_path_outside_temp() {
+        let nonexistent = PathBuf::from("/nonexistent/zeroclaw/workspace");
+        assert!(
+            !is_temp_directory(&nonexistent),
+            "nonexistent path outside temp should not be detected as temp"
+        );
     }
 }

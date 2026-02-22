@@ -146,6 +146,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         skills: crate::config::SkillsConfig::default(),
         model_routes: Vec::new(),
         embedding_routes: Vec::new(),
+        goal_loop: crate::config::GoalLoopConfig::default(),
         heartbeat: HeartbeatConfig::default(),
         cron: crate::config::CronConfig::default(),
         channels_config,
@@ -494,6 +495,7 @@ async fn run_quick_setup_with_home(
         skills: crate::config::SkillsConfig::default(),
         model_routes: Vec::new(),
         embedding_routes: Vec::new(),
+        goal_loop: crate::config::GoalLoopConfig::default(),
         heartbeat: HeartbeatConfig::default(),
         cron: crate::config::CronConfig::default(),
         channels_config: ChannelsConfig::default(),
@@ -4719,6 +4721,8 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         allowed_users,
                         receive_mode,
                         port,
+                        draft_update_interval_ms: 3000,
+                        max_draft_edits: 20,
                     });
                 } else {
                     config.lark = Some(LarkConfig {
@@ -4730,6 +4734,8 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         use_feishu: false,
                         receive_mode,
                         port,
+                        draft_update_interval_ms: 3000,
+                        max_draft_edits: 20,
                     });
                 }
             }
@@ -5071,6 +5077,28 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          - If a run stops unexpectedly, recover context before acting.\n\
          - Check `MEMORY.md` + latest `memory/*.md` notes to avoid duplicate work.\n\
          - Resume from the last confirmed step, not from scratch.\n\n\
+         ## Long Task Protocol\n\n\
+         For multi-step tasks (3+ tool calls), persist progress so work survives session breaks:\n\n\
+         1. **Before starting:** Write `state/active_task.json` with task plan\n\
+         2. **After each step:** Update the checkpoint — mark completed, set next step\n\
+         3. **On session start:** Check for `state/active_task.json` and resume if found\n\
+         4. **On completion:** Delete the checkpoint file\n\n\
+         Checkpoint format:\n\
+         ```json\n\
+         {{\n\
+           \"task_id\": \"<uuid>\",\n\
+           \"description\": \"<what you are doing>\",\n\
+           \"steps\": [\n\
+             {{\"id\": 1, \"description\": \"...\", \"status\": \"completed\"}},\n\
+             {{\"id\": 2, \"description\": \"...\", \"status\": \"in_progress\"}},\n\
+             {{\"id\": 3, \"description\": \"...\", \"status\": \"pending\"}}\n\
+           ],\n\
+           \"updated_at\": \"<ISO 8601>\",\n\
+           \"context\": \"<accumulated context from completed steps>\"\n\
+         }}\n\
+         ```\n\n\
+         Use `file_write` / `file_read` for checkpoint I/O. For long-running shell commands,\n\
+         use `shell` with `background: true` and poll with `shell_status` to avoid timeouts.\n\n\
          ## Sub-task Scoping\n\n\
          - Break complex work into focused sub-tasks with clear success criteria.\n\
          - Keep sub-tasks small, verify each output, then merge results.\n\
@@ -6944,6 +6972,8 @@ mod tests {
             allowed_users: vec!["*".into()],
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
+            draft_update_interval_ms: 3000,
+            max_draft_edits: 20,
         });
         assert!(has_launchable_channels(&channels));
     }
