@@ -2937,6 +2937,15 @@ pub async fn run(
         )
         .await?;
         final_output = response.clone();
+
+        // Auto-save agent response to memory
+        if config.memory.auto_save {
+            let agent_key = autosave_memory_key("msg:agent");
+            let _ = mem
+                .store(&agent_key, &response, MemoryCategory::Conversation, None)
+                .await;
+        }
+
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
     } else {
@@ -3065,6 +3074,15 @@ pub async fn run(
                 }
             };
             final_output = response.clone();
+
+            // Auto-save agent response to memory
+            if config.memory.auto_save {
+                let agent_key = autosave_memory_key("msg:agent");
+                let _ = mem
+                    .store(&agent_key, &response, MemoryCategory::Conversation, None)
+                    .await;
+            }
+
             if let Err(e) = crate::channels::Channel::send(
                 &cli,
                 &crate::channels::traits::SendMessage::new(format!("\n{response}\n"), "user"),
