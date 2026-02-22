@@ -2414,6 +2414,75 @@ impl Channel for TelegramChannel {
 
         tracing::info!("Telegram channel listening for messages...");
 
+        // Startup probe: claim the getUpdates slot before entering the long-poll loop.
+        // A previous daemon's 30-second poll may still be active on Telegram's server.
+        // We retry with timeout=0 until we receive a successful (non-409) response,
+        // confirming the slot is ours. This prevents the long-poll loop from entering
+        // a self-sustaining 409 cycle where each rejected request is immediately retried.
+        loop {
+            let url = self.api_url("getUpdates");
+            let probe = serde_json::json!({
+                "offset": offset,
+                "timeout": 0,
+                "allowed_updates": ["message"]
+            });
+            match self.http_client().post(&url).json(&probe).send().await {
+                Err(e) => {
+                    tracing::warn!("Telegram startup probe error: {e}; retrying in 5s");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+                Ok(resp) => {
+                    match resp.json::<serde_json::Value>().await {
+                        Err(e) => {
+                            tracing::warn!("Telegram startup probe parse error: {e}; retrying in 5s");
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        }
+                        Ok(data) => {
+                            let ok = data
+                                .get("ok")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false);
+                            if ok {
+                                // Slot claimed — advance offset past any queued updates.
+                                if let Some(results) =
+                                    data.get("result").and_then(serde_json::Value::as_array)
+                                {
+                                    for update in results {
+                                        if let Some(uid) = update
+                                            .get("update_id")
+                                            .and_then(serde_json::Value::as_i64)
+                                        {
+                                            offset = uid + 1;
+                                        }
+                                    }
+                                }
+                                break; // Probe succeeded; enter the long-poll loop.
+                            } else {
+                                let error_code = data
+                                    .get("error_code")
+                                    .and_then(serde_json::Value::as_i64)
+                                    .unwrap_or_default();
+                                if error_code == 409 {
+                                    tracing::debug!(
+                                        "Startup probe: slot busy (409), retrying in 5s"
+                                    );
+                                } else {
+                                    let desc = data
+                                        .get("description")
+                                        .and_then(serde_json::Value::as_str)
+                                        .unwrap_or("unknown");
+                                    tracing::warn!(
+                                        "Startup probe: API error {error_code}: {desc}; retrying in 5s"
+                                    );
+                                }
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         loop {
             if self.mention_only {
                 let missing_username = self.bot_username.lock().is_none();
@@ -2466,7 +2535,10 @@ impl Channel for TelegramChannel {
                         "Telegram polling conflict (409): {description}. \
 Ensure only one `zeroclaw` process is using this bot token."
                     );
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    // Back off for 35 seconds — longer than Telegram's 30-second poll
+                    // timeout — so any competing session (e.g. a stale connection from
+                    // a previous daemon) has time to expire before we retry.
+                    tokio::time::sleep(std::time::Duration::from_secs(35)).await;
                 } else {
                     tracing::warn!(
                         "Telegram getUpdates API error (code={}): {description}",
