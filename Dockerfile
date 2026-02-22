@@ -96,6 +96,6 @@ USER 65534:65534
 WORKDIR /zeroclaw-data
 EXPOSE 8080
 
-# 核心修正：增加 --config 参数
+# 核心修正：使用程序要求的 --config-dir 参数，指向文件夹路径
 ENTRYPOINT ["zeroclaw"]
-CMD ["gateway", "--config", "/zeroclaw-data/.zeroclaw/config.toml"]
+CMD ["gateway", "--config-dir", "/zeroclaw-data/.zeroclaw"]
