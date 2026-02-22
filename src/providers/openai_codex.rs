@@ -1,6 +1,7 @@
 use crate::auth::openai_oauth::extract_account_id_from_jwt;
 use crate::auth::AuthService;
-use crate::providers::traits::{ChatMessage, Provider};
+use crate::multimodal;
+use crate::providers::traits::{ChatMessage, Provider, ProviderCapabilities};
 use crate::providers::ProviderRuntimeOptions;
 use async_trait::async_trait;
 use reqwest::Client;
@@ -42,7 +43,10 @@ struct ResponsesInput {
 struct ResponsesInputContent {
     #[serde(rename = "type")]
     kind: String,
-    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -131,12 +135,40 @@ fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<ResponsesInpu
         match msg.role.as_str() {
             "system" => system_parts.push(&msg.content),
             "user" => {
+                let (cleaned_text, image_refs) = multimodal::parse_image_markers(&msg.content);
+
+                let mut content_items = Vec::new();
+
+                // Add text if present
+                if !cleaned_text.trim().is_empty() {
+                    content_items.push(ResponsesInputContent {
+                        kind: "input_text".to_string(),
+                        text: Some(cleaned_text),
+                        image_url: None,
+                    });
+                }
+
+                // Add images
+                for image_ref in image_refs {
+                    content_items.push(ResponsesInputContent {
+                        kind: "input_image".to_string(),
+                        text: None,
+                        image_url: Some(image_ref),
+                    });
+                }
+
+                // If no content at all, add empty text
+                if content_items.is_empty() {
+                    content_items.push(ResponsesInputContent {
+                        kind: "input_text".to_string(),
+                        text: Some(String::new()),
+                        image_url: None,
+                    });
+                }
+
                 input.push(ResponsesInput {
                     role: "user".to_string(),
-                    content: vec![ResponsesInputContent {
-                        kind: "input_text".to_string(),
-                        text: msg.content.clone(),
-                    }],
+                    content: content_items,
                 });
             }
             "assistant" => {
@@ -144,7 +176,8 @@ fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<ResponsesInpu
                     role: "assistant".to_string(),
                     content: vec![ResponsesInputContent {
                         kind: "output_text".to_string(),
-                        text: msg.content.clone(),
+                        text: Some(msg.content.clone()),
+                        image_url: None,
                     }],
                 });
             }
@@ -456,6 +489,13 @@ impl OpenAiCodexProvider {
 
 #[async_trait]
 impl Provider for OpenAiCodexProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calling: false,
+            vision: true,
+        }
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -463,14 +503,19 @@ impl Provider for OpenAiCodexProvider {
         model: &str,
         _temperature: f64,
     ) -> anyhow::Result<String> {
-        let input = vec![ResponsesInput {
-            role: "user".to_string(),
-            content: vec![ResponsesInputContent {
-                kind: "input_text".to_string(),
-                text: message.to_string(),
-            }],
-        }];
-        self.send_responses_request(input, resolve_instructions(system_prompt), model)
+        // Build temporary messages array
+        let mut messages = Vec::new();
+        if let Some(sys) = system_prompt {
+            messages.push(ChatMessage::system(sys));
+        }
+        messages.push(ChatMessage::user(message));
+
+        // Normalize images: convert file paths to data URIs
+        let config = crate::config::MultimodalConfig::default();
+        let prepared = crate::multimodal::prepare_messages_for_provider(&messages, &config).await?;
+
+        let (instructions, input) = build_responses_input(&prepared.messages);
+        self.send_responses_request(input, instructions, model)
             .await
     }
 
@@ -480,7 +525,11 @@ impl Provider for OpenAiCodexProvider {
         model: &str,
         _temperature: f64,
     ) -> anyhow::Result<String> {
-        let (instructions, input) = build_responses_input(messages);
+        // Normalize image markers: convert file paths to data URIs
+        let config = crate::config::MultimodalConfig::default();
+        let prepared = crate::multimodal::prepare_messages_for_provider(messages, &config).await?;
+
+        let (instructions, input) = build_responses_input(&prepared.messages);
         self.send_responses_request(input, instructions, model)
             .await
     }
@@ -672,5 +721,80 @@ data: [DONE]
         assert_eq!(input.len(), 1);
         let json = serde_json::to_value(&input[0]).unwrap();
         assert_eq!(json["role"], "user");
+    }
+
+    #[test]
+    fn build_responses_input_handles_image_markers() {
+        let messages = vec![ChatMessage::user(
+            "Describe this\n\n[IMAGE:data:image/png;base64,abc]",
+        )];
+        let (_, input) = build_responses_input(&messages);
+
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0].role, "user");
+        assert_eq!(input[0].content.len(), 2);
+
+        let json: Vec<Value> = input[0]
+            .content
+            .iter()
+            .map(|item| serde_json::to_value(item).unwrap())
+            .collect();
+
+        // First content = text
+        assert_eq!(json[0]["type"], "input_text");
+        assert!(json[0]["text"].as_str().unwrap().contains("Describe this"));
+
+        // Second content = image
+        assert_eq!(json[1]["type"], "input_image");
+        assert_eq!(json[1]["image_url"], "data:image/png;base64,abc");
+    }
+
+    #[test]
+    fn build_responses_input_preserves_text_only_messages() {
+        let messages = vec![ChatMessage::user("Hello without images")];
+        let (_, input) = build_responses_input(&messages);
+
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0].content.len(), 1);
+
+        let json = serde_json::to_value(&input[0].content[0]).unwrap();
+        assert_eq!(json["type"], "input_text");
+        assert_eq!(json["text"], "Hello without images");
+    }
+
+    #[test]
+    fn build_responses_input_handles_multiple_images() {
+        let messages = vec![ChatMessage::user(
+            "Compare these: [IMAGE:data:image/png;base64,img1] and [IMAGE:data:image/jpeg;base64,img2]",
+        )];
+        let (_, input) = build_responses_input(&messages);
+
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0].content.len(), 3); // text + 2 images
+
+        let json: Vec<Value> = input[0]
+            .content
+            .iter()
+            .map(|item| serde_json::to_value(item).unwrap())
+            .collect();
+
+        assert_eq!(json[0]["type"], "input_text");
+        assert_eq!(json[1]["type"], "input_image");
+        assert_eq!(json[2]["type"], "input_image");
+    }
+
+    #[test]
+    fn capabilities_includes_vision() {
+        let options = ProviderRuntimeOptions {
+            zeroclaw_dir: None,
+            secrets_encrypt: false,
+            auth_profile_override: None,
+            reasoning_enabled: None,
+        };
+        let provider = OpenAiCodexProvider::new(&options);
+        let caps = provider.capabilities();
+
+        assert!(!caps.native_tool_calling);
+        assert!(caps.vision);
     }
 }
