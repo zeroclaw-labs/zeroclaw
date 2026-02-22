@@ -245,6 +245,91 @@ impl HookRunner {
         HookResult::Continue((name, args))
     }
 
+    pub async fn run_before_compaction(
+        &self,
+        mut messages: Vec<ChatMessage>,
+    ) -> HookResult<Vec<ChatMessage>> {
+        for h in &self.handlers {
+            let hook_name = h.name();
+            match AssertUnwindSafe(h.before_compaction(messages.clone()))
+                .catch_unwind()
+                .await
+            {
+                Ok(HookResult::Continue(next)) => messages = next,
+                Ok(HookResult::Cancel(reason)) => {
+                    info!(
+                        hook = hook_name,
+                        reason, "before_compaction cancelled by hook"
+                    );
+                    return HookResult::Cancel(reason);
+                }
+                Err(_) => {
+                    tracing::error!(
+                        hook = hook_name,
+                        "before_compaction hook panicked; continuing with previous value"
+                    );
+                }
+            }
+        }
+        HookResult::Continue(messages)
+    }
+
+    pub async fn run_after_compaction(&self, mut summary: String) -> HookResult<String> {
+        for h in &self.handlers {
+            let hook_name = h.name();
+            match AssertUnwindSafe(h.after_compaction(summary.clone()))
+                .catch_unwind()
+                .await
+            {
+                Ok(HookResult::Continue(next)) => summary = next,
+                Ok(HookResult::Cancel(reason)) => {
+                    info!(
+                        hook = hook_name,
+                        reason, "after_compaction cancelled by hook"
+                    );
+                    return HookResult::Cancel(reason);
+                }
+                Err(_) => {
+                    tracing::error!(
+                        hook = hook_name,
+                        "after_compaction hook panicked; continuing with previous value"
+                    );
+                }
+            }
+        }
+        HookResult::Continue(summary)
+    }
+
+    pub async fn run_tool_result_persist(
+        &self,
+        tool: String,
+        mut result: ToolResult,
+    ) -> HookResult<ToolResult> {
+        for h in &self.handlers {
+            let hook_name = h.name();
+            match AssertUnwindSafe(h.tool_result_persist(tool.clone(), result.clone()))
+                .catch_unwind()
+                .await
+            {
+                Ok(HookResult::Continue(next_result)) => result = next_result,
+                Ok(HookResult::Cancel(reason)) => {
+                    info!(
+                        hook = hook_name,
+                        reason, "tool_result_persist cancelled by hook"
+                    );
+                    return HookResult::Cancel(reason);
+                }
+                Err(_) => {
+                    tracing::error!(
+                        hook = hook_name,
+                        "tool_result_persist hook panicked; continuing with previous value"
+                    );
+                }
+            }
+        }
+        HookResult::Continue(result)
+    }
+
     pub async fn run_on_message_received(
         &self,
         mut message: ChannelMessage,

@@ -321,7 +321,17 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     // ── Hooks ──────────────────────────────────────────────────────
     let hooks: Option<std::sync::Arc<crate::hooks::HookRunner>> = if config.hooks.enabled {
-        Some(std::sync::Arc::new(crate::hooks::HookRunner::new()))
+        let mut runner = crate::hooks::HookRunner::new();
+        if config.hooks.builtin.boot_script {
+            runner.register(Box::new(crate::hooks::builtin::BootScriptHook));
+        }
+        if config.hooks.builtin.command_logger {
+            runner.register(Box::new(crate::hooks::builtin::CommandLoggerHook::new()));
+        }
+        if config.hooks.builtin.session_memory {
+            runner.register(Box::new(crate::hooks::builtin::SessionMemoryHook));
+        }
+        Some(std::sync::Arc::new(runner))
     } else {
         None
     };
@@ -671,11 +681,17 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .fallback(get(static_files::handle_spa_fallback));
 
     // Run the server
-    axum::serve(
+    let serve_result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .await?;
+    .await;
+
+    if let Some(ref hooks) = hooks {
+        hooks.fire_gateway_stop().await;
+    }
+
+    serve_result?;
 
     Ok(())
 }
