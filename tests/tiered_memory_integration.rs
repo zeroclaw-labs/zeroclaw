@@ -13,6 +13,11 @@ use tokio::sync::{mpsc, Mutex};
 
 use zeroclaw::agent::memory_loader::MemoryLoader;
 use zeroclaw::memory::tiered::budget::estimate_tokens;
+use zeroclaw::memory::tiered::extraction_worker::run_extraction_worker;
+use zeroclaw::memory::tiered::extractor::{FactEntryDraft, MockFactExtractor};
+use zeroclaw::memory::tiered::facts::{
+    FactConfidence, FactEntry, FactStatus, SourceRole, SourceTurnRef, VolatilityClass,
+};
 use zeroclaw::memory::tiered::loader::TieredMemoryLoader;
 use zeroclaw::memory::tiered::manager::TierManager;
 use zeroclaw::memory::tiered::summarization::MockSummarizer;
@@ -599,5 +604,277 @@ async fn compress_day_is_idempotent() {
     assert_eq!(
         succeeded_count, 1,
         "Journal should have exactly 1 succeeded job, got {succeeded_count}"
+    );
+}
+
+// ── Test 4: Fact extraction stores structured facts ────────────────────────
+
+#[tokio::test]
+async fn fact_extraction_stores_structured_facts() {
+    // 1. Create InMemoryBackend instances for stm, mtm, ltm.
+    let stm = make_shared(InMemoryBackend::new());
+    let mtm = make_shared(InMemoryBackend::new());
+    let ltm = make_shared(InMemoryBackend::new());
+
+    // 2. Create TieredMemory with extraction_tx = Some(tx).
+    let (cmd_tx, _cmd_rx) = mpsc::channel(16);
+    let (extraction_tx, extraction_rx) = mpsc::channel(16);
+    let mut cfg = TierConfig::default();
+    cfg.min_relevance_threshold = 0.0;
+    let cfg = Arc::new(cfg);
+
+    let tiered = TieredMemory {
+        stm: Arc::clone(&stm),
+        mtm: Arc::clone(&mtm),
+        ltm: Arc::clone(&ltm),
+        cfg: Arc::clone(&cfg),
+        cmd_tx,
+        extraction_tx: Some(extraction_tx.clone()),
+    };
+
+    // 3. Create MockFactExtractor returning a known fact.
+    let mock_draft = FactEntryDraft {
+        category: "personal".to_string(),
+        subject: "user".to_string(),
+        attribute: "name".to_string(),
+        value: "John".to_string(),
+        context_narrative: "User said their name is John.".to_string(),
+        confidence: "high".to_string(),
+        related_facts: vec![],
+        volatility_class: "stable".to_string(),
+    };
+    let extractor: Arc<dyn zeroclaw::memory::tiered::extractor::FactExtractor> =
+        Arc::new(MockFactExtractor::new(vec![mock_draft]));
+
+    // 4. Spawn extraction_worker in background.
+    let stm_clone = Arc::clone(&stm);
+    let worker_handle = tokio::spawn(async move {
+        run_extraction_worker(extraction_rx, stm_clone, extractor, "conv-integration".to_string())
+            .await;
+    });
+
+    // 5. Store a user message via TieredMemory::store().
+    tiered
+        .store("msg:user:100", "My name is John", MemoryCategory::Conversation, None)
+        .await
+        .unwrap();
+
+    // 6. Wait briefly for extraction to process.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // 7. Drop the extraction_tx to close the channel, wait for worker to finish.
+    drop(extraction_tx);
+    drop(tiered); // This drops the other extraction_tx clone inside TieredMemory
+    worker_handle.await.unwrap();
+
+    // 8. Check STM for Core entries with fact: prefix.
+    let stm_guard = stm.lock().await;
+    let fact_key = "fact:personal:user:name";
+    let entry = stm_guard.get(fact_key).await.unwrap();
+
+    // 9. Assert the fact entry exists with correct key and value.
+    assert!(
+        entry.is_some(),
+        "expected fact to be stored under key `{fact_key}` in STM"
+    );
+    let entry = entry.unwrap();
+    assert_eq!(entry.category, MemoryCategory::Core);
+    assert!(entry.key.starts_with("fact:"));
+
+    // Verify the stored content is a valid FactEntry with the correct value.
+    let fact: FactEntry = serde_json::from_str(&entry.content)
+        .expect("fact entry content should be valid FactEntry JSON");
+    assert_eq!(fact.value, "John");
+    assert_eq!(fact.subject, "user");
+    assert_eq!(fact.attribute, "name");
+    assert_eq!(fact.category, "personal");
+    assert_eq!(fact.extracted_by_tier, "stm");
+}
+
+// ── Test 5: Fact-first recall boosts facts over raw ────────────────────────
+
+#[tokio::test]
+async fn fact_first_recall_boosts_facts_over_raw() {
+    // 1. Create TieredMemory (no extraction queue needed).
+    let stm = make_shared(InMemoryBackend::new());
+    let mtm = make_shared(InMemoryBackend::new());
+    let ltm = make_shared(InMemoryBackend::new());
+
+    let (cmd_tx, _cmd_rx) = mpsc::channel(16);
+    let mut cfg = TierConfig::default();
+    cfg.min_relevance_threshold = 0.0; // allow all results in tests
+    let cfg = Arc::new(cfg);
+
+    let tiered = TieredMemory {
+        stm: Arc::clone(&stm),
+        mtm: Arc::clone(&mtm),
+        ltm: Arc::clone(&ltm),
+        cfg: Arc::clone(&cfg),
+        cmd_tx,
+        extraction_tx: None,
+    };
+
+    // 2. Store a raw conversation entry in STM.
+    stm.lock()
+        .await
+        .store(
+            "conv:user:001",
+            "My name is John and I like programming",
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // 3. Store a fact entry (as JSON FactEntry) in STM with MemoryCategory::Core.
+    let fact = FactEntry {
+        fact_id: "f-recall-001".to_string(),
+        fact_key: "fact:personal:user:name".to_string(),
+        category: "personal".to_string(),
+        subject: "user".to_string(),
+        attribute: "name".to_string(),
+        value: "John".to_string(),
+        context_narrative: "User said their name is John.".to_string(),
+        source_turn: SourceTurnRef {
+            conversation_id: "conv-test".to_string(),
+            turn_index: 1,
+            message_id: None,
+            role: SourceRole::User,
+            timestamp_unix_ms: 1_700_000_000_000,
+        },
+        confidence: FactConfidence::High,
+        related_facts: vec![],
+        extracted_by_tier: "stm".to_string(),
+        extracted_at_unix_ms: 1_700_000_001_000,
+        source_role: SourceRole::User,
+        status: FactStatus::Active,
+        revision: 1,
+        supersedes_fact_id: None,
+        tags: vec!["personal".to_string()],
+        volatility_class: VolatilityClass::Stable,
+        ttl_days: None,
+        expires_at_unix_ms: None,
+        last_verified_unix_ms: None,
+    };
+    let fact_json = serde_json::to_string(&fact).unwrap();
+    stm.lock()
+        .await
+        .store(
+            "fact:personal:user:name",
+            &fact_json,
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // 4. Call recall() with a query matching both.
+    let results = tiered.recall("John", 10, None).await.unwrap();
+
+    // 5. Assert the fact entry appears in results (it should score higher due to fact boost).
+    assert!(
+        !results.is_empty(),
+        "recall('John') should return results"
+    );
+
+    // Find the fact entry in results.
+    let fact_result = results.iter().find(|e| e.key.starts_with("fact:"));
+    assert!(
+        fact_result.is_some(),
+        "fact entry should appear in recall results"
+    );
+
+    // If both appear, the fact should be ranked first (higher score).
+    if results.len() >= 2 {
+        assert!(
+            results[0].key.starts_with("fact:"),
+            "fact entry should be ranked first due to fact-first boost, but got key: {}",
+            results[0].key
+        );
+    }
+}
+
+// ── Test 6: Loader includes Known Facts section ────────────────────────────
+
+#[tokio::test]
+async fn loader_includes_known_facts_section() {
+    // 1. Create InMemoryBackend for stm and mtm.
+    let stm_backend = InMemoryBackend::new();
+
+    // 2. Store a FactEntry JSON in STM as Core with key "fact:personal:user:name".
+    let fact = FactEntry {
+        fact_id: "f-loader-001".to_string(),
+        fact_key: "fact:personal:user:name".to_string(),
+        category: "personal".to_string(),
+        subject: "user".to_string(),
+        attribute: "name".to_string(),
+        value: "John".to_string(),
+        context_narrative: "User introduced themselves as John.".to_string(),
+        source_turn: SourceTurnRef {
+            conversation_id: "conv-loader".to_string(),
+            turn_index: 1,
+            message_id: None,
+            role: SourceRole::User,
+            timestamp_unix_ms: 1_700_000_000_000,
+        },
+        confidence: FactConfidence::High,
+        related_facts: vec![],
+        extracted_by_tier: "stm".to_string(),
+        extracted_at_unix_ms: 1_700_000_001_000,
+        source_role: SourceRole::User,
+        status: FactStatus::Active,
+        revision: 1,
+        supersedes_fact_id: None,
+        tags: vec!["personal".to_string()],
+        volatility_class: VolatilityClass::Stable,
+        ttl_days: None,
+        expires_at_unix_ms: None,
+        last_verified_unix_ms: None,
+    };
+    let fact_json = serde_json::to_string(&fact).unwrap();
+    stm_backend
+        .store(
+            "fact:personal:user:name",
+            &fact_json,
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let stm = make_shared(stm_backend);
+    let mtm = make_shared(InMemoryBackend::new());
+    let cfg = Arc::new(TierConfig::default());
+
+    // 3. Create TieredMemoryLoader.
+    let loader = TieredMemoryLoader::new(
+        Arc::clone(&stm),
+        Arc::clone(&mtm),
+        Arc::clone(&cfg),
+    );
+
+    // 4. Call load_context().
+    let context = loader.load_context(&NoopMemory, "test query").await.unwrap();
+
+    // 5. Assert output contains "Known Facts".
+    assert!(
+        context.contains("Known Facts"),
+        "Loaded context should contain 'Known Facts' section.\nGot:\n{context}"
+    );
+
+    // 6. Assert output contains the fact value ("John").
+    assert!(
+        context.contains("John"),
+        "Loaded context should contain the fact value 'John'.\nGot:\n{context}"
+    );
+
+    // Also verify confidence tag and subject/attribute are present.
+    assert!(
+        context.contains("[high]"),
+        "Loaded context should contain confidence tag '[high]'.\nGot:\n{context}"
+    );
+    assert!(
+        context.contains("user name"),
+        "Loaded context should contain subject and attribute.\nGot:\n{context}"
     );
 }
