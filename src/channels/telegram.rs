@@ -2483,6 +2483,8 @@ impl Channel for TelegramChannel {
             }
         }
 
+        tracing::debug!("Startup probe succeeded; entering main long-poll loop.");
+
         loop {
             if self.mention_only {
                 let missing_username = self.bot_username.lock().is_none();
