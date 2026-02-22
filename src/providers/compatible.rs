@@ -1077,16 +1077,17 @@ impl OpenAiCompatibleProvider {
             || self.base_url.contains("api.kimi.com/coding")
     }
 
-    fn is_native_tool_schema_unsupported(status: reqwest::StatusCode, error: &str) -> bool {
-        if !matches!(
-            status,
-            reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY
-        ) {
+    fn is_native_tool_schema_unsupported(
+        status: reqwest::StatusCode,
+        error: &str,
+        has_native_tools: bool,
+    ) -> bool {
+        if !has_native_tools {
             return false;
         }
 
         let lower = error.to_lowercase();
-        [
+        let explicit_tool_schema_rejection = [
             "unknown parameter: tools",
             "unsupported parameter: tools",
             "unrecognized field `tools`",
@@ -1095,7 +1096,27 @@ impl OpenAiCompatibleProvider {
             "tool_choice",
         ]
         .iter()
-        .any(|hint| lower.contains(hint))
+        .any(|hint| lower.contains(hint));
+        if matches!(
+            status,
+            reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+        ) && explicit_tool_schema_rejection
+        {
+            return true;
+        }
+
+        // Some OpenAI-compatible gateways return custom 5xx statuses (for example
+        // 516) when their JSON mapper fails to parse native tool payloads.
+        // Treat those parser signatures as native-tool incompatibility and switch
+        // to prompt-guided tool mode instead of retrying the same payload.
+        let mapper_parse_hint = lower.contains("json mapper error")
+            || lower.contains("mapper_parsing_exception")
+            || lower.contains("json parse error");
+        let parser_token_hint = lower.contains("unrecognized token")
+            || lower.contains("was expecting (json")
+            || lower.contains("cannot parse");
+
+        status.is_server_error() && mapper_parse_hint && parser_token_hint
     }
 }
 
@@ -1531,7 +1552,8 @@ impl Provider for OpenAiCompatibleProvider {
             let error = response.text().await?;
             let sanitized = super::sanitize_api_error(&error);
 
-            if Self::is_native_tool_schema_unsupported(status, &sanitized) {
+            let has_native_tools = request.tools.map_or(false, |tools| !tools.is_empty());
+            if Self::is_native_tool_schema_unsupported(status, &sanitized, has_native_tools) {
                 let fallback_messages =
                     Self::with_prompt_guided_tool_instructions(request.messages, request.tools);
                 let text = self
@@ -2275,12 +2297,34 @@ mod tests {
     fn native_tool_schema_unsupported_detection_is_precise() {
         assert!(OpenAiCompatibleProvider::is_native_tool_schema_unsupported(
             reqwest::StatusCode::BAD_REQUEST,
-            "unknown parameter: tools"
+            "unknown parameter: tools",
+            true,
         ));
         assert!(
             !OpenAiCompatibleProvider::is_native_tool_schema_unsupported(
                 reqwest::StatusCode::UNAUTHORIZED,
-                "unknown parameter: tools"
+                "unknown parameter: tools",
+                true,
+            )
+        );
+        assert!(
+            !OpenAiCompatibleProvider::is_native_tool_schema_unsupported(
+                reqwest::StatusCode::BAD_REQUEST,
+                "unknown parameter: tools",
+                false,
+            )
+        );
+        let status_516 = reqwest::StatusCode::from_u16(516).expect("516 must be a valid status");
+        assert!(OpenAiCompatibleProvider::is_native_tool_schema_unsupported(
+            status_516,
+            "Engine unexpected error!: inference failed, msg=Json mapper error!: msg=Unrecognized token 'Internal': was expecting (JSON String, Nu...",
+            true,
+        ));
+        assert!(
+            !OpenAiCompatibleProvider::is_native_tool_schema_unsupported(
+                status_516,
+                "Internal server error",
+                true,
             )
         );
     }
