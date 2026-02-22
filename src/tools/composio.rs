@@ -1166,8 +1166,10 @@ fn format_schema_hint(schema: &serde_json::Value) -> Option<String> {
             String::new()
         } else {
             // Truncate long descriptions to keep the hint concise.
+            // Use char boundary to avoid panic on multi-byte UTF-8.
             let short = if desc.len() > 80 {
-                format!("{}...", &desc[..77])
+                let end = desc.floor_char_boundary(77);
+                format!("{}...", &desc[..end])
             } else {
                 desc.to_string()
             };
