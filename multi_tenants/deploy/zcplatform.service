@@ -1,0 +1,32 @@
+[Unit]
+Description=ZeroClaw Multi-Tenant Platform
+Documentation=https://github.com/zeroclaw-labs/zeroclaw
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/zcplatform
+ExecStart=/opt/zcplatform/zcplatform-bin serve --config /opt/zcplatform/platform.toml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/zcplatform/data
+ProtectHome=true
+PrivateTmp=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zcplatform
+
+# Environment
+Environment=RUST_LOG=zcplatform=info
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,59 @@
+# ZeroClaw Multi-Tenant Platform Configuration
+# Copy to /opt/zcplatform/platform.toml and customize.
+
+# Platform API server
+host = "127.0.0.1"
+port = 8080
+
+# Database (SQLite, WAL mode)
+database_path = "/opt/zcplatform/data/platform.db"
+
+# Encryption key file
+master_key_path = "/opt/zcplatform/data/master.key"
+
+# Tenant data directory
+data_dir = "/opt/zcplatform/data/tenants"
+
+# Docker
+docker_image = "zeroclaw-tenant:latest"
+docker_network = "zcplatform-internal"
+port_range = [10001, 10999]
+uid_range = [10001, 10999]
+
+# Domain (enables Caddy subdomain routing)
+# domain = "example.com"
+
+# Caddy admin API
+caddy_api_url = "http://localhost:2019"
+
+# JWT secret (auto-generated during bootstrap if omitted)
+# jwt_secret = "..."
+
+# Plan definitions
+[plans.free]
+max_messages_per_day = 100
+max_channels = 2
+max_members = 3
+memory_mb = 256
+cpu_limit = 0.5
+
+[plans.starter]
+max_messages_per_day = 1000
+max_channels = 5
+max_members = 10
+memory_mb = 384
+cpu_limit = 0.75
+
+[plans.pro]
+max_messages_per_day = 10000
+max_channels = 10
+max_members = 20
+memory_mb = 512
+cpu_limit = 1.0
+
+[plans.enterprise]
+max_messages_per_day = 100000
+max_channels = 50
+max_members = 100
+memory_mb = 1024
+cpu_limit = 2.0

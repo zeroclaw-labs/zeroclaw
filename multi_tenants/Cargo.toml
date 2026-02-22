@@ -1,0 +1,62 @@
+[package]
+name = "zcplatform"
+version = "0.1.0"
+edition = "2021"
+description = "ZeroClaw Multi-Tenant Platform"
+
+[[bin]]
+name = "zcplatform"
+path = "src/main.rs"
+
+[dependencies]
+# Web framework
+axum = { version = "0.8", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
+
+# Async runtime
+tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "signal", "time", "process", "fs", "sync"] }
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Database (must match workspace root rusqlite version to avoid sqlite3 link conflict)
+rusqlite = { version = "0.37", features = ["bundled", "backup"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "1.0"
+
+# Encryption
+chacha20poly1305 = "0.10"
+rand = "0.10"
+
+# Auth
+jsonwebtoken = "9"
+sha2 = "0.10"
+subtle = "2.6"
+hex = "0.4"
+
+# Template engine (config rendering)
+tera = "1.20"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# UUID
+uuid = { version = "1.11", features = ["v4"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "ansi", "env-filter"] }
+
+# HTTP client (for health checks, Caddy API)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Email (SMTP)
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1-rustls-tls", "builder", "hostname"] }

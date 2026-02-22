@@ -1,0 +1,19 @@
+# Minimal tenant container based on ZeroClaw release image.
+# The ZeroClaw binary must be copied into the build context before building.
+
+FROM gcr.io/distroless/cc-debian13:nonroot
+
+COPY zeroclaw /usr/local/bin/zeroclaw
+
+ENV ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace
+ENV HOME=/zeroclaw-data
+ENV ZEROCLAW_ALLOW_PUBLIC_BIND=true
+
+WORKDIR /zeroclaw-data
+USER 65534:65534
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["/usr/local/bin/zeroclaw", "status"]
+
+ENTRYPOINT ["zeroclaw"]
+CMD ["gateway"]
