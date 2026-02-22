@@ -109,12 +109,11 @@ id = "demo"
 version = "1.0.0"
 module_path = "plugins/demo.wasm"
 wit_packages = ["zeroclaw:tools@1.0.0"]
+providers = ["demo-provider"]
 
 [[tools]]
 name = "demo_tool"
 description = "demo tool"
-
-providers = ["demo-provider"]
 "#,
         )
         .expect("write manifest");
