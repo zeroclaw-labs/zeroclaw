@@ -34,8 +34,7 @@ impl CodexCliProvider {
         }
     }
 
-    /// Create a provider with a custom binary path (test-only).
-    #[cfg(test)]
+    /// Create a provider with a custom binary path (for testing).
     pub fn new_for_test(codex_bin: impl Into<String>) -> Self {
         Self {
             codex_bin: codex_bin.into(),
