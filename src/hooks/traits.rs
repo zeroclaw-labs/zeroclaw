@@ -64,6 +64,22 @@ pub trait HookHandler: Send + Sync {
         HookResult::Continue((name, args))
     }
 
+    async fn before_compaction(&self, messages: Vec<ChatMessage>) -> HookResult<Vec<ChatMessage>> {
+        HookResult::Continue(messages)
+    }
+
+    async fn after_compaction(&self, summary: String) -> HookResult<String> {
+        HookResult::Continue(summary)
+    }
+
+    async fn tool_result_persist(
+        &self,
+        _tool: String,
+        result: ToolResult,
+    ) -> HookResult<ToolResult> {
+        HookResult::Continue(result)
+    }
+
     async fn on_message_received(&self, message: ChannelMessage) -> HookResult<ChannelMessage> {
         HookResult::Continue(message)
     }

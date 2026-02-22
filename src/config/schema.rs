@@ -200,6 +200,10 @@ pub struct Config {
     #[serde(default)]
     pub hooks: HooksConfig,
 
+    /// WASM plugin runtime configuration.
+    #[serde(default)]
+    pub plugins: PluginsConfig,
+
     /// Hardware configuration (wizard-driven physical world setup).
     #[serde(default)]
     pub hardware: HardwareConfig,
@@ -1830,12 +1834,88 @@ impl Default for HooksConfig {
 pub struct BuiltinHooksConfig {
     /// Enable the command-logger hook (logs tool calls for auditing).
     pub command_logger: bool,
+    /// Enable the session-memory hook.
+    pub session_memory: bool,
+    /// Enable the boot-script hook.
+    pub boot_script: bool,
 }
 
 impl Default for BuiltinHooksConfig {
     fn default() -> Self {
         Self {
             command_logger: false,
+            session_memory: false,
+            boot_script: false,
+        }
+    }
+}
+
+/// Runtime limits for WASM plugin execution.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PluginLimitsConfig {
+    /// Max plugin invocation duration in milliseconds.
+    #[serde(default = "default_plugin_invoke_timeout_ms")]
+    pub invoke_timeout_ms: u64,
+    /// Max memory allowed per plugin instance in bytes.
+    #[serde(default = "default_plugin_memory_limit_bytes")]
+    pub memory_limit_bytes: u64,
+    /// Max concurrent plugin invocations.
+    #[serde(default = "default_plugin_max_concurrency")]
+    pub max_concurrency: usize,
+}
+
+fn default_plugin_invoke_timeout_ms() -> u64 {
+    2_000
+}
+
+fn default_plugin_memory_limit_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+
+fn default_plugin_max_concurrency() -> usize {
+    8
+}
+
+impl Default for PluginLimitsConfig {
+    fn default() -> Self {
+        Self {
+            invoke_timeout_ms: default_plugin_invoke_timeout_ms(),
+            memory_limit_bytes: default_plugin_memory_limit_bytes(),
+            max_concurrency: default_plugin_max_concurrency(),
+        }
+    }
+}
+
+/// WASM plugin runtime configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PluginsConfig {
+    /// Global plugin runtime toggle.
+    pub enabled: bool,
+    /// Plugin discovery directories.
+    #[serde(default)]
+    pub dirs: Vec<String>,
+    /// Enable filesystem watcher based hot-reload.
+    pub hot_reload: bool,
+    /// Runtime resource limits.
+    #[serde(default)]
+    pub limits: PluginLimitsConfig,
+    /// Explicit capability allowlist (empty = deny all).
+    #[serde(default)]
+    pub allow_capabilities: Vec<String>,
+    /// Explicit capability denylist.
+    #[serde(default)]
+    pub deny_capabilities: Vec<String>,
+}
+
+impl Default for PluginsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dirs: Vec::new(),
+            hot_reload: false,
+            limits: PluginLimitsConfig::default(),
+            allow_capabilities: Vec::new(),
+            deny_capabilities: Vec::new(),
         }
     }
 }
@@ -3460,6 +3540,7 @@ impl Default for Config {
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hooks: HooksConfig::default(),
+            plugins: PluginsConfig::default(),
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
@@ -4490,6 +4571,23 @@ mod tests {
         );
         assert!(c.workspace_dir.to_string_lossy().contains("workspace"));
         assert!(c.config_path.to_string_lossy().contains("config.toml"));
+        assert!(!c.plugins.enabled);
+        assert!(!c.plugins.hot_reload);
+        assert!(c.plugins.allow_capabilities.is_empty());
+        assert!(c.plugins.deny_capabilities.is_empty());
+    }
+
+    #[test]
+    async fn plugins_config_defaults_safe() {
+        let plugins = PluginsConfig::default();
+        assert!(!plugins.enabled);
+        assert!(plugins.dirs.is_empty());
+        assert!(!plugins.hot_reload);
+        assert!(plugins.allow_capabilities.is_empty());
+        assert!(plugins.deny_capabilities.is_empty());
+        assert_eq!(plugins.limits.invoke_timeout_ms, 2_000);
+        assert_eq!(plugins.limits.memory_limit_bytes, 64 * 1024 * 1024);
+        assert_eq!(plugins.limits.max_concurrency, 8);
     }
 
     #[test]
@@ -4732,6 +4830,7 @@ default_temperature = 0.7
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hooks: HooksConfig::default(),
+            plugins: PluginsConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
         };
@@ -4777,6 +4876,7 @@ default_temperature = 0.7
         assert_eq!(parsed.memory.archive_after_days, 7);
         assert_eq!(parsed.memory.purge_after_days, 30);
         assert_eq!(parsed.memory.conversation_retention_days, 30);
+        assert!(!parsed.plugins.enabled);
     }
 
     #[test]
@@ -4906,6 +5006,7 @@ tool_dispatcher = "xml"
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hooks: HooksConfig::default(),
+            plugins: PluginsConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
         };
