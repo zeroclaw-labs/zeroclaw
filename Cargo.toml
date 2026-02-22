@@ -34,6 +34,7 @@ matrix-sdk = { version = "0.16", optional = true, default-features = false, feat
 # Serialization
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
+serde_ignored = "0.1"
 
 # Config
 directories = "6.0"
