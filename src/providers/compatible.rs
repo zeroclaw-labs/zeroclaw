@@ -1079,7 +1079,10 @@ impl OpenAiCompatibleProvider {
 impl Provider for OpenAiCompatibleProvider {
     fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
         crate::providers::traits::ProviderCapabilities {
-            native_tool_calling: true,
+            // Providers that require system-prompt merging (e.g. MiniMax) also
+            // reject OpenAI-style `tools` in the request body.  Fall back to
+            // prompt-guided tool calling for those providers.
+            native_tool_calling: !self.merge_system_into_user,
             vision: self.supports_vision,
         }
     }
@@ -2287,6 +2290,24 @@ mod tests {
         let caps = <OpenAiCompatibleProvider as Provider>::capabilities(&p);
         assert!(caps.native_tool_calling);
         assert!(caps.vision);
+    }
+
+    #[test]
+    fn capabilities_disables_native_tool_calling_for_merge_system_into_user() {
+        // MiniMax (and any provider created via new_merge_system_into_user) does
+        // not support OpenAI-style `tools` in the request body.  Sending them
+        // causes a 500 "unknown error (1000)" response (issue #1387).
+        let p = OpenAiCompatibleProvider::new_merge_system_into_user(
+            "MiniMax",
+            "https://api.minimaxi.com/v1",
+            Some("k"),
+            AuthStyle::Bearer,
+        );
+        let caps = <OpenAiCompatibleProvider as Provider>::capabilities(&p);
+        assert!(
+            !caps.native_tool_calling,
+            "MiniMax must not use native tool calling"
+        );
     }
 
     #[test]
