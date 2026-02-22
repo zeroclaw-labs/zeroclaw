@@ -53,11 +53,8 @@ impl ClawHubClient {
     pub async fn search_skills(&self, query: &str, limit: usize) -> Result<Vec<ClawHubSkill>> {
         let result = self.search(query, limit).await?;
 
-        let skills: Vec<ClawHubSkill> = result
-            .results
-            .into_iter()
-            .map(|item| item.into())
-            .collect();
+        let skills: Vec<ClawHubSkill> =
+            result.results.into_iter().map(|item| item.into()).collect();
 
         Ok(skills)
     }

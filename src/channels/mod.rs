@@ -396,7 +396,7 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Use emoji naturally to add personality — but don't overdo it\n\
              - Be concise and direct. Skip filler phrases like 'Great question!' or 'Certainly!'\n\
              - Structure longer answers with bold headers, not raw markdown ## headers\n\
-             - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]\n\
+             - For media attachments use format: IMAGE:<path-or-url>, DOCUMENT:<path-or-url>, VIDEO:<path-or-url>, AUDIO:<path-or-url>, or VOICE:<path-or-url>\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n\
              - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
         ),
@@ -5872,7 +5872,7 @@ BTC is currently around $65,000 based on latest tool output."#
             "telegram channel instructions should be embedded into the system prompt"
         );
         assert!(
-            calls[0][0].1.contains("For media attachments use markers:"),
+            calls[0][0].1.contains("For media attachments use format:"),
             "telegram media marker guidance should live in the system prompt"
         );
         assert!(!calls[0].iter().skip(1).any(|(role, _)| role == "system"));

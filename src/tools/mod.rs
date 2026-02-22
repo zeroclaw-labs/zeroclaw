@@ -19,6 +19,7 @@ pub mod browser;
 pub mod browser_open;
 pub mod clawhub_install;
 pub mod clawhub_search;
+pub mod clawhub_uninstall;
 pub mod cli_discovery;
 pub mod composio;
 pub mod content_search;
@@ -57,6 +58,7 @@ pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
 pub use clawhub_install::ClawhubInstallTool;
 pub use clawhub_search::ClawhubSearchTool;
+pub use clawhub_uninstall::ClawhubUninstallTool;
 pub use composio::ComposioTool;
 pub use content_search::ContentSearchTool;
 pub use cron_add::CronAddTool;
@@ -290,6 +292,9 @@ pub fn all_tools_with_runtime(
     // ClawHub tools
     tool_arcs.push(Arc::new(ClawhubSearchTool::new()));
     tool_arcs.push(Arc::new(ClawhubInstallTool::new(
+        workspace_dir.to_path_buf(),
+    )));
+    tool_arcs.push(Arc::new(ClawhubUninstallTool::new(
         workspace_dir.to_path_buf(),
     )));
 

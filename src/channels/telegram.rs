@@ -375,7 +375,7 @@ impl TelegramChannel {
             let response = match client.post(&url).json(&body).send().await {
                 Ok(resp) => resp,
                 Err(err) => {
-                    tracing::warn!(
+                    tracing::debug!(
                         "Telegram: failed to add ACK reaction to chat_id={chat_id}, message_id={message_id}: {err}"
                     );
                     return;
@@ -385,7 +385,7 @@ impl TelegramChannel {
             if !response.status().is_success() {
                 let status = response.status();
                 let err_body = response.text().await.unwrap_or_default();
-                tracing::warn!(
+                tracing::debug!(
                     "Telegram: add ACK reaction failed for chat_id={chat_id}, message_id={message_id}: status={status}, body={err_body}"
                 );
             }
