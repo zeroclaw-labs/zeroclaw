@@ -5,6 +5,7 @@
 //! backend while adding tiered recall, merge-and-rank, and lifecycle commands.
 
 pub mod budget;
+pub mod facts;
 pub mod loader;
 pub mod merge;
 pub mod summarization;
