@@ -2599,7 +2599,7 @@ pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Con
             }
             if !cfg!(feature = "channel-lark") {
                 println!(
-                    "  ℹ️ Lark channel support is disabled in this build (enable `channel-lark`)."
+                    "  ℹ️ Lark/Feishu channel support is disabled in this build (enable `channel-lark`)."
                 );
             }
             println!("\nTo start channels: zeroclaw channel start");
@@ -2851,16 +2851,40 @@ fn collect_configured_channels(
 
     #[cfg(feature = "channel-lark")]
     if let Some(ref lk) = config.channels_config.lark {
+        if lk.use_feishu {
+            if config.channels_config.feishu.is_some() {
+                tracing::warn!(
+                    "Both [channels_config.feishu] and legacy [channels_config.lark].use_feishu=true are configured; ignoring legacy Feishu fallback in lark."
+                );
+            } else {
+                tracing::warn!(
+                    "Using legacy [channels_config.lark].use_feishu=true compatibility path; prefer [channels_config.feishu]."
+                );
+                channels.push(ConfiguredChannel {
+                    display_name: "Feishu",
+                    channel: Arc::new(LarkChannel::from_config(lk)),
+                });
+            }
+        } else {
+            channels.push(ConfiguredChannel {
+                display_name: "Lark",
+                channel: Arc::new(LarkChannel::from_lark_config(lk)),
+            });
+        }
+    }
+
+    #[cfg(feature = "channel-lark")]
+    if let Some(ref fs) = config.channels_config.feishu {
         channels.push(ConfiguredChannel {
-            display_name: "Lark",
-            channel: Arc::new(LarkChannel::from_config(lk)),
+            display_name: "Feishu",
+            channel: Arc::new(LarkChannel::from_feishu_config(fs)),
         });
     }
 
     #[cfg(not(feature = "channel-lark"))]
-    if config.channels_config.lark.is_some() {
+    if config.channels_config.lark.is_some() || config.channels_config.feishu.is_some() {
         tracing::warn!(
-            "Lark channel is configured but this build was compiled without `channel-lark`; skipping Lark health check."
+            "Lark/Feishu channel is configured but this build was compiled without `channel-lark`; skipping Lark/Feishu health check."
         );
     }
 

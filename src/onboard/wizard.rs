@@ -4,8 +4,9 @@ use crate::config::schema::{
 };
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
-    HeartbeatConfig, IMessageConfig, LarkConfig, MatrixConfig, MemoryConfig, ObservabilityConfig,
-    RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig, TelegramConfig, WebhookConfig,
+    FeishuConfig, HeartbeatConfig, IMessageConfig, LarkConfig, MatrixConfig, MemoryConfig,
+    ObservabilityConfig, RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig, TelegramConfig,
+    WebhookConfig,
 };
 use crate::hardware::{self, HardwareConfig};
 use crate::memory::{
@@ -3111,7 +3112,8 @@ enum ChannelMenuChoice {
     NextcloudTalk,
     DingTalk,
     QqOfficial,
-    LarkFeishu,
+    Lark,
+    Feishu,
     Nostr,
     Done,
 }
@@ -3130,7 +3132,8 @@ const CHANNEL_MENU_CHOICES: &[ChannelMenuChoice] = &[
     ChannelMenuChoice::NextcloudTalk,
     ChannelMenuChoice::DingTalk,
     ChannelMenuChoice::QqOfficial,
-    ChannelMenuChoice::LarkFeishu,
+    ChannelMenuChoice::Lark,
+    ChannelMenuChoice::Feishu,
     ChannelMenuChoice::Nostr,
     ChannelMenuChoice::Done,
 ];
@@ -3256,12 +3259,22 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         "— Tencent QQ Bot"
                     }
                 ),
-                ChannelMenuChoice::LarkFeishu => format!(
-                    "Lark/Feishu {}",
-                    if config.lark.is_some() {
+                ChannelMenuChoice::Lark => format!(
+                    "Lark       {}",
+                    if config.lark.as_ref().is_some_and(|cfg| !cfg.use_feishu) {
                         "✅ connected"
                     } else {
-                        "— Lark/Feishu Bot"
+                        "— Lark Bot"
+                    }
+                ),
+                ChannelMenuChoice::Feishu => format!(
+                    "Feishu     {}",
+                    if config.feishu.is_some()
+                        || config.lark.as_ref().is_some_and(|cfg| cfg.use_feishu)
+                    {
+                        "✅ connected"
+                    } else {
+                        "— Feishu Bot"
                     }
                 ),
                 ChannelMenuChoice::Nostr => format!(
@@ -4520,17 +4533,30 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     allowed_users,
                 });
             }
-            ChannelMenuChoice::LarkFeishu => {
-                // ── Lark/Feishu ──
+            ChannelMenuChoice::Lark | ChannelMenuChoice::Feishu => {
+                let is_feishu = matches!(choice, ChannelMenuChoice::Feishu);
+                let provider_label = if is_feishu { "Feishu" } else { "Lark" };
+                let provider_host = if is_feishu {
+                    "open.feishu.cn"
+                } else {
+                    "open.larksuite.com"
+                };
+                let base_url = if is_feishu {
+                    "https://open.feishu.cn/open-apis"
+                } else {
+                    "https://open.larksuite.com/open-apis"
+                };
+
+                // ── Lark / Feishu ──
                 println!();
                 println!(
                     "  {} {}",
-                    style("Lark/Feishu Setup").white().bold(),
-                    style("— talk to ZeroClaw from Lark or Feishu").dim()
+                    style(format!("{provider_label} Setup")).white().bold(),
+                    style(format!("— talk to ZeroClaw from {provider_label}")).dim()
                 );
-                print_bullet(
-                    "1. Go to Lark/Feishu Open Platform (open.larksuite.com / open.feishu.cn)",
-                );
+                print_bullet(&format!(
+                    "1. Go to {provider_label} Open Platform ({provider_host})"
+                ));
                 print_bullet("2. Create an app and enable 'Bot' capability");
                 print_bullet("3. Copy the App ID and App Secret");
                 println!();
@@ -4552,20 +4578,8 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     continue;
                 }
 
-                let use_feishu = Select::new()
-                    .with_prompt("  Region")
-                    .items(["Feishu (CN)", "Lark (International)"])
-                    .default(0)
-                    .interact()?
-                    == 0;
-
                 // Test connection (run entirely in separate thread — Response must be used/dropped there)
                 print!("  {} Testing connection... ", style("⏳").dim());
-                let base_url = if use_feishu {
-                    "https://open.feishu.cn/open-apis"
-                } else {
-                    "https://open.larksuite.com/open-apis"
-                };
                 let app_id_clone = app_id.clone();
                 let app_secret_clone = app_secret.clone();
                 let endpoint = format!("{base_url}/auth/v3/tenant_access_token/internal");
@@ -4611,7 +4625,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 match thread_result {
                     Ok(Ok(())) => {
                         println!(
-                            "\r  {} Lark/Feishu credentials verified        ",
+                            "\r  {} {provider_label} credentials verified        ",
                             style("✅").green().bold()
                         );
                     }
@@ -4691,21 +4705,33 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                 if allowed_users.is_empty() {
                     println!(
-                        "  {} No users allowlisted — Lark/Feishu inbound messages will be denied until you add Open IDs or '*'.",
+                        "  {} No users allowlisted — {provider_label} inbound messages will be denied until you add Open IDs or '*'.",
                         style("⚠").yellow().bold()
                     );
                 }
 
-                config.lark = Some(LarkConfig {
-                    app_id,
-                    app_secret,
-                    verification_token,
-                    encrypt_key: None,
-                    allowed_users,
-                    use_feishu,
-                    receive_mode,
-                    port,
-                });
+                if is_feishu {
+                    config.feishu = Some(FeishuConfig {
+                        app_id,
+                        app_secret,
+                        verification_token,
+                        encrypt_key: None,
+                        allowed_users,
+                        receive_mode,
+                        port,
+                    });
+                } else {
+                    config.lark = Some(LarkConfig {
+                        app_id,
+                        app_secret,
+                        verification_token,
+                        encrypt_key: None,
+                        allowed_users,
+                        use_feishu: false,
+                        receive_mode,
+                        port,
+                    });
+                }
             }
             ChannelMenuChoice::Nostr => {
                 // ── Nostr ──
@@ -6859,13 +6885,15 @@ mod tests {
     }
 
     #[test]
-    fn channel_menu_choices_include_signal_and_nextcloud_talk() {
+    fn channel_menu_choices_include_signal_nextcloud_lark_and_feishu() {
         assert!(channel_menu_choices().contains(&ChannelMenuChoice::Signal));
         assert!(channel_menu_choices().contains(&ChannelMenuChoice::NextcloudTalk));
+        assert!(channel_menu_choices().contains(&ChannelMenuChoice::Lark));
+        assert!(channel_menu_choices().contains(&ChannelMenuChoice::Feishu));
     }
 
     #[test]
-    fn launchable_channels_include_signal_mattermost_qq_and_nextcloud_talk() {
+    fn launchable_channels_include_signal_mattermost_qq_nextcloud_and_feishu() {
         let mut channels = ChannelsConfig::default();
         assert!(!has_launchable_channels(&channels));
 
@@ -6904,6 +6932,18 @@ mod tests {
             app_token: "token".into(),
             webhook_secret: Some("secret".into()),
             allowed_users: vec!["*".into()],
+        });
+        assert!(has_launchable_channels(&channels));
+
+        channels.nextcloud_talk = None;
+        channels.feishu = Some(crate::config::schema::FeishuConfig {
+            app_id: "cli_123".into(),
+            app_secret: "secret".into(),
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec!["*".into()],
+            receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
+            port: None,
         });
         assert!(has_launchable_channels(&channels));
     }
