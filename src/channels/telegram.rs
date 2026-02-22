@@ -2459,26 +2459,24 @@ impl Channel for TelegramChannel {
                                     }
                                 }
                                 break; // Probe succeeded; enter the long-poll loop.
-                            } else {
-                                let error_code = data
-                                    .get("error_code")
-                                    .and_then(serde_json::Value::as_i64)
-                                    .unwrap_or_default();
-                                if error_code == 409 {
-                                    tracing::debug!(
-                                        "Startup probe: slot busy (409), retrying in 5s"
-                                    );
-                                } else {
-                                    let desc = data
-                                        .get("description")
-                                        .and_then(serde_json::Value::as_str)
-                                        .unwrap_or("unknown");
-                                    tracing::warn!(
-                                        "Startup probe: API error {error_code}: {desc}; retrying in 5s"
-                                    );
-                                }
-                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                             }
+
+                            let error_code = data
+                                .get("error_code")
+                                .and_then(serde_json::Value::as_i64)
+                                .unwrap_or_default();
+                            if error_code == 409 {
+                                tracing::debug!("Startup probe: slot busy (409), retrying in 5s");
+                            } else {
+                                let desc = data
+                                    .get("description")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("unknown");
+                                tracing::warn!(
+                                    "Startup probe: API error {error_code}: {desc}; retrying in 5s"
+                                );
+                            }
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                         }
                     }
                 }
