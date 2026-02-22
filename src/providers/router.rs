@@ -23,6 +23,8 @@ pub struct RouterProvider {
     providers: Vec<(String, Box<dyn Provider>)>,
     default_index: usize,
     default_model: String,
+    /// Vision support override from config (`None` = defer to providers).
+    vision_override: Option<bool>,
 }
 
 impl RouterProvider {
@@ -66,7 +68,14 @@ impl RouterProvider {
             providers,
             default_index: 0,
             default_model,
+            vision_override: None,
         }
+    }
+
+    /// Set vision support override from runtime config.
+    pub fn with_vision_override(mut self, vision_override: Option<bool>) -> Self {
+        self.vision_override = vision_override;
+        self
     }
 
     /// Resolve a model parameter to a (provider, actual_model) pair.
@@ -159,9 +168,11 @@ impl Provider for RouterProvider {
     }
 
     fn supports_vision(&self) -> bool {
-        self.providers
-            .iter()
-            .any(|(_, provider)| provider.supports_vision())
+        self.vision_override.unwrap_or_else(|| {
+            self.providers
+                .iter()
+                .any(|(_, provider)| provider.supports_vision())
+        })
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
