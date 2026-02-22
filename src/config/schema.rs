@@ -176,6 +176,10 @@ pub struct Config {
     #[serde(default)]
     pub web_search: WebSearchConfig,
 
+    /// Web fetch tool configuration (`[web_fetch]`).
+    #[serde(default)]
+    pub web_fetch: WebFetchConfig,
+
     /// Proxy configuration for outbound HTTP/HTTPS/SOCKS5 traffic (`[proxy]`).
     #[serde(default)]
     pub proxy: ProxyConfig,
@@ -998,6 +1002,9 @@ pub struct HttpRequestConfig {
     /// Request timeout in seconds (default: 30)
     #[serde(default = "default_http_timeout_secs")]
     pub timeout_secs: u64,
+    /// User Agent string for HTTP requests
+    #[serde(default = "default_user_agent")]
+    pub user_agent: String,
 }
 
 impl Default for HttpRequestConfig {
@@ -1007,6 +1014,7 @@ impl Default for HttpRequestConfig {
             allowed_domains: vec![],
             max_response_size: default_http_max_response_size(),
             timeout_secs: default_http_timeout_secs(),
+            user_agent: default_user_agent(),
         }
     }
 }
@@ -1027,18 +1035,27 @@ pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
     #[serde(default)]
     pub enabled: bool,
-    /// Search provider: "duckduckgo" (free, no API key) or "brave" (requires API key)
+    /// Search provider: "duckduckgo" (free, no API key), "brave" (requires API key), or "firecrawl" (requires feature + API key)
     #[serde(default = "default_web_search_provider")]
     pub provider: String,
     /// Brave Search API key (required if provider is "brave")
     #[serde(default)]
     pub brave_api_key: Option<String>,
+    /// Firecrawl API key (required if provider is "firecrawl")
+    #[serde(default)]
+    pub firecrawl_api_key: Option<String>,
+    /// Firecrawl API base URL override (for self-hosted instances)
+    #[serde(default)]
+    pub firecrawl_api_url: Option<String>,
     /// Maximum results per search (1-10)
     #[serde(default = "default_web_search_max_results")]
     pub max_results: usize,
     /// Request timeout in seconds
     #[serde(default = "default_web_search_timeout_secs")]
     pub timeout_secs: u64,
+    /// User Agent string for web requests
+    #[serde(default = "default_user_agent")]
+    pub user_agent: String,
 }
 
 fn default_web_search_provider() -> String {
@@ -1053,14 +1070,86 @@ fn default_web_search_timeout_secs() -> u64 {
     15
 }
 
+fn default_user_agent() -> String {
+    "ZeroClaw/1.0".into()
+}
+
 impl Default for WebSearchConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             provider: default_web_search_provider(),
             brave_api_key: None,
+            firecrawl_api_key: None,
+            firecrawl_api_url: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
+            user_agent: default_user_agent(),
+        }
+    }
+}
+
+// ── Web fetch ────────────────────────────────────────────────────
+
+/// Web fetch tool configuration (`[web_fetch]` section).
+///
+/// Fetches a URL and returns its content as Markdown.
+/// Two providers are supported:
+/// - `"fast_html2md"` (default) — local conversion using reqwest + fast_html2md (no API key required)
+/// - `"firecrawl"` — cloud-based conversion via the Firecrawl API (requires `firecrawl` feature and API key)
+///
+/// Deny-by-default: if `allowed_domains` is empty, all requests are rejected.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WebFetchConfig {
+    /// Enable `web_fetch` tool for fetching and converting web pages to Markdown
+    #[serde(default)]
+    pub enabled: bool,
+    /// Fetch provider: `"fast_html2md"` (local, default) or `"firecrawl"` (cloud, requires feature + API key)
+    #[serde(default = "default_web_fetch_provider")]
+    pub provider: String,
+    /// Firecrawl API key (required when provider is `"firecrawl"`)
+    #[serde(default)]
+    pub firecrawl_api_key: Option<String>,
+    /// Firecrawl API base URL override (for self-hosted instances; default: https://api.firecrawl.dev)
+    #[serde(default)]
+    pub firecrawl_api_url: Option<String>,
+    /// Allowed domains for web fetch requests (exact or subdomain match)
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+    /// Maximum response size in bytes for the converted Markdown (default: 500KB)
+    #[serde(default = "default_web_fetch_max_response_size")]
+    pub max_response_size: usize,
+    /// Request timeout in seconds (default: 30)
+    #[serde(default = "default_web_fetch_timeout_secs")]
+    pub timeout_secs: u64,
+    /// User Agent string for web requests
+    #[serde(default = "default_user_agent")]
+    pub user_agent: String,
+}
+
+fn default_web_fetch_provider() -> String {
+    "fast_html2md".into()
+}
+
+fn default_web_fetch_max_response_size() -> usize {
+    500_000 // 500KB
+}
+
+fn default_web_fetch_timeout_secs() -> u64 {
+    30
+}
+
+impl Default for WebFetchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: default_web_fetch_provider(),
+            firecrawl_api_key: None,
+            firecrawl_api_url: None,
+            allowed_domains: vec![],
+            max_response_size: default_web_fetch_max_response_size(),
+            timeout_secs: default_web_fetch_timeout_secs(),
+            user_agent: default_user_agent(),
         }
     }
 }
@@ -3454,6 +3543,7 @@ impl Default for Config {
             http_request: HttpRequestConfig::default(),
             multimodal: MultimodalConfig::default(),
             web_search: WebSearchConfig::default(),
+            web_fetch: WebFetchConfig::default(),
             proxy: ProxyConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
@@ -4170,6 +4260,18 @@ impl Config {
             }
         }
 
+        // Global User Agent fallback: ZEROCLAW_USER_AGENT or USER_AGENT
+        if let Ok(user_agent) =
+            std::env::var("ZEROCLAW_USER_AGENT").or_else(|_| std::env::var("USER_AGENT"))
+        {
+            let user_agent = user_agent.trim();
+            if !user_agent.is_empty() {
+                self.http_request.user_agent = user_agent.to_string();
+                self.web_search.user_agent = user_agent.to_string();
+                self.web_fetch.user_agent = user_agent.to_string();
+            }
+        }
+
         // Web search enabled: ZEROCLAW_WEB_SEARCH_ENABLED or WEB_SEARCH_ENABLED
         if let Ok(enabled) = std::env::var("ZEROCLAW_WEB_SEARCH_ENABLED")
             .or_else(|_| std::env::var("WEB_SEARCH_ENABLED"))
@@ -4197,6 +4299,66 @@ impl Config {
             }
         }
 
+        // Firecrawl API key (global): ZEROCLAW_FIRECRAWL_API_KEY or FIRECRAWL_API_KEY
+        if let Ok(api_key) = std::env::var("ZEROCLAW_FIRECRAWL_API_KEY")
+            .or_else(|_| std::env::var("FIRECRAWL_API_KEY"))
+        {
+            let api_key = api_key.trim();
+            if !api_key.is_empty() {
+                self.web_search.firecrawl_api_key = Some(api_key.to_string());
+                self.web_fetch.firecrawl_api_key = Some(api_key.to_string());
+            }
+        }
+
+        // Firecrawl API key (per-tool overrides, applied after global so they win)
+        if let Ok(api_key) = std::env::var("ZEROCLAW_WEB_SEARCH_FIRECRAWL_API_KEY")
+            .or_else(|_| std::env::var("WEB_SEARCH_FIRECRAWL_API_KEY"))
+        {
+            let api_key = api_key.trim();
+            if !api_key.is_empty() {
+                self.web_search.firecrawl_api_key = Some(api_key.to_string());
+            }
+        }
+
+        if let Ok(api_key) = std::env::var("ZEROCLAW_WEB_FETCH_FIRECRAWL_API_KEY")
+            .or_else(|_| std::env::var("WEB_FETCH_FIRECRAWL_API_KEY"))
+        {
+            let api_key = api_key.trim();
+            if !api_key.is_empty() {
+                self.web_fetch.firecrawl_api_key = Some(api_key.to_string());
+            }
+        }
+
+        // Firecrawl API URL (global): ZEROCLAW_FIRECRAWL_API_URL or FIRECRAWL_API_URL
+        if let Ok(api_url) = std::env::var("ZEROCLAW_FIRECRAWL_API_URL")
+            .or_else(|_| std::env::var("FIRECRAWL_API_URL"))
+        {
+            let api_url = api_url.trim();
+            if !api_url.is_empty() {
+                self.web_search.firecrawl_api_url = Some(api_url.to_string());
+                self.web_fetch.firecrawl_api_url = Some(api_url.to_string());
+            }
+        }
+
+        // Firecrawl API URL (per-tool overrides, applied after global so they win)
+        if let Ok(api_url) = std::env::var("ZEROCLAW_WEB_SEARCH_FIRECRAWL_API_URL")
+            .or_else(|_| std::env::var("WEB_SEARCH_FIRECRAWL_API_URL"))
+        {
+            let api_url = api_url.trim();
+            if !api_url.is_empty() {
+                self.web_search.firecrawl_api_url = Some(api_url.to_string());
+            }
+        }
+
+        if let Ok(api_url) = std::env::var("ZEROCLAW_WEB_FETCH_FIRECRAWL_API_URL")
+            .or_else(|_| std::env::var("WEB_FETCH_FIRECRAWL_API_URL"))
+        {
+            let api_url = api_url.trim();
+            if !api_url.is_empty() {
+                self.web_fetch.firecrawl_api_url = Some(api_url.to_string());
+            }
+        }
+
         // Web search max results: ZEROCLAW_WEB_SEARCH_MAX_RESULTS or WEB_SEARCH_MAX_RESULTS
         if let Ok(max_results) = std::env::var("ZEROCLAW_WEB_SEARCH_MAX_RESULTS")
             .or_else(|_| std::env::var("WEB_SEARCH_MAX_RESULTS"))
@@ -4216,6 +4378,36 @@ impl Config {
                 if timeout_secs > 0 {
                     self.web_search.timeout_secs = timeout_secs;
                 }
+            }
+        }
+
+        // Web search user agent: ZEROCLAW_WEB_SEARCH_USER_AGENT or WEB_SEARCH_USER_AGENT
+        if let Ok(user_agent) = std::env::var("ZEROCLAW_WEB_SEARCH_USER_AGENT")
+            .or_else(|_| std::env::var("WEB_SEARCH_USER_AGENT"))
+        {
+            let user_agent = user_agent.trim();
+            if !user_agent.is_empty() {
+                self.web_search.user_agent = user_agent.to_string();
+            }
+        }
+
+        // Web fetch user agent: ZEROCLAW_WEB_FETCH_USER_AGENT or WEB_FETCH_USER_AGENT
+        if let Ok(user_agent) = std::env::var("ZEROCLAW_WEB_FETCH_USER_AGENT")
+            .or_else(|_| std::env::var("WEB_FETCH_USER_AGENT"))
+        {
+            let user_agent = user_agent.trim();
+            if !user_agent.is_empty() {
+                self.web_fetch.user_agent = user_agent.to_string();
+            }
+        }
+
+        // HTTP request user agent: ZEROCLAW_HTTP_REQUEST_USER_AGENT or HTTP_REQUEST_USER_AGENT
+        if let Ok(user_agent) = std::env::var("ZEROCLAW_HTTP_REQUEST_USER_AGENT")
+            .or_else(|_| std::env::var("HTTP_REQUEST_USER_AGENT"))
+        {
+            let user_agent = user_agent.trim();
+            if !user_agent.is_empty() {
+                self.http_request.user_agent = user_agent.to_string();
             }
         }
 
@@ -4739,6 +4931,7 @@ default_temperature = 0.7
             http_request: HttpRequestConfig::default(),
             multimodal: MultimodalConfig::default(),
             web_search: WebSearchConfig::default(),
+            web_fetch: WebFetchConfig::default(),
             proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
@@ -4913,6 +5106,7 @@ tool_dispatcher = "xml"
             http_request: HttpRequestConfig::default(),
             multimodal: MultimodalConfig::default(),
             web_search: WebSearchConfig::default(),
+            web_fetch: WebFetchConfig::default(),
             proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),

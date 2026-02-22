@@ -305,12 +305,71 @@ Notes:
 | `allowed_domains` | `[]` | Allowed domains for HTTP requests (exact/subdomain match, or `"*"` for all public domains) |
 | `max_response_size` | `1000000` | Maximum response size in bytes (default: 1 MB) |
 | `timeout_secs` | `30` | Request timeout in seconds |
+| `user_agent` | `"ZeroClaw/1.0"` | User-Agent header sent with every request |
 
 Notes:
 
 - Deny-by-default: if `allowed_domains` is empty, all HTTP requests are rejected.
 - Use exact domain or subdomain matching (e.g. `"api.example.com"`, `"example.com"`), or `"*"` to allow any public domain.
 - Local/private targets are still blocked even when `"*"` is configured.
+- `user_agent` can be overridden globally via `ZEROCLAW_USER_AGENT` / `USER_AGENT` (applies to all three web tools) or per-tool via `ZEROCLAW_HTTP_REQUEST_USER_AGENT` / `HTTP_REQUEST_USER_AGENT`. Per-tool overrides win over the global one (see [Environment Variable Overrides](#environment-variable-overrides) below).
+
+## `[web_search]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable `web_search_tool` for web searches |
+| `provider` | `"duckduckgo"` | Search provider: `"duckduckgo"` (free), `"brave"` (requires API key), or `"firecrawl"` (requires `firecrawl` feature + API key) |
+| `brave_api_key` | unset | Brave Search API key (required when `provider = "brave"`) |
+| `firecrawl_api_key` | unset | Firecrawl API key (required when `provider = "firecrawl"`) |
+| `firecrawl_api_url` | unset | Firecrawl API base URL override for self-hosted instances (default: `https://api.firecrawl.dev`) |
+| `max_results` | `5` | Maximum search results returned (clamped 1–10) |
+| `timeout_secs` | `15` | Request timeout in seconds |
+| `user_agent` | `"ZeroClaw/1.0"` | User-Agent header sent with every request |
+
+Notes:
+
+- `"firecrawl"` provider requires the binary to be built with `--features firecrawl`. Using it without the feature flag will produce a runtime error.
+- `brave_api_key` and `firecrawl_api_key` can be set via env vars (see below) to avoid storing keys in config files.
+- `user_agent` can be overridden globally via `ZEROCLAW_USER_AGENT` or per-tool via `ZEROCLAW_WEB_SEARCH_USER_AGENT`.
+
+```toml
+[web_search]
+enabled = true
+provider = "brave"
+brave_api_key = "BSA..."
+max_results = 5
+```
+
+## `[web_fetch]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable `web_fetch` tool for fetching and converting web pages to Markdown |
+| `provider` | `"fast_html2md"` | Fetch provider: `"fast_html2md"` (local, no API key) or `"firecrawl"` (cloud, requires `firecrawl` feature + API key) |
+| `firecrawl_api_key` | unset | Firecrawl API key (required when `provider = "firecrawl"`) |
+| `firecrawl_api_url` | unset | Firecrawl API base URL override for self-hosted instances (default: `https://api.firecrawl.dev`) |
+| `allowed_domains` | `[]` | Allowed domains for fetch requests (exact/subdomain match, or `"*"` for all public domains) |
+| `max_response_size` | `500000` | Maximum Markdown response size in bytes (default: 500 KB) |
+| `timeout_secs` | `30` | Request timeout in seconds |
+| `user_agent` | `"ZeroClaw/1.0"` | User-Agent header sent with every request |
+
+Notes:
+
+- Deny-by-default: if `allowed_domains` is empty, all fetch requests are rejected.
+- Only `http://` and `https://` URLs are accepted; other schemes are rejected immediately.
+- Private/local hosts (`localhost`, `127.x`, `10.x`, `192.168.x`, etc.) are always blocked regardless of `allowed_domains`.
+- Redirects are **not followed** automatically. When a redirect is encountered, the target URL is returned to the LLM, which can then call `web_fetch` again with that URL if it is within the allowed domains.
+- `"fast_html2md"` provider requires the `web-fetch` feature (included in the default build). `"firecrawl"` requires an additional `--features firecrawl` build flag.
+- `user_agent` can be overridden globally via `ZEROCLAW_USER_AGENT` or per-tool via `ZEROCLAW_WEB_FETCH_USER_AGENT`.
+
+```toml
+[web_fetch]
+enabled = true
+provider = "fast_html2md"
+allowed_domains = ["docs.example.com", "blog.example.com"]
+max_response_size = 200000
+```
 
 ## `[gateway]`
 
@@ -629,11 +688,41 @@ Notes:
 - Place `.md`/`.txt` datasheet files named by board (e.g. `nucleo-f401re.md`, `rpi-gpio.md`) in `datasheet_dir` for RAG retrieval.
 - See [hardware-peripherals-design.md](hardware-peripherals-design.md) for board protocol and firmware notes.
 
+## Environment Variable Overrides
+
+The following environment variables override their corresponding config keys at startup. `ZEROCLAW_*` variants always take precedence over the shorter legacy aliases.
+
+| Environment Variable | Legacy Alias | Overrides |
+|---|---|---|
+| `ZEROCLAW_USER_AGENT` | `USER_AGENT` | `http_request.user_agent`, `web_search.user_agent`, `web_fetch.user_agent` (all three) |
+| `ZEROCLAW_HTTP_REQUEST_USER_AGENT` | `HTTP_REQUEST_USER_AGENT` | `http_request.user_agent` only |
+| `ZEROCLAW_WEB_SEARCH_USER_AGENT` | `WEB_SEARCH_USER_AGENT` | `web_search.user_agent` only |
+| `ZEROCLAW_WEB_FETCH_USER_AGENT` | `WEB_FETCH_USER_AGENT` | `web_fetch.user_agent` only |
+| `ZEROCLAW_FIRECRAWL_API_KEY` | `FIRECRAWL_API_KEY` | `web_search.firecrawl_api_key` and `web_fetch.firecrawl_api_key` (both) |
+| `ZEROCLAW_WEB_SEARCH_FIRECRAWL_API_KEY` | `WEB_SEARCH_FIRECRAWL_API_KEY` | `web_search.firecrawl_api_key` only |
+| `ZEROCLAW_WEB_FETCH_FIRECRAWL_API_KEY` | `WEB_FETCH_FIRECRAWL_API_KEY` | `web_fetch.firecrawl_api_key` only |
+| `ZEROCLAW_FIRECRAWL_API_URL` | `FIRECRAWL_API_URL` | `web_search.firecrawl_api_url` and `web_fetch.firecrawl_api_url` (both) |
+| `ZEROCLAW_WEB_SEARCH_FIRECRAWL_API_URL` | `WEB_SEARCH_FIRECRAWL_API_URL` | `web_search.firecrawl_api_url` only |
+| `ZEROCLAW_WEB_FETCH_FIRECRAWL_API_URL` | `WEB_FETCH_FIRECRAWL_API_URL` | `web_fetch.firecrawl_api_url` only |
+| `ZEROCLAW_WEB_SEARCH_ENABLED` | `WEB_SEARCH_ENABLED` | `web_search.enabled` |
+| `ZEROCLAW_WEB_SEARCH_PROVIDER` | `WEB_SEARCH_PROVIDER` | `web_search.provider` |
+| `ZEROCLAW_BRAVE_API_KEY` | `BRAVE_API_KEY` | `web_search.brave_api_key` |
+| `ZEROCLAW_WEB_SEARCH_MAX_RESULTS` | `WEB_SEARCH_MAX_RESULTS` | `web_search.max_results` |
+| `ZEROCLAW_WEB_SEARCH_TIMEOUT_SECS` | `WEB_SEARCH_TIMEOUT_SECS` | `web_search.timeout_secs` |
+
+Notes:
+
+- Global overrides (`ZEROCLAW_USER_AGENT`, `ZEROCLAW_FIRECRAWL_API_KEY`, `ZEROCLAW_FIRECRAWL_API_URL`) are applied first and affect all relevant tools at once.
+- Per-tool overrides are applied after the global ones and always win when both are set.
+- All env vars are applied after `config.toml` is loaded; env always wins over file-based config.
+
 ## Security-Relevant Defaults
 
 - deny-by-default channel allowlists (`[]` means deny all)
 - pairing required on gateway by default
 - public bind disabled by default
+- `web_fetch` and `http_request` deny all requests when `allowed_domains` is empty
+- `web_fetch` blocks private/local hosts regardless of `allowed_domains`
 
 ## Validation Commands
 
