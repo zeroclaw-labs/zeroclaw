@@ -50,8 +50,8 @@ pub enum ClawHubSubcommand {
 /// Handle clawhub CLI commands
 pub async fn handle_command(
     command: ClawHubSubcommand,
-    config_dir: &PathBuf,
-    workspace_dir: &PathBuf,
+    config_dir: &Path,
+    workspace_dir: &Path,
 ) -> Result<()> {
     match command {
         ClawHubSubcommand::Search { query, limit } => handle_search(&query, limit).await,
@@ -179,7 +179,7 @@ async fn handle_install(
     Ok(())
 }
 
-fn handle_uninstall(slug: &str, config_dir: &PathBuf, workspace_dir: &PathBuf) -> Result<()> {
+fn handle_uninstall(slug: &str, config_dir: &Path, workspace_dir: &Path) -> Result<()> {
     let mut registry = Registry::new(config_dir);
 
     if !registry.is_installed(slug) {
@@ -203,7 +203,7 @@ fn handle_uninstall(slug: &str, config_dir: &PathBuf, workspace_dir: &PathBuf) -
     Ok(())
 }
 
-fn handle_list(config_dir: &PathBuf) -> Result<()> {
+fn handle_list(config_dir: &Path) -> Result<()> {
     let registry = Registry::new(config_dir);
     let skills = registry.list_skills();
 
@@ -226,7 +226,7 @@ fn handle_list(config_dir: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-async fn handle_update(config_dir: &PathBuf, _workspace_dir: &PathBuf) -> Result<()> {
+async fn handle_update(config_dir: &Path, _workspace_dir: &Path) -> Result<()> {
     println!("Checking for updates...");
 
     let registry = Registry::new(config_dir);
@@ -273,7 +273,7 @@ fn handle_login() -> Result<()> {
     Ok(())
 }
 
-async fn handle_whoami(config_dir: &PathBuf) -> Result<()> {
+async fn handle_whoami(config_dir: &Path) -> Result<()> {
     // Check for token in environment or config
     let token = std::env::var("ZEROCLAW_CLAWHUB_TOKEN").ok();
 
@@ -325,13 +325,14 @@ pub fn update_skills_readme(skills_dir: &Path, clawhub_skills: &[InstalledSkill]
         content.push_str("|-------|---------|--------|\n");
 
         for skill in clawhub_skills {
-            content.push_str(&format!(
+            let row = format!(
                 "| [{}]({}) | {} | [ClawHub](https://clawhub.ai/s/{}) |\n",
                 skill.name,
                 format!("skills/{}/SKILL.md", skill.slug),
                 skill.version,
                 skill.slug
-            ));
+            );
+            content.push_str(&row);
         }
 
         content.push('\n');
