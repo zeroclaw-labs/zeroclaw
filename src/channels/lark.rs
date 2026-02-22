@@ -14,37 +14,19 @@ const FEISHU_WS_BASE_URL: &str = "https://open.feishu.cn";
 const LARK_BASE_URL: &str = "https://open.larksuite.com/open-apis";
 const LARK_WS_BASE_URL: &str = "https://open.larksuite.com";
 
-const LARK_ACK_REACTIONS_ZH_CN: &[&str] = &["OK", "加油", "鼓掌", "碰拳", "看", "奋斗", "强"];
+/// Feishu/Lark API emoji_type keys for message reactions.
+/// These must match the API's enum values exactly (case-sensitive).
+/// Reference: https://open.feishu.cn/document/server-docs/im-v1/message-reaction/emojis-introduce
+const LARK_ACK_REACTIONS_ZH_CN: &[&str] =
+    &["OK", "MUSCLE", "APPLAUSE", "FISTBUMP", "GLANCE", "STRIVE", "THUMBSUP"];
 const LARK_ACK_REACTIONS_ZH_TW: &[&str] = &[
-    "我看行",
-    "OK",
-    "加油",
-    "鼓掌",
-    "碰拳",
-    "看",
-    "奮鬥",
-    "強",
-    "很 OK",
+    "LGTM", "OK", "MUSCLE", "APPLAUSE", "FISTBUMP", "GLANCE", "STRIVE", "THUMBSUP", "DONE",
 ];
 const LARK_ACK_REACTIONS_EN: &[&str] = &[
-    "LooksGoodToMe",
-    "OK",
-    "Praise",
-    "Determined",
-    "Glance",
-    "FistBump",
-    "Applaud",
-    "FightOn",
+    "LGTM", "OK", "PRAISE", "MUSCLE", "GLANCE", "FISTBUMP", "APPLAUSE", "STRIVE",
 ];
 const LARK_ACK_REACTIONS_JA: &[&str] = &[
-    "いいと思う",
-    "OK",
-    "よくできた",
-    "頑張る",
-    "見る",
-    "グータッチ",
-    "拍手",
-    "頑張れ",
+    "LGTM", "OK", "PRAISE", "MUSCLE", "GLANCE", "FISTBUMP", "APPLAUSE", "STRIVE",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
