@@ -88,6 +88,22 @@ pub struct ClawHubSkill {
     pub readme_url: Option<String>,
 }
 
+impl From<SearchResultItem> for ClawHubSkill {
+    fn from(item: SearchResultItem) -> Self {
+        ClawHubSkill {
+            slug: item.slug,
+            name: item.display_name,
+            description: item.summary,
+            author: String::new(),
+            tags: vec![],
+            stars: 0,
+            version: item.version,
+            github_url: None,
+            readme_url: None,
+        }
+    }
+}
+
 /// Local registry entry for installed clawhub skill
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstalledSkill {

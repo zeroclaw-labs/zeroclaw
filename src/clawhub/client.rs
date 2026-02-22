@@ -56,7 +56,7 @@ impl ClawHubClient {
         let skills: Vec<ClawHubSkill> = result
             .results
             .into_iter()
-            .map(|item| SearchResultItem::into_skill(item))
+            .map(|item| item.into())
             .collect();
 
         Ok(skills)
@@ -114,23 +114,6 @@ impl Default for ClawHubClient {
 pub struct ClawHubUser {
     pub login: String,
     pub name: Option<String>,
-}
-
-impl SearchResultItem {
-    /// Convert API response to internal ClawHubSkill format
-    pub fn into_skill(self) -> ClawHubSkill {
-        ClawHubSkill {
-            slug: self.slug,
-            name: self.display_name,
-            description: self.summary,
-            author: String::new(), // Not available in search results
-            tags: vec![],         // Not available in search results
-            stars: 0,             // Not available in search results
-            version: self.version,
-            github_url: None,     // Not available in search results
-            readme_url: None,     // Not available in search results
-        }
-    }
 }
 
 impl From<SkillDetail> for ClawHubSkill {
