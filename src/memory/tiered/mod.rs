@@ -8,6 +8,7 @@ pub mod budget;
 pub mod merge;
 pub mod summarization;
 pub mod tagging;
+pub mod manager;
 pub mod types;
 
 #[allow(unused_imports)]
