@@ -107,7 +107,9 @@ jobs:
                       echo "::error::HOMEBREW_CORE_BOT_FORK_REPO must be in owner/repo format."
                       exit 1
                     fi
-                    git clone --depth=1 "https://x-access-token:${HOMEBREW_CORE_BOT_TOKEN}@github.com/${BOT_FORK_REPO}.git" "$tmp_repo/homebrew-core"
+                    auth_header="$(printf 'x-access-token:%s' "${HOMEBREW_CORE_BOT_TOKEN}" | base64 | tr -d '\n')"
+                    git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth_header}" \
+                      clone --depth=1 "https://github.com/${BOT_FORK_REPO}.git" "$tmp_repo/homebrew-core"
                   fi
 
                   repo_dir="$tmp_repo/homebrew-core"
@@ -164,7 +166,9 @@ jobs:
                   git -C "$repo_dir" config user.email "$bot_email"
                   git -C "$repo_dir" add "$FORMULA_PATH"
                   git -C "$repo_dir" commit -m "zeroclaw ${tag_version}"
-                  git -C "$repo_dir" push --set-upstream origin "$branch_name"
+                  auth_header="$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 | tr -d '\n')"
+                  git -C "$repo_dir" -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth_header}" \
+                    push --set-upstream origin "$branch_name"
 
                   pr_title="zeroclaw ${tag_version}"
                   pr_body=$(cat <<EOF
