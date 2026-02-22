@@ -1,4 +1,4 @@
-use crate::clawhub::types::{ClawHubSkill, SearchResult};
+use crate::clawhub::types::{ClawHubSkill, SearchResult, SearchResultItem, SkillDetail};
 use anyhow::{Context, Result};
 use reqwest::Client;
 use std::time::Duration;
@@ -49,9 +49,22 @@ impl ClawHubClient {
         Ok(result)
     }
 
+    /// Search and convert to internal ClawHubSkill format
+    pub async fn search_skills(&self, query: &str, limit: usize) -> Result<Vec<ClawHubSkill>> {
+        let result = self.search(query, limit).await?;
+
+        let skills: Vec<ClawHubSkill> = result
+            .results
+            .into_iter()
+            .map(|item| SearchResultItem::into_skill(item))
+            .collect();
+
+        Ok(skills)
+    }
+
     /// Get skill metadata by slug
     pub async fn get_skill(&self, slug: &str) -> Result<ClawHubSkill> {
-        let url = format!("{}/api/skills/{}", self.api_url, slug);
+        let url = format!("{}/api/skill?slug={}", self.api_url, slug);
 
         let mut request = self.http_client.get(&url);
 
@@ -60,12 +73,12 @@ impl ClawHubClient {
         }
 
         let response = request.send().await.context("Failed to get skill")?;
-        let skill = response
-            .json::<ClawHubSkill>()
+        let detail = response
+            .json::<SkillDetail>()
             .await
             .context("Failed to parse skill")?;
 
-        Ok(skill)
+        Ok(detail.into())
     }
 
     /// Get authenticated user info
@@ -101,6 +114,45 @@ impl Default for ClawHubClient {
 pub struct ClawHubUser {
     pub login: String,
     pub name: Option<String>,
+}
+
+impl SearchResultItem {
+    /// Convert API response to internal ClawHubSkill format
+    pub fn into_skill(self) -> ClawHubSkill {
+        ClawHubSkill {
+            slug: self.slug,
+            name: self.display_name,
+            description: self.summary,
+            author: String::new(), // Not available in search results
+            tags: vec![],         // Not available in search results
+            stars: 0,             // Not available in search results
+            version: self.version,
+            github_url: None,     // Not available in search results
+            readme_url: None,     // Not available in search results
+        }
+    }
+}
+
+impl From<SkillDetail> for ClawHubSkill {
+    fn from(detail: SkillDetail) -> Self {
+        let slug = detail.skill.slug.clone();
+        let handle = detail.owner.handle.clone();
+        let version = detail.latest_version.version.clone();
+        ClawHubSkill {
+            slug: slug.clone(),
+            name: detail.skill.display_name,
+            description: detail.skill.summary,
+            author: handle.clone(),
+            tags: vec![], // Tags is a complex object, simplified for now
+            stars: detail.skill.stats.stars,
+            version,
+            github_url: Some(format!("https://github.com/{}/{}", handle, slug)),
+            readme_url: Some(format!(
+                "https://raw.githubusercontent.com/{}/{}/main/SKILL.md",
+                handle, slug
+            )),
+        }
+    }
 }
 
 #[cfg(test)]

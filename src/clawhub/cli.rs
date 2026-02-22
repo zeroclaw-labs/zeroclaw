@@ -68,20 +68,19 @@ pub async fn handle_command(
 
 async fn handle_search(query: &str, limit: usize) -> Result<()> {
     let client = ClawHubClient::default();
-    let result = client.search(query, limit).await?;
+    let skills = client.search_skills(query, limit).await?;
 
     println!("Searching ClawHub for \"{query}\"...");
-    println!("Found {} skills:\n", result.total);
+    println!("Found {} skills:\n", skills.len());
     println!("  {:<20} {:<30} {:<8} Tags", "Name", "Description", "Stars");
     println!("  {}", "-".repeat(70));
 
-    for skill in result.skills {
+    for skill in skills {
         println!(
-            "  {:<20} {:<30} {:<8} [{}]",
+            "  {:<20} {:<30} {:<8}",
             skill.name.chars().take(20).collect::<String>(),
             skill.description.chars().take(30).collect::<String>(),
-            skill.stars,
-            skill.tags.join(", ")
+            skill.stars
         );
     }
 
@@ -174,7 +173,7 @@ async fn handle_inspect(slug: &str) -> Result<()> {
     println!("Version: {}", skill.version);
     println!(
         "Author: {}",
-        skill.author.unwrap_or_else(|| "unknown".into())
+        skill.author
     );
     println!("Stars: {}", skill.stars);
     println!("Tags: [{}]", skill.tags.join(", "));
