@@ -65,6 +65,11 @@ pub struct ChatResponse {
     pub tool_calls: Vec<ToolCall>,
     /// Token usage reported by the provider, if available.
     pub usage: Option<TokenUsage>,
+    /// Raw reasoning/thinking content from thinking models (e.g. DeepSeek-R1,
+    /// Kimi K2.5, GLM-4.7). Preserved as an opaque pass-through so it can be
+    /// sent back in subsequent API requests — some providers reject tool-call
+    /// history that omits this field.
+    pub reasoning_content: Option<String>,
 }
 
 impl ChatResponse {
@@ -103,6 +108,9 @@ pub enum ConversationMessage {
     AssistantToolCalls {
         text: Option<String>,
         tool_calls: Vec<ToolCall>,
+        /// Raw reasoning content from thinking models, preserved for round-trip
+        /// fidelity with provider APIs that require it.
+        reasoning_content: Option<String>,
     },
     /// Results of tool executions, fed back to the LLM.
     ToolResults(Vec<ToolResultMessage>),
@@ -354,6 +362,7 @@ pub trait Provider: Send + Sync {
                     text: Some(text),
                     tool_calls: Vec::new(),
                     usage: None,
+                    reasoning_content: None,
                 });
             }
         }
@@ -365,6 +374,7 @@ pub trait Provider: Send + Sync {
             text: Some(text),
             tool_calls: Vec::new(),
             usage: None,
+            reasoning_content: None,
         })
     }
 
@@ -399,6 +409,7 @@ pub trait Provider: Send + Sync {
             text: Some(text),
             tool_calls: Vec::new(),
             usage: None,
+            reasoning_content: None,
         })
     }
 
@@ -523,6 +534,7 @@ mod tests {
             text: None,
             tool_calls: vec![],
             usage: None,
+            reasoning_content: None,
         };
         assert!(!empty.has_tool_calls());
         assert_eq!(empty.text_or_empty(), "");
@@ -535,6 +547,7 @@ mod tests {
                 arguments: "{}".into(),
             }],
             usage: None,
+            reasoning_content: None,
         };
         assert!(with_tools.has_tool_calls());
         assert_eq!(with_tools.text_or_empty(), "Let me check");
@@ -556,6 +569,7 @@ mod tests {
                 input_tokens: Some(100),
                 output_tokens: Some(50),
             }),
+            reasoning_content: None,
         };
         assert_eq!(resp.usage.as_ref().unwrap().input_tokens, Some(100));
         assert_eq!(resp.usage.as_ref().unwrap().output_tokens, Some(50));

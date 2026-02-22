@@ -515,6 +515,10 @@ struct NativeMessage {
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCall>>,
+    /// Raw reasoning content from thinking models; pass-through for providers
+    /// that require it in assistant tool-call history messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -935,11 +939,17 @@ impl OpenAiCompatibleProvider {
                                     .and_then(serde_json::Value::as_str)
                                     .map(|value| MessageContent::Text(value.to_string()));
 
+                                let reasoning_content = value
+                                    .get("reasoning_content")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(ToString::to_string);
+
                                 return NativeMessage {
                                     role: "assistant".to_string(),
                                     content,
                                     tool_call_id: None,
                                     tool_calls: Some(tool_calls),
+                                    reasoning_content,
                                 };
                             }
                         }
@@ -963,6 +973,7 @@ impl OpenAiCompatibleProvider {
                             content,
                             tool_call_id,
                             tool_calls: None,
+                            reasoning_content: None,
                         };
                     }
                 }
@@ -972,6 +983,7 @@ impl OpenAiCompatibleProvider {
                     content: Some(Self::to_message_content(&message.role, &message.content)),
                     tool_call_id: None,
                     tool_calls: None,
+                    reasoning_content: None,
                 }
             })
             .collect()
@@ -1006,6 +1018,7 @@ impl OpenAiCompatibleProvider {
 
     fn parse_native_response(message: ResponseMessage) -> ProviderChatResponse {
         let text = message.effective_content_optional();
+        let reasoning_content = message.reasoning_content.clone();
         let tool_calls = message
             .tool_calls
             .unwrap_or_default()
@@ -1036,6 +1049,7 @@ impl OpenAiCompatibleProvider {
             text,
             tool_calls,
             usage: None,
+            reasoning_content,
         }
     }
 
@@ -1366,6 +1380,7 @@ impl Provider for OpenAiCompatibleProvider {
                     text: Some(text),
                     tool_calls: vec![],
                     usage: None,
+                    reasoning_content: None,
                 });
             }
         };
@@ -1387,6 +1402,7 @@ impl Provider for OpenAiCompatibleProvider {
             .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))?;
 
         let text = choice.message.effective_content_optional();
+        let reasoning_content = choice.message.reasoning_content;
         let tool_calls = choice
             .message
             .tool_calls
@@ -1408,6 +1424,7 @@ impl Provider for OpenAiCompatibleProvider {
             text,
             tool_calls,
             usage,
+            reasoning_content,
         })
     }
 
@@ -1459,6 +1476,7 @@ impl Provider for OpenAiCompatibleProvider {
                             text: Some(text),
                             tool_calls: vec![],
                             usage: None,
+                            reasoning_content: None,
                         })
                         .map_err(|responses_err| {
                             anyhow::anyhow!(
@@ -1487,6 +1505,7 @@ impl Provider for OpenAiCompatibleProvider {
                     text: Some(text),
                     tool_calls: vec![],
                     usage: None,
+                    reasoning_content: None,
                 });
             }
 
@@ -1498,6 +1517,7 @@ impl Provider for OpenAiCompatibleProvider {
                         text: Some(text),
                         tool_calls: vec![],
                         usage: None,
+                        reasoning_content: None,
                     })
                     .map_err(|responses_err| {
                         anyhow::anyhow!(
@@ -2639,5 +2659,119 @@ mod tests {
         let json = r#"{"choices": [{"message": {"content": "Hello"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         assert!(resp.usage.is_none());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // reasoning_content pass-through tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn parse_native_response_captures_reasoning_content() {
+        let message = ResponseMessage {
+            content: Some("answer".to_string()),
+            reasoning_content: Some("thinking step".to_string()),
+            tool_calls: Some(vec![ToolCall {
+                id: Some("call_1".to_string()),
+                kind: Some("function".to_string()),
+                function: Some(Function {
+                    name: Some("shell".to_string()),
+                    arguments: Some(r#"{"cmd":"ls"}"#.to_string()),
+                }),
+                name: None,
+                arguments: None,
+                parameters: None,
+            }]),
+        };
+
+        let parsed = OpenAiCompatibleProvider::parse_native_response(message);
+        assert_eq!(parsed.reasoning_content.as_deref(), Some("thinking step"));
+        assert_eq!(parsed.text.as_deref(), Some("answer"));
+        assert_eq!(parsed.tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn parse_native_response_none_reasoning_content_for_normal_model() {
+        let message = ResponseMessage {
+            content: Some("hello".to_string()),
+            reasoning_content: None,
+            tool_calls: None,
+        };
+
+        let parsed = OpenAiCompatibleProvider::parse_native_response(message);
+        assert!(parsed.reasoning_content.is_none());
+        assert_eq!(parsed.text.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn convert_messages_for_native_round_trips_reasoning_content() {
+        // Simulate stored assistant history JSON that includes reasoning_content
+        let history_json = serde_json::json!({
+            "content": "I will check",
+            "tool_calls": [{
+                "id": "tc_1",
+                "name": "shell",
+                "arguments": "{\"cmd\":\"ls\"}"
+            }],
+            "reasoning_content": "Let me think about this..."
+        });
+
+        let messages = vec![ChatMessage::assistant(history_json.to_string())];
+        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages);
+        assert_eq!(native.len(), 1);
+        assert_eq!(native[0].role, "assistant");
+        assert_eq!(
+            native[0].reasoning_content.as_deref(),
+            Some("Let me think about this...")
+        );
+        assert!(native[0].tool_calls.is_some());
+    }
+
+    #[test]
+    fn convert_messages_for_native_no_reasoning_content_when_absent() {
+        // Normal model history without reasoning_content key
+        let history_json = serde_json::json!({
+            "content": "I will check",
+            "tool_calls": [{
+                "id": "tc_1",
+                "name": "shell",
+                "arguments": "{\"cmd\":\"ls\"}"
+            }]
+        });
+
+        let messages = vec![ChatMessage::assistant(history_json.to_string())];
+        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages);
+        assert_eq!(native.len(), 1);
+        assert!(native[0].reasoning_content.is_none());
+    }
+
+    #[test]
+    fn convert_messages_for_native_reasoning_content_serialized_only_when_present() {
+        // Verify skip_serializing_if works: reasoning_content omitted from JSON when None
+        let msg_without = NativeMessage {
+            role: "assistant".to_string(),
+            content: Some(MessageContent::Text("hi".to_string())),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+        };
+        let json = serde_json::to_string(&msg_without).unwrap();
+        assert!(
+            !json.contains("reasoning_content"),
+            "reasoning_content should be omitted when None"
+        );
+
+        let msg_with = NativeMessage {
+            role: "assistant".to_string(),
+            content: Some(MessageContent::Text("hi".to_string())),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: Some("thinking...".to_string()),
+        };
+        let json = serde_json::to_string(&msg_with).unwrap();
+        assert!(
+            json.contains("reasoning_content"),
+            "reasoning_content should be present when Some"
+        );
+        assert!(json.contains("thinking..."));
     }
 }

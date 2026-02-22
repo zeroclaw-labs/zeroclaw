@@ -203,11 +203,18 @@ impl ToolDispatcher for NativeToolDispatcher {
             .iter()
             .flat_map(|msg| match msg {
                 ConversationMessage::Chat(chat) => vec![chat.clone()],
-                ConversationMessage::AssistantToolCalls { text, tool_calls } => {
-                    let payload = serde_json::json!({
+                ConversationMessage::AssistantToolCalls {
+                    text,
+                    tool_calls,
+                    reasoning_content,
+                } => {
+                    let mut payload = serde_json::json!({
                         "content": text,
                         "tool_calls": tool_calls,
                     });
+                    if let Some(rc) = reasoning_content {
+                        payload["reasoning_content"] = serde_json::json!(rc);
+                    }
                     vec![ChatMessage::assistant(payload.to_string())]
                 }
                 ConversationMessage::ToolResults(results) => results
@@ -244,6 +251,7 @@ mod tests {
             ),
             tool_calls: vec![],
             usage: None,
+            reasoning_content: None,
         };
         let dispatcher = XmlToolDispatcher;
         let (_, calls) = dispatcher.parse_response(&response);
@@ -261,6 +269,7 @@ mod tests {
                 arguments: "{\"path\":\"a.txt\"}".into(),
             }],
             usage: None,
+            reasoning_content: None,
         };
         let dispatcher = NativeToolDispatcher;
         let (_, calls) = dispatcher.parse_response(&response);
@@ -316,5 +325,73 @@ mod tests {
             }
             _ => panic!("expected ToolResults variant"),
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // reasoning_content pass-through tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn native_to_provider_messages_includes_reasoning_content() {
+        let dispatcher = NativeToolDispatcher;
+        let history = vec![ConversationMessage::AssistantToolCalls {
+            text: Some("answer".into()),
+            tool_calls: vec![crate::providers::ToolCall {
+                id: "tc_1".into(),
+                name: "shell".into(),
+                arguments: "{}".into(),
+            }],
+            reasoning_content: Some("thinking step".into()),
+        }];
+
+        let messages = dispatcher.to_provider_messages(&history);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "assistant");
+
+        let payload: serde_json::Value = serde_json::from_str(&messages[0].content).unwrap();
+        assert_eq!(payload["reasoning_content"].as_str(), Some("thinking step"));
+        assert_eq!(payload["content"].as_str(), Some("answer"));
+        assert!(payload["tool_calls"].is_array());
+    }
+
+    #[test]
+    fn native_to_provider_messages_omits_reasoning_content_when_none() {
+        let dispatcher = NativeToolDispatcher;
+        let history = vec![ConversationMessage::AssistantToolCalls {
+            text: Some("answer".into()),
+            tool_calls: vec![crate::providers::ToolCall {
+                id: "tc_1".into(),
+                name: "shell".into(),
+                arguments: "{}".into(),
+            }],
+            reasoning_content: None,
+        }];
+
+        let messages = dispatcher.to_provider_messages(&history);
+        assert_eq!(messages.len(), 1);
+
+        let payload: serde_json::Value = serde_json::from_str(&messages[0].content).unwrap();
+        assert!(payload.get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn xml_to_provider_messages_ignores_reasoning_content() {
+        let dispatcher = XmlToolDispatcher;
+        let history = vec![ConversationMessage::AssistantToolCalls {
+            text: Some("answer".into()),
+            tool_calls: vec![crate::providers::ToolCall {
+                id: "tc_1".into(),
+                name: "shell".into(),
+                arguments: "{}".into(),
+            }],
+            reasoning_content: Some("should be ignored".into()),
+        }];
+
+        let messages = dispatcher.to_provider_messages(&history);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "assistant");
+        // XmlToolDispatcher returns text only, not JSON payload
+        assert_eq!(messages[0].content, "answer");
+        assert!(!messages[0].content.contains("reasoning_content"));
     }
 }

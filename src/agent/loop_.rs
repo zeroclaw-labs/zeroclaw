@@ -1669,7 +1669,11 @@ fn parse_structured_tool_calls(tool_calls: &[ToolCall]) -> Vec<ParsedToolCall> {
 /// Build assistant history entry in JSON format for native tool-call APIs.
 /// `convert_messages` in the OpenRouter provider parses this JSON to reconstruct
 /// the proper `NativeMessage` with structured `tool_calls`.
-fn build_native_assistant_history(text: &str, tool_calls: &[ToolCall]) -> String {
+fn build_native_assistant_history(
+    text: &str,
+    tool_calls: &[ToolCall],
+    reasoning_content: Option<&str>,
+) -> String {
     let calls_json: Vec<serde_json::Value> = tool_calls
         .iter()
         .map(|tc| {
@@ -1687,16 +1691,25 @@ fn build_native_assistant_history(text: &str, tool_calls: &[ToolCall]) -> String
         serde_json::Value::String(text.trim().to_string())
     };
 
-    serde_json::json!({
+    let mut obj = serde_json::json!({
         "content": content,
         "tool_calls": calls_json,
-    })
-    .to_string()
+    });
+
+    if let Some(rc) = reasoning_content {
+        obj.as_object_mut().unwrap().insert(
+            "reasoning_content".to_string(),
+            serde_json::Value::String(rc.to_string()),
+        );
+    }
+
+    obj.to_string()
 }
 
 fn build_native_assistant_history_from_parsed_calls(
     text: &str,
     tool_calls: &[ParsedToolCall],
+    reasoning_content: Option<&str>,
 ) -> Option<String> {
     let calls_json = tool_calls
         .iter()
@@ -1715,13 +1728,19 @@ fn build_native_assistant_history_from_parsed_calls(
         serde_json::Value::String(text.trim().to_string())
     };
 
-    Some(
-        serde_json::json!({
-            "content": content,
-            "tool_calls": calls_json,
-        })
-        .to_string(),
-    )
+    let mut obj = serde_json::json!({
+        "content": content,
+        "tool_calls": calls_json,
+    });
+
+    if let Some(rc) = reasoning_content {
+        obj.as_object_mut().unwrap().insert(
+            "reasoning_content".to_string(),
+            serde_json::Value::String(rc.to_string()),
+        );
+    }
+
+    Some(obj.to_string())
 }
 
 fn build_assistant_history_with_tool_calls(text: &str, tool_calls: &[ToolCall]) -> String {
@@ -2167,15 +2186,24 @@ pub(crate) async fn run_tool_call_loop(
 
                     // Preserve native tool call IDs in assistant history so role=tool
                     // follow-up messages can reference the exact call id.
+                    let reasoning_content = resp.reasoning_content.clone();
                     let assistant_history_content = if resp.tool_calls.is_empty() {
                         if use_native_tools {
-                            build_native_assistant_history_from_parsed_calls(&response_text, &calls)
-                                .unwrap_or_else(|| response_text.clone())
+                            build_native_assistant_history_from_parsed_calls(
+                                &response_text,
+                                &calls,
+                                reasoning_content.as_deref(),
+                            )
+                            .unwrap_or_else(|| response_text.clone())
                         } else {
                             response_text.clone()
                         }
                     } else {
-                        build_native_assistant_history(&response_text, &resp.tool_calls)
+                        build_native_assistant_history(
+                            &response_text,
+                            &resp.tool_calls,
+                            reasoning_content.as_deref(),
+                        )
                     };
 
                     let native_calls = resp.tool_calls;
@@ -3383,6 +3411,7 @@ mod tests {
                 text: Some("vision-ok".to_string()),
                 tool_calls: Vec::new(),
                 usage: None,
+                reasoning_content: None,
             })
         }
     }
@@ -3400,6 +3429,7 @@ mod tests {
                     text: Some(text.to_string()),
                     tool_calls: Vec::new(),
                     usage: None,
+                    reasoning_content: None,
                 })
                 .collect();
             Self {
@@ -5275,5 +5305,69 @@ Let me check the result."#;
         // Tool names with special characters should be rejected
         assert!(parse_glm_shortened_body("not-a-tool>value").is_none());
         assert!(parse_glm_shortened_body("tool name>value").is_none());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // reasoning_content pass-through tests for history builders
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn build_native_assistant_history_includes_reasoning_content() {
+        let calls = vec![ToolCall {
+            id: "call_1".into(),
+            name: "shell".into(),
+            arguments: "{}".into(),
+        }];
+        let result = build_native_assistant_history("answer", &calls, Some("thinking step"));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["content"].as_str(), Some("answer"));
+        assert_eq!(parsed["reasoning_content"].as_str(), Some("thinking step"));
+        assert!(parsed["tool_calls"].is_array());
+    }
+
+    #[test]
+    fn build_native_assistant_history_omits_reasoning_content_when_none() {
+        let calls = vec![ToolCall {
+            id: "call_1".into(),
+            name: "shell".into(),
+            arguments: "{}".into(),
+        }];
+        let result = build_native_assistant_history("answer", &calls, None);
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["content"].as_str(), Some("answer"));
+        assert!(parsed.get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn build_native_assistant_history_from_parsed_calls_includes_reasoning_content() {
+        let calls = vec![ParsedToolCall {
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "pwd"}),
+            tool_call_id: Some("call_2".into()),
+        }];
+        let result = build_native_assistant_history_from_parsed_calls(
+            "answer",
+            &calls,
+            Some("deep thought"),
+        );
+        assert!(result.is_some());
+        let parsed: serde_json::Value = serde_json::from_str(result.as_deref().unwrap()).unwrap();
+        assert_eq!(parsed["content"].as_str(), Some("answer"));
+        assert_eq!(parsed["reasoning_content"].as_str(), Some("deep thought"));
+        assert!(parsed["tool_calls"].is_array());
+    }
+
+    #[test]
+    fn build_native_assistant_history_from_parsed_calls_omits_reasoning_content_when_none() {
+        let calls = vec![ParsedToolCall {
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "pwd"}),
+            tool_call_id: Some("call_2".into()),
+        }];
+        let result = build_native_assistant_history_from_parsed_calls("answer", &calls, None);
+        assert!(result.is_some());
+        let parsed: serde_json::Value = serde_json::from_str(result.as_deref().unwrap()).unwrap();
+        assert_eq!(parsed["content"].as_str(), Some("answer"));
+        assert!(parsed.get("reasoning_content").is_none());
     }
 }

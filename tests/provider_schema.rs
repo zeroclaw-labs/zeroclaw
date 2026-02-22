@@ -154,6 +154,7 @@ fn chat_response_text_only() {
         text: Some("Hello world".into()),
         tool_calls: vec![],
         usage: None,
+        reasoning_content: None,
     };
 
     assert_eq!(resp.text_or_empty(), "Hello world");
@@ -170,6 +171,7 @@ fn chat_response_with_tool_calls() {
             arguments: "{}".into(),
         }],
         usage: None,
+        reasoning_content: None,
     };
 
     assert!(resp.has_tool_calls());
@@ -183,6 +185,7 @@ fn chat_response_text_or_empty_handles_none() {
         text: None,
         tool_calls: vec![],
         usage: None,
+        reasoning_content: None,
     };
 
     assert_eq!(resp.text_or_empty(), "");
@@ -205,6 +208,7 @@ fn chat_response_multiple_tool_calls() {
             },
         ],
         usage: None,
+        reasoning_content: None,
     };
 
     assert!(resp.has_tool_calls());
