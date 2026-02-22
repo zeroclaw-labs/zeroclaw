@@ -7,6 +7,7 @@
 pub mod budget;
 pub mod extractor;
 pub mod facts;
+pub mod prompts;
 pub mod loader;
 pub mod merge;
 pub mod summarization;
