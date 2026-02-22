@@ -14,10 +14,38 @@ const FEISHU_WS_BASE_URL: &str = "https://open.feishu.cn";
 const LARK_BASE_URL: &str = "https://open.larksuite.com/open-apis";
 const LARK_WS_BASE_URL: &str = "https://open.larksuite.com";
 
-const LARK_ACK_REACTIONS_ZH_CN: &[&str] = &["SMILE"];
-const LARK_ACK_REACTIONS_ZH_TW: &[&str] = &["SMILE"];
-const LARK_ACK_REACTIONS_EN: &[&str] = &["SMILE"];
-const LARK_ACK_REACTIONS_JA: &[&str] = &["SMILE"];
+const LARK_ACK_REACTIONS_ZH_CN: &[&str] = &[
+    "OK", "JIAYI", "APPLAUSE", "THUMBSUP", "MUSCLE", "SMILE", "DONE",
+];
+const LARK_ACK_REACTIONS_ZH_TW: &[&str] = &[
+    "OK",
+    "JIAYI",
+    "APPLAUSE",
+    "THUMBSUP",
+    "FINGERHEART",
+    "SMILE",
+    "DONE",
+];
+const LARK_ACK_REACTIONS_EN: &[&str] = &[
+    "OK",
+    "THUMBSUP",
+    "THANKS",
+    "MUSCLE",
+    "FINGERHEART",
+    "APPLAUSE",
+    "SMILE",
+    "DONE",
+];
+const LARK_ACK_REACTIONS_JA: &[&str] = &[
+    "OK",
+    "THUMBSUP",
+    "THANKS",
+    "MUSCLE",
+    "FINGERHEART",
+    "APPLAUSE",
+    "SMILE",
+    "DONE",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LarkAckLocale {
