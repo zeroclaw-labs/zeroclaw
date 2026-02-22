@@ -38,6 +38,7 @@ serde_json = { version = "1.0", default-features = false, features = ["std"] }
 # Config
 directories = "6.0"
 toml = "1.0"
+serde_ignored = "0.1"
 shellexpand = "3.1"
 
 # JSON Schema generation for config export
@@ -108,7 +109,7 @@ console = "0.16"
 glob = "0.3"
 
 # Binary discovery (init system detection)
-which = "7.0"
+which = "8.0"
 
 # WebSocket client channels (Discord/Lark/DingTalk/Nostr)
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
