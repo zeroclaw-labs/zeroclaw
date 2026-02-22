@@ -604,6 +604,32 @@ mod tests {
     }
 
     #[test]
+    fn add_shell_job_marks_at_schedule_for_auto_delete() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let one_shot = add_shell_job(
+            &config,
+            None,
+            Schedule::At {
+                at: Utc::now() + ChronoDuration::minutes(10),
+            },
+            "echo once",
+        )
+        .unwrap();
+        assert!(one_shot.delete_after_run);
+
+        let recurring = add_shell_job(
+            &config,
+            None,
+            Schedule::Every { every_ms: 60_000 },
+            "echo recurring",
+        )
+        .unwrap();
+        assert!(!recurring.delete_after_run);
+    }
+
+    #[test]
     fn add_list_remove_roundtrip() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
