@@ -8,3 +8,4 @@ pub use types::{
     CompressionJob, CompressionJobKind, CompressionJobStatus, IndexEntry, MemoryTier, TierCommand,
     TierConfig,
 };
+pub mod merge;
