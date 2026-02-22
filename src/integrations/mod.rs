@@ -69,8 +69,149 @@ pub struct IntegrationEntry {
 /// Handle the `integrations` CLI command
 pub fn handle_command(command: crate::IntegrationCommands, config: &Config) -> Result<()> {
     match command {
+        crate::IntegrationCommands::List { category, status } => {
+            list_integrations(config, category.as_deref(), status.as_deref())
+        }
+        crate::IntegrationCommands::Search { query } => search_integrations(config, &query),
         crate::IntegrationCommands::Info { name } => show_integration_info(config, &name),
     }
+}
+
+fn status_icon(status: IntegrationStatus) -> &'static str {
+    match status {
+        IntegrationStatus::Active => "✅",
+        IntegrationStatus::Available => "⚪",
+        IntegrationStatus::ComingSoon => "🔜",
+    }
+}
+
+fn parse_category_filter(input: &str) -> Option<IntegrationCategory> {
+    match input.to_lowercase().as_str() {
+        "chat" => Some(IntegrationCategory::Chat),
+        "ai" | "model" | "models" | "ai-model" | "ai-models" => Some(IntegrationCategory::AiModel),
+        "productivity" => Some(IntegrationCategory::Productivity),
+        "music" | "audio" | "music-audio" => Some(IntegrationCategory::MusicAudio),
+        "smart-home" | "smarthome" | "home" => Some(IntegrationCategory::SmartHome),
+        "tools" | "automation" | "tools-automation" => Some(IntegrationCategory::ToolsAutomation),
+        "media" | "creative" | "media-creative" => Some(IntegrationCategory::MediaCreative),
+        "social" => Some(IntegrationCategory::Social),
+        "platform" | "platforms" => Some(IntegrationCategory::Platform),
+        _ => None,
+    }
+}
+
+fn parse_status_filter(input: &str) -> Option<IntegrationStatus> {
+    match input.to_lowercase().as_str() {
+        "active" => Some(IntegrationStatus::Active),
+        "available" => Some(IntegrationStatus::Available),
+        "coming-soon" | "comingsoon" | "soon" => Some(IntegrationStatus::ComingSoon),
+        _ => None,
+    }
+}
+
+fn list_integrations(
+    config: &Config,
+    category_filter: Option<&str>,
+    status_filter: Option<&str>,
+) -> Result<()> {
+    let entries = registry::all_integrations();
+
+    let cat_filter = category_filter.map(parse_category_filter);
+    if let Some(None) = cat_filter.as_ref() {
+        anyhow::bail!(
+            "Unknown category: '{}'. Valid: chat, ai, productivity, music, smart-home, tools, media, social, platform",
+            category_filter.unwrap_or_default()
+        );
+    }
+    let cat_filter = cat_filter.flatten();
+
+    let stat_filter = status_filter.map(parse_status_filter);
+    if let Some(None) = stat_filter.as_ref() {
+        anyhow::bail!(
+            "Unknown status: '{}'. Valid: active, available, coming-soon",
+            status_filter.unwrap_or_default()
+        );
+    }
+    let stat_filter = stat_filter.flatten();
+
+    let mut count = 0usize;
+    for cat in IntegrationCategory::all() {
+        if let Some(ref cf) = cat_filter {
+            if *cf != *cat {
+                continue;
+            }
+        }
+
+        let cat_entries: Vec<_> = entries
+            .iter()
+            .filter(|e| e.category == *cat)
+            .filter(|e| {
+                if let Some(ref sf) = stat_filter {
+                    (e.status_fn)(config) == *sf
+                } else {
+                    true
+                }
+            })
+            .collect();
+
+        if cat_entries.is_empty() {
+            continue;
+        }
+
+        println!();
+        println!("  {}", console::style(cat.label()).bold().underlined());
+        for entry in &cat_entries {
+            let status = (entry.status_fn)(config);
+            println!(
+                "    {} {:<20} {}",
+                status_icon(status),
+                entry.name,
+                console::style(entry.description).dim()
+            );
+            count += 1;
+        }
+    }
+
+    println!();
+    println!("  {} integration(s) shown.", count);
+    println!();
+    Ok(())
+}
+
+fn search_integrations(config: &Config, query: &str) -> Result<()> {
+    let entries = registry::all_integrations();
+    let query_lower = query.to_lowercase();
+
+    let matches: Vec<_> = entries
+        .iter()
+        .filter(|e| {
+            e.name.to_lowercase().contains(&query_lower)
+                || e.description.to_lowercase().contains(&query_lower)
+        })
+        .collect();
+
+    if matches.is_empty() {
+        println!();
+        println!("  No integrations matching '{query}'.");
+        println!();
+        return Ok(());
+    }
+
+    println!();
+    for entry in &matches {
+        let status = (entry.status_fn)(config);
+        println!(
+            "    {} {:<20} {} — {}",
+            status_icon(status),
+            entry.name,
+            console::style(entry.category.label()).dim(),
+            entry.description,
+        );
+    }
+    println!();
+    println!("  {} result(s) for '{query}'.", matches.len());
+    println!();
+    Ok(())
 }
 
 fn show_integration_info(config: &Config, name: &str) -> Result<()> {
@@ -84,10 +225,11 @@ fn show_integration_info(config: &Config, name: &str) -> Result<()> {
     };
 
     let status = (entry.status_fn)(config);
-    let (icon, label) = match status {
-        IntegrationStatus::Active => ("✅", "Active"),
-        IntegrationStatus::Available => ("⚪", "Available"),
-        IntegrationStatus::ComingSoon => ("🔜", "Coming Soon"),
+    let icon = status_icon(status);
+    let label = match status {
+        IntegrationStatus::Active => "Active",
+        IntegrationStatus::Available => "Available",
+        IntegrationStatus::ComingSoon => "Coming Soon",
     };
 
     println!();
@@ -223,5 +365,120 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Unknown integration"));
+    }
+
+    #[test]
+    fn list_all_integrations_succeeds() {
+        let config = Config::default();
+        let result = handle_command(
+            crate::IntegrationCommands::List {
+                category: None,
+                status: None,
+            },
+            &config,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn list_with_category_filter_succeeds() {
+        let config = Config::default();
+        let result = handle_command(
+            crate::IntegrationCommands::List {
+                category: Some("chat".into()),
+                status: None,
+            },
+            &config,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn list_with_status_filter_succeeds() {
+        let config = Config::default();
+        let result = handle_command(
+            crate::IntegrationCommands::List {
+                category: None,
+                status: Some("available".into()),
+            },
+            &config,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn list_with_invalid_category_fails() {
+        let config = Config::default();
+        let result = handle_command(
+            crate::IntegrationCommands::List {
+                category: Some("nonexistent".into()),
+                status: None,
+            },
+            &config,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Unknown category"));
+    }
+
+    #[test]
+    fn list_with_invalid_status_fails() {
+        let config = Config::default();
+        let result = handle_command(
+            crate::IntegrationCommands::List {
+                category: None,
+                status: Some("bogus".into()),
+            },
+            &config,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Unknown status"));
+    }
+
+    #[test]
+    fn search_finds_matching_integrations() {
+        let config = Config::default();
+        let result = handle_command(
+            crate::IntegrationCommands::Search {
+                query: "telegram".into(),
+            },
+            &config,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn search_no_match_succeeds() {
+        let config = Config::default();
+        let result = handle_command(
+            crate::IntegrationCommands::Search {
+                query: "zzz-no-match-zzz".into(),
+            },
+            &config,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn parse_category_filter_covers_all_aliases() {
+        assert!(parse_category_filter("chat").is_some());
+        assert!(parse_category_filter("ai").is_some());
+        assert!(parse_category_filter("models").is_some());
+        assert!(parse_category_filter("productivity").is_some());
+        assert!(parse_category_filter("music").is_some());
+        assert!(parse_category_filter("smart-home").is_some());
+        assert!(parse_category_filter("tools").is_some());
+        assert!(parse_category_filter("media").is_some());
+        assert!(parse_category_filter("social").is_some());
+        assert!(parse_category_filter("platform").is_some());
+        assert!(parse_category_filter("bogus").is_none());
+    }
+
+    #[test]
+    fn parse_status_filter_covers_all_aliases() {
+        assert!(parse_status_filter("active").is_some());
+        assert!(parse_status_filter("available").is_some());
+        assert!(parse_status_filter("coming-soon").is_some());
+        assert!(parse_status_filter("soon").is_some());
+        assert!(parse_status_filter("bogus").is_none());
     }
 }
