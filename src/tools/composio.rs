@@ -220,6 +220,7 @@ impl ComposioTool {
         action_name: &str,
         app_name_hint: Option<&str>,
         params: serde_json::Value,
+        text: Option<&str>,
         entity_id: Option<&str>,
         connected_account_ref: Option<&str>,
     ) -> anyhow::Result<serde_json::Value> {
@@ -244,6 +245,7 @@ impl ComposioTool {
             .execute_action_v3(
                 &tool_slug,
                 params.clone(),
+                text,
                 entity_id,
                 resolved_account_ref.as_deref(),
             )
@@ -251,6 +253,19 @@ impl ComposioTool {
         {
             Ok(result) => Ok(result),
             Err(v3_err) => {
+                // When text-mode was used, v2 fallback is not applicable
+                // because v2 has no NLP support.
+                if text.is_some() {
+                    anyhow::bail!(
+                        "Composio v3 NLP execute failed: {v3_err}{}",
+                        build_connected_account_hint(
+                            app_hint.as_deref(),
+                            normalized_entity_id.as_deref(),
+                            resolved_account_ref.as_deref(),
+                        )
+                    );
+                }
+
                 let mut v2_candidates = vec![action_name.trim().to_string()];
                 let legacy_action_name = normalize_legacy_action_name(action_name);
                 if !legacy_action_name.is_empty() && !v2_candidates.contains(&legacy_action_name) {
@@ -301,6 +316,7 @@ impl ComposioTool {
     fn build_execute_action_v3_request(
         tool_slug: &str,
         params: serde_json::Value,
+        text: Option<&str>,
         entity_id: Option<&str>,
         connected_account_ref: Option<&str>,
     ) -> (String, serde_json::Value) {
@@ -311,9 +327,19 @@ impl ComposioTool {
         });
 
         let mut body = json!({
-            "arguments": params,
             "version": COMPOSIO_TOOL_VERSION_LATEST,
         });
+
+        // The v3 execute endpoint accepts either structured `arguments` or a
+        // natural-language `text` description (mutually exclusive).  Prefer
+        // `text` when the caller provides it so Composio's NLP resolves the
+        // correct parameters — this is the primary fix for the "keeps guessing
+        // and failing" issue reported by the community.
+        if let Some(nl_text) = text {
+            body["text"] = json!(nl_text);
+        } else {
+            body["arguments"] = params;
+        }
 
         if let Some(entity) = entity_id {
             body["user_id"] = json!(entity);
@@ -329,12 +355,14 @@ impl ComposioTool {
         &self,
         tool_slug: &str,
         params: serde_json::Value,
+        text: Option<&str>,
         entity_id: Option<&str>,
         connected_account_ref: Option<&str>,
     ) -> anyhow::Result<serde_json::Value> {
         let (url, body) = Self::build_execute_action_v3_request(
             tool_slug,
             params,
+            text,
             entity_id,
             connected_account_ref,
         );
@@ -511,6 +539,35 @@ impl ComposioTool {
         })
     }
 
+    /// Fetch full metadata for a single tool by slug, including input/output parameter schemas.
+    ///
+    /// Calls `GET /api/v3/tools/{tool_slug}` which returns the detailed schema
+    /// the LLM needs to construct correct `params` for `execute`.
+    async fn get_tool_schema(&self, tool_slug: &str) -> anyhow::Result<serde_json::Value> {
+        let slug = normalize_tool_slug(tool_slug);
+        let url = format!("{COMPOSIO_API_BASE_V3}/tools/{slug}");
+        ensure_https(&url)?;
+
+        let resp = self
+            .client()
+            .get(&url)
+            .header("x-api-key", &self.api_key)
+            .query(&[("version", COMPOSIO_TOOL_VERSION_LATEST)])
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let err = response_error(resp).await;
+            anyhow::bail!("Composio v3 tool schema lookup failed for '{slug}': {err}");
+        }
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .context("Failed to decode Composio v3 tool schema response")?;
+        Ok(body)
+    }
+
     async fn resolve_auth_config_id(&self, app_name: &str) -> anyhow::Result<String> {
         let url = format!("{COMPOSIO_API_BASE_V3}/auth_configs");
 
@@ -561,10 +618,13 @@ impl Tool for ComposioTool {
 
     fn description(&self) -> &str {
         "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). \
-         Use action='list' to see available actions, \
-         action='list_accounts' or action='connected_accounts' to list OAuth-connected accounts after login, \
-         action='execute' with action_name/tool_slug and params (connected_account_id auto-resolved when omitted), \
-         or action='connect' with app/auth_config_id to get OAuth URL."
+         Use action='list' to see available actions (includes parameter names). \
+         action='execute' with action_name/tool_slug and params to run an action. \
+         If you are unsure of the exact params, pass 'text' instead with a natural-language description \
+         of what you want (Composio will resolve the correct parameters via NLP). \
+         action='list_accounts' or action='connected_accounts' to list OAuth-connected accounts. \
+         action='connect' with app/auth_config_id to get OAuth URL. \
+         connected_account_id is auto-resolved when omitted."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -590,7 +650,11 @@ impl Tool for ComposioTool {
                 },
                 "params": {
                     "type": "object",
-                    "description": "Parameters to pass to the action"
+                    "description": "Structured parameters to pass to the action (use the key names shown by action='list')"
+                },
+                "text": {
+                    "type": "string",
+                    "description": "Natural-language description of what you want the action to do (alternative to 'params' when you are unsure of the exact parameter names). Composio will resolve the correct parameters via NLP. Mutually exclusive with 'params'."
                 },
                 "entity_id": {
                     "type": "string",
@@ -629,11 +693,14 @@ impl Tool for ComposioTool {
                             .iter()
                             .take(20)
                             .map(|a| {
+                                let params_hint =
+                                    format_input_params_hint(a.input_parameters.as_ref());
                                 format!(
-                                    "- {} ({}): {}",
+                                    "- {} ({}): {}{}",
                                     a.name,
                                     a.app_name.as_deref().unwrap_or("?"),
-                                    a.description.as_deref().unwrap_or("")
+                                    a.description.as_deref().unwrap_or(""),
+                                    params_hint,
                                 )
                             })
                             .collect();
@@ -733,10 +800,18 @@ impl Tool for ComposioTool {
 
                 let app = args.get("app").and_then(|v| v.as_str());
                 let params = args.get("params").cloned().unwrap_or(json!({}));
+                let text = args.get("text").and_then(|v| v.as_str());
                 let acct_ref = args.get("connected_account_id").and_then(|v| v.as_str());
 
                 match self
-                    .execute_action(action_name, app, params, Some(entity_id), acct_ref)
+                    .execute_action(
+                        action_name,
+                        app,
+                        params,
+                        text,
+                        Some(entity_id),
+                        acct_ref,
+                    )
                     .await
                 {
                     Ok(result) => {
@@ -748,11 +823,23 @@ impl Tool for ComposioTool {
                             error: None,
                         })
                     }
-                    Err(e) => Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!("Action execution failed: {e}")),
-                    }),
+                    Err(e) => {
+                        // On failure, try to fetch the tool's parameter schema
+                        // so the LLM can self-correct on its next attempt.
+                        let schema_hint = self
+                            .get_tool_schema(action_name)
+                            .await
+                            .ok()
+                            .and_then(|s| format_schema_hint(&s))
+                            .unwrap_or_default();
+                        Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!(
+                                "Action execution failed: {e}{schema_hint}"
+                            )),
+                        })
+                    }
                 }
             }
 
@@ -911,6 +998,7 @@ fn map_v3_tools_to_actions(items: Vec<ComposioV3Tool>) -> Vec<ComposioAction> {
                 app_name,
                 description,
                 enabled: true,
+                input_parameters: item.input_parameters,
             })
         })
         .collect()
@@ -1008,6 +1096,94 @@ fn extract_api_error_message(body: &str) -> Option<String> {
         })
 }
 
+/// Build a compact hint string showing parameter key names from an `input_parameters` JSON Schema.
+///
+/// Used in the `list` output so the LLM can see what keys each action expects
+/// without dumping the full schema.
+fn format_input_params_hint(schema: Option<&serde_json::Value>) -> String {
+    let props = schema
+        .and_then(|v| v.get("properties"))
+        .and_then(|v| v.as_object());
+    let required: Vec<&str> = schema
+        .and_then(|v| v.get("required"))
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+
+    let Some(props) = props else {
+        return String::new();
+    };
+    if props.is_empty() {
+        return String::new();
+    }
+
+    let keys: Vec<String> = props
+        .keys()
+        .map(|k| {
+            if required.contains(&k.as_str()) {
+                format!("{k}*")
+            } else {
+                k.clone()
+            }
+        })
+        .collect();
+    format!(" [params: {}]", keys.join(", "))
+}
+
+/// Build a human-readable schema hint from a full tool schema response.
+///
+/// Used in execute error messages so the LLM can see the expected parameter
+/// names and types to self-correct on the next attempt.
+fn format_schema_hint(schema: &serde_json::Value) -> Option<String> {
+    let input_params = schema.get("input_parameters")?;
+    let props = input_params.get("properties")?.as_object()?;
+    if props.is_empty() {
+        return None;
+    }
+
+    let required: Vec<&str> = input_params
+        .get("required")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+
+    let mut lines = Vec::new();
+    for (key, spec) in props {
+        let type_str = spec
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("any");
+        let desc = spec
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let req = if required.contains(&key.as_str()) {
+            " (required)"
+        } else {
+            ""
+        };
+        let desc_suffix = if desc.is_empty() {
+            String::new()
+        } else {
+            // Truncate long descriptions to keep the hint concise.
+            // Use char boundary to avoid panic on multi-byte UTF-8.
+            let short = if desc.len() > 80 {
+                let end = desc.floor_char_boundary(77);
+                format!("{}...", &desc[..end])
+            } else {
+                desc.to_string()
+            };
+            format!(" - {short}")
+        };
+        lines.push(format!("  {key}: {type_str}{req}{desc_suffix}"));
+    }
+
+    Some(format!(
+        "\n\nExpected input parameters:\n{}",
+        lines.join("\n")
+    ))
+}
+
 // ── API response types ──────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -1063,6 +1239,9 @@ struct ComposioV3Tool {
     app_name: Option<String>,
     #[serde(default)]
     toolkit: Option<ComposioToolkitRef>,
+    /// Full JSON Schema for the tool's input parameters (returned by v3 API).
+    #[serde(default)]
+    input_parameters: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1112,6 +1291,9 @@ pub struct ComposioAction {
     pub description: Option<String>,
     #[serde(default)]
     pub enabled: bool,
+    /// Input parameter schema returned by the v3 API (absent from v2 responses).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_parameters: Option<serde_json::Value>,
 }
 
 #[cfg(test)]
@@ -1525,6 +1707,7 @@ mod tests {
         let (url, body) = ComposioTool::build_execute_action_v3_request(
             "gmail-send-email",
             json!({"to": "test@example.com"}),
+            None,
             Some("workspace-user"),
             Some("account-42"),
         );
@@ -1675,6 +1858,7 @@ mod tests {
         let (url, body) = ComposioTool::build_execute_action_v3_request(
             "github-list-repos",
             json!({}),
+            None,
             None,
             Some("   "),
         );
