@@ -6,6 +6,7 @@
 
 pub mod budget;
 pub mod extractor;
+pub mod extraction_worker;
 pub mod facts;
 pub mod prompts;
 pub mod loader;
