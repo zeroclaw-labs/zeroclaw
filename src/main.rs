@@ -440,6 +440,9 @@ Examples:
         config_command: ConfigCommands,
     },
 
+    /// Start ZeroClaw as an MCP stdio server exposing native tool registry
+    McpServer,
+
     /// Generate shell completion script to stdout
     #[command(long_about = "\
 Generate shell completion scripts for `zeroclaw`.
@@ -990,6 +993,63 @@ async fn main() -> Result<()> {
 
         Commands::Peripheral { peripheral_command } => {
             peripherals::handle_command(peripheral_command.clone(), &config).await
+        }
+
+        Commands::McpServer => {
+            use zeroclaw::mcp::server::run_stdio_server;
+            use zeroclaw::mcp::tool_bridge::McpToolBridge;
+
+            let security = std::sync::Arc::new(security::SecurityPolicy::from_config(
+                &config.autonomy,
+                &config.workspace_dir,
+            ));
+
+            let mem: std::sync::Arc<dyn memory::Memory> =
+                std::sync::Arc::from(memory::create_memory_with_storage(
+                    &config.memory,
+                    Some(&config.storage.provider.config),
+                    &config.workspace_dir,
+                    config.api_key.as_deref(),
+                )?);
+
+            let (composio_key, composio_entity_id) = if config.composio.enabled {
+                (
+                    config.composio.api_key.as_deref(),
+                    Some(config.composio.entity_id.as_str()),
+                )
+            } else {
+                (None, None)
+            };
+
+            let mut tools_registry = tools::all_tools(
+                std::sync::Arc::new(config.clone()),
+                &security,
+                mem,
+                composio_key,
+                composio_entity_id,
+                &config.browser,
+                &config.http_request,
+                &config.workspace_dir,
+                &config.agents,
+                config.api_key.as_deref(),
+                &config,
+            );
+
+            let peripheral_tools =
+                peripherals::create_peripheral_tools(&config.peripherals).await?;
+            if !peripheral_tools.is_empty() {
+                info!(count = peripheral_tools.len(), "Peripheral tools added to MCP server");
+                tools_registry.extend(peripheral_tools);
+            }
+
+            // Adapt binary-crate Tool instances to library-crate Tool trait for McpToolBridge.
+            let lib_tools: Vec<Box<dyn zeroclaw::tools::Tool>> = tools_registry
+                .into_iter()
+                .map(|t| Box::new(BinToolAdapter(t)) as Box<dyn zeroclaw::tools::Tool>)
+                .collect();
+
+            let bridge = std::sync::Arc::new(McpToolBridge::new(lib_tools));
+            run_stdio_server(bridge).await
         }
 
         Commands::Config { config_command } => match config_command {
@@ -1810,6 +1870,38 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
     }
 }
 
+/// Adapter that bridges the binary-crate `tools::Tool` trait to the library-crate
+/// `zeroclaw::tools::Tool` trait. Both traits have identical signatures but Rust
+/// treats them as distinct types because the binary and library are separate crates.
+struct BinToolAdapter(Box<dyn tools::Tool>);
+
+#[async_trait::async_trait]
+impl zeroclaw::tools::Tool for BinToolAdapter {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+
+    fn description(&self) -> &str {
+        self.0.description()
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        self.0.parameters_schema()
+    }
+
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+    ) -> anyhow::Result<zeroclaw::tools::ToolResult> {
+        let result = self.0.execute(args).await?;
+        Ok(zeroclaw::tools::ToolResult {
+            success: result.success,
+            output: result.output,
+            error: result.error,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1905,6 +1997,15 @@ mod tests {
         match cli.command {
             Commands::Onboard { force, .. } => assert!(force),
             other => panic!("expected onboard command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_mcp_server_command() {
+        let cli = Cli::parse_from(["zeroclaw", "mcp-server"]);
+        match cli.command {
+            Commands::McpServer => {}
+            _ => panic!("expected mcp-server command"),
         }
     }
 
