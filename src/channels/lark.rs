@@ -260,13 +260,13 @@ pub struct LarkChannel {
     /// Dedup set: WS message_ids seen in last ~30 min to prevent double-dispatch
     ws_seen_ids: Arc<RwLock<HashMap<String, Instant>>>,
     /// Rate-limit tracking for draft edits per chat
-    last_draft_edit: Mutex<HashMap<String, Instant>>,
+    last_draft_edit: Arc<Mutex<HashMap<String, Instant>>>,
     /// Minimum interval between draft edits (ms)
     draft_update_interval_ms: u64,
     /// Maximum number of edits per draft message before stopping updates
     max_draft_edits: u32,
     /// Per-message edit count tracker
-    draft_edit_counts: Mutex<HashMap<String, u32>>,
+    draft_edit_counts: Arc<Mutex<HashMap<String, u32>>>,
 }
 
 impl LarkChannel {
@@ -287,10 +287,10 @@ impl LarkChannel {
             receive_mode: crate::config::schema::LarkReceiveMode::default(),
             tenant_token: Arc::new(RwLock::new(None)),
             ws_seen_ids: Arc::new(RwLock::new(HashMap::new())),
-            last_draft_edit: Mutex::new(HashMap::new()),
+            last_draft_edit: Arc::new(Mutex::new(HashMap::new())),
             draft_update_interval_ms: 3000,
             max_draft_edits: 20,
-            draft_edit_counts: Mutex::new(HashMap::new()),
+            draft_edit_counts: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1120,33 +1120,39 @@ impl Channel for LarkChannel {
 
     async fn update_draft(
         &self,
-        _recipient: &str,
+        recipient: &str,
         message_id: &str,
         text: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<String>> {
         // Rate-limit edits per message
         {
             let last_edits = self.last_draft_edit.lock();
             if let Some(last_time) = last_edits.get(message_id) {
                 let elapsed = u64::try_from(last_time.elapsed().as_millis()).unwrap_or(u64::MAX);
                 if elapsed < self.draft_update_interval_ms {
-                    return Ok(());
+                    return Ok(None);
                 }
             }
         }
 
-        // Enforce max edits per draft message (Feishu platform cap)
-        {
+        // When the platform edit cap is reached, create a continuation message
+        // instead of silently dropping updates.
+        let cap_reached = {
             let counts = self.draft_edit_counts.lock();
-            if let Some(&count) = counts.get(message_id) {
-                if count >= self.max_draft_edits {
-                    tracing::debug!(
-                        "Lark update_draft skipped for {message_id}: reached max edits ({count}/{})",
-                        self.max_draft_edits
-                    );
-                    return Ok(());
-                }
-            }
+            counts
+                .get(message_id)
+                .is_some_and(|&count| count >= self.max_draft_edits)
+        };
+        if cap_reached {
+            tracing::info!(
+                "Lark update_draft: edit cap reached for {message_id} ({}); \
+                 creating continuation message",
+                self.max_draft_edits
+            );
+            self.last_draft_edit.lock().remove(message_id);
+            self.draft_edit_counts.lock().remove(message_id);
+            let new_id = self.send_draft(&SendMessage::new(text, recipient)).await?;
+            return Ok(new_id);
         }
 
         let cleaned = strip_tool_blocks(text);
@@ -1174,7 +1180,7 @@ impl Channel for LarkChannel {
             }
         }
 
-        Ok(())
+        Ok(None)
     }
 
     async fn finalize_draft(

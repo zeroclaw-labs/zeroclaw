@@ -1616,7 +1616,7 @@ async fn process_channel_message(
         (None, None)
     };
 
-    let draft_message_id = if use_streaming {
+    let draft_message_id: Option<Arc<tokio::sync::Mutex<String>>> = if use_streaming {
         if let Some(channel) = target_channel.as_ref() {
             match channel
                 .send_draft(
@@ -1624,7 +1624,8 @@ async fn process_channel_message(
                 )
                 .await
             {
-                Ok(id) => id,
+                Ok(Some(id)) => Some(Arc::new(tokio::sync::Mutex::new(id))),
+                Ok(None) => None,
                 Err(e) => {
                     tracing::debug!("Failed to send draft on {}: {e}", channel.name());
                     None
@@ -1637,14 +1638,11 @@ async fn process_channel_message(
         None
     };
 
-    let draft_updater = if let (Some(mut rx), Some(draft_id_ref), Some(channel_ref)) = (
-        delta_rx,
-        draft_message_id.as_deref(),
-        target_channel.as_ref(),
-    ) {
+    let draft_updater = if let (Some(mut rx), Some(draft_id_arc), Some(channel_ref)) =
+        (delta_rx, draft_message_id.clone(), target_channel.as_ref())
+    {
         let channel = Arc::clone(channel_ref);
         let reply_target = msg.reply_target.clone();
-        let draft_id = draft_id_ref.to_string();
         Some(tokio::spawn(async move {
             let mut accumulated = String::new();
             while let Some(delta) = rx.recv().await {
@@ -1653,11 +1651,18 @@ async fn process_channel_message(
                     continue;
                 }
                 accumulated.push_str(&delta);
-                if let Err(e) = channel
+                let draft_id = draft_id_arc.lock().await.clone();
+                match channel
                     .update_draft(&reply_target, &draft_id, &accumulated)
                     .await
                 {
-                    tracing::debug!("Draft update failed: {e}");
+                    Ok(Some(new_id)) => {
+                        *draft_id_arc.lock().await = new_id;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::debug!("Draft update failed: {e}");
+                    }
                 }
             }
         }))
@@ -1760,11 +1765,12 @@ async fn process_channel_message(
                     "elapsed_ms": started_at.elapsed().as_millis(),
                 }),
             );
-            if let (Some(channel), Some(draft_id)) =
-                (target_channel.as_ref(), draft_message_id.as_deref())
-            {
-                if let Err(err) = channel.cancel_draft(&msg.reply_target, draft_id).await {
-                    tracing::debug!("Failed to cancel draft on {}: {err}", channel.name());
+            if let Some(channel) = target_channel.as_ref() {
+                if let Some(ref draft_id_arc) = draft_message_id {
+                    let draft_id = draft_id_arc.lock().await.clone();
+                    if let Err(err) = channel.cancel_draft(&msg.reply_target, &draft_id).await {
+                        tracing::debug!("Failed to cancel draft on {}: {err}", channel.name());
+                    }
                 }
             }
         }
@@ -1872,9 +1878,10 @@ async fn process_channel_message(
                 truncate_with_ellipsis(&delivered_response, 80)
             );
             if let Some(channel) = target_channel.as_ref() {
-                if let Some(ref draft_id) = draft_message_id {
+                if let Some(ref draft_id_arc) = draft_message_id {
+                    let draft_id = draft_id_arc.lock().await.clone();
                     if let Err(e) = channel
-                        .finalize_draft(&msg.reply_target, draft_id, &delivered_response)
+                        .finalize_draft(&msg.reply_target, &draft_id, &delivered_response)
                         .await
                     {
                         tracing::warn!("Failed to finalize draft: {e}; sending as new message");
@@ -1917,11 +1924,12 @@ async fn process_channel_message(
                         "elapsed_ms": started_at.elapsed().as_millis(),
                     }),
                 );
-                if let (Some(channel), Some(draft_id)) =
-                    (target_channel.as_ref(), draft_message_id.as_deref())
-                {
-                    if let Err(err) = channel.cancel_draft(&msg.reply_target, draft_id).await {
-                        tracing::debug!("Failed to cancel draft on {}: {err}", channel.name());
+                if let Some(channel) = target_channel.as_ref() {
+                    if let Some(ref draft_id_arc) = draft_message_id {
+                        let draft_id = draft_id_arc.lock().await.clone();
+                        if let Err(err) = channel.cancel_draft(&msg.reply_target, &draft_id).await {
+                            tracing::debug!("Failed to cancel draft on {}: {err}", channel.name());
+                        }
                     }
                 }
             } else if is_context_window_overflow_error(&e) {
@@ -1951,9 +1959,10 @@ async fn process_channel_message(
                     }),
                 );
                 if let Some(channel) = target_channel.as_ref() {
-                    if let Some(ref draft_id) = draft_message_id {
+                    if let Some(ref draft_id_arc) = draft_message_id {
+                        let draft_id = draft_id_arc.lock().await.clone();
                         let _ = channel
-                            .finalize_draft(&msg.reply_target, draft_id, error_text)
+                            .finalize_draft(&msg.reply_target, &draft_id, error_text)
                             .await;
                     } else {
                         let _ = channel
@@ -1999,9 +2008,10 @@ async fn process_channel_message(
                     );
                 }
                 if let Some(channel) = target_channel.as_ref() {
-                    if let Some(ref draft_id) = draft_message_id {
+                    if let Some(ref draft_id_arc) = draft_message_id {
+                        let draft_id = draft_id_arc.lock().await.clone();
                         let _ = channel
-                            .finalize_draft(&msg.reply_target, draft_id, &format!("⚠️ Error: {e}"))
+                            .finalize_draft(&msg.reply_target, &draft_id, &format!("⚠️ Error: {e}"))
                             .await;
                     } else {
                         let _ = channel
@@ -2047,9 +2057,10 @@ async fn process_channel_message(
             if let Some(channel) = target_channel.as_ref() {
                 let error_text =
                     "⚠️ Request timed out while waiting for the model. Please try again.";
-                if let Some(ref draft_id) = draft_message_id {
+                if let Some(ref draft_id_arc) = draft_message_id {
+                    let draft_id = draft_id_arc.lock().await.clone();
                     let _ = channel
-                        .finalize_draft(&msg.reply_target, draft_id, error_text)
+                        .finalize_draft(&msg.reply_target, &draft_id, error_text)
                         .await;
                 } else {
                     let _ = channel

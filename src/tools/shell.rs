@@ -119,7 +119,17 @@ pub struct ShellTool {
 }
 
 impl ShellTool {
-    pub fn new(
+    pub fn new(security: Arc<SecurityPolicy>, runtime: Arc<dyn RuntimeAdapter>) -> Self {
+        Self {
+            security,
+            runtime,
+            bg_registry: Arc::new(BackgroundTaskRegistry::default()),
+        }
+    }
+
+    /// Construct with an externally-provided registry so callers can share it
+    /// with `ShellStatusTool`.
+    pub fn with_registry(
         security: Arc<SecurityPolicy>,
         runtime: Arc<dyn RuntimeAdapter>,
         bg_registry: Arc<BackgroundTaskRegistry>,
@@ -486,7 +496,7 @@ mod tests {
 
     #[test]
     fn shell_tool_name() {
-        let tool = ShellTool::new(
+        let tool = ShellTool::with_registry(
             test_security(AutonomyLevel::Supervised),
             test_runtime(),
             test_registry(),
@@ -496,7 +506,7 @@ mod tests {
 
     #[test]
     fn shell_tool_description() {
-        let tool = ShellTool::new(
+        let tool = ShellTool::with_registry(
             test_security(AutonomyLevel::Supervised),
             test_runtime(),
             test_registry(),
@@ -506,7 +516,7 @@ mod tests {
 
     #[test]
     fn shell_tool_schema_has_command() {
-        let tool = ShellTool::new(
+        let tool = ShellTool::with_registry(
             test_security(AutonomyLevel::Supervised),
             test_runtime(),
             test_registry(),
@@ -523,7 +533,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_executes_allowed_command() {
-        let tool = ShellTool::new(
+        let tool = ShellTool::with_registry(
             test_security(AutonomyLevel::Supervised),
             test_runtime(),
             test_registry(),
@@ -539,7 +549,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_blocks_disallowed_command() {
-        let tool = ShellTool::new(
+        let tool = ShellTool::with_registry(
             test_security(AutonomyLevel::Supervised),
             test_runtime(),
             test_registry(),
@@ -555,7 +565,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_blocks_readonly() {
-        let tool = ShellTool::new(
+        let tool = ShellTool::with_registry(
             test_security(AutonomyLevel::ReadOnly),
             test_runtime(),
             test_registry(),
@@ -574,7 +584,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_missing_command_param() {
-        let tool = ShellTool::new(
+        let tool = ShellTool::with_registry(
             test_security(AutonomyLevel::Supervised),
             test_runtime(),
             test_registry(),
@@ -586,7 +596,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_wrong_type_param() {
-        let tool = ShellTool::new(
+        let tool = ShellTool::with_registry(
             test_security(AutonomyLevel::Supervised),
             test_runtime(),
             test_registry(),
@@ -597,7 +607,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_captures_exit_code() {
-        let tool = ShellTool::new(
+        let tool = ShellTool::with_registry(
             test_security(AutonomyLevel::Supervised),
             test_runtime(),
             test_registry(),
@@ -732,7 +742,7 @@ mod tests {
         let _g1 = EnvGuard::set("API_KEY", "sk-test-secret-12345");
         let _g2 = EnvGuard::set("ZEROCLAW_API_KEY", "sk-test-secret-67890");
 
-        let tool = ShellTool::new(
+        let tool = ShellTool::with_registry(
             test_security_with_env_cmd(),
             test_runtime(),
             test_registry(),
@@ -754,7 +764,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_preserves_path_and_home_for_env_command() {
-        let tool = ShellTool::new(
+        let tool = ShellTool::with_registry(
             test_security_with_env_cmd(),
             test_runtime(),
             test_registry(),
@@ -793,7 +803,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn shell_allows_configured_env_passthrough() {
         let _guard = EnvGuard::set("ZEROCLAW_TEST_PASSTHROUGH", "db://unit-test");
-        let tool = ShellTool::new(
+        let tool = ShellTool::with_registry(
             test_security_with_env_passthrough(&["ZEROCLAW_TEST_PASSTHROUGH"]),
             test_runtime(),
             test_registry(),
@@ -836,7 +846,7 @@ mod tests {
             ..SecurityPolicy::default()
         });
 
-        let tool = ShellTool::new(security.clone(), test_runtime(), test_registry());
+        let tool = ShellTool::with_registry(security.clone(), test_runtime(), test_registry());
         let denied = tool
             .execute(json!({"command": "touch zeroclaw_shell_approval_test"}))
             .await
@@ -913,7 +923,7 @@ mod tests {
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         });
-        let tool = ShellTool::new(security, test_runtime(), test_registry());
+        let tool = ShellTool::with_registry(security, test_runtime(), test_registry());
         let result = tool
             .execute(json!({"command": "echo test"}))
             .await
@@ -929,7 +939,7 @@ mod tests {
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         });
-        let tool = ShellTool::new(security, test_runtime(), test_registry());
+        let tool = ShellTool::with_registry(security, test_runtime(), test_registry());
         let result = tool
             .execute(json!({"command": "nonexistent_binary_xyz_12345"}))
             .await
@@ -939,7 +949,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_captures_stderr_output() {
-        let tool = ShellTool::new(
+        let tool = ShellTool::with_registry(
             test_security(AutonomyLevel::Full),
             test_runtime(),
             test_registry(),
@@ -959,7 +969,7 @@ mod tests {
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         });
-        let tool = ShellTool::new(security, test_runtime(), test_registry());
+        let tool = ShellTool::with_registry(security, test_runtime(), test_registry());
 
         let r1 = tool
             .execute(json!({"command": "echo first"}))
@@ -982,7 +992,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_background_returns_task_id() {
-        let tool = ShellTool::new(
+        let tool = ShellTool::with_registry(
             test_security(AutonomyLevel::Supervised),
             test_runtime(),
             test_registry(),
@@ -1001,7 +1011,7 @@ mod tests {
     #[tokio::test]
     async fn shell_background_task_completes() {
         let registry = test_registry();
-        let tool = ShellTool::new(
+        let tool = ShellTool::with_registry(
             test_security(AutonomyLevel::Supervised),
             test_runtime(),
             Arc::clone(&registry),
