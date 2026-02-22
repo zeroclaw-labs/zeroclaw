@@ -121,6 +121,23 @@ impl WhatsAppWebChannel {
         recipient.trim().contains('@')
     }
 
+    /// Render a WhatsApp pairing QR payload into terminal-friendly text.
+    #[cfg(feature = "whatsapp-web")]
+    fn render_pairing_qr(code: &str) -> Result<String> {
+        let payload = code.trim();
+        if payload.is_empty() {
+            anyhow::bail!("QR payload is empty");
+        }
+
+        let qr = qrcode::QrCode::new(payload.as_bytes())
+            .map_err(|err| anyhow!("Failed to encode WhatsApp Web QR payload: {err}"))?;
+
+        Ok(qr
+            .render::<qrcode::render::unicode::Dense1x2>()
+            .quiet_zone(true)
+            .build())
+    }
+
     /// Convert a recipient to a wa-rs JID.
     ///
     /// Supports:
@@ -315,7 +332,23 @@ impl Channel for WhatsAppWebChannel {
                             tracing::info!(
                                 "WhatsApp Web QR code received (scan with WhatsApp > Linked Devices)"
                             );
-                            tracing::debug!("QR code: {}", code);
+                            match Self::render_pairing_qr(&code) {
+                                Ok(rendered) => {
+                                    eprintln!();
+                                    eprintln!(
+                                        "WhatsApp Web QR code (scan in WhatsApp > Linked Devices):"
+                                    );
+                                    eprintln!("{rendered}");
+                                    eprintln!();
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        "WhatsApp Web: failed to render pairing QR in terminal: {}",
+                                        err
+                                    );
+                                    tracing::info!("WhatsApp Web QR payload: {}", code);
+                                }
+                            }
                         }
                         _ => {}
                     }
@@ -553,6 +586,23 @@ mod tests {
             ch.normalize_phone("1234567890@s.whatsapp.net"),
             "+1234567890"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_render_pairing_qr_rejects_empty_payload() {
+        let err = WhatsAppWebChannel::render_pairing_qr("   ").expect_err("empty payload");
+        assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_render_pairing_qr_outputs_multiline_text() {
+        let rendered =
+            WhatsAppWebChannel::render_pairing_qr("https://example.com/whatsapp-pairing")
+                .expect("rendered QR");
+        assert!(rendered.lines().count() > 10);
+        assert!(rendered.trim().len() > 64);
     }
 
     #[tokio::test]

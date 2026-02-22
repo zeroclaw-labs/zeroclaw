@@ -1,3 +1,5 @@
+#[cfg(feature = "channel-lark")]
+use crate::channels::LarkChannel;
 use crate::channels::{
     Channel, DiscordChannel, MattermostChannel, SendMessage, SlackChannel, TelegramChannel,
 };
@@ -135,6 +137,21 @@ async fn execute_and_persist_job(
     (job.id.clone(), success)
 }
 
+fn build_agent_prompt(job: &CronJob) -> String {
+    let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
+    let prompt = job.prompt.clone().unwrap_or_default();
+    let mut prefixed = format!("[cron:{} {name}] {prompt}", job.id);
+
+    if let Some(ref last) = job.last_output {
+        if !last.is_empty() {
+            prefixed.push_str("\n\n[Previous run result]\n");
+            prefixed.push_str(last);
+        }
+    }
+
+    prefixed
+}
+
 async fn run_agent_job(
     config: &Config,
     security: &SecurityPolicy,
@@ -160,10 +177,10 @@ async fn run_agent_job(
             "blocked by security policy: action budget exhausted".to_string(),
         );
     }
-    let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
-    let prompt = job.prompt.clone().unwrap_or_default();
-    let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
+    let prefixed_prompt = build_agent_prompt(job);
     let model_override = job.model.clone();
+    let cron_name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
+    let session_source = format!("cron:{cron_name}");
 
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
@@ -175,6 +192,8 @@ async fn run_agent_job(
                 config.default_temperature,
                 vec![],
                 false,
+                false,
+                Some(&session_source),
             )
             .await
         }
@@ -353,6 +372,20 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 mm.mention_only.unwrap_or(false),
             );
             channel.send(&SendMessage::new(output, target)).await?;
+        }
+        "lark" => {
+            #[cfg(feature = "channel-lark")]
+            {
+                let lk = config
+                    .channels_config
+                    .lark
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("lark channel not configured"))?;
+                let channel = LarkChannel::from_config(lk);
+                channel.send(&SendMessage::new(output, target)).await?;
+            }
+            #[cfg(not(feature = "channel-lark"))]
+            anyhow::bail!("lark channel requires the `channel-lark` build feature");
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
@@ -849,6 +882,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persist_job_result_success_deletes_one_shot_shell_job() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let at = Utc::now() + ChronoDuration::minutes(10);
+        let job = cron::add_once_at(&config, at, "echo one-shot-shell").unwrap();
+        assert!(job.delete_after_run);
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+
+        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        assert!(success);
+        let lookup = cron::get_job(&config, &job.id);
+        assert!(lookup.is_err());
+    }
+
+    #[tokio::test]
+    async fn persist_job_result_failure_disables_one_shot_shell_job() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let at = Utc::now() + ChronoDuration::minutes(10);
+        let job = cron::add_once_at(&config, at, "echo one-shot-shell").unwrap();
+        assert!(job.delete_after_run);
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+
+        let success = persist_job_result(&config, &job, false, "boom", started, finished).await;
+        assert!(!success);
+        let updated = cron::get_job(&config, &job.id).unwrap();
+        assert!(!updated.enabled);
+        assert_eq!(updated.last_status.as_deref(), Some("error"));
+    }
+
+    #[tokio::test]
     async fn deliver_if_configured_handles_none_and_invalid_channel() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
@@ -864,5 +930,60 @@ mod tests {
         };
         let err = deliver_if_configured(&config, &job, "x").await.unwrap_err();
         assert!(err.to_string().contains("unsupported delivery channel"));
+    }
+
+    #[tokio::test]
+    async fn deliver_if_configured_lark_not_configured_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let mut job = test_job("echo ok");
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("lark".into()),
+            to: Some("oc_abc123".into()),
+            best_effort: false,
+        };
+        let err = deliver_if_configured(&config, &job, "hello")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("lark channel not configured"));
+    }
+
+    #[test]
+    fn build_agent_prompt_includes_last_output_when_present() {
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("Check status".into());
+        job.name = Some("health-check".into());
+        job.last_output = Some("previous result".into());
+
+        let prompt = build_agent_prompt(&job);
+        assert!(prompt.starts_with("[cron:test-job health-check] Check status"));
+        assert!(prompt.contains("\n\n[Previous run result]\n"));
+        assert!(prompt.contains("previous result"));
+    }
+
+    #[test]
+    fn build_agent_prompt_omits_section_when_last_output_is_none() {
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("Check status".into());
+        job.last_output = None;
+
+        let prompt = build_agent_prompt(&job);
+        assert!(prompt.contains("[cron:test-job cron-job] Check status"));
+        assert!(!prompt.contains("[Previous run result]"));
+    }
+
+    #[test]
+    fn build_agent_prompt_omits_section_when_last_output_is_empty() {
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("Check status".into());
+        job.last_output = Some(String::new());
+
+        let prompt = build_agent_prompt(&job);
+        assert!(prompt.contains("[cron:test-job cron-job] Check status"));
+        assert!(!prompt.contains("[Previous run result]"));
     }
 }

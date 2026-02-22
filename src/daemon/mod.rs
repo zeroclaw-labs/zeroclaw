@@ -1,14 +1,21 @@
 use crate::config::Config;
 use anyhow::Result;
 use chrono::Utc;
+use std::collections::HashMap;
+use std::fs::File;
 use std::future::Future;
+use std::io::{Read as _, Write as _};
 use std::path::PathBuf;
 use tokio::task::JoinHandle;
-use tokio::time::Duration;
+use tokio::time::{Duration, Instant};
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
 
 pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
+    // Acquire PID lock to enforce single-instance daemon.
+    // The lock is held for the lifetime of `run()` and released on exit/crash.
+    let _pid_lock = acquire_pid_lock(&config)?;
+
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config
         .reliability
@@ -71,6 +78,22 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         ));
     }
 
+    if config.goal_loop.enabled {
+        let goal_cfg = config.clone();
+        handles.push(spawn_component_supervisor(
+            "goal-loop",
+            initial_backoff,
+            max_backoff,
+            move || {
+                let cfg = goal_cfg.clone();
+                Box::pin(async move { Box::pin(run_goal_loop_worker(cfg)).await })
+            },
+        ));
+    } else {
+        crate::health::mark_component_ok("goal-loop");
+        tracing::info!("Goal loop disabled; goal-loop supervisor not started");
+    }
+
     if config.cron.enabled {
         let scheduler_cfg = config.clone();
         handles.push(spawn_component_supervisor(
@@ -89,7 +112,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
 
     println!("🧠 ZeroClaw daemon started");
     println!("   Gateway:  http://{host}:{port}");
-    println!("   Components: gateway, channels, heartbeat, scheduler");
+    println!("   Components: gateway, channels, heartbeat, goal-loop, scheduler");
     println!("   Ctrl+C to stop");
 
     tokio::signal::ctrl_c().await?;
@@ -111,6 +134,57 @@ pub fn state_file_path(config: &Config) -> PathBuf {
         .parent()
         .map_or_else(|| PathBuf::from("."), PathBuf::from)
         .join("daemon_state.json")
+}
+
+fn pid_lock_path(config: &Config) -> PathBuf {
+    config
+        .config_path
+        .parent()
+        .map_or_else(|| PathBuf::from("."), PathBuf::from)
+        .join("daemon.pid")
+}
+
+/// Acquire an exclusive advisory lock on the PID file. Returns the open [`File`]
+/// handle — the OS releases the lock automatically when the handle is dropped
+/// (on normal exit or crash), so no stale-lock cleanup is needed.
+fn acquire_pid_lock(config: &Config) -> Result<File> {
+    use std::os::unix::io::AsRawFd;
+
+    let path = pid_lock_path(config);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)?;
+
+    let fd = file.as_raw_fd();
+    let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            let mut existing_pid = String::new();
+            let _ = file.read_to_string(&mut existing_pid);
+            let existing_pid = existing_pid.trim();
+            anyhow::bail!(
+                "Another ZeroClaw daemon is already running (PID {existing_pid}). \
+                 Lock file: {}",
+                path.display()
+            );
+        }
+        return Err(err.into());
+    }
+
+    // Lock acquired — write our PID
+    file.set_len(0)?;
+    write!(file, "{}", std::process::id())?;
+    file.sync_all()?;
+
+    Ok(file)
 }
 
 fn spawn_state_writer(config: Config) -> JoinHandle<()> {
@@ -173,6 +247,10 @@ where
     })
 }
 
+/// Maximum consecutive failures before a heartbeat task is auto-disabled
+/// for the remainder of this daemon lifetime.
+const HEARTBEAT_MAX_CONSECUTIVE_FAILURES: u32 = 3;
+
 async fn run_heartbeat_worker(config: Config) -> Result<()> {
     let observer: std::sync::Arc<dyn crate::observability::Observer> =
         std::sync::Arc::from(crate::observability::create_observer(&config.observability));
@@ -181,6 +259,15 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         config.workspace_dir.clone(),
         observer,
     );
+
+    let initial_backoff_secs = config.reliability.channel_initial_backoff_secs.max(1);
+    let max_backoff_secs = config
+        .reliability
+        .channel_max_backoff_secs
+        .max(initial_backoff_secs);
+
+    // Per-task failure tracking: task_description -> (consecutive_failures, last_failure_at)
+    let mut failure_map: HashMap<String, (u32, Instant)> = HashMap::new();
 
     let interval_mins = config.heartbeat.interval_minutes.max(5);
     let mut interval = tokio::time::interval(Duration::from_secs(u64::from(interval_mins) * 60));
@@ -194,9 +281,30 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         }
 
         for task in tasks {
+            // Check if task is permanently disabled (hit max failures)
+            if let Some(&(failures, _)) = failure_map.get(&task) {
+                if failures >= HEARTBEAT_MAX_CONSECUTIVE_FAILURES {
+                    tracing::debug!(
+                        "Heartbeat task disabled after {failures} consecutive failures, \
+                         skipping: {task}"
+                    );
+                    continue;
+                }
+
+                // Check exponential backoff cooldown
+                let backoff = initial_backoff_secs
+                    .saturating_mul(1u64.checked_shl(failures).unwrap_or(u64::MAX))
+                    .min(max_backoff_secs);
+                let (_, last_failure_at) = failure_map[&task];
+                if last_failure_at.elapsed() < Duration::from_secs(backoff) {
+                    tracing::debug!("Heartbeat task in cooldown ({backoff}s), skipping: {task}");
+                    continue;
+                }
+            }
+
             let prompt = format!("[Heartbeat Task] {task}");
             let temp = config.default_temperature;
-            if let Err(e) = crate::agent::run(
+            match crate::agent::run(
                 config.clone(),
                 Some(prompt),
                 None,
@@ -204,15 +312,353 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 temp,
                 vec![],
                 false,
+                false,
+                Some("heartbeat"),
             )
             .await
             {
-                crate::health::mark_component_error("heartbeat", e.to_string());
-                tracing::warn!("Heartbeat task failed: {e}");
-            } else {
-                crate::health::mark_component_ok("heartbeat");
+                Ok(output) => {
+                    // Success: reset failure tracking for this task
+                    failure_map.remove(&task);
+                    crate::health::mark_component_ok("heartbeat");
+                    // Deliver to configured channel (best-effort)
+                    if let (Some(ch_name), Some(target)) =
+                        (&config.heartbeat.channel, &config.heartbeat.target)
+                    {
+                        if let Err(e) = deliver_heartbeat(&config, ch_name, target, &output).await {
+                            tracing::warn!("Heartbeat delivery to {ch_name} failed: {e}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    let (failures, _) = failure_map
+                        .entry(task.clone())
+                        .or_insert((0, Instant::now()));
+                    *failures += 1;
+                    let f = *failures;
+                    // Update last_failure_at
+                    failure_map.get_mut(&task).unwrap().1 = Instant::now();
+
+                    if f >= HEARTBEAT_MAX_CONSECUTIVE_FAILURES {
+                        tracing::error!(
+                            "Heartbeat task disabled after {f} consecutive failures. \
+                             Check HEARTBEAT.md configuration: {task} — error: {e}"
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Heartbeat task failed ({f}/{HEARTBEAT_MAX_CONSECUTIVE_FAILURES}): {e}"
+                        );
+                    }
+                    crate::health::mark_component_error("heartbeat", e.to_string());
+                }
             }
         }
+    }
+}
+
+async fn deliver_heartbeat(
+    config: &Config,
+    channel_name: &str,
+    target: &str,
+    output: &str,
+) -> Result<()> {
+    use crate::channels::{Channel, SendMessage};
+
+    match channel_name.to_ascii_lowercase().as_str() {
+        "lark" => {
+            #[cfg(feature = "channel-lark")]
+            {
+                let lk = config
+                    .channels_config
+                    .lark
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("lark channel not configured"))?;
+                let channel = crate::channels::LarkChannel::from_config(lk);
+                channel
+                    .send_card(target, "🦀 ZeroClaw 心跳报告", output)
+                    .await?;
+            }
+            #[cfg(not(feature = "channel-lark"))]
+            anyhow::bail!("lark channel requires the `channel-lark` build feature");
+        }
+        "telegram" => {
+            let tg = config
+                .channels_config
+                .telegram
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("telegram channel not configured"))?;
+            let channel = crate::channels::TelegramChannel::new(
+                tg.bot_token.clone(),
+                tg.allowed_users.clone(),
+                tg.mention_only,
+            );
+            channel.send(&SendMessage::new(output, target)).await?;
+        }
+        "discord" => {
+            let dc = config
+                .channels_config
+                .discord
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("discord channel not configured"))?;
+            let channel = crate::channels::DiscordChannel::new(
+                dc.bot_token.clone(),
+                dc.guild_id.clone(),
+                dc.allowed_users.clone(),
+                dc.listen_to_bots,
+                dc.mention_only,
+            );
+            channel.send(&SendMessage::new(output, target)).await?;
+        }
+        "slack" => {
+            let sl = config
+                .channels_config
+                .slack
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("slack channel not configured"))?;
+            let channel = crate::channels::SlackChannel::new(
+                sl.bot_token.clone(),
+                sl.channel_id.clone(),
+                sl.allowed_users.clone(),
+            );
+            channel.send(&SendMessage::new(output, target)).await?;
+        }
+        "mattermost" => {
+            let mm = config
+                .channels_config
+                .mattermost
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("mattermost channel not configured"))?;
+            let channel = crate::channels::MattermostChannel::new(
+                mm.url.clone(),
+                mm.bot_token.clone(),
+                mm.channel_id.clone(),
+                mm.allowed_users.clone(),
+                mm.thread_replies.unwrap_or(true),
+                mm.mention_only.unwrap_or(false),
+            );
+            channel.send(&SendMessage::new(output, target)).await?;
+        }
+        other => anyhow::bail!("unsupported heartbeat delivery channel: {other}"),
+    }
+
+    Ok(())
+}
+
+// ── Goal Loop Worker ─────────────────────────────────────────────
+
+async fn run_goal_loop_worker(config: Config) -> Result<()> {
+    use crate::goals::engine::{GoalEngine, GoalStatus, StepStatus};
+
+    let engine = GoalEngine::new(&config.workspace_dir);
+    let interval_mins = config.goal_loop.interval_minutes.max(1);
+    let max_steps = config.goal_loop.max_steps_per_cycle.max(1);
+    let step_timeout = Duration::from_secs(config.goal_loop.step_timeout_secs.max(10));
+
+    let mut interval = tokio::time::interval(Duration::from_secs(u64::from(interval_mins) * 60));
+
+    loop {
+        interval.tick().await;
+
+        let mut state = match engine.load_state().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("Goal loop: failed to load state: {e}");
+                continue;
+            }
+        };
+
+        if state.goals.is_empty() {
+            continue;
+        }
+
+        // ── Reflection: detect stalled goals before executing steps ──
+        let stalled = GoalEngine::find_stalled_goals(&state);
+        for gi in stalled {
+            tracing::info!(
+                goal = %state.goals[gi].description,
+                "Goal loop: goal stalled, triggering reflection"
+            );
+            let prompt = GoalEngine::build_reflection_prompt(&state.goals[gi]);
+            let temp = config.default_temperature;
+
+            let result = tokio::time::timeout(
+                step_timeout,
+                crate::agent::run(
+                    config.clone(),
+                    Some(prompt),
+                    None,
+                    None,
+                    temp,
+                    vec![],
+                    false,
+                    true,
+                    Some("goal-loop"),
+                ),
+            )
+            .await;
+
+            match result {
+                Ok(Ok(output)) => {
+                    tracing::info!(
+                        goal = %state.goals[gi].description,
+                        "Goal reflection completed"
+                    );
+                    // Reload state — the agent may have modified goals.json
+                    state = match engine.load_state().await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!("Goal loop: failed to reload state after reflection: {e}");
+                            break;
+                        }
+                    };
+                    notify_goal_event(
+                        &config,
+                        &format!(
+                            "Goal reflection: {}\n{}",
+                            state.goals.get(gi).map(|g| g.description.as_str()).unwrap_or("?"),
+                            crate::util::truncate_with_ellipsis(&output, 300),
+                        ),
+                    )
+                    .await;
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("Goal reflection failed: {e}");
+                }
+                Err(_) => {
+                    tracing::warn!("Goal reflection timed out");
+                }
+            }
+        }
+
+        // ── Normal step execution ───────────────────────────────────
+        for _ in 0..max_steps {
+            let Some((gi, si)) = GoalEngine::select_next_actionable(&state) else {
+                break;
+            };
+
+            // Mark step in_progress
+            state.goals[gi].steps[si].status = StepStatus::InProgress;
+            let _ = engine.save_state(&state).await;
+
+            let prompt =
+                GoalEngine::build_step_prompt(&state.goals[gi], &state.goals[gi].steps[si]);
+            let temp = config.default_temperature;
+
+            let result = tokio::time::timeout(
+                step_timeout,
+                crate::agent::run(
+                    config.clone(),
+                    Some(prompt),
+                    None,
+                    None,
+                    temp,
+                    vec![],
+                    false,
+                    true,
+                    Some("goal-loop"),
+                ),
+            )
+            .await;
+
+            match result {
+                Ok(Ok(output)) => {
+                    let success = GoalEngine::interpret_result(&output);
+                    if success {
+                        state.goals[gi].steps[si].status = StepStatus::Completed;
+                        state.goals[gi].steps[si].result =
+                            Some(crate::util::truncate_with_ellipsis(&output, 500));
+                        // Append to goal context
+                        let step_desc = state.goals[gi].steps[si].description.clone();
+                        let summary = crate::util::truncate_with_ellipsis(&output, 200);
+                        use std::fmt::Write as _;
+                        let _ = write!(state.goals[gi].context, "\n- {step_desc}: {summary}");
+                        state.goals[gi].last_error = None;
+
+                        crate::health::mark_component_ok("goal-loop");
+                    } else {
+                        state.goals[gi].steps[si].status = StepStatus::Pending;
+                        state.goals[gi].steps[si].attempts += 1;
+                        state.goals[gi].last_error =
+                            Some(crate::util::truncate_with_ellipsis(&output, 200));
+
+                        if state.goals[gi].steps[si].attempts >= GoalEngine::max_step_attempts() {
+                            state.goals[gi].status = GoalStatus::Blocked;
+                            state.goals[gi].last_error = Some(format!(
+                                "Step '{}' failed {} times",
+                                state.goals[gi].steps[si].description,
+                                state.goals[gi].steps[si].attempts,
+                            ));
+                            notify_goal_event(
+                                &config,
+                                &format!(
+                                    "Goal '{}' blocked: step '{}' failed {} times",
+                                    state.goals[gi].description,
+                                    state.goals[gi].steps[si].description,
+                                    state.goals[gi].steps[si].attempts,
+                                ),
+                            )
+                            .await;
+                            let _ = engine.save_state(&state).await;
+                            break;
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    state.goals[gi].steps[si].status = StepStatus::Pending;
+                    state.goals[gi].steps[si].attempts += 1;
+                    state.goals[gi].last_error = Some(e.to_string());
+                    tracing::warn!(
+                        "Goal loop step error (attempt {}): {e}",
+                        state.goals[gi].steps[si].attempts
+                    );
+                    crate::health::mark_component_error("goal-loop", e.to_string());
+                    let _ = engine.save_state(&state).await;
+                    break;
+                }
+                Err(_elapsed) => {
+                    state.goals[gi].steps[si].status = StepStatus::Pending;
+                    state.goals[gi].steps[si].attempts += 1;
+                    state.goals[gi].last_error = Some("step execution timed out".into());
+                    tracing::warn!(
+                        "Goal loop step timed out (attempt {})",
+                        state.goals[gi].steps[si].attempts
+                    );
+                    crate::health::mark_component_error("goal-loop", "step timed out");
+                    let _ = engine.save_state(&state).await;
+                    break;
+                }
+            }
+
+            // Check if all steps done → goal completed
+            let all_done = state.goals[gi]
+                .steps
+                .iter()
+                .all(|s| s.status == StepStatus::Completed);
+            if all_done {
+                state.goals[gi].status = GoalStatus::Completed;
+                state.goals[gi].updated_at = chrono::Utc::now().to_rfc3339();
+                notify_goal_event(
+                    &config,
+                    &format!("Goal completed: {}", state.goals[gi].description),
+                )
+                .await;
+                let _ = engine.save_state(&state).await;
+                break;
+            }
+
+            let _ = engine.save_state(&state).await;
+        }
+    }
+}
+
+/// Send a goal event notification via the configured channel (best-effort).
+async fn notify_goal_event(config: &Config, message: &str) {
+    if let (Some(ch_name), Some(target)) = (&config.goal_loop.channel, &config.goal_loop.target) {
+        if let Err(e) = deliver_heartbeat(config, ch_name, target, message).await {
+            tracing::warn!("Goal event delivery to {ch_name} failed: {e}");
+        }
+    } else {
+        tracing::info!("Goal event (no delivery channel): {message}");
     }
 }
 
@@ -352,5 +798,52 @@ mod tests {
             allowed_users: vec!["*".into()],
         });
         assert!(has_supervised_channels(&config));
+    }
+
+    #[tokio::test]
+    async fn deliver_heartbeat_unsupported_channel_returns_error() {
+        let config = Config::default();
+        let err = deliver_heartbeat(&config, "carrier_pigeon", "target", "hello")
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("unsupported heartbeat delivery channel"));
+    }
+
+    #[tokio::test]
+    async fn deliver_heartbeat_lark_not_configured_returns_error() {
+        let config = Config::default();
+        let err = deliver_heartbeat(&config, "lark", "oc_abc123", "report")
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("lark channel not configured") || msg.contains("channel-lark"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_heartbeat_telegram_not_configured_returns_error() {
+        let config = Config::default();
+        let err = deliver_heartbeat(&config, "telegram", "12345", "report")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("telegram channel not configured"));
+    }
+
+    #[tokio::test]
+    async fn deliver_heartbeat_case_insensitive_channel_name() {
+        let config = Config::default();
+        // "LARK" should match as "lark" (case insensitive), then fail because not configured
+        let err = deliver_heartbeat(&config, "LARK", "oc_abc123", "report")
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("lark channel not configured") || msg.contains("channel-lark"),
+            "unexpected error: {msg}"
+        );
     }
 }

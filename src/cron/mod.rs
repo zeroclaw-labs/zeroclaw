@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::security::SecurityPolicy;
 use anyhow::{bail, Result};
 
+pub mod consolidation;
 mod schedule;
 mod store;
 mod types;

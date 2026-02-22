@@ -24,6 +24,7 @@ impl CronAddTool {
                 error: Some(format!(
                     "Security policy: read-only mode, cannot perform '{action}'"
                 )),
+                error_kind: None,
             });
         }
 
@@ -32,6 +33,7 @@ impl CronAddTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".to_string()),
+                error_kind: None,
             });
         }
 
@@ -40,6 +42,7 @@ impl CronAddTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: action budget exhausted".to_string()),
+                error_kind: None,
             });
         }
 
@@ -89,6 +92,7 @@ impl Tool for CronAddTool {
                 success: false,
                 output: String::new(),
                 error: Some("cron is disabled by config (cron.enabled=false)".to_string()),
+                error_kind: None,
             });
         }
 
@@ -100,6 +104,7 @@ impl Tool for CronAddTool {
                         success: false,
                         output: String::new(),
                         error: Some(format!("Invalid schedule: {e}")),
+                        error_kind: None,
                     });
                 }
             },
@@ -108,6 +113,7 @@ impl Tool for CronAddTool {
                     success: false,
                     output: String::new(),
                     error: Some("Missing 'schedule' parameter".to_string()),
+                    error_kind: None,
                 });
             }
         };
@@ -125,6 +131,7 @@ impl Tool for CronAddTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Invalid job_type: {other}")),
+                    error_kind: None,
                 });
             }
             None => {
@@ -155,6 +162,7 @@ impl Tool for CronAddTool {
                             success: false,
                             output: String::new(),
                             error: Some("Missing 'command' for shell job".to_string()),
+                            error_kind: None,
                         });
                     }
                 };
@@ -164,6 +172,7 @@ impl Tool for CronAddTool {
                         success: false,
                         output: String::new(),
                         error: Some(reason),
+                        error_kind: None,
                     });
                 }
 
@@ -181,6 +190,7 @@ impl Tool for CronAddTool {
                             success: false,
                             output: String::new(),
                             error: Some("Missing 'prompt' for agent job".to_string()),
+                            error_kind: None,
                         });
                     }
                 };
@@ -193,6 +203,7 @@ impl Tool for CronAddTool {
                                 success: false,
                                 output: String::new(),
                                 error: Some(format!("Invalid session_target: {e}")),
+                                error_kind: None,
                             });
                         }
                     },
@@ -212,6 +223,7 @@ impl Tool for CronAddTool {
                                 success: false,
                                 output: String::new(),
                                 error: Some(format!("Invalid delivery config: {e}")),
+                                error_kind: None,
                             });
                         }
                     },
@@ -247,11 +259,13 @@ impl Tool for CronAddTool {
                     "enabled": job.enabled
                 }))?,
                 error: None,
+                error_kind: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(e.to_string()),
+                error_kind: None,
             }),
         }
     }

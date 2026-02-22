@@ -117,6 +117,7 @@ impl Tool for PushoverTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: autonomy is read-only".into()),
+                error_kind: None,
             });
         }
 
@@ -125,6 +126,7 @@ impl Tool for PushoverTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: rate limit exceeded".into()),
+                error_kind: None,
             });
         }
 
@@ -147,6 +149,7 @@ impl Tool for PushoverTool {
                     error: Some(format!(
                         "Invalid 'priority': {value}. Expected integer in range -2..=2"
                     )),
+                    error_kind: None,
                 })
             }
             None => None,
@@ -188,6 +191,7 @@ impl Tool for PushoverTool {
                 success: false,
                 output: body,
                 error: Some(format!("Pushover API returned status {}", status)),
+                error_kind: None,
             });
         }
 
@@ -203,12 +207,14 @@ impl Tool for PushoverTool {
                     body
                 ),
                 error: None,
+                error_kind: None,
             })
         } else {
             Ok(ToolResult {
                 success: false,
                 output: body,
                 error: Some("Pushover API returned an application-level error".into()),
+                error_kind: None,
             })
         }
     }

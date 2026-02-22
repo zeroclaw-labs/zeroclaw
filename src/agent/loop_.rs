@@ -1801,6 +1801,7 @@ pub(crate) async fn agent_turn(
     silent: bool,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
+    audit_logger: Option<&crate::security::AuditLogger>,
 ) -> Result<String> {
     run_tool_call_loop(
         provider,
@@ -1819,6 +1820,8 @@ pub(crate) async fn agent_turn(
         None,
         None,
         &[],
+        None,
+        audit_logger,
     )
     .await
 }
@@ -1829,6 +1832,8 @@ async fn execute_one_tool(
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
+    audit_logger: Option<&crate::security::AuditLogger>,
+    channel_name: &str,
 ) -> Result<ToolExecutionOutcome> {
     observer.record_event(&ObserverEvent::ToolCallStart {
         tool: call_name.to_string(),
@@ -1847,6 +1852,7 @@ async fn execute_one_tool(
             output: reason.clone(),
             success: false,
             error_reason: Some(scrub_credentials(&reason)),
+            error_kind: None,
             duration,
         });
     };
@@ -1861,7 +1867,7 @@ async fn execute_one_tool(
         tool_future.await
     };
 
-    match tool_result {
+    let outcome = match tool_result {
         Ok(r) => {
             let duration = start.elapsed();
             observer.record_event(&ObserverEvent::ToolCall {
@@ -1870,20 +1876,26 @@ async fn execute_one_tool(
                 success: r.success,
             });
             if r.success {
-                Ok(ToolExecutionOutcome {
+                ToolExecutionOutcome {
                     output: scrub_credentials(&r.output),
                     success: true,
                     error_reason: None,
+                    error_kind: None,
                     duration,
-                })
+                }
             } else {
                 let reason = r.error.unwrap_or(r.output);
-                Ok(ToolExecutionOutcome {
-                    output: format!("Error: {reason}"),
+                let kind_tag = r
+                    .error_kind
+                    .map(|k| format!(" [{}]", k.as_label()))
+                    .unwrap_or_default();
+                ToolExecutionOutcome {
+                    output: format!("Error{kind_tag}: {reason}"),
                     success: false,
                     error_reason: Some(scrub_credentials(&reason)),
+                    error_kind: r.error_kind,
                     duration,
-                })
+                }
             }
         }
         Err(e) => {
@@ -1894,21 +1906,183 @@ async fn execute_one_tool(
                 success: false,
             });
             let reason = format!("Error executing {call_name}: {e}");
-            Ok(ToolExecutionOutcome {
+            ToolExecutionOutcome {
                 output: reason.clone(),
                 success: false,
                 error_reason: Some(scrub_credentials(&reason)),
+                error_kind: None,
                 duration,
-            })
+            }
+        }
+    };
+
+    // ── Audit: log tool call outcome (fail-open) ──────────────
+    #[allow(clippy::cast_possible_truncation)] // duration_ms fits u64
+    if let Some(audit) = audit_logger {
+        let error_label = if outcome.success {
+            None
+        } else {
+            outcome
+                .error_kind
+                .as_ref()
+                .map(|k| k.as_label())
+                .or(Some("tool_execution_failed"))
+        };
+        if let Err(e) = audit.log_tool_call(
+            channel_name,
+            call_name,
+            outcome.success,
+            outcome.duration.as_millis() as u64,
+            error_label,
+        ) {
+            tracing::warn!(
+                tool = call_name,
+                error = %e,
+                "audit: failed to write tool call event"
+            );
         }
     }
+
+    Ok(outcome)
 }
 
 struct ToolExecutionOutcome {
     output: String,
     success: bool,
     error_reason: Option<String>,
+    error_kind: Option<tools::ErrorKind>,
     duration: Duration,
+}
+
+// ── Failure tracking for error reflection ────────────────────────────
+
+/// Tracks repeated tool failures by (tool_name, error_label) to detect
+/// retry loops. When a pattern reaches the threshold, the tracker fires
+/// once to allow the caller to inject a reflection prompt.
+struct FailureTracker {
+    counts: std::collections::HashMap<(String, String), usize>,
+    threshold: usize,
+}
+
+impl FailureTracker {
+    fn new(threshold: usize) -> Self {
+        Self {
+            counts: std::collections::HashMap::new(),
+            threshold,
+        }
+    }
+
+    /// Record a failure. Returns `true` exactly once when the threshold is
+    /// reached for a given (tool, error_label) pair.
+    fn record(&mut self, tool_name: &str, error_label: &str) -> bool {
+        let key = (tool_name.to_string(), error_label.to_string());
+        let count = self.counts.entry(key).or_insert(0);
+        *count += 1;
+        *count == self.threshold
+    }
+}
+
+/// Extract the error_kind label from a `ToolExecutionOutcome`, falling
+/// back to "unknown" when no structured kind is available.
+fn error_label_from_outcome(outcome: &ToolExecutionOutcome) -> &str {
+    outcome
+        .error_kind
+        .as_ref()
+        .map(tools::ErrorKind::as_label)
+        .unwrap_or("unknown")
+}
+
+/// Build a reflection prompt injected when repeated failures are detected.
+fn build_reflection_prompt(tool_name: &str, error_label: &str, last_error: &str) -> String {
+    format!(
+        "[Reflection required]\n\
+         The tool `{tool_name}` has failed repeatedly with error type `{error_label}`.\n\
+         Last error: {last_error}\n\n\
+         STOP retrying this approach. Instead:\n\
+         1. Analyze why this specific error keeps occurring.\n\
+         2. Consider what constraints or policies are blocking you.\n\
+         3. Try a fundamentally different approach to achieve the same goal.\n\
+         4. If no alternative exists, explain the blocker to the user."
+    )
+}
+
+// ── State reconciliation for goal loop ───────────────────────────────
+
+/// Runtime state-sync verifier. Records the initial mtime of `state/goals.json`
+/// and blocks loop exit if the file has not been modified while in-progress
+/// goals exist.
+pub(crate) struct StateReconciliation {
+    state_path: std::path::PathBuf,
+    initial_mtime: Option<std::time::SystemTime>,
+    max_rejections: usize,
+    rejections: std::cell::Cell<usize>,
+}
+
+impl StateReconciliation {
+    pub(crate) fn new_if_applicable(workspace_dir: &std::path::Path) -> Option<Self> {
+        let state_path = workspace_dir.join("state").join("goals.json");
+        if !state_path.exists() {
+            return None;
+        }
+        let initial_mtime = std::fs::metadata(&state_path)
+            .and_then(|m| m.modified())
+            .ok();
+        // Only create if there are in-progress goals
+        let has_active = Self::check_in_progress(&state_path);
+        if !has_active {
+            return None;
+        }
+        Some(Self {
+            state_path,
+            initial_mtime,
+            max_rejections: 2,
+            rejections: std::cell::Cell::new(0),
+        })
+    }
+
+    /// Check before allowing the loop to exit. Returns `Some(message)` if
+    /// exit should be blocked.
+    pub(crate) fn check_before_exit(&self) -> Option<String> {
+        if !self.state_path.exists() {
+            return None;
+        }
+
+        if self.rejections.get() >= self.max_rejections {
+            return None;
+        }
+
+        if !Self::check_in_progress(&self.state_path) {
+            return None;
+        }
+
+        let current_mtime = std::fs::metadata(&self.state_path)
+            .and_then(|m| m.modified())
+            .ok();
+
+        if current_mtime == self.initial_mtime {
+            self.rejections.set(self.rejections.get() + 1);
+            Some(
+                "[State reconciliation required]\n\
+                 The task state file `state/goals.json` has not been updated during this session, \
+                 but there are active in-progress goals.\n\n\
+                 You MUST update the goal/step status in `state/goals.json` before completing.\n\
+                 Use the `file_read` tool to read the current state, then use `file_write` to \
+                 update the status of the step you just worked on.\n\n\
+                 Error type: state_not_updated"
+                    .to_string(),
+            )
+        } else {
+            None
+        }
+    }
+
+    fn check_in_progress(state_path: &std::path::Path) -> bool {
+        let Ok(bytes) = std::fs::read(state_path) else {
+            return false;
+        };
+        let content = String::from_utf8_lossy(&bytes);
+        content.contains("\"in_progress\"")
+    }
 }
 
 fn should_execute_tools_in_parallel(
@@ -1935,6 +2109,8 @@ async fn execute_tools_parallel(
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
+    audit_logger: Option<&crate::security::AuditLogger>,
+    channel_name: &str,
 ) -> Result<Vec<ToolExecutionOutcome>> {
     let futures: Vec<_> = tool_calls
         .iter()
@@ -1945,6 +2121,8 @@ async fn execute_tools_parallel(
                 tools_registry,
                 observer,
                 cancellation_token,
+                audit_logger,
+                channel_name,
             )
         })
         .collect();
@@ -1958,6 +2136,8 @@ async fn execute_tools_sequential(
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
+    audit_logger: Option<&crate::security::AuditLogger>,
+    channel_name: &str,
 ) -> Result<Vec<ToolExecutionOutcome>> {
     let mut outcomes = Vec::with_capacity(tool_calls.len());
 
@@ -1969,6 +2149,8 @@ async fn execute_tools_sequential(
                 tools_registry,
                 observer,
                 cancellation_token,
+                audit_logger,
+                channel_name,
             )
             .await?,
         );
@@ -2009,12 +2191,18 @@ pub(crate) async fn run_tool_call_loop(
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
+    workspace_dir: Option<&std::path::Path>,
+    audit_logger: Option<&crate::security::AuditLogger>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
     } else {
         max_tool_iterations
     };
+
+    // ── Error reflection: failure tracker + state reconciliation ──
+    let mut failure_tracker = FailureTracker::new(2);
+    let state_reconciliation = workspace_dir.and_then(StateReconciliation::new_if_applicable);
 
     let tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
         .iter()
@@ -2263,6 +2451,15 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         if tool_calls.is_empty() {
+            // ── State reconciliation gate ────────────────────
+            if let Some(ref reconciliation) = state_reconciliation {
+                if let Some(rejection_msg) = reconciliation.check_before_exit() {
+                    history.push(ChatMessage::assistant(response_text.clone()));
+                    history.push(ChatMessage::user(rejection_msg));
+                    continue;
+                }
+            }
+
             runtime_trace::record_event(
                 "turn_final_response",
                 Some(channel_name),
@@ -2325,6 +2522,7 @@ pub(crate) async fn run_tool_call_loop(
         let allow_parallel_execution = should_execute_tools_in_parallel(&tool_calls, approval);
         let mut executable_indices: Vec<usize> = Vec::new();
         let mut executable_calls: Vec<ParsedToolCall> = Vec::new();
+        let mut reflection_to_inject: Option<String> = None;
 
         for (idx, call) in tool_calls.iter().enumerate() {
             // ── Hook: before_tool_call (modifying) ──────────
@@ -2359,6 +2557,7 @@ pub(crate) async fn run_tool_call_loop(
                                 output: cancelled,
                                 success: false,
                                 error_reason: Some(scrub_credentials(&reason)),
+                                error_kind: None,
                                 duration: Duration::ZERO,
                             },
                         ));
@@ -2411,6 +2610,7 @@ pub(crate) async fn run_tool_call_loop(
                                 output: denied.clone(),
                                 success: false,
                                 error_reason: Some(denied),
+                                error_kind: Some(tools::ErrorKind::PolicyDenied),
                                 duration: Duration::ZERO,
                             },
                         ));
@@ -2446,6 +2646,7 @@ pub(crate) async fn run_tool_call_loop(
                         output: duplicate.clone(),
                         success: false,
                         error_reason: Some(duplicate),
+                        error_kind: None,
                         duration: Duration::ZERO,
                     },
                 ));
@@ -2493,6 +2694,8 @@ pub(crate) async fn run_tool_call_loop(
                 tools_registry,
                 observer,
                 cancellation_token.as_ref(),
+                audit_logger,
+                channel_name,
             )
             .await?
         } else {
@@ -2501,6 +2704,8 @@ pub(crate) async fn run_tool_call_loop(
                 tools_registry,
                 observer,
                 cancellation_token.as_ref(),
+                audit_logger,
+                channel_name,
             )
             .await?
         };
@@ -2532,10 +2737,26 @@ pub(crate) async fn run_tool_call_loop(
                     success: outcome.success,
                     output: outcome.output.clone(),
                     error: None,
+                    error_kind: outcome.error_kind,
                 };
                 hooks
                     .fire_after_tool_call(&call.name, &tool_result_obj, outcome.duration)
                     .await;
+            }
+
+            // ── Failure tracking for error reflection ────────
+            if !outcome.success {
+                let label = error_label_from_outcome(&outcome);
+                if failure_tracker.record(&call.name, label) {
+                    let reflection = build_reflection_prompt(
+                        &call.name,
+                        label,
+                        outcome.error_reason.as_deref().unwrap_or(&outcome.output),
+                    );
+                    // Inject as a pending reflection; will be appended after tool results.
+                    // We store it and add to history after the tool results block.
+                    reflection_to_inject = Some(reflection);
+                }
             }
 
             // ── Progress: tool completion ───────────────────────
@@ -2596,6 +2817,11 @@ pub(crate) async fn run_tool_call_loop(
                 });
                 history.push(ChatMessage::tool(tool_msg.to_string()));
             }
+        }
+
+        // ── Inject reflection prompt if failure threshold was reached ──
+        if let Some(reflection) = reflection_to_inject {
+            history.push(ChatMessage::user(reflection));
         }
     }
 
@@ -2659,6 +2885,8 @@ pub async fn run(
     temperature: f64,
     peripheral_overrides: Vec<String>,
     interactive: bool,
+    enable_state_reconciliation: bool,
+    session_source: Option<&str>,
 ) -> Result<String> {
     // ── Wire up agnostic subsystems ──────────────────────────────
     let base_observer = observability::create_observer(&config.observability);
@@ -2750,6 +2978,24 @@ pub async fn run(
         provider: provider_name.to_string(),
         model: model_name.to_string(),
     });
+
+    // ── Audit logger (tool call audit) ──────────────────────────
+    let audit_logger = if config.security.audit.enabled {
+        let zeroclaw_dir = config
+            .config_path
+            .parent()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| config.workspace_dir.clone());
+        match crate::security::AuditLogger::new(config.security.audit.clone(), zeroclaw_dir) {
+            Ok(logger) => Some(logger),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to create audit logger; tool call audit disabled");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // ── Hardware RAG (datasheet retrieval when peripherals + datasheet_dir) ──
     let hardware_rag: Option<crate::rag::HardwareRag> = config
@@ -2903,13 +3149,13 @@ pub async fn run(
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
 
-    // ── Approval manager (supervised mode) ───────────────────────
+    // ── Approval manager (supervised mode, CLI-interactive only) ─
     let approval_manager = if interactive {
         Some(ApprovalManager::from_config(&config.autonomy))
     } else {
         None
     };
-    let channel_name = if interactive { "cli" } else { "daemon" };
+    let channel_name = session_source.unwrap_or(if interactive { "cli" } else { "daemon" });
 
     // ── Execute ──────────────────────────────────────────────────
     let start = Instant::now();
@@ -2945,6 +3191,11 @@ pub async fn run(
             ChatMessage::user(&enriched),
         ];
 
+        let reconciliation_dir = if enable_state_reconciliation {
+            Some(config.workspace_dir.as_path())
+        } else {
+            None
+        };
         let response = run_tool_call_loop(
             provider.as_ref(),
             &mut history,
@@ -2953,7 +3204,7 @@ pub async fn run(
             provider_name,
             model_name,
             temperature,
-            false,
+            !interactive,
             approval_manager.as_ref(),
             channel_name,
             &config.multimodal,
@@ -2962,6 +3213,8 @@ pub async fn run(
             None,
             None,
             &[],
+            reconciliation_dir,
+            audit_logger.as_ref(),
         )
         .await?;
         final_output = response.clone();
@@ -3066,6 +3319,11 @@ pub async fn run(
 
             history.push(ChatMessage::user(&enriched));
 
+            let reconciliation_dir = if enable_state_reconciliation {
+                Some(config.workspace_dir.as_path())
+            } else {
+                None
+            };
             let response = match run_tool_call_loop(
                 provider.as_ref(),
                 &mut history,
@@ -3083,6 +3341,8 @@ pub async fn run(
                 None,
                 None,
                 &[],
+                reconciliation_dir,
+                audit_logger.as_ref(),
             )
             .await
             {
@@ -3311,6 +3571,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         true,
         &config.multimodal,
         config.agent.max_tool_iterations,
+        None,
     )
     .await
 }
@@ -3522,6 +3783,7 @@ mod tests {
                 success: true,
                 output: format!("counted:{value}"),
                 error: None,
+                error_kind: None,
             })
         }
     }
@@ -3590,6 +3852,7 @@ mod tests {
                 success: true,
                 output: format!("ok:{value}"),
                 error: None,
+                error_kind: None,
             })
         }
     }
@@ -3624,6 +3887,8 @@ mod tests {
             None,
             None,
             &[],
+            None,
+            None,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -3670,6 +3935,8 @@ mod tests {
             None,
             None,
             &[],
+            None,
+            None,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -3710,6 +3977,8 @@ mod tests {
             None,
             None,
             &[],
+            None,
+            None,
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -3836,6 +4105,8 @@ mod tests {
             None,
             None,
             &[],
+            None,
+            None,
         )
         .await
         .expect("parallel execution should complete");
@@ -3905,6 +4176,8 @@ mod tests {
             None,
             None,
             &[],
+            None,
+            None,
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -3961,6 +4234,8 @@ mod tests {
             None,
             None,
             &[],
+            None,
+            None,
         )
         .await
         .expect("native fallback id flow should complete");
@@ -5307,6 +5582,222 @@ Let me check the result."#;
         assert!(parse_glm_shortened_body("tool name>value").is_none());
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // reasoning_content pass-through tests for history builders
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn build_native_assistant_history_includes_reasoning_content() {
+        let calls = vec![ToolCall {
+            id: "call_1".into(),
+            name: "shell".into(),
+            arguments: "{}".into(),
+        }];
+        let result = build_native_assistant_history("answer", &calls, Some("thinking step"));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["content"].as_str(), Some("answer"));
+        assert_eq!(parsed["reasoning_content"].as_str(), Some("thinking step"));
+        assert!(parsed["tool_calls"].is_array());
+    }
+
+    #[test]
+    fn build_native_assistant_history_omits_reasoning_content_when_none() {
+        let calls = vec![ToolCall {
+            id: "call_1".into(),
+            name: "shell".into(),
+            arguments: "{}".into(),
+        }];
+        let result = build_native_assistant_history("answer", &calls, None);
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["content"].as_str(), Some("answer"));
+        assert!(parsed.get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn build_native_assistant_history_from_parsed_calls_includes_reasoning_content() {
+        let calls = vec![ParsedToolCall {
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "pwd"}),
+            tool_call_id: Some("call_2".into()),
+        }];
+        let result = build_native_assistant_history_from_parsed_calls(
+            "answer",
+            &calls,
+            Some("deep thought"),
+        );
+        assert!(result.is_some());
+        let parsed: serde_json::Value = serde_json::from_str(result.as_deref().unwrap()).unwrap();
+        assert_eq!(parsed["content"].as_str(), Some("answer"));
+        assert_eq!(parsed["reasoning_content"].as_str(), Some("deep thought"));
+        assert!(parsed["tool_calls"].is_array());
+    }
+
+    #[test]
+    fn build_native_assistant_history_from_parsed_calls_omits_reasoning_content_when_none() {
+        let calls = vec![ParsedToolCall {
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "pwd"}),
+            tool_call_id: Some("call_2".into()),
+        }];
+        let result = build_native_assistant_history_from_parsed_calls("answer", &calls, None);
+        assert!(result.is_some());
+        let parsed: serde_json::Value = serde_json::from_str(result.as_deref().unwrap()).unwrap();
+        assert_eq!(parsed["content"].as_str(), Some("answer"));
+        assert!(parsed.get("reasoning_content").is_none());
+    }
+    // ── FailureTracker tests ───────────────────────────────────
+
+    #[test]
+    fn failure_tracker_fires_at_threshold() {
+        let mut tracker = FailureTracker::new(2);
+        assert!(!tracker.record("shell", "policy_denied"));
+        assert!(tracker.record("shell", "policy_denied"));
+        // Should not fire again after threshold
+        assert!(!tracker.record("shell", "policy_denied"));
+    }
+
+    #[test]
+    fn failure_tracker_independent_per_tool_and_error() {
+        let mut tracker = FailureTracker::new(2);
+        tracker.record("shell", "policy_denied");
+        tracker.record("file_read", "not_found");
+        // Different (tool, error) pairs should not interfere
+        assert!(tracker.record("shell", "policy_denied")); // 2nd for shell/policy
+        assert!(tracker.record("file_read", "not_found")); // 2nd for file_read/not_found
+    }
+
+    #[test]
+    fn failure_tracker_different_errors_same_tool() {
+        let mut tracker = FailureTracker::new(2);
+        tracker.record("shell", "policy_denied");
+        tracker.record("shell", "timeout");
+        // Neither has reached threshold of 2 yet
+        assert!(tracker.record("shell", "policy_denied")); // 2nd policy
+        assert!(tracker.record("shell", "timeout")); // 2nd timeout
+    }
+
+    // ── StateReconciliation tests ──────────────────────────────
+
+    #[test]
+    fn state_reconciliation_no_file_returns_none() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_sr_nofile");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let result = StateReconciliation::new_if_applicable(&dir);
+        assert!(result.is_none(), "should not create when goals.json absent");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn state_reconciliation_no_in_progress_returns_none() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_sr_no_active");
+        let _ = std::fs::remove_dir_all(&dir);
+        let state_dir = dir.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(
+            state_dir.join("goals.json"),
+            r#"{"goals":[{"status":"completed"}]}"#,
+        )
+        .unwrap();
+
+        let result = StateReconciliation::new_if_applicable(&dir);
+        assert!(
+            result.is_none(),
+            "should not create when no in_progress goals"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn state_reconciliation_blocks_when_mtime_unchanged() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_sr_block");
+        let _ = std::fs::remove_dir_all(&dir);
+        let state_dir = dir.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(
+            state_dir.join("goals.json"),
+            r#"{"goals":[{"status":"in_progress"}]}"#,
+        )
+        .unwrap();
+
+        let reconciliation = StateReconciliation::new_if_applicable(&dir)
+            .expect("should create when in_progress goal exists");
+
+        let msg = reconciliation.check_before_exit();
+        assert!(msg.is_some(), "should block exit when mtime unchanged");
+        assert!(msg.unwrap().contains("state_not_updated"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn state_reconciliation_allows_when_mtime_changed() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_sr_allow");
+        let _ = std::fs::remove_dir_all(&dir);
+        let state_dir = dir.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(
+            state_dir.join("goals.json"),
+            r#"{"goals":[{"status":"in_progress"}]}"#,
+        )
+        .unwrap();
+
+        let reconciliation = StateReconciliation::new_if_applicable(&dir)
+            .expect("should create when in_progress goal exists");
+
+        // Modify the file to change mtime
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(
+            state_dir.join("goals.json"),
+            r#"{"goals":[{"status":"completed"}]}"#,
+        )
+        .unwrap();
+
+        let msg = reconciliation.check_before_exit();
+        assert!(msg.is_none(), "should allow exit when mtime changed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn state_reconciliation_max_rejections_safety_valve() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_sr_maxrej");
+        let _ = std::fs::remove_dir_all(&dir);
+        let state_dir = dir.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(
+            state_dir.join("goals.json"),
+            r#"{"goals":[{"status":"in_progress"}]}"#,
+        )
+        .unwrap();
+
+        let reconciliation = StateReconciliation::new_if_applicable(&dir)
+            .expect("should create when in_progress goal exists");
+
+        // First two rejections should block
+        assert!(reconciliation.check_before_exit().is_some());
+        assert!(reconciliation.check_before_exit().is_some());
+        // Third should allow (safety valve)
+        assert!(
+            reconciliation.check_before_exit().is_none(),
+            "should allow after max_rejections"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_reflection_prompt_contains_key_elements() {
+        let prompt = build_reflection_prompt("shell", "policy_denied", "Command not allowed");
+        assert!(prompt.contains("[Reflection required]"));
+        assert!(prompt.contains("shell"));
+        assert!(prompt.contains("policy_denied"));
+        assert!(prompt.contains("Command not allowed"));
+        assert!(prompt.contains("STOP retrying"));
+    }
     // ═══════════════════════════════════════════════════════════════════════
     // reasoning_content pass-through tests for history builders
     // ═══════════════════════════════════════════════════════════════════════
