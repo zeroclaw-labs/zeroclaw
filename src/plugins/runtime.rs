@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{OnceLock, RwLock};
+use std::time::SystemTime;
 use wasmtime::{Engine, Extern, Instance, Memory, Module, Store, TypedFunc};
 
 use super::manifest::PluginManifest;
@@ -238,24 +240,100 @@ pub fn execute_plugin_provider_chat(
 }
 
 fn registry_cell() -> &'static RwLock<PluginRegistry> {
-    static CELL: OnceLock<RwLock<PluginRegistry>> = OnceLock::new();
-    CELL.get_or_init(|| RwLock::new(PluginRegistry::default()))
+    static CELL: OnceLock<RwLock<RuntimeState>> = OnceLock::new();
+    CELL.get_or_init(|| RwLock::new(RuntimeState::default()))
+}
+
+#[derive(Debug, Clone, Default)]
+struct RuntimeState {
+    registry: PluginRegistry,
+    hot_reload: bool,
+    config: Option<PluginsConfig>,
+    fingerprints: HashMap<String, SystemTime>,
+}
+
+fn collect_manifest_fingerprints(dirs: &[String]) -> HashMap<String, SystemTime> {
+    let mut out = HashMap::new();
+    for dir in dirs {
+        let path = Path::new(dir);
+        let Ok(entries) = std::fs::read_dir(path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let file_name = path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .unwrap_or("");
+            if !(file_name.ends_with(".plugin.toml") || file_name.ends_with(".plugin.json")) {
+                continue;
+            }
+            if let Ok(metadata) = std::fs::metadata(&path) {
+                if let Ok(modified) = metadata.modified() {
+                    out.insert(path.to_string_lossy().to_string(), modified);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn maybe_hot_reload() {
+    let (hot_reload, config, previous_fingerprints) = {
+        let guard = registry_cell()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            guard.hot_reload,
+            guard.config.clone(),
+            guard.fingerprints.clone(),
+        )
+    };
+    if !hot_reload {
+        return;
+    }
+    let Some(config) = config else {
+        return;
+    };
+    let current_fingerprints = collect_manifest_fingerprints(&config.dirs);
+    if current_fingerprints == previous_fingerprints {
+        return;
+    }
+
+    let runtime = PluginRuntime::new();
+    let load_result = runtime.load_registry_from_config(&config);
+    if let Ok(new_registry) = load_result {
+        let mut guard = registry_cell()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.registry = new_registry;
+        guard.fingerprints = current_fingerprints;
+    }
 }
 
 pub fn initialize_from_config(config: &PluginsConfig) -> Result<()> {
     let runtime = PluginRuntime::new();
     let registry = runtime.load_registry_from_config(config)?;
+    let fingerprints = collect_manifest_fingerprints(&config.dirs);
     let mut guard = registry_cell()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *guard = registry;
+    guard.registry = registry;
+    guard.hot_reload = config.hot_reload;
+    guard.config = Some(config.clone());
+    guard.fingerprints = fingerprints;
     Ok(())
 }
 
 pub fn current_registry() -> PluginRegistry {
+    maybe_hot_reload();
     registry_cell()
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .registry
         .clone()
 }
 
