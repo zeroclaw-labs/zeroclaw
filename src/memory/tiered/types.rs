@@ -7,6 +7,62 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use uuid::Uuid;
 
+// ── MemoryAgentConfig ────────────────────────────────────────────────────────
+
+/// Configuration for a single memory agent (one per tier).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryAgentConfig {
+    pub model: String,
+    pub max_tokens: usize,
+    pub temperature: f32,
+    pub timeout_secs: u64,
+}
+
+impl Default for MemoryAgentConfig {
+    fn default() -> Self {
+        Self {
+            model: "google/gemini-3-flash-preview".to_string(),
+            max_tokens: 4096,
+            temperature: 0.1,
+            timeout_secs: 30,
+        }
+    }
+}
+
+/// Configuration for all memory agents across the three tiers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryAgentsConfig {
+    pub openrouter_api_key: Option<String>,
+    pub openrouter_base_url: String,
+    pub stm: MemoryAgentConfig,
+    pub mtm: MemoryAgentConfig,
+    pub ltm: MemoryAgentConfig,
+}
+
+impl Default for MemoryAgentsConfig {
+    fn default() -> Self {
+        Self {
+            openrouter_api_key: None,
+            openrouter_base_url: "https://openrouter.ai/api/v1".to_string(),
+            stm: MemoryAgentConfig {
+                max_tokens: 400,
+                timeout_secs: 10,
+                ..MemoryAgentConfig::default()
+            },
+            mtm: MemoryAgentConfig {
+                max_tokens: 8192,
+                timeout_secs: 60,
+                ..MemoryAgentConfig::default()
+            },
+            ltm: MemoryAgentConfig {
+                max_tokens: 8192,
+                timeout_secs: 60,
+                ..MemoryAgentConfig::default()
+            },
+        }
+    }
+}
+
 // ── TierConfig ────────────────────────────────────────────────────────────────
 
 /// Configuration for the three-tier memory system.
@@ -53,6 +109,9 @@ pub struct TierConfig {
 
     /// Minimum relevance score a result must exceed to be returned, default 0.4.
     pub min_relevance_threshold: f32,
+
+    /// Per-tier memory agent configuration.
+    pub memory_agents: MemoryAgentsConfig,
 }
 
 impl Default for TierConfig {
@@ -75,6 +134,7 @@ impl Default for TierConfig {
             weight_mtm: 0.35,
             weight_ltm: 0.20,
             min_relevance_threshold: 0.4,
+            memory_agents: MemoryAgentsConfig::default(),
         }
     }
 }
@@ -286,6 +346,25 @@ mod tests {
         assert_eq!(job.attempts, 0);
         assert!(job.last_error.is_none());
         assert!(!job.is_terminal());
+    }
+
+    #[test]
+    fn default_memory_agent_config_has_sane_values() {
+        let cfg = MemoryAgentConfig::default();
+        assert_eq!(cfg.model, "google/gemini-3-flash-preview");
+        assert_eq!(cfg.temperature, 0.1);
+        assert!(cfg.timeout_secs > 0);
+        assert!(cfg.max_tokens > 0);
+    }
+
+    #[test]
+    fn default_tier_config_has_memory_agents() {
+        let cfg = TierConfig::default();
+        assert_eq!(cfg.memory_agents.openrouter_base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(cfg.memory_agents.stm.model, "google/gemini-3-flash-preview");
+        assert_eq!(cfg.memory_agents.stm.timeout_secs, 10);
+        assert_eq!(cfg.memory_agents.mtm.timeout_secs, 60);
+        assert_eq!(cfg.memory_agents.ltm.timeout_secs, 60);
     }
 
     #[test]
