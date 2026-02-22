@@ -1675,6 +1675,26 @@ pub struct MemoryConfig {
     /// None = wait indefinitely (default). Recommended max: 300.
     #[serde(default)]
     pub sqlite_open_timeout_secs: Option<u64>,
+
+    // ── Memory Agent (OpenRouter) settings ───────────────────
+    /// OpenRouter API key for memory agents (separate from main provider)
+    #[serde(default)]
+    pub memory_agent_openrouter_api_key: Option<String>,
+    /// OpenRouter base URL for memory agents
+    #[serde(default = "default_memory_agent_openrouter_base_url")]
+    pub memory_agent_openrouter_base_url: String,
+    /// Model for memory agents (all tiers use the same model)
+    #[serde(default = "default_memory_agent_model")]
+    pub memory_agent_model: String,
+    /// Timeout for STM extraction agent (seconds)
+    #[serde(default = "default_memory_agent_stm_timeout_secs")]
+    pub memory_agent_stm_timeout_secs: u64,
+    /// Timeout for MTM compression agent (seconds)
+    #[serde(default = "default_memory_agent_mtm_timeout_secs")]
+    pub memory_agent_mtm_timeout_secs: u64,
+    /// Timeout for LTM consolidation agent (seconds)
+    #[serde(default = "default_memory_agent_ltm_timeout_secs")]
+    pub memory_agent_ltm_timeout_secs: u64,
 }
 
 fn default_embedding_provider() -> String {
@@ -1720,6 +1740,22 @@ fn default_response_cache_max() -> usize {
     5_000
 }
 
+fn default_memory_agent_openrouter_base_url() -> String {
+    "https://openrouter.ai/api/v1".to_string()
+}
+fn default_memory_agent_model() -> String {
+    "google/gemini-3-flash-preview".to_string()
+}
+fn default_memory_agent_stm_timeout_secs() -> u64 {
+    10
+}
+fn default_memory_agent_mtm_timeout_secs() -> u64 {
+    60
+}
+fn default_memory_agent_ltm_timeout_secs() -> u64 {
+    60
+}
+
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
@@ -1744,6 +1780,12 @@ impl Default for MemoryConfig {
             snapshot_on_hygiene: false,
             auto_hydrate: true,
             sqlite_open_timeout_secs: None,
+            memory_agent_openrouter_api_key: None,
+            memory_agent_openrouter_base_url: default_memory_agent_openrouter_base_url(),
+            memory_agent_model: default_memory_agent_model(),
+            memory_agent_stm_timeout_secs: default_memory_agent_stm_timeout_secs(),
+            memory_agent_mtm_timeout_secs: default_memory_agent_mtm_timeout_secs(),
+            memory_agent_ltm_timeout_secs: default_memory_agent_ltm_timeout_secs(),
         }
     }
 }

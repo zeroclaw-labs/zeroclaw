@@ -386,6 +386,12 @@ fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
         snapshot_on_hygiene: false,
         auto_hydrate: true,
         sqlite_open_timeout_secs: None,
+        memory_agent_openrouter_api_key: None,
+        memory_agent_openrouter_base_url: "https://openrouter.ai/api/v1".to_string(),
+        memory_agent_model: "google/gemini-3-flash-preview".to_string(),
+        memory_agent_stm_timeout_secs: 10,
+        memory_agent_mtm_timeout_secs: 60,
+        memory_agent_ltm_timeout_secs: 60,
     }
 }
 
