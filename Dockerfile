@@ -20,14 +20,10 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# 1. 拷贝前端构建结果
 COPY --from=frontend-builder /app/web/dist ./web/dist
-
-# 2. 拷贝 manifests 缓存依赖
 COPY Cargo.toml Cargo.lock ./
 COPY crates/robot-kit/Cargo.toml crates/robot-kit/Cargo.toml
 
-# 创建哑目标以加速缓存
 RUN mkdir -p src benches crates/robot-kit/src \
     && echo "fn main() {}" > src/main.rs \
     && echo "fn main() {}" > benches/agent_benchmarks.rs \
@@ -39,8 +35,6 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
     cargo build --release --locked
 
 RUN rm -rf src benches crates/robot-kit/src
-
-# 3. 拷贝源码并正式编译
 COPY src/ src/
 COPY benches/ benches/
 COPY crates/ crates/
@@ -53,7 +47,7 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
     cp target/release/zeroclaw /app/zeroclaw && \
     strip /app/zeroclaw
 
-# 准备运行时配置：确保包含所有必填字段
+# 准备运行时配置：确保 [channels_config] 结构完整
 RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace && \
     cat > /zeroclaw-data/.zeroclaw/config.toml <<EOF
 workspace_dir = "/zeroclaw-data/workspace"
@@ -83,16 +77,13 @@ allow_public_bind = true
 paired_tokens = ["5247d9d046f1e53ed49a0f5b4d509cd8432aae614fb8971c9f3d3821866fb8e7"]
 EOF
 
-# 修正权限并限制访问权限（解决日志中的模式警告）
 RUN chmod 600 /zeroclaw-data/.zeroclaw/config.toml && \
     chown -R 65534:65534 /zeroclaw-data
-# ── Stage 3: Production Runtime (Debian Trixie) ──────────────
+
+# ── Stage 3: Production Runtime ──────────────────────────────
 FROM debian:trixie-slim AS release
 
-RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    libssl3 \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y ca-certificates libssl3 curl && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
 COPY --from=builder /zeroclaw-data /zeroclaw-data
@@ -104,5 +95,7 @@ ENV ZEROCLAW_GATEWAY_PORT=8080
 USER 65534:65534
 WORKDIR /zeroclaw-data
 EXPOSE 8080
+
+# 核心修正：增加 --config 参数
 ENTRYPOINT ["zeroclaw"]
-CMD ["gateway"]
+CMD ["gateway", "--config", "/zeroclaw-data/.zeroclaw/config.toml"]
