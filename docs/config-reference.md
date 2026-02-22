@@ -26,6 +26,14 @@ Schema export command:
 | `provider_api` | unset | Optional API mode for `custom:<url>` providers: `openai-chat-completions` or `openai-responses` |
 | `default_model` | `anthropic/claude-sonnet-4-6` | model routed through selected provider |
 | `default_temperature` | `0.7` | model temperature |
+| `model_support_vision` | unset (`None`) | Vision support override for active provider/model |
+
+Notes:
+
+- `model_support_vision = true` forces vision support on (e.g. Ollama running `llava`).
+- `model_support_vision = false` forces vision support off.
+- Unset keeps the provider's built-in default.
+- Environment override: `ZEROCLAW_MODEL_SUPPORT_VISION` or `MODEL_SUPPORT_VISION` (values: `true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`).
 
 ## `[observability]`
 

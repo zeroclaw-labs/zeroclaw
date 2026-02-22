@@ -360,10 +360,7 @@ pub fn all_tools_with_runtime(
                     .map(std::path::PathBuf::from),
                 secrets_encrypt: root_config.secrets.encrypt,
                 reasoning_enabled: root_config.runtime.reasoning_enabled,
-                custom_provider_api_mode: root_config
-                    .provider_api
-                    .map(|mode| mode.as_compatible_mode()),
-                max_tokens_override: None,
+                model_support_vision: root_config.model_support_vision,
             },
         )
         .with_parent_tools(parent_tools)

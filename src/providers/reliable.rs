@@ -233,6 +233,8 @@ pub struct ReliableProvider {
     model_fallbacks: HashMap<String, Vec<String>>,
     /// Provider-scoped model remaps: provider_name → [model_1, model_2, ...]
     provider_model_fallbacks: HashMap<String, Vec<String>>,
+    /// Vision support override from config (`None` = defer to provider).
+    vision_override: Option<bool>,
 }
 
 impl ReliableProvider {
@@ -249,6 +251,7 @@ impl ReliableProvider {
             key_index: AtomicUsize::new(0),
             model_fallbacks: HashMap::new(),
             provider_model_fallbacks: HashMap::new(),
+            vision_override: None,
         }
     }
 
@@ -276,6 +279,12 @@ impl ReliableProvider {
             }
         }
 
+        self
+    }
+
+    /// Set vision support override from runtime config.
+    pub fn with_vision_override(mut self, vision_override: Option<bool>) -> Self {
+        self.vision_override = vision_override;
         self
     }
 
@@ -605,9 +614,11 @@ impl Provider for ReliableProvider {
     }
 
     fn supports_vision(&self) -> bool {
-        self.providers
-            .iter()
-            .any(|(_, provider)| provider.supports_vision())
+        self.vision_override.unwrap_or_else(|| {
+            self.providers
+                .iter()
+                .any(|(_, provider)| provider.supports_vision())
+        })
     }
 
     async fn chat_with_tools(
@@ -2104,5 +2115,69 @@ mod tests {
         // Primary should have been called only once (no retries)
         assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn vision_override_forces_true() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![(
+                "primary".into(),
+                Box::new(MockProvider {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: 0,
+                    response: "ok",
+                    error: "",
+                }) as Box<dyn Provider>,
+            )],
+            1,
+            100,
+        )
+        .with_vision_override(Some(true));
+
+        // MockProvider default capabilities → vision: false
+        // Override should force true
+        assert!(provider.supports_vision());
+    }
+
+    #[test]
+    fn vision_override_forces_false() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![(
+                "primary".into(),
+                Box::new(MockProvider {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: 0,
+                    response: "ok",
+                    error: "",
+                }) as Box<dyn Provider>,
+            )],
+            1,
+            100,
+        )
+        .with_vision_override(Some(false));
+
+        assert!(!provider.supports_vision());
+    }
+
+    #[test]
+    fn vision_override_none_defers_to_provider() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![(
+                "primary".into(),
+                Box::new(MockProvider {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: 0,
+                    response: "ok",
+                    error: "",
+                }) as Box<dyn Provider>,
+            )],
+            1,
+            100,
+        );
+        // No override set → should defer to provider default (false)
+        assert!(!provider.supports_vision());
     }
 }
