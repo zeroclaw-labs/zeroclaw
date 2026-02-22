@@ -36,8 +36,8 @@ pub fn select_overflow_batch(
 ) -> Vec<MtmEntry> {
     let target = budget.saturating_sub(hysteresis);
 
-    // No overflow: current total is within budget + hysteresis band
-    if current_total <= target + hysteresis {
+    // No overflow: current total is within budget (equivalent to target + hysteresis when hysteresis <= budget)
+    if current_total <= budget {
         return Vec::new();
     }
 
