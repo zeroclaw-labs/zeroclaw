@@ -43,6 +43,21 @@ pub fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Return the nearest UTF-8 character boundary at or before `index`.
+///
+/// This mirrors `str::floor_char_boundary` for toolchains where direct method
+/// use is undesirable in project code.
+pub fn floor_char_boundary(s: &str, index: usize) -> usize {
+    if index >= s.len() {
+        return s.len();
+    }
+    let mut idx = index;
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
 /// Utility enum for handling optional values.
 pub enum MaybeSet<T> {
     Set(T),
@@ -141,5 +156,24 @@ mod tests {
     fn test_truncate_zero_max_chars() {
         // Edge case: max_chars = 0
         assert_eq!(truncate_with_ellipsis("hello", 0), "...");
+    }
+
+    #[test]
+    fn test_floor_char_boundary_ascii() {
+        let s = "hello";
+        assert_eq!(floor_char_boundary(s, 3), 3);
+    }
+
+    #[test]
+    fn test_floor_char_boundary_multibyte() {
+        let s = "a\u{00E9}\u{4E2D}\u{1F980}";
+        let crab_start = s.len() - "\u{1F980}".len();
+        assert_eq!(floor_char_boundary(s, crab_start + 1), crab_start);
+    }
+
+    #[test]
+    fn test_floor_char_boundary_out_of_bounds() {
+        let s = "abc";
+        assert_eq!(floor_char_boundary(s, 10), s.len());
     }
 }

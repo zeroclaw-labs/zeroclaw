@@ -1,6 +1,7 @@
 use super::traits::{Tool, ToolResult};
 use crate::runtime::RuntimeAdapter;
 use crate::security::SecurityPolicy;
+use crate::util::floor_char_boundary;
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashSet;
@@ -164,11 +165,13 @@ impl Tool for ShellTool {
 
                 // Truncate output to prevent OOM
                 if stdout.len() > MAX_OUTPUT_BYTES {
-                    stdout.truncate(stdout.floor_char_boundary(MAX_OUTPUT_BYTES));
+                    let boundary = floor_char_boundary(&stdout, MAX_OUTPUT_BYTES);
+                    stdout.truncate(boundary);
                     stdout.push_str("\n... [output truncated at 1MB]");
                 }
                 if stderr.len() > MAX_OUTPUT_BYTES {
-                    stderr.truncate(stderr.floor_char_boundary(MAX_OUTPUT_BYTES));
+                    let boundary = floor_char_boundary(&stderr, MAX_OUTPUT_BYTES);
+                    stderr.truncate(boundary);
                     stderr.push_str("\n... [stderr truncated at 1MB]");
                 }
 
