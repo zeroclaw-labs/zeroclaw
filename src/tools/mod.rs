@@ -287,6 +287,12 @@ pub fn all_tools_with_runtime(
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
     tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
 
+    // ClawHub tools
+    tool_arcs.push(Arc::new(ClawhubSearchTool::new()));
+    tool_arcs.push(Arc::new(ClawhubInstallTool::new(
+        workspace_dir.to_path_buf(),
+    )));
+
     if let Some(key) = composio_key {
         if !key.is_empty() {
             tool_arcs.push(Arc::new(ComposioTool::new(
