@@ -913,6 +913,7 @@ impl OpenAiCompatibleProvider {
     fn convert_messages_for_native(
         messages: &[ChatMessage],
         allow_user_image_parts: bool,
+        require_reasoning_for_tool_history: bool,
     ) -> Vec<NativeMessage> {
         messages
             .iter()
@@ -946,10 +947,16 @@ impl OpenAiCompatibleProvider {
                                     .and_then(serde_json::Value::as_str)
                                     .map(|value| MessageContent::Text(value.to_string()));
 
-                                let reasoning_content = value
+                                let mut reasoning_content = value
                                     .get("reasoning_content")
                                     .and_then(serde_json::Value::as_str)
                                     .map(ToString::to_string);
+
+                                if require_reasoning_for_tool_history
+                                    && reasoning_content.is_none()
+                                {
+                                    reasoning_content = Some(String::new());
+                                }
 
                                 return NativeMessage {
                                     role: "assistant".to_string(),
@@ -1062,6 +1069,12 @@ impl OpenAiCompatibleProvider {
             usage: None,
             reasoning_content,
         }
+    }
+
+    fn requires_reasoning_content_for_tool_history(&self) -> bool {
+        self.name.eq_ignore_ascii_case("Kimi Code")
+            || self.name.eq_ignore_ascii_case("kimi-code")
+            || self.base_url.contains("api.kimi.com/coding")
     }
 
     fn is_native_tool_schema_unsupported(status: reqwest::StatusCode, error: &str) -> bool {
@@ -1471,6 +1484,7 @@ impl Provider for OpenAiCompatibleProvider {
             messages: Self::convert_messages_for_native(
                 &effective_messages,
                 !self.merge_system_into_user,
+                self.requires_reasoning_content_for_tool_history(),
             ),
             temperature,
             stream: Some(false),
@@ -2189,7 +2203,7 @@ mod tests {
             r#"{"tool_call_id":"call_abc","content":"done"}"#,
         )];
 
-        let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input, true);
+        let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input, true, false);
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].role, "tool");
         assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_abc"));
@@ -2205,7 +2219,7 @@ mod tests {
             "System primer [IMAGE:data:image/png;base64,abcd] user turn",
         )];
 
-        let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input, false);
+        let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input, false, false);
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].role, "user");
         assert!(matches!(
@@ -2765,7 +2779,7 @@ mod tests {
         });
 
         let messages = vec![ChatMessage::assistant(history_json.to_string())];
-        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages, true);
+        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages, true, false);
         assert_eq!(native.len(), 1);
         assert_eq!(native[0].role, "assistant");
         assert_eq!(
@@ -2788,9 +2802,47 @@ mod tests {
         });
 
         let messages = vec![ChatMessage::assistant(history_json.to_string())];
-        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages, true);
+        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages, true, false);
         assert_eq!(native.len(), 1);
         assert!(native[0].reasoning_content.is_none());
+    }
+
+    #[test]
+    fn convert_messages_for_native_injects_empty_reasoning_for_tool_history_when_required() {
+        let history_json = serde_json::json!({
+            "content": "I will check",
+            "tool_calls": [{
+                "id": "tc_1",
+                "name": "shell",
+                "arguments": "{\"cmd\":\"ls\"}"
+            }]
+        });
+
+        let messages = vec![ChatMessage::assistant(history_json.to_string())];
+        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages, true, true);
+        assert_eq!(native.len(), 1);
+        assert_eq!(native[0].reasoning_content.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn convert_messages_for_native_keeps_existing_reasoning_when_required() {
+        let history_json = serde_json::json!({
+            "content": "I will check",
+            "tool_calls": [{
+                "id": "tc_1",
+                "name": "shell",
+                "arguments": "{\"cmd\":\"ls\"}"
+            }],
+            "reasoning_content": "already-present"
+        });
+
+        let messages = vec![ChatMessage::assistant(history_json.to_string())];
+        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages, true, true);
+        assert_eq!(native.len(), 1);
+        assert_eq!(
+            native[0].reasoning_content.as_deref(),
+            Some("already-present")
+        );
     }
 
     #[test]
