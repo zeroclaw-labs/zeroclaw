@@ -2,6 +2,7 @@
 //! CLI commands for ClawHub integration
 
 use crate::clawhub::client::ClawHubClient;
+use crate::clawhub::downloader::SkillDownloader;
 use crate::clawhub::registry::Registry;
 use crate::clawhub::types::InstalledSkill;
 use anyhow::{Context, Result};
@@ -90,8 +91,8 @@ async fn handle_search(query: &str, limit: usize) -> Result<()> {
 async fn handle_install(
     slug: &str,
     _version: Option<&str>,
-    _config_dir: &PathBuf,
-    _workspace_dir: &PathBuf,
+    config_dir: &PathBuf,
+    workspace_dir: &PathBuf,
 ) -> Result<()> {
     println!("Installing skill: {}", slug);
 
@@ -105,20 +106,89 @@ async fn handle_install(
 
     println!("  Downloading from: {}", readme_url);
 
-    // TODO: Full implementation - download, audit, install
-    println!("  Would install {} v{}", skill.name, skill.version);
+    // Download the skill content
+    let downloader = SkillDownloader::new();
+    let skills_path = workspace_dir.join("skills");
+    std::fs::create_dir_all(&skills_path)?;
+
+    let skill_dir = skills_path.join(slug);
+
+    // Check if already installed
+    if skill_dir.exists() {
+        anyhow::bail!("Skill '{}' is already installed. Use 'zeroclaw clawhub update' to update.", slug);
+    }
+
+    // Download to temp location first for audit
+    let temp_dir = std::env::temp_dir().join(format!("clawhub_install_{}", slug));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    std::fs::create_dir_all(&temp_dir)?;
+
+    // Download SKILL.md
+    let content = downloader.download_file(readme_url).await?;
+    let skill_md = temp_dir.join("SKILL.md");
+    std::fs::write(&skill_md, &content)?;
+
+    // Run security audit
+    println!("  Running security audit...");
+    match crate::skills::audit::audit_skill_directory(&temp_dir) {
+        Ok(report) => {
+            if !report.is_clean() {
+                let _ = std::fs::remove_dir_all(&temp_dir);
+                anyhow::bail!("Security audit failed: {}", report.summary());
+            }
+            println!("  Security audit passed ({} files scanned)", report.files_scanned);
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            anyhow::bail!("Security audit error: {}", e);
+        }
+    }
+
+    // Copy to final location
+    std::fs::create_dir_all(&skill_dir)?;
+    std::fs::copy(&skill_md, skill_dir.join("SKILL.md"))?;
+
+    // Clean up temp
+    let _ = std::fs::remove_dir_all(&temp_dir);
+
+    // Update registry
+    let mut registry = Registry::new(config_dir);
+    registry.add_skill(
+        &skill.slug,
+        &skill.name,
+        &skill.version,
+        skill.github_url.as_deref().unwrap_or(""),
+    )?;
+
+    // Update README
+    let clawhub_skills = registry.list_skills().to_vec();
+    update_skills_readme(&skills_path, &clawhub_skills)?;
+
+    println!("  ✓ Installed {} v{}", skill.name, skill.version);
 
     Ok(())
 }
 
-fn handle_uninstall(slug: &str, config_dir: &PathBuf, _workspace_dir: &PathBuf) -> Result<()> {
+fn handle_uninstall(slug: &str, config_dir: &PathBuf, workspace_dir: &PathBuf) -> Result<()> {
     let mut registry = Registry::new(config_dir);
 
     if !registry.is_installed(slug) {
         anyhow::bail!("Skill not installed: {}", slug);
     }
 
+    // Remove skill directory
+    let skills_path = workspace_dir.join("skills");
+    let skill_dir = skills_path.join(slug);
+    if skill_dir.exists() {
+        std::fs::remove_dir_all(&skill_dir)?;
+    }
+
     registry.remove_skill(slug)?;
+
+    // Update README
+    let clawhub_skills = registry.list_skills().to_vec();
+    update_skills_readme(&skills_path, &clawhub_skills)?;
+
     println!("  Uninstalled {}", slug);
     Ok(())
 }
