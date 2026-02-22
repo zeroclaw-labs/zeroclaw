@@ -3267,8 +3267,14 @@ pub async fn start_channels(config: Config) -> Result<()> {
         multimodal: config.multimodal.clone(),
         hooks: if config.hooks.enabled {
             let mut runner = crate::hooks::HookRunner::new();
+            if config.hooks.builtin.boot_script {
+                runner.register(Box::new(crate::hooks::builtin::BootScriptHook));
+            }
             if config.hooks.builtin.command_logger {
                 runner.register(Box::new(crate::hooks::builtin::CommandLoggerHook::new()));
+            }
+            if config.hooks.builtin.session_memory {
+                runner.register(Box::new(crate::hooks::builtin::SessionMemoryHook));
             }
             Some(Arc::new(runner))
         } else {
