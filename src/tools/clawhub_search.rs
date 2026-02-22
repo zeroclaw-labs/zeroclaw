@@ -1,6 +1,7 @@
 use crate::clawhub::client::ClawHubClient;
 use crate::tools::traits::{Tool, ToolResult};
 use async_trait::async_trait;
+use std::fmt::Write;
 
 /// Tool for searching ClawHub skills
 pub struct ClawhubSearchTool;
@@ -44,7 +45,7 @@ impl Tool for ClawhubSearchTool {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing query parameter"))?;
 
-        let limit = args["limit"].as_u64().unwrap_or(10) as usize;
+        let limit = args["limit"].as_u64().unwrap_or(10).try_into().unwrap_or(10);
 
         let client = ClawHubClient::default();
 
@@ -53,10 +54,11 @@ impl Tool for ClawhubSearchTool {
                 let mut output = format!("Found {} skills:\n\n", skills.len());
 
                 for skill in skills {
-                    output.push_str(&format!(
+                    write!(
+                        output,
                         "- {} ({})\n  {}\n  Stars: {}\n\n",
                         skill.name, skill.slug, skill.description, skill.stars
-                    ));
+                    ).ok();
                 }
 
                 Ok(ToolResult {

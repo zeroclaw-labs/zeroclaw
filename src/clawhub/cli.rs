@@ -6,7 +6,8 @@ use crate::clawhub::downloader::SkillDownloader;
 use crate::clawhub::registry::Registry;
 use crate::clawhub::types::InstalledSkill;
 use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
+use std::fmt::Write;
+use std::path::Path;
 
 /// CLI subcommands for clawhub
 #[derive(Debug, Clone, clap::Subcommand)]
@@ -325,14 +326,12 @@ pub fn update_skills_readme(skills_dir: &Path, clawhub_skills: &[InstalledSkill]
         content.push_str("|-------|---------|--------|\n");
 
         for skill in clawhub_skills {
-            let row = format!(
-                "| [{}]({}) | {} | [ClawHub](https://clawhub.ai/s/{}) |\n",
-                skill.name,
-                format!("skills/{}/SKILL.md", skill.slug),
-                skill.version,
-                skill.slug
-            );
-            content.push_str(&row);
+            let skill_path = format!("skills/{}/SKILL.md", skill.slug);
+            writeln!(
+                content,
+                "| [{}]({}) | {} | [ClawHub](https://clawhub.ai/s/{}) |",
+                skill.name, skill_path, skill.version, skill.slug
+            ).ok();
         }
 
         content.push_str("\n");
