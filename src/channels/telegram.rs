@@ -2434,7 +2434,9 @@ impl Channel for TelegramChannel {
                 Ok(resp) => {
                     match resp.json::<serde_json::Value>().await {
                         Err(e) => {
-                            tracing::warn!("Telegram startup probe parse error: {e}; retrying in 5s");
+                            tracing::warn!(
+                                "Telegram startup probe parse error: {e}; retrying in 5s"
+                            );
                             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                         }
                         Ok(data) => {
