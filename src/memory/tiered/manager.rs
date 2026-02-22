@@ -13,6 +13,9 @@ use tokio::sync::{mpsc, Mutex};
 use uuid::Uuid;
 
 use crate::memory::tiered::budget::{estimate_tokens, select_overflow_batch, MtmEntry};
+use crate::memory::tiered::extractor::FactExtractor;
+use crate::memory::tiered::facts::*;
+use crate::memory::tiered::prompts::build_mtm_extraction_prompt;
 use crate::memory::tiered::summarization::TierSummarizer;
 use crate::memory::tiered::tagging::TagExtractor;
 use crate::memory::tiered::types::{
@@ -31,6 +34,7 @@ pub struct TierManager {
     pub cfg: Arc<TierConfig>,
     pub summarizer: Arc<dyn TierSummarizer>,
     pub tag_extractor: Arc<dyn TagExtractor>,
+    pub fact_extractor: Option<Arc<dyn FactExtractor>>,
     pub compression_guard: Arc<Mutex<()>>,
     pub job_journal: Arc<Mutex<Vec<CompressionJob>>>,
     pub rx: mpsc::Receiver<TierCommand>,
@@ -187,6 +191,81 @@ impl TierManager {
             mtm.store(&mtm_key, &summary_text, MemoryCategory::Daily, None)
                 .await
                 .context("storing MTM summary")?;
+        }
+
+        // (f.1) Deep fact extraction via MTM agent (if available).
+        if let Some(ref extractor) = self.fact_extractor {
+            let transcript = stm_entries.iter()
+                .map(|e| format!("[{}] {}: {}", e.timestamp, e.key, e.content))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            // Gather existing facts for cross-referencing.
+            let existing_facts: Vec<String> = {
+                let stm_guard = self.stm.lock().await;
+                stm_guard.list(Some(&MemoryCategory::Core), None).await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|e| e.key.starts_with("fact:"))
+                    .map(|e| format!("{} → {}", e.key, e.content))
+                    .collect()
+            };
+            let fact_refs: Vec<&str> = existing_facts.iter().map(|s| s.as_str()).collect();
+            let prompt = build_mtm_extraction_prompt(&transcript, &fact_refs);
+
+            match extractor.extract(&prompt).await {
+                Ok(drafts) => {
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    let stm_guard = self.stm.lock().await;
+                    for draft in drafts {
+                        let fact_key = build_fact_key(&draft.category, &draft.subject, &draft.attribute);
+                        let confidence = match draft.confidence.to_lowercase().as_str() {
+                            "high" => FactConfidence::High,
+                            "low" => FactConfidence::Low,
+                            _ => FactConfidence::Medium,
+                        };
+                        let volatility = match draft.volatility_class.to_lowercase().as_str() {
+                            "stable" => VolatilityClass::Stable,
+                            "volatile" => VolatilityClass::Volatile,
+                            _ => VolatilityClass::SemiStable,
+                        };
+                        let entry = FactEntry {
+                            fact_id: uuid::Uuid::new_v4().to_string(),
+                            fact_key: fact_key.clone(),
+                            category: draft.category,
+                            subject: draft.subject,
+                            attribute: draft.attribute,
+                            value: draft.value,
+                            context_narrative: draft.context_narrative,
+                            source_turn: SourceTurnRef {
+                                conversation_id: String::new(),
+                                turn_index: 0,
+                                message_id: None,
+                                role: SourceRole::System,
+                                timestamp_unix_ms: now_ms,
+                            },
+                            confidence,
+                            related_facts: draft.related_facts,
+                            extracted_by_tier: "mtm".to_string(),
+                            extracted_at_unix_ms: now_ms,
+                            source_role: SourceRole::System,
+                            status: FactStatus::Active,
+                            revision: 1,
+                            supersedes_fact_id: None,
+                            tags: tags.clone(),
+                            volatility_class: volatility,
+                            ttl_days: None,
+                            expires_at_unix_ms: None,
+                            last_verified_unix_ms: Some(now_ms),
+                        };
+                        let content = serde_json::to_string(&entry).unwrap_or_default();
+                        let _ = stm_guard.store(&fact_key, &content, MemoryCategory::Core, None).await;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("MTM deep fact extraction failed (non-fatal): {:#}", e);
+                }
+            }
         }
 
         // (g) Archive raw STM entries → store each in LTM.
@@ -572,6 +651,7 @@ mod tests {
             cfg: Arc::new(TierConfig::default()),
             summarizer: Arc::new(MockSummarizer),
             tag_extractor: Arc::new(BasicTagExtractor::new()),
+            fact_extractor: None,
             compression_guard: Arc::new(Mutex::new(())),
             job_journal: Arc::new(Mutex::new(Vec::new())),
             rx,
@@ -766,6 +846,7 @@ mod tests {
             cfg: Arc::new(TierConfig::default()),
             summarizer: Arc::new(MockSummarizer),
             tag_extractor: Arc::new(BasicTagExtractor::new()),
+            fact_extractor: None,
             compression_guard: Arc::new(Mutex::new(())),
             job_journal: Arc::new(Mutex::new(Vec::new())),
             rx,
@@ -805,6 +886,7 @@ mod tests {
             cfg: Arc::new(TierConfig::default()),
             summarizer: Arc::new(MockSummarizer),
             tag_extractor: Arc::new(BasicTagExtractor::new()),
+            fact_extractor: None,
             compression_guard: Arc::new(Mutex::new(())),
             job_journal: Arc::new(Mutex::new(Vec::new())),
             rx,
@@ -828,5 +910,64 @@ mod tests {
 
         // MTM should have 1 summary from the forced compression.
         assert_eq!(mtm_clone.lock().await.count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn compress_day_extracts_facts_when_extractor_present() {
+        use crate::memory::tiered::extractor::{FactEntryDraft, MockFactExtractor};
+        use crate::memory::tiered::summarization::MockSummarizer;
+        use crate::memory::tiered::tagging::BasicTagExtractor;
+
+        let stm = make_shared(TimestampInMemoryBackend::new());
+        let mtm = make_shared(InMemoryBackend::new());
+        let ltm = make_shared(InMemoryBackend::new());
+        let (_tx, rx) = mpsc::channel(16);
+
+        let mock_drafts = vec![FactEntryDraft {
+            category: "personal".to_string(),
+            subject: "user".to_string(),
+            attribute: "favorite_color".to_string(),
+            value: "blue".to_string(),
+            context_narrative: "User mentioned they love blue.".to_string(),
+            confidence: "high".to_string(),
+            related_facts: vec![],
+            volatility_class: "stable".to_string(),
+        }];
+
+        let stm_clone = Arc::clone(&stm);
+
+        let manager = TierManager {
+            stm: Arc::clone(&stm),
+            mtm: Arc::clone(&mtm),
+            ltm: Arc::clone(&ltm),
+            cfg: Arc::new(TierConfig::default()),
+            summarizer: Arc::new(MockSummarizer),
+            tag_extractor: Arc::new(BasicTagExtractor::new()),
+            fact_extractor: Some(Arc::new(MockFactExtractor::new(mock_drafts))),
+            compression_guard: Arc::new(Mutex::new(())),
+            job_journal: Arc::new(Mutex::new(Vec::new())),
+            rx,
+        };
+
+        let day = NaiveDate::from_ymd_opt(2026, 1, 15).unwrap();
+        store_test_entry(&stm_clone, "e1", "my favorite color is blue", day).await;
+
+        manager.compress_day(day).await.unwrap();
+
+        // Verify facts are stored in STM as Core entries.
+        let stm_entries = stm_clone.lock().await.list(Some(&MemoryCategory::Core), None).await.unwrap();
+        let fact_entries: Vec<_> = stm_entries.iter().filter(|e| e.key.starts_with("fact:")).collect();
+        assert_eq!(fact_entries.len(), 1, "should have exactly 1 fact entry");
+        assert_eq!(
+            fact_entries[0].key, "fact:personal:user:favorite-color",
+            "fact key should follow taxonomy"
+        );
+
+        // Verify the stored content is valid JSON FactEntry.
+        let parsed: crate::memory::tiered::facts::FactEntry =
+            serde_json::from_str(&fact_entries[0].content).expect("should parse as FactEntry");
+        assert_eq!(parsed.value, "blue");
+        assert_eq!(parsed.extracted_by_tier, "mtm");
+        assert_eq!(parsed.confidence, crate::memory::tiered::facts::FactConfidence::High);
     }
 }
