@@ -456,10 +456,11 @@ impl Agent {
             .await
             .unwrap_or_default();
 
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
         let enriched = if context.is_empty() {
-            user_message.to_string()
+            format!("[{now}] {user_message}")
         } else {
-            format!("{context}{user_message}")
+            format!("{context}[{now}] {user_message}")
         };
 
         self.history
