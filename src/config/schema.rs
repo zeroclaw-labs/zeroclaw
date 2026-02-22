@@ -2286,6 +2286,13 @@ pub struct HeartbeatConfig {
     pub enabled: bool,
     /// Interval in minutes between heartbeat pings. Default: `30`.
     pub interval_minutes: u32,
+    /// Channel to deliver heartbeat results to (e.g. `"lark"`, `"telegram"`, `"discord"`).
+    /// When set together with `target`, heartbeat output is sent to this channel after each run.
+    #[serde(default)]
+    pub channel: Option<String>,
+    /// Recipient / chat ID for heartbeat delivery (channel-specific).
+    #[serde(default)]
+    pub target: Option<String>,
 }
 
 impl Default for HeartbeatConfig {
@@ -2293,6 +2300,8 @@ impl Default for HeartbeatConfig {
         Self {
             enabled: false,
             interval_minutes: 30,
+            channel: None,
+            target: None,
         }
     }
 }
@@ -4639,6 +4648,7 @@ default_temperature = 0.7
             heartbeat: HeartbeatConfig {
                 enabled: true,
                 interval_minutes: 15,
+                ..Default::default()
             },
             cron: CronConfig::default(),
             channels_config: ChannelsConfig {

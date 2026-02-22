@@ -2641,12 +2641,12 @@ fn classify_health_result(
     }
 }
 
-struct ConfiguredChannel {
-    display_name: &'static str,
-    channel: Arc<dyn Channel>,
+pub(crate) struct ConfiguredChannel {
+    pub(crate) display_name: &'static str,
+    pub(crate) channel: Arc<dyn Channel>,
 }
 
-fn collect_configured_channels(
+pub(crate) fn collect_configured_channels(
     config: &Config,
     _matrix_skip_context: &str,
 ) -> Vec<ConfiguredChannel> {

@@ -182,6 +182,9 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         observer,
     );
 
+    // Build delivery channel if configured
+    let delivery_channel = build_heartbeat_delivery_channel(&config);
+
     let interval_mins = config.heartbeat.interval_minutes.max(5);
     let mut interval = tokio::time::interval(Duration::from_secs(u64::from(interval_mins) * 60));
 
@@ -193,7 +196,9 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             continue;
         }
 
-        for task in tasks {
+        let mut results: Vec<String> = Vec::new();
+
+        for task in &tasks {
             let prompt = format!("[Heartbeat Task] {task}");
             let temp = config.default_temperature;
             if let Err(e) = crate::agent::run(
@@ -209,9 +214,58 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             {
                 crate::health::mark_component_error("heartbeat", e.to_string());
                 tracing::warn!("Heartbeat task failed: {e}");
+                results.push(format!("- {task}: FAILED ({e})"));
             } else {
                 crate::health::mark_component_ok("heartbeat");
+                results.push(format!("- {task}: OK"));
             }
+        }
+
+        // Deliver heartbeat summary to configured channel
+        if let Some((ref ch, ref target)) = delivery_channel {
+            let summary = format!(
+                "[Heartbeat Report]\n{}\n\nTasks: {}, Time: {}",
+                results.join("\n"),
+                tasks.len(),
+                chrono::Utc::now().format("%Y-%m-%d %H:%M UTC"),
+            );
+            let msg = crate::channels::traits::SendMessage::new(&summary, target.as_str());
+            if let Err(e) = ch.send(&msg).await {
+                tracing::warn!("Heartbeat delivery to channel failed: {e}");
+            }
+        }
+    }
+}
+
+/// Build a delivery channel from heartbeat config (`channel` + `target` fields).
+/// Returns `None` if either field is unset or the channel name doesn't match any
+/// configured channel.
+fn build_heartbeat_delivery_channel(
+    config: &Config,
+) -> Option<(std::sync::Arc<dyn crate::channels::traits::Channel>, String)> {
+    let channel_name = config.heartbeat.channel.as_deref()?;
+    let target = config.heartbeat.target.clone()?;
+
+    let configured = crate::channels::collect_configured_channels(config, "heartbeat delivery");
+    let found = configured
+        .into_iter()
+        .find(|c| c.channel.name().eq_ignore_ascii_case(channel_name));
+
+    match found {
+        Some(c) => {
+            tracing::info!(
+                "Heartbeat delivery enabled: channel={}, target={}",
+                c.display_name,
+                target,
+            );
+            Some((c.channel, target))
+        }
+        None => {
+            tracing::warn!(
+                "Heartbeat delivery channel '{}' not found in configured channels; delivery disabled",
+                channel_name,
+            );
+            None
         }
     }
 }
