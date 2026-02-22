@@ -8,13 +8,13 @@ pub use schema::{
     AgentConfig, AuditConfig, AutonomyConfig, BrowserComputerUseConfig, BrowserConfig,
     BuiltinHooksConfig, ChannelsConfig, ClassificationRule, ComposioConfig, Config, CostConfig,
     CronConfig, DelegateAgentConfig, DiscordConfig, DockerRuntimeConfig, EmbeddingRouteConfig,
-    EstopConfig, FeishuConfig, GatewayConfig, HardwareConfig, HardwareTransport, HeartbeatConfig,
-    HooksConfig, HttpRequestConfig, IMessageConfig, IdentityConfig, LarkConfig, MatrixConfig,
-    MemoryConfig, ModelRouteConfig, MultimodalConfig, NextcloudTalkConfig, ObservabilityConfig,
-    OtpConfig, OtpMethod, PeripheralBoardConfig, PeripheralsConfig, ProxyConfig, ProxyScope,
-    QueryClassificationConfig, ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig,
-    SandboxBackend, SandboxConfig, SchedulerConfig, SecretsConfig, SecurityConfig, SkillsConfig,
-    SkillsPromptInjectionMode, SlackConfig, StorageConfig, StorageProviderConfig,
+    EstopConfig, FeishuConfig, GatewayConfig, GoalLoopConfig, HardwareConfig, HardwareTransport,
+    HeartbeatConfig, HooksConfig, HttpRequestConfig, IMessageConfig, IdentityConfig, LarkConfig,
+    MatrixConfig, MemoryConfig, ModelRouteConfig, MultimodalConfig, NextcloudTalkConfig,
+    ObservabilityConfig, OtpConfig, OtpMethod, PeripheralBoardConfig, PeripheralsConfig,
+    ProxyConfig, ProxyScope, QueryClassificationConfig, ReliabilityConfig, ResourceLimitsConfig,
+    RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig, SecretsConfig, SecurityConfig,
+    SkillsConfig, SkillsPromptInjectionMode, SlackConfig, StorageConfig, StorageProviderConfig,
     StorageProviderSection, StreamMode, TelegramConfig, TranscriptionConfig, TunnelConfig,
     WebSearchConfig, WebhookConfig,
 };
@@ -64,6 +64,8 @@ mod tests {
             use_feishu: false,
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
+            draft_update_interval_ms: 3000,
+            max_draft_edits: 20,
         };
         let feishu = FeishuConfig {
             app_id: "app-id".into(),
@@ -73,6 +75,8 @@ mod tests {
             allowed_users: vec![],
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
+            draft_update_interval_ms: 3000,
+            max_draft_edits: 20,
         };
 
         let nextcloud_talk = NextcloudTalkConfig {
