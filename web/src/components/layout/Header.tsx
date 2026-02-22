@@ -1,6 +1,7 @@
 import { useLocation } from 'react-router-dom';
 import { LogOut } from 'lucide-react';
 import { t } from '@/lib/i18n';
+import type { Locale } from '@/lib/i18n';
 import { useLocaleContext } from '@/App';
 import { useAuth } from '@/hooks/useAuth';
 
@@ -17,6 +18,8 @@ const routeTitles: Record<string, string> = {
   '/doctor': 'nav.doctor',
 };
 
+const localeCycle: Locale[] = ['en', 'tr', 'zh-CN'];
+
 export default function Header() {
   const location = useLocation();
   const { logout } = useAuth();
@@ -26,7 +29,9 @@ export default function Header() {
   const pageTitle = t(titleKey);
 
   const toggleLanguage = () => {
-    setAppLocale(locale === 'en' ? 'tr' : 'en');
+    const currentIndex = localeCycle.indexOf(locale);
+    const nextLocale = localeCycle[(currentIndex + 1) % localeCycle.length] ?? 'en';
+    setAppLocale(nextLocale);
   };
 
   return (
@@ -42,7 +47,7 @@ export default function Header() {
           onClick={toggleLanguage}
           className="px-3 py-1 rounded-md text-sm font-medium border border-gray-600 text-gray-300 hover:bg-gray-700 hover:text-white transition-colors"
         >
-          {locale === 'en' ? 'EN' : 'TR'}
+          {locale === 'en' ? 'EN' : locale === 'tr' ? 'TR' : '中文'}
         </button>
 
         {/* Logout */}
