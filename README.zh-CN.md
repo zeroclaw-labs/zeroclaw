@@ -46,7 +46,7 @@
 > 
 > 技术标识（命令、配置键、API 路径、Trait 名称）保持英文，避免语义漂移。
 > 
-> 最后对齐时间：**2026-02-19**。
+> 最后对齐时间：**2026-02-22**。
 
 ## 📢 公告板
 
@@ -70,7 +70,7 @@ ZeroClaw 是一个高性能、低资源占用、可组合的自主智能体运�
 
 - **默认轻量运行时**：常见 CLI 与 `status` 工作流通常保持在几 MB 级内存范围。
 - **低成本部署友好**：面向低价板卡与小规格云主机设计，不依赖厚重运行时。
-- **冷启动很快**：Rust 单二进制让常用命令与守护进程启动更接近“秒开”。
+- **冷启动速度快**：Rust 单二进制让常用命令与守护进程启动更接近“秒开”。
 - **跨架构可移植**：同一套二进制优先流程覆盖 ARM / x86 / RISC-V，并保持 provider/channel/tool 可替换。
 
 ## 基准快照（ZeroClaw vs OpenClaw，可复现）
@@ -271,7 +271,7 @@ default_temperature = 0.7
 [memory]
 backend = "sqlite"             # sqlite | lucid | markdown | none
 auto_save = true
-embedding_provider = "none"    # none | openai | custom:https://...
+embedding_provider = "none"    # none | openai | custom:https://..."
 
 [gateway]
 host = "127.0.0.1"
