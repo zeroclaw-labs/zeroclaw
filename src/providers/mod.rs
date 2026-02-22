@@ -915,6 +915,7 @@ pub fn create_provider_with_options(
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
     match name {
+        "codex-cli" | "codex_cli" => Ok(Box::new(codex_cli::CodexCliProvider::new())),
         "openai-codex" | "openai_codex" | "codex" => {
             Ok(Box::new(openai_codex::OpenAiCodexProvider::new(options)))
         }
@@ -1470,6 +1471,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             local: false,
         },
         ProviderInfo {
+            name: "codex-cli",
+            display_name: "Codex CLI (local)",
+            aliases: &["codex_cli"],
+            local: true,
+        },
+        ProviderInfo {
             name: "ollama",
             display_name: "Ollama",
             aliases: &[],
@@ -1971,6 +1978,14 @@ mod tests {
     fn factory_openai_codex() {
         let options = ProviderRuntimeOptions::default();
         assert!(create_provider_with_options("openai-codex", None, &options).is_ok());
+    }
+
+    #[test]
+    fn factory_codex_cli() {
+        assert!(create_provider("codex-cli", None).is_ok());
+        assert!(create_provider("codex_cli", None).is_ok());
+        // Also works when an api_key is passed (ignored by the provider).
+        assert!(create_provider("codex-cli", Some("ignored")).is_ok());
     }
 
     #[test]
