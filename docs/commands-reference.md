@@ -88,6 +88,7 @@ Runtime in-chat commands (Telegram/Discord while channel server is running):
 - `/models <provider>`
 - `/model`
 - `/model <model-id>`
+- `/new`
 
 `add/remove` currently route you back to managed setup/manual config paths (not full declarative mutators yet).
 
