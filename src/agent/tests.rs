@@ -158,6 +158,7 @@ impl Tool for EchoTool {
             success: true,
             output: msg,
             error: None,
+            error_kind: None,
         })
     }
 }
@@ -184,6 +185,7 @@ impl Tool for FailingTool {
             success: false,
             output: String::new(),
             error: Some("intentional failure".into()),
+            error_kind: None,
         })
     }
 }
@@ -248,6 +250,7 @@ impl Tool for CountingTool {
             success: true,
             output: format!("call #{}", *c),
             error: None,
+            error_kind: None,
         })
     }
 }

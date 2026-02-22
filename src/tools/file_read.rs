@@ -1,4 +1,4 @@
-use super::traits::{Tool, ToolResult};
+use super::traits::{ErrorKind, Tool, ToolResult};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -59,6 +59,7 @@ impl Tool for FileReadTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".into()),
+                error_kind: Some(ErrorKind::RateLimited),
             });
         }
 
@@ -68,6 +69,7 @@ impl Tool for FileReadTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Path not allowed by security policy: {path}")),
+                error_kind: Some(ErrorKind::PolicyDenied),
             });
         }
 
@@ -79,6 +81,7 @@ impl Tool for FileReadTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: action budget exhausted".into()),
+                error_kind: Some(ErrorKind::RateLimited),
             });
         }
 
@@ -92,6 +95,7 @@ impl Tool for FileReadTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Failed to resolve file path: {e}")),
+                    error_kind: Some(ErrorKind::NotFound),
                 });
             }
         };
@@ -104,6 +108,7 @@ impl Tool for FileReadTool {
                     self.security
                         .resolved_path_violation_message(&resolved_path),
                 ),
+                error_kind: Some(ErrorKind::PermissionDenied),
             });
         }
 
@@ -118,6 +123,7 @@ impl Tool for FileReadTool {
                             "File too large: {} bytes (limit: {MAX_FILE_SIZE_BYTES} bytes)",
                             meta.len()
                         )),
+                        error_kind: Some(ErrorKind::InvalidInput),
                     });
                 }
             }
@@ -126,6 +132,7 @@ impl Tool for FileReadTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Failed to read file metadata: {e}")),
+                    error_kind: Some(ErrorKind::NotFound),
                 });
             }
         }
@@ -140,6 +147,7 @@ impl Tool for FileReadTool {
                         success: true,
                         output: String::new(),
                         error: None,
+                        error_kind: None,
                     });
                 }
 
@@ -167,6 +175,7 @@ impl Tool for FileReadTool {
                         success: true,
                         output: format!("[No lines in range, file has {total} lines]"),
                         error: None,
+                        error_kind: None,
                     });
                 }
 
@@ -188,6 +197,7 @@ impl Tool for FileReadTool {
                     success: true,
                     output: format!("{numbered}{summary}"),
                     error: None,
+                    error_kind: None,
                 })
             }
             Err(_) => {
@@ -201,6 +211,7 @@ impl Tool for FileReadTool {
                         success: true,
                         output: text,
                         error: None,
+                        error_kind: None,
                     });
                 }
 
@@ -210,6 +221,7 @@ impl Tool for FileReadTool {
                     success: true,
                     output: lossy,
                     error: None,
+                    error_kind: None,
                 })
             }
         }

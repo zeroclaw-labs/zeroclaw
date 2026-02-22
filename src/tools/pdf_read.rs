@@ -80,6 +80,7 @@ impl Tool for PdfReadTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".into()),
+                error_kind: None,
             });
         }
 
@@ -88,6 +89,7 @@ impl Tool for PdfReadTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Path not allowed by security policy: {path}")),
+                error_kind: None,
             });
         }
 
@@ -97,6 +99,7 @@ impl Tool for PdfReadTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: action budget exhausted".into()),
+                error_kind: None,
             });
         }
 
@@ -109,6 +112,7 @@ impl Tool for PdfReadTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Failed to resolve file path: {e}")),
+                    error_kind: None,
                 });
             }
         };
@@ -121,6 +125,7 @@ impl Tool for PdfReadTool {
                     self.security
                         .resolved_path_violation_message(&resolved_path),
                 ),
+                error_kind: None,
             });
         }
 
@@ -136,6 +141,7 @@ impl Tool for PdfReadTool {
                             "PDF too large: {} bytes (limit: {MAX_PDF_BYTES} bytes)",
                             meta.len()
                         )),
+                        error_kind: None,
                     });
                 }
             }
@@ -144,6 +150,7 @@ impl Tool for PdfReadTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Failed to read file metadata: {e}")),
+                    error_kind: None,
                 });
             }
         }
@@ -155,6 +162,7 @@ impl Tool for PdfReadTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Failed to read PDF file: {e}")),
+                    error_kind: None,
                 });
             }
         };
@@ -173,6 +181,7 @@ impl Tool for PdfReadTool {
                         success: false,
                         output: String::new(),
                         error: Some(format!("PDF extraction failed: {e}")),
+                        error_kind: None,
                     });
                 }
                 Err(e) => {
@@ -180,6 +189,7 @@ impl Tool for PdfReadTool {
                         success: false,
                         output: String::new(),
                         error: Some(format!("PDF extraction task panicked: {e}")),
+                        error_kind: None,
                     });
                 }
             };
@@ -192,6 +202,7 @@ impl Tool for PdfReadTool {
                     output: "PDF contains no extractable text (may be image-only or encrypted)"
                         .into(),
                     error: None,
+                    error_kind: None,
                 });
             }
 
@@ -208,6 +219,7 @@ impl Tool for PdfReadTool {
                 success: true,
                 output,
                 error: None,
+                error_kind: None,
             });
         }
 
@@ -223,6 +235,7 @@ impl Tool for PdfReadTool {
                      Rebuild with: cargo build --features rag-pdf"
                         .into(),
                 ),
+                error_kind: None,
             })
         }
     }

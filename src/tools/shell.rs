@@ -1,31 +1,149 @@
-use super::traits::{Tool, ToolResult};
+use super::traits::{ErrorKind, Tool, ToolResult};
 use crate::runtime::RuntimeAdapter;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Maximum shell command execution time before kill.
+/// Maximum shell command execution time before kill (sync mode).
 const SHELL_TIMEOUT_SECS: u64 = 60;
+/// Maximum background task execution time before kill.
+const BACKGROUND_TIMEOUT_SECS: u64 = 3600;
 /// Maximum output size in bytes (1MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
+/// Maximum concurrent background tasks in the registry.
+const MAX_BACKGROUND_TASKS: usize = 50;
 /// Environment variables safe to pass to shell commands.
 /// Only functional variables are included — never API keys or secrets.
 const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
 
-/// Shell command execution tool with sandboxing
+// ── Background task registry ────────────────────────────────────────
+
+/// Status of a background shell task.
+#[derive(Debug, Clone)]
+pub enum BackgroundTaskStatus {
+    Running,
+    Completed { exit_code: i32 },
+    Failed { error: String },
+}
+
+/// Metadata for a single background shell task.
+#[derive(Debug, Clone)]
+pub struct BackgroundTask {
+    pub id: String,
+    pub command: String,
+    pub log_path: PathBuf,
+    pub pid: u32,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub status: BackgroundTaskStatus,
+}
+
+/// In-memory registry of background shell tasks.
+/// Shared between `ShellTool` and `ShellStatusTool` via `Arc`.
+pub struct BackgroundTaskRegistry {
+    tasks: parking_lot::Mutex<HashMap<String, BackgroundTask>>,
+}
+
+impl Default for BackgroundTaskRegistry {
+    fn default() -> Self {
+        Self {
+            tasks: parking_lot::Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl BackgroundTaskRegistry {
+    /// Insert a new task. If at capacity, remove oldest completed tasks first.
+    pub fn insert(&self, task: BackgroundTask) {
+        let mut tasks = self.tasks.lock();
+        // Evict oldest completed tasks if at capacity.
+        while tasks.len() >= MAX_BACKGROUND_TASKS {
+            let oldest_completed = tasks
+                .iter()
+                .filter(|(_, t)| !matches!(t.status, BackgroundTaskStatus::Running))
+                .min_by_key(|(_, t)| t.started_at)
+                .map(|(id, _)| id.clone());
+            match oldest_completed {
+                Some(id) => {
+                    tasks.remove(&id);
+                }
+                None => break, // all tasks are running, can't evict
+            }
+        }
+        tasks.insert(task.id.clone(), task);
+    }
+
+    /// Update a task's status.
+    pub fn update_status(&self, task_id: &str, status: BackgroundTaskStatus) {
+        let mut tasks = self.tasks.lock();
+        if let Some(task) = tasks.get_mut(task_id) {
+            task.status = status;
+        }
+    }
+
+    /// Get a snapshot of a single task.
+    pub fn get(&self, task_id: &str) -> Option<BackgroundTask> {
+        self.tasks.lock().get(task_id).cloned()
+    }
+
+    /// List all tasks (snapshot).
+    pub fn list(&self) -> Vec<BackgroundTask> {
+        let tasks = self.tasks.lock();
+        let mut list: Vec<BackgroundTask> = tasks.values().cloned().collect();
+        list.sort_by_key(|t| t.started_at);
+        list
+    }
+
+    /// Check if the registry is full (all slots occupied by running tasks).
+    pub fn is_full(&self) -> bool {
+        let tasks = self.tasks.lock();
+        tasks.len() >= MAX_BACKGROUND_TASKS
+            && tasks
+                .values()
+                .all(|t| matches!(t.status, BackgroundTaskStatus::Running))
+    }
+}
+
+// ── Shell tool ──────────────────────────────────────────────────────
+
+/// Shell command execution tool with sandboxing and optional background mode.
 pub struct ShellTool {
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
+    bg_registry: Arc<BackgroundTaskRegistry>,
 }
 
 impl ShellTool {
     pub fn new(security: Arc<SecurityPolicy>, runtime: Arc<dyn RuntimeAdapter>) -> Self {
-        Self { security, runtime }
+        Self {
+            security,
+            runtime,
+            bg_registry: Arc::new(BackgroundTaskRegistry::default()),
+        }
+    }
+
+    /// Construct with an externally-provided registry so callers can share it
+    /// with `ShellStatusTool`.
+    pub fn with_registry(
+        security: Arc<SecurityPolicy>,
+        runtime: Arc<dyn RuntimeAdapter>,
+        bg_registry: Arc<BackgroundTaskRegistry>,
+    ) -> Self {
+        Self {
+            security,
+            runtime,
+            bg_registry,
+        }
+    }
+
+    /// Return a handle to the background task registry.
+    pub fn registry(&self) -> &Arc<BackgroundTaskRegistry> {
+        &self.bg_registry
     }
 }
 
@@ -64,7 +182,7 @@ impl Tool for ShellTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command in the workspace directory"
+        "Execute a shell command in the workspace directory. Set background=true for long-running commands (git clone, pip install, etc.) to avoid timeouts; then report to the user that the task is running and poll with shell_status at least 10 seconds apart."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -78,6 +196,11 @@ impl Tool for ShellTool {
                 "approved": {
                     "type": "boolean",
                     "description": "Set true to explicitly approve medium/high-risk commands in supervised mode",
+                    "default": false
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "Run the command in the background. Returns a task_id immediately. For long-running tasks, report the task_id to the user first, then use shell_status to check progress — wait at least 10 seconds between polls.",
                     "default": false
                 }
             },
@@ -94,12 +217,17 @@ impl Tool for ShellTool {
             .get("approved")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let background = args
+            .get("background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         if self.security.is_rate_limited() {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".into()),
+                error_kind: Some(ErrorKind::RateLimited),
             });
         }
 
@@ -110,6 +238,7 @@ impl Tool for ShellTool {
                     success: false,
                     output: String::new(),
                     error: Some(reason),
+                    error_kind: Some(ErrorKind::PolicyDenied),
                 });
             }
         }
@@ -119,6 +248,7 @@ impl Tool for ShellTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Path blocked by security policy: {path}")),
+                error_kind: Some(ErrorKind::PolicyDenied),
             });
         }
 
@@ -127,12 +257,21 @@ impl Tool for ShellTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: action budget exhausted".into()),
+                error_kind: Some(ErrorKind::RateLimited),
             });
         }
 
-        // Execute with timeout to prevent hanging commands.
-        // Clear the environment to prevent leaking API keys and other secrets
-        // (CWE-200), then re-add only safe, functional variables.
+        if background {
+            return self.execute_background(command).await;
+        }
+
+        self.execute_sync(command).await
+    }
+}
+
+impl ShellTool {
+    /// Execute a shell command synchronously with timeout.
+    async fn execute_sync(&self, command: &str) -> anyhow::Result<ToolResult> {
         let mut cmd = match self
             .runtime
             .build_shell_command(command, &self.security.workspace_dir)
@@ -143,6 +282,7 @@ impl Tool for ShellTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Failed to build runtime command: {e}")),
+                    error_kind: Some(ErrorKind::ExecutionFailed),
                 });
             }
         };
@@ -180,12 +320,18 @@ impl Tool for ShellTool {
                     } else {
                         Some(stderr)
                     },
+                    error_kind: if output.status.success() {
+                        None
+                    } else {
+                        Some(ErrorKind::ExecutionFailed)
+                    },
                 })
             }
             Ok(Err(e)) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to execute command: {e}")),
+                error_kind: Some(ErrorKind::ExecutionFailed),
             }),
             Err(_) => Ok(ToolResult {
                 success: false,
@@ -193,8 +339,160 @@ impl Tool for ShellTool {
                 error: Some(format!(
                     "Command timed out after {SHELL_TIMEOUT_SECS}s and was killed"
                 )),
+                error_kind: Some(ErrorKind::Timeout),
             }),
         }
+    }
+
+    /// Spawn a background shell command. Returns immediately with task_id.
+    async fn execute_background(&self, command: &str) -> anyhow::Result<ToolResult> {
+        if self.bg_registry.is_full() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Background task limit reached ({MAX_BACKGROUND_TASKS}). \
+                     Kill or wait for existing tasks before starting new ones."
+                )),
+                error_kind: Some(ErrorKind::RateLimited),
+            });
+        }
+
+        let task_id = uuid::Uuid::new_v4().to_string();
+
+        // Create log directory and file.
+        let log_dir = self.security.workspace_dir.join("background_tasks");
+        if let Err(e) = tokio::fs::create_dir_all(&log_dir).await {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Failed to create background_tasks directory: {e}")),
+                error_kind: Some(ErrorKind::ExecutionFailed),
+            });
+        }
+        let log_path = log_dir.join(format!("{task_id}.log"));
+
+        let log_file = match std::fs::File::create(&log_path) {
+            Ok(f) => f,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to create log file: {e}")),
+                    error_kind: Some(ErrorKind::ExecutionFailed),
+                });
+            }
+        };
+        let stderr_file = match log_file.try_clone() {
+            Ok(f) => f,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to clone log file handle: {e}")),
+                    error_kind: Some(ErrorKind::ExecutionFailed),
+                });
+            }
+        };
+
+        let mut cmd = match self
+            .runtime
+            .build_shell_command(command, &self.security.workspace_dir)
+        {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to build runtime command: {e}")),
+                    error_kind: Some(ErrorKind::ExecutionFailed),
+                });
+            }
+        };
+        cmd.env_clear();
+        for var in SAFE_ENV_VARS {
+            if let Ok(val) = std::env::var(var) {
+                cmd.env(var, val);
+            }
+        }
+        cmd.stdout(log_file);
+        cmd.stderr(stderr_file);
+
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to spawn background command: {e}")),
+                    error_kind: Some(ErrorKind::ExecutionFailed),
+                });
+            }
+        };
+
+        let pid = child.id().unwrap_or(0);
+
+        let task = BackgroundTask {
+            id: task_id.clone(),
+            command: command.to_string(),
+            log_path: log_path.clone(),
+            pid,
+            started_at: chrono::Utc::now(),
+            status: BackgroundTaskStatus::Running,
+        };
+        self.bg_registry.insert(task);
+
+        // Spawn a monitoring task to update status when the process completes.
+        let registry = Arc::clone(&self.bg_registry);
+        let monitor_task_id = task_id.clone();
+        tokio::spawn(async move {
+            let result =
+                tokio::time::timeout(Duration::from_secs(BACKGROUND_TIMEOUT_SECS), child.wait())
+                    .await;
+
+            match result {
+                Ok(Ok(status)) => {
+                    let code = status.code().unwrap_or(-1);
+                    registry.update_status(
+                        &monitor_task_id,
+                        BackgroundTaskStatus::Completed { exit_code: code },
+                    );
+                }
+                Ok(Err(e)) => {
+                    registry.update_status(
+                        &monitor_task_id,
+                        BackgroundTaskStatus::Failed {
+                            error: format!("Process error: {e}"),
+                        },
+                    );
+                }
+                Err(_) => {
+                    // Timeout — kill the child.
+                    let _ = child.kill().await;
+                    registry.update_status(
+                        &monitor_task_id,
+                        BackgroundTaskStatus::Failed {
+                            error: format!(
+                                "Background task timed out after {BACKGROUND_TIMEOUT_SECS}s"
+                            ),
+                        },
+                    );
+                }
+            }
+        });
+
+        Ok(ToolResult {
+            success: true,
+            output: json!({
+                "task_id": task_id,
+                "pid": pid,
+                "log_path": log_path.display().to_string(),
+                "status": "running"
+            })
+            .to_string(),
+            error: None,
+            error_kind: None,
+        })
     }
 }
 
@@ -203,6 +501,10 @@ mod tests {
     use super::*;
     use crate::runtime::{NativeRuntime, RuntimeAdapter};
     use crate::security::{AutonomyLevel, SecurityPolicy};
+
+    fn test_registry() -> Arc<BackgroundTaskRegistry> {
+        Arc::new(BackgroundTaskRegistry::default())
+    }
 
     fn test_security(autonomy: AutonomyLevel) -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
@@ -218,19 +520,31 @@ mod tests {
 
     #[test]
     fn shell_tool_name() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let tool = ShellTool::with_registry(
+            test_security(AutonomyLevel::Supervised),
+            test_runtime(),
+            test_registry(),
+        );
         assert_eq!(tool.name(), "shell");
     }
 
     #[test]
     fn shell_tool_description() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let tool = ShellTool::with_registry(
+            test_security(AutonomyLevel::Supervised),
+            test_runtime(),
+            test_registry(),
+        );
         assert!(!tool.description().is_empty());
     }
 
     #[test]
     fn shell_tool_schema_has_command() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let tool = ShellTool::with_registry(
+            test_security(AutonomyLevel::Supervised),
+            test_runtime(),
+            test_registry(),
+        );
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["command"].is_object());
         assert!(schema["required"]
@@ -238,11 +552,16 @@ mod tests {
             .expect("schema required field should be an array")
             .contains(&json!("command")));
         assert!(schema["properties"]["approved"].is_object());
+        assert!(schema["properties"]["background"].is_object());
     }
 
     #[tokio::test]
     async fn shell_executes_allowed_command() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let tool = ShellTool::with_registry(
+            test_security(AutonomyLevel::Supervised),
+            test_runtime(),
+            test_registry(),
+        );
         let result = tool
             .execute(json!({"command": "echo hello"}))
             .await
@@ -254,7 +573,11 @@ mod tests {
 
     #[tokio::test]
     async fn shell_blocks_disallowed_command() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let tool = ShellTool::with_registry(
+            test_security(AutonomyLevel::Supervised),
+            test_runtime(),
+            test_registry(),
+        );
         let result = tool
             .execute(json!({"command": "rm -rf /"}))
             .await
@@ -266,7 +589,11 @@ mod tests {
 
     #[tokio::test]
     async fn shell_blocks_readonly() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::ReadOnly), test_runtime());
+        let tool = ShellTool::with_registry(
+            test_security(AutonomyLevel::ReadOnly),
+            test_runtime(),
+            test_registry(),
+        );
         let result = tool
             .execute(json!({"command": "ls"}))
             .await
@@ -281,7 +608,11 @@ mod tests {
 
     #[tokio::test]
     async fn shell_missing_command_param() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let tool = ShellTool::with_registry(
+            test_security(AutonomyLevel::Supervised),
+            test_runtime(),
+            test_registry(),
+        );
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("command"));
@@ -289,14 +620,22 @@ mod tests {
 
     #[tokio::test]
     async fn shell_wrong_type_param() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let tool = ShellTool::with_registry(
+            test_security(AutonomyLevel::Supervised),
+            test_runtime(),
+            test_registry(),
+        );
         let result = tool.execute(json!({"command": 123})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn shell_captures_exit_code() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let tool = ShellTool::with_registry(
+            test_security(AutonomyLevel::Supervised),
+            test_runtime(),
+            test_registry(),
+        );
         let result = tool
             .execute(json!({"command": "ls /nonexistent_dir_xyz"}))
             .await
@@ -427,7 +766,11 @@ mod tests {
         let _g1 = EnvGuard::set("API_KEY", "sk-test-secret-12345");
         let _g2 = EnvGuard::set("ZEROCLAW_API_KEY", "sk-test-secret-67890");
 
-        let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime());
+        let tool = ShellTool::with_registry(
+            test_security_with_env_cmd(),
+            test_runtime(),
+            test_registry(),
+        );
         let result = tool
             .execute(json!({"command": "env"}))
             .await
@@ -445,7 +788,11 @@ mod tests {
 
     #[tokio::test]
     async fn shell_preserves_path_and_home_for_env_command() {
-        let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime());
+        let tool = ShellTool::with_registry(
+            test_security_with_env_cmd(),
+            test_runtime(),
+            test_registry(),
+        );
 
         let result = tool
             .execute(json!({"command": "env"}))
@@ -480,9 +827,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn shell_allows_configured_env_passthrough() {
         let _guard = EnvGuard::set("ZEROCLAW_TEST_PASSTHROUGH", "db://unit-test");
-        let tool = ShellTool::new(
+        let tool = ShellTool::with_registry(
             test_security_with_env_passthrough(&["ZEROCLAW_TEST_PASSTHROUGH"]),
             test_runtime(),
+            test_registry(),
         );
 
         let result = tool
@@ -522,7 +870,7 @@ mod tests {
             ..SecurityPolicy::default()
         });
 
-        let tool = ShellTool::new(security.clone(), test_runtime());
+        let tool = ShellTool::with_registry(security.clone(), test_runtime(), test_registry());
         let denied = tool
             .execute(json!({"command": "touch zeroclaw_shell_approval_test"}))
             .await
@@ -599,7 +947,7 @@ mod tests {
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         });
-        let tool = ShellTool::new(security, test_runtime());
+        let tool = ShellTool::with_registry(security, test_runtime(), test_registry());
         let result = tool
             .execute(json!({"command": "echo test"}))
             .await
@@ -615,7 +963,7 @@ mod tests {
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         });
-        let tool = ShellTool::new(security, test_runtime());
+        let tool = ShellTool::with_registry(security, test_runtime(), test_registry());
         let result = tool
             .execute(json!({"command": "nonexistent_binary_xyz_12345"}))
             .await
@@ -625,7 +973,11 @@ mod tests {
 
     #[tokio::test]
     async fn shell_captures_stderr_output() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Full), test_runtime());
+        let tool = ShellTool::with_registry(
+            test_security(AutonomyLevel::Full),
+            test_runtime(),
+            test_registry(),
+        );
         let result = tool
             .execute(json!({"command": "echo error_msg >&2"}))
             .await
@@ -641,7 +993,7 @@ mod tests {
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         });
-        let tool = ShellTool::new(security, test_runtime());
+        let tool = ShellTool::with_registry(security, test_runtime(), test_registry());
 
         let r1 = tool
             .execute(json!({"command": "echo first"}))
@@ -658,5 +1010,92 @@ mod tests {
             r2.error.as_deref().unwrap_or("").contains("Rate limit")
                 || r2.error.as_deref().unwrap_or("").contains("budget")
         );
+    }
+
+    // ── Background task tests ────────────────────────────────
+
+    #[tokio::test]
+    async fn shell_background_returns_task_id() {
+        let tool = ShellTool::with_registry(
+            test_security(AutonomyLevel::Supervised),
+            test_runtime(),
+            test_registry(),
+        );
+        let result = tool
+            .execute(json!({"command": "echo background_test", "background": true}))
+            .await
+            .expect("background command should return a result");
+        assert!(result.success);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result.output).expect("output should be valid JSON");
+        assert!(parsed["task_id"].is_string());
+        assert_eq!(parsed["status"], "running");
+    }
+
+    #[tokio::test]
+    async fn shell_background_task_completes() {
+        let registry = test_registry();
+        let tool = ShellTool::with_registry(
+            test_security(AutonomyLevel::Supervised),
+            test_runtime(),
+            Arc::clone(&registry),
+        );
+        let result = tool
+            .execute(json!({"command": "echo done", "background": true}))
+            .await
+            .expect("background command should return a result");
+        let parsed: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        let task_id = parsed["task_id"].as_str().unwrap().to_string();
+
+        // Wait a moment for the monitor task to update status.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let task = registry
+            .get(&task_id)
+            .expect("task should exist in registry");
+        assert!(
+            matches!(
+                task.status,
+                BackgroundTaskStatus::Completed { exit_code: 0 }
+            ),
+            "task should have completed with exit code 0, got {:?}",
+            task.status
+        );
+    }
+
+    #[test]
+    fn background_registry_evicts_oldest_completed() {
+        let registry = BackgroundTaskRegistry::default();
+        // Fill registry with completed tasks.
+        for i in 0..MAX_BACKGROUND_TASKS {
+            let task = BackgroundTask {
+                id: format!("task-{i}"),
+                command: format!("cmd-{i}"),
+                log_path: PathBuf::from("/dev/null"),
+                #[allow(clippy::cast_possible_truncation)]
+                pid: 1000 + (i as u32),
+                started_at: chrono::Utc::now() + chrono::Duration::seconds(i as i64),
+                status: BackgroundTaskStatus::Completed { exit_code: 0 },
+            };
+            registry.insert(task);
+        }
+        assert_eq!(registry.list().len(), MAX_BACKGROUND_TASKS);
+
+        // Adding one more should evict the oldest.
+        let new_task = BackgroundTask {
+            id: "new-task".to_string(),
+            command: "new-cmd".to_string(),
+            log_path: PathBuf::from("/dev/null"),
+            pid: 9999,
+            started_at: chrono::Utc::now() + chrono::Duration::seconds(100),
+            status: BackgroundTaskStatus::Running,
+        };
+        registry.insert(new_task);
+        assert_eq!(registry.list().len(), MAX_BACKGROUND_TASKS);
+        assert!(
+            registry.get("task-0").is_none(),
+            "oldest task should be evicted"
+        );
+        assert!(registry.get("new-task").is_some());
     }
 }

@@ -36,6 +36,7 @@ impl SystemPromptBuilder {
                 Box::new(IdentitySection),
                 Box::new(ToolsSection),
                 Box::new(SafetySection),
+                Box::new(ErrorReflectionSection),
                 Box::new(SkillsSection),
                 Box::new(WorkspaceSection),
                 Box::new(DateTimeSection),
@@ -66,6 +67,7 @@ impl SystemPromptBuilder {
 pub struct IdentitySection;
 pub struct ToolsSection;
 pub struct SafetySection;
+pub struct ErrorReflectionSection;
 pub struct SkillsSection;
 pub struct WorkspaceSection;
 pub struct RuntimeSection;
@@ -145,6 +147,31 @@ impl PromptSection for SafetySection {
 
     fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
         Ok("## Safety\n\n- Do not exfiltrate private data.\n- Do not run destructive commands without asking.\n- Do not bypass oversight or approval mechanisms.\n- Prefer `trash` over `rm`.\n- When in doubt, ask before acting externally.".into())
+    }
+}
+
+impl PromptSection for ErrorReflectionSection {
+    fn name(&self) -> &str {
+        "error_reflection"
+    }
+
+    fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
+        Ok(r#"## Error Handling
+
+When a tool call fails, follow these rules:
+
+1. **Classify the error** before retrying:
+   - `policy_denied`: Blocked by security policy. Do NOT retry. Find an allowed alternative.
+   - `not_found`: File or command missing. Verify path/name first.
+   - `rate_limited`: Too many actions. Reduce frequency.
+   - `timeout`: Too slow. Break into smaller steps.
+   - `execution_failed`: Read error output carefully before retrying with fixes.
+   - `state_not_updated`: You must update the task state file before completing. Use file_write to update `state/goals.json`.
+
+2. **Never retry the same failing command more than twice.** After 2 failures with the same error type, take a different approach.
+
+3. **When stuck**, summarize what you tried and what failed, then either try a fundamentally different approach or ask the user for guidance."#
+            .into())
     }
 }
 
@@ -270,6 +297,7 @@ mod tests {
                 success: true,
                 output: "ok".into(),
                 error: None,
+                error_kind: None,
             })
         }
     }
@@ -333,6 +361,26 @@ mod tests {
         assert!(prompt.contains("## Tools"));
         assert!(prompt.contains("test_tool"));
         assert!(prompt.contains("instr"));
+        assert!(prompt.contains("## Error Handling"));
+    }
+
+    #[test]
+    fn error_reflection_section_contains_key_guidance() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+        };
+        let output = ErrorReflectionSection.build(&ctx).unwrap();
+        assert!(output.contains("## Error Handling"));
+        assert!(output.contains("policy_denied"));
+        assert!(output.contains("state_not_updated"));
+        assert!(output.contains("Never retry the same failing command more than twice"));
     }
 
     #[test]
