@@ -40,12 +40,14 @@ pub fn add_shell_job(
     let expression = schedule_cron_expression(&schedule).unwrap_or_default();
     let schedule_json = serde_json::to_string(&schedule)?;
 
+    let delete_after_run = matches!(schedule, Schedule::At { .. });
+
     with_connection(config, |conn| {
         conn.execute(
             "INSERT INTO cron_jobs (
                 id, expression, command, schedule, job_type, prompt, name, session_target, model,
                 enabled, delivery, delete_after_run, created_at, next_run
-             ) VALUES (?1, ?2, ?3, ?4, 'shell', NULL, ?5, 'isolated', NULL, 1, ?6, 0, ?7, ?8)",
+             ) VALUES (?1, ?2, ?3, ?4, 'shell', NULL, ?5, 'isolated', NULL, 1, ?6, ?7, ?8, ?9)",
             params![
                 id,
                 expression,
@@ -53,6 +55,7 @@ pub fn add_shell_job(
                 schedule_json,
                 name,
                 serde_json::to_string(&DeliveryConfig::default())?,
+                if delete_after_run { 1 } else { 0 },
                 now.to_rfc3339(),
                 next_run.to_rfc3339(),
             ],
