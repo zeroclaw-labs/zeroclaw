@@ -9,3 +9,4 @@ pub use types::{
     TierConfig,
 };
 pub mod merge;
+pub mod tagging;
