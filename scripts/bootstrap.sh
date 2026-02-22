@@ -30,6 +30,10 @@ Options:
   --guided                   Run interactive guided installer
   --no-guided                Disable guided installer
   --docker                   Run bootstrap in Docker-compatible mode and launch onboarding inside the container
+  --docker-reset             Reset existing ZeroClaw Docker containers/networks/volumes and data dir before --docker bootstrap
+  --docker-config <path>     Seed Docker config.toml from host path (skips default onboarding unless explicitly requested)
+  --docker-secret-key <path> Seed Docker .secret_key from host path (used with --docker-config encrypted secrets)
+  --docker-daemon            Start persistent Docker daemon container directly (requires --docker)
   --install-system-deps      Install build dependencies (Linux/macOS)
   --install-rust             Install Rust via rustup if missing
   --prefer-prebuilt          Try latest release binary first; fallback to source build on miss
@@ -53,6 +57,7 @@ Examples:
   ./zeroclaw_install.sh --prebuilt-only
   ./zeroclaw_install.sh --onboard --api-key "sk-..." --provider openrouter [--model "openrouter/auto"]
   ./zeroclaw_install.sh --interactive-onboard
+  ./zeroclaw_install.sh --docker --docker-config ./config.toml --docker-daemon
 
   # Compatibility entrypoint:
   ./bootstrap.sh --docker
@@ -64,6 +69,23 @@ Environment:
   ZEROCLAW_CONTAINER_CLI     Container CLI command (default: docker; auto-fallback: podman)
   ZEROCLAW_DOCKER_DATA_DIR   Host path for Docker config/workspace persistence
   ZEROCLAW_DOCKER_IMAGE      Docker image tag to build/run (default: zeroclaw-bootstrap:local)
+  ZEROCLAW_DOCKER_BROWSER_RUNTIME
+                            Browser runtime provisioning mode for --docker: "auto" (prompt), "on", or "off"
+  ZEROCLAW_DOCKER_BROWSER_SIDECAR_IMAGE
+                            Browser WebDriver sidecar image (default: selenium/standalone-chromium:latest)
+  ZEROCLAW_DOCKER_BROWSER_SIDECAR_NAME
+                            Browser WebDriver sidecar container name (default: zeroclaw-browser-webdriver)
+  ZEROCLAW_DOCKER_NETWORK    Docker network for ZeroClaw + sidecars (default: zeroclaw-bootstrap-net)
+  ZEROCLAW_DOCKER_CARGO_FEATURES
+                            Extra Cargo features for Docker builds (comma-separated)
+  ZEROCLAW_DOCKER_DAEMON_NAME
+                            Daemon container name for --docker-daemon (default: zeroclaw-daemon)
+  ZEROCLAW_DOCKER_DAEMON_BIND_HOST
+                            Host bind address for daemon port publish (default: 127.0.0.1)
+  ZEROCLAW_DOCKER_DAEMON_HOST_PORT
+                            Host port to publish daemon gateway (default: same as gateway.port)
+  ZEROCLAW_DOCKER_SECRET_KEY_FILE
+                            Host path to .secret_key used when seeding encrypted config.toml
   ZEROCLAW_API_KEY           Used when --api-key is not provided
   ZEROCLAW_PROVIDER          Used when --provider is not provided (default: openrouter)
   ZEROCLAW_MODEL             Used when --model is not provided
@@ -311,6 +333,22 @@ bool_to_word() {
   else
     echo "no"
   fi
+}
+
+string_to_bool() {
+  local value
+  value="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$value" in
+    1|true|yes|on)
+      echo "true"
+      ;;
+    0|false|no|off)
+      echo "false"
+      ;;
+    *)
+      echo "invalid"
+      ;;
+  esac
 }
 
 guided_input_stream() {
@@ -624,12 +662,323 @@ ensure_docker_ready() {
   fi
 }
 
+is_zeroclaw_container() {
+  local name="$1"
+  local image="$2"
+  local command="$3"
+  local name_lc image_lc command_lc
+
+  name_lc="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
+  image_lc="$(printf '%s' "$image" | tr '[:upper:]' '[:lower:]')"
+  command_lc="$(printf '%s' "$command" | tr '[:upper:]' '[:lower:]')"
+
+  [[ "$name_lc" == *"zeroclaw"* || "$image_lc" == *"zeroclaw"* || "$command_lc" == *"zeroclaw"* ]]
+}
+
+is_zeroclaw_resource_name() {
+  local name="$1"
+  local name_lc
+  name_lc="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
+  [[ "$name_lc" == *"zeroclaw"* ]]
+}
+
+maybe_stop_running_zeroclaw_containers() {
+  local -a running_ids running_rows
+  local id name image command row
+
+  while IFS=$'\t' read -r id name image command; do
+    if [[ -z "$id" ]]; then
+      continue
+    fi
+    if is_zeroclaw_container "$name" "$image" "$command"; then
+      running_ids+=("$id")
+      running_rows+=("$id"$'\t'"$name"$'\t'"$image"$'\t'"$command")
+    fi
+  done < <("$CONTAINER_CLI" ps --format '{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Command}}')
+
+  if [[ ${#running_ids[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  warn "Detected running ZeroClaw container(s):"
+  for row in "${running_rows[@]}"; do
+    IFS=$'\t' read -r id name image command <<<"$row"
+    echo "  - $name ($id) image=$image cmd=$command"
+  done
+
+  if ! guided_input_stream >/dev/null 2>&1; then
+    warn "Non-interactive mode detected; leaving existing ZeroClaw containers running."
+    return 0
+  fi
+
+  if prompt_yes_no "Stop these running ZeroClaw containers before continuing?" "yes"; then
+    info "Stopping ${#running_ids[@]} ZeroClaw container(s)"
+    "$CONTAINER_CLI" stop "${running_ids[@]}" >/dev/null
+  else
+    warn "Continuing with existing ZeroClaw containers still running."
+  fi
+}
+
+reset_docker_zeroclaw_resources() {
+  local docker_data_dir="$1"
+  local -a container_ids container_rows network_names volume_names
+  local id name image command row resource_name
+
+  container_ids=()
+  container_rows=()
+  network_names=()
+  volume_names=()
+
+  info "Resetting ZeroClaw Docker resources"
+
+  while IFS=$'\t' read -r id name image command; do
+    if [[ -z "$id" ]]; then
+      continue
+    fi
+    if is_zeroclaw_container "$name" "$image" "$command"; then
+      container_ids+=("$id")
+      container_rows+=("$id"$'\t'"$name"$'\t'"$image"$'\t'"$command")
+    fi
+  done < <("$CONTAINER_CLI" ps -a --format '{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Command}}')
+
+  if [[ ${#container_ids[@]} -gt 0 ]]; then
+    info "Removing ${#container_ids[@]} ZeroClaw container(s)"
+    for row in "${container_rows[@]}"; do
+      IFS=$'\t' read -r id name image command <<<"$row"
+      echo "  - $name ($id) image=$image cmd=$command"
+    done
+    "$CONTAINER_CLI" rm -f "${container_ids[@]}" >/dev/null
+  else
+    info "No existing ZeroClaw containers found"
+  fi
+
+  while IFS= read -r resource_name; do
+    if [[ -z "$resource_name" ]]; then
+      continue
+    fi
+    if is_zeroclaw_resource_name "$resource_name"; then
+      network_names+=("$resource_name")
+    fi
+  done < <("$CONTAINER_CLI" network ls --format '{{.Name}}')
+
+  if [[ ${#network_names[@]} -gt 0 ]]; then
+    info "Removing ${#network_names[@]} ZeroClaw network(s)"
+    for resource_name in "${network_names[@]}"; do
+      echo "  - $resource_name"
+      if ! "$CONTAINER_CLI" network rm "$resource_name" >/dev/null 2>&1; then
+        warn "Could not remove network '$resource_name' (it may still be in use)."
+      fi
+    done
+  else
+    info "No existing ZeroClaw networks found"
+  fi
+
+  while IFS= read -r resource_name; do
+    if [[ -z "$resource_name" ]]; then
+      continue
+    fi
+    if is_zeroclaw_resource_name "$resource_name"; then
+      volume_names+=("$resource_name")
+    fi
+  done < <("$CONTAINER_CLI" volume ls --format '{{.Name}}')
+
+  if [[ ${#volume_names[@]} -gt 0 ]]; then
+    info "Removing ${#volume_names[@]} ZeroClaw volume(s)"
+    for resource_name in "${volume_names[@]}"; do
+      echo "  - $resource_name"
+      if ! "$CONTAINER_CLI" volume rm "$resource_name" >/dev/null 2>&1; then
+        warn "Could not remove volume '$resource_name' (it may still be in use)."
+      fi
+    done
+  else
+    info "No existing ZeroClaw volumes found"
+  fi
+
+  if [[ -d "$docker_data_dir" ]]; then
+    info "Removing Docker data directory ($docker_data_dir)"
+    rm -rf "$docker_data_dir"
+  else
+    info "No Docker data directory to remove ($docker_data_dir)"
+  fi
+}
+
+ensure_docker_network() {
+  local network_name="$1"
+  if "$CONTAINER_CLI" network inspect "$network_name" >/dev/null 2>&1; then
+    return 0
+  fi
+  info "Creating Docker network ($network_name)"
+  "$CONTAINER_CLI" network create "$network_name" >/dev/null
+}
+
+toml_section_value() {
+  local file_path="$1"
+  local section_name="$2"
+  local key_name="$3"
+  awk -v target_section="[$section_name]" -v target_key="$key_name" '
+    function trim(s) {
+      sub(/^[[:space:]]+/, "", s);
+      sub(/[[:space:]]+$/, "", s);
+      return s;
+    }
+    {
+      line = $0;
+      sub(/[[:space:]]*#.*/, "", line);
+      line = trim(line);
+      if (line == "") {
+        next;
+      }
+      if (line ~ /^\[[^]]+\]$/) {
+        section = line;
+        next;
+      }
+      if (section != target_section) {
+        next;
+      }
+
+      split_pos = index(line, "=");
+      if (split_pos == 0) {
+        next;
+      }
+      key = trim(substr(line, 1, split_pos - 1));
+      if (key != target_key) {
+        next;
+      }
+      value = trim(substr(line, split_pos + 1));
+      print value;
+      exit;
+    }
+  ' "$file_path"
+}
+
+strip_toml_quotes() {
+  local value="$1"
+  value="$(printf '%s' "$value" | tr -d '\r')"
+  if [[ "$value" == \"*\" ]]; then
+    value="${value#\"}"
+    value="${value%\"}"
+  fi
+  printf '%s' "$value"
+}
+
+config_requests_webdriver_sidecar() {
+  local config_path="$1"
+  local enabled_raw backend_raw enabled backend
+
+  enabled_raw="$(toml_section_value "$config_path" "browser" "enabled" || true)"
+  backend_raw="$(toml_section_value "$config_path" "browser" "backend" || true)"
+
+  enabled="$(printf '%s' "$enabled_raw" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+  backend="$(printf '%s' "$backend_raw" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+  backend="$(strip_toml_quotes "$backend")"
+
+  if [[ "$enabled" != "true" ]]; then
+    return 1
+  fi
+
+  case "$backend" in
+    rust_native|auto)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+config_gateway_port() {
+  local config_path="$1"
+  local raw port
+  raw="$(toml_section_value "$config_path" "gateway" "port" || true)"
+  port="$(printf '%s' "$raw" | tr -cd '0-9')"
+  if [[ "$port" =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535)); then
+    printf '%s' "$port"
+  fi
+}
+
+config_has_encrypted_secrets() {
+  local config_path="$1"
+  grep -Eq "enc2:|enc:" "$config_path"
+}
+
+seed_docker_secret_key_for_config() {
+  local source_config_path="$1"
+  local target_config_dir="$2"
+  local source_secret_key_override="${3:-}"
+  local source_config_dir source_secret_key target_secret_key
+
+  source_config_dir="$(dirname "$source_config_path")"
+  if [[ -n "$source_secret_key_override" ]]; then
+    source_secret_key="$source_secret_key_override"
+  else
+    source_secret_key="$source_config_dir/.secret_key"
+  fi
+  target_secret_key="$target_config_dir/.secret_key"
+
+  if [[ -f "$source_secret_key" ]]; then
+    info "Importing secret key from $source_secret_key"
+    install -m 600 "$source_secret_key" "$target_secret_key"
+    return 0
+  fi
+
+  if config_has_encrypted_secrets "$source_config_path"; then
+    error "Encrypted secrets detected in $source_config_path, but key file was not found at:"
+    error "  $source_secret_key"
+    error "Provide the matching .secret_key next to config.toml (or via --docker-secret-key), or decrypt/remove encrypted values before bootstrap."
+    exit 1
+  fi
+}
+
+ensure_browser_webdriver_sidecar() {
+  local sidecar_name="$1"
+  local sidecar_image="$2"
+  local network_name="$3"
+
+  if "$CONTAINER_CLI" ps --format '{{.Names}}' | grep -Fxq "$sidecar_name"; then
+    info "Browser WebDriver sidecar already running ($sidecar_name)"
+    return 0
+  fi
+
+  if "$CONTAINER_CLI" ps -a --format '{{.Names}}' | grep -Fxq "$sidecar_name"; then
+    info "Starting existing browser WebDriver sidecar ($sidecar_name)"
+    "$CONTAINER_CLI" start "$sidecar_name" >/dev/null
+    return 0
+  fi
+
+  info "Starting browser WebDriver sidecar ($sidecar_name)"
+  "$CONTAINER_CLI" run -d \
+    --name "$sidecar_name" \
+    --network "$network_name" \
+    --shm-size=2g \
+    "$sidecar_image" >/dev/null
+}
+
 run_docker_bootstrap() {
   local docker_image docker_data_dir default_data_dir fallback_image
+  local seed_config_path
+  local seed_secret_key_path
   local config_mount workspace_mount
+  local docker_build_features docker_browser_runtime_mode docker_browser_runtime_bool
+  local docker_browser_sidecar_name docker_browser_sidecar_image docker_network
+  local container_network_name docker_browser_webdriver_url
+  local docker_daemon_name docker_daemon_bind_host docker_daemon_host_port docker_daemon_port
+  local config_gateway_port_value
   local -a container_run_user_args container_run_namespace_args
+  local -a container_extra_run_args container_extra_env_args docker_build_args daemon_cmd
   docker_image="${ZEROCLAW_DOCKER_IMAGE:-zeroclaw-bootstrap:local}"
   fallback_image="ghcr.io/zeroclaw-labs/zeroclaw:latest"
+  docker_build_features="${ZEROCLAW_DOCKER_CARGO_FEATURES:-}"
+  docker_browser_runtime_mode="${ZEROCLAW_DOCKER_BROWSER_RUNTIME:-auto}"
+  docker_browser_sidecar_name="${ZEROCLAW_DOCKER_BROWSER_SIDECAR_NAME:-zeroclaw-browser-webdriver}"
+  docker_browser_sidecar_image="${ZEROCLAW_DOCKER_BROWSER_SIDECAR_IMAGE:-selenium/standalone-chromium:latest}"
+  docker_network="${ZEROCLAW_DOCKER_NETWORK:-zeroclaw-bootstrap-net}"
+  docker_daemon_name="${ZEROCLAW_DOCKER_DAEMON_NAME:-zeroclaw-daemon}"
+  docker_daemon_bind_host="${ZEROCLAW_DOCKER_DAEMON_BIND_HOST:-127.0.0.1}"
+  docker_daemon_host_port="${ZEROCLAW_DOCKER_DAEMON_HOST_PORT:-}"
+  seed_config_path="${DOCKER_CONFIG_FILE:-}"
+  seed_secret_key_path="${DOCKER_SECRET_KEY_FILE:-${ZEROCLAW_DOCKER_SECRET_KEY_FILE:-}}"
+  container_network_name=""
+  docker_browser_webdriver_url=""
   if [[ "$TEMP_CLONE" == true ]]; then
     default_data_dir="$HOME/.zeroclaw-docker"
   else
@@ -638,15 +987,85 @@ run_docker_bootstrap() {
   docker_data_dir="${ZEROCLAW_DOCKER_DATA_DIR:-$default_data_dir}"
   DOCKER_DATA_DIR="$docker_data_dir"
 
+  if [[ "$DOCKER_RESET" == true ]]; then
+    reset_docker_zeroclaw_resources "$docker_data_dir"
+  fi
+
   mkdir -p "$docker_data_dir/.zeroclaw" "$docker_data_dir/workspace"
+
+  if [[ -n "$seed_config_path" ]]; then
+    if [[ ! -f "$seed_config_path" ]]; then
+      error "--docker-config file was not found: $seed_config_path"
+      exit 1
+    fi
+    info "Seeding Docker config from $seed_config_path"
+    install -m 600 "$seed_config_path" "$docker_data_dir/.zeroclaw/config.toml"
+    seed_docker_secret_key_for_config "$seed_config_path" "$docker_data_dir/.zeroclaw" "$seed_secret_key_path"
+  fi
 
   if [[ "$SKIP_INSTALL" == true ]]; then
     warn "--skip-install has no effect with --docker."
   fi
 
+  maybe_stop_running_zeroclaw_containers
+
+  docker_browser_runtime_bool="false"
+  case "$(printf '%s' "$docker_browser_runtime_mode" | tr '[:upper:]' '[:lower:]')" in
+    ""|auto)
+      if [[ -n "$seed_config_path" ]]; then
+        if config_requests_webdriver_sidecar "$seed_config_path"; then
+          docker_browser_runtime_bool="true"
+          info "Browser WebDriver sidecar enabled from seeded config ([browser] backend=rust_native/auto)."
+        else
+          docker_browser_runtime_bool="false"
+          info "Browser WebDriver sidecar disabled from seeded config."
+        fi
+      elif guided_input_stream >/dev/null 2>&1; then
+        echo
+        if prompt_yes_no "Provision browser WebDriver sidecar for Docker bootstrap?" "yes"; then
+          docker_browser_runtime_bool="true"
+        fi
+      fi
+      ;;
+    *)
+      docker_browser_runtime_bool="$(string_to_bool "$docker_browser_runtime_mode")"
+      if [[ "$docker_browser_runtime_bool" == "invalid" ]]; then
+        warn "Invalid ZEROCLAW_DOCKER_BROWSER_RUNTIME='$docker_browser_runtime_mode' (expected auto/on/off). Defaulting to off."
+        docker_browser_runtime_bool="false"
+      fi
+      ;;
+  esac
+
+  if [[ "$docker_browser_runtime_bool" == "true" ]]; then
+    if [[ ",${docker_build_features// /,}," != *,browser-native,* ]]; then
+      if [[ -n "$docker_build_features" ]]; then
+        docker_build_features+=",browser-native"
+      else
+        docker_build_features="browser-native"
+      fi
+    fi
+    ensure_docker_network "$docker_network"
+    ensure_browser_webdriver_sidecar \
+      "$docker_browser_sidecar_name" \
+      "$docker_browser_sidecar_image" \
+      "$docker_network"
+    container_network_name="$docker_network"
+    docker_browser_webdriver_url="http://${docker_browser_sidecar_name}:4444"
+    info "Browser runtime sidecar: $docker_browser_sidecar_name ($docker_browser_webdriver_url)"
+    if [[ "$SKIP_BUILD" == true ]]; then
+      warn "--skip-build enabled: existing image must already include browser-native feature for rust_native backend."
+    fi
+  fi
+
   if [[ "$SKIP_BUILD" == false ]]; then
     info "Building Docker image ($docker_image)"
-    "$CONTAINER_CLI" build --target release -t "$docker_image" "$WORK_DIR"
+    docker_build_args=(build --target release -t "$docker_image")
+    if [[ -n "$docker_build_features" ]]; then
+      info "Docker build features: $docker_build_features"
+      docker_build_args+=(--build-arg "ZEROCLAW_CARGO_FEATURES=$docker_build_features")
+    fi
+    docker_build_args+=("$WORK_DIR")
+    "$CONTAINER_CLI" "${docker_build_args[@]}"
   else
     info "Skipping Docker image build"
     if ! "$CONTAINER_CLI" image inspect "$docker_image" >/dev/null 2>&1; then
@@ -676,16 +1095,74 @@ run_docker_bootstrap() {
     container_run_user_args=(--user "$(id -u):$(id -g)")
   fi
 
+  container_extra_run_args=()
+  container_extra_env_args=()
+  if [[ -n "$container_network_name" ]]; then
+    container_extra_run_args+=(--network "$container_network_name")
+  fi
+  if [[ -n "$docker_browser_webdriver_url" ]]; then
+    container_extra_env_args+=(-e "ZEROCLAW_DOCKER_WEBDRIVER_URL=$docker_browser_webdriver_url")
+  fi
+
   info "Docker data directory: $docker_data_dir"
   info "Container CLI: $CONTAINER_CLI"
 
-  local onboard_cmd=()
-  if [[ "$INTERACTIVE_ONBOARD" == true ]]; then
-    info "Launching interactive onboarding in container"
-    onboard_cmd=(onboard --interactive)
-  else
-    if [[ -z "$API_KEY" ]]; then
-      cat <<'MSG'
+  if [[ "$DOCKER_DAEMON_MODE" == true ]]; then
+    if "$CONTAINER_CLI" ps -a --format '{{.Names}}' | grep -Fxq "$docker_daemon_name"; then
+      error "Daemon container '$docker_daemon_name' already exists."
+      error "Use --docker-reset, or remove it manually: $CONTAINER_CLI rm -f $docker_daemon_name"
+      exit 1
+    fi
+
+    config_gateway_port_value=""
+    if [[ -f "$docker_data_dir/.zeroclaw/config.toml" ]]; then
+      config_gateway_port_value="$(config_gateway_port "$docker_data_dir/.zeroclaw/config.toml" || true)"
+    fi
+    docker_daemon_port="${config_gateway_port_value:-42617}"
+    if [[ -z "$docker_daemon_host_port" ]]; then
+      docker_daemon_host_port="$docker_daemon_port"
+    fi
+
+    daemon_cmd=(run -d --name "$docker_daemon_name" --restart unless-stopped)
+    if [[ "$CONTAINER_CLI" == "podman" ]]; then
+      daemon_cmd+=("${container_run_namespace_args[@]}")
+    fi
+    daemon_cmd+=("${container_run_user_args[@]}")
+    if [[ ${#container_extra_run_args[@]} -gt 0 ]]; then
+      daemon_cmd+=("${container_extra_run_args[@]}")
+    fi
+    daemon_cmd+=(
+      -p "${docker_daemon_bind_host}:${docker_daemon_host_port}:${docker_daemon_port}"
+      -e HOME=/zeroclaw-data
+      -e ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace
+      -e ZEROCLAW_DOCKER_BOOTSTRAP=1
+    )
+    if [[ ${#container_extra_env_args[@]} -gt 0 ]]; then
+      daemon_cmd+=("${container_extra_env_args[@]}")
+    fi
+    daemon_cmd+=(
+      -v "$config_mount"
+      -v "$workspace_mount"
+      "$docker_image"
+      daemon
+      --port "$docker_daemon_port"
+    )
+
+    info "Starting daemon container ($docker_daemon_name)"
+    "$CONTAINER_CLI" "${daemon_cmd[@]}" >/dev/null
+    info "Daemon running: $docker_daemon_name (gateway: http://${docker_daemon_bind_host}:${docker_daemon_host_port})"
+    info "Follow logs: $CONTAINER_CLI logs -f $docker_daemon_name"
+    return 0
+  fi
+
+  if [[ "$RUN_ONBOARD" == true ]]; then
+    local onboard_cmd=()
+    if [[ "$INTERACTIVE_ONBOARD" == true ]]; then
+      info "Launching interactive onboarding in container"
+      onboard_cmd=(onboard --interactive)
+    else
+      if [[ -z "$API_KEY" ]]; then
+        cat <<'MSG'
 ==> Onboarding requested, but API key not provided.
 Use either:
   --api-key "sk-..."
@@ -694,28 +1171,48 @@ or:
 or run interactive:
   ./zeroclaw_install.sh --docker --interactive-onboard
 MSG
-      exit 1
+        exit 1
+      fi
+      if [[ -n "$MODEL" ]]; then
+        info "Launching quick onboarding in container (provider: $PROVIDER, model: $MODEL)"
+      else
+        info "Launching quick onboarding in container (provider: $PROVIDER)"
+      fi
+      onboard_cmd=(onboard --api-key "$API_KEY" --provider "$PROVIDER")
+      if [[ -n "$MODEL" ]]; then
+        onboard_cmd+=(--model "$MODEL")
+      fi
     fi
-    if [[ -n "$MODEL" ]]; then
-      info "Launching quick onboarding in container (provider: $PROVIDER, model: $MODEL)"
-    else
-      info "Launching quick onboarding in container (provider: $PROVIDER)"
-    fi
-    onboard_cmd=(onboard --api-key "$API_KEY" --provider "$PROVIDER")
-    if [[ -n "$MODEL" ]]; then
-      onboard_cmd+=(--model "$MODEL")
-    fi
-  fi
 
-  "$CONTAINER_CLI" run --rm -it \
-    "${container_run_namespace_args[@]}" \
-    "${container_run_user_args[@]}" \
-    -e HOME=/zeroclaw-data \
-    -e ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace \
-    -v "$config_mount" \
-    -v "$workspace_mount" \
-    "$docker_image" \
-    "${onboard_cmd[@]}"
+    if [[ "$CONTAINER_CLI" == "podman" ]]; then
+      "$CONTAINER_CLI" run --rm -it \
+        "${container_run_namespace_args[@]}" \
+        "${container_run_user_args[@]}" \
+        "${container_extra_run_args[@]+${container_extra_run_args[@]}}" \
+        -e HOME=/zeroclaw-data \
+        -e ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace \
+        -e ZEROCLAW_DOCKER_BOOTSTRAP=1 \
+        "${container_extra_env_args[@]+${container_extra_env_args[@]}}" \
+        -v "$config_mount" \
+        -v "$workspace_mount" \
+        "$docker_image" \
+        "${onboard_cmd[@]}"
+    else
+      "$CONTAINER_CLI" run --rm -it \
+        "${container_run_user_args[@]}" \
+        "${container_extra_run_args[@]+${container_extra_run_args[@]}}" \
+        -e HOME=/zeroclaw-data \
+        -e ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace \
+        -e ZEROCLAW_DOCKER_BOOTSTRAP=1 \
+        "${container_extra_env_args[@]+${container_extra_env_args[@]}}" \
+        -v "$config_mount" \
+        -v "$workspace_mount" \
+        "$docker_image" \
+        "${onboard_cmd[@]}"
+    fi
+  else
+    info "Skipping onboarding container run (--onboard not requested)."
+  fi
 }
 
 SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
@@ -726,6 +1223,10 @@ ORIGINAL_ARG_COUNT=$#
 GUIDED_MODE="auto"
 
 DOCKER_MODE=false
+DOCKER_RESET=false
+DOCKER_DAEMON_MODE=false
+DOCKER_CONFIG_FILE=""
+DOCKER_SECRET_KEY_FILE=""
 INSTALL_SYSTEM_DEPS=false
 INSTALL_RUST=false
 PREFER_PREBUILT=false
@@ -753,6 +1254,30 @@ while [[ $# -gt 0 ]]; do
       ;;
     --docker)
       DOCKER_MODE=true
+      shift
+      ;;
+    --docker-reset)
+      DOCKER_RESET=true
+      shift
+      ;;
+    --docker-config)
+      DOCKER_CONFIG_FILE="${2:-}"
+      [[ -n "$DOCKER_CONFIG_FILE" ]] || {
+        error "--docker-config requires a value"
+        exit 1
+      }
+      shift 2
+      ;;
+    --docker-secret-key)
+      DOCKER_SECRET_KEY_FILE="${2:-}"
+      [[ -n "$DOCKER_SECRET_KEY_FILE" ]] || {
+        error "--docker-secret-key requires a value"
+        exit 1
+      }
+      shift 2
+      ;;
+    --docker-daemon)
+      DOCKER_DAEMON_MODE=true
       shift
       ;;
     --install-system-deps)
@@ -847,6 +1372,36 @@ if [[ "$DOCKER_MODE" == true && "$GUIDED_MODE" == "on" ]]; then
   GUIDED_MODE="off"
 fi
 
+if [[ "$DOCKER_RESET" == true && "$DOCKER_MODE" == false ]]; then
+  error "--docker-reset requires --docker."
+  exit 1
+fi
+
+if [[ -n "$DOCKER_CONFIG_FILE" && "$DOCKER_MODE" == false ]]; then
+  error "--docker-config requires --docker."
+  exit 1
+fi
+
+if [[ -n "$DOCKER_SECRET_KEY_FILE" && "$DOCKER_MODE" == false ]]; then
+  error "--docker-secret-key requires --docker."
+  exit 1
+fi
+
+if [[ -n "$DOCKER_SECRET_KEY_FILE" && -z "$DOCKER_CONFIG_FILE" ]]; then
+  error "--docker-secret-key requires --docker-config."
+  exit 1
+fi
+
+if [[ "$DOCKER_DAEMON_MODE" == true && "$DOCKER_MODE" == false ]]; then
+  error "--docker-daemon requires --docker."
+  exit 1
+fi
+
+if [[ "$DOCKER_DAEMON_MODE" == true && "$RUN_ONBOARD" == true ]]; then
+  error "--docker-daemon cannot be combined with --onboard/--interactive-onboard."
+  exit 1
+fi
+
 if [[ "$GUIDED_MODE" == "on" ]]; then
   run_guided_installer "$OS_NAME"
 fi
@@ -929,25 +1484,46 @@ fi
 if [[ "$DOCKER_MODE" == true ]]; then
   ensure_docker_ready
   if [[ "$RUN_ONBOARD" == false ]]; then
-    RUN_ONBOARD=true
-    if [[ -z "$API_KEY" ]]; then
-      INTERACTIVE_ONBOARD=true
+    if [[ -n "$DOCKER_CONFIG_FILE" || "$DOCKER_DAEMON_MODE" == true ]]; then
+      RUN_ONBOARD=false
+    else
+      RUN_ONBOARD=true
+      if [[ -z "$API_KEY" ]]; then
+        INTERACTIVE_ONBOARD=true
+      fi
     fi
   fi
   run_docker_bootstrap
-  cat <<'DONE'
-
-✅ Docker bootstrap complete.
-
-Your containerized ZeroClaw data is persisted under:
-DONE
+  echo
+  echo "✅ Docker bootstrap complete."
+  echo
+  echo "Your containerized ZeroClaw data is persisted under:"
   echo "  $DOCKER_DATA_DIR"
-  cat <<'DONE'
+  echo
 
+  if [[ "$DOCKER_DAEMON_MODE" == true ]]; then
+    daemon_name="${ZEROCLAW_DOCKER_DAEMON_NAME:-zeroclaw-daemon}"
+    echo "Daemon mode is active; onboarding was intentionally skipped."
+    echo "  container: $daemon_name"
+    echo "  logs:      $CONTAINER_CLI logs -f $daemon_name"
+    echo "  stop:      $CONTAINER_CLI rm -f $daemon_name"
+    echo
+    echo "Optional next steps:"
+    echo "  ./zeroclaw_install.sh --docker --interactive-onboard"
+  elif [[ "$RUN_ONBOARD" == false ]]; then
+    echo "Onboarding was intentionally skipped (pre-seeded config mode)."
+    echo
+    echo "Next steps:"
+    echo "  ./zeroclaw_install.sh --docker --docker-config ./config.toml --docker-daemon"
+    echo "  ./zeroclaw_install.sh --docker --interactive-onboard"
+  else
+    cat <<'DONE'
 Next steps:
   ./zeroclaw_install.sh --docker --interactive-onboard
   ./zeroclaw_install.sh --docker --api-key "sk-..." --provider openrouter
+  ./zeroclaw_install.sh --docker --docker-config ./config.toml --docker-daemon
 DONE
+  fi
   exit 0
 fi
 

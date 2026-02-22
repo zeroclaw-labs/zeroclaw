@@ -261,15 +261,16 @@ fn extract_host(url: &str) -> anyhow::Result<String> {
 }
 
 fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
-    if allowed_domains.iter().any(|domain| domain == "*") {
-        return true;
-    }
-
-    allowed_domains.iter().any(|domain| {
-        host == domain
-            || host
-                .strip_suffix(domain)
-                .is_some_and(|prefix| prefix.ends_with('.'))
+    allowed_domains.iter().any(|pattern| {
+        if pattern == "*" {
+            return true;
+        }
+        if pattern.starts_with("*.") {
+            let suffix = &pattern[1..]; // ".example.com"
+            host.ends_with(suffix) || host == &pattern[2..]
+        } else {
+            host == pattern || host.ends_with(&format!(".{pattern}"))
+        }
     })
 }
 
@@ -368,6 +369,14 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("local/private"));
+    }
+
+    #[test]
+    fn validate_accepts_wildcard_subdomain_pattern() {
+        let tool = test_tool(vec!["*.example.com"]);
+        assert!(tool.validate_url("https://example.com").is_ok());
+        assert!(tool.validate_url("https://sub.example.com").is_ok());
+        assert!(tool.validate_url("https://other.com").is_err());
     }
 
     #[test]
