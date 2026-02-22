@@ -2230,28 +2230,62 @@ impl Channel for TelegramChannel {
         // Clean up rate-limit tracking for this chat
         self.last_draft_edit.lock().remove(&chat_id);
 
+        // Parse attachments before processing
+        let (text_without_markers, attachments) = parse_attachment_markers(text);
+
+        // Parse message ID once for reuse
+        let msg_id = match message_id.parse::<i64>() {
+            Ok(id) => Some(id),
+            Err(e) => {
+                tracing::warn!("Invalid Telegram message_id '{message_id}': {e}");
+                None
+            }
+        };
+
+        // If we have attachments, delete the draft and send fresh messages
+        // (Telegram editMessageText can't add attachments)
+        if !attachments.is_empty() {
+            // Delete the draft message
+            if let Some(id) = msg_id {
+                let _ = self
+                    .client
+                    .post(self.api_url("deleteMessage"))
+                    .json(&serde_json::json!({
+                        "chat_id": chat_id,
+                        "message_id": id,
+                    }))
+                    .send()
+                    .await;
+            }
+
+            // Send text without markers
+            if !text_without_markers.is_empty() {
+                self.send_text_chunks(&text_without_markers, &chat_id, thread_id.as_deref())
+                    .await?;
+            }
+
+            // Send attachments
+            for attachment in &attachments {
+                self.send_attachment(&chat_id, thread_id.as_deref(), attachment)
+                    .await?;
+            }
+
+            return Ok(());
+        }
+
         // If text exceeds limit, delete draft and send as chunked messages
         if text.len() > TELEGRAM_MAX_MESSAGE_LENGTH {
-            let msg_id = match message_id.parse::<i64>() {
-                Ok(id) => id,
-                Err(e) => {
-                    tracing::warn!("Invalid Telegram message_id '{message_id}': {e}");
-                    return self
-                        .send_text_chunks(text, &chat_id, thread_id.as_deref())
-                        .await;
-                }
-            };
-
-            // Delete the draft
-            let _ = self
-                .client
-                .post(self.api_url("deleteMessage"))
-                .json(&serde_json::json!({
-                    "chat_id": chat_id,
-                    "message_id": msg_id,
-                }))
-                .send()
-                .await;
+            if let Some(id) = msg_id {
+                let _ = self
+                    .client
+                    .post(self.api_url("deleteMessage"))
+                    .json(&serde_json::json!({
+                        "chat_id": chat_id,
+                        "message_id": id,
+                    }))
+                    .send()
+                    .await;
+            }
 
             // Fall back to chunked send
             return self
@@ -2259,20 +2293,16 @@ impl Channel for TelegramChannel {
                 .await;
         }
 
-        let msg_id = match message_id.parse::<i64>() {
-            Ok(id) => id,
-            Err(e) => {
-                tracing::warn!("Invalid Telegram message_id '{message_id}': {e}");
-                return self
-                    .send_text_chunks(text, &chat_id, thread_id.as_deref())
-                    .await;
-            }
+        let Some(id) = msg_id else {
+            return self
+                .send_text_chunks(text, &chat_id, thread_id.as_deref())
+                .await;
         };
 
         // Try editing with HTML formatting
         let body = serde_json::json!({
             "chat_id": chat_id,
-            "message_id": msg_id,
+            "message_id": id,
             "text": Self::markdown_to_telegram_html(text),
             "parse_mode": "HTML",
         });
@@ -2291,7 +2321,7 @@ impl Channel for TelegramChannel {
         // Markdown failed — retry without parse_mode
         let plain_body = serde_json::json!({
             "chat_id": chat_id,
-            "message_id": msg_id,
+            "message_id": id,
             "text": text,
         });
 
