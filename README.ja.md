@@ -16,8 +16,7 @@
   <a href="https://zeroclawlabs.cn/group.jpg"><img src="https://img.shields.io/badge/WeChat-Group-B7D7A8?logo=wechat&logoColor=white" alt="WeChat Group" /></a>
   <a href="https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search"><img src="https://img.shields.io/badge/Xiaohongshu-Official-FF2442?style=flat" alt="Xiaohongshu: Official" /></a>
   <a href="https://t.me/zeroclawlabs"><img src="https://img.shields.io/badge/Telegram-%40zeroclawlabs-26A5E4?style=flat&logo=telegram&logoColor=white" alt="Telegram: @zeroclawlabs" /></a>
-  <a href="https://t.me/zeroclawlabs_cn"><img src="https://img.shields.io/badge/Telegram%20CN-%40zeroclawlabs__cn-26A5E4?style=flat&logo=telegram&logoColor=white" alt="Telegram CN: @zeroclawlabs_cn" /></a>
-  <a href="https://t.me/zeroclawlabs_ru"><img src="https://img.shields.io/badge/Telegram%20RU-%40zeroclawlabs__ru-26A5E4?style=flat&logo=telegram&logoColor=white" alt="Telegram RU: @zeroclawlabs_ru" /></a>
+  <a href="https://www.facebook.com/groups/zeroclaw"><img src="https://img.shields.io/badge/Facebook-Group-1877F2?style=flat&logo=facebook&logoColor=white" alt="Facebook Group" /></a>
   <a href="https://www.reddit.com/r/zeroclawlabs/"><img src="https://img.shields.io/badge/Reddit-r%2Fzeroclawlabs-FF4500?style=flat&logo=reddit&logoColor=white" alt="Reddit: r/zeroclawlabs" /></a>
 </p>
 
@@ -55,7 +54,7 @@
 | 日付 (UTC) | レベル | お知らせ | 対応 |
 |---|---|---|---|
 | 2026-02-19 | _緊急_ | 私たちは `openagen/zeroclaw` および `zeroclaw.org` とは**一切関係ありません**。`zeroclaw.org` は現在 `openagen/zeroclaw` の fork を指しており、そのドメイン/リポジトリは当プロジェクトの公式サイト・公式プロジェクトを装っています。 | これらの情報源による案内、バイナリ、資金調達情報、公式発表は信頼しないでください。必ず[本リポジトリ](https://github.com/zeroclaw-labs/zeroclaw)と認証済み公式SNSのみを参照してください。 |
-| 2026-02-21 | _重要_ | 公式サイトを公開しました: [zeroclawlabs.ai](https://zeroclawlabs.ai)。公開までお待ちいただきありがとうございました。引き続きなりすましの試みを確認しているため、ZeroClaw 名義の投資・資金調達などの案内は、公式チャネルで確認できない限り参加しないでください。 | 情報は[本リポジトリ](https://github.com/zeroclaw-labs/zeroclaw)を最優先で確認し、[X（@zeroclawlabs）](https://x.com/zeroclawlabs?s=21)、[Reddit（r/zeroclawlabs）](https://www.reddit.com/r/zeroclawlabs/)、[Telegram（@zeroclawlabs）](https://t.me/zeroclawlabs)、[Telegram CN（@zeroclawlabs_cn）](https://t.me/zeroclawlabs_cn)、[Telegram RU（@zeroclawlabs_ru）](https://t.me/zeroclawlabs_ru) と [小紅書アカウント](https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search) で公式更新を確認してください。 |
+| 2026-02-21 | _重要_ | 公式サイトを公開しました: [zeroclawlabs.ai](https://zeroclawlabs.ai)。公開までお待ちいただきありがとうございました。引き続きなりすましの試みを確認しているため、ZeroClaw 名義の投資・資金調達などの案内は、公式チャネルで確認できない限り参加しないでください。 | 情報は[本リポジトリ](https://github.com/zeroclaw-labs/zeroclaw)を最優先で確認し、[X（@zeroclawlabs）](https://x.com/zeroclawlabs?s=21)、[Telegram（@zeroclawlabs）](https://t.me/zeroclawlabs)、[Facebook（グループ）](https://www.facebook.com/groups/zeroclaw)、[Reddit（r/zeroclawlabs）](https://www.reddit.com/r/zeroclawlabs/) と [小紅書アカウント](https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search) で公式更新を確認してください。 |
 | 2026-02-19 | _重要_ | Anthropic は 2026-02-19 に Authentication and Credential Use を更新しました。条文では、OAuth authentication（Free/Pro/Max）は Claude Code と Claude.ai 専用であり、Claude Free/Pro/Max で取得した OAuth トークンを他の製品・ツール・サービス（Agent SDK を含む）で使用することは許可されず、Consumer Terms of Service 違反に該当すると明記されています。 | 損失回避のため、当面は Claude Code OAuth 連携を試さないでください。原文: [Authentication and Credential Use](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use)。 |
 
 ## 概要
