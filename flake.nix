@@ -8,7 +8,7 @@
     nixpkgs.url = "nixpkgs/nixos-unstable";
   };
 
-  outputs = { flake-utils, fenix, nixpkgs, ... }:
+  outputs = { self, flake-utils, fenix, nixpkgs, ... }:
     let
       nixosModule = { pkgs, ... }: {
         nixpkgs.overlays = [ fenix.overlays.default ];
@@ -37,8 +37,20 @@
           "rustc"
           "rustfmt"
         ];
+        zeroclaw = pkgs.rustPlatform.buildRustPackage {
+          pname = "zeroclaw";
+          version = (pkgs.lib.importTOML ./Cargo.toml).package.version;
+          src = self;
+          doCheck = false;
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+          };
+        };
       in {
-        packages.default = fenix.packages.${system}.stable.toolchain;
+        packages = {
+          default = zeroclaw;
+          zeroclaw = zeroclaw;
+        };
         devShells.default = pkgs.mkShell {
           packages = [
             rustToolchain
