@@ -17,10 +17,12 @@
 //! in [`create_provider_with_url`]. See `AGENTS.md` §7.1 for the full change playbook.
 
 pub mod anthropic;
+mod backoff;
 pub mod bedrock;
 pub mod compatible;
 pub mod copilot;
 pub mod gemini;
+pub mod health;
 pub mod ollama;
 pub mod openai;
 pub mod openai_codex;
@@ -35,6 +37,8 @@ pub use traits::{
     ChatMessage, ChatRequest, ChatResponse, ConversationMessage, Provider, ProviderCapabilityError,
     ToolCall, ToolResultMessage,
 };
+
+pub use health::{ProviderHealthState, ProviderHealthTracker};
 
 use crate::auth::AuthService;
 use compatible::{AuthStyle, OpenAiCompatibleProvider};

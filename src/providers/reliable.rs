@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 // ── Error Classification ─────────────────────────────────────────────────
@@ -231,6 +232,8 @@ pub struct ReliableProvider {
     key_index: AtomicUsize,
     /// Per-model fallback chains: model_name → [fallback_model_1, fallback_model_2, ...]
     model_fallbacks: HashMap<String, Vec<String>>,
+    /// Provider health tracker with circuit breaker
+    health: Arc<super::health::ProviderHealthTracker>,
 }
 
 impl ReliableProvider {
@@ -239,6 +242,13 @@ impl ReliableProvider {
         max_retries: u32,
         base_backoff_ms: u64,
     ) -> Self {
+        // Default circuit breaker settings: 3 failures, 60s cooldown
+        let health = Arc::new(super::health::ProviderHealthTracker::new(
+            3,
+            Duration::from_secs(60),
+            100,
+        ));
+
         Self {
             providers,
             max_retries,
@@ -246,6 +256,7 @@ impl ReliableProvider {
             api_keys: Vec::new(),
             key_index: AtomicUsize::new(0),
             model_fallbacks: HashMap::new(),
+            health,
         }
     }
 
@@ -318,6 +329,17 @@ impl Provider for ReliableProvider {
         // retryable error, sleep with exponential backoff and retry.
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
+                // Check circuit breaker
+                if let Err((remaining, state)) = self.health.should_try(provider_name) {
+                    tracing::warn!(
+                        provider = provider_name,
+                        remaining_secs = remaining.as_secs(),
+                        failure_count = state.failure_count,
+                        "Skipping provider - circuit breaker open"
+                    );
+                    continue;
+                }
+
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -326,6 +348,7 @@ impl Provider for ReliableProvider {
                         .await
                     {
                         Ok(resp) => {
+                            self.health.record_success(provider_name);
                             if attempt > 0 || *current_model != model {
                                 tracing::info!(
                                     provider = provider_name,
@@ -343,6 +366,9 @@ impl Provider for ReliableProvider {
                             let rate_limited = is_rate_limited(&e);
                             let failure_reason = failure_reason(rate_limited, non_retryable);
                             let error_detail = compact_error_detail(&e);
+
+                            // Record failure in health tracker
+                            self.health.record_failure(provider_name, &error_detail);
 
                             push_failure(
                                 &mut failures,
@@ -438,6 +464,17 @@ impl Provider for ReliableProvider {
 
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
+                // Check circuit breaker
+                if let Err((remaining, state)) = self.health.should_try(provider_name) {
+                    tracing::warn!(
+                        provider = provider_name,
+                        remaining_secs = remaining.as_secs(),
+                        failure_count = state.failure_count,
+                        "Skipping provider - circuit breaker open"
+                    );
+                    continue;
+                }
+
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -446,6 +483,7 @@ impl Provider for ReliableProvider {
                         .await
                     {
                         Ok(resp) => {
+                            self.health.record_success(provider_name);
                             if attempt > 0 || *current_model != model {
                                 tracing::info!(
                                     provider = provider_name,
@@ -463,6 +501,9 @@ impl Provider for ReliableProvider {
                             let rate_limited = is_rate_limited(&e);
                             let failure_reason = failure_reason(rate_limited, non_retryable);
                             let error_detail = compact_error_detail(&e);
+
+                            // Record failure in health tracker
+                            self.health.record_failure(provider_name, &error_detail);
 
                             push_failure(
                                 &mut failures,
@@ -562,6 +603,17 @@ impl Provider for ReliableProvider {
 
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
+                // Check circuit breaker
+                if let Err((remaining, state)) = self.health.should_try(provider_name) {
+                    tracing::warn!(
+                        provider = provider_name,
+                        remaining_secs = remaining.as_secs(),
+                        failure_count = state.failure_count,
+                        "Skipping provider - circuit breaker open"
+                    );
+                    continue;
+                }
+
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -570,6 +622,7 @@ impl Provider for ReliableProvider {
                         .await
                     {
                         Ok(resp) => {
+                            self.health.record_success(provider_name);
                             if attempt > 0 || *current_model != model {
                                 tracing::info!(
                                     provider = provider_name,
@@ -587,6 +640,9 @@ impl Provider for ReliableProvider {
                             let rate_limited = is_rate_limited(&e);
                             let failure_reason = failure_reason(rate_limited, non_retryable);
                             let error_detail = compact_error_detail(&e);
+
+                            // Record failure in health tracker
+                            self.health.record_failure(provider_name, &error_detail);
 
                             push_failure(
                                 &mut failures,
@@ -672,6 +728,17 @@ impl Provider for ReliableProvider {
 
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
+                // Check circuit breaker
+                if let Err((remaining, state)) = self.health.should_try(provider_name) {
+                    tracing::warn!(
+                        provider = provider_name,
+                        remaining_secs = remaining.as_secs(),
+                        failure_count = state.failure_count,
+                        "Skipping provider - circuit breaker open"
+                    );
+                    continue;
+                }
+
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -681,6 +748,7 @@ impl Provider for ReliableProvider {
                     };
                     match provider.chat(req, current_model, temperature).await {
                         Ok(resp) => {
+                            self.health.record_success(provider_name);
                             if attempt > 0 || *current_model != model {
                                 tracing::info!(
                                     provider = provider_name,
@@ -698,6 +766,9 @@ impl Provider for ReliableProvider {
                             let rate_limited = is_rate_limited(&e);
                             let failure_reason = failure_reason(rate_limited, non_retryable);
                             let error_detail = compact_error_detail(&e);
+
+                            // Record failure in health tracker
+                            self.health.record_failure(provider_name, &error_detail);
 
                             push_failure(
                                 &mut failures,
