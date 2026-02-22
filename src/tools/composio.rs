@@ -791,6 +791,9 @@ fn build_tool_slug_candidates(action_name: &str) -> Vec<String> {
         }
     };
 
+    // Keep the original slug/name first so execute() honors exact tool IDs
+    // returned by Composio list APIs before trying normalized variants.
+    push_candidate(trimmed.to_string());
     push_candidate(normalize_tool_slug(trimmed));
 
     let lower = trimmed.to_ascii_lowercase();
@@ -801,6 +804,11 @@ fn build_tool_slug_candidates(action_name: &str) -> Vec<String> {
 
     let hyphen_lower = lower.replace('_', "-");
     push_candidate(hyphen_lower);
+
+    let upper = trimmed.to_ascii_uppercase();
+    push_candidate(upper.clone());
+    push_candidate(upper.replace('-', "_"));
+    push_candidate(upper.replace('_', "-"));
 
     candidates
 }
@@ -848,7 +856,15 @@ fn normalize_action_cache_key(alias: &str) -> Option<String> {
         return None;
     }
 
-    Some(trimmed.to_ascii_lowercase())
+    Some(
+        trimmed
+            .to_ascii_lowercase()
+            .replace('_', "-")
+            .split('-')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("-"),
+    )
 }
 
 fn build_connected_account_hint(
@@ -1233,28 +1249,22 @@ mod tests {
     }
 
     #[test]
-    fn composio_actions_response_deserializes() {
-        let json_str = r#"{"items": [{"name": "TEST_ACTION", "appName": "test", "description": "A test", "enabled": true}]}"#;
+    fn composio_tools_response_deserializes() {
+        let json_str = r#"{"items": [{"slug": "test-action", "name": "TEST_ACTION", "appName": "test", "description": "A test"}]}"#;
         let resp: ComposioToolsResponse = serde_json::from_str(json_str).unwrap();
         assert_eq!(resp.items.len(), 1);
-        assert_eq!(
-            resp.items[0]
-                .slug
-                .as_ref()
-                .unwrap_or(&resp.items[0].name.as_ref().unwrap().clone()),
-            "TEST_ACTION"
-        );
+        assert_eq!(resp.items[0].slug.as_deref(), Some("test-action"));
     }
 
     #[test]
-    fn composio_actions_response_empty() {
+    fn composio_tools_response_empty() {
         let json_str = r#"{"items": []}"#;
         let resp: ComposioToolsResponse = serde_json::from_str(json_str).unwrap();
         assert!(resp.items.is_empty());
     }
 
     #[test]
-    fn composio_actions_response_missing_items_defaults() {
+    fn composio_tools_response_missing_items_defaults() {
         let json_str = r"{}";
         let resp: ComposioToolsResponse = serde_json::from_str(json_str).unwrap();
         assert!(resp.items.is_empty());
@@ -1304,14 +1314,33 @@ mod tests {
     #[test]
     fn build_tool_slug_candidates_cover_common_variants() {
         let candidates = build_tool_slug_candidates("GMAIL_FETCH_EMAILS");
+        assert_eq!(
+            candidates.first().map(String::as_str),
+            Some("GMAIL_FETCH_EMAILS")
+        );
         assert!(candidates.contains(&"gmail-fetch-emails".to_string()));
         assert!(candidates.contains(&"gmail_fetch_emails".to_string()));
+        assert!(candidates.contains(&"GMAIL_FETCH_EMAILS".to_string()));
 
         let hyphen = build_tool_slug_candidates("github-list-repos");
         assert_eq!(
             hyphen.first().map(String::as_str),
             Some("github-list-repos")
         );
+        assert!(hyphen.contains(&"github_list_repos".to_string()));
+    }
+
+    #[test]
+    fn normalize_action_cache_key_merges_underscore_and_hyphen_variants() {
+        assert_eq!(
+            normalize_action_cache_key(" GMAIL_FETCH_EMAILS ").as_deref(),
+            Some("gmail-fetch-emails")
+        );
+        assert_eq!(
+            normalize_action_cache_key("gmail-fetch-emails").as_deref(),
+            Some("gmail-fetch-emails")
+        );
+        assert_eq!(normalize_action_cache_key("  ").as_deref(), None);
     }
 
     #[test]
@@ -1489,10 +1518,10 @@ mod tests {
         let mut items = Vec::new();
         for i in 0..100 {
             items.push(json!({
+                "slug": format!("action-{i}"),
                 "name": format!("ACTION_{i}"),
-                "appName": "test",
-                "description": "Test action",
-                "enabled": true
+                "app_name": "test",
+                "description": "Test action"
             }));
         }
         let json_str = json!({"items": items}).to_string();
@@ -1557,7 +1586,6 @@ mod tests {
     fn resolve_picks_first_usable_when_multiple_accounts_exist() {
         // Regression test for issue #959: previously returned None when
         // multiple accounts existed, causing the LLM to loop on the OAuth URL.
-        let _tool = ComposioTool::new("test-key", None, test_security());
         let accounts = vec![
             ComposioConnectedAccount {
                 id: "ca_old".to_string(),
