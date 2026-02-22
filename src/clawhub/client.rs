@@ -1,4 +1,4 @@
-use crate::clawhub::types::{ClawHubSkill, SearchResult, SearchResultItem, SkillDetail};
+use crate::clawhub::types::{ClawHubSkill, SearchResult, SkillDetail};
 use anyhow::{Context, Result};
 use reqwest::Client;
 use std::time::Duration;

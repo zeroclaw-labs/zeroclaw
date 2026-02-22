@@ -95,8 +95,8 @@ async fn handle_search(query: &str, limit: usize) -> Result<()> {
 async fn handle_install(
     slug: &str,
     _version: Option<&str>,
-    config_dir: &PathBuf,
-    workspace_dir: &PathBuf,
+    config_dir: &Path,
+    workspace_dir: &Path,
 ) -> Result<()> {
     println!("Installing skill: {}", slug);
 
@@ -213,7 +213,7 @@ fn handle_list(config_dir: &PathBuf) -> Result<()> {
     }
 
     println!("Installed ClawHub skills ({}):\n", skills.len());
-    println!("  {:<20} {:<10} {}", "Name", "Version", "Installed");
+    println!("  {:<20} {:<10} Installed", "Name", "Version");
     println!("  {}", "-".repeat(50));
 
     for skill in skills {
@@ -234,10 +234,10 @@ async fn handle_update(config_dir: &PathBuf, _workspace_dir: &PathBuf) -> Result
 
     for skill in registry.list_skills() {
         if let Ok(remote) = client.get_skill(&skill.slug).await {
-            if remote.version != skill.version {
-                println!("  {}: {} -> {}", skill.slug, skill.version, remote.version);
-            } else {
+            if remote.version == skill.version {
                 println!("  {}: {} (up to date)", skill.slug, skill.version);
+            } else {
+                println!("  {}: {} -> {}", skill.slug, skill.version, remote.version);
             }
         }
     }
@@ -334,7 +334,7 @@ pub fn update_skills_readme(skills_dir: &Path, clawhub_skills: &[InstalledSkill]
             ));
         }
 
-        content.push_str("\n");
+        content.push('\n');
     }
 
     // Installation instructions

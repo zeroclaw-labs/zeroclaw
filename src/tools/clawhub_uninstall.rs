@@ -57,7 +57,7 @@ impl Tool for ClawhubUninstallTool {
 
         // Remove the skill directory
         match std::fs::remove_dir_all(&skill_dir) {
-            Ok(_) => Ok(ToolResult {
+            Ok(()) => Ok(ToolResult {
                 success: true,
                 output: format!(
                     "Successfully uninstalled skill '{}'.\n\

@@ -11,7 +11,3 @@ pub mod registry;
 pub mod types;
 
 pub use cli::*;
-pub use client::*;
-pub use downloader::*;
-pub use registry::*;
-pub use types::*;
