@@ -132,11 +132,11 @@ fn write_guest_bytes(
 ) -> Result<(i32, i32)> {
     let len_i32 = i32::try_from(bytes.len()).context("input too large for wasm ABI i32 length")?;
     let ptr = alloc
-        .call(store, len_i32)
+        .call(&mut *store, len_i32)
         .context("wasm alloc call failed")?;
     let ptr_usize = usize::try_from(ptr).context("wasm alloc returned invalid pointer")?;
     memory
-        .write(store, ptr_usize, bytes)
+        .write(&mut *store, ptr_usize, bytes)
         .context("failed to write input bytes into wasm memory")?;
     Ok((ptr, len_i32))
 }
@@ -150,12 +150,12 @@ fn read_guest_bytes(store: &mut Store<()>, memory: &Memory, ptr: i32, len: i32) 
     let end = ptr_usize
         .checked_add(len_usize)
         .context("overflow in output range")?;
-    if end > memory.data_size(store) {
+    if end > memory.data_size(&mut *store) {
         anyhow::bail!("output range exceeds wasm memory bounds");
     }
     let mut out = vec![0u8; len_usize];
     memory
-        .read(store, ptr_usize, &mut out)
+        .read(&mut *store, ptr_usize, &mut out)
         .context("failed to read wasm output bytes")?;
     Ok(out)
 }
@@ -304,7 +304,7 @@ fn registry_cell() -> &'static RwLock<RuntimeState> {
     CELL.get_or_init(|| RwLock::new(RuntimeState::default()))
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct RuntimeState {
     registry: PluginRegistry,
     hot_reload: bool,
