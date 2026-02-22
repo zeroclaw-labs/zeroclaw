@@ -123,6 +123,7 @@ credential is not reused for fallback providers.
 - [Osaurus](https://github.com/dinoki-ai/osaurus) is a unified AI edge runtime for macOS (Apple Silicon) that combines local MLX inference with cloud provider proxying through a single endpoint.
 - Supports multiple API formats simultaneously: OpenAI-compatible (`/v1/chat/completions`), Anthropic (`/messages`), Ollama (`/chat`), and Open Responses (`/v1/responses`).
 - Built-in MCP (Model Context Protocol) support for tool and context server connectivity.
+- MCP server registration is handled by Osaurus; ZeroClaw onboarding does not manage MCP server entries.
 - Local models run via MLX (Llama, Qwen, Gemma, GLM, Phi, Nemotron, and others); cloud models are proxied transparently.
 
 ### Bedrock Notes

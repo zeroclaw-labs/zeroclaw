@@ -47,6 +47,7 @@ Last verified: **February 21, 2026**.
   - Provider-only update (update provider/model/API key while preserving existing channels, tunnel, memory, hooks, and other settings)
 - In non-interactive environments, existing `config.toml` causes a safe refusal unless `--force` is passed.
 - Use `zeroclaw onboard --channels-only` when you only need to rotate channel tokens/allowlists.
+- `onboard` does not register MCP servers; configure MCP server connections in your MCP-capable runtime/client.
 
 ### `agent`
 
