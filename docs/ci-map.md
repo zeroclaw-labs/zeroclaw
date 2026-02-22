@@ -61,19 +61,6 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
     - Noise control: excludes common test/fixture paths and test file patterns by default (`include_tests=false`)
 - `.github/workflows/pub-release.yml` (`Release`)
     - Purpose: build release artifacts in verification mode (manual/scheduled) and publish GitHub releases on tag push or manual publish mode
-    - Additional behavior: `release_trigger_guard.py` enforces stable-tag contract, annotated-tag requirement, actor authorization allowlist, and emits trigger-provenance audit artifacts
-    - Additional behavior: `release_artifact_guard.py` enforces `.github/release/release-artifact-contract.json` in verify/publish stages and emits auditable guard reports (`release-artifact-guard-verify`, `release-artifact-guard.publish.json`)
-    - Additional behavior: `release_notes_with_supply_chain_refs.py` composes release-note preface links for manifest/SBOM/provenance artifacts while GitHub auto-generates commit-window notes
-- `.github/workflows/pub-prerelease.yml` (`Pub Pre-release`)
-    - Purpose: validate alpha/beta/rc/stable policy matrix integrity, enforce stage progression + monotonic stage numbering + tag/version integrity, publish transition audit trail and release-stage history, and optionally publish GitHub prerelease assets
-- `.github/workflows/ci-canary-gate.yml` (`CI Canary Gate`)
-    - Purpose: evaluate canary metrics against policy thresholds (`promote` / `hold` / `abort`) with auditable artifacts, guarded execute mode, and optional auto-dispatch to `CI Rollback Guard` on `abort`
-- `.github/workflows/docs-deploy.yml` (`Docs Deploy`)
-    - Purpose: docs quality checks + preview artifacts + GitHub Pages production deployment lane
-    - Additional behavior: `docs_deploy_guard.py` enforces `.github/release/docs-deploy-policy.json` for preview/production promotion and manual rollback ref validation, with audit-event artifacts
-- `.github/workflows/pub-homebrew-core.yml` (`Pub Homebrew Core`)
-    - Purpose: manual, bot-owned Homebrew core formula bump PR flow for tagged releases
-    - Guardrail: release tag must match `Cargo.toml` version
 - `.github/workflows/pr-label-policy-check.yml` (`Label Policy Sanity`)
     - Purpose: validate shared contributor-tier policy in `.github/label-policy.json` and ensure label workflows consume that policy
 - `.github/workflows/test-rust-build.yml` (`Rust Reusable Job`)
@@ -113,17 +100,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 - `Feature Matrix`: PR/push on Rust + workflow paths, merge queue, weekly schedule, manual dispatch
 - `Nightly All-Features`: daily schedule and manual dispatch
 - `Release`: tag push (`v*`), weekly schedule (verification-only), manual dispatch (verification or publish)
-- `Pub Pre-release`: pre-release tag pushes (`v*-alpha.*`, `v*-beta.*`, `v*-rc.*`) and manual dispatch
-- `CI Canary Gate`: weekly schedule (policy check) and manual dispatch (`dry-run` / `execute`)
-- `Docs Deploy`: docs/README path changes on PR/push + manual dispatch (`preview` / `production`)
-- `Connectivity Probes`: manual dispatch only (legacy wrapper)
-- `Pub Homebrew Core`: manual dispatch only
-- `Security Audit`: push to `dev` and `main`, PRs to `dev` and `main`, merge queue `merge_group` for `dev`/`main`, weekly schedule
-- `CI/CD Change Audit`: PR/push on CI/security workflow paths, manual dispatch
-- `CI Provider Connectivity`: schedule every 6 hours, manual dispatch, and PR/push for probe config/script/workflow changes
-- `CI Reproducible Build`: PR/push on Rust/build paths, weekly schedule, manual dispatch
-- `CI Supply Chain Provenance`: push on Rust/build paths, weekly schedule, manual dispatch
-- `CI Rollback Guard`: weekly schedule (plan-only) and manual dispatch (`dry-run` or guarded `execute`)
+- `Security Audit`: push to `dev` and `main`, PRs to `dev` and `main`, weekly schedule
 - `Sec Vorpal Reviewdog`: manual dispatch only
 - `Workflow Sanity`: PR/push when `.github/workflows/**`, `.github/*.yml`, or `.github/*.yaml` change
 - `Main Promotion Gate`: PRs to `main` only; requires PR author `willsarg`/`theonlyhennygod` and head branch `dev` in the same repository
@@ -141,27 +118,12 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 2. Docker failures on PRs: inspect `.github/workflows/pub-docker-img.yml` `pr-smoke` job.
    - For tag-publish failures, inspect `ghcr-publish-contract.json` / `audit-event-ghcr-publish-contract.json`, `ghcr-vulnerability-gate.json` / `audit-event-ghcr-vulnerability-gate.json`, and Trivy artifacts from `pub-docker-img.yml`.
 3. Release failures (tag/manual/scheduled): inspect `.github/workflows/pub-release.yml` and the `prepare` job outputs.
-   - Start with `release-trigger-guard.json` / `audit-event-release-trigger-guard.json` artifacts for authorization and provenance failures.
-   - Then inspect `release-artifact-guard.verify.json` / `release-artifact-guard.publish.json` and corresponding audit-event envelopes for contract completeness failures.
-4. Homebrew formula publish failures: inspect `.github/workflows/pub-homebrew-core.yml` summary output and bot token/fork variables.
-5. Security failures: inspect `.github/workflows/sec-audit.yml` and `deny.toml`.
-6. Connectivity probe failures: inspect `connectivity-summary.md` and `connectivity-report.json` artifacts from `.github/workflows/ci-connectivity-probes.yml`; apply runbook in `docs/operations/connectivity-probes-runbook.md`.
-7. CI policy failures (`unpinned action` / `pipe-to-shell` / `permissions: write-all` / `pull_request_target`): inspect `.github/workflows/ci-change-audit.yml` summary + artifact.
-8. Provider connectivity drift/incidents: inspect `.github/workflows/ci-provider-connectivity.yml` summary + artifact.
-9. Reproducibility drift signals: inspect `.github/workflows/ci-reproducible-build.yml` artifacts.
-10. Provenance/signing failures: inspect `.github/workflows/ci-supply-chain-provenance.yml` logs and bundle artifacts.
-11. Rollback planning/execution issues: inspect `.github/workflows/ci-rollback.yml` summary + `ci-rollback-plan` artifact.
-12. Workflow syntax/lint failures: inspect `.github/workflows/workflow-sanity.yml`.
-13. PR intake failures: inspect `.github/workflows/pr-intake-checks.yml` sticky comment and run logs.
-14. Label policy parity failures: inspect `.github/workflows/pr-label-policy-check.yml`.
-15. Docs failures in CI: inspect `docs-quality` job logs in `.github/workflows/ci-run.yml`.
-16. Strict delta lint failures in CI: inspect `lint-strict-delta` job logs and compare with `BASE_SHA` diff scope.
-17. Suspected flaky tests: inspect `Test Flake Retry Probe` summary and `test-flake-probe` artifact in `.github/workflows/ci-run.yml`.
-18. Feature-combo regressions: inspect `.github/workflows/feature-matrix.yml` summary artifact and lane JSON reports.
-19. Nightly integration drift: inspect `.github/workflows/nightly-all-features.yml` summary and lane owner mapping.
-20. Pre-release stage gate failures: inspect `.github/workflows/pub-prerelease.yml` guard artifact (`prerelease-guard.json`), starting from `transition` and `stage_history` fields.
-21. Canary gate hold/abort decisions: inspect `.github/workflows/ci-canary-gate.yml` guard artifact (`canary-guard.json`); on `abort`, verify rollback dispatch summary and follow-up `ci-rollback` run.
-22. Docs deploy failures: inspect `.github/workflows/docs-deploy.yml` quality lane + preview/deploy artifacts and `docs-deploy-guard.json` / `audit-event-docs-deploy-guard.json`.
+4. Security failures: inspect `.github/workflows/sec-audit.yml` and `deny.toml`.
+5. Workflow syntax/lint failures: inspect `.github/workflows/workflow-sanity.yml`.
+6. PR intake failures: inspect `.github/workflows/pr-intake-checks.yml` sticky comment and run logs.
+7. Label policy parity failures: inspect `.github/workflows/pr-label-policy-check.yml`.
+8. Docs failures in CI: inspect `docs-quality` job logs in `.github/workflows/ci-run.yml`.
+9. Strict delta lint failures in CI: inspect `lint-strict-delta` job logs and compare with `BASE_SHA` diff scope.
 
 ## Maintenance Rules
 
