@@ -49,13 +49,13 @@ impl TierWeights {
 /// Merge candidates from all tiers into a ranked, deduplicated, diverse list.
 ///
 /// Scoring formula:
-///   final_score = tier_weight * base_score + 0.25 * recency_score + 0.15 * link_boost
-/// where link_boost = 0.15 if has_cross_tier_link else 0.0
+///   final_score = tier_weight * base_score + 0.25 * recency_score + link_boost
+///   where link_boost = 0.15 if has_cross_tier_link else 0.0
 ///
 /// Deduplication: keep highest final_score per origin_id
 /// Threshold: filter items where final_score < min_threshold
 /// Diversity guard: reserve 1 slot each for STM and MTM if available
-/// Result: top-k by final_score
+/// Returns items in descending `final_score` order.
 pub fn merge_and_rank(
     items: Vec<TieredRecallItem>,
     weights: &TierWeights,
@@ -75,7 +75,7 @@ pub fn merge_and_rank(
         .collect();
 
     // 2. Sort descending by final_score so dedup keeps the best per origin.
-    scored.sort_by(|a, b| b.final_score.partial_cmp(&a.final_score).unwrap());
+    scored.sort_by(|a, b| b.final_score.total_cmp(&a.final_score));
 
     // 3. Deduplicate: keep first (highest-scored) occurrence per origin_id.
     let mut seen_origins: HashSet<String> = HashSet::new();
@@ -119,7 +119,7 @@ fn apply_diversity_guard(
         reserved_ids.insert(m.entry_id.clone());
     }
 
-    let reserved_count = reserved_ids.len();
+    let reserved_count = stm_candidate.is_some() as usize + mtm_candidate.is_some() as usize;
 
     // Build the general pool: everything that is NOT a reserved candidate.
     let remaining: Vec<TieredRecallItem> = items
@@ -142,7 +142,7 @@ fn apply_diversity_guard(
     }
 
     // Re-sort and truncate to top_k.
-    result.sort_by(|a, b| b.final_score.partial_cmp(&a.final_score).unwrap());
+    result.sort_by(|a, b| b.final_score.total_cmp(&a.final_score));
     result.truncate(top_k);
     result
 }
@@ -227,5 +227,16 @@ mod tests {
         let weights = TierWeights { stm: 0.45, mtm: 0.35, ltm: 0.20 };
         let merged = merge_and_rank(vec![normal, boosted], &weights, 0.0, 5);
         assert_eq!(merged[0].entry_id, "boosted");
+    }
+
+    #[test]
+    fn merge_handles_nan_scores_without_panic() {
+        let mut nan_item = make_item("nan", MemoryTier::Stm, f32::NAN, 100);
+        nan_item.base_score = f32::NAN;
+        let normal = make_item("normal", MemoryTier::Ltm, 0.8, 100);
+        let weights = TierWeights { stm: 0.45, mtm: 0.35, ltm: 0.20 };
+        // Should not panic
+        let result = merge_and_rank(vec![nan_item, normal], &weights, 0.0, 5);
+        assert!(!result.is_empty());
     }
 }
