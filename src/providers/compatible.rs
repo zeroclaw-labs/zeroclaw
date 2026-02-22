@@ -879,8 +879,12 @@ impl OpenAiCompatibleProvider {
         })
     }
 
-    fn to_message_content(role: &str, content: &str) -> MessageContent {
-        if role != "user" {
+    fn to_message_content(
+        role: &str,
+        content: &str,
+        allow_user_image_parts: bool,
+    ) -> MessageContent {
+        if role != "user" || !allow_user_image_parts {
             return MessageContent::Text(content.to_string());
         }
 
@@ -906,7 +910,10 @@ impl OpenAiCompatibleProvider {
         MessageContent::Parts(parts)
     }
 
-    fn convert_messages_for_native(messages: &[ChatMessage]) -> Vec<NativeMessage> {
+    fn convert_messages_for_native(
+        messages: &[ChatMessage],
+        allow_user_image_parts: bool,
+    ) -> Vec<NativeMessage> {
         messages
             .iter()
             .map(|message| {
@@ -980,7 +987,11 @@ impl OpenAiCompatibleProvider {
 
                 NativeMessage {
                     role: message.role.clone(),
-                    content: Some(Self::to_message_content(&message.role, &message.content)),
+                    content: Some(Self::to_message_content(
+                        &message.role,
+                        &message.content,
+                        allow_user_image_parts,
+                    )),
                     tool_call_id: None,
                     tool_calls: None,
                     reasoning_content: None,
@@ -1107,7 +1118,7 @@ impl Provider for OpenAiCompatibleProvider {
             };
             messages.push(Message {
                 role: "user".to_string(),
-                content: Self::to_message_content("user", &content),
+                content: Self::to_message_content("user", &content, !self.merge_system_into_user),
             });
         } else {
             if let Some(sys) = system_prompt {
@@ -1118,7 +1129,7 @@ impl Provider for OpenAiCompatibleProvider {
             }
             messages.push(Message {
                 role: "user".to_string(),
-                content: Self::to_message_content("user", message),
+                content: Self::to_message_content("user", message, true),
             });
         }
 
@@ -1236,7 +1247,11 @@ impl Provider for OpenAiCompatibleProvider {
             .iter()
             .map(|m| Message {
                 role: m.role.clone(),
-                content: Self::to_message_content(&m.role, &m.content),
+                content: Self::to_message_content(
+                    &m.role,
+                    &m.content,
+                    !self.merge_system_into_user,
+                ),
             })
             .collect();
 
@@ -1342,7 +1357,11 @@ impl Provider for OpenAiCompatibleProvider {
             .iter()
             .map(|m| Message {
                 role: m.role.clone(),
-                content: Self::to_message_content(&m.role, &m.content),
+                content: Self::to_message_content(
+                    &m.role,
+                    &m.content,
+                    !self.merge_system_into_user,
+                ),
             })
             .collect();
 
@@ -1449,7 +1468,10 @@ impl Provider for OpenAiCompatibleProvider {
         };
         let native_request = NativeChatRequest {
             model: model.to_string(),
-            messages: Self::convert_messages_for_native(&effective_messages),
+            messages: Self::convert_messages_for_native(
+                &effective_messages,
+                !self.merge_system_into_user,
+            ),
             temperature,
             stream: Some(false),
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
@@ -1586,7 +1608,7 @@ impl Provider for OpenAiCompatibleProvider {
         }
         messages.push(Message {
             role: "user".to_string(),
-            content: Self::to_message_content("user", message),
+            content: Self::to_message_content("user", message, !self.merge_system_into_user),
         });
 
         let request = ApiChatRequest {
@@ -2167,13 +2189,29 @@ mod tests {
             r#"{"tool_call_id":"call_abc","content":"done"}"#,
         )];
 
-        let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input);
+        let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input, true);
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].role, "tool");
         assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_abc"));
         assert!(matches!(
             converted[0].content.as_ref(),
             Some(MessageContent::Text(value)) if value == "done"
+        ));
+    }
+
+    #[test]
+    fn convert_messages_for_native_keeps_user_image_markers_as_text_when_disabled() {
+        let input = vec![ChatMessage::user(
+            "System primer [IMAGE:data:image/png;base64,abcd] user turn",
+        )];
+
+        let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input, false);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, "user");
+        assert!(matches!(
+            converted[0].content.as_ref(),
+            Some(MessageContent::Text(value))
+                if value == "System primer [IMAGE:data:image/png;base64,abcd] user turn"
         ));
     }
 
@@ -2293,7 +2331,7 @@ mod tests {
     fn to_message_content_converts_image_markers_to_openai_parts() {
         let content = "Describe this\n\n[IMAGE:data:image/png;base64,abcd]";
         let value = serde_json::to_value(OpenAiCompatibleProvider::to_message_content(
-            "user", content,
+            "user", content, true,
         ))
         .unwrap();
         let parts = value
@@ -2307,10 +2345,21 @@ mod tests {
     }
 
     #[test]
+    fn to_message_content_keeps_markers_as_text_when_user_image_parts_disabled() {
+        let content = "Policy [IMAGE:data:image/png;base64,abcd]";
+        let value = serde_json::to_value(OpenAiCompatibleProvider::to_message_content(
+            "user", content, false,
+        ))
+        .unwrap();
+        assert_eq!(value, serde_json::json!(content));
+    }
+
+    #[test]
     fn to_message_content_keeps_plain_text_for_non_user_roles() {
         let value = serde_json::to_value(OpenAiCompatibleProvider::to_message_content(
             "system",
             "You are a helpful assistant.",
+            true,
         ))
         .unwrap();
         assert_eq!(value, serde_json::json!("You are a helpful assistant."));
@@ -2716,7 +2765,7 @@ mod tests {
         });
 
         let messages = vec![ChatMessage::assistant(history_json.to_string())];
-        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages);
+        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages, true);
         assert_eq!(native.len(), 1);
         assert_eq!(native[0].role, "assistant");
         assert_eq!(
@@ -2739,7 +2788,7 @@ mod tests {
         });
 
         let messages = vec![ChatMessage::assistant(history_json.to_string())];
-        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages);
+        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages, true);
         assert_eq!(native.len(), 1);
         assert!(native[0].reasoning_content.is_none());
     }
