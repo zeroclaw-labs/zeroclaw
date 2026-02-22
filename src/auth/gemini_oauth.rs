@@ -253,6 +253,14 @@ pub async fn start_device_code_flow(client: &Client) -> Result<DeviceCodeStart> 
         .context("Failed to read device code response")?;
 
     if !status.is_success() {
+        // Detect Cloudflare blocks specifically
+        if status == 403 && (body.contains("Cloudflare") || body.contains("challenge-platform")) {
+            anyhow::bail!(
+                "Device-code endpoint is protected by Cloudflare (403 Forbidden). \
+                This is expected for server environments. Use browser flow instead."
+            );
+        }
+
         if let Ok(err) = serde_json::from_str::<OAuthErrorResponse>(&body) {
             anyhow::bail!(
                 "Google device code error: {} - {}",
@@ -485,7 +493,24 @@ pub fn parse_code_from_redirect(input: &str, expected_state: Option<&str>) -> Re
         if let Some(expected) = expected_state {
             if let Some(actual) = params.get("state") {
                 if actual != expected {
-                    anyhow::bail!("OAuth state mismatch: expected {expected}, got {actual}");
+                    let mut err_msg = format!(
+                        "OAuth state mismatch: expected {}, got {}",
+                        expected, actual
+                    );
+
+                    // Add helpful hint if truncation detected
+                    if let Some(hint) =
+                        crate::auth::oauth_common::detect_url_truncation(input, expected.len())
+                    {
+                        err_msg.push_str(&format!(
+                            "\n\n💡 Tip: {}\n   \
+                            Try copying ONLY the authorization code instead of the full URL.\n   \
+                            The code looks like: 4/0AfrIep...",
+                            hint
+                        ));
+                    }
+
+                    anyhow::bail!(err_msg);
                 }
             }
         }
