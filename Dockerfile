@@ -74,7 +74,6 @@ allowed_users = ["8519504418"]
 port = 8080
 host = "0.0.0.0"
 allow_public_bind = true
-paired_tokens = ["5247d9d046f1e53ed49a0f5b4d509cd8432aae614fb8971c9f3d3821866fb8e7"]
 EOF
 
 RUN chmod 600 /zeroclaw-data/.zeroclaw/config.toml && \
