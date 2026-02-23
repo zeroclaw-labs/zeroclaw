@@ -27,6 +27,7 @@ pub mod cron_run;
 pub mod cron_runs;
 pub mod cron_update;
 pub mod delegate;
+pub mod dynamic_registry;
 pub mod file_edit;
 pub mod file_read;
 pub mod file_write;
