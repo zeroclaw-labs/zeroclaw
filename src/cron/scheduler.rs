@@ -111,9 +111,9 @@ async fn process_due_jobs(
         )
         .buffer_unordered(max_concurrent);
 
-    while let Some((job_id, success)) = in_flight.next().await {
+    while let Some((job_id, success, output)) = in_flight.next().await {
         if !success {
-            tracing::warn!("Scheduler job '{job_id}' failed");
+            tracing::warn!("Scheduler job '{job_id}' failed: {output}");
         }
     }
 }
@@ -123,7 +123,7 @@ async fn execute_and_persist_job(
     security: &SecurityPolicy,
     job: &CronJob,
     component: &str,
-) -> (String, bool) {
+) -> (String, bool, String) {
     crate::health::mark_component_ok(component);
     warn_if_high_frequency_agent_job(job);
 
@@ -132,7 +132,7 @@ async fn execute_and_persist_job(
     let finished_at = Utc::now();
     let success = persist_job_result(config, job, success, &output, started_at, finished_at).await;
 
-    (job.id.clone(), success)
+    (job.id.clone(), success, output)
 }
 
 async fn run_agent_job(
