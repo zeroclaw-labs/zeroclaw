@@ -4504,6 +4504,37 @@ Tail"#;
     }
 
     #[test]
+    fn parse_tool_calls_handles_minimax_toolcall_alias_and_cross_close_tag() {
+        let response = r#"<tool_call>
+{"name":"shell","arguments":{"command":"date"}}
+</minimax:toolcall>"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "date"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_perl_style_tool_call_blocks() {
+        let response = r#"TOOL_CALL
+{tool => "shell", args => { --command "uname -a" }}}
+/TOOL_CALL"#;
+
+        let calls = parse_perl_style_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "uname -a"
+        );
+    }
+
+    #[test]
     fn parse_tool_calls_recovers_unclosed_tool_call_with_json() {
         let response = r#"I will call the tool now.
 <tool_call>
@@ -5453,6 +5484,25 @@ Let me check the result."#;
         let call = parse_glm_shortened_body("memory_recall>recent meetings").unwrap();
         assert_eq!(call.name, "memory_recall");
         assert_eq!(call.arguments["query"], "recent meetings");
+    }
+
+    #[test]
+    fn parse_glm_shortened_body_function_style_alias_maps_to_message_send() {
+        let call =
+            parse_glm_shortened_body(r#"sendmessage(channel="alerts", message="hi")"#).unwrap();
+        assert_eq!(call.name, "message_send");
+        assert_eq!(call.arguments["channel"], "alerts");
+        assert_eq!(call.arguments["message"], "hi");
+    }
+
+    #[test]
+    fn map_tool_name_alias_direct_coverage() {
+        assert_eq!(map_tool_name_alias("bash"), "shell");
+        assert_eq!(map_tool_name_alias("filelist"), "file_list");
+        assert_eq!(map_tool_name_alias("memorystore"), "memory_store");
+        assert_eq!(map_tool_name_alias("memoryforget"), "memory_forget");
+        assert_eq!(map_tool_name_alias("http"), "http_request");
+        assert_eq!(map_tool_name_alias("totally_unknown_tool"), "totally_unknown_tool");
     }
 
     #[test]

@@ -2348,6 +2348,51 @@ mod tests {
     }
 
     #[test]
+    fn user_agent_constructor_keeps_native_tool_calling_enabled() {
+        let p = OpenAiCompatibleProvider::new_with_user_agent(
+            "TestProvider",
+            "https://example.com",
+            Some("k"),
+            AuthStyle::Bearer,
+            "zeroclaw-test/1.0",
+        );
+        let caps = <OpenAiCompatibleProvider as Provider>::capabilities(&p);
+        assert!(caps.native_tool_calling);
+        assert!(!caps.vision);
+        assert_eq!(p.user_agent.as_deref(), Some("zeroclaw-test/1.0"));
+    }
+
+    #[test]
+    fn user_agent_and_vision_constructor_preserves_capability_flags() {
+        let p = OpenAiCompatibleProvider::new_with_user_agent_and_vision(
+            "VisionProvider",
+            "https://example.com",
+            Some("k"),
+            AuthStyle::Bearer,
+            "zeroclaw-test/vision",
+            true,
+        );
+        let caps = <OpenAiCompatibleProvider as Provider>::capabilities(&p);
+        assert!(caps.native_tool_calling);
+        assert!(caps.vision);
+        assert_eq!(p.user_agent.as_deref(), Some("zeroclaw-test/vision"));
+    }
+
+    #[test]
+    fn no_responses_fallback_constructor_keeps_native_tool_calling_enabled() {
+        let p = OpenAiCompatibleProvider::new_no_responses_fallback(
+            "FallbackProvider",
+            "https://example.com",
+            Some("k"),
+            AuthStyle::Bearer,
+        );
+        let caps = <OpenAiCompatibleProvider as Provider>::capabilities(&p);
+        assert!(caps.native_tool_calling);
+        assert!(!caps.vision);
+        assert!(p.user_agent.is_none());
+    }
+
+    #[test]
     fn to_message_content_converts_image_markers_to_openai_parts() {
         let content = "Describe this\n\n[IMAGE:data:image/png;base64,abcd]";
         let value = serde_json::to_value(OpenAiCompatibleProvider::to_message_content(

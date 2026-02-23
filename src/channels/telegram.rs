@@ -4057,6 +4057,65 @@ mod tests {
         assert!(ch.transcription.is_none());
     }
 
+    #[tokio::test]
+    async fn try_parse_voice_message_returns_none_when_transcription_disabled() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false);
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 1,
+                "voice": { "file_id": "voice_file", "duration": 4 },
+                "from": { "id": 123, "username": "alice" },
+                "chat": { "id": 456, "type": "private" }
+            }
+        });
+
+        let parsed = ch.try_parse_voice_message(&update).await;
+        assert!(parsed.is_none());
+    }
+
+    #[tokio::test]
+    async fn try_parse_voice_message_skips_when_duration_exceeds_limit() {
+        let mut tc = crate::config::TranscriptionConfig::default();
+        tc.enabled = true;
+        tc.max_duration_secs = 5;
+
+        let ch =
+            TelegramChannel::new("token".into(), vec!["*".into()], false).with_transcription(tc);
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 2,
+                "voice": { "file_id": "voice_file", "duration": 30 },
+                "from": { "id": 123, "username": "alice" },
+                "chat": { "id": 456, "type": "private" }
+            }
+        });
+
+        let parsed = ch.try_parse_voice_message(&update).await;
+        assert!(parsed.is_none());
+    }
+
+    #[tokio::test]
+    async fn try_parse_voice_message_rejects_unauthorized_sender_before_download() {
+        let mut tc = crate::config::TranscriptionConfig::default();
+        tc.enabled = true;
+        tc.max_duration_secs = 120;
+
+        let ch = TelegramChannel::new("token".into(), vec!["alice".into()], false)
+            .with_transcription(tc);
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 3,
+                "voice": { "file_id": "voice_file", "duration": 4 },
+                "from": { "id": 999, "username": "bob" },
+                "chat": { "id": 456, "type": "private" }
+            }
+        });
+
+        let parsed = ch.try_parse_voice_message(&update).await;
+        assert!(parsed.is_none());
+        assert!(ch.voice_transcriptions.lock().is_empty());
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     // Live e2e: voice transcription via Groq Whisper + reply cache lookup
     // ─────────────────────────────────────────────────────────────────────
