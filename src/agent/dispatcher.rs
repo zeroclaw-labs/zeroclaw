@@ -3,6 +3,24 @@ use crate::tools::{Tool, ToolSpec};
 use serde_json::Value;
 use std::fmt::Write;
 
+/// Format dynamic tool specs as XML-style tool documentation, matching
+/// the format produced by `XmlToolDispatcher::prompt_instructions`.
+pub fn format_dynamic_tool_docs(specs: &[ToolSpec]) -> String {
+    if specs.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    out.push_str("\n\n### Dynamic Tools\n\n");
+    for spec in specs {
+        let _ = writeln!(
+            out,
+            "- **{}**: {}\n  Parameters: `{}`",
+            spec.name, spec.description, spec.parameters
+        );
+    }
+    out
+}
+
 #[derive(Debug, Clone)]
 pub struct ParsedToolCall {
     pub name: String,

@@ -204,6 +204,40 @@ pub async fn run_stdio_server(bridge: Arc<McpToolBridge>) -> anyhow::Result<()> 
     }
 }
 
+/// Emit a `notifications/tools/list_changed` notification if the tool revision
+/// has changed since the last check. Returns the new revision.
+async fn maybe_emit_tools_changed<W>(
+    stdout: &mut W,
+    bridge: &McpToolBridge,
+    last_revision: u64,
+    mode: TransportMode,
+) -> anyhow::Result<u64>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let current = bridge.tool_revision();
+    if current != last_revision {
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/tools/list_changed"
+        });
+        match mode {
+            TransportMode::Newline => {
+                let mut bytes = serde_json::to_vec(&notification)?;
+                bytes.push(b'\n');
+                stdout.write_all(&bytes).await?;
+                stdout.flush().await?;
+            }
+            TransportMode::ContentLength => {
+                let frame = encode_frame(&notification)?;
+                stdout.write_all(&frame).await?;
+                stdout.flush().await?;
+            }
+        }
+    }
+    Ok(current)
+}
+
 /// Newline-delimited JSON transport: each line is a complete JSON-RPC message.
 async fn run_newline_mode<R, W>(
     reader: &mut BufReader<R>,
@@ -215,6 +249,8 @@ where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
+    let mut last_tool_revision = bridge.tool_revision();
+
     // Process the first line if provided.
     if let Some(line) = first_line {
         let trimmed = line.trim();
@@ -227,6 +263,13 @@ where
                     stdout.write_all(&bytes).await?;
                     stdout.flush().await?;
                 }
+                last_tool_revision = maybe_emit_tools_changed(
+                    stdout,
+                    bridge,
+                    last_tool_revision,
+                    TransportMode::Newline,
+                )
+                .await?;
             }
         }
     }
@@ -254,6 +297,14 @@ where
         bytes.push(b'\n');
         stdout.write_all(&bytes).await?;
         stdout.flush().await?;
+
+        last_tool_revision = maybe_emit_tools_changed(
+            stdout,
+            bridge,
+            last_tool_revision,
+            TransportMode::Newline,
+        )
+        .await?;
     }
 }
 
@@ -268,6 +319,7 @@ where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
+    let mut last_tool_revision = bridge.tool_revision();
     // We may already have the first header line.
     let mut pending_header = first_header_line;
 
@@ -321,6 +373,14 @@ where
         let frame = encode_frame(&resp)?;
         stdout.write_all(&frame).await?;
         stdout.flush().await?;
+
+        last_tool_revision = maybe_emit_tools_changed(
+            stdout,
+            bridge,
+            last_tool_revision,
+            TransportMode::ContentLength,
+        )
+        .await?;
     }
 }
 

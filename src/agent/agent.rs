@@ -1,5 +1,6 @@
 use crate::agent::dispatcher::{
-    NativeToolDispatcher, ParsedToolCall, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
+    format_dynamic_tool_docs, NativeToolDispatcher, ParsedToolCall, ToolDispatcher,
+    ToolExecutionResult, XmlToolDispatcher,
 };
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
@@ -9,6 +10,7 @@ use crate::observability::{self, Observer, ObserverEvent};
 use crate::providers::{self, ChatMessage, ChatRequest, ConversationMessage, Provider};
 use crate::runtime;
 use crate::security::SecurityPolicy;
+use crate::tools::dynamic_registry::DynamicRegistry;
 use crate::tools::{self, Tool, ToolSpec};
 use anyhow::Result;
 use std::io::Write as IoWrite;
@@ -33,6 +35,7 @@ pub struct Agent {
     skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
     auto_save: bool,
     history: Vec<ConversationMessage>,
+    dynamic_registry: Option<Arc<DynamicRegistry>>,
     classification_config: crate::config::QueryClassificationConfig,
     available_hints: Vec<String>,
 }
@@ -53,6 +56,7 @@ pub struct AgentBuilder {
     skills: Option<Vec<crate::skills::Skill>>,
     skills_prompt_mode: Option<crate::config::SkillsPromptInjectionMode>,
     auto_save: Option<bool>,
+    dynamic_registry: Option<Arc<DynamicRegistry>>,
     classification_config: Option<crate::config::QueryClassificationConfig>,
     available_hints: Option<Vec<String>>,
 }
@@ -75,6 +79,7 @@ impl AgentBuilder {
             skills: None,
             skills_prompt_mode: None,
             auto_save: None,
+            dynamic_registry: None,
             classification_config: None,
             available_hints: None,
         }
@@ -171,6 +176,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn dynamic_registry(mut self, dynamic_registry: Arc<DynamicRegistry>) -> Self {
+        self.dynamic_registry = Some(dynamic_registry);
+        self
+    }
+
     pub fn build(self) -> Result<Agent> {
         let tools = self
             .tools
@@ -210,6 +220,7 @@ impl AgentBuilder {
             skills: self.skills.unwrap_or_default(),
             skills_prompt_mode: self.skills_prompt_mode.unwrap_or_default(),
             auto_save: self.auto_save.unwrap_or(false),
+            dynamic_registry: self.dynamic_registry,
             history: Vec::new(),
             classification_config: self.classification_config.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
@@ -259,7 +270,7 @@ impl Agent {
             None
         };
 
-        let tools = tools::all_tools_with_runtime(
+        let mut tools = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
             runtime,
@@ -273,6 +284,33 @@ impl Agent {
             config.api_key.as_deref(),
             config,
         );
+
+        // Create DynamicRegistry for runtime tool/hook management.
+        let persistence_path = config
+            .workspace_dir
+            .join(".zeroclaw")
+            .join("state")
+            .join("dynamic-registry.json");
+
+        let build_ctx = crate::tools::dynamic_factories::ToolBuildContext {
+            security: security.clone(),
+            workspace_dir: config.workspace_dir.clone(),
+        };
+
+        let dynamic_registry = Arc::new(DynamicRegistry::new(
+            Vec::new(), // no static tools in registry for v1 — they stay in Agent.tools
+            config.dynamic_registry.clone(),
+            persistence_path,
+            build_ctx,
+        ));
+
+        // Add meta-tools for runtime tool/hook management.
+        tools.push(Box::new(crate::tools::manage_tools::ManageToolsTool::new(
+            dynamic_registry.clone(),
+        )));
+        tools.push(Box::new(crate::tools::manage_hooks::ManageHooksTool::new(
+            dynamic_registry.clone(),
+        )));
 
         let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
 
@@ -326,6 +364,7 @@ impl Agent {
             ))
             .skills_prompt_mode(config.skills.prompt_injection_mode)
             .auto_save(config.memory.auto_save)
+            .dynamic_registry(dynamic_registry)
             .build()
     }
 
@@ -405,6 +444,34 @@ impl Agent {
                     format!("Error executing {}: {e}", call.name)
                 }
             }
+        } else if let Some(ref registry) = self.dynamic_registry {
+            let snapshot = registry.snapshot();
+            if let Some(tool) = snapshot.all_tools.iter().find(|t| t.name() == call.name) {
+                match tool.execute(call.arguments.clone()).await {
+                    Ok(r) => {
+                        self.observer.record_event(&ObserverEvent::ToolCall {
+                            tool: call.name.clone(),
+                            duration: start.elapsed(),
+                            success: r.success,
+                        });
+                        if r.success {
+                            r.output
+                        } else {
+                            format!("Error: {}", r.error.unwrap_or(r.output))
+                        }
+                    }
+                    Err(e) => {
+                        self.observer.record_event(&ObserverEvent::ToolCall {
+                            tool: call.name.clone(),
+                            duration: start.elapsed(),
+                            success: false,
+                        });
+                        format!("Error executing {}: {e}", call.name)
+                    }
+                }
+            } else {
+                format!("Unknown tool: {}", call.name)
+            }
         } else {
             format!("Unknown tool: {}", call.name)
         };
@@ -444,7 +511,57 @@ impl Agent {
     }
 
     pub async fn turn(&mut self, user_message: &str) -> Result<String> {
-        if self.history.is_empty() {
+        // Collect dynamic tool specs from the registry snapshot (single snapshot for consistency).
+        let dynamic_specs: Vec<ToolSpec> = if let Some(ref registry) = self.dynamic_registry {
+            let snapshot = registry.snapshot();
+            snapshot.all_tools.iter().map(|t| t.spec()).collect()
+        } else {
+            Vec::new()
+        };
+
+        // Refresh combined tool specs (static + dynamic).
+        if !dynamic_specs.is_empty() {
+            let mut specs: Vec<ToolSpec> = self.tools.iter().map(|t| t.spec()).collect();
+            specs.extend(dynamic_specs.iter().cloned());
+            self.tool_specs = specs;
+        }
+
+        // For prompt-guided dispatch, regenerate the system prompt each turn so
+        // dynamic tool documentation stays current (tools may be added/removed between turns).
+        // Native providers send tools via ChatRequest.tools and don't need this.
+        if !self.tool_dispatcher.should_send_tool_specs() {
+            let base_prompt = self.build_system_prompt()?;
+            let effective_prompt = if dynamic_specs.is_empty() {
+                base_prompt
+            } else {
+                let dynamic_docs = format_dynamic_tool_docs(&dynamic_specs);
+                format!("{base_prompt}{dynamic_docs}")
+            };
+
+            if self.history.is_empty() {
+                self.history
+                    .push(ConversationMessage::Chat(ChatMessage::system(
+                        effective_prompt,
+                    )));
+            } else if let Some(pos) = self.history.iter().position(|m| {
+                matches!(m, ConversationMessage::Chat(chat) if chat.role == "system")
+            }) {
+                // Replace only if content changed (avoid unnecessary allocations).
+                let changed = !matches!(
+                    &self.history[pos],
+                    ConversationMessage::Chat(chat) if chat.content == effective_prompt
+                );
+                if changed {
+                    self.history[pos] =
+                        ConversationMessage::Chat(ChatMessage::system(effective_prompt));
+                }
+            } else {
+                self.history.insert(
+                    0,
+                    ConversationMessage::Chat(ChatMessage::system(effective_prompt)),
+                );
+            }
+        } else if self.history.is_empty() {
             let system_prompt = self.build_system_prompt()?;
             self.history
                 .push(ConversationMessage::Chat(ChatMessage::system(

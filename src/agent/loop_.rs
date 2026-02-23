@@ -1820,6 +1820,7 @@ pub(crate) async fn agent_turn(
         None,
         &[],
         None,
+        None,
     )
     .await
 }
@@ -1830,13 +1831,17 @@ async fn execute_one_tool(
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
+    dynamic_tools: Option<&[Arc<dyn Tool>]>,
 ) -> Result<ToolExecutionOutcome> {
     observer.record_event(&ObserverEvent::ToolCallStart {
         tool: call_name.to_string(),
     });
     let start = Instant::now();
 
-    let Some(tool) = find_tool(tools_registry, call_name) else {
+    let dynamic_hit = dynamic_tools.and_then(|dt| dt.iter().find(|t| t.name() == call_name));
+    let tool_ref: Option<&dyn Tool> =
+        find_tool(tools_registry, call_name).or_else(|| dynamic_hit.map(|t| t.as_ref()));
+    let Some(tool) = tool_ref else {
         let reason = format!("Unknown tool: {call_name}");
         let duration = start.elapsed();
         observer.record_event(&ObserverEvent::ToolCall {
@@ -1936,6 +1941,7 @@ async fn execute_tools_parallel(
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
+    dynamic_tools: Option<&[Arc<dyn Tool>]>,
 ) -> Result<Vec<ToolExecutionOutcome>> {
     let futures: Vec<_> = tool_calls
         .iter()
@@ -1946,6 +1952,7 @@ async fn execute_tools_parallel(
                 tools_registry,
                 observer,
                 cancellation_token,
+                dynamic_tools,
             )
         })
         .collect();
@@ -1959,6 +1966,7 @@ async fn execute_tools_sequential(
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
+    dynamic_tools: Option<&[Arc<dyn Tool>]>,
 ) -> Result<Vec<ToolExecutionOutcome>> {
     let mut outcomes = Vec::with_capacity(tool_calls.len());
 
@@ -1970,6 +1978,7 @@ async fn execute_tools_sequential(
                 tools_registry,
                 observer,
                 cancellation_token,
+                dynamic_tools,
             )
             .await?,
         );
@@ -2011,6 +2020,7 @@ pub(crate) async fn run_tool_call_loop(
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
     sender_key: Option<&str>,
+    dynamic_registry: Option<&crate::tools::dynamic_registry::DynamicRegistry>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -2018,11 +2028,27 @@ pub(crate) async fn run_tool_call_loop(
         max_tool_iterations
     };
 
-    let tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
+    // Capture a snapshot of dynamic tools/hooks for this turn.
+    let dynamic_snapshot = dynamic_registry.map(|r| r.snapshot());
+    let dynamic_tools_slice: Option<&[Arc<dyn Tool>]> = dynamic_snapshot
+        .as_ref()
+        .map(|snap| snap.all_tools.as_slice());
+
+    let mut tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
         .iter()
         .filter(|tool| !excluded_tools.iter().any(|ex| ex == tool.name()))
         .map(|tool| tool.spec())
         .collect();
+
+    // Add dynamic tool specs if registry is present.
+    if let Some(ref snapshot) = dynamic_snapshot {
+        for tool in snapshot.all_tools.iter() {
+            if !excluded_tools.iter().any(|ex| ex == tool.name()) {
+                tool_specs.push(tool.spec());
+            }
+        }
+    }
+
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
     let turn_id = Uuid::new_v4().to_string();
     let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
@@ -2512,6 +2538,7 @@ pub(crate) async fn run_tool_call_loop(
                 tools_registry,
                 observer,
                 cancellation_token.as_ref(),
+                dynamic_tools_slice,
             )
             .await?
         } else {
@@ -2520,6 +2547,7 @@ pub(crate) async fn run_tool_call_loop(
                 tools_registry,
                 observer,
                 cancellation_token.as_ref(),
+                dynamic_tools_slice,
             )
             .await?
         };
@@ -2735,6 +2763,29 @@ pub async fn run(
         tools_registry.extend(peripheral_tools);
     }
 
+    // ── Dynamic tool/hook registry ───────────────────────────────
+    let persistence_path = config
+        .workspace_dir
+        .join(".zeroclaw")
+        .join("state")
+        .join("dynamic-registry.json");
+    let build_ctx = crate::tools::dynamic_factories::ToolBuildContext {
+        security: security.clone(),
+        workspace_dir: config.workspace_dir.clone(),
+    };
+    let dynamic_registry = Arc::new(crate::tools::dynamic_registry::DynamicRegistry::new(
+        Vec::new(),
+        config.dynamic_registry.clone(),
+        persistence_path,
+        build_ctx,
+    ));
+    tools_registry.push(Box::new(
+        crate::tools::manage_tools::ManageToolsTool::new(dynamic_registry.clone()),
+    ));
+    tools_registry.push(Box::new(
+        crate::tools::manage_hooks::ManageHooksTool::new(dynamic_registry.clone()),
+    ));
+
     // ── Resolve provider ─────────────────────────────────────────
     let provider_name = provider_override
         .as_deref()
@@ -2898,6 +2949,14 @@ pub async fn run(
             "Query connected hardware for reported GPIO pins and LED pin. Use when: user asks what pins are available.",
         ));
     }
+    tool_descs.push((
+        "manage_tools",
+        "Create, remove, enable, or disable dynamic tools at runtime. Actions: create, remove, enable, disable, list. Created tools persist across restarts.",
+    ));
+    tool_descs.push((
+        "manage_hooks",
+        "Create, remove, enable, or disable dynamic hooks at runtime. Actions: create, remove, enable, disable, list. Hooks run automatically on matching events.",
+    ));
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
     } else {
@@ -2991,6 +3050,7 @@ pub async fn run(
             None,
             &[],
             None,
+            Some(&*dynamic_registry),
         )
         .await?;
         final_output = response.clone();
@@ -3104,6 +3164,28 @@ pub async fn run(
 
             history.push(ChatMessage::user(&enriched));
 
+            // For prompt-guided dispatch, refresh the system prompt to include
+            // any dynamic tools that were added/removed in previous turns.
+            if !native_tools {
+                let snapshot = dynamic_registry.snapshot();
+                if !snapshot.all_tools.is_empty() {
+                    let dynamic_docs =
+                        crate::agent::dispatcher::format_dynamic_tool_docs(
+                            &snapshot.all_tools.iter().map(|t| t.spec()).collect::<Vec<_>>(),
+                        );
+                    let refreshed = format!("{system_prompt}{dynamic_docs}");
+                    if let Some(sys) = history.first_mut() {
+                        if sys.role == "system" {
+                            sys.content.clone_from(&refreshed);
+                        }
+                    }
+                } else if let Some(sys) = history.first_mut() {
+                    if sys.role == "system" && sys.content != system_prompt {
+                        sys.content.clone_from(&system_prompt);
+                    }
+                }
+            }
+
             let response = match run_tool_call_loop(
                 provider.as_ref(),
                 &mut history,
@@ -3122,6 +3204,7 @@ pub async fn run(
                 None,
                 &[],
                 None,
+                Some(&*dynamic_registry),
             )
             .await
             {
@@ -3226,6 +3309,29 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
     tools_registry.extend(peripheral_tools);
 
+    // Dynamic tool/hook registry for process_message path.
+    let pm_persistence_path = config
+        .workspace_dir
+        .join(".zeroclaw")
+        .join("state")
+        .join("dynamic-registry.json");
+    let pm_build_ctx = crate::tools::dynamic_factories::ToolBuildContext {
+        security: security.clone(),
+        workspace_dir: config.workspace_dir.clone(),
+    };
+    let pm_dynamic_registry = Arc::new(crate::tools::dynamic_registry::DynamicRegistry::new(
+        Vec::new(),
+        config.dynamic_registry.clone(),
+        pm_persistence_path,
+        pm_build_ctx,
+    ));
+    tools_registry.push(Box::new(
+        crate::tools::manage_tools::ManageToolsTool::new(pm_dynamic_registry.clone()),
+    ));
+    tools_registry.push(Box::new(
+        crate::tools::manage_hooks::ManageHooksTool::new(pm_dynamic_registry.clone()),
+    ));
+
     let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
     let model_name = config
         .default_model
@@ -3310,6 +3416,14 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
             "Query connected hardware for reported GPIO pins and LED pin. Use when user asks what pins are available.",
         ));
     }
+    tool_descs.push((
+        "manage_tools",
+        "Create, remove, enable, or disable dynamic tools at runtime.",
+    ));
+    tool_descs.push((
+        "manage_hooks",
+        "Create, remove, enable, or disable dynamic hooks at runtime.",
+    ));
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
     } else {
@@ -3683,6 +3797,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -3730,6 +3845,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -3770,6 +3886,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
         )
         .await
@@ -3898,6 +4015,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
         )
         .await
         .expect("parallel execution should complete");
@@ -3968,6 +4086,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -4024,6 +4143,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
         )
         .await

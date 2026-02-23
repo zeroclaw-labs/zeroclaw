@@ -628,6 +628,32 @@ Notes:
 - Place `.md`/`.txt` datasheet files named by board (e.g. `nucleo-f401re.md`, `rpi-gpio.md`) in `datasheet_dir` for RAG retrieval.
 - See [hardware-peripherals-design.md](hardware-peripherals-design.md) for board protocol and firmware notes.
 
+## `[dynamic_registry]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `max_tools` | `20` | Maximum number of dynamic tools the agent can register at runtime |
+| `max_hooks` | `20` | Maximum number of dynamic hooks the agent can register at runtime |
+| `allowed_tool_kinds` | `["shell_command", "http_endpoint"]` | Factory keys allowed for dynamic tool creation |
+
+The dynamic registry allows the agent to create, remove, enable, and disable tools and hooks at runtime via the `manage_tools` and `manage_hooks` meta-tools. Changes persist across restarts in `.zeroclaw/state/dynamic-registry.json`.
+
+Example:
+
+```toml
+[dynamic_registry]
+max_tools = 10
+max_hooks = 5
+allowed_tool_kinds = ["shell_command"]
+```
+
+Notes:
+
+- Dynamic tools use snapshot isolation: changes take effect on the next turn, not mid-turn.
+- `shell_command` tools execute structured commands with argument templates.
+- `http_endpoint` tools make HTTP requests to fixed URLs with configurable method/headers.
+- The meta-tools (`manage_tools`, `manage_hooks`) are always available when the registry is enabled.
+
 ## Security-Relevant Defaults
 
 - deny-by-default channel allowlists (`[]` means deny all)
