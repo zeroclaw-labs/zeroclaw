@@ -166,6 +166,7 @@ probe-rs = { version = "0.31", optional = true }
 
 # PDF extraction for datasheet RAG (optional, enable with --features rag-pdf)
 pdf-extract = { version = "0.10", optional = true }
+tempfile = "3.14"
 
 # Terminal QR rendering for WhatsApp Web pairing flow.
 qrcode = { version = "0.14", optional = true }

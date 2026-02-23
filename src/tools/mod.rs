@@ -16,6 +16,7 @@
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
 pub mod agents_ipc;
+pub mod apply_patch;
 pub mod browser;
 pub mod browser_open;
 pub mod cli_discovery;
@@ -65,6 +66,7 @@ pub mod wasm_module;
 pub mod web_fetch;
 pub mod web_search_tool;
 
+pub use apply_patch::ApplyPatchTool;
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
 pub use composio::ComposioTool;
@@ -178,6 +180,7 @@ pub fn default_tools_with_runtime(
         tools.push(Box::new(FileReadTool::new(security.clone())));
         tools.push(Box::new(FileWriteTool::new(security.clone())));
         tools.push(Box::new(FileEditTool::new(security.clone())));
+        tools.push(Box::new(ApplyPatchTool::new()));
         tools.push(Box::new(GlobSearchTool::new(security.clone())));
         tools.push(Box::new(ContentSearchTool::new(security.clone())));
     }
@@ -295,6 +298,7 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(FileReadTool::new(security.clone())));
         tool_arcs.push(Arc::new(FileWriteTool::new(security.clone())));
         tool_arcs.push(Arc::new(FileEditTool::new(security.clone())));
+        tool_arcs.push(Arc::new(ApplyPatchTool::new()));
         tool_arcs.push(Arc::new(GlobSearchTool::new(security.clone())));
         tool_arcs.push(Arc::new(ContentSearchTool::new(security.clone())));
     }
@@ -538,7 +542,8 @@ mod tests {
     fn default_tools_has_expected_count() {
         let security = Arc::new(SecurityPolicy::default());
         let tools = default_tools(security);
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 7);
+        assert!(tools.iter().any(|tool| tool.name() == "apply_patch"));
     }
 
     #[test]
@@ -562,6 +567,7 @@ mod tests {
         assert!(!names.contains(&"file_read"));
         assert!(!names.contains(&"file_write"));
         assert!(!names.contains(&"file_edit"));
+        assert!(!names.contains(&"apply_patch"));
         assert!(!names.contains(&"glob_search"));
         assert!(!names.contains(&"content_search"));
     }
