@@ -56,7 +56,9 @@ pub use secrets::SecretStore;
 #[allow(unused_imports)]
 pub use traits::{NoopSandbox, Sandbox};
 // Prompt injection defense exports
+#[allow(unused_imports)]
 pub use leak_detector::{LeakDetector, LeakResult};
+#[allow(unused_imports)]
 pub use prompt_guard::{GuardAction, GuardResult, PromptGuard};
 
 /// Redact sensitive values for safe logging. Shows first 4 chars + "***" suffix.
