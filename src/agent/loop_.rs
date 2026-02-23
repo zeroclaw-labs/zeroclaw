@@ -1064,22 +1064,22 @@ fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value, Opt
                                 let Some(command) = build_curl_command(value) else {
                                     continue;
                                 };
-                                serde_json::json!({"command": command})
+                                serde_json::json!({ "command": command })
                             } else if value.starts_with("http://") || value.starts_with("https://")
                             {
                                 if let Some(command) = build_curl_command(value) {
-                                    serde_json::json!({"command": command})
+                                    serde_json::json!({ "command": command })
                                 } else {
-                                    serde_json::json!({"command": value})
+                                    serde_json::json!({ "command": value })
                                 }
                             } else {
-                                serde_json::json!({"command": value})
+                                serde_json::json!({ "command": value })
                             }
                         }
                         "http_request" => {
                             serde_json::json!({"url": value, "method": "GET"})
                         }
-                        _ => serde_json::json!({param_name: value}),
+                        _ => serde_json::json!({ param_name: value }),
                     };
 
                     calls.push((tool_name.to_string(), arguments, Some(line.to_string())));
@@ -1098,7 +1098,7 @@ fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value, Opt
         if let Some(command) = build_curl_command(line) {
             calls.push((
                 "shell".to_string(),
-                serde_json::json!({"command": command}),
+                serde_json::json!({ "command": command }),
                 Some(line.to_string()),
             ));
         }
@@ -1252,16 +1252,16 @@ fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
             "shell" => {
                 if value_part.starts_with("http://") || value_part.starts_with("https://") {
                     if let Some(cmd) = build_curl_command(value_part) {
-                        serde_json::json!({"command": cmd})
+                        serde_json::json!({ "command": cmd })
                     } else {
-                        serde_json::json!({"command": value_part})
+                        serde_json::json!({ "command": value_part })
                     }
                 } else {
-                    serde_json::json!({"command": value_part})
+                    serde_json::json!({ "command": value_part })
                 }
             }
             "http_request" => serde_json::json!({"url": value_part, "method": "GET"}),
-            _ => serde_json::json!({param: value_part}),
+            _ => serde_json::json!({ param: value_part }),
         };
         return Some(ParsedToolCall {
             name: tool_name.to_string(),

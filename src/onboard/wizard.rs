@@ -602,10 +602,22 @@ async fn run_quick_setup_with_home(
     println!();
     println!("  {}", style("Next steps:").white().bold());
     if credential_override.is_none() {
-        println!("    1. Set your API key:  export OPENROUTER_API_KEY=\"sk-...\"");
-        println!("    2. Or edit:           ~/.zeroclaw/config.toml");
-        println!("    3. Chat:              zeroclaw agent -m \"Hello!\"");
-        println!("    4. Gateway:           zeroclaw gateway");
+        if provider_supports_keyless_local_usage(&provider_name) {
+            println!("    1. Chat:     zeroclaw agent -m \"Hello!\"");
+            println!("    2. Gateway:  zeroclaw gateway");
+            println!("    3. Status:   zeroclaw status");
+        } else if provider_supports_device_flow(&provider_name) {
+            println!("    1. Chat:              zeroclaw agent -m \"Hello!\"");
+            println!("       (device / OAuth auth will prompt on first run)");
+            println!("    2. Gateway:           zeroclaw gateway");
+            println!("    3. Status:            zeroclaw status");
+        } else {
+            let env_var = provider_env_var(&provider_name);
+            println!("    1. Set your API key:  export {env_var}=\"sk-...\"");
+            println!("    2. Or edit:           ~/.zeroclaw/config.toml");
+            println!("    3. Chat:              zeroclaw agent -m \"Hello!\"");
+            println!("    4. Gateway:           zeroclaw gateway");
+        }
     } else {
         println!("    1. Chat:     zeroclaw agent -m \"Hello!\"");
         println!("    2. Gateway:  zeroclaw gateway");
@@ -629,6 +641,7 @@ fn canonical_provider_name(provider_name: &str) -> &str {
         "grok" => "xai",
         "together" => "together-ai",
         "google" | "google-gemini" => "gemini",
+        "github-copilot" => "copilot",
         "kimi_coding" | "kimi_for_coding" => "kimi-code",
         "nvidia-nim" | "build.nvidia.com" => "nvidia",
         "aws-bedrock" => "bedrock",
@@ -867,12 +880,10 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "Mixtral 8x22B".to_string(),
             ),
         ],
-        "novita" => vec![
-            (
-                "minimax/minimax-m2.5".to_string(),
-                "MiniMax M2.5".to_string(),
-            ),
-        ],
+        "novita" => vec![(
+            "minimax/minimax-m2.5".to_string(),
+            "MiniMax M2.5".to_string(),
+        )],
         "together-ai" => vec![
             (
                 "meta-llama/Llama-3.3-70B-Instruct-Turbo".to_string(),
@@ -2778,6 +2789,13 @@ fn provider_supports_keyless_local_usage(provider_name: &str) -> bool {
     matches!(
         canonical_provider_name(provider_name),
         "ollama" | "llamacpp" | "sglang" | "vllm" | "osaurus"
+    )
+}
+
+fn provider_supports_device_flow(provider_name: &str) -> bool {
+    matches!(
+        canonical_provider_name(provider_name),
+        "copilot" | "gemini" | "openai-codex"
     )
 }
 
@@ -6909,6 +6927,16 @@ mod tests {
         assert!(provider_supports_keyless_local_usage("sglang"));
         assert!(provider_supports_keyless_local_usage("vllm"));
         assert!(!provider_supports_keyless_local_usage("openai"));
+    }
+
+    #[test]
+    fn provider_supports_device_flow_copilot() {
+        assert!(provider_supports_device_flow("copilot"));
+        assert!(provider_supports_device_flow("github-copilot"));
+        assert!(provider_supports_device_flow("gemini"));
+        assert!(provider_supports_device_flow("openai-codex"));
+        assert!(!provider_supports_device_flow("openai"));
+        assert!(!provider_supports_device_flow("openrouter"));
     }
 
     #[test]
