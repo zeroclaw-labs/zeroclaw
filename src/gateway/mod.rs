@@ -300,8 +300,8 @@ pub struct AppState {
     /// Nextcloud Talk webhook secret for signature verification
     pub nextcloud_talk_webhook_secret: Option<Arc<str>>,
     pub wati: Option<Arc<WatiChannel>>,
-    /// WATI webhook secret for signature verification (`X-Hub-Signature-256`)
-    pub wati_webhook_secret: Option<Arc<str>>,
+    /// SHA-256 hash of WATI webhook secret (hex-encoded), never plaintext.
+    pub wati_webhook_secret_hash: Option<Arc<str>>,
     /// Observability backend for metrics scraping
     pub observer: Arc<dyn crate::observability::Observer>,
     /// Registered tool specs (for web dashboard tools page)
@@ -492,24 +492,25 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             ))
         });
 
-    // WATI webhook secret for signature verification
+    // WATI webhook secret for authentication (hashed at startup, never stored in plaintext)
     // Priority: environment variable > config file
-    let wati_webhook_secret: Option<Arc<str>> = std::env::var("ZEROCLAW_WATI_WEBHOOK_SECRET")
-        .ok()
-        .and_then(|secret| {
-            let secret = secret.trim();
-            (!secret.is_empty()).then(|| secret.to_owned())
-        })
-        .or_else(|| {
-            config.channels_config.wati.as_ref().and_then(|w| {
-                w.webhook_secret
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|secret| !secret.is_empty())
-                    .map(ToOwned::to_owned)
+    let wati_webhook_secret_hash: Option<Arc<str>> =
+        std::env::var("ZEROCLAW_WATI_WEBHOOK_SECRET")
+            .ok()
+            .and_then(|secret| {
+                let secret = secret.trim().to_owned();
+                (!secret.is_empty()).then_some(secret)
             })
-        })
-        .map(Arc::from);
+            .or_else(|| {
+                config.channels_config.wati.as_ref().and_then(|w| {
+                    w.webhook_secret
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|secret| !secret.is_empty())
+                        .map(ToOwned::to_owned)
+                })
+            })
+            .map(|secret| Arc::from(hash_webhook_secret(&secret)));
 
     // Nextcloud Talk channel (if configured)
     let nextcloud_talk_channel: Option<Arc<NextcloudTalkChannel>> =
@@ -658,7 +659,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         nextcloud_talk: nextcloud_talk_channel,
         nextcloud_talk_webhook_secret,
         wati: wati_channel,
-        wati_webhook_secret,
+        wati_webhook_secret_hash,
         observer: broadcast_observer,
         tools_registry,
         cost_tracker,
@@ -1375,26 +1376,25 @@ async fn handle_wati_webhook(
         );
     };
 
-    // ── Security: Verify X-Hub-Signature-256 if webhook_secret is configured ──
-    if let Some(ref webhook_secret) = state.wati_webhook_secret {
-        let signature = headers
-            .get("X-Hub-Signature-256")
+    // ── Security: Verify X-Webhook-Secret if webhook_secret is configured ──
+    if let Some(ref secret_hash) = state.wati_webhook_secret_hash {
+        let header_hash = headers
+            .get("X-Webhook-Secret")
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-
-        if !verify_whatsapp_signature(webhook_secret, &body, signature) {
-            tracing::warn!(
-                "WATI webhook signature verification failed (signature: {})",
-                if signature.is_empty() {
-                    "missing"
-                } else {
-                    "invalid"
-                }
-            );
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "Invalid signature"})),
-            );
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(hash_webhook_secret);
+        match header_hash {
+            Some(val) if constant_time_eq(&val, secret_hash.as_ref()) => {}
+            _ => {
+                tracing::warn!(
+                    "WATI webhook: rejected request — invalid or missing X-Webhook-Secret"
+                );
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({"error": "Unauthorized — invalid or missing X-Webhook-Secret header"})),
+                );
+            }
         }
     }
 

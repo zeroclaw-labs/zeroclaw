@@ -2909,8 +2909,8 @@ pub struct WatiConfig {
     /// Allowed phone numbers (E.164 format) or "*" for all.
     #[serde(default)]
     pub allowed_numbers: Vec<String>,
-    /// Webhook signing secret for HMAC-SHA256 signature verification.
-    /// When set, incoming webhooks must include a valid `X-Hub-Signature-256` header.
+    /// Shared secret for webhook authentication.
+    /// When set, incoming webhooks must include a valid `X-Webhook-Secret` header.
     #[serde(default)]
     pub webhook_secret: Option<String>,
 }
