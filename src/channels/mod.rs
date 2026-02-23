@@ -404,8 +404,13 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
     }
 }
 
-fn build_channel_system_prompt(base_prompt: &str, channel_name: &str) -> String {
-    if let Some(instructions) = channel_delivery_instructions(channel_name) {
+fn build_channel_system_prompt(
+    base_prompt: &str,
+    channel_name: &str,
+    reply_target: &str,
+    sender: &str,
+) -> String {
+    let mut prompt = if let Some(instructions) = channel_delivery_instructions(channel_name) {
         if base_prompt.is_empty() {
             instructions.to_string()
         } else {
@@ -413,7 +418,20 @@ fn build_channel_system_prompt(base_prompt: &str, channel_name: &str) -> String 
         }
     } else {
         base_prompt.to_string()
+    };
+
+    if !reply_target.is_empty() {
+        let _ = write!(
+            prompt,
+            "\n\n## Channel Context\n\nThis conversation is coming from channel `{channel_name}`, \
+             sender `{sender}`, reply_target `{reply_target}`.\n\
+             When scheduling reminders or timed tasks with `cron_add`, include \
+             `\"delivery\": {{\"mode\": \"announce\", \"channel\": \"{channel_name}\", \"to\": \"{reply_target}\"}}` \
+             so the result is delivered back to this conversation."
+        );
     }
+
+    prompt
 }
 
 fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
@@ -1594,7 +1612,12 @@ async fn process_channel_message(
         }
     }
 
-    let system_prompt = build_channel_system_prompt(ctx.system_prompt.as_str(), &msg.channel);
+    let system_prompt = build_channel_system_prompt(
+        ctx.system_prompt.as_str(),
+        &msg.channel,
+        &msg.reply_target,
+        &msg.sender,
+    );
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
     let use_streaming = target_channel
@@ -6538,6 +6561,33 @@ This is an example JSON object for profile settings."#;
         assert!(
             turns.iter().all(|turn| !turn.content.contains("[IMAGE:")),
             "failed vision turn must not persist image marker content"
+        );
+    }
+
+    #[test]
+    fn channel_system_prompt_injects_reply_target_for_telegram() {
+        let prompt =
+            build_channel_system_prompt("base", "telegram", "176880986", "zeroclaw_user");
+        assert!(
+            prompt.contains("reply_target `176880986`"),
+            "reply_target should appear in prompt"
+        );
+        assert!(
+            prompt.contains("\"to\": \"176880986\""),
+            "delivery config should include the reply_target"
+        );
+        assert!(
+            prompt.contains("cron_add"),
+            "prompt should mention cron_add tool"
+        );
+    }
+
+    #[test]
+    fn channel_system_prompt_no_context_for_empty_reply_target() {
+        let prompt = build_channel_system_prompt("base", "telegram", "", "");
+        assert!(
+            !prompt.contains("Channel Context"),
+            "no channel context block when reply_target is empty"
         );
     }
 }
