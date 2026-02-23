@@ -1862,10 +1862,7 @@ impl Default for DynamicRegistryConfig {
         Self {
             max_tools: 20,
             max_hooks: 20,
-            allowed_tool_kinds: vec![
-                "shell_command".to_string(),
-                "http_endpoint".to_string(),
-            ],
+            allowed_tool_kinds: vec!["shell_command".to_string(), "http_endpoint".to_string()],
         }
     }
 }

@@ -81,9 +81,7 @@ impl DynamicToolFactory for ShellCommandFactory {
 
         if let Some(timeout) = cfg.timeout_secs {
             if timeout > 300 {
-                anyhow::bail!(
-                    "shell_command: timeout_secs must be <= 300, got {timeout}"
-                );
+                anyhow::bail!("shell_command: timeout_secs must be <= 300, got {timeout}");
             }
         }
 
@@ -130,10 +128,7 @@ impl Tool for ShellCommandDynamicTool {
 
         for arg in &self.config.args {
             if let ArgTemplate::Param(param_name) = arg {
-                properties.insert(
-                    param_name.clone(),
-                    serde_json::json!({ "type": "string" }),
-                );
+                properties.insert(param_name.clone(), serde_json::json!({ "type": "string" }));
                 required.push(serde_json::Value::String(param_name.clone()));
             }
         }
@@ -239,9 +234,7 @@ impl Tool for ShellCommandDynamicTool {
             Err(_) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!(
-                    "command timed out after {timeout_secs}s"
-                )),
+                error: Some(format!("command timed out after {timeout_secs}s")),
             }),
         }
     }

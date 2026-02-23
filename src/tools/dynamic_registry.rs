@@ -1,8 +1,11 @@
-//! Core types, error model, and persistence for the dynamic tool/hook registry.
+//! Core types, error model, persistence, and runtime registry for the dynamic
+//! tool/hook system.
 //!
 //! This module defines the foundational data structures used by the dynamic
 //! registry system: persisted tool definitions, hook definitions with
-//! phase/effect validation, and atomic JSON file persistence.
+//! phase/effect validation, atomic JSON file persistence, and the central
+//! [`DynamicRegistry`] container that manages static + dynamic tools/hooks
+//! with versioned [`RegistrySnapshot`] isolation.
 //!
 //! # Serde Compatibility
 //!
@@ -13,13 +16,20 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::channels::traits::ChannelMessage;
+use crate::config::DynamicRegistryConfig;
 use crate::hooks::{HookHandler, HookResult};
+use crate::tools::dynamic_factories::{
+    default_factory_registry, DynamicToolFactory, ToolBuildContext,
+};
+use crate::tools::traits::{Tool, ToolSpec};
 
 // ---------------------------------------------------------------------------
 // Error model
@@ -492,6 +502,589 @@ impl HookHandler for DynamicHookInstance {
 }
 
 // ---------------------------------------------------------------------------
+// RegistrySnapshot — immutable view captured per agent turn
+// ---------------------------------------------------------------------------
+
+/// An immutable, cheaply clonable snapshot of the registry state at a point
+/// in time. The agent loop captures one snapshot per turn so that tool lists
+/// and hook chains are stable for the duration of a single LLM call.
+pub struct RegistrySnapshot {
+    /// Monotonic counter bumped on any mutation (tool or hook).
+    pub state_revision: u64,
+    /// Monotonic counter bumped only on tool mutations.
+    pub tool_revision: u64,
+    /// Monotonic counter bumped only on hook mutations.
+    pub hook_revision: u64,
+    /// Static tools first (insertion order), then enabled dynamic tools sorted by name.
+    pub all_tools: Arc<Vec<Arc<dyn Tool>>>,
+    /// Precomputed [`ToolSpec`] list matching `all_tools` order.
+    pub tool_specs: Arc<Vec<ToolSpec>>,
+    /// Enabled dynamic hooks sorted by (priority desc, id asc).
+    pub dynamic_hooks: Arc<Vec<Arc<dyn HookHandler>>>,
+}
+
+// ---------------------------------------------------------------------------
+// DynamicRegistryState — interior mutable state behind Mutex
+// ---------------------------------------------------------------------------
+
+struct DynamicRegistryState {
+    tools: BTreeMap<String, DynamicToolDef>,
+    hooks: BTreeMap<String, DynamicHookDef>,
+    tool_instances: HashMap<String, Arc<dyn Tool>>,
+    hook_instances: HashMap<String, Arc<DynamicHookInstance>>,
+    state_revision: u64,
+    tool_revision: u64,
+    hook_revision: u64,
+}
+
+// ---------------------------------------------------------------------------
+// DynamicRegistry — the central runtime container
+// ---------------------------------------------------------------------------
+
+/// Central runtime container that manages static + dynamic tools/hooks with
+/// versioned snapshots. Thread-safe: snapshot reads are lock-free (`Arc` clone),
+/// mutations are serialized via an interior `Mutex`.
+pub struct DynamicRegistry {
+    static_tools: Vec<Arc<dyn Tool>>,
+    static_tool_names: HashSet<String>,
+    snapshot: RwLock<Arc<RegistrySnapshot>>,
+    state: Mutex<DynamicRegistryState>,
+    persistence_path: PathBuf,
+    factories: HashMap<String, Box<dyn DynamicToolFactory>>,
+    config: DynamicRegistryConfig,
+    #[allow(dead_code)]
+    build_ctx: Option<ToolBuildContext>,
+}
+
+impl DynamicRegistry {
+    /// Create a new registry with static tools and load persisted dynamic state.
+    pub fn new(
+        static_tools: Vec<Arc<dyn Tool>>,
+        config: DynamicRegistryConfig,
+        persistence_path: PathBuf,
+        build_ctx: ToolBuildContext,
+    ) -> Self {
+        let static_tool_names: HashSet<String> =
+            static_tools.iter().map(|t| t.name().to_string()).collect();
+        let factories = default_factory_registry();
+
+        // Load persisted state (quarantines corrupt files).
+        let persisted = PersistedRegistry::try_load_or_quarantine(&persistence_path);
+
+        let mut tool_defs = BTreeMap::new();
+        let mut tool_instances = HashMap::new();
+        let mut hook_defs = BTreeMap::new();
+        let mut hook_instances = HashMap::new();
+
+        // Restore persisted tools.
+        for def in persisted.tools {
+            // Validate kind is allowed.
+            if !config.allowed_tool_kinds.contains(&def.kind) {
+                tracing::warn!(
+                    id = %def.id,
+                    kind = %def.kind,
+                    "skipping persisted tool: kind not in allowed_tool_kinds"
+                );
+                continue;
+            }
+            // Build instance via factory.
+            match factories.get(&def.kind) {
+                Some(factory) => match factory.build(&def, &build_ctx) {
+                    Ok(instance) => {
+                        tool_instances.insert(def.id.clone(), instance);
+                        tool_defs.insert(def.id.clone(), def);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            id = %def.id,
+                            error = %e,
+                            "skipping persisted tool: factory build failed"
+                        );
+                    }
+                },
+                None => {
+                    tracing::warn!(
+                        id = %def.id,
+                        kind = %def.kind,
+                        "skipping persisted tool: no factory for kind"
+                    );
+                }
+            }
+        }
+
+        // Restore persisted hooks.
+        for def in persisted.hooks {
+            if let Err(e) = validate_phase_effect(&def.phase, &def.effect) {
+                tracing::warn!(
+                    id = %def.id,
+                    error = %e,
+                    "skipping persisted hook: phase/effect validation failed"
+                );
+                continue;
+            }
+            let instance = Arc::new(DynamicHookInstance::new(def.clone()));
+            hook_instances.insert(def.id.clone(), instance);
+            hook_defs.insert(def.id.clone(), def);
+        }
+
+        let internal_state = DynamicRegistryState {
+            tools: tool_defs,
+            hooks: hook_defs,
+            tool_instances,
+            hook_instances,
+            state_revision: 0,
+            tool_revision: 0,
+            hook_revision: 0,
+        };
+
+        let snapshot = Self::build_snapshot(&static_tools, &internal_state);
+
+        Self {
+            static_tools,
+            static_tool_names,
+            snapshot: RwLock::new(Arc::new(snapshot)),
+            state: Mutex::new(internal_state),
+            persistence_path,
+            factories,
+            config,
+            build_ctx: Some(build_ctx),
+        }
+    }
+
+    /// Create an empty registry for testing (no static tools, temp path).
+    pub fn new_empty(config: DynamicRegistryConfig) -> Self {
+        let static_tools: Vec<Arc<dyn Tool>> = Vec::new();
+        let static_tool_names = HashSet::new();
+        let factories = default_factory_registry();
+
+        let internal_state = DynamicRegistryState {
+            tools: BTreeMap::new(),
+            hooks: BTreeMap::new(),
+            tool_instances: HashMap::new(),
+            hook_instances: HashMap::new(),
+            state_revision: 0,
+            tool_revision: 0,
+            hook_revision: 0,
+        };
+
+        let snapshot = Self::build_snapshot(&static_tools, &internal_state);
+
+        // Use a path that won't collide; callers should provide a real temp path
+        // for persistence tests.
+        let persistence_path = std::env::temp_dir().join("zeroclaw_test_registry.json");
+
+        Self {
+            static_tools,
+            static_tool_names,
+            snapshot: RwLock::new(Arc::new(snapshot)),
+            state: Mutex::new(internal_state),
+            persistence_path,
+            factories,
+            config,
+            build_ctx: None,
+        }
+    }
+
+    /// Get the current snapshot (cheap `Arc` clone).
+    pub fn snapshot(&self) -> Arc<RegistrySnapshot> {
+        self.snapshot
+            .read()
+            .expect("snapshot RwLock poisoned")
+            .clone()
+    }
+
+    /// Current tool revision counter.
+    pub fn tool_revision(&self) -> u64 {
+        self.state
+            .lock()
+            .expect("state Mutex poisoned")
+            .tool_revision
+    }
+
+    // ── Tool mutations ──────────────────────────────────────────────
+
+    /// Add a dynamic tool definition. Returns the new `state_revision`.
+    ///
+    /// If `expected_revision` is `Some(r)` and `state_revision != r`,
+    /// returns `RevisionConflict`.
+    pub fn add_tool(
+        &self,
+        def: DynamicToolDef,
+        expected_revision: Option<u64>,
+    ) -> Result<u64, DynamicRegistryError> {
+        let mut state = self.state.lock().expect("state Mutex poisoned");
+
+        // Optimistic concurrency check.
+        if let Some(expected) = expected_revision {
+            if state.state_revision != expected {
+                return Err(DynamicRegistryError::RevisionConflict {
+                    expected,
+                    actual: state.state_revision,
+                });
+            }
+        }
+
+        // Quota check.
+        if state.tools.len() >= self.config.max_tools {
+            return Err(DynamicRegistryError::QuotaExceeded {
+                kind: "tools".into(),
+                limit: self.config.max_tools,
+            });
+        }
+
+        // Kind check.
+        if !self.config.allowed_tool_kinds.contains(&def.kind) {
+            return Err(DynamicRegistryError::UnknownKind(def.kind.clone()));
+        }
+
+        // Name collision with static tools.
+        if self.static_tool_names.contains(&def.name) {
+            return Err(DynamicRegistryError::NameCollision(def.name.clone()));
+        }
+
+        // Name collision with existing dynamic tools.
+        for existing in state.tools.values() {
+            if existing.name == def.name {
+                return Err(DynamicRegistryError::NameCollision(def.name.clone()));
+            }
+        }
+
+        // Validate config via factory.
+        let factory = self
+            .factories
+            .get(&def.kind)
+            .ok_or_else(|| DynamicRegistryError::UnknownKind(def.kind.clone()))?;
+        factory
+            .validate(&def.config)
+            .map_err(|e| DynamicRegistryError::ValidationFailed(e.to_string()))?;
+
+        // Build tool instance.
+        let instance = if let Some(ref ctx) = self.build_ctx {
+            factory
+                .build(&def, ctx)
+                .map_err(|e| DynamicRegistryError::ValidationFailed(e.to_string()))?
+        } else {
+            // Test path: create a stub tool for registries without build_ctx.
+            Arc::new(StubDynamicTool {
+                name: def.name.clone(),
+                description: def.description.clone(),
+            })
+        };
+
+        // Insert.
+        state.tool_instances.insert(def.id.clone(), instance);
+        state.tools.insert(def.id.clone(), def);
+
+        // Bump revisions.
+        state.state_revision += 1;
+        state.tool_revision += 1;
+        let new_revision = state.state_revision;
+
+        // Persist.
+        self.persist(&state);
+
+        // Rebuild snapshot.
+        let snap = Self::build_snapshot(&self.static_tools, &state);
+        drop(state);
+        *self.snapshot.write().expect("snapshot RwLock poisoned") = Arc::new(snap);
+
+        Ok(new_revision)
+    }
+
+    /// Remove a dynamic tool by ID. Returns the new `state_revision`.
+    pub fn remove_tool(&self, id: &str) -> Result<u64, DynamicRegistryError> {
+        let mut state = self.state.lock().expect("state Mutex poisoned");
+
+        if state.tools.remove(id).is_none() {
+            return Err(DynamicRegistryError::NotFound(id.to_string()));
+        }
+        state.tool_instances.remove(id);
+
+        state.state_revision += 1;
+        state.tool_revision += 1;
+        let new_revision = state.state_revision;
+
+        self.persist(&state);
+
+        let snap = Self::build_snapshot(&self.static_tools, &state);
+        drop(state);
+        *self.snapshot.write().expect("snapshot RwLock poisoned") = Arc::new(snap);
+
+        Ok(new_revision)
+    }
+
+    /// Enable or disable a dynamic tool.
+    pub fn enable_tool(&self, id: &str, enabled: bool) -> Result<(), DynamicRegistryError> {
+        let mut state = self.state.lock().expect("state Mutex poisoned");
+
+        let def = state
+            .tools
+            .get_mut(id)
+            .ok_or_else(|| DynamicRegistryError::NotFound(id.to_string()))?;
+        def.enabled = enabled;
+        def.updated_at = Utc::now();
+
+        state.state_revision += 1;
+        state.tool_revision += 1;
+
+        self.persist(&state);
+
+        let snap = Self::build_snapshot(&self.static_tools, &state);
+        drop(state);
+        *self.snapshot.write().expect("snapshot RwLock poisoned") = Arc::new(snap);
+
+        Ok(())
+    }
+
+    /// List all dynamic tool definitions (enabled and disabled).
+    pub fn list_tools(&self) -> Vec<DynamicToolDef> {
+        let state = self.state.lock().expect("state Mutex poisoned");
+        state.tools.values().cloned().collect()
+    }
+
+    /// Get a specific dynamic tool definition by ID.
+    pub fn get_tool(&self, id: &str) -> Option<DynamicToolDef> {
+        let state = self.state.lock().expect("state Mutex poisoned");
+        state.tools.get(id).cloned()
+    }
+
+    // ── Hook mutations ──────────────────────────────────────────────
+
+    /// Add a dynamic hook definition. Returns the new `state_revision`.
+    pub fn add_hook(
+        &self,
+        def: DynamicHookDef,
+        expected_revision: Option<u64>,
+    ) -> Result<u64, DynamicRegistryError> {
+        let mut state = self.state.lock().expect("state Mutex poisoned");
+
+        // Optimistic concurrency check.
+        if let Some(expected) = expected_revision {
+            if state.state_revision != expected {
+                return Err(DynamicRegistryError::RevisionConflict {
+                    expected,
+                    actual: state.state_revision,
+                });
+            }
+        }
+
+        // Quota check.
+        if state.hooks.len() >= self.config.max_hooks {
+            return Err(DynamicRegistryError::QuotaExceeded {
+                kind: "hooks".into(),
+                limit: self.config.max_hooks,
+            });
+        }
+
+        // Validate phase/effect combination.
+        validate_phase_effect(&def.phase, &def.effect)?;
+
+        // Build instance.
+        let instance = Arc::new(DynamicHookInstance::new(def.clone()));
+
+        // Insert.
+        state.hook_instances.insert(def.id.clone(), instance);
+        state.hooks.insert(def.id.clone(), def);
+
+        // Bump revisions (hook mutations bump state_revision + hook_revision, NOT tool_revision).
+        state.state_revision += 1;
+        state.hook_revision += 1;
+        let new_revision = state.state_revision;
+
+        self.persist(&state);
+
+        let snap = Self::build_snapshot(&self.static_tools, &state);
+        drop(state);
+        *self.snapshot.write().expect("snapshot RwLock poisoned") = Arc::new(snap);
+
+        Ok(new_revision)
+    }
+
+    /// Remove a dynamic hook by ID. Returns the new `state_revision`.
+    pub fn remove_hook(&self, id: &str) -> Result<u64, DynamicRegistryError> {
+        let mut state = self.state.lock().expect("state Mutex poisoned");
+
+        if state.hooks.remove(id).is_none() {
+            return Err(DynamicRegistryError::NotFound(id.to_string()));
+        }
+        state.hook_instances.remove(id);
+
+        state.state_revision += 1;
+        state.hook_revision += 1;
+        let new_revision = state.state_revision;
+
+        self.persist(&state);
+
+        let snap = Self::build_snapshot(&self.static_tools, &state);
+        drop(state);
+        *self.snapshot.write().expect("snapshot RwLock poisoned") = Arc::new(snap);
+
+        Ok(new_revision)
+    }
+
+    /// Enable or disable a dynamic hook.
+    pub fn enable_hook(&self, id: &str, enabled: bool) -> Result<(), DynamicRegistryError> {
+        let mut state = self.state.lock().expect("state Mutex poisoned");
+
+        let def = state
+            .hooks
+            .get_mut(id)
+            .ok_or_else(|| DynamicRegistryError::NotFound(id.to_string()))?;
+        def.enabled = enabled;
+        def.updated_at = Utc::now();
+
+        // Rebuild the hook instance so it picks up the new enabled state.
+        let instance = Arc::new(DynamicHookInstance::new(def.clone()));
+        state.hook_instances.insert(id.to_string(), instance);
+
+        state.state_revision += 1;
+        state.hook_revision += 1;
+
+        self.persist(&state);
+
+        let snap = Self::build_snapshot(&self.static_tools, &state);
+        drop(state);
+        *self.snapshot.write().expect("snapshot RwLock poisoned") = Arc::new(snap);
+
+        Ok(())
+    }
+
+    /// List all dynamic hook definitions (enabled and disabled).
+    pub fn list_hooks(&self) -> Vec<DynamicHookDef> {
+        let state = self.state.lock().expect("state Mutex poisoned");
+        state.hooks.values().cloned().collect()
+    }
+
+    /// Get a specific dynamic hook definition by ID.
+    pub fn get_hook(&self, id: &str) -> Option<DynamicHookDef> {
+        let state = self.state.lock().expect("state Mutex poisoned");
+        state.hooks.get(id).cloned()
+    }
+
+    // ── Internal helpers ────────────────────────────────────────────
+
+    /// Build a [`RegistrySnapshot`] from current state.
+    fn build_snapshot(
+        static_tools: &[Arc<dyn Tool>],
+        state: &DynamicRegistryState,
+    ) -> RegistrySnapshot {
+        // Collect static tools in insertion order.
+        let mut all_tools: Vec<Arc<dyn Tool>> = static_tools.to_vec();
+
+        // Collect enabled dynamic tools sorted by name.
+        let mut dynamic_entries: Vec<(&String, &Arc<dyn Tool>)> = state
+            .tools
+            .iter()
+            .filter(|(_, def)| def.enabled)
+            .filter_map(|(id, _)| state.tool_instances.get(id).map(|inst| (id, inst)))
+            .collect();
+        // Sort by tool name (from the def, not the id).
+        dynamic_entries.sort_by(|(id_a, _), (id_b, _)| {
+            let name_a = state
+                .tools
+                .get(*id_a)
+                .map(|d| d.name.as_str())
+                .unwrap_or("");
+            let name_b = state
+                .tools
+                .get(*id_b)
+                .map(|d| d.name.as_str())
+                .unwrap_or("");
+            name_a.cmp(name_b)
+        });
+        for (_, instance) in dynamic_entries {
+            all_tools.push(instance.clone());
+        }
+
+        // Precompute tool specs.
+        let tool_specs: Vec<ToolSpec> = all_tools.iter().map(|t| t.spec()).collect();
+
+        // Collect enabled dynamic hooks sorted by (priority desc, id asc).
+        let mut hook_entries: Vec<(&String, &Arc<DynamicHookInstance>)> = state
+            .hooks
+            .iter()
+            .filter(|(_, def)| def.enabled)
+            .filter_map(|(id, _)| state.hook_instances.get(id).map(|inst| (id, inst)))
+            .collect();
+        hook_entries.sort_by(|(id_a, inst_a), (id_b, inst_b)| {
+            // Priority descending.
+            let pri_cmp = inst_b.priority().cmp(&inst_a.priority());
+            if pri_cmp != std::cmp::Ordering::Equal {
+                return pri_cmp;
+            }
+            // ID ascending for stable tie-breaking.
+            id_a.cmp(id_b)
+        });
+        let dynamic_hooks: Vec<Arc<dyn HookHandler>> = hook_entries
+            .into_iter()
+            .map(|(_, inst)| inst.clone() as Arc<dyn HookHandler>)
+            .collect();
+
+        RegistrySnapshot {
+            state_revision: state.state_revision,
+            tool_revision: state.tool_revision,
+            hook_revision: state.hook_revision,
+            all_tools: Arc::new(all_tools),
+            tool_specs: Arc::new(tool_specs),
+            dynamic_hooks: Arc::new(dynamic_hooks),
+        }
+    }
+
+    /// Persist current state to disk. Logs warnings on failure (never panics).
+    fn persist(&self, state: &DynamicRegistryState) {
+        let persisted = PersistedRegistry {
+            schema_version: 1,
+            tools: state.tools.values().cloned().collect(),
+            hooks: state.hooks.values().cloned().collect(),
+        };
+        if let Err(e) = persisted.save_to_file(&self.persistence_path) {
+            tracing::warn!(
+                path = %self.persistence_path.display(),
+                error = %e,
+                "failed to persist dynamic registry"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StubDynamicTool — minimal Tool impl for test registries without build_ctx
+// ---------------------------------------------------------------------------
+
+/// A no-op tool used internally when `DynamicRegistry::new_empty()` creates
+/// tools without a real `ToolBuildContext`.
+struct StubDynamicTool {
+    name: String,
+    description: String,
+}
+
+#[async_trait]
+impl Tool for StubDynamicTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+
+    async fn execute(
+        &self,
+        _args: serde_json::Value,
+    ) -> anyhow::Result<crate::tools::traits::ToolResult> {
+        Ok(crate::tools::traits::ToolResult {
+            success: true,
+            output: "stub".into(),
+            error: None,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -844,7 +1437,7 @@ mod tests {
     // ------------------------------------------------------------------
     #[test]
     fn persistence_error_has_source() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "disk full");
+        let io_err = std::io::Error::other("disk full");
         let err = DynamicRegistryError::PersistenceError(io_err);
         assert!(std::error::Error::source(&err).is_some());
 
@@ -868,10 +1461,7 @@ mod tests {
     }
 
     /// Helper: build a Pre/ToolCall hook def with given effect and filter.
-    fn pre_tool_call_hook(
-        effect: HookEffect,
-        filter: Option<HookFilter>,
-    ) -> DynamicHookDef {
+    fn pre_tool_call_hook(effect: HookEffect, filter: Option<HookFilter>) -> DynamicHookDef {
         DynamicHookDef {
             id: "hook-test".into(),
             name: "test_hook".into(),
@@ -949,9 +1539,7 @@ mod tests {
         let hook = make_hook_instance(def);
 
         let original_args = serde_json::json!({"cmd": "ls", "timeout": 10});
-        let result = hook
-            .before_tool_call("shell".into(), original_args)
-            .await;
+        let result = hook.before_tool_call("shell".into(), original_args).await;
 
         match result {
             HookResult::Continue((name, args)) => {
@@ -984,7 +1572,9 @@ mod tests {
         };
         let hook = make_hook_instance(def);
 
-        let result = hook.before_prompt_build("You are a helpful agent.".into()).await;
+        let result = hook
+            .before_prompt_build("You are a helpful agent.".into())
+            .await;
 
         match result {
             HookResult::Continue(prompt) => {
@@ -1029,10 +1619,7 @@ mod tests {
     // ------------------------------------------------------------------
     #[tokio::test]
     async fn dynamic_hook_disabled_passes_through() {
-        let mut def = pre_tool_call_hook(
-            HookEffect::Cancel("should not fire".into()),
-            None,
-        );
+        let mut def = pre_tool_call_hook(HookEffect::Cancel("should not fire".into()), None);
         def.enabled = false;
         let hook = make_hook_instance(def);
 
@@ -1053,10 +1640,7 @@ mod tests {
     #[tokio::test]
     async fn dynamic_hook_wrong_target_passes_through() {
         // Hook targets ToolCall, but we call before_prompt_build.
-        let def = pre_tool_call_hook(
-            HookEffect::Cancel("should not fire".into()),
-            None,
-        );
+        let def = pre_tool_call_hook(HookEffect::Cancel("should not fire".into()), None);
         let hook = make_hook_instance(def);
 
         let result = hook.before_prompt_build("original prompt".into()).await;
@@ -1147,5 +1731,430 @@ mod tests {
             HookResult::Continue(m) => assert_eq!(m.channel, "discord"),
             HookResult::Cancel(_) => panic!("expected Continue — channel filter did not match"),
         }
+    }
+
+    // ==================================================================
+    // DynamicRegistry tests
+    // ==================================================================
+
+    /// Helper: create a DynamicRegistry backed by a temp dir with a persistence path.
+    fn make_test_registry(dir: &TempDir) -> DynamicRegistry {
+        let path = dir.path().join("registry.json");
+        let mut reg = DynamicRegistry::new_empty(DynamicRegistryConfig::default());
+        reg.persistence_path = path;
+        reg
+    }
+
+    /// Helper: create a DynamicRegistry with one static tool.
+    fn make_test_registry_with_static(dir: &TempDir) -> DynamicRegistry {
+        let static_tool: Arc<dyn Tool> = Arc::new(StubDynamicTool {
+            name: "static_shell".into(),
+            description: "A static shell tool".into(),
+        });
+        let path = dir.path().join("registry.json");
+        let config = DynamicRegistryConfig::default();
+        let factories = default_factory_registry();
+        let static_tool_names: HashSet<String> =
+            vec!["static_shell".to_string()].into_iter().collect();
+
+        let internal_state = DynamicRegistryState {
+            tools: BTreeMap::new(),
+            hooks: BTreeMap::new(),
+            tool_instances: HashMap::new(),
+            hook_instances: HashMap::new(),
+            state_revision: 0,
+            tool_revision: 0,
+            hook_revision: 0,
+        };
+
+        let static_tools = vec![static_tool];
+        let snapshot = DynamicRegistry::build_snapshot(&static_tools, &internal_state);
+
+        DynamicRegistry {
+            static_tools,
+            static_tool_names,
+            snapshot: RwLock::new(Arc::new(snapshot)),
+            state: Mutex::new(internal_state),
+            persistence_path: path,
+            factories,
+            config,
+            build_ctx: None,
+        }
+    }
+
+    /// Helper: build a shell_command tool def for DynamicRegistry tests.
+    fn registry_tool_def(id: &str, name: &str) -> DynamicToolDef {
+        DynamicToolDef {
+            id: id.into(),
+            name: name.into(),
+            description: format!("Dynamic tool {name}"),
+            kind: "shell_command".into(),
+            config: serde_json::json!({
+                "command": "echo",
+                "args": [{"Fixed": "hello"}]
+            }),
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            created_by: Some("zeroclaw_user".into()),
+        }
+    }
+
+    /// Helper: build a Pre/ToolCall Cancel hook def for DynamicRegistry tests.
+    fn registry_hook_def(id: &str, name: &str, priority: i32) -> DynamicHookDef {
+        DynamicHookDef {
+            id: id.into(),
+            name: name.into(),
+            phase: HookPhase::Pre,
+            target: HookPoint::ToolCall,
+            priority,
+            enabled: true,
+            filter: None,
+            effect: HookEffect::Cancel("blocked".into()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // R1. registry_add_tool_increments_revision
+    // ------------------------------------------------------------------
+    #[test]
+    fn registry_add_tool_increments_revision() {
+        let dir = TempDir::new().unwrap();
+        let reg = make_test_registry(&dir);
+
+        assert_eq!(reg.tool_revision(), 0);
+
+        let rev = reg
+            .add_tool(registry_tool_def("t1", "tool_alpha"), None)
+            .unwrap();
+        assert_eq!(rev, 1);
+        assert_eq!(reg.tool_revision(), 1);
+
+        let snap = reg.snapshot();
+        assert_eq!(snap.state_revision, 1);
+        assert_eq!(snap.tool_revision, 1);
+    }
+
+    // ------------------------------------------------------------------
+    // R2. registry_add_hook_does_not_increment_tool_revision
+    // ------------------------------------------------------------------
+    #[test]
+    fn registry_add_hook_does_not_increment_tool_revision() {
+        let dir = TempDir::new().unwrap();
+        let reg = make_test_registry(&dir);
+
+        let rev = reg
+            .add_hook(registry_hook_def("h1", "hook_a", 10), None)
+            .unwrap();
+        assert_eq!(rev, 1);
+
+        let snap = reg.snapshot();
+        assert_eq!(snap.state_revision, 1);
+        assert_eq!(snap.hook_revision, 1);
+        // tool_revision should NOT have changed.
+        assert_eq!(snap.tool_revision, 0);
+    }
+
+    // ------------------------------------------------------------------
+    // R3. registry_name_collision_with_static_rejected
+    // ------------------------------------------------------------------
+    #[test]
+    fn registry_name_collision_with_static_rejected() {
+        let dir = TempDir::new().unwrap();
+        let reg = make_test_registry_with_static(&dir);
+
+        // Try to add a dynamic tool with the same name as the static tool.
+        let result = reg.add_tool(registry_tool_def("t1", "static_shell"), None);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, DynamicRegistryError::NameCollision(_)),
+            "expected NameCollision, got: {err}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // R4. registry_name_collision_with_dynamic_rejected
+    // ------------------------------------------------------------------
+    #[test]
+    fn registry_name_collision_with_dynamic_rejected() {
+        let dir = TempDir::new().unwrap();
+        let reg = make_test_registry(&dir);
+
+        reg.add_tool(registry_tool_def("t1", "tool_alpha"), None)
+            .unwrap();
+
+        // Try to add another tool with the same name but different ID.
+        let result = reg.add_tool(registry_tool_def("t2", "tool_alpha"), None);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, DynamicRegistryError::NameCollision(_)),
+            "expected NameCollision, got: {err}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // R5. registry_quota_enforced
+    // ------------------------------------------------------------------
+    #[test]
+    fn registry_quota_enforced() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("registry.json");
+        let config = DynamicRegistryConfig {
+            max_tools: 2,
+            max_hooks: 20,
+            allowed_tool_kinds: vec!["shell_command".into(), "http_endpoint".into()],
+        };
+        let mut reg = DynamicRegistry::new_empty(config);
+        reg.persistence_path = path;
+
+        reg.add_tool(registry_tool_def("t1", "tool_a"), None)
+            .unwrap();
+        reg.add_tool(registry_tool_def("t2", "tool_b"), None)
+            .unwrap();
+
+        // Third tool should fail quota.
+        let result = reg.add_tool(registry_tool_def("t3", "tool_c"), None);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, DynamicRegistryError::QuotaExceeded { .. }),
+            "expected QuotaExceeded, got: {err}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // R6. registry_optimistic_concurrency_conflict
+    // ------------------------------------------------------------------
+    #[test]
+    fn registry_optimistic_concurrency_conflict() {
+        let dir = TempDir::new().unwrap();
+        let reg = make_test_registry(&dir);
+
+        // Advance revision to 1.
+        reg.add_tool(registry_tool_def("t1", "tool_a"), None)
+            .unwrap();
+
+        // Try to add with expected_revision=0 (stale).
+        let result = reg.add_tool(registry_tool_def("t2", "tool_b"), Some(0));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match err {
+            DynamicRegistryError::RevisionConflict { expected, actual } => {
+                assert_eq!(expected, 0);
+                assert_eq!(actual, 1);
+            }
+            other => panic!("expected RevisionConflict, got: {other}"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // R7. registry_optimistic_concurrency_passes_when_matching
+    // ------------------------------------------------------------------
+    #[test]
+    fn registry_optimistic_concurrency_passes_when_matching() {
+        let dir = TempDir::new().unwrap();
+        let reg = make_test_registry(&dir);
+
+        let rev = reg
+            .add_tool(registry_tool_def("t1", "tool_a"), None)
+            .unwrap();
+        assert_eq!(rev, 1);
+
+        // Now add with expected_revision=1 (current).
+        let rev2 = reg
+            .add_tool(registry_tool_def("t2", "tool_b"), Some(1))
+            .unwrap();
+        assert_eq!(rev2, 2);
+    }
+
+    // ------------------------------------------------------------------
+    // R8. registry_snapshot_shows_tools_in_order
+    // ------------------------------------------------------------------
+    #[test]
+    fn registry_snapshot_shows_tools_in_order() {
+        let dir = TempDir::new().unwrap();
+        let reg = make_test_registry_with_static(&dir);
+
+        // Add dynamic tools in reverse alphabetical order.
+        reg.add_tool(registry_tool_def("t2", "zeta_tool"), None)
+            .unwrap();
+        reg.add_tool(registry_tool_def("t1", "alpha_tool"), None)
+            .unwrap();
+
+        let snap = reg.snapshot();
+        let names: Vec<&str> = snap.all_tools.iter().map(|t| t.name()).collect();
+
+        // Static tool first, then dynamic sorted by name.
+        assert_eq!(names, vec!["static_shell", "alpha_tool", "zeta_tool"]);
+
+        // tool_specs should match.
+        let spec_names: Vec<&str> = snap.tool_specs.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(spec_names, vec!["static_shell", "alpha_tool", "zeta_tool"]);
+    }
+
+    // ------------------------------------------------------------------
+    // R9. registry_remove_tool_removes_from_snapshot
+    // ------------------------------------------------------------------
+    #[test]
+    fn registry_remove_tool_removes_from_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let reg = make_test_registry(&dir);
+
+        reg.add_tool(registry_tool_def("t1", "tool_a"), None)
+            .unwrap();
+        reg.add_tool(registry_tool_def("t2", "tool_b"), None)
+            .unwrap();
+
+        assert_eq!(reg.snapshot().all_tools.len(), 2);
+
+        reg.remove_tool("t1").unwrap();
+
+        let snap = reg.snapshot();
+        assert_eq!(snap.all_tools.len(), 1);
+        assert_eq!(snap.all_tools[0].name(), "tool_b");
+    }
+
+    // ------------------------------------------------------------------
+    // R10. registry_enable_disable_tool
+    // ------------------------------------------------------------------
+    #[test]
+    fn registry_enable_disable_tool() {
+        let dir = TempDir::new().unwrap();
+        let reg = make_test_registry(&dir);
+
+        reg.add_tool(registry_tool_def("t1", "tool_a"), None)
+            .unwrap();
+        assert_eq!(reg.snapshot().all_tools.len(), 1);
+
+        // Disable.
+        reg.enable_tool("t1", false).unwrap();
+        assert_eq!(
+            reg.snapshot().all_tools.len(),
+            0,
+            "disabled tool should not appear in snapshot"
+        );
+
+        // The def should still be listed.
+        assert_eq!(reg.list_tools().len(), 1);
+        assert!(!reg.get_tool("t1").unwrap().enabled);
+
+        // Re-enable.
+        reg.enable_tool("t1", true).unwrap();
+        assert_eq!(reg.snapshot().all_tools.len(), 1);
+        assert!(reg.get_tool("t1").unwrap().enabled);
+    }
+
+    // ------------------------------------------------------------------
+    // R11. registry_add_list_get_hook
+    // ------------------------------------------------------------------
+    #[test]
+    fn registry_add_list_get_hook() {
+        let dir = TempDir::new().unwrap();
+        let reg = make_test_registry(&dir);
+
+        reg.add_hook(registry_hook_def("h1", "hook_a", 10), None)
+            .unwrap();
+        reg.add_hook(registry_hook_def("h2", "hook_b", 5), None)
+            .unwrap();
+
+        let hooks = reg.list_hooks();
+        assert_eq!(hooks.len(), 2);
+
+        let h1 = reg.get_hook("h1").unwrap();
+        assert_eq!(h1.name, "hook_a");
+        assert_eq!(h1.priority, 10);
+
+        let h2 = reg.get_hook("h2").unwrap();
+        assert_eq!(h2.name, "hook_b");
+        assert_eq!(h2.priority, 5);
+
+        // Snapshot hooks should be sorted by priority desc, then id asc.
+        let snap = reg.snapshot();
+        assert_eq!(snap.dynamic_hooks.len(), 2);
+        assert_eq!(snap.dynamic_hooks[0].name(), "hook_a"); // priority 10
+        assert_eq!(snap.dynamic_hooks[1].name(), "hook_b"); // priority 5
+    }
+
+    // ------------------------------------------------------------------
+    // R12. registry_persistence_round_trip
+    // ------------------------------------------------------------------
+    #[test]
+    fn registry_persistence_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("registry.json");
+
+        // Create first registry, add tools and hooks.
+        {
+            let config = DynamicRegistryConfig::default();
+            let mut reg = DynamicRegistry::new_empty(config);
+            reg.persistence_path = path.clone();
+
+            reg.add_tool(registry_tool_def("t1", "tool_a"), None)
+                .unwrap();
+            reg.add_hook(registry_hook_def("h1", "hook_a", 10), None)
+                .unwrap();
+        }
+
+        // Verify file was written.
+        assert!(path.exists(), "persistence file should exist");
+
+        // Load into a new registry using PersistedRegistry directly
+        // (since new_empty doesn't load from disk, and `new()` needs ToolBuildContext).
+        let loaded = PersistedRegistry::load_from_file(&path).unwrap();
+        assert_eq!(loaded.tools.len(), 1);
+        assert_eq!(loaded.tools[0].name, "tool_a");
+        assert_eq!(loaded.tools[0].id, "t1");
+        assert_eq!(loaded.hooks.len(), 1);
+        assert_eq!(loaded.hooks[0].name, "hook_a");
+        assert_eq!(loaded.hooks[0].id, "h1");
+    }
+
+    // ------------------------------------------------------------------
+    // R13. registry_unknown_kind_rejected
+    // ------------------------------------------------------------------
+    #[test]
+    fn registry_unknown_kind_rejected() {
+        let dir = TempDir::new().unwrap();
+        let reg = make_test_registry(&dir);
+
+        let mut def = registry_tool_def("t1", "tool_a");
+        def.kind = "magic_wand".into();
+
+        let result = reg.add_tool(def, None);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, DynamicRegistryError::UnknownKind(_)),
+            "expected UnknownKind, got: {err}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // R14. registry_disabled_tool_not_in_snapshot
+    // ------------------------------------------------------------------
+    #[test]
+    fn registry_disabled_tool_not_in_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let reg = make_test_registry(&dir);
+
+        let mut def = registry_tool_def("t1", "tool_a");
+        def.enabled = false;
+        reg.add_tool(def, None).unwrap();
+
+        let snap = reg.snapshot();
+        assert_eq!(
+            snap.all_tools.len(),
+            0,
+            "disabled tool should not appear in snapshot"
+        );
+        assert_eq!(snap.tool_specs.len(), 0);
+
+        // But the def is still listed.
+        assert_eq!(reg.list_tools().len(), 1);
+        assert!(!reg.get_tool("t1").unwrap().enabled);
     }
 }
