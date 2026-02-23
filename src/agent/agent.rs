@@ -55,7 +55,7 @@ pub struct AgentBuilder {
     skills: Option<Vec<crate::skills::Skill>>,
     skills_prompt_mode: Option<crate::config::SkillsPromptInjectionMode>,
     auto_save: Option<bool>,
-    dynamic_registry: Option<Option<Arc<DynamicRegistry>>>,
+    dynamic_registry: Option<Arc<DynamicRegistry>>,
     classification_config: Option<crate::config::QueryClassificationConfig>,
     available_hints: Option<Vec<String>>,
 }
@@ -175,7 +175,7 @@ impl AgentBuilder {
         self
     }
 
-    pub fn dynamic_registry(mut self, dynamic_registry: Option<Arc<DynamicRegistry>>) -> Self {
+    pub fn dynamic_registry(mut self, dynamic_registry: Arc<DynamicRegistry>) -> Self {
         self.dynamic_registry = Some(dynamic_registry);
         self
     }
@@ -219,7 +219,7 @@ impl AgentBuilder {
             skills: self.skills.unwrap_or_default(),
             skills_prompt_mode: self.skills_prompt_mode.unwrap_or_default(),
             auto_save: self.auto_save.unwrap_or(false),
-            dynamic_registry: self.dynamic_registry.flatten(),
+            dynamic_registry: self.dynamic_registry,
             history: Vec::new(),
             classification_config: self.classification_config.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
@@ -363,7 +363,7 @@ impl Agent {
             ))
             .skills_prompt_mode(config.skills.prompt_injection_mode)
             .auto_save(config.memory.auto_save)
-            .dynamic_registry(Some(dynamic_registry))
+            .dynamic_registry(dynamic_registry)
             .build()
     }
 
