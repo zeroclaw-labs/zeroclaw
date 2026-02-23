@@ -1,6 +1,7 @@
 use crate::auth::openai_oauth::extract_account_id_from_jwt;
 use crate::auth::AuthService;
-use crate::providers::traits::{ChatMessage, Provider};
+use crate::multimodal;
+use crate::providers::traits::{ChatMessage, Provider, ProviderCapabilities};
 use crate::providers::ProviderRuntimeOptions;
 use async_trait::async_trait;
 use reqwest::Client;
@@ -43,7 +44,10 @@ struct ResponsesInput {
 struct ResponsesInputContent {
     #[serde(rename = "type")]
     kind: String,
-    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -133,12 +137,32 @@ fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<ResponsesInpu
         match msg.role.as_str() {
             "system" => system_parts.push(&msg.content),
             "user" => {
+                let (cleaned_text, image_refs) = multimodal::parse_image_markers(&msg.content);
+                let mut content = Vec::new();
+                if !cleaned_text.trim().is_empty() {
+                    content.push(ResponsesInputContent {
+                        kind: "input_text".to_string(),
+                        text: Some(cleaned_text),
+                        image_url: None,
+                    });
+                }
+                for image_ref in image_refs {
+                    content.push(ResponsesInputContent {
+                        kind: "input_image".to_string(),
+                        text: None,
+                        image_url: Some(image_ref),
+                    });
+                }
+                if content.is_empty() {
+                    content.push(ResponsesInputContent {
+                        kind: "input_text".to_string(),
+                        text: Some(msg.content.clone()),
+                        image_url: None,
+                    });
+                }
                 input.push(ResponsesInput {
                     role: "user".to_string(),
-                    content: vec![ResponsesInputContent {
-                        kind: "input_text".to_string(),
-                        text: msg.content.clone(),
-                    }],
+                    content,
                 });
             }
             "assistant" => {
@@ -146,7 +170,8 @@ fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<ResponsesInpu
                     role: "assistant".to_string(),
                     content: vec![ResponsesInputContent {
                         kind: "output_text".to_string(),
-                        text: msg.content.clone(),
+                        text: Some(msg.content.clone()),
+                        image_url: None,
                     }],
                 });
             }
@@ -476,7 +501,8 @@ impl Provider for OpenAiCodexProvider {
             role: "user".to_string(),
             content: vec![ResponsesInputContent {
                 kind: "input_text".to_string(),
-                text: message.to_string(),
+                text: Some(message.to_string()),
+                image_url: None,
             }],
         }];
         self.send_responses_request(input, resolve_instructions(system_prompt), model)
@@ -492,6 +518,13 @@ impl Provider for OpenAiCodexProvider {
         let (instructions, input) = build_responses_input(messages);
         self.send_responses_request(input, instructions, model)
             .await
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calling: false,
+            vision: true,
+        }
     }
 }
 
@@ -520,6 +553,24 @@ mod tests {
             output_text: None,
         };
         assert_eq!(extract_responses_text(&response).as_deref(), Some("nested"));
+    }
+
+    #[test]
+    fn build_responses_input_converts_image_markers_to_input_image_blocks() {
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "Describe this\n\n[IMAGE:data:image/png;base64,abcd]".to_string(),
+        }];
+
+        let (_, input) = build_responses_input(&messages);
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0].content.len(), 2);
+        assert_eq!(input[0].content[0].kind, "input_text");
+        assert_eq!(input[0].content[1].kind, "input_image");
+        assert_eq!(
+            input[0].content[1].image_url.as_deref(),
+            Some("data:image/png;base64,abcd")
+        );
     }
 
     #[test]

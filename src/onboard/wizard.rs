@@ -1105,6 +1105,7 @@ fn supports_live_model_fetch(provider_name: &str) -> bool {
     matches!(
         canonical_provider_name(provider_name),
         "openrouter"
+            | "openai-codex"
             | "openai"
             | "anthropic"
             | "groq"
@@ -1129,6 +1130,15 @@ fn supports_live_model_fetch(provider_name: &str) -> bool {
             | "qwen"
             | "nvidia"
     )
+}
+
+fn codex_models_catalog() -> Vec<String> {
+    vec![
+        "gpt-5.3-codex".to_string(),
+        "gpt-5.2-codex".to_string(),
+        "gpt-5-codex".to_string(),
+        "gpt-5.1-codex-mini".to_string(),
+    ]
 }
 
 fn models_endpoint_for_provider(provider_name: &str) -> Option<&'static str> {
@@ -1440,6 +1450,7 @@ fn fetch_live_models_for_provider(
     };
 
     let models = match provider_name {
+        "openai-codex" => codex_models_catalog(),
         "openrouter" => fetch_openrouter_models(api_key.as_deref())?,
         "anthropic" => fetch_anthropic_models(api_key.as_deref())?,
         "gemini" => fetch_gemini_models(api_key.as_deref())?,
@@ -6426,6 +6437,7 @@ mod tests {
 
     #[test]
     fn supports_live_model_fetch_for_supported_and_unsupported_providers() {
+        assert!(supports_live_model_fetch("openai-codex"));
         assert!(supports_live_model_fetch("openai"));
         assert!(supports_live_model_fetch("anthropic"));
         assert!(supports_live_model_fetch("gemini"));
@@ -6446,6 +6458,14 @@ mod tests {
         assert!(supports_live_model_fetch("qwen-intl"));
         assert!(!supports_live_model_fetch("minimax-cn"));
         assert!(!supports_live_model_fetch("unknown-provider"));
+    }
+
+    #[test]
+    fn codex_models_catalog_contains_latest_codex_ids() {
+        let models = codex_models_catalog();
+        assert!(models.contains(&"gpt-5.3-codex".to_string()));
+        assert!(models.contains(&"gpt-5.2-codex".to_string()));
+        assert!(models.contains(&"gpt-5-codex".to_string()));
     }
 
     #[test]
