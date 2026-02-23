@@ -1273,7 +1273,7 @@ pub fn create_resilient_provider_with_options(
     let mut providers: Vec<(String, Box<dyn Provider>)> = Vec::new();
 
     let primary_provider = match primary_name {
-        "openai-codex" | "openai_codex" | "codex" => {
+        "codex-cli" | "codex_cli" | "openai-codex" | "openai_codex" | "codex" => {
             create_provider_with_options(primary_name, api_key, options)?
         }
         _ => create_provider_with_url_and_options(primary_name, api_key, api_url, options)?,
