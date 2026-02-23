@@ -113,6 +113,8 @@ struct IntegrationSettingsPayload {
     integrations: Vec<IntegrationSettingsEntry>,
 }
 
+static CONFIG_WRITE_SERIALIZER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 // ── Handlers ────────────────────────────────────────────────────
 
 /// GET /api/status — system status overview
@@ -195,6 +197,8 @@ pub async fn handle_api_config_put(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
+
+    let _config_write_guard = CONFIG_WRITE_SERIALIZER.lock().await;
 
     // Parse the incoming TOML
     let new_config: crate::config::Config = match toml::from_str(&body) {
@@ -428,6 +432,8 @@ pub async fn handle_api_integration_credentials_put(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
+
+    let _config_write_guard = CONFIG_WRITE_SERIALIZER.lock().await;
 
     let current_config = state.config.lock().clone();
     let current_revision = match config_revision(&current_config) {
@@ -1411,7 +1417,12 @@ fn apply_integration_credentials(
         _ => {
             if let Some(spec) = ai_integration_spec(integration_id) {
                 let force_default_model = matches!(integration_id, "ollama" | "bedrock");
-                config.default_provider = Some(spec.provider.to_owned());
+                if !ai_provider_matches_integration(
+                    integration_id,
+                    config.default_provider.as_deref(),
+                ) {
+                    config.default_provider = Some(spec.provider.to_owned());
+                }
 
                 let api_key_update = parse_optional_secret_input(fields, "api_key");
                 match api_key_update {
@@ -1627,6 +1638,18 @@ mod tests {
             config.default_model.as_deref(),
             Some("google/gemini-3.1-pro")
         );
+    }
+
+    #[test]
+    fn apply_integration_credentials_preserves_matching_provider_profile() {
+        let mut config = crate::config::Config::default();
+        config.default_provider = Some("openrouter:work".to_string());
+        config.api_key = Some("sk-openrouter".to_string());
+
+        let fields = HashMap::new();
+        apply_integration_credentials(&mut config, "openrouter", &fields).unwrap();
+
+        assert_eq!(config.default_provider.as_deref(), Some("openrouter:work"));
     }
 
     #[test]
