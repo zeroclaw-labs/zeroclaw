@@ -70,10 +70,24 @@ impl SubAgentRegistry {
     }
 
     /// Insert a new session into the registry.
-    /// pub fn insert.
     pub fn insert(&self, session: SubAgentSession) {
         let mut sessions = self.sessions.write();
         sessions.insert(session.id.clone(), session);
+    }
+
+    /// Atomically check the concurrent session limit and insert if under the cap.
+    /// Returns `Ok(())` if inserted, `Err(running_count)` if at capacity.
+    pub fn try_insert(&self, session: SubAgentSession, max_concurrent: usize) -> Result<(), usize> {
+        let mut sessions = self.sessions.write();
+        let running = sessions
+            .values()
+            .filter(|s| matches!(s.status, SubAgentStatus::Running))
+            .count();
+        if running >= max_concurrent {
+            return Err(running);
+        }
+        sessions.insert(session.id.clone(), session);
+        Ok(())
     }
 
     /// Set the tokio task handle for a session (used to enable cancellation).
@@ -169,12 +183,9 @@ impl SubAgentRegistry {
                 _ => true,
             })
             .map(|s| {
-                let duration_ms = s.completed_at.map(|end| {
-                    (end - s.started_at)
-                        .num_milliseconds()
-                        .max(0)
-                        .cast_unsigned()
-                });
+                let duration_ms = s
+                    .completed_at
+                    .map(|end| (end - s.started_at).num_milliseconds().max(0) as u64);
                 SubAgentSessionInfo {
                     session_id: s.id.clone(),
                     agent: s.agent_name.clone(),
@@ -252,10 +263,15 @@ pub struct SubAgentSessionInfo {
 }
 
 fn truncate_task(task: &str, max_len: usize) -> String {
-    if task.len() <= max_len {
+    if task.chars().count() <= max_len {
         task.to_string()
     } else {
-        format!("{}...", &task[..max_len])
+        let byte_idx = task
+            .char_indices()
+            .nth(max_len)
+            .map(|(i, _)| i)
+            .unwrap_or(task.len());
+        format!("{}...", &task[..byte_idx])
     }
 }
 
@@ -459,8 +475,17 @@ mod tests {
     fn truncate_task_long() {
         let long = "a".repeat(150);
         let truncated = truncate_task(&long, 100);
-        assert_eq!(truncated.len(), 103); // 100 + "..."
         assert!(truncated.ends_with("..."));
+        assert_eq!(truncated.chars().count(), 103); // 100 chars + "..."
+    }
+
+    #[test]
+    fn truncate_task_multibyte_safe() {
+        // Each emoji is 4 bytes. 10 emojis = 40 bytes but 10 chars.
+        let emojis = "🦀".repeat(10);
+        let truncated = truncate_task(&emojis, 5);
+        assert!(truncated.ends_with("..."));
+        assert_eq!(truncated.chars().count(), 8); // 5 emojis + "..."
     }
 
     #[test]
