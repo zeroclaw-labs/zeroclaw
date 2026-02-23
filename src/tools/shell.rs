@@ -1,10 +1,10 @@
 use super::traits::{Tool, ToolResult};
 use crate::runtime::RuntimeAdapter;
-use crate::security::SecurityPolicy;
+use crate::security::{AuditLogger, SecurityPolicy, Sandbox};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Maximum shell command execution time before kill.
 const SHELL_TIMEOUT_SECS: u64 = 60;
@@ -20,11 +20,18 @@ const SAFE_ENV_VARS: &[&str] = &[
 pub struct ShellTool {
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
+    audit: Option<Arc<AuditLogger>>,
+    sandbox: Option<Arc<dyn Sandbox>>,
 }
 
 impl ShellTool {
-    pub fn new(security: Arc<SecurityPolicy>, runtime: Arc<dyn RuntimeAdapter>) -> Self {
-        Self { security, runtime }
+    pub fn new(
+        security: Arc<SecurityPolicy>,
+        runtime: Arc<dyn RuntimeAdapter>,
+        audit: Option<Arc<AuditLogger>>,
+        sandbox: Option<Arc<dyn Sandbox>>,
+    ) -> Self {
+        Self { security, runtime, audit, sandbox }
     }
 }
 
@@ -57,6 +64,7 @@ impl Tool for ShellTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let start = Instant::now();
         let command = args
             .get("command")
             .and_then(|v| v.as_str())
@@ -93,9 +101,6 @@ impl Tool for ShellTool {
             });
         }
 
-        // Execute with timeout to prevent hanging commands.
-        // Clear the environment to prevent leaking API keys and other secrets
-        // (CWE-200), then re-add only safe, functional variables.
         let mut cmd = match self
             .runtime
             .build_shell_command(command, &self.security.workspace_dir)
@@ -117,15 +122,24 @@ impl Tool for ShellTool {
             }
         }
 
+        if let Some(ref sandbox) = self.sandbox {
+            if let Err(e) = sandbox.wrap_command(cmd.as_std_mut()) {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Sandbox restriction failed: {e}")),
+                });
+            }
+        }
+
         let result =
             tokio::time::timeout(Duration::from_secs(SHELL_TIMEOUT_SECS), cmd.output()).await;
 
-        match result {
+        let tool_result = match result {
             Ok(Ok(output)) => {
                 let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
                 let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-                // Truncate output to prevent OOM
                 if stdout.len() > MAX_OUTPUT_BYTES {
                     stdout.truncate(stdout.floor_char_boundary(MAX_OUTPUT_BYTES));
                     stdout.push_str("\n... [output truncated at 1MB]");
@@ -135,7 +149,7 @@ impl Tool for ShellTool {
                     stderr.push_str("\n... [stderr truncated at 1MB]");
                 }
 
-                Ok(ToolResult {
+                ToolResult {
                     success: output.status.success(),
                     output: stdout,
                     error: if stderr.is_empty() {
@@ -143,21 +157,28 @@ impl Tool for ShellTool {
                     } else {
                         Some(stderr)
                     },
-                })
+                }
             }
-            Ok(Err(e)) => Ok(ToolResult {
+            Ok(Err(e)) => ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to execute command: {e}")),
-            }),
-            Err(_) => Ok(ToolResult {
+            },
+            Err(_) => ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
                     "Command timed out after {SHELL_TIMEOUT_SECS}s and was killed"
                 )),
-            }),
+            },
+        };
+
+        if let Some(ref logger) = self.audit {
+            let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let _ = logger.log_command("tool", command, "medium", approved, true, tool_result.success, elapsed_ms);
         }
+
+        Ok(tool_result)
     }
 }
 
@@ -181,19 +202,19 @@ mod tests {
 
     #[test]
     fn shell_tool_name() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime(), None, None);
         assert_eq!(tool.name(), "shell");
     }
 
     #[test]
     fn shell_tool_description() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime(), None, None);
         assert!(!tool.description().is_empty());
     }
 
     #[test]
     fn shell_tool_schema_has_command() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime(), None, None);
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["command"].is_object());
         assert!(schema["required"]
@@ -205,7 +226,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_executes_allowed_command() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime(), None, None);
         let result = tool
             .execute(json!({"command": "echo hello"}))
             .await
@@ -217,7 +238,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_blocks_disallowed_command() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime(), None, None);
         let result = tool.execute(json!({"command": "rm -rf /"})).await.unwrap();
         assert!(!result.success);
         let error = result.error.as_deref().unwrap_or("");
@@ -226,7 +247,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_blocks_readonly() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::ReadOnly), test_runtime());
+        let tool = ShellTool::new(test_security(AutonomyLevel::ReadOnly), test_runtime(), None, None);
         let result = tool.execute(json!({"command": "ls"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("not allowed"));
@@ -234,7 +255,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_missing_command_param() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime(), None, None);
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("command"));
@@ -242,14 +263,14 @@ mod tests {
 
     #[tokio::test]
     async fn shell_wrong_type_param() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime(), None, None);
         let result = tool.execute(json!({"command": 123})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn shell_captures_exit_code() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime(), None, None);
         let result = tool
             .execute(json!({"command": "ls /nonexistent_dir_xyz"}))
             .await
@@ -295,7 +316,7 @@ mod tests {
         let _g1 = EnvGuard::set("API_KEY", "sk-test-secret-12345");
         let _g2 = EnvGuard::set("ZEROCLAW_API_KEY", "sk-test-secret-67890");
 
-        let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime());
+        let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime(), None, None);
         let result = tool.execute(json!({"command": "env"})).await.unwrap();
         assert!(result.success);
         assert!(
@@ -310,7 +331,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_preserves_path_and_home() {
-        let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime());
+        let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime(), None, None);
 
         let result = tool
             .execute(json!({"command": "echo $HOME"}))
@@ -342,7 +363,7 @@ mod tests {
             ..SecurityPolicy::default()
         });
 
-        let tool = ShellTool::new(security.clone(), test_runtime());
+        let tool = ShellTool::new(security.clone(), test_runtime(), None, None);
         let denied = tool
             .execute(json!({"command": "touch zeroclaw_shell_approval_test"}))
             .await
@@ -418,7 +439,7 @@ mod tests {
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         });
-        let tool = ShellTool::new(security, test_runtime());
+        let tool = ShellTool::new(security, test_runtime(), None, None);
         let result = tool.execute(json!({"command": "echo test"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap_or("").contains("Rate limit"));

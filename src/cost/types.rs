@@ -124,6 +124,9 @@ pub struct CostSummary {
     pub request_count: usize,
     /// Breakdown by model
     pub by_model: std::collections::HashMap<String, ModelStats>,
+    /// Credit balance in cents (for survival system)
+    #[serde(default)]
+    pub credit_balance_cents: Option<i64>,
 }
 
 /// Statistics for a specific model.
@@ -148,6 +151,7 @@ impl Default for CostSummary {
             total_tokens: 0,
             request_count: 0,
             by_model: std::collections::HashMap::new(),
+            credit_balance_cents: None,
         }
     }
 }

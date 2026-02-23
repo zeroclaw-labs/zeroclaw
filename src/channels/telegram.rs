@@ -941,7 +941,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
         };
 
-        let transcription = match super::voice::transcribe_audio(
+        let transcription = match super::voice_utils::transcribe_audio(
             &self.http_client(),
             api_key,
             &self.voice_config.api_base_url,
@@ -1343,7 +1343,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             text
         };
 
-        match super::voice::synthesize_speech(
+        match super::voice_utils::synthesize_speech(
             &self.http_client(),
             api_key,
             &self.voice_config.api_base_url,

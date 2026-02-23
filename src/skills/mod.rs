@@ -346,8 +346,14 @@ fn load_open_skill_md(path: &Path) -> Result<Skill> {
 }
 
 fn extract_description(content: &str) -> String {
-    content
-        .lines()
+    // Skip YAML frontmatter (--- ... ---) if present
+    let body = if content.starts_with("---") {
+        content.splitn(3, "---").nth(2).unwrap_or(content)
+    } else {
+        content
+    };
+
+    body.lines()
         .find(|line| !line.starts_with('#') && !line.trim().is_empty())
         .unwrap_or("No description")
         .trim()

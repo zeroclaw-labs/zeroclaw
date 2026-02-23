@@ -93,6 +93,7 @@ impl ProxyConfigTool {
         anyhow::bail!("'{field}' must be a string or string[]")
     }
 
+    #[allow(clippy::option_option)]
     fn parse_optional_string_update(
         args: &Value,
         field: &str,

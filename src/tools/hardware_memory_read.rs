@@ -17,6 +17,13 @@ pub struct HardwareMemoryReadTool {
 
 impl HardwareMemoryReadTool {
     pub fn new(boards: Vec<String>) -> Self {
+        #[cfg(not(feature = "probe"))]
+        if !boards.is_empty() {
+            tracing::warn!(
+                boards = ?boards,
+                "HardwareMemoryReadTool registered but `probe` feature is disabled — memory reads will fail. Build with: cargo build --features hardware,probe"
+            );
+        }
         Self { boards }
     }
 

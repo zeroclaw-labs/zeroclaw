@@ -6,15 +6,12 @@ pub mod prometheus;
 pub mod traits;
 pub mod verbose;
 
-#[allow(unused_imports)]
 pub use self::log::LogObserver;
-#[allow(unused_imports)]
 pub use self::multi::MultiObserver;
 pub use noop::NoopObserver;
 pub use otel::OtelObserver;
 pub use prometheus::PrometheusObserver;
 pub use traits::{Observer, ObserverEvent};
-#[allow(unused_imports)]
 pub use verbose::VerboseObserver;
 
 use crate::config::ObservabilityConfig;
@@ -44,6 +41,12 @@ pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
                     Box::new(NoopObserver)
                 }
             }
+        }
+        "verbose" => Box::new(VerboseObserver::new()),
+        "multi" => {
+            let log_obs = Box::new(LogObserver::new());
+            let verbose_obs = Box::new(VerboseObserver::new());
+            Box::new(MultiObserver::new(vec![log_obs, verbose_obs]))
         }
         "none" | "noop" => Box::new(NoopObserver),
         _ => {

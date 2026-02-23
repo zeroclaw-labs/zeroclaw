@@ -39,6 +39,11 @@ impl CostTracker {
         &self.session_id
     }
 
+    /// Get a reference to the cost configuration.
+    pub fn config_ref(&self) -> &CostConfig {
+        &self.config
+    }
+
     fn lock_storage(&self) -> MutexGuard<'_, CostStorage> {
         self.storage.lock()
     }
@@ -159,6 +164,7 @@ impl CostTracker {
             total_tokens,
             request_count,
             by_model,
+            credit_balance_cents: None,
         })
     }
 
