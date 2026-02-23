@@ -1057,13 +1057,17 @@ pub struct ClawHubConfig {
 
     /// Fallback download URL pattern for skills not on GitHub.
     /// Use `{slug}` placeholder for skill name.
-    /// Example: https://wry-manatee-359.convex.site/api/v1/download?slug={slug}
-    #[serde(default)]
+    /// Default: https://wry-manatee-359.convex.site/api/v1/download?slug={slug}
+    #[serde(default = "default_clawhub_download_fallback")]
     pub download_fallback: Option<String>,
 }
 
 fn default_clawhub_url() -> String {
     "https://clawhub.ai".to_string()
+}
+
+fn default_clawhub_download_fallback() -> Option<String> {
+    Some("https://wry-manatee-359.convex.site/api/v1/download?slug={slug}".to_string())
 }
 
 /// Agent orchestration configuration (`[agent]` section).

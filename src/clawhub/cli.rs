@@ -54,10 +54,13 @@ pub async fn handle_command(
     config_dir: &Path,
     workspace_dir: &Path,
 ) -> Result<()> {
+    // Load config for fallback URL
+    let clawhub_config = load_clawhub_config(config_dir).await;
+
     match command {
         ClawHubSubcommand::Search { query, limit } => handle_search(&query, limit).await,
         ClawHubSubcommand::Install { slug, version } => {
-            handle_install(&slug, version.as_deref(), config_dir, workspace_dir).await
+            handle_install(&slug, version.as_deref(), config_dir, workspace_dir, clawhub_config.as_ref()).await
         }
         ClawHubSubcommand::Uninstall { slug } => handle_uninstall(&slug, config_dir, workspace_dir),
         ClawHubSubcommand::List => handle_list(config_dir),
@@ -66,6 +69,17 @@ pub async fn handle_command(
         ClawHubSubcommand::Login => handle_login(),
         ClawHubSubcommand::Whoami => handle_whoami(config_dir).await,
     }
+}
+
+/// Load ClawHub config from config directory
+async fn load_clawhub_config(config_dir: &Path) -> Option<crate::config::ClawHubConfig> {
+    let config_path = config_dir.join("config.toml");
+    if !config_path.exists() {
+        return None;
+    }
+    let content = tokio::fs::read_to_string(&config_path).await.ok()?;
+    let config: crate::config::Config = toml::from_str(&content).ok()?;
+    Some(config.clawhub)
 }
 
 async fn handle_search(query: &str, limit: usize) -> Result<()> {
@@ -96,8 +110,9 @@ async fn handle_search(query: &str, limit: usize) -> Result<()> {
 async fn handle_install(
     slug: &str,
     _version: Option<&str>,
-    config_dir: &PathBuf,
-    workspace_dir: &PathBuf,
+    config_dir: &Path,
+    workspace_dir: &Path,
+    clawhub_config: Option<&crate::config::ClawHubConfig>,
 ) -> Result<()> {
     println!("Installing skill: {}", slug);
 
@@ -106,13 +121,6 @@ async fn handle_install(
 
     println!("  Found: {} v{}", skill.name, skill.version);
     println!("  Description: {}", skill.description);
-
-    // Check if we have at least one URL (main or master)
-    if skill.readme_url.is_none() && skill.readme_url_master.is_none() {
-        anyhow::bail!("Skill has no SKILL.md URL available");
-    }
-
-    println!("  Downloading SKILL.md (trying main, then master branch)...");
 
     // Download the skill content
     let downloader = SkillDownloader::new();
@@ -134,12 +142,18 @@ async fn handle_install(
     let _ = std::fs::remove_dir_all(&temp_dir);
     std::fs::create_dir_all(&temp_dir)?;
 
-    // Download SKILL.md (try main branch first, then fallback to master)
+    // Build fallback URL if configured
+    let fallback_url = clawhub_config
+        .and_then(|c| c.download_fallback.as_ref())
+        .map(|pattern| pattern.replace("{slug}", slug));
+
+    // Try GitHub first, then fallback to zip URL
     let readme_url_master = skill.readme_url_master.as_deref();
     let download_result = downloader
-        .download_skill_with_fallback(
+        .download_skill_with_zip_fallback(
             skill.readme_url.as_deref(),
             readme_url_master,
+            fallback_url.as_deref(),
             &temp_dir,
         )
         .await;
@@ -147,15 +161,13 @@ async fn handle_install(
     if let Err(e) = download_result {
         // If GitHub download fails, provide helpful guidance
         anyhow::bail!(
-            "Failed to download SKILL.md from GitHub: {}\n\n\
-             This skill may be hosted on ClawHub's backend instead of GitHub.\n\
-             Try installing directly from the website or configure a fallback in [clawhub] config:\n\
-             download_fallback = \"https://your-convex-url.convex.site/api/v1/download?slug={{slug}}\"",
+            "Failed to download SKILL.md: {}\n\n\
+             This skill may be hosted on ClawHub's backend instead of GitHub.",
             e
         );
     }
     let skill_md = temp_dir.join("SKILL.md");
-    println!("  Downloaded from: main or master branch");
+    println!("  Downloaded successfully");
 
     // Run security audit
     println!("  Running security audit...");
