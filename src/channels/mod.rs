@@ -12,7 +12,7 @@ pub mod signal;
 pub mod slack;
 pub mod telegram;
 pub mod traits;
-pub mod voice;
+pub mod voice_utils;
 pub mod whatsapp;
 
 pub use cli::CliChannel;
@@ -714,6 +714,10 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             msg.channel.as_str(),
             ctx.max_tool_iterations,
             delta_tx,
+            None,
+            None,
+            None,
+            None,
         ),
     )
     .await;
@@ -732,7 +736,15 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
 
     match llm_result {
         Ok(Ok(response)) => {
-            // Save user + assistant turn to per-sender history
+            // Save user + assistant turn to per-sender history.
+            // When the response is empty (skill already delivered media),
+            // store a marker so the LLM knows the task completed and
+            // resumes normal conversation on the next turn.
+            let history_response = if response.trim().is_empty() {
+                "[I already sent the media directly. Task done. Continue normal conversation for the next message — do NOT send more media unless explicitly asked again.]".to_string()
+            } else {
+                response.clone()
+            };
             {
                 let mut histories = ctx
                     .conversation_histories
@@ -740,33 +752,43 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                     .unwrap_or_else(|e| e.into_inner());
                 let turns = histories.entry(history_key).or_default();
                 turns.push(ChatMessage::user(&enriched_message));
-                turns.push(ChatMessage::assistant(&response));
+                turns.push(ChatMessage::assistant(&history_response));
                 // Trim to MAX_CHANNEL_HISTORY (keep recent turns)
                 while turns.len() > MAX_CHANNEL_HISTORY {
                     turns.remove(0);
                 }
             }
-            println!(
-                "  🤖 Reply ({}ms): {}",
-                started_at.elapsed().as_millis(),
-                truncate_with_ellipsis(&response, 80)
-            );
-            if let Some(channel) = target_channel.as_ref() {
-                if let Some(ref draft_id) = draft_message_id {
-                    if let Err(e) = channel
-                        .finalize_draft(&msg.reply_target, draft_id, &response)
+            // Skip sending empty responses (e.g. when a skill already sent
+            // media directly via the channel API and the LLM correctly
+            // returned nothing).
+            if response.trim().is_empty() {
+                println!(
+                    "  🤖 Reply ({}ms): (empty — suppressed)",
+                    started_at.elapsed().as_millis(),
+                );
+            } else {
+                println!(
+                    "  🤖 Reply ({}ms): {}",
+                    started_at.elapsed().as_millis(),
+                    truncate_with_ellipsis(&response, 80)
+                );
+                if let Some(channel) = target_channel.as_ref() {
+                    if let Some(ref draft_id) = draft_message_id {
+                        if let Err(e) = channel
+                            .finalize_draft(&msg.reply_target, draft_id, &response)
+                            .await
+                        {
+                            tracing::warn!("Failed to finalize draft: {e}; sending as new message");
+                            let _ = channel
+                                .send(&SendMessage::new(&response, &msg.reply_target))
+                                .await;
+                        }
+                    } else if let Err(e) = channel
+                        .send(&SendMessage::new(response, &msg.reply_target))
                         .await
                     {
-                        tracing::warn!("Failed to finalize draft: {e}; sending as new message");
-                        let _ = channel
-                            .send(&SendMessage::new(&response, &msg.reply_target))
-                            .await;
+                        eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
                     }
-                } else if let Err(e) = channel
-                    .send(&SendMessage::new(response, &msg.reply_target))
-                    .await
-                {
-                    eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
                 }
             }
         }
@@ -955,31 +977,22 @@ pub fn build_system_prompt(
          - When in doubt, ask before acting externally.\n\n",
     );
 
-    // ── 3. Skills (compact list — load on-demand) ───────────────
+    // ── 3. Skills (inline content for immediate use) ───────────
     if !skills.is_empty() {
         prompt.push_str("## Available Skills\n\n");
         prompt.push_str(
-            "Skills are loaded on demand. Use `read` on the skill path to get full instructions.\n\n",
+            "Skills extend your capabilities. Follow the instructions in each skill to use them.\n\n",
         );
-        prompt.push_str("<available_skills>\n");
         for skill in skills {
-            let _ = writeln!(prompt, "  <skill>");
-            let _ = writeln!(prompt, "    <name>{}</name>", skill.name);
-            let _ = writeln!(
-                prompt,
-                "    <description>{}</description>",
-                skill.description
-            );
-            let location = skill.location.clone().unwrap_or_else(|| {
-                workspace_dir
-                    .join("skills")
-                    .join(&skill.name)
-                    .join("SKILL.md")
-            });
-            let _ = writeln!(prompt, "    <location>{}</location>", location.display());
-            let _ = writeln!(prompt, "  </skill>");
+            let _ = writeln!(prompt, "### {} (v{})", skill.name, skill.version);
+            let _ = writeln!(prompt, "{}\n", skill.description);
+            // Include full skill instructions inline
+            for p in &skill.prompts {
+                prompt.push_str(p);
+                prompt.push('\n');
+            }
+            prompt.push('\n');
         }
-        prompt.push_str("</available_skills>\n\n");
     }
 
     // ── 4. Workspace ────────────────────────────────────────────
