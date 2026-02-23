@@ -598,7 +598,7 @@ mod tests {
 
         // client_a should have been removed
         assert!(
-            state.0.get(client_a).is_none(),
+            !state.0.contains_key(client_a),
             "client_a state should be cleared"
         );
     }
@@ -610,8 +610,11 @@ mod tests {
         // Fill the map to MAX_TRACKED_CLIENTS with stale entries
         {
             let mut state = guard.failed_attempts.lock();
-            let past =
-                Instant::now() - std::time::Duration::from_secs(FAILED_ATTEMPT_RETENTION_SECS + 60);
+            let past = Instant::now()
+                .checked_sub(std::time::Duration::from_secs(
+                    FAILED_ATTEMPT_RETENTION_SECS + 60,
+                ))
+                .unwrap_or_else(Instant::now);
             for i in 0..MAX_TRACKED_CLIENTS {
                 state.0.insert(
                     format!("stale_client_{i}"),
@@ -647,8 +650,11 @@ mod tests {
         // Seed a stale entry and set last_sweep to long ago so sweep triggers
         {
             let mut state = guard.failed_attempts.lock();
-            let past =
-                Instant::now() - std::time::Duration::from_secs(FAILED_ATTEMPT_RETENTION_SECS + 60);
+            let past = Instant::now()
+                .checked_sub(std::time::Duration::from_secs(
+                    FAILED_ATTEMPT_RETENTION_SECS + 60,
+                ))
+                .unwrap_or_else(Instant::now);
             state.0.insert(
                 "stale_client".to_string(),
                 FailedAttemptState {
@@ -659,7 +665,10 @@ mod tests {
             );
             // Force last_sweep to be old enough to trigger sweep
             state.1 = Instant::now()
-                - std::time::Duration::from_secs(FAILED_ATTEMPT_SWEEP_INTERVAL_SECS + 1);
+                .checked_sub(std::time::Duration::from_secs(
+                    FAILED_ATTEMPT_SWEEP_INTERVAL_SECS + 1,
+                ))
+                .unwrap_or_else(Instant::now);
         }
 
         // Any attempt triggers sweep
