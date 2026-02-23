@@ -4804,7 +4804,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     encrypt_key: None,
                     allowed_users,
                     mention_only: false,
-                    use_feishu,
+                    use_feishu: is_feishu,
                     receive_mode,
                     port,
                 });
