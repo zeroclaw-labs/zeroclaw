@@ -168,6 +168,24 @@ jobs:
                       cross_compiler: gcc-arm-linux-gnueabihf
                       linker_env: CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER
                       linker: arm-linux-gnueabihf-gcc
+                    - os: ubuntu-latest
+                      target: armv7-linux-androideabi
+                      artifact: zeroclaw
+                      archive_ext: tar.gz
+                      cross_compiler: ""
+                      linker_env: ""
+                      linker: ""
+                      android_ndk: true
+                      android_api: 21
+                    - os: ubuntu-latest
+                      target: aarch64-linux-android
+                      artifact: zeroclaw
+                      archive_ext: tar.gz
+                      cross_compiler: ""
+                      linker_env: ""
+                      linker: ""
+                      android_ndk: true
+                      android_api: 21
                     - os: macos-15-intel
                       target: x86_64-apple-darwin
                       artifact: zeroclaw
@@ -208,6 +226,31 @@ jobs:
               run: |
                   sudo apt-get update -qq
                   sudo apt-get install -y ${{ matrix.cross_compiler }}
+
+            - name: Setup Android NDK
+              if: matrix.android_ndk
+              uses: nttld/setup-ndk@v1
+              id: setup-ndk
+              with:
+                  ndk-version: r26d
+                  add-to-path: true
+
+            - name: Configure Android toolchain
+              if: matrix.android_ndk
+              run: |
+                  echo "Setting up Android NDK toolchain for ${{ matrix.target }}"
+                  NDK_HOME="${{ steps.setup-ndk.outputs.ndk-path }}"
+                  TOOLCHAIN="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+                  
+                  # Add to path for linker resolution
+                  echo "$TOOLCHAIN" >> $GITHUB_PATH
+                  
+                  # Set linker environment variables
+                  if [[ "${{ matrix.target }}" == "armv7-linux-androideabi" ]]; then
+                    echo "CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=${TOOLCHAIN}/armv7a-linux-androideabi${{ matrix.android_api }}-clang" >> $GITHUB_ENV
+                  elif [[ "${{ matrix.target }}" == "aarch64-linux-android" ]]; then
+                    echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${TOOLCHAIN}/aarch64-linux-android${{ matrix.android_api }}-clang" >> $GITHUB_ENV
+                  fi
 
             - name: Build release
               shell: bash
@@ -262,6 +305,8 @@ jobs:
                     "zeroclaw-x86_64-unknown-linux-gnu.tar.gz"
                     "zeroclaw-aarch64-unknown-linux-gnu.tar.gz"
                     "zeroclaw-armv7-unknown-linux-gnueabihf.tar.gz"
+                    "zeroclaw-armv7-linux-androideabi.tar.gz"
+                    "zeroclaw-aarch64-linux-android.tar.gz"
                     "zeroclaw-x86_64-apple-darwin.tar.gz"
                     "zeroclaw-aarch64-apple-darwin.tar.gz"
                     "zeroclaw-x86_64-pc-windows-msvc.zip"

@@ -686,6 +686,7 @@ impl Provider for CodexCliProvider {
                 text: Some(text),
                 tool_calls: Vec::new(),
                 usage: None,
+                reasoning_content: None,
             });
         };
 
@@ -711,6 +712,7 @@ impl Provider for CodexCliProvider {
                         text: Some(text),
                         tool_calls: Vec::new(),
                         usage: None,
+                        reasoning_content: None,
                     });
                 }
                 Err(err) => {
@@ -744,6 +746,7 @@ impl Provider for CodexCliProvider {
             text: Some(text),
             tool_calls: Vec::new(),
             usage: None,
+            reasoning_content: None,
         })
     }
 
@@ -769,6 +772,7 @@ impl Provider for CodexCliProvider {
                 text: Some(text),
                 tool_calls: Vec::new(),
                 usage: None,
+                reasoning_content: None,
             });
         };
 
@@ -796,6 +800,7 @@ impl Provider for CodexCliProvider {
                         text: Some(text),
                         tool_calls: Vec::new(),
                         usage: None,
+                        reasoning_content: None,
                     });
                 }
                 Err(err) => {
@@ -828,6 +833,7 @@ impl Provider for CodexCliProvider {
             text: Some(text),
             tool_calls: Vec::new(),
             usage: None,
+            reasoning_content: None,
         })
     }
 }

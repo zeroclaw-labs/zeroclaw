@@ -602,6 +602,7 @@ mod tests {
                     text: Some("done".to_string()),
                     tool_calls: Vec::new(),
                     usage: None,
+                    reasoning_content: None,
                 })
             } else {
                 Ok(ChatResponse {
@@ -612,6 +613,7 @@ mod tests {
                         arguments: "{\"value\":\"ping\"}".to_string(),
                     }],
                     usage: None,
+                    reasoning_content: None,
                 })
             }
         }
@@ -645,6 +647,7 @@ mod tests {
                     arguments: "{\"value\":\"x\"}".to_string(),
                 }],
                 usage: None,
+                reasoning_content: None,
             })
         }
     }

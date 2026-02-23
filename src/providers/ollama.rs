@@ -641,6 +641,7 @@ impl Provider for OllamaProvider {
                 text,
                 tool_calls,
                 usage,
+                reasoning_content: None,
             });
         }
 
@@ -659,6 +660,7 @@ impl Provider for OllamaProvider {
                     )),
                     tool_calls: vec![],
                     usage,
+                    reasoning_content: None,
                 });
             }
             tracing::warn!("Ollama returned empty content with no tool calls");
@@ -667,6 +669,7 @@ impl Provider for OllamaProvider {
             text: Some(content),
             tool_calls: vec![],
             usage,
+            reasoning_content: None,
         })
     }
 
@@ -713,6 +716,7 @@ impl Provider for OllamaProvider {
             text: Some(text),
             tool_calls: vec![],
             usage: None,
+            reasoning_content: None,
         })
     }
 }

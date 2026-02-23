@@ -24,6 +24,7 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "provider.openrouter",
     "channel.dingtalk",
     "channel.discord",
+    "channel.feishu",
     "channel.lark",
     "channel.matrix",
     "channel.mattermost",
@@ -32,6 +33,7 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "channel.signal",
     "channel.slack",
     "channel.telegram",
+    "channel.wati",
     "channel.whatsapp",
     "tool.browser",
     "tool.composio",
@@ -2472,14 +2474,18 @@ pub struct ChannelsConfig {
     pub whatsapp: Option<WhatsAppConfig>,
     /// Linq Partner API channel configuration.
     pub linq: Option<LinqConfig>,
+    /// WATI WhatsApp Business API channel configuration.
+    pub wati: Option<WatiConfig>,
     /// Nextcloud Talk bot channel configuration.
     pub nextcloud_talk: Option<NextcloudTalkConfig>,
     /// Email channel configuration.
     pub email: Option<crate::channels::email_channel::EmailConfig>,
     /// IRC channel configuration.
     pub irc: Option<IrcConfig>,
-    /// Lark/Feishu channel configuration.
+    /// Lark channel configuration.
     pub lark: Option<LarkConfig>,
+    /// Feishu channel configuration.
+    pub feishu: Option<FeishuConfig>,
     /// DingTalk channel configuration.
     pub dingtalk: Option<DingTalkConfig>,
     /// QQ Official Bot channel configuration.
@@ -2538,6 +2544,10 @@ impl ChannelsConfig {
                 self.linq.is_some(),
             ),
             (
+                Box::new(ConfigWrapper::new(self.wati.as_ref())),
+                self.wati.is_some(),
+            ),
+            (
                 Box::new(ConfigWrapper::new(self.nextcloud_talk.as_ref())),
                 self.nextcloud_talk.is_some(),
             ),
@@ -2552,6 +2562,10 @@ impl ChannelsConfig {
             (
                 Box::new(ConfigWrapper::new(self.lark.as_ref())),
                 self.lark.is_some(),
+            ),
+            (
+                Box::new(ConfigWrapper::new(self.feishu.as_ref())),
+                self.feishu.is_some(),
             ),
             (
                 Box::new(ConfigWrapper::new(self.dingtalk.as_ref())),
@@ -2600,10 +2614,12 @@ impl Default for ChannelsConfig {
             signal: None,
             whatsapp: None,
             linq: None,
+            wati: None,
             nextcloud_talk: None,
             email: None,
             irc: None,
             lark: None,
+            feishu: None,
             dingtalk: None,
             qq: None,
             nostr: None,
@@ -2908,6 +2924,35 @@ impl ChannelConfig for LinqConfig {
     }
 }
 
+/// WATI WhatsApp Business API channel configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WatiConfig {
+    /// WATI API token (Bearer auth).
+    pub api_token: String,
+    /// WATI API base URL (default: https://live-mt-server.wati.io).
+    #[serde(default = "default_wati_api_url")]
+    pub api_url: String,
+    /// Tenant ID for multi-channel setups (optional).
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    /// Allowed phone numbers (E.164 format) or "*" for all.
+    #[serde(default)]
+    pub allowed_numbers: Vec<String>,
+}
+
+fn default_wati_api_url() -> String {
+    "https://live-mt-server.wati.io".to_string()
+}
+
+impl ChannelConfig for WatiConfig {
+    fn name() -> &'static str {
+        "WATI"
+    }
+    fn desc() -> &'static str {
+        "WhatsApp via WATI Business API"
+    }
+}
+
 /// Nextcloud Talk bot configuration (webhook receive + OCS send API).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct NextcloudTalkConfig {
@@ -3036,7 +3081,9 @@ pub struct LarkConfig {
     /// Allowed user IDs or union IDs (empty = deny all, "*" = allow all)
     #[serde(default)]
     pub allowed_users: Vec<String>,
-    /// Whether to use the Feishu (Chinese) endpoint instead of Lark (International)
+    /// Legacy compatibility flag: route this Lark config to Feishu endpoint.
+    ///
+    /// Prefer `[channels_config.feishu]` for new setups.
     #[serde(default)]
     pub use_feishu: bool,
     /// Event receive mode: "websocket" (default) or "webhook"
@@ -3050,10 +3097,44 @@ pub struct LarkConfig {
 
 impl ChannelConfig for LarkConfig {
     fn name() -> &'static str {
-        "Lark/Feishu"
+        "Lark"
     }
     fn desc() -> &'static str {
-        "Lark/Feishu Bot"
+        "Lark Bot"
+    }
+}
+
+/// Feishu configuration for messaging integration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FeishuConfig {
+    /// App ID from Feishu developer console
+    pub app_id: String,
+    /// App Secret from Feishu developer console
+    pub app_secret: String,
+    /// Encrypt key for webhook message decryption (optional)
+    #[serde(default)]
+    pub encrypt_key: Option<String>,
+    /// Verification token for webhook validation (optional)
+    #[serde(default)]
+    pub verification_token: Option<String>,
+    /// Allowed user IDs or union IDs (empty = deny all, "*" = allow all)
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// Event receive mode: "websocket" (default) or "webhook"
+    #[serde(default)]
+    pub receive_mode: LarkReceiveMode,
+    /// HTTP port for webhook mode only. Must be set when receive_mode = "webhook".
+    /// Not required (and ignored) for websocket mode.
+    #[serde(default)]
+    pub port: Option<u16>,
+}
+
+impl ChannelConfig for FeishuConfig {
+    fn name() -> &'static str {
+        "Feishu"
+    }
+    fn desc() -> &'static str {
+        "Feishu Bot"
     }
 }
 
@@ -4689,10 +4770,12 @@ default_temperature = 0.7
                 signal: None,
                 whatsapp: None,
                 linq: None,
+                wati: None,
                 nextcloud_talk: None,
                 email: None,
                 irc: None,
                 lark: None,
+                feishu: None,
                 dingtalk: None,
                 qq: None,
                 nostr: None,
@@ -5242,10 +5325,12 @@ allowed_users = ["@ops:matrix.org"]
             signal: None,
             whatsapp: None,
             linq: None,
+            wati: None,
             nextcloud_talk: None,
             email: None,
             irc: None,
             lark: None,
+            feishu: None,
             dingtalk: None,
             qq: None,
             nostr: None,
@@ -5454,10 +5539,12 @@ channel_id = "C123"
                 allowed_numbers: vec!["+1".into()],
             }),
             linq: None,
+            wati: None,
             nextcloud_talk: None,
             email: None,
             irc: None,
             lark: None,
+            feishu: None,
             dingtalk: None,
             qq: None,
             nostr: None,
@@ -6801,6 +6888,56 @@ default_model = "legacy-model"
         let json = r#"{"app_id":"cli_123","app_secret":"secret","allowed_users":["*"]}"#;
         let parsed: LarkConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.allowed_users, vec!["*"]);
+    }
+
+    #[test]
+    async fn feishu_config_serde() {
+        let fc = FeishuConfig {
+            app_id: "cli_feishu_123".into(),
+            app_secret: "secret_abc".into(),
+            encrypt_key: Some("encrypt_key".into()),
+            verification_token: Some("verify_token".into()),
+            allowed_users: vec!["user_123".into(), "user_456".into()],
+            receive_mode: LarkReceiveMode::Websocket,
+            port: None,
+        };
+        let json = serde_json::to_string(&fc).unwrap();
+        let parsed: FeishuConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.app_id, "cli_feishu_123");
+        assert_eq!(parsed.app_secret, "secret_abc");
+        assert_eq!(parsed.encrypt_key.as_deref(), Some("encrypt_key"));
+        assert_eq!(parsed.verification_token.as_deref(), Some("verify_token"));
+        assert_eq!(parsed.allowed_users.len(), 2);
+    }
+
+    #[test]
+    async fn feishu_config_toml_roundtrip() {
+        let fc = FeishuConfig {
+            app_id: "cli_feishu_123".into(),
+            app_secret: "secret_abc".into(),
+            encrypt_key: Some("encrypt_key".into()),
+            verification_token: Some("verify_token".into()),
+            allowed_users: vec!["*".into()],
+            receive_mode: LarkReceiveMode::Webhook,
+            port: Some(9898),
+        };
+        let toml_str = toml::to_string(&fc).unwrap();
+        let parsed: FeishuConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.app_id, "cli_feishu_123");
+        assert_eq!(parsed.app_secret, "secret_abc");
+        assert_eq!(parsed.receive_mode, LarkReceiveMode::Webhook);
+        assert_eq!(parsed.port, Some(9898));
+    }
+
+    #[test]
+    async fn feishu_config_deserializes_without_optional_fields() {
+        let json = r#"{"app_id":"cli_123","app_secret":"secret"}"#;
+        let parsed: FeishuConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.encrypt_key.is_none());
+        assert!(parsed.verification_token.is_none());
+        assert!(parsed.allowed_users.is_empty());
+        assert_eq!(parsed.receive_mode, LarkReceiveMode::Websocket);
+        assert!(parsed.port.is_none());
     }
 
     #[test]

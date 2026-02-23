@@ -783,6 +783,7 @@ impl BedrockProvider {
             },
             tool_calls,
             usage,
+            reasoning_content: None,
         }
     }
 
