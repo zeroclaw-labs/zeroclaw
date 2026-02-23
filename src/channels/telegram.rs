@@ -36,6 +36,18 @@ enum IncomingAttachmentKind {
 }
 const TELEGRAM_BIND_COMMAND: &str = "/bind";
 
+const TELEGRAM_RUNTIME_COMMANDS: &[(&str, &str)] = &[
+    ("status", "Show ZeroClaw runtime status"),
+    ("channels", "Show active channels"),
+    ("usage", "Show current session usage snapshot"),
+    ("compact", "Compact conversation context"),
+    ("providers", "List providers or switch provider"),
+    ("models", "List models or switch model"),
+    ("think", "Set reasoning mode/effort"),
+    ("abort", "Abort current execution"),
+    ("restart", "Restart managed ZeroClaw service"),
+];
+
 /// Split a message into chunks that respect Telegram's 4096 character limit.
 /// Tries to split at word boundaries when possible, and handles continuation.
 /// The effective per-chunk limit is reduced to leave room for continuation markers.
@@ -517,6 +529,62 @@ impl TelegramChannel {
 
     fn api_url(&self, method: &str) -> String {
         format!("{}/bot{}/{method}", self.api_base, self.bot_token)
+    }
+
+    fn build_my_commands_payload(&self) -> serde_json::Value {
+        let mut commands: Vec<serde_json::Value> = TELEGRAM_RUNTIME_COMMANDS
+            .iter()
+            .map(|(command, description)| {
+                serde_json::json!({
+                    "command": command,
+                    "description": description,
+                })
+            })
+            .collect();
+
+        if self.pairing_code_active() {
+            commands.push(serde_json::json!({
+                "command": "bind",
+                "description": "Bind account with one-time code",
+            }));
+        }
+
+        serde_json::json!({ "commands": commands })
+    }
+
+    async fn sync_my_commands(&self) -> anyhow::Result<()> {
+        let payload = self.build_my_commands_payload();
+        let response = self
+            .http_client()
+            .post(self.api_url("setMyCommands"))
+            .json(&payload)
+            .send()
+            .await
+            .context("Failed to call Telegram setMyCommands")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("Telegram setMyCommands failed ({status}): {body}");
+        }
+
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .context("Failed to parse Telegram setMyCommands response")?;
+        let ok = body
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if !ok {
+            let description = body
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown Telegram API error");
+            anyhow::bail!("Telegram setMyCommands API rejected request: {description}");
+        }
+
+        Ok(())
     }
 
     async fn fetch_bot_username(&self) -> anyhow::Result<String> {
@@ -2412,6 +2480,12 @@ impl Channel for TelegramChannel {
             let _ = self.get_bot_username().await;
         }
 
+        if let Err(err) = self.sync_my_commands().await {
+            tracing::warn!("Telegram command sync failed: {err}");
+        } else {
+            tracing::info!("Telegram command menu synced via setMyCommands");
+        }
+
         tracing::info!("Telegram channel listening for messages...");
 
         loop {
@@ -2731,6 +2805,46 @@ mod tests {
             ch.api_url("getMe"),
             "https://api.telegram.org/bot123:ABC/getMe"
         );
+    }
+
+    #[test]
+    fn telegram_set_my_commands_payload_includes_runtime_commands() {
+        let ch = TelegramChannel::new("123:ABC".into(), vec!["*".into()], false);
+        let payload = ch.build_my_commands_payload();
+        let commands = payload
+            .get("commands")
+            .and_then(serde_json::Value::as_array)
+            .expect("commands must be an array");
+
+        let names: Vec<&str> = commands
+            .iter()
+            .filter_map(|item| item.get("command").and_then(serde_json::Value::as_str))
+            .collect();
+
+        assert!(names.contains(&"status"));
+        assert!(names.contains(&"channels"));
+        assert!(names.contains(&"usage"));
+        assert!(names.contains(&"compact"));
+        assert!(names.contains(&"models"));
+        assert!(names.contains(&"think"));
+        assert!(names.contains(&"abort"));
+        assert!(names.contains(&"restart"));
+        assert!(!names.contains(&"bind"));
+    }
+
+    #[test]
+    fn telegram_set_my_commands_payload_includes_bind_when_pairing_active() {
+        let ch = TelegramChannel::new("123:ABC".into(), vec![], false);
+        let payload = ch.build_my_commands_payload();
+        let commands = payload
+            .get("commands")
+            .and_then(serde_json::Value::as_array)
+            .expect("commands must be an array");
+        let names: Vec<&str> = commands
+            .iter()
+            .filter_map(|item| item.get("command").and_then(serde_json::Value::as_str))
+            .collect();
+        assert!(names.contains(&"bind"));
     }
 
     #[test]
