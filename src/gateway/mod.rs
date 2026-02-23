@@ -28,7 +28,7 @@ use axum::{
     body::Bytes,
     extract::{ConnectInfo, Query, State},
     http::{header, HeaderMap, StatusCode},
-    response::{IntoResponse, Json},
+    response::{IntoResponse, Json, Response},
     routing::{delete, get, post, put},
     Router,
 };
@@ -1321,25 +1321,19 @@ async fn handle_linq_webhook(
 /// GET /wati — WATI webhook verification (echoes hub.challenge)
 async fn handle_wati_verify(
     State(state): State<AppState>,
-    Query(params): Query<WatiVerifyQuery>,
-) -> impl IntoResponse {
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
     if state.wati.is_none() {
-        return (StatusCode::NOT_FOUND, "WATI not configured".to_string());
+        return (StatusCode::NOT_FOUND, "WATI not configured".to_string()).into_response();
     }
 
     // WATI may use Meta-style webhook verification; echo the challenge
-    if let Some(challenge) = params.challenge {
+    if let Some(challenge) = params.get("hub.challenge") {
         tracing::info!("WATI webhook verified successfully");
-        return (StatusCode::OK, challenge);
+        return (StatusCode::OK, challenge.clone()).into_response();
     }
 
-    (StatusCode::BAD_REQUEST, "Missing hub.challenge".to_string())
-}
-
-#[derive(Debug, Deserialize)]
-pub struct WatiVerifyQuery {
-    #[serde(rename = "hub.challenge")]
-    pub challenge: Option<String>,
+    (StatusCode::BAD_REQUEST, "Missing hub.challenge".to_string()).into_response()
 }
 
 /// POST /wati — incoming WATI WhatsApp message webhook
