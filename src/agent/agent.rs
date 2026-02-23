@@ -1,5 +1,6 @@
 use crate::agent::dispatcher::{
-    NativeToolDispatcher, ParsedToolCall, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
+    format_dynamic_tool_docs, NativeToolDispatcher, ParsedToolCall, ToolDispatcher,
+    ToolExecutionResult, XmlToolDispatcher,
 };
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
@@ -510,17 +511,57 @@ impl Agent {
     }
 
     pub async fn turn(&mut self, user_message: &str) -> Result<String> {
-        // Refresh tool specs to include dynamic tools from the registry.
-        if let Some(ref registry) = self.dynamic_registry {
+        // Collect dynamic tool specs from the registry snapshot (single snapshot for consistency).
+        let dynamic_specs: Vec<ToolSpec> = if let Some(ref registry) = self.dynamic_registry {
             let snapshot = registry.snapshot();
+            snapshot.all_tools.iter().map(|t| t.spec()).collect()
+        } else {
+            Vec::new()
+        };
+
+        // Refresh combined tool specs (static + dynamic).
+        if !dynamic_specs.is_empty() {
             let mut specs: Vec<ToolSpec> = self.tools.iter().map(|t| t.spec()).collect();
-            for tool in snapshot.all_tools.iter() {
-                specs.push(tool.spec());
-            }
+            specs.extend(dynamic_specs.iter().cloned());
             self.tool_specs = specs;
         }
 
-        if self.history.is_empty() {
+        // For prompt-guided dispatch, regenerate the system prompt each turn so
+        // dynamic tool documentation stays current (tools may be added/removed between turns).
+        // Native providers send tools via ChatRequest.tools and don't need this.
+        if !self.tool_dispatcher.should_send_tool_specs() {
+            let base_prompt = self.build_system_prompt()?;
+            let effective_prompt = if dynamic_specs.is_empty() {
+                base_prompt
+            } else {
+                let dynamic_docs = format_dynamic_tool_docs(&dynamic_specs);
+                format!("{base_prompt}{dynamic_docs}")
+            };
+
+            if self.history.is_empty() {
+                self.history
+                    .push(ConversationMessage::Chat(ChatMessage::system(
+                        effective_prompt,
+                    )));
+            } else if let Some(pos) = self.history.iter().position(|m| {
+                matches!(m, ConversationMessage::Chat(chat) if chat.role == "system")
+            }) {
+                // Replace only if content changed (avoid unnecessary allocations).
+                let changed = !matches!(
+                    &self.history[pos],
+                    ConversationMessage::Chat(chat) if chat.content == effective_prompt
+                );
+                if changed {
+                    self.history[pos] =
+                        ConversationMessage::Chat(ChatMessage::system(effective_prompt));
+                }
+            } else {
+                self.history.insert(
+                    0,
+                    ConversationMessage::Chat(ChatMessage::system(effective_prompt)),
+                );
+            }
+        } else if self.history.is_empty() {
             let system_prompt = self.build_system_prompt()?;
             self.history
                 .push(ConversationMessage::Chat(ChatMessage::system(
