@@ -1593,6 +1593,39 @@ async fn process_channel_message(
         }
     }
 
+    // Inject Telegram context (chat_id, message IDs) for Telegram channel messages
+    if msg.channel == "telegram" {
+        if let Some(last_turn) = prior_turns.last_mut() {
+            if last_turn.role == "user" {
+                let chat_id = &msg.reply_target;
+                // Parse user_message_id from msg.id format "telegram_{chat_id}_{message_id}"
+                let user_message_id = msg
+                    .id
+                    .strip_prefix("telegram_")
+                    .and_then(|rest| rest.rsplit_once('_'))
+                    .and_then(|(_, mid)| mid.parse::<i64>().ok());
+
+                let bot_last_message_id = target_channel
+                    .as_ref()
+                    .and_then(|ch| ch.last_bot_message_id(chat_id));
+
+                let mut ctx_parts = vec![format!("chat_id={chat_id}")];
+                if let Some(uid) = user_message_id {
+                    ctx_parts.push(format!("user_message_id={uid}"));
+                }
+                if let Some(bid) = bot_last_message_id {
+                    ctx_parts.push(format!("bot_last_message_id={bid}"));
+                }
+
+                last_turn.content = format!(
+                    "{}\n\n[Telegram context: {}]",
+                    last_turn.content,
+                    ctx_parts.join(", ")
+                );
+            }
+        }
+    }
+
     let system_prompt = build_channel_system_prompt(ctx.system_prompt.as_str(), &msg.channel);
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);

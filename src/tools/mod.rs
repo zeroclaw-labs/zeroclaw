@@ -48,7 +48,15 @@ pub mod schedule;
 pub mod schema;
 pub mod screenshot;
 pub mod shell;
+pub mod telegram_common;
+pub mod telegram_delete;
+pub mod telegram_edit;
+pub mod telegram_forward;
+pub mod telegram_get_chat;
+pub mod telegram_get_file;
 pub mod telegram_pin;
+pub mod telegram_react;
+pub mod telegram_send;
 pub mod traits;
 pub mod web_search_tool;
 
@@ -88,7 +96,14 @@ pub use schedule::ScheduleTool;
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
 pub use shell::ShellTool;
+pub use telegram_delete::TelegramDeleteTool;
+pub use telegram_edit::TelegramEditTool;
+pub use telegram_forward::TelegramForwardTool;
+pub use telegram_get_chat::TelegramGetChatTool;
+pub use telegram_get_file::TelegramGetFileTool;
 pub use telegram_pin::TelegramPinTool;
+pub use telegram_react::TelegramReactTool;
+pub use telegram_send::TelegramSendTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
@@ -281,11 +296,40 @@ pub fn all_tools_with_runtime(
         )));
     }
 
-    // Telegram pin/unpin tool (when Telegram channel is configured)
+    // Telegram tools (when Telegram channel is configured)
     if let Some(ref telegram) = root_config.channels_config.telegram {
+        let tg_token = telegram.bot_token.clone();
         tool_arcs.push(Arc::new(TelegramPinTool::new(
             security.clone(),
-            telegram.bot_token.clone(),
+            tg_token.clone(),
+        )));
+        tool_arcs.push(Arc::new(TelegramEditTool::new(
+            security.clone(),
+            tg_token.clone(),
+        )));
+        tool_arcs.push(Arc::new(TelegramDeleteTool::new(
+            security.clone(),
+            tg_token.clone(),
+        )));
+        tool_arcs.push(Arc::new(TelegramForwardTool::new(
+            security.clone(),
+            tg_token.clone(),
+        )));
+        tool_arcs.push(Arc::new(TelegramReactTool::new(
+            security.clone(),
+            tg_token.clone(),
+        )));
+        tool_arcs.push(Arc::new(TelegramGetChatTool::new(
+            security.clone(),
+            tg_token.clone(),
+        )));
+        tool_arcs.push(Arc::new(TelegramSendTool::new(
+            security.clone(),
+            tg_token.clone(),
+        )));
+        tool_arcs.push(Arc::new(TelegramGetFileTool::new(
+            security.clone(),
+            tg_token,
         )));
     }
 

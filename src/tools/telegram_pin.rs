@@ -1,35 +1,25 @@
+use super::telegram_common::TelegramApiClient;
 use super::traits::{Tool, ToolResult};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 
-const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
-const TELEGRAM_REQUEST_TIMEOUT_SECS: u64 = 15;
-
 pub struct TelegramPinTool {
-    security: Arc<SecurityPolicy>,
-    bot_token: String,
-    api_base: String,
+    client: TelegramApiClient,
 }
 
 impl TelegramPinTool {
     pub fn new(security: Arc<SecurityPolicy>, bot_token: String) -> Self {
         Self {
-            security,
-            bot_token,
-            api_base: TELEGRAM_API_BASE.to_string(),
+            client: TelegramApiClient::new(security, bot_token),
         }
     }
 
     #[cfg(test)]
     fn with_api_base(mut self, api_base: String) -> Self {
-        self.api_base = api_base;
+        self.client = self.client.with_api_base(api_base);
         self
-    }
-
-    fn api_url(&self, method: &str) -> String {
-        format!("{}/bot{}/{method}", self.api_base, self.bot_token)
     }
 
     fn build_pin_body(
@@ -84,25 +74,14 @@ impl Tool for TelegramPinTool {
                     "description": "If true, pin silently without notifying chat members. Defaults to true."
                 }
             },
-            "required": ["action", "chat_id", "message_id"]
+            "required": ["action", "chat_id", "message_id"],
+            "additionalProperties": false
         })
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        if !self.security.can_act() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Action blocked: autonomy is read-only".into()),
-            });
-        }
-
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Action blocked: rate limit exceeded".into()),
-            });
+        if let Err(result) = self.client.enforce_act() {
+            return Ok(result);
         }
 
         let action = args
@@ -146,67 +125,16 @@ impl Tool for TelegramPinTool {
             }
         };
 
-        let url = self.api_url(method);
-
-        let client = crate::config::build_runtime_proxy_client_with_timeouts(
-            "tool.telegram_pin",
-            TELEGRAM_REQUEST_TIMEOUT_SECS,
-            10,
-        );
-
-        let response = client.post(&url).json(&body).send().await?;
-        let status = response.status();
-        let response_body = response.text().await.unwrap_or_default();
-
-        if !status.is_success() {
-            // Extract Telegram error description without exposing bot token
-            let error_desc = serde_json::from_str::<serde_json::Value>(&response_body)
-                .ok()
-                .and_then(|json| {
-                    json.get("description")
-                        .and_then(|d| d.as_str())
-                        .map(String::from)
+        match self.client.post_json("tool.telegram_pin", method, &body).await {
+            Ok(_) => {
+                let verb = if action == "pin" { "pinned" } else { "unpinned" };
+                Ok(ToolResult {
+                    success: true,
+                    output: format!("Message {message_id} {verb} in chat {chat_id}."),
+                    error: None,
                 })
-                .unwrap_or_else(|| format!("Telegram API returned status {status}"));
-
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(error_desc),
-            });
-        }
-
-        let ok = serde_json::from_str::<serde_json::Value>(&response_body)
-            .ok()
-            .and_then(|json| json.get("ok").and_then(|v| v.as_bool()))
-            .unwrap_or(false);
-
-        if ok {
-            let verb = if action == "pin" {
-                "pinned"
-            } else {
-                "unpinned"
-            };
-            Ok(ToolResult {
-                success: true,
-                output: format!("Message {message_id} {verb} in chat {chat_id}."),
-                error: None,
-            })
-        } else {
-            let error_desc = serde_json::from_str::<serde_json::Value>(&response_body)
-                .ok()
-                .and_then(|json| {
-                    json.get("description")
-                        .and_then(|d| d.as_str())
-                        .map(String::from)
-                })
-                .unwrap_or_else(|| "Telegram API returned ok=false".to_string());
-
-            Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(error_desc),
-            })
+            }
+            Err(result) => Ok(result),
         }
     }
 }
@@ -285,14 +213,14 @@ mod tests {
     #[test]
     fn api_url_constructs_correctly() {
         let tool = test_tool();
-        let url = tool.api_url("pinChatMessage");
+        let url = tool.client.api_url("pinChatMessage");
         assert_eq!(url, "https://api.telegram.org/botfake-token/pinChatMessage");
     }
 
     #[test]
     fn api_url_with_custom_base() {
         let tool = test_tool().with_api_base("https://custom.api".to_string());
-        let url = tool.api_url("unpinChatMessage");
+        let url = tool.client.api_url("unpinChatMessage");
         assert_eq!(url, "https://custom.api/botfake-token/unpinChatMessage");
     }
 
@@ -380,27 +308,29 @@ mod tests {
     }
 
     #[test]
+    fn schema_has_additional_properties_false() {
+        let schema = test_tool().parameters_schema();
+        assert_eq!(schema["additionalProperties"], false);
+    }
+
+    #[test]
     fn error_output_never_contains_bot_token() {
         let tool = test_tool();
-        let token = &tool.bot_token;
+        let token = "fake-token";
 
-        // Verify the tool description and schema don't leak the token
         assert!(!tool.description().contains(token));
         let schema_str = tool.parameters_schema().to_string();
         assert!(!schema_str.contains(token));
 
-        // Verify success output format doesn't include token
         let output = format!("Message {} pinned in chat {}.", 42, "123");
         assert!(!output.contains(token));
     }
 
     #[tokio::test]
     async fn error_path_redacts_token_from_result() {
-        // Simulate a tool error result and ensure token is not present
         let tool = test_tool();
-        let token = &tool.bot_token.clone();
+        let token = "fake-token";
 
-        // Invalid action returns error without token
         let result = tool
             .execute(json!({"action": "bad", "chat_id": "123", "message_id": 1}))
             .await

@@ -278,6 +278,8 @@ pub struct TelegramChannel {
     transcription: Option<crate::config::TranscriptionConfig>,
     voice_transcriptions: Mutex<std::collections::HashMap<String, String>>,
     workspace_dir: Option<std::path::PathBuf>,
+    /// Per-chat last bot message ID, updated when the bot sends a message.
+    last_bot_message_ids: Mutex<std::collections::HashMap<String, i64>>,
 }
 
 impl TelegramChannel {
@@ -309,6 +311,7 @@ impl TelegramChannel {
             transcription: None,
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
             workspace_dir: None,
+            last_bot_message_ids: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -395,6 +398,26 @@ impl TelegramChannel {
 
     fn http_client(&self) -> reqwest::Client {
         crate::config::build_runtime_proxy_client("channel.telegram")
+    }
+
+    /// Record the bot's last sent message ID for a given chat.
+    fn record_bot_message_id(&self, chat_id: &str, message_id: i64) {
+        self.last_bot_message_ids
+            .lock()
+            .insert(chat_id.to_string(), message_id);
+    }
+
+    /// Extract message_id from a Telegram API sendMessage/sendDocument/etc response.
+    fn extract_message_id(response_json: &serde_json::Value) -> Option<i64> {
+        response_json
+            .get("result")
+            .and_then(|r| r.get("message_id"))
+            .and_then(|v| v.as_i64())
+    }
+
+    /// Get the last bot message ID for a given chat, if any.
+    pub fn last_bot_message_id(&self, chat_id: &str) -> Option<i64> {
+        self.last_bot_message_ids.lock().get(chat_id).copied()
     }
 
     fn normalize_identity(value: &str) -> String {
@@ -1524,7 +1547,16 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .await?;
 
             if markdown_resp.status().is_success() {
-                if index < chunks.len() - 1 {
+                // Capture bot's message_id from the last chunk's response
+                if index == chunks.len() - 1 {
+                    if let Ok(body) = markdown_resp.text().await {
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+                            if let Some(mid) = Self::extract_message_id(&json) {
+                                self.record_bot_message_id(chat_id, mid);
+                            }
+                        }
+                    }
+                } else {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 continue;
@@ -1565,7 +1597,16 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 );
             }
 
-            if index < chunks.len() - 1 {
+            // Capture bot's message_id from the last chunk's response
+            if index == chunks.len() - 1 {
+                if let Ok(body) = plain_resp.text().await {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+                        if let Some(mid) = Self::extract_message_id(&json) {
+                            self.record_bot_message_id(chat_id, mid);
+                        }
+                    }
+                }
+            } else {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
@@ -2096,6 +2137,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 impl Channel for TelegramChannel {
     fn name(&self) -> &str {
         "telegram"
+    }
+
+    fn last_bot_message_id(&self, chat_id: &str) -> Option<i64> {
+        self.last_bot_message_ids.lock().get(chat_id).copied()
     }
 
     fn supports_draft_updates(&self) -> bool {

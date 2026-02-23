@@ -645,7 +645,7 @@ mod tests {
         run_newline_mode(&mut reader, &mut output, &bridge, None).await.unwrap();
 
         let output_str = String::from_utf8(output).unwrap();
-        let lines: Vec<&str> = output_str.trim().split('\n').collect();
+        let lines: Vec<&str> = output_str.lines().collect();
         assert_eq!(lines.len(), 2, "should get 2 response lines");
 
         let resp1: Value = serde_json::from_str(lines[0]).unwrap();
@@ -688,7 +688,7 @@ mod tests {
         run_newline_mode(&mut reader, &mut output, &bridge, None).await.unwrap();
 
         let output_str = String::from_utf8(output).unwrap();
-        let lines: Vec<&str> = output_str.trim().split('\n').collect();
+        let lines: Vec<&str> = output_str.lines().collect();
         assert_eq!(lines.len(), 1, "notification should not produce output");
     }
 
