@@ -607,10 +607,20 @@ async fn run_quick_setup_with_home(
             println!("    2. Gateway:  zeroclaw gateway");
             println!("    3. Status:   zeroclaw status");
         } else if provider_supports_device_flow(&provider_name) {
-            println!("    1. Chat:              zeroclaw agent -m \"Hello!\"");
-            println!("       (device / OAuth auth will prompt on first run)");
-            println!("    2. Gateway:           zeroclaw gateway");
-            println!("    3. Status:            zeroclaw status");
+            if canonical_provider_name(&provider_name) == "copilot" {
+                println!("    1. Chat:              zeroclaw agent -m \"Hello!\"");
+                println!("       (device / OAuth auth will prompt on first run)");
+                println!("    2. Gateway:           zeroclaw gateway");
+                println!("    3. Status:            zeroclaw status");
+            } else {
+                println!(
+                    "    1. Login:             zeroclaw auth login --provider {}",
+                    provider_name
+                );
+                println!("    2. Chat:              zeroclaw agent -m \"Hello!\"");
+                println!("    3. Gateway:           zeroclaw gateway");
+                println!("    4. Status:            zeroclaw status");
+            }
         } else {
             let env_var = provider_env_var(&provider_name);
             println!("    1. Set your API key:  export {env_var}=\"sk-...\"");
