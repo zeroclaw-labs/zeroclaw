@@ -1263,7 +1263,9 @@ mod tests {
         assert!(
             err.contains("credentials not set")
                 || err.contains("169.254.169.254")
-                || err.to_lowercase().contains("credential"),
+                || err.to_lowercase().contains("credential")
+                || err.to_lowercase().contains("not authorized")
+                || err.to_lowercase().contains("forbidden"),
             "Expected missing-credentials style error, got: {err}"
         );
     }

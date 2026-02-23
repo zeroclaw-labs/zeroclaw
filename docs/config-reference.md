@@ -71,6 +71,10 @@ Operational note for container users:
 
 - If your `config.toml` sets an explicit custom provider like `custom:https://.../v1`, a default `PROVIDER=openrouter` from Docker/container env will no longer replace it.
 - Use `ZEROCLAW_PROVIDER` when you intentionally want runtime env to override a non-default configured provider.
+- For OpenAI-compatible Responses fallback transport:
+  - `ZEROCLAW_RESPONSES_WEBSOCKET=1` forces websocket-first mode (`wss://.../responses`) for compatible providers.
+  - `ZEROCLAW_RESPONSES_WEBSOCKET=0` forces HTTP-only mode.
+  - Unset = auto (websocket-first only when endpoint host is `api.openai.com`, then HTTP fallback if websocket fails).
 
 ## `[agent]`
 
