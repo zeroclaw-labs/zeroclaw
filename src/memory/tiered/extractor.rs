@@ -207,11 +207,7 @@ impl FactExtractor for OpenRouterFactExtractor {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!(
-                "OpenRouter API error (HTTP {}): {}",
-                status,
-                text
-            ));
+            return Err(anyhow!("OpenRouter API error (HTTP {}): {}", status, text));
         }
 
         let chat_resp: ChatResponse = resp.json().await?;

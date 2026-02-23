@@ -50,16 +50,14 @@ pub fn build_stm_extraction_prompt(
     prompt.push_str("Output a JSON array where each element has these fields:\n");
     prompt.push_str("  - \"category\": string — one of: ");
     prompt.push_str(VALID_CATEGORIES);
-    prompt.push_str("\n");
+    prompt.push('\n');
     prompt.push_str("  - \"subject\": string — the entity the fact is about\n");
     prompt.push_str("  - \"attribute\": string — the specific property or trait\n");
     prompt.push_str("  - \"value\": string — the concrete value or assertion\n");
     prompt.push_str(
         "  - \"context_narrative\": string — brief sentence describing where/how the fact emerged\n",
     );
-    prompt.push_str(
-        "  - \"confidence\": string — one of \"low\", \"medium\", \"high\"\n",
-    );
+    prompt.push_str("  - \"confidence\": string — one of \"low\", \"medium\", \"high\"\n");
     prompt.push_str(
         "  - \"related_facts\": array of strings — keys of related facts (may be empty)\n",
     );
@@ -127,16 +125,14 @@ pub fn build_mtm_extraction_prompt(day_transcript: &str, existing_facts: &[&str]
     prompt.push_str("Output a JSON array where each element has these fields:\n");
     prompt.push_str("  - \"category\": string — one of: ");
     prompt.push_str(VALID_CATEGORIES);
-    prompt.push_str("\n");
+    prompt.push('\n');
     prompt.push_str("  - \"subject\": string — the entity the fact is about\n");
     prompt.push_str("  - \"attribute\": string — the specific property or trait\n");
     prompt.push_str("  - \"value\": string — the concrete value or assertion\n");
     prompt.push_str(
         "  - \"context_narrative\": string — brief sentence describing where/how the fact emerged\n",
     );
-    prompt.push_str(
-        "  - \"confidence\": string — one of \"low\", \"medium\", \"high\"\n",
-    );
+    prompt.push_str("  - \"confidence\": string — one of \"low\", \"medium\", \"high\"\n");
     prompt.push_str(
         "  - \"related_facts\": array of strings — keys of related facts (may be empty)\n",
     );
@@ -193,10 +189,7 @@ pub fn build_mtm_extraction_prompt(day_transcript: &str, existing_facts: &[&str]
 ///
 /// * `mtm_summaries`  - One string per day, in chronological order.
 /// * `existing_facts` - Stringified representations of facts currently in LTM.
-pub fn build_ltm_compression_prompt(
-    mtm_summaries: &[&str],
-    existing_facts: &[&str],
-) -> String {
+pub fn build_ltm_compression_prompt(mtm_summaries: &[&str], existing_facts: &[&str]) -> String {
     let mut prompt = String::with_capacity(4096);
 
     // ── System instructions ──────────────────────────────────────────────
@@ -237,9 +230,7 @@ pub fn build_ltm_compression_prompt(
     prompt.push('\n');
 
     // ── Closing instruction ──────────────────────────────────────────────
-    prompt.push_str(
-        "Return ONLY a JSON object. No markdown, no explanation.",
-    );
+    prompt.push_str("Return ONLY a JSON object. No markdown, no explanation.");
 
     prompt
 }
@@ -252,11 +243,8 @@ mod tests {
 
     #[test]
     fn stm_prompt_includes_messages() {
-        let prompt = build_stm_extraction_prompt(
-            "My name is Alice",
-            "Nice to meet you, Alice!",
-            &[],
-        );
+        let prompt =
+            build_stm_extraction_prompt("My name is Alice", "Nice to meet you, Alice!", &[]);
 
         assert!(
             prompt.contains("My name is Alice"),
@@ -278,11 +266,7 @@ mod tests {
         let turns: Vec<String> = (0..20).map(|i| format!("Turn {} content", i)).collect();
         let turn_refs: Vec<&str> = turns.iter().map(|s| s.as_str()).collect();
 
-        let prompt = build_stm_extraction_prompt(
-            "hello",
-            "hi there",
-            &turn_refs,
-        );
+        let prompt = build_stm_extraction_prompt("hello", "hi there", &turn_refs);
 
         // Only the last MAX_PRIOR_TURNS (5) should be included: turns 15..19.
         // Turn 0 must NOT appear.

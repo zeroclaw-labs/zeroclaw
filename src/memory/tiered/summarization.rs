@@ -203,11 +203,7 @@ mod tests {
         let s = MockSummarizer;
         let entries = vec![make_test_entry("entry 1"), make_test_entry("entry 2")];
         let result = s
-            .summarize_stm_day(
-                NaiveDate::from_ymd_opt(2026, 1, 15).unwrap(),
-                &entries,
-                &[],
-            )
+            .summarize_stm_day(NaiveDate::from_ymd_opt(2026, 1, 15).unwrap(), &entries, &[])
             .await
             .unwrap();
         assert!(result.contains("2 entries"), "result: {}", result);

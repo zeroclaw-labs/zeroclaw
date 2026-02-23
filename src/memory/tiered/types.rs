@@ -216,14 +216,8 @@ impl IndexEntry {
     pub fn to_display(&self) -> String {
         let tags = self.tags.join(", ");
         let date = self.day.format("%Y-%m-%d");
-        let mtm = self
-            .mtm_ref_id
-            .as_deref()
-            .unwrap_or("none");
-        let ltm = self
-            .ltm_ref_id
-            .as_deref()
-            .unwrap_or("none");
+        let mtm = self.mtm_ref_id.as_deref().unwrap_or("none");
+        let ltm = self.ltm_ref_id.as_deref().unwrap_or("none");
         format!("[{tags}] {date} → MTM:{mtm}, LTM:{ltm}")
     }
 }
@@ -339,9 +333,8 @@ mod tests {
 
     #[test]
     fn compression_job_initial_state_is_pending() {
-        let job = CompressionJob::new_stm_to_mtm(
-            chrono::NaiveDate::from_ymd_opt(2026, 1, 15).unwrap(),
-        );
+        let job =
+            CompressionJob::new_stm_to_mtm(chrono::NaiveDate::from_ymd_opt(2026, 1, 15).unwrap());
         assert_eq!(job.status, CompressionJobStatus::Pending);
         assert_eq!(job.attempts, 0);
         assert!(job.last_error.is_none());
@@ -360,7 +353,10 @@ mod tests {
     #[test]
     fn default_tier_config_has_memory_agents() {
         let cfg = TierConfig::default();
-        assert_eq!(cfg.memory_agents.openrouter_base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(
+            cfg.memory_agents.openrouter_base_url,
+            "https://openrouter.ai/api/v1"
+        );
         assert_eq!(cfg.memory_agents.stm.model, "google/gemini-3-flash-preview");
         assert_eq!(cfg.memory_agents.stm.timeout_secs, 10);
         assert_eq!(cfg.memory_agents.mtm.timeout_secs, 60);
@@ -369,8 +365,10 @@ mod tests {
 
     #[test]
     fn index_entry_display_includes_refs() {
-        let mut entry =
-            IndexEntry::new("auth", chrono::NaiveDate::from_ymd_opt(2026, 1, 15).unwrap());
+        let mut entry = IndexEntry::new(
+            "auth",
+            chrono::NaiveDate::from_ymd_opt(2026, 1, 15).unwrap(),
+        );
         entry.tags = vec!["auth".to_string(), "middleware".to_string()];
         entry.mtm_ref_id = Some("mtm-001".to_string());
         entry.ltm_ref_id = Some("ltm-001".to_string());

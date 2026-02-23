@@ -111,7 +111,11 @@ impl MemoryLoader for TieredMemoryLoader {
                 writeln!(
                     output,
                     "- [{}] {} {}: {} ({})",
-                    confidence_tag, fact.subject, fact.attribute, fact.value, fact.context_narrative
+                    confidence_tag,
+                    fact.subject,
+                    fact.attribute,
+                    fact.value,
+                    fact.context_narrative
                 )
                 .unwrap();
             }
@@ -253,14 +257,45 @@ mod tests {
 
     #[async_trait]
     impl Memory for NoopMemory {
-        fn name(&self) -> &str { "noop" }
-        async fn store(&self, _: &str, _: &str, _: MemoryCategory, _: Option<&str>) -> anyhow::Result<()> { Ok(()) }
-        async fn recall(&self, _: &str, _: usize, _: Option<&str>) -> anyhow::Result<Vec<MemoryEntry>> { Ok(vec![]) }
-        async fn get(&self, _: &str) -> anyhow::Result<Option<MemoryEntry>> { Ok(None) }
-        async fn list(&self, _: Option<&MemoryCategory>, _: Option<&str>) -> anyhow::Result<Vec<MemoryEntry>> { Ok(vec![]) }
-        async fn forget(&self, _: &str) -> anyhow::Result<bool> { Ok(false) }
-        async fn count(&self) -> anyhow::Result<usize> { Ok(0) }
-        async fn health_check(&self) -> bool { true }
+        fn name(&self) -> &str {
+            "noop"
+        }
+        async fn store(
+            &self,
+            _: &str,
+            _: &str,
+            _: MemoryCategory,
+            _: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn recall(
+            &self,
+            _: &str,
+            _: usize,
+            _: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(vec![])
+        }
+        async fn get(&self, _: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+        async fn list(
+            &self,
+            _: Option<&MemoryCategory>,
+            _: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(vec![])
+        }
+        async fn forget(&self, _: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        async fn health_check(&self) -> bool {
+            true
+        }
     }
 
     // ── Tests ─────────────────────────────────────────────────────────────
@@ -284,7 +319,12 @@ mod tests {
             .await
             .unwrap();
         stm_backend
-            .store("project-note", "working on whiskey", MemoryCategory::Conversation, None)
+            .store(
+                "project-note",
+                "working on whiskey",
+                MemoryCategory::Conversation,
+                None,
+            )
             .await
             .unwrap();
 
@@ -299,9 +339,18 @@ mod tests {
             output.contains("## Active Memory (Short-Term)"),
             "missing STM header in:\n{output}"
         );
-        assert!(output.contains("user-pref"), "missing user-pref in:\n{output}");
-        assert!(output.contains("likes Rust"), "missing content in:\n{output}");
-        assert!(output.contains("project-note"), "missing project-note in:\n{output}");
+        assert!(
+            output.contains("user-pref"),
+            "missing user-pref in:\n{output}"
+        );
+        assert!(
+            output.contains("likes Rust"),
+            "missing content in:\n{output}"
+        );
+        assert!(
+            output.contains("project-note"),
+            "missing project-note in:\n{output}"
+        );
     }
 
     #[tokio::test]
@@ -315,7 +364,10 @@ mod tests {
             .unwrap();
 
         // Store an index entry (as the manager would).
-        let mut idx = IndexEntry::new("auth", chrono::NaiveDate::from_ymd_opt(2026, 2, 20).unwrap());
+        let mut idx = IndexEntry::new(
+            "auth",
+            chrono::NaiveDate::from_ymd_opt(2026, 2, 20).unwrap(),
+        );
         idx.tags = vec!["auth".to_string(), "middleware".to_string()];
         idx.mtm_ref_id = Some("mtm-2026-02-20".to_string());
         let idx_json = serde_json::to_string(&idx).unwrap();
@@ -428,7 +480,12 @@ mod tests {
         // MTM entry (well within budget).
         let mtm_backend = InMemoryBackend::new();
         mtm_backend
-            .store("mtm-2026-02-21", "Summary of UI changes", MemoryCategory::Daily, None)
+            .store(
+                "mtm-2026-02-21",
+                "Summary of UI changes",
+                MemoryCategory::Daily,
+                None,
+            )
             .await
             .unwrap();
         let mtm = make_shared(mtm_backend);
@@ -438,7 +495,10 @@ mod tests {
         let output = loader.load_context(&NoopMemory, "test").await.unwrap();
 
         // All three sections present.
-        assert!(output.contains("## Active Memory (Short-Term)"), "missing STM section");
+        assert!(
+            output.contains("## Active Memory (Short-Term)"),
+            "missing STM section"
+        );
         assert!(output.contains("## Memory Index"), "missing Index section");
         assert!(
             output.contains("## Medium-Term Memory (Recent Summaries)"),
@@ -448,7 +508,9 @@ mod tests {
         // Correct ordering: STM before Known Facts before Index before MTM.
         let stm_pos = output.find("## Active Memory (Short-Term)").unwrap();
         let idx_pos = output.find("## Memory Index").unwrap();
-        let mtm_pos = output.find("## Medium-Term Memory (Recent Summaries)").unwrap();
+        let mtm_pos = output
+            .find("## Medium-Term Memory (Recent Summaries)")
+            .unwrap();
         assert!(stm_pos < idx_pos, "STM should come before Index");
         assert!(idx_pos < mtm_pos, "Index should come before MTM");
     }
@@ -519,10 +581,7 @@ mod tests {
             output.contains("## Known Facts"),
             "missing Known Facts header in:\n{output}"
         );
-        assert!(
-            output.contains("Alice"),
-            "missing fact value in:\n{output}"
-        );
+        assert!(output.contains("Alice"), "missing fact value in:\n{output}");
         assert!(
             output.contains("[high]"),
             "missing confidence tag in:\n{output}"
