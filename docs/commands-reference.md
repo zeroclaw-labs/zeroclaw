@@ -27,6 +27,7 @@ Last verified: **February 21, 2026**.
 | `completions` | Generate shell completion scripts to stdout |
 | `hardware` | Discover and introspect USB hardware |
 | `peripheral` | Configure and flash peripherals |
+| `mcp-server` | Start MCP stdio server for external tool clients |
 
 ## Command Groups
 
@@ -206,6 +207,25 @@ Skill manifests (`SKILL.toml`) support `prompts` and `[[tools]]`; both are injec
 - `zeroclaw peripheral flash [--port <serial_port>]`
 - `zeroclaw peripheral setup-uno-q [--host <ip_or_host>]`
 - `zeroclaw peripheral flash-nucleo`
+
+### `mcp-server`
+
+- `zeroclaw mcp-server`
+
+Starts ZeroClaw as an MCP (Model Context Protocol) stdio server that exposes the full native tool registry. Intended for use with external MCP clients like Codex CLI.
+
+Notes:
+
+- Reads from stdin (Content-Length framed JSON-RPC), writes to stdout.
+- Supports methods: `initialize`, `tools/list`, `tools/call`, `ping`.
+- The server runs until stdin is closed or the process is terminated.
+
+Integration example (Codex CLI):
+
+```bash
+codex mcp add zeroclaw -- zeroclaw mcp-server
+codex mcp list
+```
 
 ## Validation Tip
 

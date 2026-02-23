@@ -59,6 +59,7 @@ credential is not reused for fallback providers.
 | `sglang` | — | Yes | `SGLANG_API_KEY` (optional) |
 | `vllm` | — | Yes | `VLLM_API_KEY` (optional) |
 | `osaurus` | — | Yes | `OSAURUS_API_KEY` (optional; defaults to `"osaurus"`) |
+| `codex-cli` | `codex_cli` | Yes | `ZEROCLAW_CODEX_BIN` (optional), `ZEROCLAW_CODEX_SANDBOX` (optional) |
 | `nvidia` | `nvidia-nim`, `build.nvidia.com` | No | `NVIDIA_API_KEY` |
 
 ### Vercel AI Gateway Notes
@@ -171,6 +172,28 @@ Recommended starter model IDs (verified against NVIDIA API catalog on February 1
 - `deepseek-ai/deepseek-v3.2`
 - `nvidia/llama-3.3-nemotron-super-49b-v1.5`
 - `nvidia/llama-3.1-nemotron-ultra-253b-v1`
+
+### Codex CLI Notes
+
+- Provider ID: `codex-cli` (alias: `codex_cli`)
+- Local: Yes (no API key required)
+- Default model: `gpt-5.3-codex-spark`
+- Available models: `gpt-5.3-codex-spark`, `gpt-5.3-codex`, `gpt-5-codex`
+- Delegates inference to a locally installed Codex CLI binary via `codex exec --json`. Supports all models available to the local Codex CLI installation.
+
+Configuration:
+
+```toml
+default_provider = "codex-cli"
+default_model = "gpt-5.3-codex-spark"
+```
+
+Environment variables:
+
+- `ZEROCLAW_CODEX_BIN` — custom path to the Codex CLI binary (default: `codex` in `PATH`)
+- `ZEROCLAW_CODEX_SANDBOX` — sandbox mode passed to Codex CLI (default: `read-only`)
+
+Note: Requires the Codex CLI binary to be installed and available in PATH (or specify via `ZEROCLAW_CODEX_BIN`).
 
 ## Custom Endpoints
 
