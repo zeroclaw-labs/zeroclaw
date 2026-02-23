@@ -1819,6 +1819,7 @@ pub(crate) async fn agent_turn(
         None,
         None,
         &[],
+        None,
     )
     .await
 }
@@ -1829,13 +1830,17 @@ async fn execute_one_tool(
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
+    dynamic_tools: Option<&[Arc<dyn Tool>]>,
 ) -> Result<ToolExecutionOutcome> {
     observer.record_event(&ObserverEvent::ToolCallStart {
         tool: call_name.to_string(),
     });
     let start = Instant::now();
 
-    let Some(tool) = find_tool(tools_registry, call_name) else {
+    let dynamic_hit = dynamic_tools.and_then(|dt| dt.iter().find(|t| t.name() == call_name));
+    let tool_ref: Option<&dyn Tool> =
+        find_tool(tools_registry, call_name).or_else(|| dynamic_hit.map(|t| t.as_ref()));
+    let Some(tool) = tool_ref else {
         let reason = format!("Unknown tool: {call_name}");
         let duration = start.elapsed();
         observer.record_event(&ObserverEvent::ToolCall {
@@ -1935,6 +1940,7 @@ async fn execute_tools_parallel(
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
+    dynamic_tools: Option<&[Arc<dyn Tool>]>,
 ) -> Result<Vec<ToolExecutionOutcome>> {
     let futures: Vec<_> = tool_calls
         .iter()
@@ -1945,6 +1951,7 @@ async fn execute_tools_parallel(
                 tools_registry,
                 observer,
                 cancellation_token,
+                dynamic_tools,
             )
         })
         .collect();
@@ -1958,6 +1965,7 @@ async fn execute_tools_sequential(
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
+    dynamic_tools: Option<&[Arc<dyn Tool>]>,
 ) -> Result<Vec<ToolExecutionOutcome>> {
     let mut outcomes = Vec::with_capacity(tool_calls.len());
 
@@ -1969,6 +1977,7 @@ async fn execute_tools_sequential(
                 tools_registry,
                 observer,
                 cancellation_token,
+                dynamic_tools,
             )
             .await?,
         );
@@ -2009,6 +2018,7 @@ pub(crate) async fn run_tool_call_loop(
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
+    dynamic_registry: Option<&crate::tools::dynamic_registry::DynamicRegistry>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -2016,11 +2026,27 @@ pub(crate) async fn run_tool_call_loop(
         max_tool_iterations
     };
 
-    let tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
+    // Capture a snapshot of dynamic tools/hooks for this turn.
+    let dynamic_snapshot = dynamic_registry.map(|r| r.snapshot());
+    let dynamic_tools_slice: Option<&[Arc<dyn Tool>]> = dynamic_snapshot
+        .as_ref()
+        .map(|snap| snap.all_tools.as_slice());
+
+    let mut tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
         .iter()
         .filter(|tool| !excluded_tools.iter().any(|ex| ex == tool.name()))
         .map(|tool| tool.spec())
         .collect();
+
+    // Add dynamic tool specs if registry is present.
+    if let Some(ref snapshot) = dynamic_snapshot {
+        for tool in snapshot.all_tools.iter() {
+            if !excluded_tools.iter().any(|ex| ex == tool.name()) {
+                tool_specs.push(tool.spec());
+            }
+        }
+    }
+
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
     let turn_id = Uuid::new_v4().to_string();
     let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
@@ -2493,6 +2519,7 @@ pub(crate) async fn run_tool_call_loop(
                 tools_registry,
                 observer,
                 cancellation_token.as_ref(),
+                dynamic_tools_slice,
             )
             .await?
         } else {
@@ -2501,6 +2528,7 @@ pub(crate) async fn run_tool_call_loop(
                 tools_registry,
                 observer,
                 cancellation_token.as_ref(),
+                dynamic_tools_slice,
             )
             .await?
         };
@@ -2962,6 +2990,7 @@ pub async fn run(
             None,
             None,
             &[],
+            None,
         )
         .await?;
         final_output = response.clone();
@@ -3083,6 +3112,7 @@ pub async fn run(
                 None,
                 None,
                 &[],
+                None,
             )
             .await
             {
@@ -3624,6 +3654,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -3670,6 +3701,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -3710,6 +3742,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -3836,6 +3869,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("parallel execution should complete");
@@ -3905,6 +3939,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -3961,6 +3996,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("native fallback id flow should complete");
