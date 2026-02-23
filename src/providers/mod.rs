@@ -27,6 +27,7 @@ pub mod openai_codex;
 pub mod openrouter;
 pub mod reliable;
 pub mod router;
+pub mod siliconflow;
 pub mod telnyx;
 pub mod traits;
 
@@ -171,6 +172,10 @@ pub(crate) fn is_qianfan_alias(name: &str) -> bool {
 
 pub(crate) fn is_doubao_alias(name: &str) -> bool {
     matches!(name, "doubao" | "volcengine" | "ark" | "doubao-cn")
+}
+
+pub(crate) fn is_siliconflow_alias(name: &str) -> bool {
+    matches!(name, "siliconflow" | "silicon-flow")
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -612,6 +617,8 @@ pub(crate) fn canonical_china_provider_name(name: &str) -> Option<&'static str> 
         Some("qianfan")
     } else if is_doubao_alias(name) {
         Some("doubao")
+    } else if is_siliconflow_alias(name) {
+        Some("siliconflow")
     } else {
         None
     }
@@ -831,6 +838,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "bedrock" | "aws-bedrock" => return None,
         name if is_qianfan_alias(name) => vec!["QIANFAN_API_KEY"],
         name if is_doubao_alias(name) => vec!["ARK_API_KEY", "DOUBAO_API_KEY"],
+        name if is_siliconflow_alias(name) => vec!["SILICONFLOW_API_KEY"],
         name if is_qwen_alias(name) => vec!["DASHSCOPE_API_KEY"],
         name if is_zai_alias(name) => vec!["ZAI_API_KEY"],
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => vec!["NVIDIA_API_KEY"],
@@ -1068,6 +1076,9 @@ fn create_provider_with_url_and_options(
             key,
             AuthStyle::Bearer,
         ))),
+        name if is_siliconflow_alias(name) => Ok(Box::new(
+            siliconflow::SiliconFlowProvider::new(key)
+        )),
         name if qwen_base_url(name).is_some() => Ok(Box::new(OpenAiCompatibleProvider::new_with_vision(
             "Qwen",
             qwen_base_url(name).expect("checked in guard"),
@@ -1567,6 +1578,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             name: "doubao",
             display_name: "Doubao (Volcengine)",
             aliases: &["volcengine", "ark", "doubao-cn"],
+            local: false,
+        },
+        ProviderInfo {
+            name: "siliconflow",
+            display_name: "SiliconFlow",
+            aliases: &["silicon-flow"],
             local: false,
         },
         ProviderInfo {

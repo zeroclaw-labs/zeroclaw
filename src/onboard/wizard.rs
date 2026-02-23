@@ -14,8 +14,8 @@ use crate::memory::{
 };
 use crate::providers::{
     canonical_china_provider_name, is_glm_alias, is_glm_cn_alias, is_minimax_alias,
-    is_moonshot_alias, is_qianfan_alias, is_qwen_alias, is_qwen_oauth_alias, is_zai_alias,
-    is_zai_cn_alias,
+    is_moonshot_alias, is_qianfan_alias, is_qwen_alias, is_qwen_oauth_alias, is_siliconflow_alias,
+    is_zai_alias, is_zai_cn_alias,
 };
 use anyhow::{bail, Context, Result};
 use console::style;
@@ -44,14 +44,14 @@ pub struct ProjectContext {
 const BANNER: &str = r"
     ⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡
 
-    ███████╗███████╗██████╗  ██████╗  ██████╗██╗      █████╗ ██╗    ██╗
-    ╚══███╔╝██╔════╝██╔══██╗██╔═══██╗██╔════╝██║     ██╔══██╗██║    ██║
-      ███╔╝ █████╗  ██████╔╝██║   ██║██║     ██║     ███████║██║ █╗ ██║
-     ███╔╝  ██╔══╝  ██╔══██╗██║   ██║██║     ██║     ██╔══██║██║███╗██║
-    ███████╗███████╗██║  ██║╚██████╔╝╚██████╗███████╗██║  ██║╚███╔███╔╝
-    ╚══════╝╚══════╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝
+    ██╗     ██╗████████╗ █████╗ 
+    ██║     ██║╚══██╔══╝██╔══██╗
+    ██║     ██║   ██║   ███████║
+    ██║     ██║   ██║   ██╔══██║
+    ███████╗██║   ██║   ██║  ██║
+    ╚══════╝╚═╝   ╚═╝   ╚═╝  ╚═╝
 
-    Zero overhead. Zero compromise. 100% Rust. 100% Agnostic.
+     overhead.  compromise. 100% Rust. 100% Agnostic.
 
     ⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡
 ";
@@ -685,11 +685,43 @@ fn default_model_for_provider(provider: &str) -> String {
         "kimi-code" => "kimi-for-coding".into(),
         "bedrock" => "anthropic.claude-sonnet-4-5-20250929-v1:0".into(),
         "nvidia" => "meta/llama-3.3-70b-instruct".into(),
+        // SiliconFlow：推荐使用 GLM-4.6 作为默认（免费额度充足）
+        "siliconflow" => "zai-org/GLM-4.6".into(),
         _ => "anthropic/claude-sonnet-4.6".into(),
     }
 }
 
 fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
+    // SiliconFlow 精选型号列表
+    if is_siliconflow_alias(provider_name) || provider_name == "siliconflow" {
+        return vec![
+            (
+                "zai-org/GLM-4.6".to_string(),
+                "GLM-4.6（推荐，免费额度，强工具调用）".to_string(),
+            ),
+            (
+                "Pro/zai-org/GLM-4.7".to_string(),
+                "GLM-4.7 Pro（旗舰推理模型，含思维链）".to_string(),
+            ),
+            (
+                "deepseek-ai/DeepSeek-V3.2".to_string(),
+                "DeepSeek-V3.2（高性价比，代码能力强）".to_string(),
+            ),
+            (
+                "Pro/deepseek-ai/DeepSeek-V3.2".to_string(),
+                "DeepSeek-V3.2 Pro（最高配额）".to_string(),
+            ),
+            (
+                "Qwen/Qwen3-32B".to_string(),
+                "Qwen3-32B（通义千问旗舰，支持思考模式）".to_string(),
+            ),
+            (
+                "Qwen/Qwen3-8B".to_string(),
+                "Qwen3-8B（轻量级，低延迟）".to_string(),
+            ),
+        ];
+    }
+
     match canonical_provider_name(provider_name) {
         "openrouter" => vec![
             (
@@ -1954,6 +1986,10 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
         ],
         3 => vec![
             (
+                "siliconflow",
+                "SiliconFlow — GLM、DeepSeek、Qwen 等模型（国内推理平台）",
+            ),
+            (
                 "kimi-code",
                 "Kimi Code — coding-optimized Kimi API (KimiCLI)",
             ),
@@ -2343,6 +2379,8 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             "https://platform.moonshot.cn/console/api-keys"
         } else if canonical_provider_name(provider_name) == "qwen-code" {
             "https://qwen.readthedocs.io/en/latest/getting_started/installation.html"
+        } else if is_siliconflow_alias(provider_name) || provider_name == "siliconflow" {
+            "https://cloud.siliconflow.cn/account/ak"
         } else if is_glm_cn_alias(provider_name) || is_zai_cn_alias(provider_name) {
             "https://open.bigmodel.cn/usercenter/proj-mgmt/apikeys"
         } else if is_glm_alias(provider_name) || is_zai_alias(provider_name) {
@@ -2661,6 +2699,7 @@ fn provider_env_var(name: &str) -> &'static str {
         "qwen" => "DASHSCOPE_API_KEY",
         "qianfan" => "QIANFAN_API_KEY",
         "zai" => "ZAI_API_KEY",
+        "siliconflow" => "SILICONFLOW_API_KEY",
         "synthetic" => "SYNTHETIC_API_KEY",
         "opencode" | "opencode-zen" => "OPENCODE_API_KEY",
         "vercel" | "vercel-ai" => "VERCEL_API_KEY",
@@ -2970,37 +3009,41 @@ fn setup_project_context() -> Result<ProjectContext> {
         .default("User".into())
         .interact_text()?;
 
-    let tz_options = vec![
-        "US/Eastern (EST/EDT)",
-        "US/Central (CST/CDT)",
-        "US/Mountain (MST/MDT)",
-        "US/Pacific (PST/PDT)",
-        "Europe/London (GMT/BST)",
-        "Europe/Berlin (CET/CEST)",
-        "Asia/Tokyo (JST)",
-        "UTC",
-        "Other (type manually)",
+    // 时区选项：(显示标签, IANA时区ID)
+    let tz_options: Vec<(&str, &str)> = vec![
+        (
+            "🇨🇳 Asia/Shanghai — 北京/上海时间 (UTC+8, CST)",
+            "Asia/Shanghai",
+        ),
+        ("🇭🇰 Asia/Hong_Kong — 香港时间 (UTC+8)", "Asia/Hong_Kong"),
+        ("🇸🇬 Asia/Singapore — 新加坡时间 (UTC+8)", "Asia/Singapore"),
+        ("🇯🇵 Asia/Tokyo — 东京时间 (UTC+9, JST)", "Asia/Tokyo"),
+        ("🇰🇷 Asia/Seoul — 首尔时间 (UTC+9, KST)", "Asia/Seoul"),
+        ("🇮🇳 Asia/Kolkata — 印度标准时间 (UTC+5:30)", "Asia/Kolkata"),
+        ("🌍 Europe/London (GMT/BST)", "Europe/London"),
+        ("🇩🇪 Europe/Berlin (CET/CEST)", "Europe/Berlin"),
+        ("🇺🇸 US/Eastern (EST/EDT)", "US/Eastern"),
+        ("🇺🇸 US/Central (CST/CDT)", "US/Central"),
+        ("🇺🇸 US/Pacific (PST/PDT)", "US/Pacific"),
+        ("🌐 UTC", "UTC"),
+        ("✏️  Other — 手动输入 (type manually)", "__other__"),
     ];
 
+    let tz_labels: Vec<&str> = tz_options.iter().map(|(label, _)| *label).collect();
+
     let tz_idx = Select::new()
-        .with_prompt("  Your timezone")
-        .items(&tz_options)
-        .default(0)
+        .with_prompt("  Your timezone / 你的时区")
+        .items(&tz_labels)
+        .default(0) // 默认北京时间
         .interact()?;
 
-    let timezone = if tz_idx == tz_options.len() - 1 {
+    let timezone = if tz_options[tz_idx].1 == "__other__" {
         Input::new()
-            .with_prompt("  Enter timezone (e.g. America/New_York)")
-            .default("UTC".into())
+            .with_prompt("  Enter IANA timezone (e.g. Asia/Shanghai, America/New_York)")
+            .default("Asia/Shanghai".into())
             .interact_text()?
     } else {
-        // Extract the short label before the parenthetical
-        tz_options[tz_idx]
-            .split('(')
-            .next()
-            .unwrap_or("UTC")
-            .trim()
-            .to_string()
+        tz_options[tz_idx].1.to_string()
     };
 
     let agent_name: String = Input::new()
