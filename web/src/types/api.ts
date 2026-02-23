@@ -49,6 +49,34 @@ export interface Integration {
   status: 'Available' | 'Active' | 'ComingSoon';
 }
 
+export interface IntegrationCredentialsField {
+  key: string;
+  label: string;
+  required: boolean;
+  has_value: boolean;
+  input_type: 'secret' | 'text' | 'select';
+  options: string[];
+  current_value?: string;
+  masked_value?: string;
+}
+
+export interface IntegrationSettingsEntry {
+  id: string;
+  name: string;
+  description: string;
+  category: string;
+  status: Integration['status'];
+  configured: boolean;
+  activates_default_provider: boolean;
+  fields: IntegrationCredentialsField[];
+}
+
+export interface IntegrationSettingsPayload {
+  revision: string;
+  active_default_provider_integration_id?: string;
+  integrations: IntegrationSettingsEntry[];
+}
+
 export interface DiagResult {
   severity: 'ok' | 'warn' | 'error';
   category: string;

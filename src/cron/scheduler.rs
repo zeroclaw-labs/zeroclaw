@@ -468,7 +468,35 @@ mod tests {
     use crate::cron::{self, DeliveryConfig};
     use crate::security::SecurityPolicy;
     use chrono::{Duration as ChronoDuration, Utc};
+    use std::sync::OnceLock;
     use tempfile::TempDir;
+
+    async fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn unset(key: &'static str) -> Self {
+            let original = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.original.as_ref() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     async fn test_config(tmp: &TempDir) -> Config {
         let config = Config {
@@ -708,6 +736,10 @@ mod tests {
     async fn run_agent_job_returns_error_without_provider_key() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
+        let _env = env_lock().await;
+        let _generic = EnvGuard::unset("ZEROCLAW_API_KEY");
+        let _fallback = EnvGuard::unset("API_KEY");
+        let _openrouter = EnvGuard::unset("OPENROUTER_API_KEY");
         let mut job = test_job("");
         job.job_type = JobType::Agent;
         job.prompt = Some("Say hello".into());
