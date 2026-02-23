@@ -12,7 +12,7 @@ pub mod traits;
 
 #[allow(unused_imports)]
 pub use traits::{
-    ChatMessage, ChatRequest, ChatResponse, ConversationMessage, Provider, ToolCall,
+    ChatMessage, ChatRequest, ChatResponse, ConversationMessage, Provider, ResponseUsage, ToolCall,
     ToolResultMessage,
 };
 

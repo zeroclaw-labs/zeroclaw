@@ -49,6 +49,13 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
+/// Token usage reported by the provider (when available).
+#[derive(Debug, Clone, Default)]
+pub struct ResponseUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
 /// An LLM response that may contain text, tool calls, or both.
 #[derive(Debug, Clone)]
 pub struct ChatResponse {
@@ -56,6 +63,8 @@ pub struct ChatResponse {
     pub text: Option<String>,
     /// Tool calls requested by the LLM.
     pub tool_calls: Vec<ToolCall>,
+    /// Token usage from this request (None if provider doesn't report it).
+    pub usage: Option<ResponseUsage>,
 }
 
 impl ChatResponse {
@@ -333,6 +342,7 @@ pub trait Provider: Send + Sync {
                 return Ok(ChatResponse {
                     text: Some(text),
                     tool_calls: Vec::new(),
+                    usage: None,
                 });
             }
         }
@@ -343,6 +353,7 @@ pub trait Provider: Send + Sync {
         Ok(ChatResponse {
             text: Some(text),
             tool_calls: Vec::new(),
+            usage: None,
         })
     }
 
@@ -371,6 +382,7 @@ pub trait Provider: Send + Sync {
         Ok(ChatResponse {
             text: Some(text),
             tool_calls: Vec::new(),
+            usage: None,
         })
     }
 
@@ -493,6 +505,7 @@ mod tests {
         let empty = ChatResponse {
             text: None,
             tool_calls: vec![],
+            usage: None,
         };
         assert!(!empty.has_tool_calls());
         assert_eq!(empty.text_or_empty(), "");
@@ -504,6 +517,7 @@ mod tests {
                 name: "shell".into(),
                 arguments: "{}".into(),
             }],
+            usage: None,
         };
         assert!(with_tools.has_tool_calls());
         assert_eq!(with_tools.text_or_empty(), "Let me check");

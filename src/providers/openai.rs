@@ -246,7 +246,7 @@ impl OpenAiProvider {
             })
             .collect::<Vec<_>>();
 
-        ProviderChatResponse { text, tool_calls }
+        ProviderChatResponse { text, tool_calls, usage: None }
     }
 
     fn http_client(&self) -> Client {

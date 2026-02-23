@@ -217,6 +217,7 @@ impl OpenRouterProvider {
         ProviderChatResponse {
             text: message.content,
             tool_calls,
+            usage: None,
         }
     }
 
