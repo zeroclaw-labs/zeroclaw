@@ -3115,6 +3115,18 @@ pub async fn start_channels(config: Config) -> Result<()> {
             "delegate",
             "Delegate a subtask to a specialized agent. Use when: a task benefits from a different model (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single prompt and returns its response.",
         ));
+        tool_descs.push((
+            "subagent_spawn",
+            "Spawn a delegate agent in the background. Returns immediately with a session_id. Use for long-running tasks that should not block.",
+        ));
+        tool_descs.push((
+            "subagent_list",
+            "List running and completed background sub-agents. Filter by status: running, completed, failed, killed, or all.",
+        ));
+        tool_descs.push((
+            "subagent_manage",
+            "Manage a background sub-agent: 'status' to check progress/output, 'kill' to cancel a running session.",
+        ));
     }
 
     // Filter out tools excluded for non-CLI channels so the system prompt
