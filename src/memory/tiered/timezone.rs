@@ -20,10 +20,7 @@ use tokio::time::timeout;
 /// - Caps the result at 256 characters.
 pub fn sanitize_location(input: &str) -> String {
     let trimmed = input.trim();
-    let cleaned: String = trimmed
-        .chars()
-        .filter(|c| !c.is_ascii_control())
-        .collect();
+    let cleaned: String = trimmed.chars().filter(|c| !c.is_ascii_control()).collect();
     if cleaned.len() <= 256 {
         cleaned
     } else {
@@ -62,10 +59,7 @@ pub fn is_valid_iana_tz(tz: &str) -> bool {
 ///   data field to prevent prompt injection.
 /// - The LLM response is validated against `chrono-tz` before being returned.
 /// - A 3-second timeout prevents blocking if the LLM is slow.
-pub async fn resolve_timezone_via_llm<F, Fut>(
-    location: &str,
-    llm_call: F,
-) -> Option<String>
+pub async fn resolve_timezone_via_llm<F, Fut>(location: &str, llm_call: F) -> Option<String>
 where
     F: FnOnce(String) -> Fut,
     Fut: std::future::Future<Output = Result<String, anyhow::Error>>,
@@ -95,8 +89,7 @@ where
                 None
             }
         }
-        Ok(Err(_)) => None,  // LLM call failed
-        Err(_) => None,       // Timeout
+        Ok(Err(_)) | Err(_) => None, // LLM call failed or timeout
     }
 }
 
@@ -129,10 +122,7 @@ mod tests {
 
     #[test]
     fn sanitize_preserves_normal_input() {
-        assert_eq!(
-            sanitize_location("New York, USA"),
-            "New York, USA"
-        );
+        assert_eq!(sanitize_location("New York, USA"), "New York, USA");
     }
 
     #[test]
@@ -224,18 +214,15 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_sends_sanitized_input_as_json() {
-        let result = resolve_timezone_via_llm(
-            "Cebu\x00, Philippines",
-            |prompt| async move {
-                // Verify the prompt is valid JSON and contains sanitized data.
-                let parsed: serde_json::Value = serde_json::from_str(&prompt)
-                    .expect("prompt should be valid JSON");
-                let data = parsed["data"].as_str().unwrap();
-                assert!(!data.contains('\x00'), "control chars should be stripped");
-                assert!(data.contains("Cebu"), "location should be preserved");
-                Ok("Asia/Manila".to_string())
-            },
-        )
+        let result = resolve_timezone_via_llm("Cebu\x00, Philippines", |prompt| async move {
+            // Verify the prompt is valid JSON and contains sanitized data.
+            let parsed: serde_json::Value =
+                serde_json::from_str(&prompt).expect("prompt should be valid JSON");
+            let data = parsed["data"].as_str().unwrap();
+            assert!(!data.contains('\x00'), "control chars should be stripped");
+            assert!(data.contains("Cebu"), "location should be preserved");
+            Ok("Asia/Manila".to_string())
+        })
         .await;
         assert_eq!(result, Some("Asia/Manila".to_string()));
     }

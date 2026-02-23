@@ -1572,7 +1572,7 @@ mod tests {
     fn resolve_picks_first_usable_when_multiple_accounts_exist() {
         // Regression test for issue #959: previously returned None when
         // multiple accounts existed, causing the LLM to loop on the OAuth URL.
-        let tool = ComposioTool::new("test-key", None, test_security());
+        let _tool = ComposioTool::new("test-key", None, test_security());
         let accounts = vec![
             ComposioConnectedAccount {
                 id: "ca_old".to_string(),

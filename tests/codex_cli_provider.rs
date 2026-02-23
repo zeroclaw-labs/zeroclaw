@@ -25,8 +25,7 @@ fn write_fake_codex(name: &str, body: &str) -> (TempDir, String) {
         .expect("failed to write script");
     file.sync_all().expect("failed to sync script to disk");
     drop(file);
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
-        .expect("failed to chmod script");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("failed to chmod script");
     let path_str = path.to_str().expect("non-UTF-8 temp path").to_owned();
     (dir, path_str)
 }

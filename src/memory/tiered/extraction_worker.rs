@@ -1,14 +1,17 @@
 //! Background worker that processes the STM extraction queue.
 
-use std::sync::Arc;
-use chrono::Utc;
-use tokio::sync::mpsc;
 use crate::memory::tiered::extractor::FactExtractor;
-use crate::memory::tiered::facts::*;
+use crate::memory::tiered::facts::{
+    build_fact_key, FactConfidence, FactEntry, FactStatus, SourceRole, SourceTurnRef,
+    VolatilityClass,
+};
 use crate::memory::tiered::prompts::build_stm_extraction_prompt;
 use crate::memory::tiered::ExtractionRequest;
 use crate::memory::tiered::SharedMemory;
 use crate::memory::traits::MemoryCategory;
+use chrono::Utc;
+use std::sync::Arc;
+use tokio::sync::mpsc;
 
 /// Run the STM extraction worker loop until the channel is closed.
 pub async fn run_extraction_worker(
@@ -34,7 +37,11 @@ async fn process_extraction(
     let prompt = build_stm_extraction_prompt(&req.content, "", &[]);
     let drafts = extractor.extract(&prompt).await?;
     let now_ms = Utc::now().timestamp_millis();
-    let source_role = if req.role == "agent" { SourceRole::Agent } else { SourceRole::User };
+    let source_role = if req.role == "agent" {
+        SourceRole::Agent
+    } else {
+        SourceRole::User
+    };
     let stm_guard = stm.lock().await;
 
     for draft in drafts {
@@ -82,7 +89,9 @@ async fn process_extraction(
 
         entry.apply_poisoning_guard();
         let content = serde_json::to_string(&entry)?;
-        stm_guard.store(&fact_key, &content, MemoryCategory::Core, None).await?;
+        stm_guard
+            .store(&fact_key, &content, MemoryCategory::Core, None)
+            .await?;
     }
     Ok(())
 }
@@ -249,8 +258,7 @@ mod tests {
         draft.confidence = "high".to_string(); // Agent with High → should be demoted
 
         let stm = make_shared(InMemoryBackend::new());
-        let extractor: Arc<dyn FactExtractor> =
-            Arc::new(MockFactExtractor::new(vec![draft]));
+        let extractor: Arc<dyn FactExtractor> = Arc::new(MockFactExtractor::new(vec![draft]));
 
         let req = ExtractionRequest {
             content: "I think blue is a great color".to_string(),
@@ -269,7 +277,11 @@ mod tests {
         // Verify the fact was stored and confidence was demoted
         let guard = stm.lock().await;
         let fact_key = "fact:personal:user:favorite-color";
-        let entry = guard.get(fact_key).await.unwrap().expect("fact should exist");
+        let entry = guard
+            .get(fact_key)
+            .await
+            .unwrap()
+            .expect("fact should exist");
         let fact: FactEntry = serde_json::from_str(&entry.content).unwrap();
 
         assert_eq!(

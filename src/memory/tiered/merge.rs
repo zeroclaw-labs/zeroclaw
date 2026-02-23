@@ -133,10 +133,7 @@ pub fn merge_and_rank(
 /// Reserve 1 slot for the highest-scoring STM candidate and 1 for the highest-scoring MTM
 /// candidate (when available), then fill remaining slots with the top scorers from the rest,
 /// then re-sort and truncate to top_k.
-fn apply_diversity_guard(
-    items: Vec<TieredRecallItem>,
-    top_k: usize,
-) -> Vec<TieredRecallItem> {
+fn apply_diversity_guard(items: Vec<TieredRecallItem>, top_k: usize) -> Vec<TieredRecallItem> {
     if top_k == 0 {
         return Vec::new();
     }
@@ -155,7 +152,8 @@ fn apply_diversity_guard(
         reserved_ids.insert(m.entry_id.clone());
     }
 
-    let reserved_count = stm_candidate.is_some() as usize + mtm_candidate.is_some() as usize;
+    let reserved_count =
+        usize::from(stm_candidate.is_some()) + usize::from(mtm_candidate.is_some());
 
     // Build the general pool: everything that is NOT a reserved candidate.
     let remaining: Vec<TieredRecallItem> = items
@@ -212,7 +210,11 @@ mod tests {
             make_item("a", MemoryTier::Ltm, 0.8, 1000),
             make_item("b", MemoryTier::Mtm, 0.7, 500),
         ];
-        let weights = TierWeights { stm: 0.45, mtm: 0.35, ltm: 0.20 };
+        let weights = TierWeights {
+            stm: 0.45,
+            mtm: 0.35,
+            ltm: 0.20,
+        };
         let merged = merge_and_rank(items, &weights, 0.0, 5);
         assert_eq!(merged.len(), 2, "should deduplicate 'a'");
         // STM "a" should win (higher weight * base)
@@ -225,7 +227,11 @@ mod tests {
             make_item("high", MemoryTier::Stm, 0.9, 100),
             make_item("low", MemoryTier::Ltm, 0.05, 100),
         ];
-        let weights = TierWeights { stm: 0.45, mtm: 0.35, ltm: 0.20 };
+        let weights = TierWeights {
+            stm: 0.45,
+            mtm: 0.35,
+            ltm: 0.20,
+        };
         let merged = merge_and_rank(items, &weights, 0.4, 5);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].entry_id, "high");
@@ -236,7 +242,11 @@ mod tests {
         let items: Vec<_> = (0..10)
             .map(|i| make_item(&i.to_string(), MemoryTier::Stm, 0.9 - i as f32 * 0.05, 100))
             .collect();
-        let weights = TierWeights { stm: 0.45, mtm: 0.35, ltm: 0.20 };
+        let weights = TierWeights {
+            stm: 0.45,
+            mtm: 0.35,
+            ltm: 0.20,
+        };
         let merged = merge_and_rank(items, &weights, 0.0, 3);
         assert_eq!(merged.len(), 3);
     }
@@ -250,10 +260,20 @@ mod tests {
             .collect();
         items.push(make_item("stm-1", MemoryTier::Stm, 0.5, 50));
         items.push(make_item("mtm-1", MemoryTier::Mtm, 0.5, 200));
-        let weights = TierWeights { stm: 0.45, mtm: 0.35, ltm: 0.20 };
+        let weights = TierWeights {
+            stm: 0.45,
+            mtm: 0.35,
+            ltm: 0.20,
+        };
         let merged = merge_and_rank(items, &weights, 0.0, 5);
-        assert!(merged.iter().any(|i| i.tier == MemoryTier::Stm), "must include STM");
-        assert!(merged.iter().any(|i| i.tier == MemoryTier::Mtm), "must include MTM");
+        assert!(
+            merged.iter().any(|i| i.tier == MemoryTier::Stm),
+            "must include STM"
+        );
+        assert!(
+            merged.iter().any(|i| i.tier == MemoryTier::Mtm),
+            "must include MTM"
+        );
     }
 
     #[test]
@@ -262,7 +282,11 @@ mod tests {
         let mut boosted = make_item("boosted", MemoryTier::Ltm, 0.5, 100);
         boosted.has_cross_tier_link = true;
         let normal = make_item("normal", MemoryTier::Ltm, 0.5, 100);
-        let weights = TierWeights { stm: 0.45, mtm: 0.35, ltm: 0.20 };
+        let weights = TierWeights {
+            stm: 0.45,
+            mtm: 0.35,
+            ltm: 0.20,
+        };
         let merged = merge_and_rank(vec![normal, boosted], &weights, 0.0, 5);
         assert_eq!(merged[0].entry_id, "boosted");
     }
@@ -272,7 +296,11 @@ mod tests {
         let mut nan_item = make_item("nan", MemoryTier::Stm, f32::NAN, 100);
         nan_item.base_score = f32::NAN;
         let normal = make_item("normal", MemoryTier::Ltm, 0.8, 100);
-        let weights = TierWeights { stm: 0.45, mtm: 0.35, ltm: 0.20 };
+        let weights = TierWeights {
+            stm: 0.45,
+            mtm: 0.35,
+            ltm: 0.20,
+        };
         // Should not panic
         let result = merge_and_rank(vec![nan_item, normal], &weights, 0.0, 5);
         assert!(!result.is_empty());

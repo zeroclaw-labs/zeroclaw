@@ -1,4 +1,5 @@
-//! Integration tests — full STM → MTM → LTM tiered-memory pipeline.
+#![allow(clippy::field_reassign_with_default)]
+//! Integration tests -- full STM -> MTM -> LTM tiered-memory pipeline.
 //!
 //! These tests exercise the complete compression pipeline end-to-end using the
 //! crate's public API with in-memory backends, a [`MockSummarizer`], and a
@@ -107,7 +108,7 @@ impl Memory for InMemoryBackend {
         let guard = self.entries.lock().unwrap();
         let results: Vec<MemoryEntry> = guard
             .values()
-            .filter(|e| category.map_or(true, |c| &e.category == c))
+            .filter(|e| category.is_none_or(|c| &e.category == c))
             .cloned()
             .collect();
         Ok(results)
@@ -152,12 +153,7 @@ impl Memory for NoopMemory {
     ) -> anyhow::Result<()> {
         Ok(())
     }
-    async fn recall(
-        &self,
-        _: &str,
-        _: usize,
-        _: Option<&str>,
-    ) -> anyhow::Result<Vec<MemoryEntry>> {
+    async fn recall(&self, _: &str, _: usize, _: Option<&str>) -> anyhow::Result<Vec<MemoryEntry>> {
         Ok(vec![])
     }
     async fn get(&self, _: &str) -> anyhow::Result<Option<MemoryEntry>> {
@@ -192,11 +188,7 @@ async fn full_pipeline_stm_to_mtm_to_ltm() {
 
     // Pin all STM entries to today so compress_day(today) picks them up.
     let today = Utc::now().date_naive();
-    let today_ts = today
-        .and_hms_opt(12, 0, 0)
-        .unwrap()
-        .and_utc()
-        .to_rfc3339();
+    let today_ts = today.and_hms_opt(12, 0, 0).unwrap().and_utc().to_rfc3339();
 
     // Set the timestamp override on the STM backend before wrapping.
     *stm_backend.ts_override.lock().unwrap() = Some(today_ts);
@@ -346,10 +338,7 @@ async fn full_pipeline_stm_to_mtm_to_ltm() {
         3,
         "Index entry should reference 3 source STM entries"
     );
-    assert!(
-        idx.confidence > 0.0,
-        "Index entry confidence should be > 0"
-    );
+    assert!(idx.confidence > 0.0, "Index entry confidence should be > 0");
 
     // 7. Call recall("auth") on TieredMemory — should return results from across tiers.
     let recall_results = tiered.recall("auth", 10, None).await.unwrap();
@@ -359,11 +348,7 @@ async fn full_pipeline_stm_to_mtm_to_ltm() {
     );
 
     // 8. Load context via TieredMemoryLoader — should have index + MTM sections.
-    let loader = TieredMemoryLoader::new(
-        Arc::clone(&stm),
-        Arc::clone(&mtm),
-        Arc::clone(&cfg),
-    );
+    let loader = TieredMemoryLoader::new(Arc::clone(&stm), Arc::clone(&mtm), Arc::clone(&cfg));
 
     let context = loader.load_context(&NoopMemory, "auth").await.unwrap();
 
@@ -537,11 +522,7 @@ async fn compress_day_is_idempotent() {
     let ltm_backend = InMemoryBackend::new();
 
     let today = Utc::now().date_naive();
-    let today_ts = today
-        .and_hms_opt(12, 0, 0)
-        .unwrap()
-        .and_utc()
-        .to_rfc3339();
+    let today_ts = today.and_hms_opt(12, 0, 0).unwrap().and_utc().to_rfc3339();
 
     *stm_backend.ts_override.lock().unwrap() = Some(today_ts);
     stm_backend
@@ -597,9 +578,7 @@ async fn compress_day_is_idempotent() {
     let journal = job_journal.lock().await;
     let succeeded_count = journal
         .iter()
-        .filter(|j| {
-            j.status == zeroclaw::memory::tiered::types::CompressionJobStatus::Succeeded
-        })
+        .filter(|j| j.status == zeroclaw::memory::tiered::types::CompressionJobStatus::Succeeded)
         .count();
     assert_eq!(
         succeeded_count, 1,
@@ -649,13 +628,23 @@ async fn fact_extraction_stores_structured_facts() {
     // 4. Spawn extraction_worker in background.
     let stm_clone = Arc::clone(&stm);
     let worker_handle = tokio::spawn(async move {
-        run_extraction_worker(extraction_rx, stm_clone, extractor, "conv-integration".to_string())
-            .await;
+        run_extraction_worker(
+            extraction_rx,
+            stm_clone,
+            extractor,
+            "conv-integration".to_string(),
+        )
+        .await;
     });
 
     // 5. Store a user message via TieredMemory::store().
     tiered
-        .store("msg:user:100", "My name is John", MemoryCategory::Conversation, None)
+        .store(
+            "msg:user:100",
+            "My name is John",
+            MemoryCategory::Conversation,
+            None,
+        )
         .await
         .unwrap();
 
@@ -772,10 +761,7 @@ async fn fact_first_recall_boosts_facts_over_raw() {
     let results = tiered.recall("John", 10, None).await.unwrap();
 
     // 5. Assert the fact entry appears in results (it should score higher due to fact boost).
-    assert!(
-        !results.is_empty(),
-        "recall('John') should return results"
-    );
+    assert!(!results.is_empty(), "recall('John') should return results");
 
     // Find the fact entry in results.
     let fact_result = results.iter().find(|e| e.key.starts_with("fact:"));
@@ -847,14 +833,13 @@ async fn loader_includes_known_facts_section() {
     let cfg = Arc::new(TierConfig::default());
 
     // 3. Create TieredMemoryLoader.
-    let loader = TieredMemoryLoader::new(
-        Arc::clone(&stm),
-        Arc::clone(&mtm),
-        Arc::clone(&cfg),
-    );
+    let loader = TieredMemoryLoader::new(Arc::clone(&stm), Arc::clone(&mtm), Arc::clone(&cfg));
 
     // 4. Call load_context().
-    let context = loader.load_context(&NoopMemory, "test query").await.unwrap();
+    let context = loader
+        .load_context(&NoopMemory, "test query")
+        .await
+        .unwrap();
 
     // 5. Assert output contains "Known Facts".
     assert!(

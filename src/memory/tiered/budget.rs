@@ -8,7 +8,7 @@
 ///
 /// Rounds up to the nearest whole token using integer arithmetic.
 pub fn estimate_tokens(text: &str) -> usize {
-    (text.len() + 3) / 4
+    text.len().div_ceil(4)
 }
 
 /// Lightweight descriptor for an MTM entry used during batch selection.
@@ -86,9 +86,21 @@ mod tests {
         // overflow = 1000-800=200, must_free >= 200+100=300
         // oldest entry has 500 tokens -> frees 500 >= 300, done
         let entries = vec![
-            MtmEntry { id: "old".into(), token_count: 500, day: make_day(1) },
-            MtmEntry { id: "mid".into(), token_count: 300, day: make_day(2) },
-            MtmEntry { id: "new".into(), token_count: 200, day: make_day(3) },
+            MtmEntry {
+                id: "old".into(),
+                token_count: 500,
+                day: make_day(1),
+            },
+            MtmEntry {
+                id: "mid".into(),
+                token_count: 300,
+                day: make_day(2),
+            },
+            MtmEntry {
+                id: "new".into(),
+                token_count: 200,
+                day: make_day(3),
+            },
         ];
         let batch = select_overflow_batch(&entries, 1000, 800, 100, 7);
         assert_eq!(batch.len(), 1);
@@ -100,9 +112,21 @@ mod tests {
         // each 150 tokens, total=450, budget=200, hysteresis=50
         // overflow=250, must_free>=300 -> need 2 entries (2*150=300)
         let entries = vec![
-            MtmEntry { id: "a".into(), token_count: 150, day: make_day(1) },
-            MtmEntry { id: "b".into(), token_count: 150, day: make_day(2) },
-            MtmEntry { id: "c".into(), token_count: 150, day: make_day(3) },
+            MtmEntry {
+                id: "a".into(),
+                token_count: 150,
+                day: make_day(1),
+            },
+            MtmEntry {
+                id: "b".into(),
+                token_count: 150,
+                day: make_day(2),
+            },
+            MtmEntry {
+                id: "c".into(),
+                token_count: 150,
+                day: make_day(3),
+            },
         ];
         let batch = select_overflow_batch(&entries, 450, 200, 50, 7);
         assert_eq!(batch.len(), 2);
@@ -112,9 +136,11 @@ mod tests {
 
     #[test]
     fn no_overflow_returns_empty_batch() {
-        let entries = vec![
-            MtmEntry { id: "x".into(), token_count: 100, day: make_day(1) },
-        ];
+        let entries = vec![MtmEntry {
+            id: "x".into(),
+            token_count: 100,
+            day: make_day(1),
+        }];
         let batch = select_overflow_batch(&entries, 100, 2000, 200, 7);
         assert!(batch.is_empty());
     }
@@ -124,7 +150,11 @@ mod tests {
         // 10 entries, each 100 tokens, total=1000, budget=100, hysteresis=0
         // must_free=900, but max_batch_days=3 caps us at 3 entries
         let entries: Vec<MtmEntry> = (1..=10)
-            .map(|i| MtmEntry { id: i.to_string(), token_count: 100, day: make_day(i) })
+            .map(|i| MtmEntry {
+                id: i.to_string(),
+                token_count: 100,
+                day: make_day(i),
+            })
             .collect();
         let batch = select_overflow_batch(&entries, 1000, 100, 0, 3);
         assert_eq!(batch.len(), 3);

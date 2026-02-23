@@ -14,7 +14,10 @@ use uuid::Uuid;
 
 use crate::memory::tiered::budget::{estimate_tokens, select_overflow_batch, MtmEntry};
 use crate::memory::tiered::extractor::FactExtractor;
-use crate::memory::tiered::facts::*;
+use crate::memory::tiered::facts::{
+    build_fact_key, FactConfidence, FactEntry, FactStatus, SourceRole, SourceTurnRef,
+    VolatilityClass,
+};
 use crate::memory::tiered::prompts::build_mtm_extraction_prompt;
 use crate::memory::tiered::summarization::TierSummarizer;
 use crate::memory::tiered::tagging::TagExtractor;
@@ -53,7 +56,7 @@ impl TierManager {
             let eod_sleep = self.duration_until_eod();
 
             tokio::select! {
-                _ = tokio::time::sleep(eod_sleep) => {
+                () = tokio::time::sleep(eod_sleep) => {
                     let today = Utc::now().date_naive();
                     if let Err(e) = self.compress_day(today).await {
                         tracing::error!("EOD compression failed for {today}: {e:#}");
@@ -88,36 +91,36 @@ impl TierManager {
         let now_utc = Utc::now();
 
         // Try to parse as a chrono-tz timezone; fall back to UTC.
-        let target_utc = tz_str
-            .parse::<chrono_tz::Tz>()
-            .ok()
-            .and_then(|tz| {
-                use chrono::TimeZone;
-                let now_local = now_utc.with_timezone(&tz);
-                let today = now_local.date_naive();
-                let eod = today
-                    .and_hms_opt(self.cfg.stm_eod_hour as u32, self.cfg.stm_eod_minute as u32, 0)?;
-                let eod_local = tz.from_local_datetime(&eod).single()?;
-                let eod_utc = eod_local.with_timezone(&Utc);
-                if eod_utc <= now_utc {
-                    // Already past today's EOD — target tomorrow.
-                    let tomorrow = today.succ_opt()?;
-                    let eod_tomorrow = tomorrow.and_hms_opt(
-                        self.cfg.stm_eod_hour as u32,
-                        self.cfg.stm_eod_minute as u32,
-                        0,
-                    )?;
-                    let eod_tomorrow_local = tz.from_local_datetime(&eod_tomorrow).single()?;
-                    Some(eod_tomorrow_local.with_timezone(&Utc))
-                } else {
-                    Some(eod_utc)
-                }
-            });
+        let target_utc = tz_str.parse::<chrono_tz::Tz>().ok().and_then(|tz| {
+            use chrono::TimeZone;
+            let now_local = now_utc.with_timezone(&tz);
+            let today = now_local.date_naive();
+            let eod = today.and_hms_opt(
+                u32::from(self.cfg.stm_eod_hour),
+                u32::from(self.cfg.stm_eod_minute),
+                0,
+            )?;
+            let eod_local = tz.from_local_datetime(&eod).single()?;
+            let eod_utc = eod_local.with_timezone(&Utc);
+            if eod_utc <= now_utc {
+                // Already past today's EOD — target tomorrow.
+                let tomorrow = today.succ_opt()?;
+                let eod_tomorrow = tomorrow.and_hms_opt(
+                    u32::from(self.cfg.stm_eod_hour),
+                    u32::from(self.cfg.stm_eod_minute),
+                    0,
+                )?;
+                let eod_tomorrow_local = tz.from_local_datetime(&eod_tomorrow).single()?;
+                Some(eod_tomorrow_local.with_timezone(&Utc))
+            } else {
+                Some(eod_utc)
+            }
+        });
 
         match target_utc {
             Some(target) => {
                 let delta = target.signed_duration_since(now_utc);
-                let secs = delta.num_seconds().max(1) as u64;
+                let secs = delta.num_seconds().max(1).cast_unsigned();
                 tokio::time::Duration::from_secs(secs)
             }
             None => {
@@ -195,7 +198,8 @@ impl TierManager {
 
         // (f.1) Deep fact extraction via MTM agent (if available).
         if let Some(ref extractor) = self.fact_extractor {
-            let transcript = stm_entries.iter()
+            let transcript = stm_entries
+                .iter()
                 .map(|e| format!("[{}] {}: {}", e.timestamp, e.key, e.content))
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -203,7 +207,9 @@ impl TierManager {
             // Gather existing facts for cross-referencing.
             let existing_facts: Vec<String> = {
                 let stm_guard = self.stm.lock().await;
-                stm_guard.list(Some(&MemoryCategory::Core), None).await
+                stm_guard
+                    .list(Some(&MemoryCategory::Core), None)
+                    .await
                     .unwrap_or_default()
                     .into_iter()
                     .filter(|e| e.key.starts_with("fact:"))
@@ -218,7 +224,8 @@ impl TierManager {
                     let now_ms = chrono::Utc::now().timestamp_millis();
                     let stm_guard = self.stm.lock().await;
                     for draft in drafts {
-                        let fact_key = build_fact_key(&draft.category, &draft.subject, &draft.attribute);
+                        let fact_key =
+                            build_fact_key(&draft.category, &draft.subject, &draft.attribute);
                         let confidence = match draft.confidence.to_lowercase().as_str() {
                             "high" => FactConfidence::High,
                             "low" => FactConfidence::Low,
@@ -259,7 +266,9 @@ impl TierManager {
                             last_verified_unix_ms: Some(now_ms),
                         };
                         let content = serde_json::to_string(&entry).unwrap_or_default();
-                        let _ = stm_guard.store(&fact_key, &content, MemoryCategory::Core, None).await;
+                        let _ = stm_guard
+                            .store(&fact_key, &content, MemoryCategory::Core, None)
+                            .await;
                     }
                 }
                 Err(e) => {
@@ -281,15 +290,17 @@ impl TierManager {
         }
 
         // (h) Create IndexEntry, store in STM as stm_index category.
-        let topic = tags.first().cloned().unwrap_or_else(|| "general".to_string());
+        let topic = tags
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "general".to_string());
         let mut idx = IndexEntry::new(&topic, day);
         idx.tags = tags;
         idx.mtm_ref_id = Some(mtm_key.clone());
         idx.source_entry_ids = source_ids.clone();
         idx.confidence = confidence;
 
-        let idx_json =
-            serde_json::to_string(&idx).context("serializing IndexEntry")?;
+        let idx_json = serde_json::to_string(&idx).context("serializing IndexEntry")?;
         {
             let stm = self.stm.lock().await;
             stm.store(
@@ -389,7 +400,9 @@ impl TierManager {
         {
             let mtm = self.mtm.lock().await;
             for id in &batch_ids {
-                mtm.forget(id).await.context("deleting overflowed MTM entry")?;
+                mtm.forget(id)
+                    .await
+                    .context("deleting overflowed MTM entry")?;
             }
         }
 
@@ -565,7 +578,9 @@ mod tests {
             session_id: Option<&str>,
         ) -> anyhow::Result<()> {
             let ts = OVERRIDE_TIMESTAMP.with(|cell| {
-                cell.borrow().clone().unwrap_or_else(|| Utc::now().to_rfc3339())
+                cell.borrow()
+                    .clone()
+                    .unwrap_or_else(|| Utc::now().to_rfc3339())
             });
             let entry = MemoryEntry {
                 id: key.to_string(),
@@ -629,13 +644,13 @@ mod tests {
 
     // ── Helpers ───────────────────────────────────────────────────────────
 
-    fn make_shared(backend: impl Memory + Send + 'static) -> SharedMemory {
+    fn make_shared(backend: impl Memory + 'static) -> SharedMemory {
         Arc::new(Mutex::new(Box::new(backend)))
     }
 
     /// Build a TierManager for tests. Returns (manager, stm, mtm, ltm) so
     /// tests can inspect tier contents after operations.
-    async fn make_test_manager() -> (TierManager, SharedMemory, SharedMemory, SharedMemory) {
+    fn make_test_manager() -> (TierManager, SharedMemory, SharedMemory, SharedMemory) {
         use crate::memory::tiered::summarization::MockSummarizer;
         use crate::memory::tiered::tagging::BasicTagExtractor;
 
@@ -662,11 +677,7 @@ mod tests {
 
     /// Store a test entry in STM with a timestamp matching the given day.
     async fn store_test_entry(stm: &SharedMemory, key: &str, content: &str, day: NaiveDate) {
-        let ts = day
-            .and_hms_opt(12, 0, 0)
-            .unwrap()
-            .and_utc()
-            .to_rfc3339();
+        let ts = day.and_hms_opt(12, 0, 0).unwrap().and_utc().to_rfc3339();
 
         OVERRIDE_TIMESTAMP.with(|cell| {
             *cell.borrow_mut() = Some(ts);
@@ -697,7 +708,7 @@ mod tests {
 
     #[tokio::test]
     async fn compress_day_moves_stm_to_mtm_and_ltm() {
-        let (manager, stm, mtm, ltm) = make_test_manager().await;
+        let (manager, stm, mtm, ltm) = make_test_manager();
         let day = NaiveDate::from_ymd_opt(2026, 1, 15).unwrap();
 
         // Store 2 STM entries for this day.
@@ -732,7 +743,7 @@ mod tests {
 
     #[tokio::test]
     async fn compress_day_is_idempotent() {
-        let (manager, stm, mtm, _ltm) = make_test_manager().await;
+        let (manager, stm, mtm, _ltm) = make_test_manager();
         let day = NaiveDate::from_ymd_opt(2026, 1, 15).unwrap();
         store_test_entry(&stm, "e1", "test", day).await;
 
@@ -748,7 +759,7 @@ mod tests {
 
     #[tokio::test]
     async fn compress_day_empty_is_noop() {
-        let (manager, _stm, mtm, _ltm) = make_test_manager().await;
+        let (manager, _stm, mtm, _ltm) = make_test_manager();
         let day = NaiveDate::from_ymd_opt(2026, 1, 15).unwrap();
 
         manager.compress_day(day).await.unwrap();
@@ -761,7 +772,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_mtm_budget_compresses_when_over_budget() {
-        let (manager, _stm, mtm, ltm) = make_test_manager().await;
+        let (manager, _stm, mtm, ltm) = make_test_manager();
 
         // config default mtm_token_budget = 2000 tokens = ~8000 chars.
         // Store 2 entries that together exceed the budget.
@@ -780,7 +791,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_mtm_budget_noop_when_under_budget() {
-        let (manager, _stm, mtm, ltm) = make_test_manager().await;
+        let (manager, _stm, mtm, ltm) = make_test_manager();
 
         // Store a small entry well under budget.
         store_mtm_entry(&mtm, "mtm-small", "short text", 1).await;
@@ -803,7 +814,7 @@ mod tests {
 
     #[tokio::test]
     async fn compress_day_does_not_touch_index_entries() {
-        let (manager, stm, mtm, _ltm) = make_test_manager().await;
+        let (manager, stm, mtm, _ltm) = make_test_manager();
         let day1 = NaiveDate::from_ymd_opt(2026, 1, 14).unwrap();
         let day2 = NaiveDate::from_ymd_opt(2026, 1, 15).unwrap();
 
@@ -819,9 +830,7 @@ mod tests {
         let stm_entries = stm.lock().await.list(None, None).await.unwrap();
         let index_count = stm_entries
             .iter()
-            .filter(|e| {
-                e.category == MemoryCategory::Custom(STM_INDEX_CATEGORY.to_string())
-            })
+            .filter(|e| e.category == MemoryCategory::Custom(STM_INDEX_CATEGORY.to_string()))
             .count();
         assert_eq!(index_count, 2, "should have 2 index entries");
 
@@ -856,11 +865,7 @@ mod tests {
         tx.send(TierCommand::Shutdown).await.unwrap();
 
         // run() should exit cleanly.
-        let result = tokio::time::timeout(
-            tokio::time::Duration::from_secs(5),
-            manager.run(),
-        )
-        .await;
+        let result = tokio::time::timeout(tokio::time::Duration::from_secs(5), manager.run()).await;
 
         assert!(result.is_ok(), "run() should complete within timeout");
         assert!(result.unwrap().is_ok(), "run() should return Ok");
@@ -896,14 +901,12 @@ mod tests {
         store_test_entry(&stm_clone, "e1", "test entry", day).await;
 
         // Send ForceEodCompression then Shutdown.
-        tx.send(TierCommand::ForceEodCompression { day }).await.unwrap();
+        tx.send(TierCommand::ForceEodCompression { day })
+            .await
+            .unwrap();
         tx.send(TierCommand::Shutdown).await.unwrap();
 
-        let result = tokio::time::timeout(
-            tokio::time::Duration::from_secs(5),
-            manager.run(),
-        )
-        .await;
+        let result = tokio::time::timeout(tokio::time::Duration::from_secs(5), manager.run()).await;
 
         assert!(result.is_ok(), "run() should complete within timeout");
         assert!(result.unwrap().is_ok(), "run() should return Ok");
@@ -955,8 +958,16 @@ mod tests {
         manager.compress_day(day).await.unwrap();
 
         // Verify facts are stored in STM as Core entries.
-        let stm_entries = stm_clone.lock().await.list(Some(&MemoryCategory::Core), None).await.unwrap();
-        let fact_entries: Vec<_> = stm_entries.iter().filter(|e| e.key.starts_with("fact:")).collect();
+        let stm_entries = stm_clone
+            .lock()
+            .await
+            .list(Some(&MemoryCategory::Core), None)
+            .await
+            .unwrap();
+        let fact_entries: Vec<_> = stm_entries
+            .iter()
+            .filter(|e| e.key.starts_with("fact:"))
+            .collect();
         assert_eq!(fact_entries.len(), 1, "should have exactly 1 fact entry");
         assert_eq!(
             fact_entries[0].key, "fact:personal:user:favorite-color",
@@ -968,6 +979,9 @@ mod tests {
             serde_json::from_str(&fact_entries[0].content).expect("should parse as FactEntry");
         assert_eq!(parsed.value, "blue");
         assert_eq!(parsed.extracted_by_tier, "mtm");
-        assert_eq!(parsed.confidence, crate::memory::tiered::facts::FactConfidence::High);
+        assert_eq!(
+            parsed.confidence,
+            crate::memory::tiered::facts::FactConfidence::High
+        );
     }
 }

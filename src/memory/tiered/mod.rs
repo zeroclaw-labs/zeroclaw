@@ -5,27 +5,29 @@
 //! backend while adding tiered recall, merge-and-rank, and lifecycle commands.
 
 pub mod budget;
-pub mod extractor;
 pub mod extraction_worker;
+pub mod extractor;
 pub mod facts;
-pub mod prompts;
 pub mod loader;
+pub mod manager;
 pub mod merge;
+pub mod prompts;
 pub mod summarization;
 pub mod tagging;
 pub mod timezone;
-pub mod manager;
 pub mod types;
 
+#[allow(unused_imports)]
+pub use extractor::{FactEntryDraft, FactExtractor, MockFactExtractor, OpenRouterFactExtractor};
+#[allow(unused_imports)]
+pub use facts::{
+    FactConfidence, FactEntry, FactStatus, SourceRole, SourceTurnRef, VolatilityClass,
+};
 #[allow(unused_imports)]
 pub use types::{
     CompressionJob, CompressionJobKind, CompressionJobStatus, IndexEntry, MemoryTier, TierCommand,
     TierConfig,
 };
-#[allow(unused_imports)]
-pub use facts::{FactEntry, FactConfidence, FactStatus, SourceRole, VolatilityClass, SourceTurnRef};
-#[allow(unused_imports)]
-pub use extractor::{FactExtractor, MockFactExtractor, OpenRouterFactExtractor, FactEntryDraft};
 #[allow(unused_imports)]
 pub use types::{MemoryAgentConfig, MemoryAgentsConfig};
 
@@ -36,7 +38,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, Mutex};
 
-use crate::memory::tiered::merge::{merge_and_rank, FactConfidenceLevel, TierWeights, TieredRecallItem};
+use crate::memory::tiered::merge::{
+    merge_and_rank, FactConfidenceLevel, TierWeights, TieredRecallItem,
+};
 
 use crate::memory::traits::{Memory, MemoryCategory, MemoryEntry};
 
@@ -44,7 +48,7 @@ use crate::memory::traits::{Memory, MemoryCategory, MemoryEntry};
 #[derive(Debug, Clone)]
 pub struct ExtractionRequest {
     pub content: String,
-    pub role: String,       // "user" or "agent"
+    pub role: String, // "user" or "agent"
     pub key: String,
     pub session_id: Option<String>,
     pub timestamp_unix_ms: i64,
@@ -71,21 +75,15 @@ pub struct TieredMemory {
 /// Returns 1.0 for entries created right now, decaying linearly to 0.0 at 24 h.
 /// Unparseable timestamps default to 0.0.
 fn recency_score_from_timestamp(timestamp: &str) -> f32 {
-    let parsed = timestamp
-        .parse::<DateTime<Utc>>()
-        .ok()
-        .or_else(|| {
-            chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%S")
-                .ok()
-                .map(|ndt| ndt.and_utc())
-        });
+    let parsed = timestamp.parse::<DateTime<Utc>>().ok().or_else(|| {
+        chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%S")
+            .ok()
+            .map(|ndt| ndt.and_utc())
+    });
 
     match parsed {
         Some(dt) => {
-            let age_secs = Utc::now()
-                .signed_duration_since(dt)
-                .num_seconds()
-                .max(0) as f32;
+            let age_secs = Utc::now().signed_duration_since(dt).num_seconds().max(0) as f32;
             (1.0 - age_secs / 86400.0).max(0.0)
         }
         None => 0.0,
@@ -115,7 +113,11 @@ impl Memory for TieredMemory {
 
         // Non-blocking extraction enqueue (best-effort).
         if let Some(ref tx) = self.extraction_tx {
-            let role = if key.starts_with("msg:agent:") { "agent" } else { "user" };
+            let role = if key.starts_with("msg:agent:") {
+                "agent"
+            } else {
+                "user"
+            };
             let req = ExtractionRequest {
                 content: content.to_string(),
                 role: role.to_string(),
@@ -162,6 +164,7 @@ impl Memory for TieredMemory {
 
         for (tier, entries) in &tiers {
             for entry in *entries {
+                #[allow(clippy::cast_possible_truncation)]
                 let base_score = entry.score.unwrap_or(0.5) as f32;
                 let recency = recency_score_from_timestamp(&entry.timestamp);
 
@@ -170,9 +173,15 @@ impl Memory for TieredMemory {
                     serde_json::from_str::<crate::memory::tiered::facts::FactEntry>(&entry.content)
                         .ok()
                         .map(|f| match f.confidence {
-                            crate::memory::tiered::facts::FactConfidence::High => FactConfidenceLevel::High,
-                            crate::memory::tiered::facts::FactConfidence::Medium => FactConfidenceLevel::Medium,
-                            crate::memory::tiered::facts::FactConfidence::Low => FactConfidenceLevel::Low,
+                            crate::memory::tiered::facts::FactConfidence::High => {
+                                FactConfidenceLevel::High
+                            }
+                            crate::memory::tiered::facts::FactConfidence::Medium => {
+                                FactConfidenceLevel::Medium
+                            }
+                            crate::memory::tiered::facts::FactConfidence::Low => {
+                                FactConfidenceLevel::Low
+                            }
                         })
                 } else {
                     None
@@ -208,7 +217,7 @@ impl Memory for TieredMemory {
             .into_iter()
             .filter_map(|item| {
                 entry_map.remove(&item.entry_id).map(|mut e| {
-                    e.score = Some(item.final_score as f64);
+                    e.score = Some(f64::from(item.final_score));
                     e
                 })
             })
@@ -368,7 +377,7 @@ mod tests {
         Arc::new(Mutex::new(Box::new(backend)))
     }
 
-    async fn make_test_tiered() -> TieredMemory {
+    fn make_test_tiered() -> TieredMemory {
         let (cmd_tx, _cmd_rx) = mpsc::channel(16);
         TieredMemory {
             stm: make_shared(InMemoryBackend::new()),
@@ -381,7 +390,7 @@ mod tests {
     }
 
     /// Helper to create a TieredMemory with a custom min_relevance_threshold.
-    async fn make_test_tiered_with_threshold(threshold: f32) -> TieredMemory {
+    fn make_test_tiered_with_threshold(threshold: f32) -> TieredMemory {
         let (cmd_tx, _cmd_rx) = mpsc::channel(16);
         let mut cfg = TierConfig::default();
         cfg.min_relevance_threshold = threshold;
@@ -399,7 +408,7 @@ mod tests {
 
     #[tokio::test]
     async fn store_writes_to_stm_only() {
-        let tiered = make_test_tiered().await;
+        let tiered = make_test_tiered();
         tiered
             .store("e1", "test content", MemoryCategory::Core, None)
             .await
@@ -411,7 +420,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_checks_all_tiers() {
-        let tiered = make_test_tiered().await;
+        let tiered = make_test_tiered();
         // Store in LTM directly
         tiered
             .ltm
@@ -428,7 +437,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_prefers_stm_over_ltm() {
-        let tiered = make_test_tiered().await;
+        let tiered = make_test_tiered();
         tiered
             .stm
             .lock()
@@ -449,7 +458,7 @@ mod tests {
 
     #[tokio::test]
     async fn forget_removes_from_all_tiers() {
-        let tiered = make_test_tiered().await;
+        let tiered = make_test_tiered();
         tiered
             .stm
             .lock()
@@ -472,7 +481,7 @@ mod tests {
 
     #[tokio::test]
     async fn count_sums_all_tiers() {
-        let tiered = make_test_tiered().await;
+        let tiered = make_test_tiered();
         tiered
             .stm
             .lock()
@@ -499,7 +508,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_returns_stm_only() {
-        let tiered = make_test_tiered().await;
+        let tiered = make_test_tiered();
         tiered
             .stm
             .lock()
@@ -521,20 +530,20 @@ mod tests {
 
     #[tokio::test]
     async fn health_check_passes_when_all_tiers_healthy() {
-        let tiered = make_test_tiered().await;
+        let tiered = make_test_tiered();
         assert!(tiered.health_check().await);
     }
 
     #[tokio::test]
     async fn name_returns_tiered() {
-        let tiered = make_test_tiered().await;
+        let tiered = make_test_tiered();
         assert_eq!(tiered.name(), "tiered");
     }
 
     #[tokio::test]
     async fn recall_returns_entries_from_multiple_tiers() {
         // Use 0.0 threshold so nothing gets filtered out
-        let tiered = make_test_tiered_with_threshold(0.0).await;
+        let tiered = make_test_tiered_with_threshold(0.0);
 
         tiered
             .stm
@@ -560,7 +569,7 @@ mod tests {
 
     #[tokio::test]
     async fn forget_nonexistent_key_returns_false() {
-        let tiered = make_test_tiered().await;
+        let tiered = make_test_tiered();
         let removed = tiered.forget("nonexistent").await.unwrap();
         assert!(!removed);
     }
@@ -612,7 +621,9 @@ mod tests {
             .await
             .unwrap();
 
-        let req = ext_rx.try_recv().expect("should have received an ExtractionRequest");
+        let req = ext_rx
+            .try_recv()
+            .expect("should have received an ExtractionRequest");
         assert_eq!(req.content, "Hello world");
         assert_eq!(req.role, "agent");
         assert_eq!(req.key, "msg:agent:123");
@@ -620,7 +631,7 @@ mod tests {
 
     #[tokio::test]
     async fn store_works_without_extractor() {
-        let tiered = make_test_tiered().await;
+        let tiered = make_test_tiered();
         // Should succeed without panic even though extraction_tx is None
         tiered
             .store("msg:user:456", "test content", MemoryCategory::Core, None)

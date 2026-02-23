@@ -168,7 +168,6 @@ fn clamp_reasoning_effort(model: &str, effort: &str) -> String {
         return match effort {
             "low" | "medium" | "high" => effort.to_string(),
             "minimal" => "low".to_string(),
-            "xhigh" => "high".to_string(),
             _ => "high".to_string(),
         };
     }

@@ -22,10 +22,9 @@ pub enum RuntimeTraceStorageMode {
 impl RuntimeTraceStorageMode {
     fn from_raw(raw: &str) -> Self {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "none" => Self::None,
             "rolling" => Self::Rolling,
             "full" => Self::Full,
-            _ => Self::None,
+            _ => Self::None, // includes "none" and any unknown values
         }
     }
 }

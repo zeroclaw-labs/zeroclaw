@@ -1,4 +1,4 @@
-use anyhow::{Context, bail};
+use anyhow::{bail, Context};
 use serde_json::Value;
 
 pub fn decode_frame(raw: &[u8]) -> anyhow::Result<Value> {
@@ -6,7 +6,11 @@ pub fn decode_frame(raw: &[u8]) -> anyhow::Result<Value> {
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
         .map(|idx| (idx, 4))
-        .or_else(|| raw.windows(2).position(|window| window == b"\n\n").map(|idx| (idx, 2)))
+        .or_else(|| {
+            raw.windows(2)
+                .position(|window| window == b"\n\n")
+                .map(|idx| (idx, 2))
+        })
         .ok_or_else(|| anyhow::anyhow!("missing frame separator"))?;
 
     let (headers, rest) = raw.split_at(separator.0);

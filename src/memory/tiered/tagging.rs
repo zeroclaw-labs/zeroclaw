@@ -38,8 +38,8 @@ impl BasicTagExtractor {
     /// Create a new extractor with sensible defaults for stop/boost words.
     pub fn new() -> Self {
         let stop_words: HashSet<String> = [
-            "the", "a", "an", "is", "in", "on", "at", "to", "and", "or", "of", "for", "with",
-            "it", "was", "i", "you", "we", "that", "this", "have", "be",
+            "the", "a", "an", "is", "in", "on", "at", "to", "and", "or", "of", "for", "with", "it",
+            "was", "i", "you", "we", "that", "this", "have", "be",
         ]
         .iter()
         .map(|s| (*s).to_string())
@@ -149,9 +149,7 @@ mod tests {
     #[tokio::test]
     async fn basic_extractor_extracts_tags_from_content() {
         let extractor = BasicTagExtractor::new();
-        let entries = vec![make_test_entry(
-            "auth middleware jwt token login session",
-        )];
+        let entries = vec![make_test_entry("auth middleware jwt token login session")];
         let (tags, confidence) = extractor.extract_tags(&entries).await.unwrap();
         assert!(!tags.is_empty());
         assert!(tags.len() <= 6);
@@ -184,9 +182,7 @@ mod tests {
         let extractor = BasicTagExtractor::new();
         // "auth" appears once but is boosted (+2 -> effective 3);
         // "randomword" appears 3 times (effective 3) but sorts after "auth" alphabetically.
-        let entries = vec![make_test_entry(
-            "auth randomword randomword randomword",
-        )];
+        let entries = vec![make_test_entry("auth randomword randomword randomword")];
         let (tags, _) = extractor.extract_tags(&entries).await.unwrap();
         assert!(
             tags.contains(&"auth".to_string()),
@@ -211,9 +207,7 @@ mod tests {
     #[tokio::test]
     async fn basic_extractor_skips_stop_words() {
         let extractor = BasicTagExtractor::new();
-        let entries = vec![make_test_entry(
-            "the database is for the api and the cache",
-        )];
+        let entries = vec![make_test_entry("the database is for the api and the cache")];
         let (tags, _) = extractor.extract_tags(&entries).await.unwrap();
         for tag in &tags {
             assert!(

@@ -1,4 +1,3 @@
-pub mod tiered;
 pub mod backend;
 pub mod chunker;
 pub mod cli;
@@ -12,6 +11,7 @@ pub mod postgres;
 pub mod response_cache;
 pub mod snapshot;
 pub mod sqlite;
+pub mod tiered;
 pub mod traits;
 pub mod vector;
 
@@ -32,14 +32,15 @@ pub use traits::Memory;
 pub use traits::{MemoryCategory, MemoryEntry};
 
 // Tiered-memory public API
+#[allow(unused_imports)]
 pub use tiered::TieredMemory;
 #[allow(unused_imports)]
 pub use tiered::{ExtractionRequest, SharedMemory, TierCommand, TierConfig};
 #[allow(unused_imports)]
 pub use tiered::{
-    FactEntry, FactConfidence, FactStatus, SourceRole, VolatilityClass, SourceTurnRef,
-    FactExtractor, MockFactExtractor, OpenRouterFactExtractor, FactEntryDraft,
-    MemoryAgentConfig, MemoryAgentsConfig,
+    FactConfidence, FactEntry, FactEntryDraft, FactExtractor, FactStatus, MemoryAgentConfig,
+    MemoryAgentsConfig, MockFactExtractor, OpenRouterFactExtractor, SourceRole, SourceTurnRef,
+    VolatilityClass,
 };
 
 use crate::config::{EmbeddingRouteConfig, MemoryConfig, StorageProviderConfig};
@@ -632,7 +633,8 @@ mod tests {
         let ltm: Box<dyn Memory + Send> = Box::new(NoneMemory::new());
         let cfg = TierConfig::default();
 
-        let (tiered, cmd_tx, _cmd_rx) = create_tiered_memory_from_backends(stm, mtm, ltm, cfg, None);
+        let (tiered, cmd_tx, _cmd_rx) =
+            create_tiered_memory_from_backends(stm, mtm, ltm, cfg, None);
 
         assert_eq!(tiered.name(), "tiered");
         assert_eq!(tiered.count().await.unwrap(), 0);

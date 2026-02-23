@@ -521,7 +521,7 @@ fn mask_sensitive_fields(toml_str: &str) -> String {
             || trimmed.starts_with("signing_secret")
         {
             if let Some(eq_pos) = line.find('=') {
-                output.push_str(&line[..eq_pos + 1]);
+                output.push_str(&line[..=eq_pos]);
                 output.push_str(" \"***MASKED***\"");
             } else {
                 output.push_str(line);
