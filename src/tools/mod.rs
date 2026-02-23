@@ -617,9 +617,10 @@ pub fn all_tools_with_runtime(
 
     // ClawHub tools
     tool_arcs.push(Arc::new(ClawhubSearchTool::new()));
-    tool_arcs.push(Arc::new(ClawhubInstallTool::new(
-        workspace_dir.to_path_buf(),
-    )));
+    tool_arcs.push(Arc::new(
+        ClawhubInstallTool::new(workspace_dir.to_path_buf())
+            .with_config(root_config.clawhub.clone()),
+    ));
     tool_arcs.push(Arc::new(ClawhubUninstallTool::new(
         workspace_dir.to_path_buf(),
     )));

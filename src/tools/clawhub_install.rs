@@ -1,5 +1,6 @@
 use crate::clawhub::client::ClawHubClient;
 use crate::clawhub::downloader::SkillDownloader;
+use crate::config::ClawHubConfig;
 use crate::skills::audit;
 use crate::tools::traits::{Tool, ToolResult};
 use async_trait::async_trait;
@@ -9,6 +10,7 @@ use std::path::PathBuf;
 pub struct ClawhubInstallTool {
     workspace_dir: PathBuf,
     config_dir: PathBuf,
+    clawhub_config: Option<ClawHubConfig>,
 }
 
 impl ClawhubInstallTool {
@@ -20,7 +22,13 @@ impl ClawhubInstallTool {
         Self {
             workspace_dir,
             config_dir,
+            clawhub_config: None,
         }
+    }
+
+    pub fn with_config(mut self, config: ClawHubConfig) -> Self {
+        self.clawhub_config = Some(config);
+        self
     }
 }
 
@@ -60,16 +68,13 @@ impl Tool for ClawhubInstallTool {
 
         match client.get_skill(slug).await {
             Ok(skill) => {
-                let readme_url = match &skill.readme_url {
-                    Some(url) => url,
-                    None => {
-                        return Ok(ToolResult {
-                            success: false,
-                            output: String::new(),
-                            error: Some("Skill has no SKILL.md - cannot install".to_string()),
-                        });
-                    }
-                };
+                if skill.readme_url.is_none() && skill.readme_url_master.is_none() {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some("Skill has no SKILL.md - cannot install".to_string()),
+                    });
+                }
 
                 let skills_path = self.workspace_dir.join("skills");
                 std::fs::create_dir_all(&skills_path)?;
@@ -93,17 +98,34 @@ impl Tool for ClawhubInstallTool {
                 let _ = std::fs::remove_dir_all(&temp_dir);
                 std::fs::create_dir_all(&temp_dir)?;
 
-                // Download SKILL.md
+                // Build fallback URL if configured
+                let fallback_url = self
+                    .clawhub_config
+                    .as_ref()
+                    .and_then(|c| c.download_fallback.as_ref())
+                    .map(|pattern| pattern.replace("{slug}", slug));
+
+                // Download SKILL.md with fallback support
                 let downloader = SkillDownloader::new();
-                match downloader.download_file(readme_url).await {
-                    Ok(content) => {
+                let readme_url_master = skill.readme_url_master.as_deref();
+                match downloader
+                    .download_skill_with_zip_fallback(
+                        skill.readme_url.as_deref(),
+                        readme_url_master,
+                        fallback_url.as_deref(),
+                        &temp_dir,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        // File downloaded to temp_dir, verify it exists
                         let skill_md = temp_dir.join("SKILL.md");
-                        if let Err(e) = std::fs::write(&skill_md, &content) {
+                        if !skill_md.exists() {
                             let _ = std::fs::remove_dir_all(&temp_dir);
                             return Ok(ToolResult {
                                 success: false,
                                 output: String::new(),
-                                error: Some(format!("Failed to write skill file: {}", e)),
+                                error: Some("Downloaded skill file not found".to_string()),
                             });
                         }
 
@@ -178,7 +200,11 @@ impl Tool for ClawhubInstallTool {
                         Ok(ToolResult {
                             success: false,
                             output: String::new(),
-                            error: Some(format!("Failed to download skill: {}", e)),
+                            error: Some(format!(
+                                "Failed to download SKILL.md: {}\n\n\
+                                 This skill may be hosted on ClawHub's backend instead of GitHub.",
+                                e
+                            )),
                         })
                     }
                 }
