@@ -1010,6 +1010,10 @@ async fn main() -> Result<()> {
         Commands::McpServer => {
             use zeroclaw::mcp::server::run_stdio_server;
             use zeroclaw::mcp::tool_bridge::McpToolBridge;
+            use zeroclaw::tools::dynamic_factories::ToolBuildContext;
+            use zeroclaw::tools::dynamic_registry::DynamicRegistry;
+            use zeroclaw::tools::manage_hooks::ManageHooksTool;
+            use zeroclaw::tools::manage_tools::ManageToolsTool;
 
             let security = std::sync::Arc::new(security::SecurityPolicy::from_config(
                 &config.autonomy,
@@ -1057,13 +1061,51 @@ async fn main() -> Result<()> {
                 tools_registry.extend(peripheral_tools);
             }
 
-            // Adapt binary-crate Tool instances to library-crate Tool trait for McpToolBridge.
-            let lib_tools: Vec<Box<dyn zeroclaw::tools::Tool>> = tools_registry
+            // Adapt binary-crate Tool instances to library-crate Tool trait.
+            let lib_tools: Vec<std::sync::Arc<dyn zeroclaw::tools::Tool>> = tools_registry
                 .into_iter()
-                .map(|t| Box::new(BinToolAdapter(t)) as Box<dyn zeroclaw::tools::Tool>)
+                .map(|t| std::sync::Arc::new(BinToolAdapter(t)) as std::sync::Arc<dyn zeroclaw::tools::Tool>)
                 .collect();
 
-            let bridge = std::sync::Arc::new(McpToolBridge::new(lib_tools));
+            // Create DynamicRegistry with static tools + dynamic tool management.
+            let persistence_path = config
+                .workspace_dir
+                .join(".zeroclaw")
+                .join("state")
+                .join("dynamic-registry.json");
+            // Cross the binary/library crate boundary via serde round-trip.
+            let lib_autonomy: zeroclaw::config::AutonomyConfig =
+                serde_json::from_value(serde_json::to_value(&config.autonomy)?)?;
+            let lib_dyn_config: zeroclaw::config::DynamicRegistryConfig =
+                serde_json::from_value(serde_json::to_value(&config.dynamic_registry)?)?;
+
+            let build_ctx = ToolBuildContext {
+                security: std::sync::Arc::new(zeroclaw::security::SecurityPolicy::from_config(
+                    &lib_autonomy,
+                    &config.workspace_dir,
+                )),
+                workspace_dir: config.workspace_dir.clone(),
+            };
+            let dynamic_registry = std::sync::Arc::new(DynamicRegistry::new(
+                lib_tools,
+                lib_dyn_config,
+                persistence_path,
+                build_ctx,
+            ));
+
+            // Create meta-tools for runtime tool/hook management.
+            // These live outside the registry to avoid circular deps
+            // (they need Arc<DynamicRegistry>, but registry is built first).
+            // The McpToolBridge includes them alongside registry snapshot tools.
+            let manage_tools_tool: std::sync::Arc<dyn zeroclaw::tools::Tool> =
+                std::sync::Arc::new(ManageToolsTool::new(dynamic_registry.clone()));
+            let manage_hooks_tool: std::sync::Arc<dyn zeroclaw::tools::Tool> =
+                std::sync::Arc::new(ManageHooksTool::new(dynamic_registry.clone()));
+
+            let bridge = std::sync::Arc::new(McpToolBridge::from_registry(
+                dynamic_registry,
+                vec![manage_tools_tool, manage_hooks_tool],
+            ));
             run_stdio_server(bridge).await
         }
 
