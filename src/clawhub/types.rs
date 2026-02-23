@@ -86,6 +86,9 @@ pub struct ClawHubSkill {
     pub version: String,
     pub github_url: Option<String>,
     pub readme_url: Option<String>,
+    /// Fallback URL for repos using master branch instead of main
+    #[serde(default)]
+    pub readme_url_master: Option<String>,
 }
 
 impl From<SearchResultItem> for ClawHubSkill {
@@ -100,6 +103,7 @@ impl From<SearchResultItem> for ClawHubSkill {
             version: item.version,
             github_url: None,
             readme_url: None,
+            readme_url_master: None,
         }
     }
 }

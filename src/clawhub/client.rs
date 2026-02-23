@@ -127,8 +127,14 @@ impl From<SkillDetail> for ClawHubSkill {
             stars: detail.skill.stats.stars,
             version,
             github_url: Some(format!("https://github.com/{}/{}", handle, slug)),
+            // Try both main and master branches - downloader will try both URLs
             readme_url: Some(format!(
                 "https://raw.githubusercontent.com/{}/{}/main/SKILL.md",
+                handle, slug
+            )),
+            // Store master branch URL for fallback
+            readme_url_master: Some(format!(
+                "https://raw.githubusercontent.com/{}/{}/master/SKILL.md",
                 handle, slug
             )),
         }

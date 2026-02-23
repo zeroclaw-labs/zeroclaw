@@ -5,7 +5,7 @@ use crate::clawhub::client::ClawHubClient;
 use crate::clawhub::downloader::SkillDownloader;
 use crate::clawhub::registry::Registry;
 use crate::clawhub::types::InstalledSkill;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::fmt::Write;
 use std::path::Path;
 
@@ -107,9 +107,12 @@ async fn handle_install(
     println!("  Found: {} v{}", skill.name, skill.version);
     println!("  Description: {}", skill.description);
 
-    let readme_url = skill.readme_url.as_ref().context("Skill has no SKILL.md")?;
+    // Check if we have at least one URL (main or master)
+    if skill.readme_url.is_none() && skill.readme_url_master.is_none() {
+        anyhow::bail!("Skill has no SKILL.md URL available");
+    }
 
-    println!("  Downloading from: {}", readme_url);
+    println!("  Downloading SKILL.md (trying main, then master branch)...");
 
     // Download the skill content
     let downloader = SkillDownloader::new();
@@ -131,10 +134,18 @@ async fn handle_install(
     let _ = std::fs::remove_dir_all(&temp_dir);
     std::fs::create_dir_all(&temp_dir)?;
 
-    // Download SKILL.md
-    let content = downloader.download_file(readme_url).await?;
+    // Download SKILL.md (try main branch first, then fallback to master)
+    let readme_url_master = skill.readme_url_master.as_deref();
+    downloader
+        .download_skill_with_fallback(
+            skill.readme_url.as_deref(),
+            readme_url_master,
+            &temp_dir,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to download SKILL.md: {}", e))?;
     let skill_md = temp_dir.join("SKILL.md");
-    std::fs::write(&skill_md, &content)?;
+    println!("  Downloaded from: main or master branch");
 
     // Run security audit
     println!("  Running security audit...");

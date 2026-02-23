@@ -53,6 +53,40 @@ impl SkillDownloader {
         std::fs::write(&skill_md, &content)?;
         Ok(())
     }
+
+    /// Download SKILL.md trying both main and master branch URLs
+    pub async fn download_skill_with_fallback(
+        &self,
+        readme_url: Option<&str>,
+        readme_url_master: Option<&str>,
+        target_dir: &Path,
+    ) -> Result<()> {
+        // Try main branch first
+        if let Some(url) = readme_url {
+            match self.download_file(url).await {
+                Ok(content) => {
+                    std::fs::create_dir_all(target_dir)?;
+                    let skill_md = target_dir.join("SKILL.md");
+                    std::fs::write(&skill_md, &content)?;
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::debug!("Failed to download from main branch {}: {}", url, e);
+                }
+            }
+        }
+
+        // Try master branch as fallback
+        if let Some(url) = readme_url_master {
+            let content = self.download_file(url).await?;
+            std::fs::create_dir_all(target_dir)?;
+            let skill_md = target_dir.join("SKILL.md");
+            std::fs::write(&skill_md, &content)?;
+            return Ok(());
+        }
+
+        anyhow::bail!("No readme_url provided and master branch fallback also failed");
+    }
 }
 
 impl Default for SkillDownloader {
