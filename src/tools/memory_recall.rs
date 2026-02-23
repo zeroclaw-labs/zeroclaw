@@ -164,4 +164,90 @@ mod tests {
         assert_eq!(tool.name(), "memory_recall");
         assert!(tool.parameters_schema()["properties"]["query"].is_object());
     }
+
+    #[test]
+    fn schema_has_query_required_and_limit_optional() {
+        let (_tmp, mem) = seeded_mem();
+        let tool = MemoryRecallTool::new(mem);
+        let schema = tool.parameters_schema();
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"]["query"].is_object());
+        assert!(schema["properties"]["limit"].is_object());
+        let required = schema["required"].as_array().unwrap();
+        assert!(required.contains(&json!("query")));
+        assert!(!required.contains(&json!("limit")));
+    }
+
+    #[tokio::test]
+    async fn recall_uses_default_limit_of_five() {
+        let (_tmp, mem) = seeded_mem();
+        for i in 0..10 {
+            mem.store(
+                &format!("item{i}"),
+                &format!("common keyword data {i}"),
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let tool = MemoryRecallTool::new(mem);
+        let result = tool
+            .execute(json!({"query": "common"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("Found 5"));
+    }
+
+    #[tokio::test]
+    async fn recall_non_string_query_returns_error() {
+        let (_tmp, mem) = seeded_mem();
+        let tool = MemoryRecallTool::new(mem);
+        let result = tool.execute(json!({"query": 12345})).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn recall_output_contains_category_and_key() {
+        let (_tmp, mem) = seeded_mem();
+        mem.store(
+            "preferred_editor",
+            "User prefers neovim",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let tool = MemoryRecallTool::new(mem);
+        let result = tool
+            .execute(json!({"query": "neovim"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("preferred_editor"));
+        assert!(result.output.contains("neovim"));
+        assert!(result.output.contains("[core]"));
+    }
+
+    #[tokio::test]
+    async fn recall_with_limit_one() {
+        let (_tmp, mem) = seeded_mem();
+        mem.store("a", "search term alpha", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("b", "search term beta", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let tool = MemoryRecallTool::new(mem);
+        let result = tool
+            .execute(json!({"query": "search term", "limit": 1}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("Found 1"));
+    }
 }

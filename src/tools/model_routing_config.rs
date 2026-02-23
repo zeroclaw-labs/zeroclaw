@@ -1082,4 +1082,208 @@ mod tests {
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("read-only"));
     }
+
+    #[test]
+    fn schema_has_action_enum_and_expected_properties() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Arc::new(Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        });
+        let tool = ModelRoutingConfigTool::new(cfg, test_security());
+        let schema = tool.parameters_schema();
+        assert_eq!(schema["type"], "object");
+        let action_enum = schema["properties"]["action"]["enum"].as_array().unwrap();
+        assert!(action_enum.contains(&json!("get")));
+        assert!(action_enum.contains(&json!("list_hints")));
+        assert!(action_enum.contains(&json!("set_default")));
+        assert!(action_enum.contains(&json!("upsert_scenario")));
+        assert!(action_enum.contains(&json!("remove_scenario")));
+        assert!(action_enum.contains(&json!("upsert_agent")));
+        assert!(action_enum.contains(&json!("remove_agent")));
+        assert!(schema["properties"]["hint"].is_object());
+        assert!(schema["properties"]["provider"].is_object());
+        assert!(schema["properties"]["model"].is_object());
+        assert_eq!(schema["additionalProperties"], json!(false));
+    }
+
+    #[test]
+    fn name_returns_model_routing_config() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Arc::new(Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        });
+        let tool = ModelRoutingConfigTool::new(cfg, test_security());
+        assert_eq!(tool.name(), "model_routing_config");
+        assert!(!tool.description().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unknown_action_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, test_security());
+
+        let result = tool
+            .execute(json!({"action": "nuke_everything"}))
+            .await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Unknown action"));
+    }
+
+    #[tokio::test]
+    async fn remove_nonexistent_scenario_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, test_security());
+
+        let result = tool
+            .execute(json!({
+                "action": "remove_scenario",
+                "hint": "nonexistent_hint_xyz"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("No scenario found"));
+    }
+
+    #[tokio::test]
+    async fn remove_nonexistent_agent_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, test_security());
+
+        let result = tool
+            .execute(json!({
+                "action": "remove_agent",
+                "name": "nonexistent_agent_xyz"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("No delegate agent found"));
+    }
+
+    #[tokio::test]
+    async fn list_hints_returns_empty_lists_by_default() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, test_security());
+
+        let result = tool
+            .execute(json!({"action": "list_hints"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        let output: Value = serde_json::from_str(&result.output).unwrap();
+        assert!(output["model_route_hints"].is_array());
+        assert!(output["classification_hints"].is_array());
+    }
+
+    #[tokio::test]
+    async fn set_default_requires_at_least_one_field() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, test_security());
+
+        let result = tool
+            .execute(json!({"action": "set_default"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("at least one"));
+    }
+
+    #[tokio::test]
+    async fn set_default_rejects_invalid_temperature() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, test_security());
+
+        let result = tool
+            .execute(json!({
+                "action": "set_default",
+                "temperature": 5.0
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("temperature"));
+    }
+
+    #[tokio::test]
+    async fn get_action_default_returns_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, test_security());
+
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(result.success);
+        let output: Value = serde_json::from_str(&result.output).unwrap();
+        assert!(output["default"].is_object());
+        assert!(output["scenarios"].is_array());
+        assert!(output["agents"].is_object());
+    }
+
+    #[tokio::test]
+    async fn upsert_agent_rejects_agentic_without_tools() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, test_security());
+
+        let result = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "bad_agent",
+                "provider": "openai",
+                "model": "gpt-4o",
+                "agentic": true,
+                "allowed_tools": []
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("allowed_tools is empty"));
+    }
+
+    #[tokio::test]
+    async fn read_only_blocks_all_mutating_actions() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, readonly_security());
+
+        let actions = vec![
+            json!({"action": "upsert_scenario", "hint": "test", "provider": "p", "model": "m", "keywords": ["k"]}),
+            json!({"action": "remove_scenario", "hint": "test"}),
+            json!({"action": "upsert_agent", "name": "a", "provider": "p", "model": "m"}),
+            json!({"action": "remove_agent", "name": "a"}),
+        ];
+
+        for action_args in actions {
+            let result = tool.execute(action_args.clone()).await.unwrap();
+            assert!(
+                !result.success,
+                "Expected failure for {:?} but got success",
+                action_args["action"]
+            );
+            assert!(
+                result.error.unwrap_or_default().contains("read-only"),
+                "Expected read-only error for {:?}",
+                action_args["action"]
+            );
+        }
+    }
 }

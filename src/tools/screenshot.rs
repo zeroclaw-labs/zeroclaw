@@ -321,4 +321,118 @@ mod tests {
             "Command should contain the output path"
         );
     }
+
+    #[test]
+    fn schema_properties_have_type_and_description() {
+        let tool = ScreenshotTool::new(test_security());
+        let schema = tool.parameters_schema();
+        assert_eq!(schema["type"], "object");
+        // filename property
+        assert_eq!(schema["properties"]["filename"]["type"], "string");
+        assert!(schema["properties"]["filename"]["description"]
+            .as_str()
+            .unwrap_or("")
+            .contains("filename"));
+        // region property
+        assert_eq!(schema["properties"]["region"]["type"], "string");
+        assert!(schema["properties"]["region"]["description"]
+            .as_str()
+            .unwrap_or("")
+            .contains("region"));
+        // No required fields for screenshot
+        assert!(schema.get("required").is_none());
+    }
+
+    #[tokio::test]
+    async fn screenshot_blocked_in_readonly_mode() {
+        let readonly = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        });
+        let tool = ScreenshotTool::new(readonly);
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("read-only"));
+    }
+
+    #[tokio::test]
+    async fn screenshot_rejects_path_traversal_filename() {
+        let tool = ScreenshotTool::new(test_security());
+        // Path traversal attempt: "../../../etc/passwd"
+        // PathBuf::file_name() should strip directory components, making it safe
+        let result = tool
+            .execute(json!({"filename": "../../../etc/passwd.png"}))
+            .await;
+        // Should not error at the Rust level; the filename gets sanitized
+        let res = result.unwrap();
+        // The sanitized name should not contain path separators
+        // It either succeeds with sanitized name or fails for other reasons
+        // (e.g., no screenshot tool in CI). Crucially, it should not traverse.
+        if res.success {
+            assert!(!res.output.contains("../"));
+        }
+    }
+
+    #[tokio::test]
+    async fn screenshot_rejects_backtick_injection() {
+        let tool = ScreenshotTool::new(test_security());
+        let result = tool
+            .execute(json!({"filename": "test`whoami`.png"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("unsafe for shell execution"));
+    }
+
+    #[tokio::test]
+    async fn screenshot_rejects_dollar_injection() {
+        let tool = ScreenshotTool::new(test_security());
+        let result = tool
+            .execute(json!({"filename": "test$(rm -rf /).png"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("unsafe for shell execution"));
+    }
+
+    #[tokio::test]
+    async fn screenshot_rejects_semicolon_in_filename() {
+        let tool = ScreenshotTool::new(test_security());
+        // Semicolon without path separator stays in filename and gets rejected
+        let result = tool
+            .execute(json!({"filename": "test;echo.png"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("unsafe for shell execution"));
+    }
+
+    #[tokio::test]
+    async fn read_and_encode_missing_file_returns_error() {
+        let result = ScreenshotTool::read_and_encode(std::path::Path::new("/tmp/nonexistent_screenshot_test_file.png"))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Failed to read"));
+    }
+
+    #[tokio::test]
+    async fn read_and_encode_valid_file_returns_base64() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        // Write a small fake PNG (just bytes, not a real image)
+        std::fs::write(tmp.path(), b"fake_png_data_for_test").unwrap();
+        let result = ScreenshotTool::read_and_encode(tmp.path()).await.unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("base64,"));
+        assert!(result.output.contains("Screenshot saved to:"));
+    }
 }

@@ -174,4 +174,114 @@ mod tests {
             .unwrap_or_default()
             .contains("Missing 'job_id'"));
     }
+
+    #[test]
+    fn schema_has_job_id_required() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Arc::new(Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        });
+        let tool = CronRunsTool::new(cfg);
+        let schema = tool.parameters_schema();
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"]["job_id"].is_object());
+        assert!(schema["properties"]["limit"].is_object());
+        let required = schema["required"].as_array().unwrap();
+        assert!(required.contains(&json!("job_id")));
+    }
+
+    #[test]
+    fn name_returns_cron_runs() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Arc::new(Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        });
+        let tool = CronRunsTool::new(cfg);
+        assert_eq!(tool.name(), "cron_runs");
+        assert!(!tool.description().is_empty());
+    }
+
+    #[tokio::test]
+    async fn errors_when_cron_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = (*test_config(&tmp).await).clone();
+        cfg.cron.enabled = false;
+        let tool = CronRunsTool::new(Arc::new(cfg));
+
+        let result = tool
+            .execute(json!({"job_id": "any-id"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("cron is disabled"));
+    }
+
+    #[tokio::test]
+    async fn returns_empty_runs_for_valid_job() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
+
+        let tool = CronRunsTool::new(cfg);
+        let result = tool
+            .execute(json!({"job_id": job.id}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert_eq!(result.output.trim(), "[]");
+    }
+
+    #[tokio::test]
+    async fn errors_when_job_id_is_empty_string() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronRunsTool::new(cfg);
+
+        let result = tool
+            .execute(json!({"job_id": ""}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("Missing 'job_id'"));
+    }
+
+    #[tokio::test]
+    async fn errors_when_job_id_is_whitespace_only() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronRunsTool::new(cfg);
+
+        let result = tool
+            .execute(json!({"job_id": "   "}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("Missing 'job_id'"));
+    }
+
+    #[test]
+    fn truncate_short_input_unchanged() {
+        assert_eq!(truncate("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_long_input_adds_ellipsis() {
+        let long = "a".repeat(600);
+        let result = truncate(&long, 500);
+        assert_eq!(result.len(), 503); // 500 + "..."
+        assert!(result.ends_with("..."));
+    }
 }

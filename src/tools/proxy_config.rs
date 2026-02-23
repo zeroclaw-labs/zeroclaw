@@ -547,4 +547,111 @@ mod tests {
         assert!(parsed["proxy"]["http_proxy"].is_null());
         assert!(parsed["runtime_proxy"]["http_proxy"].is_null());
     }
+
+    #[test]
+    fn schema_has_action_enum_and_proxy_fields() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Arc::new(Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        });
+        let tool = ProxyConfigTool::new(cfg, test_security());
+        let schema = tool.parameters_schema();
+        assert_eq!(schema["type"], "object");
+        let action_enum = schema["properties"]["action"]["enum"].as_array().unwrap();
+        assert!(action_enum.contains(&json!("get")));
+        assert!(action_enum.contains(&json!("set")));
+        assert!(action_enum.contains(&json!("disable")));
+        assert!(action_enum.contains(&json!("list_services")));
+        assert!(action_enum.contains(&json!("apply_env")));
+        assert!(action_enum.contains(&json!("clear_env")));
+        assert!(schema["properties"]["http_proxy"].is_object());
+        assert!(schema["properties"]["https_proxy"].is_object());
+    }
+
+    #[test]
+    fn name_returns_proxy_config() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Arc::new(Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        });
+        let tool = ProxyConfigTool::new(cfg, test_security());
+        assert_eq!(tool.name(), "proxy_config");
+        assert!(!tool.description().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unknown_action_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ProxyConfigTool::new(test_config(&tmp).await, test_security());
+
+        let result = tool
+            .execute(json!({"action": "destroy_everything"}))
+            .await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Unknown action"));
+    }
+
+    #[tokio::test]
+    async fn get_action_default_returns_proxy_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ProxyConfigTool::new(test_config(&tmp).await, test_security());
+
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(result.success);
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        assert!(parsed["proxy"].is_object());
+        assert!(parsed["runtime_proxy"].is_object());
+        assert!(parsed["environment"].is_object());
+    }
+
+    #[tokio::test]
+    async fn read_only_blocks_set_action() {
+        let tmp = TempDir::new().unwrap();
+        let readonly_sec = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        });
+        let tool = ProxyConfigTool::new(test_config(&tmp).await, readonly_sec);
+
+        let result = tool
+            .execute(json!({
+                "action": "set",
+                "http_proxy": "http://127.0.0.1:7890"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("read-only"));
+    }
+
+    #[tokio::test]
+    async fn invalid_scope_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ProxyConfigTool::new(test_config(&tmp).await, test_security());
+
+        let result = tool
+            .execute(json!({
+                "action": "set",
+                "scope": "nonexistent_scope",
+                "http_proxy": "http://127.0.0.1:7890"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("Invalid scope"));
+    }
 }

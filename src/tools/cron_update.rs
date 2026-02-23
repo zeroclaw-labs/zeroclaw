@@ -313,4 +313,141 @@ mod tests {
             .contains("Rate limit exceeded"));
         assert!(cron::get_job(&cfg, &job.id).unwrap().enabled);
     }
+
+    #[test]
+    fn schema_has_job_id_and_patch_required() {
+        let tmp = TempDir::new().unwrap();
+        let config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        let cfg = Arc::new(config);
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
+        let schema = tool.parameters_schema();
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"]["job_id"].is_object());
+        assert!(schema["properties"]["patch"].is_object());
+        assert!(schema["properties"]["approved"].is_object());
+        let required = schema["required"].as_array().unwrap();
+        assert!(required.contains(&json!("job_id")));
+        assert!(required.contains(&json!("patch")));
+    }
+
+    #[test]
+    fn name_returns_cron_update() {
+        let tmp = TempDir::new().unwrap();
+        let config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        let cfg = Arc::new(config);
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
+        assert_eq!(tool.name(), "cron_update");
+        assert!(!tool.description().is_empty());
+    }
+
+    #[tokio::test]
+    async fn errors_when_cron_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.cron.enabled = false;
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let cfg = Arc::new(config);
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool
+            .execute(json!({
+                "job_id": "any-id",
+                "patch": { "enabled": false }
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("cron is disabled"));
+    }
+
+    #[tokio::test]
+    async fn errors_when_job_id_missing() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool
+            .execute(json!({
+                "patch": { "enabled": false }
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("Missing 'job_id'"));
+    }
+
+    #[tokio::test]
+    async fn errors_when_patch_missing() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool
+            .execute(json!({
+                "job_id": job.id
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("Missing 'patch'"));
+    }
+
+    #[tokio::test]
+    async fn errors_for_nonexistent_job() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool
+            .execute(json!({
+                "job_id": "nonexistent-id-abc",
+                "patch": { "enabled": false }
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn errors_for_empty_job_id() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool
+            .execute(json!({
+                "job_id": "",
+                "patch": { "enabled": false }
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("Missing 'job_id'"));
+    }
 }

@@ -221,4 +221,136 @@ mod tests {
             .contains("Rate limit exceeded"));
         assert!(mem.get("lang").await.unwrap().is_none());
     }
+
+    #[test]
+    fn schema_has_all_properties_and_required_fields() {
+        let (_tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem, test_security());
+        let schema = tool.parameters_schema();
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"]["key"].is_object());
+        assert!(schema["properties"]["content"].is_object());
+        assert!(schema["properties"]["category"].is_object());
+        assert_eq!(schema["properties"]["key"]["type"], "string");
+        assert_eq!(schema["properties"]["content"]["type"], "string");
+        assert_eq!(schema["properties"]["category"]["type"], "string");
+        let required = schema["required"].as_array().expect("required array");
+        assert!(required.contains(&json!("key")));
+        assert!(required.contains(&json!("content")));
+        assert!(!required.contains(&json!("category")));
+    }
+
+    #[test]
+    fn description_mentions_store_or_memory() {
+        let (_tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem, test_security());
+        let desc = tool.description();
+        assert!(
+            desc.contains("Store") || desc.contains("store") || desc.contains("memory"),
+            "Description should mention storing: {desc}"
+        );
+    }
+
+    #[test]
+    fn spec_returns_consistent_metadata() {
+        let (_tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem, test_security());
+        let spec = tool.spec();
+        assert_eq!(spec.name, "memory_store");
+        assert!(!spec.description.is_empty());
+        assert!(spec.parameters["properties"]["key"].is_object());
+        assert!(spec.parameters["properties"]["content"].is_object());
+    }
+
+    #[tokio::test]
+    async fn store_overwrites_existing_key() {
+        let (_tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem.clone(), test_security());
+
+        let r1 = tool
+            .execute(json!({"key": "stack", "content": "Python"}))
+            .await
+            .unwrap();
+        assert!(r1.success);
+
+        let r2 = tool
+            .execute(json!({"key": "stack", "content": "Rust"}))
+            .await
+            .unwrap();
+        assert!(r2.success);
+
+        let entry = mem.get("stack").await.unwrap().unwrap();
+        assert_eq!(entry.content, "Rust");
+    }
+
+    #[tokio::test]
+    async fn store_conversation_category() {
+        let (_tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem.clone(), test_security());
+        let result = tool
+            .execute(json!({"key": "ctx_topic", "content": "Discussing architecture", "category": "conversation"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+
+        let entry = mem.get("ctx_topic").await.unwrap().unwrap();
+        assert_eq!(entry.category, MemoryCategory::Conversation);
+    }
+
+    #[tokio::test]
+    async fn store_special_characters_in_key_and_content() {
+        let (_tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem.clone(), test_security());
+        let result = tool
+            .execute(json!({
+                "key": "user::config/path#1",
+                "content": "Line 1\nLine 2\ttab\u{00e9}"
+            }))
+            .await
+            .unwrap();
+        assert!(result.success);
+
+        let entry = mem.get("user::config/path#1").await.unwrap().unwrap();
+        assert!(entry.content.contains('\n'));
+        assert!(entry.content.contains('\t'));
+    }
+
+    #[tokio::test]
+    async fn store_empty_content_string() {
+        let (_tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem.clone(), test_security());
+        // Empty string is technically a valid string
+        let result = tool
+            .execute(json!({"key": "empty_note", "content": ""}))
+            .await
+            .unwrap();
+        assert!(result.success);
+
+        let entry = mem.get("empty_note").await.unwrap().unwrap();
+        assert_eq!(entry.content, "");
+    }
+
+    #[tokio::test]
+    async fn store_key_as_non_string_returns_error() {
+        let (_tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem, test_security());
+        let result = tool
+            .execute(json!({"key": 123, "content": "numeric key"}))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn store_defaults_to_core_category() {
+        let (_tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem.clone(), test_security());
+        let result = tool
+            .execute(json!({"key": "default_cat", "content": "no category specified"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+
+        let entry = mem.get("default_cat").await.unwrap().unwrap();
+        assert_eq!(entry.category, MemoryCategory::Core);
+    }
 }

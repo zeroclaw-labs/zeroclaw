@@ -206,3 +206,105 @@ fn memory_map_static(board: &str) -> Option<&'static str> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::traits::Tool;
+
+    #[test]
+    fn name_and_description_are_correct() {
+        let tool = HardwareBoardInfoTool::new(vec![]);
+        assert_eq!(tool.name(), "hardware_board_info");
+        assert!(!tool.description().is_empty());
+        assert!(tool.description().contains("board info"));
+    }
+
+    #[test]
+    fn parameters_schema_has_valid_structure() {
+        let tool = HardwareBoardInfoTool::new(vec![]);
+        let schema = tool.parameters_schema();
+
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"].is_object());
+        assert_eq!(schema["properties"]["board"]["type"], "string");
+    }
+
+    #[tokio::test]
+    async fn execute_returns_error_when_no_boards_configured() {
+        let tool = HardwareBoardInfoTool::new(vec![]);
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.is_some());
+        assert!(result.error.unwrap().contains("No peripherals configured"));
+    }
+
+    #[tokio::test]
+    async fn execute_returns_static_info_for_known_board() {
+        let tool = HardwareBoardInfoTool::new(vec!["nucleo-f401re".into()]);
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("STM32F401RET6"));
+        assert!(result.output.contains("ARM Cortex-M4"));
+        assert!(result.output.contains("Memory map"));
+    }
+
+    #[tokio::test]
+    async fn execute_with_explicit_board_param() {
+        let tool = HardwareBoardInfoTool::new(vec!["nucleo-f401re".into(), "esp32".into()]);
+        let result = tool
+            .execute(serde_json::json!({"board": "esp32"}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("ESP32"));
+    }
+
+    #[tokio::test]
+    async fn execute_handles_unknown_board_gracefully() {
+        let tool = HardwareBoardInfoTool::new(vec!["unknown-board-xyz".into()]);
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("No static info available"));
+    }
+
+    #[test]
+    fn static_info_returns_none_for_unknown_board() {
+        let tool = HardwareBoardInfoTool::new(vec![]);
+        assert!(tool.static_info_for_board("nonexistent").is_none());
+    }
+
+    #[test]
+    fn static_info_returns_some_for_all_known_boards() {
+        let tool = HardwareBoardInfoTool::new(vec![]);
+        let known = [
+            "nucleo-f401re",
+            "nucleo-f411re",
+            "arduino-uno",
+            "arduino-uno-q",
+            "esp32",
+            "rpi-gpio",
+        ];
+        for board in &known {
+            assert!(
+                tool.static_info_for_board(board).is_some(),
+                "Expected static info for board '{}'",
+                board
+            );
+        }
+    }
+
+    #[test]
+    fn spec_returns_consistent_tool_metadata() {
+        let tool = HardwareBoardInfoTool::new(vec![]);
+        let spec = tool.spec();
+
+        assert_eq!(spec.name, "hardware_board_info");
+        assert!(!spec.description.is_empty());
+        assert_eq!(spec.parameters["type"], "object");
+    }
+}
