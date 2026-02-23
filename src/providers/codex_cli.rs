@@ -336,7 +336,7 @@ impl CodexCliProvider {
         prompt: &str,
         model: &str,
     ) -> Result<String> {
-        let args = build_codex_resume_args(thread_id, model, &self.sandbox_mode);
+        let args = build_codex_resume_args(thread_id, model);
         let (stdout, success) = self.run_codex(&args, prompt).await?;
 
         if !success {
@@ -373,7 +373,7 @@ impl CodexCliProvider {
         model: &str,
         on_progress: &tokio::sync::mpsc::Sender<String>,
     ) -> Result<String> {
-        let args = build_codex_resume_args(thread_id, model, &self.sandbox_mode);
+        let args = build_codex_resume_args(thread_id, model);
         let (stdout, success) = self.run_codex_streaming(&args, prompt, on_progress).await?;
 
         if !success {
@@ -403,7 +403,6 @@ pub(crate) fn build_codex_exec_args(model: &str, sandbox: &str) -> Vec<String> {
 pub(crate) fn build_codex_resume_args(
     thread_id: &str,
     model: &str,
-    sandbox: &str,
 ) -> Vec<String> {
     vec![
         "exec".into(),
@@ -412,8 +411,6 @@ pub(crate) fn build_codex_resume_args(
         "--json".into(),
         "--skip-git-repo-check".into(),
         "--full-auto".into(),
-        "--sandbox".into(),
-        sandbox.into(),
         "--model".into(),
         model.into(),
         "-".into(),
@@ -1093,7 +1090,7 @@ mod tests {
 
     #[test]
     fn build_resume_args_includes_thread_id() {
-        let args = build_codex_resume_args("tid-123", "gpt-5.3-codex-spark", "read-only");
+        let args = build_codex_resume_args("tid-123", "gpt-5.3-codex-spark");
         assert!(args.contains(&"resume".to_string()));
         assert!(args.contains(&"tid-123".to_string()));
         assert!(args.contains(&"--json".to_string()));
