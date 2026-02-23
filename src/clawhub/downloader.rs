@@ -31,6 +31,12 @@ impl SkillDownloader {
             .await
             .context("Failed to download file")?;
 
+        if !response.status().is_success() {
+            let status = response.status();
+            let url = url.to_string();
+            anyhow::bail!("Failed to download {}: HTTP {}", url, status);
+        }
+
         let content = response
             .text()
             .await
