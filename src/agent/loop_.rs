@@ -2763,6 +2763,29 @@ pub async fn run(
         tools_registry.extend(peripheral_tools);
     }
 
+    // ── Dynamic tool/hook registry ───────────────────────────────
+    let persistence_path = config
+        .workspace_dir
+        .join(".zeroclaw")
+        .join("state")
+        .join("dynamic-registry.json");
+    let build_ctx = crate::tools::dynamic_factories::ToolBuildContext {
+        security: security.clone(),
+        workspace_dir: config.workspace_dir.clone(),
+    };
+    let dynamic_registry = Arc::new(crate::tools::dynamic_registry::DynamicRegistry::new(
+        Vec::new(),
+        config.dynamic_registry.clone(),
+        persistence_path,
+        build_ctx,
+    ));
+    tools_registry.push(Box::new(
+        crate::tools::manage_tools::ManageToolsTool::new(dynamic_registry.clone()),
+    ));
+    tools_registry.push(Box::new(
+        crate::tools::manage_hooks::ManageHooksTool::new(dynamic_registry.clone()),
+    ));
+
     // ── Resolve provider ─────────────────────────────────────────
     let provider_name = provider_override
         .as_deref()
@@ -2926,6 +2949,14 @@ pub async fn run(
             "Query connected hardware for reported GPIO pins and LED pin. Use when: user asks what pins are available.",
         ));
     }
+    tool_descs.push((
+        "manage_tools",
+        "Create, remove, enable, or disable dynamic tools at runtime. Actions: create, remove, enable, disable, list. Created tools persist across restarts.",
+    ));
+    tool_descs.push((
+        "manage_hooks",
+        "Create, remove, enable, or disable dynamic hooks at runtime. Actions: create, remove, enable, disable, list. Hooks run automatically on matching events.",
+    ));
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
     } else {
@@ -3019,7 +3050,7 @@ pub async fn run(
             None,
             &[],
             None,
-            None,
+            Some(&*dynamic_registry),
         )
         .await?;
         final_output = response.clone();
@@ -3133,6 +3164,28 @@ pub async fn run(
 
             history.push(ChatMessage::user(&enriched));
 
+            // For prompt-guided dispatch, refresh the system prompt to include
+            // any dynamic tools that were added/removed in previous turns.
+            if !native_tools {
+                let snapshot = dynamic_registry.snapshot();
+                if !snapshot.all_tools.is_empty() {
+                    let dynamic_docs =
+                        crate::agent::dispatcher::format_dynamic_tool_docs(
+                            &snapshot.all_tools.iter().map(|t| t.spec()).collect::<Vec<_>>(),
+                        );
+                    let refreshed = format!("{system_prompt}{dynamic_docs}");
+                    if let Some(sys) = history.first_mut() {
+                        if sys.role == "system" {
+                            sys.content.clone_from(&refreshed);
+                        }
+                    }
+                } else if let Some(sys) = history.first_mut() {
+                    if sys.role == "system" && sys.content != system_prompt {
+                        sys.content.clone_from(&system_prompt);
+                    }
+                }
+            }
+
             let response = match run_tool_call_loop(
                 provider.as_ref(),
                 &mut history,
@@ -3151,7 +3204,7 @@ pub async fn run(
                 None,
                 &[],
                 None,
-                None,
+                Some(&*dynamic_registry),
             )
             .await
             {
