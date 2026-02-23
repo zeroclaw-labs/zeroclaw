@@ -804,14 +804,23 @@ async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Res
     // workspace-aware system context before model invocation.
     let system_prompt = {
         let config_guard = state.config.lock();
-        crate::channels::build_system_prompt(
+        let mut prompt = String::new();
+        if let Some(ref custom) = config_guard.agent.system_prompt {
+            let trimmed = custom.trim();
+            if !trimmed.is_empty() {
+                prompt.push_str(trimmed);
+                prompt.push_str("\n\n");
+            }
+        }
+        prompt.push_str(&crate::channels::build_system_prompt(
             &config_guard.workspace_dir,
             &state.model,
             &[], // tools - empty for simple chat
             &[], // skills
             Some(&config_guard.identity),
             None, // bootstrap_max_chars - use default
-        )
+        ));
+        prompt
     };
 
     let mut messages = Vec::with_capacity(1 + user_messages.len());

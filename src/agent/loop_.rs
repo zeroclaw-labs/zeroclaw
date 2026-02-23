@@ -2876,7 +2876,18 @@ pub async fn run(
         None
     };
     let native_tools = provider.supports_native_tools();
-    let mut system_prompt = crate::channels::build_system_prompt_with_mode(
+    let mut system_prompt = String::new();
+
+    // Prepend user-configured system prompt if set.
+    if let Some(ref custom) = config.agent.system_prompt {
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() {
+            system_prompt.push_str(trimmed);
+            system_prompt.push_str("\n\n");
+        }
+    }
+
+    system_prompt.push_str(&crate::channels::build_system_prompt_with_mode(
         &config.workspace_dir,
         model_name,
         &tool_descs,
@@ -2885,7 +2896,7 @@ pub async fn run(
         bootstrap_max_chars,
         native_tools,
         config.skills.prompt_injection_mode,
-    );
+    ));
 
     // Append structured tool-use instructions with schemas (only for non-native providers)
     if !native_tools {
@@ -3277,7 +3288,17 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         None
     };
     let native_tools = provider.supports_native_tools();
-    let mut system_prompt = crate::channels::build_system_prompt_with_mode(
+    let mut system_prompt = String::new();
+
+    if let Some(ref custom) = config.agent.system_prompt {
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() {
+            system_prompt.push_str(trimmed);
+            system_prompt.push_str("\n\n");
+        }
+    }
+
+    system_prompt.push_str(&crate::channels::build_system_prompt_with_mode(
         &config.workspace_dir,
         &model_name,
         &tool_descs,
@@ -3286,7 +3307,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         bootstrap_max_chars,
         native_tools,
         config.skills.prompt_injection_mode,
-    );
+    ));
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
