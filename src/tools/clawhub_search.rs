@@ -45,7 +45,11 @@ impl Tool for ClawhubSearchTool {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing query parameter"))?;
 
-        let limit = args["limit"].as_u64().unwrap_or(10).try_into().unwrap_or(10);
+        // Clamp limit to safe range (1-100)
+        let limit = args["limit"]
+            .as_u64()
+            .unwrap_or(10)
+            .clamp(1, 100) as usize;
 
         let client = ClawHubClient::default();
 

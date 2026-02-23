@@ -5,9 +5,35 @@ use crate::clawhub::client::ClawHubClient;
 use crate::clawhub::downloader::SkillDownloader;
 use crate::clawhub::registry::Registry;
 use crate::clawhub::types::InstalledSkill;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use std::fmt::Write;
 use std::path::Path;
+
+/// Validate a skill slug to prevent path traversal attacks
+fn validate_slug(slug: &str) -> Result<()> {
+    if slug.is_empty() {
+        bail!("Slug cannot be empty");
+    }
+
+    // Check for path separators
+    if slug.contains('/') || slug.contains('\\') {
+        bail!("Slug cannot contain path separators");
+    }
+
+    // Check for path traversal attempts
+    if slug.contains("..") {
+        bail!("Slug cannot contain path traversal sequences");
+    }
+
+    // Allow only safe characters: lowercase letters, numbers, hyphens, underscores
+    for ch in slug.chars() {
+        if !ch.is_ascii_lowercase() && !ch.is_ascii_digit() && ch != '-' && ch != '_' {
+            bail!("Slug can only contain lowercase letters (a-z), numbers (0-9), hyphens (-), and underscores (_)");
+        }
+    }
+
+    Ok(())
+}
 
 /// CLI subcommands for clawhub
 #[derive(Debug, Clone, clap::Subcommand)]
@@ -109,11 +135,19 @@ async fn handle_search(query: &str, limit: usize) -> Result<()> {
 
 async fn handle_install(
     slug: &str,
-    _version: Option<&str>,
+    version: Option<&str>,
     config_dir: &Path,
     workspace_dir: &Path,
     clawhub_config: Option<&crate::config::ClawHubConfig>,
 ) -> Result<()> {
+    // Validate slug
+    validate_slug(slug)?;
+
+    // Check if version pinning is requested (not yet supported)
+    if version.is_some() {
+        anyhow::bail!("Version pinning is not yet supported. Use 'zeroclaw clawhub install {}' to install the latest version.", slug);
+    }
+
     println!("Installing skill: {}", slug);
 
     let client = ClawHubClient::default();
@@ -307,7 +341,7 @@ fn handle_login() -> Result<()> {
     Ok(())
 }
 
-async fn handle_whoami(config_dir: &Path) -> Result<()> {
+async fn handle_whoami(_config_dir: &Path) -> Result<()> {
     // Check for token in environment or config
     let token = std::env::var("ZEROCLAW_CLAWHUB_TOKEN").ok();
 
@@ -325,11 +359,6 @@ async fn handle_whoami(config_dir: &Path) -> Result<()> {
                 println!("Failed to get user info: {}", e);
             }
         }
-    }
-
-    let registry_path = config_dir.join("clawhub_skills.json");
-    if registry_path.exists() {
-        println!("Token configured via file.");
     }
 
     println!("Not authenticated. Run 'zeroclaw clawhub login' first.");
@@ -359,7 +388,7 @@ pub fn update_skills_readme(skills_dir: &Path, clawhub_skills: &[InstalledSkill]
         content.push_str("|-------|---------|--------|\n");
 
         for skill in clawhub_skills {
-            let skill_path = format!("skills/{}/SKILL.md", skill.slug);
+            let skill_path = format!("{}/SKILL.md", skill.slug);
             writeln!(
                 content,
                 "| [{}]({}) | {} | [ClawHub](https://clawhub.ai/s/{}) |",

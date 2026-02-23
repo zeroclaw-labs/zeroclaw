@@ -32,7 +32,11 @@ impl ClawHubClient {
 
     /// Search skills on ClawHub
     pub async fn search(&self, query: &str, limit: usize) -> Result<SearchResult> {
-        let url = format!("{}/api/search?q={}&limit={}", self.api_url, query, limit);
+        let encoded_query = urlencoding::encode(query);
+        let url = format!(
+            "{}/api/search?q={}&limit={}",
+            self.api_url, encoded_query, limit
+        );
 
         let mut request = self.http_client.get(&url);
 
@@ -41,6 +45,11 @@ impl ClawHubClient {
         }
 
         let response = request.send().await.context("Failed to search ClawHub")?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            anyhow::bail!("Search request failed with status {}: {}", status, text);
+        }
         let result = response
             .json::<SearchResult>()
             .await
@@ -61,7 +70,8 @@ impl ClawHubClient {
 
     /// Get skill metadata by slug
     pub async fn get_skill(&self, slug: &str) -> Result<ClawHubSkill> {
-        let url = format!("{}/api/skill?slug={}", self.api_url, slug);
+        let encoded_slug = urlencoding::encode(slug);
+        let url = format!("{}/api/skill?slug={}", self.api_url, encoded_slug);
 
         let mut request = self.http_client.get(&url);
 
@@ -70,6 +80,11 @@ impl ClawHubClient {
         }
 
         let response = request.send().await.context("Failed to get skill")?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to get skill '{}': {} - {}", slug, status, text);
+        }
         let detail = response
             .json::<SkillDetail>()
             .await
@@ -91,6 +106,11 @@ impl ClawHubClient {
         request = request.header("Authorization", format!("Bearer {}", token));
 
         let response = request.send().await.context("Failed to get user")?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to get user info: {} - {}", status, text);
+        }
         let user = response
             .json::<ClawHubUser>()
             .await

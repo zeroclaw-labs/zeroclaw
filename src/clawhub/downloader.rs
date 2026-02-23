@@ -86,7 +86,14 @@ impl SkillDownloader {
             return Ok(());
         }
 
-        anyhow::bail!("No readme_url provided and master branch fallback also failed");
+        // Provide specific error based on what URLs were available
+        if readme_url.is_some() {
+            anyhow::bail!(
+                "Download from provided readme_url failed and no master branch fallback available"
+            );
+        } else {
+            anyhow::bail!("No readme_url provided and no master branch fallback");
+        }
     }
 
     /// Download SKILL.md from a zip URL (e.g., ClawHub Convex backend)
@@ -111,12 +118,27 @@ impl SkillDownloader {
 
         std::fs::create_dir_all(target_dir)?;
 
+        // First try exact match
         if let Ok(mut file) = archive.by_name("SKILL.md") {
             let mut content = String::new();
             file.read_to_string(&mut content)?;
             let skill_md = target_dir.join("SKILL.md");
             std::fs::write(&skill_md, &content)?;
             return Ok(());
+        }
+
+        // Try to find SKILL.md in nested folders (top-level folder in zip)
+        for i in 0..archive.len() {
+            if let Ok(mut file) = archive.by_index(i) {
+                let name = file.name();
+                if name.ends_with("SKILL.md") {
+                    let mut content = String::new();
+                    file.read_to_string(&mut content)?;
+                    let skill_md = target_dir.join("SKILL.md");
+                    std::fs::write(&skill_md, &content)?;
+                    return Ok(());
+                }
+            }
         }
 
         anyhow::bail!("SKILL.md not found in zip");

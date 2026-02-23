@@ -64,6 +64,40 @@ impl Tool for ClawhubInstallTool {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing slug parameter"))?;
 
+        // Validate slug
+        if slug.is_empty() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Slug cannot be empty".to_string()),
+            });
+        }
+        if slug.contains('/') || slug.contains('\\') || slug.contains("..") {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Slug contains invalid characters (no path separators or traversal)".to_string()),
+            });
+        }
+        for ch in slug.chars() {
+            if !ch.is_ascii_lowercase() && !ch.is_ascii_digit() && ch != '-' && ch != '_' {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some("Slug can only contain lowercase letters (a-z), numbers (0-9), hyphens (-), and underscores (_)".to_string()),
+                });
+            }
+        }
+
+        // Check version parameter (not yet supported)
+        if args.get("version").and_then(|v| v.as_str()).is_some() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Version pinning is not yet supported. Install the latest version by omitting the version parameter.".to_string()),
+            });
+        }
+
         let client = ClawHubClient::default();
 
         match client.get_skill(slug).await {
