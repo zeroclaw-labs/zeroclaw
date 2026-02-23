@@ -86,47 +86,20 @@ impl LeakDetector {
         let regexes = API_KEY_PATTERNS.get_or_init(|| {
             vec![
                 // Stripe
-                (
-                    Regex::new(r"sk_(live|test)_[a-zA-Z0-9]{24,}").unwrap(),
-                    "Stripe secret key",
-                ),
-                (
-                    Regex::new(r"pk_(live|test)_[a-zA-Z0-9]{24,}").unwrap(),
-                    "Stripe publishable key",
-                ),
+                (Regex::new(r#"sk_(live|test)_[a-zA-Z0-9]{24,}"#).unwrap(), "Stripe secret key"),
+                (Regex::new(r#"pk_(live|test)_[a-zA-Z0-9]{24,}"#).unwrap(), "Stripe publishable key"),
                 // OpenAI
-                (
-                    Regex::new(r"sk-[a-zA-Z0-9]{20,}T3BlbkFJ[a-zA-Z0-9]{20,}").unwrap(),
-                    "OpenAI API key",
-                ),
-                (
-                    Regex::new(r"sk-[a-zA-Z0-9]{48,}").unwrap(),
-                    "OpenAI-style API key",
-                ),
+                (Regex::new(r#"sk-[a-zA-Z0-9]{20,}T3BlbkFJ[a-zA-Z0-9]{20,}"#).unwrap(), "OpenAI API key"),
+                (Regex::new(r#"sk-[a-zA-Z0-9]{48,}"#).unwrap(), "OpenAI-style API key"),
                 // Anthropic
-                (
-                    Regex::new(r"sk-ant-[a-zA-Z0-9-_]{32,}").unwrap(),
-                    "Anthropic API key",
-                ),
+                (Regex::new(r#"sk-ant-[a-zA-Z0-9-_]{32,}"#).unwrap(), "Anthropic API key"),
                 // Google
-                (
-                    Regex::new(r"AIza[a-zA-Z0-9_-]{35}").unwrap(),
-                    "Google API key",
-                ),
+                (Regex::new(r#"AIza[a-zA-Z0-9_-]{35}"#).unwrap(), "Google API key"),
                 // GitHub
-                (
-                    Regex::new(r"gh[pousr]_[a-zA-Z0-9]{36,}").unwrap(),
-                    "GitHub token",
-                ),
-                (
-                    Regex::new(r"github_pat_[a-zA-Z0-9_]{22,}").unwrap(),
-                    "GitHub PAT",
-                ),
+                (Regex::new(r#"gh[pousr]_[a-zA-Z0-9]{36,}"#).unwrap(), "GitHub token"),
+                (Regex::new(r#"github_pat_[a-zA-Z0-9_]{22,}"#).unwrap(), "GitHub PAT"),
                 // Generic
-                (
-                    Regex::new(r#"api[_-]?key[=:]\s*['"]*[a-zA-Z0-9_-]{20,}"#).unwrap(),
-                    "Generic API key",
-                ),
+                (Regex::new(r#"api[_-]?key[=:]\s*['"]?[a-zA-Z0-9_-]{20,}"#).unwrap(), "Generic API key"),
             ]
         });
 
@@ -150,17 +123,9 @@ impl LeakDetector {
         static AWS_PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
         let regexes = AWS_PATTERNS.get_or_init(|| {
             vec![
-                (
-                    Regex::new(r"AKIA[A-Z0-9]{16}").unwrap(),
-                    "AWS Access Key ID",
-                ),
-                (
-                    Regex::new(
-                        r#"aws[_-]?secret[_-]?access[_-]?key[=:]\s*['"]*[a-zA-Z0-9/+=]{40}"#,
-                    )
-                    .unwrap(),
-                    "AWS Secret Access Key",
-                ),
+                // Use r#""# syntax to avoid brace-quote parsing issue
+                (Regex::new(r#"AKIA[A-Z0-9]{16}"#).unwrap(), "AWS Access Key ID"),
+                (Regex::new(r#"aws[_-]?secret[_-]?access[_-]?key[=:]\s*['"]?[a-zA-Z0-9/+=]{40}"#).unwrap(), "AWS Secret Access Key"),
             ]
         });
 
@@ -184,18 +149,9 @@ impl LeakDetector {
         static SECRET_PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
         let regexes = SECRET_PATTERNS.get_or_init(|| {
             vec![
-                (
-                    Regex::new(r#"(?i)password[=:]\s*['"]*[^\s'"]{8,}"#).unwrap(),
-                    "Password in config",
-                ),
-                (
-                    Regex::new(r#"(?i)secret[=:]\s*['"]*[a-zA-Z0-9_-]{16,}"#).unwrap(),
-                    "Secret value",
-                ),
-                (
-                    Regex::new(r#"(?i)token[=:]\s*['"]*[a-zA-Z0-9_.-]{20,}"#).unwrap(),
-                    "Token value",
-                ),
+                (Regex::new(r#"(?i)password[=:]\s*['"]?[^\s'"]{8,}"#).unwrap(), "Password in config"),
+                (Regex::new(r#"(?i)secret[=:]\s*['"]?[a-zA-Z0-9_-]{16,}"#).unwrap(), "Secret value"),
+                (Regex::new(r#"(?i)token[=:]\s*['"]?[a-zA-Z0-9_.-]{20,}"#).unwrap(), "Token value"),
             ]
         });
 
