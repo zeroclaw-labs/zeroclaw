@@ -176,4 +176,73 @@ mod tests {
             .contains("Rate limit exceeded"));
         assert!(mem.get("temp").await.unwrap().is_some());
     }
+
+    #[test]
+    fn schema_has_required_key_field() {
+        let (_tmp, mem) = test_mem();
+        let tool = MemoryForgetTool::new(mem, test_security());
+        let schema = tool.parameters_schema();
+        assert_eq!(schema["type"], "object");
+        let required = schema["required"].as_array().expect("required should be array");
+        assert!(required.contains(&json!("key")));
+        assert!(schema["properties"]["key"]["type"] == "string");
+    }
+
+    #[test]
+    fn description_mentions_remove() {
+        let (_tmp, mem) = test_mem();
+        let tool = MemoryForgetTool::new(mem, test_security());
+        let desc = tool.description();
+        assert!(
+            desc.contains("Remove") || desc.contains("remove") || desc.contains("delete"),
+            "Description should mention removal: {desc}"
+        );
+    }
+
+    #[test]
+    fn spec_returns_consistent_metadata() {
+        let (_tmp, mem) = test_mem();
+        let tool = MemoryForgetTool::new(mem, test_security());
+        let spec = tool.spec();
+        assert_eq!(spec.name, "memory_forget");
+        assert!(!spec.description.is_empty());
+        assert!(spec.parameters["properties"]["key"].is_object());
+    }
+
+    #[tokio::test]
+    async fn forget_key_with_special_characters() {
+        let (_tmp, mem) = test_mem();
+        let special_key = "user::pref/lang#1";
+        mem.store(special_key, "value", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let tool = MemoryForgetTool::new(mem.clone(), test_security());
+        let result = tool
+            .execute(json!({"key": special_key}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("Forgot"));
+        assert!(mem.get(special_key).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn forget_empty_string_key() {
+        let (_tmp, mem) = test_mem();
+        let tool = MemoryForgetTool::new(mem, test_security());
+        // Empty string is a valid string value, so execute should succeed
+        // but no memory exists for empty key
+        let result = tool.execute(json!({"key": ""})).await.unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("No memory found"));
+    }
+
+    #[tokio::test]
+    async fn forget_key_as_non_string_returns_error() {
+        let (_tmp, mem) = test_mem();
+        let tool = MemoryForgetTool::new(mem, test_security());
+        // Numeric value for key should fail since as_str() returns None
+        let result = tool.execute(json!({"key": 42})).await;
+        assert!(result.is_err());
+    }
 }

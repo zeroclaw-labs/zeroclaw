@@ -143,6 +143,127 @@ fn parse_hex_address(s: &str) -> Option<u64> {
     u64::from_str_radix(s, 16).ok()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::traits::Tool;
+
+    #[test]
+    fn name_and_description_are_correct() {
+        let tool = HardwareMemoryReadTool::new(vec![]);
+        assert_eq!(tool.name(), "hardware_memory_read");
+        assert!(!tool.description().is_empty());
+        assert!(tool.description().contains("memory"));
+    }
+
+    #[test]
+    fn parameters_schema_has_valid_structure() {
+        let tool = HardwareMemoryReadTool::new(vec![]);
+        let schema = tool.parameters_schema();
+
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"].is_object());
+        assert_eq!(schema["properties"]["address"]["type"], "string");
+        assert_eq!(schema["properties"]["length"]["type"], "integer");
+        assert_eq!(schema["properties"]["board"]["type"], "string");
+    }
+
+    #[tokio::test]
+    async fn execute_returns_error_when_no_boards_configured() {
+        let tool = HardwareMemoryReadTool::new(vec![]);
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.is_some());
+        assert!(result.error.unwrap().contains("No peripherals configured"));
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_unsupported_board() {
+        let tool = HardwareMemoryReadTool::new(vec!["arduino-uno".into()]);
+        let result = tool
+            .execute(serde_json::json!({"board": "arduino-uno"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.is_some());
+        let err = result.error.unwrap();
+        assert!(err.contains("only supports nucleo-f401re"));
+    }
+
+    #[tokio::test]
+    async fn execute_without_probe_feature_returns_error() {
+        // Without the "probe" feature, execute for a supported board should
+        // return a graceful error about the missing feature.
+        let tool = HardwareMemoryReadTool::new(vec!["nucleo-f401re".into()]);
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+
+        // Without probe feature, this should fail gracefully
+        assert!(!result.success);
+        assert!(result.error.is_some());
+        let err = result.error.unwrap();
+        assert!(
+            err.contains("probe") || err.contains("feature"),
+            "Expected probe/feature error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn parse_hex_address_with_0x_prefix() {
+        assert_eq!(parse_hex_address("0x20000000"), Some(0x2000_0000));
+    }
+
+    #[test]
+    fn parse_hex_address_with_uppercase_0x_prefix() {
+        assert_eq!(parse_hex_address("0X08000000"), Some(0x0800_0000));
+    }
+
+    #[test]
+    fn parse_hex_address_without_prefix() {
+        assert_eq!(parse_hex_address("DEADBEEF"), Some(0xDEAD_BEEF));
+    }
+
+    #[test]
+    fn parse_hex_address_with_whitespace() {
+        assert_eq!(parse_hex_address("  0x1000  "), Some(0x1000));
+    }
+
+    #[test]
+    fn parse_hex_address_invalid_returns_none() {
+        assert_eq!(parse_hex_address("not_hex"), None);
+    }
+
+    #[test]
+    fn chip_for_board_returns_known_chips() {
+        assert_eq!(
+            HardwareMemoryReadTool::chip_for_board("nucleo-f401re"),
+            Some("STM32F401RETx")
+        );
+        assert_eq!(
+            HardwareMemoryReadTool::chip_for_board("nucleo-f411re"),
+            Some("STM32F411RETx")
+        );
+    }
+
+    #[test]
+    fn chip_for_board_returns_none_for_unknown() {
+        assert_eq!(HardwareMemoryReadTool::chip_for_board("esp32"), None);
+        assert_eq!(HardwareMemoryReadTool::chip_for_board("arduino-uno"), None);
+    }
+
+    #[test]
+    fn spec_returns_consistent_tool_metadata() {
+        let tool = HardwareMemoryReadTool::new(vec![]);
+        let spec = tool.spec();
+
+        assert_eq!(spec.name, "hardware_memory_read");
+        assert!(!spec.description.is_empty());
+        assert_eq!(spec.parameters["type"], "object");
+    }
+}
+
 #[cfg(feature = "probe")]
 fn probe_read_memory(chip: &str, address: u64, length: usize) -> anyhow::Result<String> {
     use probe_rs::MemoryInterface;
