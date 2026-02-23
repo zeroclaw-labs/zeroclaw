@@ -47,6 +47,12 @@ mod rag {
     pub use zeroclaw::rag::*;
 }
 mod config;
+mod cost {
+    pub use zeroclaw::cost::*;
+}
+mod skillforge {
+    pub use zeroclaw::skillforge::*;
+}
 mod cron;
 mod daemon;
 mod doctor;
@@ -65,11 +71,13 @@ mod providers;
 mod runtime;
 mod security;
 mod service;
-mod skillforge;
 mod skills;
+mod soul;
 mod tools;
 mod tunnel;
 mod util;
+#[cfg(feature = "wallet")]
+mod wallet;
 
 use config::Config;
 
@@ -242,6 +250,9 @@ enum Commands {
         #[command(subcommand)]
         peripheral_command: zeroclaw::PeripheralCommands,
     },
+
+    /// Run SkillForge: discover, evaluate, and integrate skills
+    Forge,
 }
 
 #[derive(Subcommand, Debug)]
@@ -748,6 +759,18 @@ async fn main() -> Result<()> {
 
         Commands::Peripheral { peripheral_command } => {
             peripherals::handle_command(peripheral_command.clone(), &config)
+        }
+
+        Commands::Forge => {
+            let forge = zeroclaw::skillforge::SkillForge::new(config.skillforge);
+            let report = forge.forge().await?;
+            println!("SkillForge Report:");
+            println!("  Discovered:      {}", report.discovered);
+            println!("  Evaluated:       {}", report.evaluated);
+            println!("  Auto-integrated: {}", report.auto_integrated);
+            println!("  Manual review:   {}", report.manual_review);
+            println!("  Skipped:         {}", report.skipped);
+            Ok(())
         }
     }
 }

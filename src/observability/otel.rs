@@ -331,6 +331,22 @@ impl Observer for OtelObserver {
                 self.errors
                     .add(1, &[KeyValue::new("component", component.clone())]);
             }
+            ObserverEvent::SurvivalTierChange {
+                from,
+                to,
+                balance_cents,
+            } => {
+                let mut span = tracer.build(
+                    opentelemetry::trace::SpanBuilder::from_name("survival.tier_change")
+                        .with_kind(SpanKind::Internal)
+                        .with_attributes(vec![
+                            KeyValue::new("survival.tier.from", from.clone()),
+                            KeyValue::new("survival.tier.to", to.clone()),
+                            KeyValue::new("survival.balance_cents", *balance_cents),
+                        ]),
+                );
+                span.end();
+            }
         }
     }
 

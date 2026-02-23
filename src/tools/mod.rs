@@ -25,7 +25,24 @@ pub mod schedule;
 pub mod schema;
 pub mod screenshot;
 pub mod shell;
+pub mod soul_reflect;
+pub mod soul_replicate;
+pub mod soul_status;
 pub mod traits;
+#[cfg(feature = "wallet")]
+pub mod wallet_info;
+#[cfg(feature = "wallet")]
+pub mod wallet_pay;
+#[cfg(feature = "wallet")]
+pub mod wallet_balance;
+#[cfg(feature = "wallet")]
+pub mod wallet_send;
+#[cfg(feature = "wallet")]
+pub mod wallet_sign;
+#[cfg(feature = "wallet")]
+pub mod wallet_token_balance;
+#[cfg(feature = "wallet")]
+pub mod wallet_token_send;
 pub mod web_search_tool;
 
 pub use browser::{BrowserTool, ComputerUseConfig};
@@ -52,19 +69,36 @@ pub use memory_store::MemoryStoreTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
 pub use schedule::ScheduleTool;
-#[allow(unused_imports)]
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
 pub use shell::ShellTool;
+pub use soul_reflect::SoulReflectTool;
+pub use soul_replicate::SoulReplicateTool;
+pub use soul_status::SoulStatusTool;
 pub use traits::Tool;
+pub use traits::ToolSpec;
 #[allow(unused_imports)]
-pub use traits::{ToolResult, ToolSpec};
+pub use traits::ToolResult;
+#[cfg(feature = "wallet")]
+pub use wallet_info::WalletInfoTool;
+#[cfg(feature = "wallet")]
+pub use wallet_pay::WalletPayTool;
+#[cfg(feature = "wallet")]
+pub use wallet_balance::WalletBalanceTool;
+#[cfg(feature = "wallet")]
+pub use wallet_send::WalletSendTool;
+#[cfg(feature = "wallet")]
+pub use wallet_sign::WalletSignTool;
+#[cfg(feature = "wallet")]
+pub use wallet_token_balance::WalletTokenBalanceTool;
+#[cfg(feature = "wallet")]
+pub use wallet_token_send::WalletTokenSendTool;
 pub use web_search_tool::WebSearchTool;
 
 use crate::config::{Config, DelegateAgentConfig};
 use crate::memory::Memory;
 use crate::runtime::{NativeRuntime, RuntimeAdapter};
-use crate::security::SecurityPolicy;
+use crate::security::{AuditLogger, SecurityPolicy};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -79,7 +113,7 @@ pub fn default_tools_with_runtime(
     runtime: Arc<dyn RuntimeAdapter>,
 ) -> Vec<Box<dyn Tool>> {
     vec![
-        Box::new(ShellTool::new(security.clone(), runtime)),
+        Box::new(ShellTool::new(security.clone(), runtime, None, None)),
         Box::new(FileReadTool::new(security.clone())),
         Box::new(FileWriteTool::new(security)),
     ]
@@ -132,8 +166,17 @@ pub fn all_tools_with_runtime(
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
 ) -> Vec<Box<dyn Tool>> {
+    let sandbox = Some(crate::security::create_sandbox(&root_config.security));
+    let audit = if root_config.security.audit.enabled {
+        AuditLogger::new(root_config.security.audit.clone(), workspace_dir.to_path_buf())
+            .ok()
+            .map(Arc::new)
+    } else {
+        None
+    };
+
     let mut tools: Vec<Box<dyn Tool>> = vec![
-        Box::new(ShellTool::new(security.clone(), runtime)),
+        Box::new(ShellTool::new(security.clone(), runtime, audit, sandbox)),
         Box::new(FileReadTool::new(security.clone())),
         Box::new(FileWriteTool::new(security.clone())),
         Box::new(CronAddTool::new(config.clone(), security.clone())),
@@ -214,6 +257,59 @@ pub fn all_tools_with_runtime(
                 composio_entity_id,
                 security.clone(),
             )));
+        }
+    }
+
+    // Add wallet tools when wallet feature is enabled and configured
+    // Add wallet tools when wallet feature is enabled and configured
+    #[cfg(feature = "wallet")]
+    {
+        if root_config.wallet.enabled {
+            let wallet_dir = workspace_dir.join(&root_config.wallet.wallet_path);
+            let store = Arc::new(crate::wallet::storage::WalletStore::new(
+                &wallet_dir,
+                workspace_dir,
+            ));
+
+            // Auto-generate wallet if configured and not yet created
+            if root_config.wallet.auto_generate && !store.exists() {
+                let kp = crate::wallet::WalletKeypair::generate();
+                let _ = store.save(&kp);
+            }
+
+            tools.push(Box::new(WalletInfoTool::new(store.clone())));
+            tools.push(Box::new(WalletSignTool::new(store.clone())));
+            tools.push(Box::new(WalletPayTool::new(
+                store.clone(),
+                root_config.treasury.clone(),
+            )));
+
+            if !root_config.wallet.rpc_url.is_empty() {
+                match crate::wallet::EvmProvider::connect(
+                    &root_config.wallet.rpc_url,
+                    root_config.wallet.chain_id,
+                ) {
+                    Ok(provider) => {
+                        let provider = Arc::new(provider);
+                        tools.push(Box::new(WalletBalanceTool::new(
+                            store.clone(),
+                            provider.clone(),
+                        )));
+                        tools.push(Box::new(WalletSendTool::new(
+                            store.clone(),
+                            provider.clone(),
+                        )));
+                        tools.push(Box::new(WalletTokenBalanceTool::new(
+                            store.clone(),
+                            provider.clone(),
+                        )));
+                        tools.push(Box::new(WalletTokenSendTool::new(store, provider)));
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to connect EVM provider; on-chain tools disabled");
+                    }
+                }
+            }
         }
     }
 

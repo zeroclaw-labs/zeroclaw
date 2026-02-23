@@ -1,5 +1,6 @@
 use crate::providers::{is_glm_alias, is_zai_alias};
 use crate::security::AutonomyLevel;
+use crate::skillforge::SkillForgeConfig;
 use anyhow::{Context, Result};
 use directories::UserDirs;
 use serde::{Deserialize, Serialize};
@@ -129,7 +130,22 @@ pub struct Config {
     pub identity: IdentityConfig,
 
     #[serde(default)]
+    pub soul: SoulConfig,
+
+    #[serde(default)]
+    pub replication: ReplicationConfig,
+
+    #[serde(default)]
+    pub model_strategy: ModelStrategyConfig,
+
+    #[serde(default)]
     pub cost: CostConfig,
+
+    #[serde(default)]
+    pub wallet: WalletConfig,
+
+    #[serde(default)]
+    pub treasury: TreasuryConfig,
 
     #[serde(default)]
     pub peripherals: PeripheralsConfig,
@@ -141,6 +157,12 @@ pub struct Config {
     /// Hardware configuration (wizard-driven physical world setup).
     #[serde(default)]
     pub hardware: HardwareConfig,
+
+    #[serde(default)]
+    pub skillforge: SkillForgeConfig,
+
+    #[serde(default)]
+    pub security: SecurityConfig,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -308,6 +330,167 @@ impl Default for IdentityConfig {
     }
 }
 
+// ── Soul system ──────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SoulConfig {
+    /// Enable the soul system (default: false)
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Soul file format: "soul/v1" (SOUL.md with YAML frontmatter)
+    #[serde(default = "default_soul_format")]
+    pub format: String,
+
+    /// Path to SOUL.md (relative to workspace, default: "SOUL.md")
+    #[serde(default = "default_soul_path")]
+    pub soul_path: String,
+
+    /// Expected SHA-256 hash of the constitution laws (verified on load)
+    #[serde(default)]
+    pub constitution_hash: Option<String>,
+
+    /// Enable alignment tracking against genesis prompt (default: false)
+    #[serde(default)]
+    pub enable_alignment_tracking: bool,
+
+    /// Enable periodic auto-reflection (default: false)
+    #[serde(default)]
+    pub enable_auto_reflection: bool,
+
+    /// Trigger reflection every N messages (default: 50)
+    #[serde(default = "default_reflection_interval")]
+    pub reflection_interval_messages: usize,
+
+    /// Token budgets for tiered memory (working/episodic/semantic/procedural)
+    #[serde(default)]
+    pub memory_budgets: MemoryTokenBudgetsConfig,
+}
+
+/// Token budgets for tiered memory management.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryTokenBudgetsConfig {
+    /// Working memory (session context) token budget
+    #[serde(default = "default_working_budget")]
+    pub working: usize,
+    /// Episodic memory (events/experiences) token budget
+    #[serde(default = "default_episodic_budget")]
+    pub episodic: usize,
+    /// Semantic memory (knowledge/facts) token budget
+    #[serde(default = "default_semantic_budget")]
+    pub semantic: usize,
+    /// Procedural memory (skills/procedures) token budget
+    #[serde(default = "default_procedural_budget")]
+    pub procedural: usize,
+}
+
+fn default_working_budget() -> usize {
+    4000
+}
+fn default_episodic_budget() -> usize {
+    2000
+}
+fn default_semantic_budget() -> usize {
+    2000
+}
+fn default_procedural_budget() -> usize {
+    1000
+}
+
+impl Default for MemoryTokenBudgetsConfig {
+    fn default() -> Self {
+        Self {
+            working: default_working_budget(),
+            episodic: default_episodic_budget(),
+            semantic: default_semantic_budget(),
+            procedural: default_procedural_budget(),
+        }
+    }
+}
+
+fn default_soul_format() -> String {
+    "soul/v1".into()
+}
+
+fn default_soul_path() -> String {
+    "SOUL.md".into()
+}
+
+fn default_reflection_interval() -> usize {
+    50
+}
+
+// ── Replication ────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicationConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default = "default_max_children")]
+    pub max_children: usize,
+
+    #[serde(default = "default_child_workspace_dir")]
+    pub child_workspace_dir: String,
+}
+
+fn default_max_children() -> usize {
+    3
+}
+
+fn default_child_workspace_dir() -> String {
+    "children".into()
+}
+
+impl Default for ReplicationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_children: default_max_children(),
+            child_workspace_dir: default_child_workspace_dir(),
+        }
+    }
+}
+
+// ── Model Strategy ─────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TierModelConfig {
+    pub tier: String,
+    pub provider: String,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelStrategyConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default)]
+    pub tier_models: Vec<TierModelConfig>,
+
+    #[serde(default)]
+    pub per_session_budget_usd: Option<f64>,
+
+    #[serde(default)]
+    pub per_call_budget_usd: Option<f64>,
+}
+
+impl Default for SoulConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            format: default_soul_format(),
+            soul_path: default_soul_path(),
+            constitution_hash: None,
+            enable_alignment_tracking: false,
+            enable_auto_reflection: false,
+            reflection_interval_messages: default_reflection_interval(),
+            memory_budgets: MemoryTokenBudgetsConfig::default(),
+        }
+    }
+}
+
 // ── Cost tracking and budget enforcement ───────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -335,6 +518,18 @@ pub struct CostConfig {
     /// Per-model pricing (USD per 1M tokens)
     #[serde(default)]
     pub prices: std::collections::HashMap<String, ModelPricing>,
+
+    /// Enable survival tier monitoring (default: false)
+    #[serde(default)]
+    pub survival_enabled: bool,
+
+    /// Initial credit balance in cents (default: 1000 = $10.00)
+    #[serde(default = "default_initial_credit_cents")]
+    pub initial_credit_cents: i64,
+
+    /// Custom survival tier thresholds (in cents)
+    #[serde(default)]
+    pub survival_thresholds: SurvivalThresholdsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -346,6 +541,136 @@ pub struct ModelPricing {
     /// Output price per 1M tokens
     #[serde(default)]
     pub output: f64,
+}
+
+fn default_initial_credit_cents() -> i64 {
+    1000
+}
+
+/// Configurable survival tier thresholds (in cents).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SurvivalThresholdsConfig {
+    /// Balance threshold for High tier (default: 500 cents)
+    #[serde(default = "default_survival_high")]
+    pub high: i64,
+    /// Balance threshold for Normal tier (default: 50 cents)
+    #[serde(default = "default_survival_normal")]
+    pub normal: i64,
+    /// Balance threshold for LowCompute tier (default: 10 cents)
+    #[serde(default = "default_survival_low_compute")]
+    pub low_compute: i64,
+    /// Balance threshold for Critical tier (default: 0 cents)
+    #[serde(default)]
+    pub critical: i64,
+}
+
+impl Default for SurvivalThresholdsConfig {
+    fn default() -> Self {
+        Self {
+            high: default_survival_high(),
+            normal: default_survival_normal(),
+            low_compute: default_survival_low_compute(),
+            critical: 0,
+        }
+    }
+}
+
+fn default_survival_high() -> i64 {
+    500
+}
+
+fn default_survival_normal() -> i64 {
+    50
+}
+
+fn default_survival_low_compute() -> i64 {
+    10
+}
+
+// ── Wallet Config ──────────────────────────────────────────────
+
+/// EVM wallet configuration (requires `--features wallet`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalletConfig {
+    /// Enable wallet functionality (default: false)
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to wallet key file (default: "wallet" directory under workspace)
+    #[serde(default = "default_wallet_path")]
+    pub wallet_path: String,
+    /// Auto-generate wallet if none exists (default: true)
+    #[serde(default = "default_wallet_auto_generate")]
+    pub auto_generate: bool,
+    /// RPC endpoint URL for on-chain operations (empty = on-chain tools disabled)
+    #[serde(default)]
+    pub rpc_url: String,
+    /// EVM chain ID (default: 11155111 = Sepolia testnet)
+    #[serde(default = "default_wallet_chain_id")]
+    pub chain_id: u64,
+}
+
+impl Default for WalletConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            wallet_path: default_wallet_path(),
+            auto_generate: true,
+            rpc_url: String::new(),
+            chain_id: default_wallet_chain_id(),
+        }
+    }
+}
+
+fn default_wallet_path() -> String {
+    "wallet".to_string()
+}
+
+fn default_wallet_auto_generate() -> bool {
+    true
+}
+
+fn default_wallet_chain_id() -> u64 {
+    11_155_111
+}
+
+/// Treasury configuration — spending limits for x402 payments.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TreasuryConfig {
+    /// Max payment per single x402 transaction in cents (default: 100 = $1)
+    #[serde(default = "default_max_x402_payment_cents")]
+    pub max_x402_payment_cents: u64,
+    /// Allowed domains for x402 payments (empty = allow all)
+    #[serde(default)]
+    pub x402_allowed_domains: Vec<String>,
+    /// Max daily x402 spend in cents (default: 500 = $5)
+    #[serde(default = "default_max_daily_x402_spend_cents")]
+    pub max_daily_spend_cents: u64,
+    /// Max monthly x402 spend in cents (default: 5000 = $50)
+    #[serde(default = "default_max_monthly_x402_spend_cents")]
+    pub max_monthly_spend_cents: u64,
+}
+
+impl Default for TreasuryConfig {
+    fn default() -> Self {
+        Self {
+            max_x402_payment_cents: default_max_x402_payment_cents(),
+            x402_allowed_domains: vec![],
+            max_daily_spend_cents: default_max_daily_x402_spend_cents(),
+            max_monthly_spend_cents: default_max_monthly_x402_spend_cents(),
+        }
+    }
+}
+
+fn default_max_x402_payment_cents() -> u64 {
+    100
+}
+
+fn default_max_daily_x402_spend_cents() -> u64 {
+    500
+}
+
+fn default_max_monthly_x402_spend_cents() -> u64 {
+    5000
 }
 
 fn default_daily_limit() -> f64 {
@@ -369,6 +694,9 @@ impl Default for CostConfig {
             warn_at_percent: default_warn_percent(),
             allow_override: false,
             prices: get_default_pricing(),
+            survival_enabled: false,
+            initial_credit_cents: default_initial_credit_cents(),
+            survival_thresholds: SurvivalThresholdsConfig::default(),
         }
     }
 }
@@ -2498,10 +2826,17 @@ impl Default for Config {
             web_search: WebSearchConfig::default(),
             proxy: ProxyConfig::default(),
             identity: IdentityConfig::default(),
+            soul: SoulConfig::default(),
+            replication: ReplicationConfig::default(),
+            model_strategy: ModelStrategyConfig::default(),
             cost: CostConfig::default(),
+            wallet: WalletConfig::default(),
+            treasury: TreasuryConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            skillforge: SkillForgeConfig::default(),
+            security: SecurityConfig::default(),
             query_classification: QueryClassificationConfig::default(),
         }
     }
@@ -3329,10 +3664,17 @@ default_temperature = 0.7
             proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
+            soul: SoulConfig::default(),
+            replication: ReplicationConfig::default(),
+            model_strategy: ModelStrategyConfig::default(),
             cost: CostConfig::default(),
+            wallet: WalletConfig::default(),
+            treasury: TreasuryConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            security: SecurityConfig::default(),
+            skillforge: SkillForgeConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -3469,10 +3811,17 @@ tool_dispatcher = "xml"
             proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
+            soul: SoulConfig::default(),
+            replication: ReplicationConfig::default(),
+            model_strategy: ModelStrategyConfig::default(),
             cost: CostConfig::default(),
+            wallet: WalletConfig::default(),
+            treasury: TreasuryConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            security: SecurityConfig::default(),
+            skillforge: SkillForgeConfig::default(),
         };
 
         config.save().unwrap();

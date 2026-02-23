@@ -30,6 +30,7 @@ pub struct Agent {
     temperature: f64,
     workspace_dir: std::path::PathBuf,
     identity_config: crate::config::IdentityConfig,
+    soul_config: crate::config::SoulConfig,
     skills: Vec<crate::skills::Skill>,
     auto_save: bool,
     history: Vec<ConversationMessage>,
@@ -50,6 +51,7 @@ pub struct AgentBuilder {
     temperature: Option<f64>,
     workspace_dir: Option<std::path::PathBuf>,
     identity_config: Option<crate::config::IdentityConfig>,
+    soul_config: Option<crate::config::SoulConfig>,
     skills: Option<Vec<crate::skills::Skill>>,
     auto_save: Option<bool>,
     classification_config: Option<crate::config::QueryClassificationConfig>,
@@ -71,6 +73,7 @@ impl AgentBuilder {
             temperature: None,
             workspace_dir: None,
             identity_config: None,
+            soul_config: None,
             skills: None,
             auto_save: None,
             classification_config: None,
@@ -138,6 +141,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn soul_config(mut self, soul_config: crate::config::SoulConfig) -> Self {
+        self.soul_config = Some(soul_config);
+        self
+    }
+
     pub fn skills(mut self, skills: Vec<crate::skills::Skill>) -> Self {
         self.skills = Some(skills);
         self
@@ -197,6 +205,7 @@ impl AgentBuilder {
                 .workspace_dir
                 .unwrap_or_else(|| std::path::PathBuf::from(".")),
             identity_config: self.identity_config.unwrap_or_default(),
+            soul_config: self.soul_config.unwrap_or_default(),
             skills: self.skills.unwrap_or_default(),
             auto_save: self.auto_save.unwrap_or(false),
             history: Vec::new(),
@@ -308,6 +317,7 @@ impl Agent {
             .classification_config(config.query_classification.clone())
             .available_hints(available_hints)
             .identity_config(config.identity.clone())
+            .soul_config(config.soul.clone())
             .skills(crate::skills::load_skills(&config.workspace_dir))
             .auto_save(config.memory.auto_save)
             .build()
@@ -348,6 +358,7 @@ impl Agent {
             tools: &self.tools,
             skills: &self.skills,
             identity_config: Some(&self.identity_config),
+            soul_config: Some(&self.soul_config),
             dispatcher_instructions: &instructions,
         };
         self.prompt_builder.build(&ctx)
@@ -641,6 +652,7 @@ mod tests {
                 return Ok(crate::providers::ChatResponse {
                     text: Some("done".into()),
                     tool_calls: vec![],
+                    usage: None,
                 });
             }
             Ok(guard.remove(0))
@@ -678,6 +690,7 @@ mod tests {
             responses: Mutex::new(vec![crate::providers::ChatResponse {
                 text: Some("hello".into()),
                 tool_calls: vec![],
+                usage: None,
             }]),
         });
 
@@ -715,10 +728,12 @@ mod tests {
                         name: "echo".into(),
                         arguments: "{}".into(),
                     }],
+                    usage: None,
                 },
                 crate::providers::ChatResponse {
                     text: Some("done".into()),
                     tool_calls: vec![],
+                    usage: None,
                 },
             ]),
         });

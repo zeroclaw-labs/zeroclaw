@@ -169,7 +169,8 @@ impl Observer for PrometheusObserver {
             ObserverEvent::ToolCallStart { tool: _ }
             | ObserverEvent::TurnComplete
             | ObserverEvent::LlmRequest { .. }
-            | ObserverEvent::LlmResponse { .. } => {}
+            | ObserverEvent::LlmResponse { .. }
+            | ObserverEvent::SurvivalTierChange { .. } => {}
             ObserverEvent::ToolCall {
                 tool,
                 duration,

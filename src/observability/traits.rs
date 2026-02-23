@@ -51,6 +51,12 @@ pub enum ObserverEvent {
         component: String,
         message: String,
     },
+    /// Survival tier changed due to credit balance change.
+    SurvivalTierChange {
+        from: String,
+        to: String,
+        balance_cents: i64,
+    },
 }
 
 /// Numeric metrics

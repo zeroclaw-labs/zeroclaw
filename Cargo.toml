@@ -136,6 +136,17 @@ probe-rs = { version = "0.30", optional = true }
 # PDF extraction for datasheet RAG (optional, enable with --features rag-pdf)
 pdf-extract = { version = "0.10", optional = true }
 
+# EVM wallet (optional, enable with --features wallet)
+alloy-primitives = { version = "1.5", optional = true, default-features = false }
+alloy-signer = { version = "1.7", optional = true, default-features = false }
+alloy-signer-local = { version = "1.7", optional = true, default-features = false }
+alloy-sol-types = { version = "1.5", optional = true, default-features = false }
+alloy-provider = { version = "1.7", optional = true, default-features = false, features = ["reqwest"] }
+alloy-transport-http = { version = "1.7", optional = true, default-features = false, features = ["reqwest"] }
+alloy-network = { version = "1.7", optional = true, default-features = false }
+alloy-rpc-types = { version = "1.7", optional = true, default-features = false, features = ["eth"] }
+alloy-consensus = { version = "1.7", optional = true, default-features = false }
+
 # Raspberry Pi GPIO / Landlock (Linux only) — target-specific to avoid compile failure on macOS
 [target.'cfg(target_os = "linux")'.dependencies]
 rppal = { version = "0.22", optional = true }
@@ -158,6 +169,12 @@ landlock = ["sandbox-landlock"]
 probe = ["dep:probe-rs"]
 # rag-pdf = PDF ingestion for datasheet RAG
 rag-pdf = ["dep:pdf-extract"]
+# wallet = EVM wallet + x402 payment protocol (adds alloy-rs deps)
+wallet = [
+    "dep:alloy-primitives", "dep:alloy-signer", "dep:alloy-signer-local", "dep:alloy-sol-types",
+    "dep:alloy-provider", "dep:alloy-transport-http", "dep:alloy-network",
+    "dep:alloy-rpc-types", "dep:alloy-consensus",
+]
 [profile.release]
 opt-level = "z"      # Optimize for size
 lto = "thin"         # Lower memory use during release builds

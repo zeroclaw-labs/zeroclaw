@@ -1,4 +1,4 @@
-use crate::config::IdentityConfig;
+use crate::config::{IdentityConfig, SoulConfig};
 use crate::identity;
 use crate::skills::Skill;
 use crate::tools::Tool;
@@ -15,6 +15,7 @@ pub struct PromptContext<'a> {
     pub tools: &'a [Box<dyn Tool>],
     pub skills: &'a [Skill],
     pub identity_config: Option<&'a IdentityConfig>,
+    pub soul_config: Option<&'a SoulConfig>,
     pub dispatcher_instructions: &'a str,
 }
 
@@ -33,6 +34,7 @@ impl SystemPromptBuilder {
         Self {
             sections: vec![
                 Box::new(IdentitySection),
+                Box::new(SoulSection),
                 Box::new(ToolsSection),
                 Box::new(SafetySection),
                 Box::new(SkillsSection),
@@ -63,6 +65,7 @@ impl SystemPromptBuilder {
 }
 
 pub struct IdentitySection;
+pub struct SoulSection;
 pub struct ToolsSection;
 pub struct SafetySection;
 pub struct SkillsSection;
@@ -103,6 +106,87 @@ impl PromptSection for IdentitySection {
             "MEMORY.md",
         ] {
             inject_workspace_file(&mut prompt, ctx.workspace_dir, file);
+        }
+
+        Ok(prompt)
+    }
+}
+
+impl PromptSection for SoulSection {
+    fn name(&self) -> &str {
+        "soul"
+    }
+
+    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        let config = match ctx.soul_config {
+            Some(c) if c.enabled => c,
+            _ => return Ok(String::new()),
+        };
+
+        let soul_path = if std::path::Path::new(&config.soul_path).is_absolute() {
+            std::path::PathBuf::from(&config.soul_path)
+        } else {
+            ctx.workspace_dir.join(&config.soul_path)
+        };
+
+        let soul = match crate::soul::parse_soul_file(&soul_path) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("Failed to load soul file: {e}");
+                return Ok(String::new());
+            }
+        };
+
+        let mut prompt = String::from("## Soul\n\n");
+
+        // Render soul model
+        let rendered = soul.to_prompt_section();
+        if !rendered.is_empty() {
+            prompt.push_str(&rendered);
+            prompt.push_str("\n\n");
+        }
+
+        // Render constitution
+        let constitution = if let Some(ref expected_hash) = config.constitution_hash {
+            // Load from soul's boundaries as custom laws, verify hash
+            if soul.boundaries.len() >= 3 {
+                let laws = [
+                    soul.boundaries[0].clone(),
+                    soul.boundaries[1].clone(),
+                    soul.boundaries[2].clone(),
+                ];
+                match crate::soul::Constitution::from_parts(laws, expected_hash) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!("Constitution integrity check failed: {e}");
+                        crate::soul::Constitution::default()
+                    }
+                }
+            } else {
+                crate::soul::Constitution::default()
+            }
+        } else {
+            crate::soul::Constitution::default()
+        };
+
+        prompt.push_str(&constitution.to_prompt_section());
+        prompt.push('\n');
+
+        // Alignment tracking
+        if config.enable_alignment_tracking {
+            if let Some(ref genesis) = soul.genesis_prompt {
+                let current_text = soul.to_prompt_section();
+                let score = crate::soul::AlignmentScore::compute(genesis, &current_text);
+                let _ = write!(
+                    prompt,
+                    "\n**Alignment:** jaccard={:.2}, recall={:.2}, combined={:.2}",
+                    score.jaccard, score.recall, score.combined
+                );
+                if !score.is_aligned(0.5) {
+                    prompt.push_str(" [WARNING: significant genesis drift detected]");
+                }
+                prompt.push('\n');
+            }
         }
 
         Ok(prompt)
@@ -153,23 +237,18 @@ impl PromptSection for SkillsSection {
             return Ok(String::new());
         }
 
-        let mut prompt = String::from("## Available Skills\n\n<available_skills>\n");
+        let mut prompt = String::from("## Available Skills\n\n");
         for skill in ctx.skills {
-            let location = skill.location.clone().unwrap_or_else(|| {
-                ctx.workspace_dir
-                    .join("skills")
-                    .join(&skill.name)
-                    .join("SKILL.md")
-            });
-            let _ = writeln!(
-                prompt,
-                "  <skill>\n    <name>{}</name>\n    <description>{}</description>\n    <location>{}</location>\n  </skill>",
-                skill.name,
-                skill.description,
-                location.display()
-            );
+            let _ = writeln!(prompt, "### {} (v{})", skill.name, skill.version);
+            let _ = writeln!(prompt, "{}\n", skill.description);
+
+            // Include full skill instructions so the LLM knows how to use the skill
+            for p in &skill.prompts {
+                prompt.push_str(p);
+                prompt.push('\n');
+            }
+            prompt.push('\n');
         }
-        prompt.push_str("</available_skills>");
         Ok(prompt)
     }
 }
@@ -294,6 +373,7 @@ mod tests {
             tools: &tools,
             skills: &[],
             identity_config: None,
+            soul_config: None,
             dispatcher_instructions: "instr",
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();

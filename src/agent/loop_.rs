@@ -1,13 +1,17 @@
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::config::Config;
+use crate::cost::{self, CostTracker, TokenUsage};
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::providers::{self, ChatMessage, ChatRequest, Provider, ToolCall};
 use crate::runtime;
 use crate::security::SecurityPolicy;
+use crate::soul::model_strategy::ModelStrategy;
+use crate::soul::survival::SurvivalMonitor;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
+use parking_lot::Mutex;
 use regex::{Regex, RegexSet};
 use std::fmt::Write;
 use std::io::Write as _;
@@ -275,6 +279,21 @@ fn build_hardware_context(
 /// Find a tool by name in the registry.
 fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool> {
     tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
+}
+
+fn lookup_model_prices(
+    model: &str,
+    prices: &std::collections::HashMap<String, crate::config::schema::ModelPricing>,
+) -> (f64, f64) {
+    if let Some(pricing) = prices.get(model) {
+        return (pricing.input, pricing.output);
+    }
+    for (pattern, pricing) in prices {
+        if model.contains(pattern.as_str()) {
+            return (pricing.input, pricing.output);
+        }
+    }
+    (0.0, 0.0)
 }
 
 fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
@@ -827,6 +846,8 @@ pub(crate) async fn agent_turn(
     temperature: f64,
     silent: bool,
     max_tool_iterations: usize,
+    survival: Option<&Mutex<SurvivalMonitor>>,
+    model_strategy: Option<&Mutex<ModelStrategy>>,
 ) -> Result<String> {
     run_tool_call_loop(
         provider,
@@ -840,6 +861,10 @@ pub(crate) async fn agent_turn(
         None,
         "channel",
         max_tool_iterations,
+        None,
+        survival,
+        model_strategy,
+        None,
         None,
     )
     .await
@@ -861,6 +886,10 @@ pub(crate) async fn run_tool_call_loop(
     channel_name: &str,
     max_tool_iterations: usize,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
+    survival: Option<&Mutex<SurvivalMonitor>>,
+    model_strategy: Option<&Mutex<ModelStrategy>>,
+    cost_tracker: Option<&Arc<Mutex<CostTracker>>>,
+    model_prices: Option<&std::collections::HashMap<String, crate::config::schema::ModelPricing>>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -868,21 +897,67 @@ pub(crate) async fn run_tool_call_loop(
         max_tool_iterations
     };
 
-    let tool_specs: Vec<crate::tools::ToolSpec> =
-        tools_registry.iter().map(|tool| tool.spec()).collect();
+    let cleaning_strategy = match provider_name {
+        "gemini" | "google" | "vertex" => Some(tools::CleaningStrategy::Gemini),
+        "anthropic" | "claude" => Some(tools::CleaningStrategy::Anthropic),
+        "openai" | "openrouter" | "azure" => Some(tools::CleaningStrategy::OpenAI),
+        _ => Some(tools::CleaningStrategy::Conservative),
+    };
+    let tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
+        .iter()
+        .map(|tool| {
+            let mut spec = tool.spec();
+            if let Some(strategy) = cleaning_strategy {
+                spec.parameters = tools::SchemaCleanr::clean(spec.parameters, strategy);
+            }
+            spec
+        })
+        .collect();
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
 
     for _iteration in 0..max_iterations {
+        let effective_model = if let (Some(surv), Some(strat)) = (survival, model_strategy) {
+            let tier = surv.lock().tier();
+            let strat_lock = strat.lock();
+            if let Some(ovr) = strat_lock.model_for_tier(tier) {
+                ovr.model.clone()
+            } else {
+                model.to_string()
+            }
+        } else {
+            model.to_string()
+        };
+
+        if let Some(tracker) = cost_tracker {
+            match (**tracker).lock().check_budget(0.0) {
+                Ok(cost::BudgetCheck::Exceeded { current_usd, limit_usd, period }) => {
+                    anyhow::bail!(
+                        "Budget exceeded: ${current_usd:.4} / ${limit_usd:.4} ({period:?})"
+                    );
+                }
+                Ok(cost::BudgetCheck::Warning { current_usd, limit_usd, period }) => {
+                    tracing::warn!(
+                        current = current_usd,
+                        limit = limit_usd,
+                        ?period,
+                        "Approaching budget limit"
+                    );
+                }
+                Ok(cost::BudgetCheck::Allowed) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "Budget check failed");
+                }
+            }
+        }
+
         observer.record_event(&ObserverEvent::LlmRequest {
             provider: provider_name.to_string(),
-            model: model.to_string(),
+            model: effective_model.clone(),
             messages_count: history.len(),
         });
 
         let llm_started_at = Instant::now();
 
-        // Unified path via Provider::chat so provider-specific native tool logic
-        // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
         let request_tools = if use_native_tools {
             Some(tool_specs.as_slice())
         } else {
@@ -896,19 +971,57 @@ pub(crate) async fn run_tool_call_loop(
                         messages: history,
                         tools: request_tools,
                     },
-                    model,
+                    &effective_model,
                     temperature,
                 )
                 .await
             {
                 Ok(resp) => {
+                    if let Some(surv) = survival {
+                        let cost_cents = 1;
+                        let mut monitor = surv.lock();
+                        if let Some((from, to)) = monitor.deduct(cost_cents) {
+                            observer.record_event(&ObserverEvent::SurvivalTierChange {
+                                from: from.label().to_string(),
+                                to: to.label().to_string(),
+                                balance_cents: monitor.balance_cents(),
+                            });
+                        }
+                        if let Some(strat) = model_strategy {
+                            strat.lock().record_spend(cost_cents);
+                        }
+                    }
+
                     observer.record_event(&ObserverEvent::LlmResponse {
                         provider: provider_name.to_string(),
-                        model: model.to_string(),
+                        model: effective_model.clone(),
                         duration: llm_started_at.elapsed(),
                         success: true,
                         error_message: None,
                     });
+
+                    if let Some(tracker) = cost_tracker {
+                        let (input_tokens, output_tokens) = if let Some(ref u) = resp.usage {
+                            (u.input_tokens, u.output_tokens)
+                        } else {
+                            let input_est = history.iter().map(|m| m.content.len() as u64).sum::<u64>() / 4;
+                            let output_est = resp.text_or_empty().len() as u64 / 4;
+                            (input_est, output_est)
+                        };
+                        let empty_prices = std::collections::HashMap::new();
+                        let prices = model_prices.unwrap_or(&empty_prices);
+                        let (input_price, output_price) = lookup_model_prices(&effective_model, prices);
+                        let usage = TokenUsage::new(
+                            &effective_model,
+                            input_tokens,
+                            output_tokens,
+                            input_price,
+                            output_price,
+                        );
+                        if let Err(e) = (**tracker).lock().record_usage(usage) {
+                            tracing::warn!(error = %e, "Failed to record cost usage");
+                        }
+                    }
 
                     let response_text = resp.text_or_empty().to_string();
                     let mut calls = parse_structured_tool_calls(&resp.tool_calls);
@@ -942,7 +1055,7 @@ pub(crate) async fn run_tool_call_loop(
                 Err(e) => {
                     observer.record_event(&ObserverEvent::LlmResponse {
                         provider: provider_name.to_string(),
-                        model: model.to_string(),
+                        model: effective_model,
                         duration: llm_started_at.elapsed(),
                         success: false,
                         error_message: Some(crate::providers::sanitize_api_error(&e.to_string())),
@@ -1141,6 +1254,25 @@ pub async fn run(
     )?);
     tracing::info!(backend = mem.name(), "Memory initialized");
 
+    // ── Cost tracking (budget enforcement) ──────────────────────────
+    let cost_tracker = if config.cost.enabled {
+        match cost::create_tracker_from_json(
+            &serde_json::to_value(&config.cost).unwrap_or_default(),
+            &config.workspace_dir,
+        ) {
+            Ok(tracker) => {
+                tracing::info!("Cost tracking enabled");
+                Some(Arc::new(Mutex::new(tracker)))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to initialize cost tracker");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // ── Peripherals (merge peripheral tools into registry) ─
     if !peripheral_overrides.is_empty() {
         tracing::info!(
@@ -1179,6 +1311,58 @@ pub async fn run(
         tracing::info!(count = peripheral_tools.len(), "Peripheral tools added");
         tools_registry.extend(peripheral_tools);
     }
+
+    // ── Survival system (optional) ───────────────────────────────
+    let survival_monitor = if config.soul.enabled && config.cost.survival_enabled {
+        let monitor = Arc::new(Mutex::new(SurvivalMonitor::new(
+            config.cost.initial_credit_cents,
+            crate::soul::survival::SurvivalThresholds::default(),
+        )));
+        tools_registry.push(Box::new(crate::tools::SoulStatusTool::new(monitor.clone())));
+        tracing::info!(
+            initial_credits = config.cost.initial_credit_cents,
+            "Survival monitor initialized"
+        );
+        Some(monitor)
+    } else {
+        None
+    };
+
+    if config.soul.enabled {
+        let soul_path = config.workspace_dir.join("SOUL.md");
+        if soul_path.exists() {
+            match crate::soul::parse_soul_file(&soul_path) {
+                Ok(soul_model) => {
+                    let soul = Arc::new(Mutex::new(soul_model));
+                    tools_registry.push(Box::new(crate::tools::SoulReflectTool::new(
+                        soul_path.clone(),
+                        soul,
+                    )));
+
+                    let mut manager = crate::soul::ReplicationManager::new(
+                        &config.replication,
+                        &config.workspace_dir,
+                    );
+                    manager.set_constitution(crate::soul::Constitution::default());
+                    let manager = Arc::new(Mutex::new(manager));
+                    tools_registry
+                        .push(Box::new(crate::tools::SoulReplicateTool::new(manager)));
+                    tracing::info!("Soul reflect + replicate tools initialized");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to parse SOUL.md; soul reflect/replicate disabled");
+                }
+            }
+        }
+    }
+
+    let model_strategy = if config.soul.enabled && config.model_strategy.enabled {
+        let strategy = ModelStrategy::from_config(&config.model_strategy);
+        tracing::info!("Model strategy initialized");
+        Some(Arc::new(Mutex::new(strategy)))
+    } else {
+        None
+    };
 
     // ── Resolve provider ─────────────────────────────────────────
     let provider_name = provider_override
@@ -1398,6 +1582,10 @@ pub async fn run(
             "cli",
             config.agent.max_tool_iterations,
             None,
+            survival_monitor.as_deref(),
+            model_strategy.as_deref(),
+            cost_tracker.as_ref(),
+            Some(&config.cost.prices),
         )
         .await?;
         final_output = response.clone();
@@ -1524,6 +1712,10 @@ pub async fn run(
                 "cli",
                 config.agent.max_tool_iterations,
                 None,
+                survival_monitor.as_deref(),
+                model_strategy.as_deref(),
+                cost_tracker.as_ref(),
+                Some(&config.cost.prices),
             )
             .await
             {
@@ -1572,12 +1764,20 @@ pub async fn run(
     }
 
     let duration = start.elapsed();
+    let (tokens_used, session_cost_usd) = if let Some(ref tracker) = cost_tracker {
+        match (**tracker).lock().get_summary() {
+            Ok(summary) => (Some(summary.total_tokens), Some(summary.session_cost_usd)),
+            Err(_) => (None, None),
+        }
+    } else {
+        (None, None)
+    };
     observer.record_event(&ObserverEvent::AgentEnd {
         provider: provider_name.to_string(),
         model: model_name.to_string(),
         duration,
-        tokens_used: None,
-        cost_usd: None,
+        tokens_used,
+        cost_usd: session_cost_usd,
     });
 
     Ok(final_output)
@@ -1626,6 +1826,52 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     let peripheral_tools: Vec<Box<dyn Tool>> =
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
     tools_registry.extend(peripheral_tools);
+
+    let survival_monitor = if config.soul.enabled && config.cost.survival_enabled {
+        let monitor = Arc::new(Mutex::new(SurvivalMonitor::new(
+            config.cost.initial_credit_cents,
+            crate::soul::survival::SurvivalThresholds::default(),
+        )));
+        tools_registry.push(Box::new(crate::tools::SoulStatusTool::new(monitor.clone())));
+        Some(monitor)
+    } else {
+        None
+    };
+
+    if config.soul.enabled {
+        let soul_path = config.workspace_dir.join("SOUL.md");
+        if soul_path.exists() {
+            match crate::soul::parse_soul_file(&soul_path) {
+                Ok(soul_model) => {
+                    let soul = Arc::new(Mutex::new(soul_model));
+                    tools_registry.push(Box::new(crate::tools::SoulReflectTool::new(
+                        soul_path.clone(),
+                        soul,
+                    )));
+
+                    let mut manager = crate::soul::ReplicationManager::new(
+                        &config.replication,
+                        &config.workspace_dir,
+                    );
+                    manager.set_constitution(crate::soul::Constitution::default());
+                    let manager = Arc::new(Mutex::new(manager));
+                    tools_registry
+                        .push(Box::new(crate::tools::SoulReplicateTool::new(manager)));
+                    tracing::info!("Soul reflect + replicate tools initialized");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to parse SOUL.md; soul reflect/replicate disabled");
+                }
+            }
+        }
+    }
+
+    let model_strategy = if config.soul.enabled && config.model_strategy.enabled {
+        let strategy = ModelStrategy::from_config(&config.model_strategy);
+        Some(Arc::new(Mutex::new(strategy)))
+    } else {
+        None
+    };
 
     let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
     let model_name = config
@@ -1743,6 +1989,8 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         config.default_temperature,
         true,
         config.agent.max_tool_iterations,
+        survival_monitor.as_deref(),
+        model_strategy.as_deref(),
     )
     .await
 }

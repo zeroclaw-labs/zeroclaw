@@ -63,10 +63,14 @@ pub mod rag;
 pub mod runtime;
 pub mod security;
 pub mod service;
+pub mod skillforge;
 pub mod skills;
+pub mod soul;
 pub mod tools;
 pub mod tunnel;
 pub mod util;
+#[cfg(feature = "wallet")]
+pub mod wallet;
 
 pub use config::Config;
 

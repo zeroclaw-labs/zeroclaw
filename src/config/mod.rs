@@ -8,12 +8,13 @@ pub use schema::{
     ChannelsConfig, ClassificationRule, ComposioConfig, Config, CostConfig, CronConfig,
     DelegateAgentConfig, DiscordConfig, DockerRuntimeConfig, GatewayConfig, HardwareConfig,
     HardwareTransport, HeartbeatConfig, HttpRequestConfig, IMessageConfig, IdentityConfig,
-    LarkConfig, MatrixConfig, MemoryConfig, ModelRouteConfig, ObservabilityConfig,
-    PeripheralBoardConfig, PeripheralsConfig, ProxyConfig, ProxyScope, QueryClassificationConfig,
-    ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig,
-    SchedulerConfig, SecretsConfig, SecurityConfig, SlackConfig, StorageConfig,
-    StorageProviderConfig, StorageProviderSection, StreamMode, TelegramConfig, TunnelConfig,
-    VoiceConfig, WebSearchConfig, WebhookConfig,
+    LarkConfig, MatrixConfig, MemoryConfig, MemoryTokenBudgetsConfig, ModelRouteConfig,
+    ModelStrategyConfig, ObservabilityConfig, PeripheralBoardConfig, PeripheralsConfig,
+    ProxyConfig, ProxyScope, QueryClassificationConfig, ReliabilityConfig, ReplicationConfig,
+    ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig,
+    SecretsConfig, SecurityConfig, SlackConfig, SoulConfig, StorageConfig, StorageProviderConfig,
+    StorageProviderSection, StreamMode, SurvivalThresholdsConfig, TelegramConfig, TierModelConfig,
+    TreasuryConfig, TunnelConfig, VoiceConfig, WalletConfig, WebSearchConfig, WebhookConfig,
 };
 
 #[cfg(test)]

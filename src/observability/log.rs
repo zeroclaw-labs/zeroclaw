@@ -79,6 +79,18 @@ impl Observer for LogObserver {
                     "llm.response"
                 );
             }
+            ObserverEvent::SurvivalTierChange {
+                from,
+                to,
+                balance_cents,
+            } => {
+                info!(
+                    from = %from,
+                    to = %to,
+                    balance_cents = balance_cents,
+                    "survival.tier_change"
+                );
+            }
         }
     }
 

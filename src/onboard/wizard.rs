@@ -135,10 +135,17 @@ pub fn run_wizard() -> Result<Config> {
         web_search: crate::config::WebSearchConfig::default(),
         proxy: crate::config::ProxyConfig::default(),
         identity: crate::config::IdentityConfig::default(),
+        soul: crate::config::SoulConfig::default(),
+        replication: crate::config::ReplicationConfig::default(),
+        model_strategy: crate::config::ModelStrategyConfig::default(),
         cost: crate::config::CostConfig::default(),
+        wallet: crate::config::WalletConfig::default(),
+        treasury: crate::config::TreasuryConfig::default(),
         peripherals: crate::config::PeripheralsConfig::default(),
         agents: std::collections::HashMap::new(),
         hardware: hardware_config,
+        skillforge: crate::skillforge::SkillForgeConfig::default(),
+        security: crate::config::SecurityConfig::default(),
         query_classification: crate::config::QueryClassificationConfig::default(),
     };
 
@@ -359,10 +366,17 @@ pub fn run_quick_setup(
         web_search: crate::config::WebSearchConfig::default(),
         proxy: crate::config::ProxyConfig::default(),
         identity: crate::config::IdentityConfig::default(),
+        soul: crate::config::SoulConfig::default(),
+        replication: crate::config::ReplicationConfig::default(),
+        model_strategy: crate::config::ModelStrategyConfig::default(),
         cost: crate::config::CostConfig::default(),
+        wallet: crate::config::WalletConfig::default(),
+        treasury: crate::config::TreasuryConfig::default(),
         peripherals: crate::config::PeripheralsConfig::default(),
         agents: std::collections::HashMap::new(),
         hardware: crate::config::HardwareConfig::default(),
+        skillforge: crate::skillforge::SkillForgeConfig::default(),
+        security: crate::config::SecurityConfig::default(),
         query_classification: crate::config::QueryClassificationConfig::default(),
     };
 
@@ -496,7 +510,6 @@ const MINIMAX_ONBOARD_MODELS: [(&str, &str); 5] = [
 fn default_model_for_provider(provider: &str) -> String {
     match canonical_provider_name(provider) {
         "anthropic" => "claude-sonnet-4-5-20250929".into(),
-        "openrouter" => "anthropic/claude-sonnet-4.6".into(),
         "openai" => "gpt-5.2".into(),
         "openai-codex" => "gpt-5-codex".into(),
         "venice" => "zai-org-glm-5".into(),
@@ -516,7 +529,6 @@ fn default_model_for_provider(provider: &str) -> String {
         "gemini" => "gemini-2.5-pro".into(),
         "kimi-code" => "kimi-for-coding".into(),
         "nvidia" => "meta/llama-3.3-70b-instruct".into(),
-        "astrai" => "anthropic/claude-sonnet-4.6".into(),
         _ => "anthropic/claude-sonnet-4.6".into(),
     }
 }
