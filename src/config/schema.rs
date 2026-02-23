@@ -200,6 +200,10 @@ pub struct Config {
     #[serde(default)]
     pub hooks: HooksConfig,
 
+    /// Dynamic tool/hook registry for runtime tool management (`[dynamic_registry]`).
+    #[serde(default)]
+    pub dynamic_registry: DynamicRegistryConfig,
+
     /// Hardware configuration (wizard-driven physical world setup).
     #[serde(default)]
     pub hardware: HardwareConfig,
@@ -1840,6 +1844,32 @@ impl Default for BuiltinHooksConfig {
     }
 }
 
+// ── Dynamic Registry ─────────────────────────────────────────────
+
+/// Dynamic tool/hook registry configuration (`[dynamic_registry]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DynamicRegistryConfig {
+    /// Maximum number of dynamic tools that can be registered at runtime.
+    pub max_tools: usize,
+    /// Maximum number of dynamic hooks that can be registered at runtime.
+    pub max_hooks: usize,
+    /// Allowed tool kind factory keys. Only these kinds can be created dynamically.
+    pub allowed_tool_kinds: Vec<String>,
+}
+
+impl Default for DynamicRegistryConfig {
+    fn default() -> Self {
+        Self {
+            max_tools: 20,
+            max_hooks: 20,
+            allowed_tool_kinds: vec![
+                "shell_command".to_string(),
+                "http_endpoint".to_string(),
+            ],
+        }
+    }
+}
+
 // ── Autonomy / Security ──────────────────────────────────────────
 
 /// Autonomy and security policy configuration (`[autonomy]` section).
@@ -3460,6 +3490,7 @@ impl Default for Config {
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hooks: HooksConfig::default(),
+            dynamic_registry: DynamicRegistryConfig::default(),
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
@@ -4732,6 +4763,7 @@ default_temperature = 0.7
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hooks: HooksConfig::default(),
+            dynamic_registry: DynamicRegistryConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
         };
@@ -4906,6 +4938,7 @@ tool_dispatcher = "xml"
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hooks: HooksConfig::default(),
+            dynamic_registry: DynamicRegistryConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
         };
@@ -7056,5 +7089,25 @@ require_otp_to_resume = true
             .validate()
             .expect_err("expected ttl validation failure");
         assert!(err.to_string().contains("token_ttl_secs"));
+    }
+
+    #[test]
+    async fn dynamic_registry_config_defaults() {
+        let cfg = DynamicRegistryConfig::default();
+        assert_eq!(cfg.max_tools, 20);
+        assert_eq!(cfg.max_hooks, 20);
+        assert_eq!(
+            cfg.allowed_tool_kinds,
+            vec!["shell_command".to_string(), "http_endpoint".to_string()]
+        );
+    }
+
+    #[test]
+    async fn dynamic_registry_config_serde_round_trip() {
+        let cfg = DynamicRegistryConfig::default();
+        let json = serde_json::to_string(&cfg).unwrap();
+        let parsed: DynamicRegistryConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.max_tools, 20);
+        assert_eq!(parsed.max_hooks, 20);
     }
 }
