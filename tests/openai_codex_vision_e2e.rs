@@ -39,7 +39,10 @@ async fn provider_vision_support() -> Result<()> {
 
     // Verify vision capability
     let capabilities = provider.capabilities();
-    println!("Provider {} capabilities: vision={}", provider_name, capabilities.vision);
+    println!(
+        "Provider {} capabilities: vision={}",
+        provider_name, capabilities.vision
+    );
 
     if !capabilities.vision {
         anyhow::bail!(
@@ -107,7 +110,8 @@ async fn provider_vision_support() -> Result<()> {
             // Check if it's the capability error we're testing for
             let error_str = e.to_string();
             if error_str.contains("provider_capability_error")
-                || error_str.contains("does not support vision") {
+                || error_str.contains("does not support vision")
+            {
                 eprintln!("\n⚠️  CAPABILITY ERROR DETECTED!");
                 eprintln!("This means the agent loop is still blocking vision input.");
                 eprintln!("Possible causes:");
@@ -156,7 +160,10 @@ async fn openai_codex_second_vision_support() -> Result<()> {
 
     // Verify vision capability
     let capabilities = provider.capabilities();
-    println!("Provider {} capabilities: vision={}", provider_name, capabilities.vision);
+    println!(
+        "Provider {} capabilities: vision={}",
+        provider_name, capabilities.vision
+    );
 
     if !capabilities.vision {
         anyhow::bail!(
@@ -224,14 +231,18 @@ async fn openai_codex_second_vision_support() -> Result<()> {
             // Check if it's the capability error we're testing for
             let error_str = e.to_string();
             if error_str.contains("provider_capability_error")
-                || error_str.contains("does not support vision") {
+                || error_str.contains("does not support vision")
+            {
                 eprintln!("\n⚠️  CAPABILITY ERROR DETECTED!");
                 eprintln!("This means the agent loop is still blocking vision input.");
                 anyhow::bail!("Vision capability check failed in agent loop");
             }
 
             // Check if it's rate limit
-            if error_str.contains("429") || error_str.contains("rate") || error_str.contains("limit") {
+            if error_str.contains("429")
+                || error_str.contains("rate")
+                || error_str.contains("limit")
+            {
                 eprintln!("\n⚠️  RATE LIMITED!");
                 eprintln!("Second OpenAI Codex profile is also rate-limited.");
                 eprintln!("This is OK - it means both profiles share the same quota.");
